@@ -483,7 +483,48 @@ uint64_t mm_free_memory_kib(void)
 }
 
 /**
- * @brief Find contiguous free bitmap pages, reference and zero them; return 0 when no run fits.
+ * @brief Atomically claim a contiguous run whose final byte fits the DMA mask.
+ * @param page_count Nonzero number of 4 KiB pages; checked before scanning.
+ * @param mask Inclusive maximum bus address; no high-address truncation.
+ * @return Identity-mapped owned physical run, or 0. IRQ-safe allocator lock;
+ * all pages are claimed together and zeroed before publication. Caller frees.
+ */
+uint64_t mm_alloc_pages_below(uint32_t page_count, uint64_t mask)
+{
+    uint64_t bytes = (uint64_t)page_count * PAGE_SIZE;
+    if (!page_count || bytes - 1 > mask || page_count > MM_PAGE_COUNT) return 0;
+    uint64_t flags, result = 0;
+    kernel_spin_lock_irqsave(&mm_lock, &flags);
+    uint64_t last = mask / PAGE_SIZE;
+    if (last >= MM_PAGE_COUNT) last = MM_PAGE_COUNT - 1;
+    uint32_t run = 0;
+    if (free_pages && page_count <= free_page_count) for (uint32_t i = 1; i <= last; ++i) {
+        if (!(free_pages[i / 64] & (1ULL << (i % 64)))) {
+            run = 0;
+            if (!(i % 64) && !free_pages[i / 64] && i + 63 <= last) i += 63;
+            continue;
+        }
+        if (++run < page_count) continue;
+        uint32_t first = i + 1 - page_count;
+        uint64_t phys = (uint64_t)first * PAGE_SIZE;
+        if (phys > mask || bytes - 1 > mask - phys) continue;
+        for (uint32_t page = first; page <= i; ++page) {
+            free_pages[page / 64] &= ~(1ULL << (page % 64)); page_refs[page] = 1;
+        }
+        free_page_count -= page_count;
+        if (first == allocation_hint) allocation_hint = i + 1;
+        result = phys;
+        break;
+    }
+    kernel_spin_unlock_irqrestore(&mm_lock, flags);
+    /* Claimed pages are private; zero outside the IRQ-disabled scan. */
+    if (result) zero_pages(result, page_count);
+    return result;
+}
+/**
+ * @brief Allocate an unrestricted contiguous run, retaining the allocator hint.
+ * @param page_count Requested pages.
+ * @return Owned zeroed physical run, or 0. IRQ-safe; caller frees the run.
  */
 uint64_t mm_alloc_pages(uint32_t page_count)
 {

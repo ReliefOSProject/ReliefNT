@@ -6,6 +6,7 @@
 #include <reliefnt/apic.h>
 #include <reliefnt/driver_manager.h>
 #include <reliefnt/input.h>
+#include <reliefnt/pci_irq.h>
 #include <reliefnt/lock.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/smp.h>
@@ -158,12 +159,18 @@ void irq_init(void)
 /**
  * Irq dispatch.
  * @param frame Value supplied by the caller.
- * @return The value or status produced by the operation.
+ * @return Next scheduled task, or NULL. IRQ context; MSI callback finishes
+ * W1C acknowledgement before EOI; no registry lock is held across callbacks.
  */
 struct task *irq_dispatch(struct trap_frame *frame)
 {
     uint64_t vector = frame ? frame->vector : 0;
     bool from_user = frame && ((frame->cs & 3ULL) == 3ULL);
+    if (vector >= 0x50 && vector <= 0x5f) {
+        pci_irq_dispatch((uint32_t)vector);
+        apic_eoi();
+        return NULL;
+    }
     if (vector == 0x20) {
         time_on_tick();
         if (from_user) {
@@ -187,6 +194,12 @@ struct task *irq_dispatch(struct trap_frame *frame)
         }
         return NULL;
     } else if (vector == 0x21) {
+        /* A polled controller reply may leave a latched IRQ1 after its byte
+         * was consumed. Do not publish stale data or steal an AUX byte. */
+        if ((x86_64_inb(0x64) & 0x21u) != 0x01u) {
+            irq_send_eoi(1);
+            return NULL;
+        }
         uint8_t scancode = x86_64_inb(PS2_DATA);
         if (keyboard_led_reply(&keyboard_led, scancode)) {
             /* Controller replies must not enter the keyboard scan-code stream. */

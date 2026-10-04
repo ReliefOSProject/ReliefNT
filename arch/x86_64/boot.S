@@ -416,6 +416,22 @@ IRQ_STUB irq14_stub 0x2e
 IRQ_STUB irq15_stub 0x2f
 IRQ_STUB irq32_stub 0x40
 IRQ_STUB irq_membarrier_stub 0x41
+IRQ_STUB irq_msi_50_stub 0x50
+IRQ_STUB irq_msi_51_stub 0x51
+IRQ_STUB irq_msi_52_stub 0x52
+IRQ_STUB irq_msi_53_stub 0x53
+IRQ_STUB irq_msi_54_stub 0x54
+IRQ_STUB irq_msi_55_stub 0x55
+IRQ_STUB irq_msi_56_stub 0x56
+IRQ_STUB irq_msi_57_stub 0x57
+IRQ_STUB irq_msi_58_stub 0x58
+IRQ_STUB irq_msi_59_stub 0x59
+IRQ_STUB irq_msi_5a_stub 0x5a
+IRQ_STUB irq_msi_5b_stub 0x5b
+IRQ_STUB irq_msi_5c_stub 0x5c
+IRQ_STUB irq_msi_5d_stub 0x5d
+IRQ_STUB irq_msi_5e_stub 0x5e
+IRQ_STUB irq_msi_5f_stub 0x5f
 IRQ_STUB irqff_stub 0xff
 
 /* int 0x80 entry: push a trap frame, dispatch the syscall, then switch tasks or resume. */

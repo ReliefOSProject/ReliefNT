@@ -10,6 +10,12 @@
 #include <reliefnt/mm.h>
 #include <reliefnt/net.h>
 #include <reliefnt/pci.h>
+#include <reliefnt/pci_irq.h>
+#include <reliefnt/driver_resources.h>
+#include <reliefnt/audio.h>
+#include <reliefnt/driver_manager_phase.h>
+#include <reliefnt/lock.h>
+#include <reliefnt/panic.h>
 #include <reliefnt/storage.h>
 #include <reliefnt/time.h>
 #include <reliefos/layout.h>
@@ -118,10 +124,12 @@ struct driver_slot {
     const struct reliefos_driver_module *module;
     uint64_t image_phys;
     uint32_t image_pages;
+    int cleanup_error;
 };
 
 static struct driver_slot driver_slots[RELIEFOS_DRIVER_MAX];
 static int32_t loading_slot = -1;
+static int32_t cleanup_slot = -1;
 static const struct reliefos_driver_mouse_ops *mouse_ops;
 static bool mouse_visible = true;
 static const struct reliefos_driver_serial_ops *serial_ops;
@@ -131,8 +139,23 @@ static uint32_t mouse_owner;
 static uint32_t serial_owner;
 static uint32_t e1000_owner;
 static uint32_t audio_owner;
+static uint32_t audio_generation, audio_lease_generation;
 static struct mouse_state mouse_cache;
 static uint8_t e1000_empty_mac[6];
+static uint8_t e1000_mac_cache[6];
+static struct kernel_spinlock manager_service_lock = KERNEL_SPINLOCK_INIT;
+static struct kernel_spinlock e1000_mac_cache_lock = KERNEL_SPINLOCK_INIT;
+
+/** @brief Resume manager ownership after a phase that may wait or sleep.
+ * @param scope Active manager wait scope whose token must be consumed.
+ * @return None. A lost transaction is a kernel invariant failure; no slot state
+ * or module resources may be reclaimed without the resumed transaction.
+ */
+static void driver_manager_wait_end_or_panic(struct driver_manager_wait_scope *scope)
+{
+    if (driver_manager_wait_end(scope) < 0)
+        panic("driver manager failed to resume execution ownership");
+}
 
 /**
  * @brief Copy src into dst up to cap-1 bytes and always NUL-terminate; safe with NULL src or cap 0.
@@ -510,6 +533,12 @@ static int driver_symbol_value(const struct elf64_sym *symbol, uint16_t shnum,
 
 /**
  * @brief Patch every RELA relocation in the loaded image; -8 on malformed data, -95 on an unknown type.
+ * @param data Borrowed validated module bytes.
+ * @param length Size of the source image.
+ * @param header Validated ELF header.
+ * @param sections Borrowed section header table.
+ * @param section_addresses Loaded writable section addresses.
+ * @return 0 after byte-safe relocation stores, or a negative format/type error.
  */
 static int driver_apply_relocations(const uint8_t *data, uint64_t length,
                                     const struct elf64_ehdr *header,
@@ -568,13 +597,15 @@ static int driver_apply_relocations(const uint8_t *data, uint64_t length,
             }
             patch = section_addresses[rela_section->info] + rela->offset;
             if (type == ELF_R_X86_64_64) {
-                *(uint64_t *)(uintptr_t)patch = symbol_value + (uint64_t)rela->addend;
+                uint64_t word = symbol_value + (uint64_t)rela->addend;
+                driver_memcpy((void *)(uintptr_t)patch, &word, sizeof(word));
             } else if (type == ELF_R_X86_64_PC32 || type == ELF_R_X86_64_PLT32) {
                 value = (int64_t)symbol_value + rela->addend - (int64_t)patch;
                 if (value < -2147483648LL || value > 2147483647LL) {
                     return -8;
                 }
-                *(uint32_t *)(uintptr_t)patch = (uint32_t)value;
+                uint32_t word = (uint32_t)value;
+                driver_memcpy((void *)(uintptr_t)patch, &word, sizeof(word));
             } else if (type == ELF_R_X86_64_32 || type == ELF_R_X86_64_32S) {
                 value = (int64_t)symbol_value + rela->addend;
                 if ((type == ELF_R_X86_64_32 &&
@@ -583,7 +614,8 @@ static int driver_apply_relocations(const uint8_t *data, uint64_t length,
                      (value < -2147483648LL || value > 2147483647LL))) {
                     return -8;
                 }
-                *(uint32_t *)(uintptr_t)patch = (uint32_t)value;
+                uint32_t word = (uint32_t)value;
+                driver_memcpy((void *)(uintptr_t)patch, &word, sizeof(word));
             } else {
                 return -95;
             }
@@ -659,8 +691,11 @@ static int driver_register_mouse(const struct reliefos_driver_mouse_ops *ops)
     if (loading_slot < 0 || !ops || !ops->poll || !ops->get_state) {
         return -22;
     }
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&manager_service_lock, &flags);
     mouse_ops = ops;
     mouse_owner = (uint32_t)loading_slot;
+    kernel_spin_unlock_irqrestore(&manager_service_lock, flags);
     return 0;
 }
 
@@ -672,8 +707,11 @@ static int driver_register_serial(const struct reliefos_driver_serial_ops *ops)
     if (loading_slot < 0 || !ops || !ops->is_ready || !ops->write) {
         return -22;
     }
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&manager_service_lock, &flags);
     serial_ops = ops;
     serial_owner = (uint32_t)loading_slot;
+    kernel_spin_unlock_irqrestore(&manager_service_lock, flags);
     return 0;
 }
 
@@ -686,13 +724,18 @@ static int driver_register_e1000(const struct reliefos_driver_e1000_ops *ops)
         !ops->poll || !ops->get_info) {
         return -22;
     }
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&manager_service_lock, &flags);
     e1000_ops = ops;
     e1000_owner = (uint32_t)loading_slot;
+    kernel_spin_unlock_irqrestore(&manager_service_lock, flags);
     return 0;
 }
 
 /**
- * @brief Bind the currently-loading driver's audio ops as the active audio backend.
+ * @brief Bind the loading driver's v1 backend with a non-reused generation.
+ * @param ops Borrowed validated callbacks, owned by the loaded image.
+ * @return Zero, -EINVAL or -ENOSPC. Task init under manager admission.
  */
 static int driver_register_audio(const struct reliefos_driver_audio_ops *ops)
 {
@@ -700,9 +743,93 @@ static int driver_register_audio(const struct reliefos_driver_audio_ops *ops)
         !ops->write || !ops->get_state) {
         return -22;
     }
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&manager_service_lock, &flags);
+    if (audio_generation == UINT32_MAX) {
+        kernel_spin_unlock_irqrestore(&manager_service_lock, flags);
+        return -28;
+    }
+    ++audio_generation;
     audio_ops = ops;
     audio_owner = (uint32_t)loading_slot;
+    kernel_spin_unlock_irqrestore(&manager_service_lock, flags);
     return 0;
+}
+
+/**
+ * @brief Capture and pin one published mouse callback table with its matching owner.
+ * @param out_owner Receives the slot whose callback pin must be released.
+ * @return Consistent local ops snapshot, or NULL while absent/closing.
+ */
+static const struct reliefos_driver_mouse_ops *driver_mouse_service_pin(uint32_t *out_owner)
+{
+    if (!out_owner) return NULL;
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&manager_service_lock, &flags);
+    const struct reliefos_driver_mouse_ops *ops = mouse_ops;
+    uint32_t owner = mouse_owner;
+    if (!ops || !driver_manager_service_try_pin(owner)) ops = NULL;
+    else *out_owner = owner;
+    kernel_spin_unlock_irqrestore(&manager_service_lock, flags);
+    return ops;
+}
+
+/**
+ * @brief Capture and pin one published serial callback table with its matching owner.
+ * @param out_owner Receives the slot whose callback pin must be released.
+ * @return Consistent local ops snapshot, or NULL while absent/closing.
+ */
+static const struct reliefos_driver_serial_ops *driver_serial_service_pin(uint32_t *out_owner)
+{
+    if (!out_owner) return NULL;
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&manager_service_lock, &flags);
+    const struct reliefos_driver_serial_ops *ops = serial_ops;
+    uint32_t owner = serial_owner;
+    if (!ops || !driver_manager_service_try_pin(owner)) ops = NULL;
+    else *out_owner = owner;
+    kernel_spin_unlock_irqrestore(&manager_service_lock, flags);
+    return ops;
+}
+
+/**
+ * @brief Capture and pin one published e1000 callback table with its matching owner.
+ * @param out_owner Receives the slot whose callback pin must be released.
+ * @return Consistent local ops snapshot, or NULL while absent/closing.
+ */
+static const struct reliefos_driver_e1000_ops *driver_e1000_service_pin(uint32_t *out_owner)
+{
+    if (!out_owner) return NULL;
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&manager_service_lock, &flags);
+    const struct reliefos_driver_e1000_ops *ops = e1000_ops;
+    uint32_t owner = e1000_owner;
+    if (!ops || !driver_manager_service_try_pin(owner)) ops = NULL;
+    else *out_owner = owner;
+    kernel_spin_unlock_irqrestore(&manager_service_lock, flags);
+    return ops;
+}
+
+/**
+ * @brief Capture and pin one published audio callback table with its matching owner.
+ * @param generation Exact OSS lease generation, or zero for native compatibility.
+ * @param out_owner Receives the slot whose callback pin must be released.
+ * @return Consistent local ops snapshot, or NULL while absent/closing.
+ */
+static const struct reliefos_driver_audio_ops *driver_audio_service_pin_bound(uint32_t generation,
+                                                                             uint32_t *out_owner)
+{
+    if (!out_owner) return NULL;
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&manager_service_lock, &flags);
+    const struct reliefos_driver_audio_ops *ops = audio_ops;
+    uint32_t owner = audio_owner;
+    if (!ops || (generation && (generation != audio_generation ||
+                                generation != audio_lease_generation)) ||
+        !driver_manager_service_try_pin(owner)) ops = NULL;
+    else *out_owner = owner;
+    kernel_spin_unlock_irqrestore(&manager_service_lock, flags);
+    return ops;
 }
 
 /**
@@ -781,6 +908,77 @@ static int driver_api_pci_find(uint16_t vendor_id, uint16_t device_id,
     return 0;
 }
 
+/** @brief Allocate a DMA lease for the loading module.
+ * @param pages Requested pages.
+ * @param mask Inclusive final-byte DMA mask.
+ * @return Owned physical run or zero. Init/task context; core records owner.
+ */
+static uint64_t driver_alloc_dma(uint32_t pages,uint64_t mask)
+{
+    return driver_alloc_dma_owned((uint32_t)loading_slot,pages,mask);
+}
+/** @brief Map a BAR lease for the loading module.
+ * @param phys Aligned BAR base of a quiesced function.
+ * @param bytes Requested byte length.
+ * @return Owned mapping pointer or NULL. Init/task context, execution transaction.
+ */
+static void *driver_map_mmio(uint64_t phys,uint64_t bytes)
+{
+    return driver_map_mmio_owned((uint32_t)loading_slot,phys,bytes);
+}
+/** @brief Register an IRQ lease for the loading module.
+ * @param dev Borrowed function identity.
+ * @param handler IRQ-safe W1C callback, never sleeping.
+ * @param opaque Module-owned context retained through synchronization.
+ * @param out_handle Receives generation token.
+ * @return 0 or negative errno. Init/task context; no callback under ledger lock.
+ */
+static int driver_request_pci_irq(const struct reliefos_driver_pci_device *dev,
+    void (*handler)(void *),void *opaque,uint32_t *out_handle)
+{
+    return driver_request_pci_irq_owned((uint32_t)loading_slot,dev,handler,opaque,out_handle);
+}
+/** @brief Copy a v2 card contract and bind the currently loading module owner.
+ * @param identity Borrowed identity, copied by core.
+ * @param ops Borrowed operations, copied by core.
+ * @param opaque Context remains module owned until unload synchronization.
+ * @param out_id Receives generation card token.
+ * @return 0 or negative errno. Task context during init; no registry lock held.
+ */
+static int driver_audio_register_card(const struct audio_card_identity *identity,
+    const struct audio_card_ops *ops,void *opaque,uint32_t *out_id)
+{
+    if(loading_slot<0)return -22;
+    return audio_register_card_owned(identity,ops,opaque,(uint32_t)loading_slot,out_id);
+}
+
+/** @brief Record the first unsafe teardown result in the serialized fini phase.
+ * @param error Negative errno; nonnegative or out-of-phase reports are ignored.
+ * @return None. No resource is released and no lock or wait is performed.
+ */
+static void driver_report_teardown_failure(int error)
+{
+    if (error < 0 && cleanup_slot >= 0 &&
+        cleanup_slot < (int32_t)RELIEFOS_DRIVER_MAX &&
+        !driver_slots[cleanup_slot].cleanup_error)
+        driver_slots[cleanup_slot].cleanup_error = error;
+}
+
+/** @brief Invoke one module fini and collect its append-only failure report.
+ * @param slot Owner slot under the manager admission gate, execution suspended.
+ * @param module Live descriptor retained throughout this synchronous callback.
+ * @return 0 for safe automatic cleanup or the first reported negative errno.
+ */
+static int driver_run_fini(struct driver_slot *slot,
+                            const struct reliefos_driver_module *module)
+{
+    slot->cleanup_error = 0;
+    cleanup_slot = (int32_t)slot->info.id;
+    if (module->fini) module->fini();
+    cleanup_slot = -1;
+    return slot->cleanup_error;
+}
+
 static const struct reliefos_driver_kernel_api driver_kernel_api = {
     .abi_version = RELIEFOS_DRIVER_ABI_VERSION,
     .struct_size = sizeof(struct reliefos_driver_kernel_api),
@@ -804,6 +1002,21 @@ static const struct reliefos_driver_kernel_api driver_kernel_api = {
     .register_serial = driver_register_serial,
     .register_e1000 = driver_register_e1000,
     .register_audio = driver_register_audio,
+    .pci_enumerate = pci_enumerate,
+    .map_mmio = driver_map_mmio,
+    .unmap_mmio = driver_unmap_mmio,
+    .alloc_dma = driver_alloc_dma,
+    .free_dma = driver_free_dma,
+    .request_pci_irq = driver_request_pci_irq,
+    .free_pci_irq = driver_free_pci_irq,
+    .audio_register_card = driver_audio_register_card,
+    .audio_unregister_card = audio_unregister_card,
+    .audio_period_elapsed = audio_period_elapsed,
+    .audio_control_changed = audio_control_changed,
+    .pci_write32 = pci_config_write32,
+    .audio_set_service = audio_card_set_service,
+    .report_teardown_failure = driver_report_teardown_failure,
+    .audio_request_disconnect = audio_request_controller_disconnect,
 };
 
 /**
@@ -811,6 +1024,10 @@ static const struct reliefos_driver_kernel_api driver_kernel_api = {
  */
 static void driver_clear_services(uint32_t slot_id)
 {
+    bool detach_network = false;
+    driver_manager_service_disable(slot_id);
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&manager_service_lock, &flags);
     if (mouse_ops && mouse_owner == slot_id) {
         mouse_ops = 0;
         mouse_owner = 0;
@@ -821,7 +1038,7 @@ static void driver_clear_services(uint32_t slot_id)
         serial_owner = 0;
     }
     if (e1000_ops && e1000_owner == slot_id) {
-        net_driver_detached();
+        detach_network = true;
         e1000_ops = 0;
         e1000_owner = 0;
     }
@@ -829,10 +1046,36 @@ static void driver_clear_services(uint32_t slot_id)
         audio_ops = 0;
         audio_owner = 0;
     }
+    kernel_spin_unlock_irqrestore(&manager_service_lock, flags);
+    if (detach_network) net_driver_detached();
+}
+
+/** @brief Reject a copied module before it can disturb an owned PCI function.
+ * @param candidate Validated, borrowed descriptor in the new module image.
+ * @return True when a loaded or retained module has the same bounded name.
+ * Task context under manager admission; no callback, allocation or PCI access.
+ */
+static bool driver_module_name_loaded(const struct reliefos_driver_module *candidate)
+{
+    for (uint32_t slot = 0; slot < RELIEFOS_DRIVER_MAX; ++slot) {
+        const struct driver_slot *existing = &driver_slots[slot];
+        if (existing->info.state != RELIEFOS_DRIVER_STATE_LOADED || !existing->module)
+            continue;
+        uint32_t n;
+        for (n = 0; n < RELIEFOS_DRIVER_NAME_LEN; ++n) {
+            if (existing->module->name[n] != candidate->name[n]) break;
+            if (!candidate->name[n]) return true;
+        }
+        if (n == RELIEFOS_DRIVER_NAME_LEN) return true;
+    }
+    return false;
 }
 
 /**
- * @brief Load and start a driver: read the ELF, lay out its image, apply relocations, then call init().
+ * @brief Load ELF, initialize module, and roll back owner resources on failure.
+ * @param slot Manager-owned slot under serialized task transaction.
+ * @return 0 or negative errno. Task context, no registry lock during callbacks;
+ * retains image if DMA STOP or fini fails; cancels service/IRQ before fini.
  */
 static int driver_load_slot(struct driver_slot *slot)
 {
@@ -939,14 +1182,58 @@ static int driver_load_slot(struct driver_slot *slot)
         driver_set_error(slot, ret, "Driver descriptor ABI is invalid");
         goto out;
     }
+    if (driver_module_name_loaded(module)) {
+        ret = -16;
+        driver_set_error(slot, ret, "Module name already loaded");
+        goto out;
+    }
     loading_slot = (int32_t)slot->info.id;
+    struct driver_manager_wait_scope init_scope = {0};
+    if ((ret = driver_manager_wait_begin(&init_scope)) < 0) {
+        loading_slot = -1;
+        driver_set_error(slot, ret, "Cannot release execution transaction for init");
+        goto out;
+    }
     ret = module->init(&driver_kernel_api);
+    driver_manager_wait_end_or_panic(&init_scope);
     loading_slot = -1;
     if (ret < 0) {
-        if (module->fini) {
-            module->fini();
+        struct driver_manager_wait_scope rollback_scope = {0};
+        driver_manager_service_close(slot->info.id);
+        if (driver_manager_wait_begin(&rollback_scope) < 0)
+            panic("driver manager cannot suspend execution for init rollback");
+        int disconnect=audio_unregister_owner(slot->info.id,1);
+        if (disconnect) {
+            /* A failed STOP forbids reclaiming code or DMA still owned by the
+             * device. Preserve a retryable slot instead of freeing its image. */
+            slot->module=module;slot->image_phys=image_phys;slot->image_pages=image_pages;
+            slot->info.kind=module->kind;
+            slot->info.load_address=image_phys;slot->info.image_size=image_size;
+            slot->info.abi_version=module->abi_version;slot->info.version=module->version;
+            driver_copy_text(slot->info.name,sizeof(slot->info.name),module->name);
+            driver_set_error(slot,disconnect,"Audio STOP failed; module retained");
+            slot->info.state=RELIEFOS_DRIVER_STATE_LOADED;
+            image_phys=0;
+            driver_manager_wait_end_or_panic(&rollback_scope);
+            driver_manager_service_enable(slot->info.id);
+            ret=disconnect;goto out;
+        }
+        driver_manager_service_drain(slot->info.id);
+        driver_resources_release(slot->info.id,true);
+        int cleanup = driver_run_fini(slot, module);
+        driver_manager_wait_end_or_panic(&rollback_scope);
+        if (cleanup < 0) {
+            slot->module=module;slot->image_phys=image_phys;slot->image_pages=image_pages;
+            slot->info.kind=module->kind;
+            slot->info.load_address=image_phys;slot->info.image_size=image_size;
+            slot->info.abi_version=module->abi_version;slot->info.version=module->version;
+            driver_copy_text(slot->info.name,sizeof(slot->info.name),module->name);
+            driver_set_error(slot,cleanup,"Unsafe teardown; module retained for retry");
+            slot->info.state=RELIEFOS_DRIVER_STATE_LOADED;
+            image_phys=0;ret=cleanup;goto out;
         }
         driver_clear_services(slot->info.id);
+        driver_resources_release(slot->info.id,false);
         driver_set_error(slot, ret, "Driver initialization failed");
         goto out;
     }
@@ -961,6 +1248,7 @@ static int driver_load_slot(struct driver_slot *slot)
     slot->info.image_size = image_size;
     driver_copy_text(slot->info.name, sizeof(slot->info.name), module->name);
     slot->info.error[0] = 0;
+    driver_manager_service_enable(slot->info.id);
     console_printf("[driver] loaded %s as %s abi=%u\n", slot->info.file,
                    slot->info.name, slot->info.abi_version);
     ret = 0;
@@ -974,7 +1262,14 @@ out:
 }
 
 /**
- * @brief Stop a driver: run fini(), drop its services and image, and mark it unloaded (force skips the network guard).
+ * @brief Disconnect owned audio before fini, synchronize MSI, then release image.
+ * @param slot Owned loaded module slot, serialized by manager transaction.
+ * @param force Nonzero disconnects active leases; normal active audio is EBUSY.
+ * @return 0 or negative errno. Task context. Module init/fini and task-context
+ * callbacks may wait only in the released manager wait phase; ISR/service callbacks
+ * must remain bounded and nonblocking and may not acquire the execution transaction.
+ * Detached stream/DMA owners survive in PCM until release. A failed fini
+ * retains DMA/MMIO/image with service admission closed; later unload retries.
  */
 static int driver_unload_slot(struct driver_slot *slot, uint32_t force)
 {
@@ -984,10 +1279,31 @@ static int driver_unload_slot(struct driver_slot *slot, uint32_t force)
     if (!force && slot->info.kind == RELIEFOS_DRIVER_KIND_NETWORK) {
         return -16;
     }
-    if (slot->module->fini) {
-        slot->module->fini();
+    uint32_t owner = slot->info.id;
+    driver_manager_service_close(owner);
+    struct driver_manager_wait_scope unload_scope = {0};
+    int ret = driver_manager_wait_begin(&unload_scope);
+    if (ret < 0) {
+        driver_manager_service_reopen(owner);
+        return ret;
     }
-    driver_clear_services(slot->info.id);
+    ret = audio_unregister_owner(owner,force);
+    if (ret) {
+        driver_manager_wait_end_or_panic(&unload_scope);
+        driver_manager_service_reopen(owner);
+        return ret;
+    }
+    driver_manager_service_drain(owner);
+    driver_resources_release(owner,true);
+    ret = driver_run_fini(slot, slot->module);
+    driver_manager_wait_end_or_panic(&unload_scope);
+    if (ret < 0) {
+        driver_set_error(slot,ret,"Unsafe teardown; module retained for retry");
+        slot->info.state=RELIEFOS_DRIVER_STATE_LOADED;
+        return ret;
+    }
+    driver_clear_services(owner);
+    driver_resources_release(owner,false);
     if (slot->image_phys && slot->image_pages) {
         mm_free_pages(slot->image_phys, slot->image_pages);
     }
@@ -1044,10 +1360,10 @@ void driver_manager_init(void)
     console_printf("[driver] manager ready abi=%u\n", RELIEFOS_DRIVER_ABI_VERSION);
 }
 
-/**
- * @brief Scan for drivers and load every autostart slot that is not disabled or already loaded.
+/** @brief Scan and load startup drivers with manager admission and execution ownership held.
+ * @return None. Called only by the public boot hook or an already-admitted RESCAN action.
  */
-void driver_manager_autoload(void)
+static void driver_manager_autoload_admitted(void)
 {
     driver_scan();
     for (uint32_t index = 0; index < RELIEFOS_DRIVER_MAX; ++index) {
@@ -1057,11 +1373,30 @@ void driver_manager_autoload(void)
             continue;
         }
         if (driver_load_slot(slot) < 0) {
+            if (slot->info.state == RELIEFOS_DRIVER_STATE_LOADED) continue;
             console_printf("[driver] retrying %s\n", slot->info.file);
             /* Second load attempt after the first failed. */
             (void)driver_load_slot(slot);
         }
     }
+}
+
+/**
+ * @brief Scan for drivers and load every autostart slot that is not disabled or already loaded.
+ * @return None. Boot has no outer execution transaction, so this hook owns a
+ * short manager transaction and suspends it only around waitable module phases.
+ */
+void driver_manager_autoload(void)
+{
+    if (driver_manager_phase_try_enter() < 0) {
+        console_printf("[driver] autoload skipped: manager busy\n");
+        return;
+    }
+    uint64_t execution_flags;
+    kernel_execution_lock_irqsave(&execution_flags);
+    driver_manager_autoload_admitted();
+    kernel_execution_unlock_irqrestore(execution_flags);
+    driver_manager_phase_leave();
 }
 
 /**
@@ -1073,6 +1408,7 @@ int driver_manager_list(struct reliefos_driver_list *query)
     if (!query) {
         return -22;
     }
+    if (driver_manager_phase_try_enter() < 0) return -16;
     if (query->capacity > RELIEFOS_DRIVER_MAX) {
         query->capacity = RELIEFOS_DRIVER_MAX;
     }
@@ -1086,6 +1422,7 @@ int driver_manager_list(struct reliefos_driver_list *query)
         ++count;
     }
     query->count = count;
+    driver_manager_phase_leave();
     return 0;
 }
 
@@ -1099,19 +1436,24 @@ int driver_manager_control(struct reliefos_driver_control *request)
     if (!request) {
         return -22;
     }
+    ret = driver_manager_phase_try_enter();
+    if (ret < 0) {
+        request->status = ret;
+        return ret;
+    }
     if (request->action == RELIEFOS_DRIVER_CONTROL_RESCAN) {
-        driver_manager_autoload();
-        request->status = 0;
-        return 0;
+        driver_manager_autoload_admitted();
+        ret = 0;
+        goto out;
     }
     if (!driver_file_name_valid(request->file)) {
-        request->status = -22;
-        return -22;
+        ret = -22;
+        goto out;
     }
     slot = driver_get_slot(request->file);
     if (!slot) {
-        request->status = -28;
-        return -28;
+        ret = -28;
+        goto out;
     }
     if (request->action == RELIEFOS_DRIVER_CONTROL_LOAD) {
         ret = driver_load_slot(slot);
@@ -1125,8 +1467,7 @@ int driver_manager_control(struct reliefos_driver_control *request)
         if (disable && slot->info.state == RELIEFOS_DRIVER_STATE_LOADED) {
             ret = driver_unload_slot(slot, 1);
             if (ret < 0) {
-                request->status = ret;
-                return ret;
+                goto out;
             }
         }
         if (disable) {
@@ -1142,7 +1483,9 @@ int driver_manager_control(struct reliefos_driver_control *request)
     } else {
         ret = -22;
     }
+out:
     request->status = ret;
+    driver_manager_phase_leave();
     return ret;
 }
 
@@ -1155,23 +1498,36 @@ void mouse_init(void)
 
 /**
  * @brief Poll the active mouse driver for new events, if one is registered.
+ * @return None. IRQ dispatch may call this wrapper; it pins a consistent local
+ * ops/owner snapshot across the callback without holding service locks. The
+ * legacy poll callback must remain bounded and IRQ-safe.
  */
 void mouse_poll(void)
 {
-    if (mouse_ops && mouse_ops->poll) {
-        mouse_ops->poll();
+    uint32_t owner;
+    const struct reliefos_driver_mouse_ops *ops = driver_mouse_service_pin(&owner);
+    if (ops && ops->poll) {
+        ops->poll();
+        driver_manager_service_unpin(owner);
+    } else if (ops) {
+        driver_manager_service_unpin(owner);
     }
 }
 
 /**
- * @brief Refresh the cached mouse state from the driver and return a pointer to it.
+ * @brief Refresh the manager-owned mouse cache from a pinned driver snapshot.
+ * @return Pointer to manager-owned cached state, never into the module image.
  */
 const struct mouse_state *mouse_get_state(void)
 {
     struct reliefos_driver_mouse_state state;
-    if (mouse_ops && mouse_ops->get_state) {
+    uint32_t owner;
+    const struct reliefos_driver_mouse_ops *ops = driver_mouse_service_pin(&owner);
+    if (ops && ops->get_state) {
         state = (struct reliefos_driver_mouse_state){0};
-        mouse_ops->get_state(&state);
+        ops->get_state(&state);
+        uint64_t flags;
+        kernel_spin_lock_irqsave(&manager_service_lock, &flags);
         mouse_cache = (struct mouse_state){
             .x = state.x,
             .y = state.y,
@@ -1179,7 +1535,9 @@ const struct mouse_state *mouse_get_state(void)
             .present = state.present != 0,
             .absolute = state.absolute != 0,
         };
+        kernel_spin_unlock_irqrestore(&manager_service_lock, flags);
     }
+    if (ops) driver_manager_service_unpin(owner);
     return &mouse_cache;
 }
 
@@ -1201,53 +1559,73 @@ bool mouse_is_visible(void)
 
 /**
  * @brief Report the driver's pending-event counter, or 0 when no driver is registered.
+ * @return Copied counter value; the matching ops/owner pin spans get_state.
  */
 uint32_t mouse_event_count(void)
 {
     struct reliefos_driver_mouse_state state;
-    if (!mouse_ops || !mouse_ops->get_state) {
+    uint32_t owner;
+    const struct reliefos_driver_mouse_ops *ops = driver_mouse_service_pin(&owner);
+    if (!ops || !ops->get_state) {
+        if (ops) driver_manager_service_unpin(owner);
         return 0;
     }
-    mouse_ops->get_state(&state);
+    ops->get_state(&state);
+    driver_manager_service_unpin(owner);
     return state.event_count;
 }
 
 /**
  * @brief Report the driver's last PS/2 status byte, or 0 when no driver is registered.
+ * @return Copied byte; the matching ops/owner pin spans get_state.
  */
 uint8_t mouse_last_status(void)
 {
     struct reliefos_driver_mouse_state state;
-    if (!mouse_ops || !mouse_ops->get_state) {
+    uint32_t owner;
+    const struct reliefos_driver_mouse_ops *ops = driver_mouse_service_pin(&owner);
+    if (!ops || !ops->get_state) {
+        if (ops) driver_manager_service_unpin(owner);
         return 0;
     }
-    mouse_ops->get_state(&state);
+    ops->get_state(&state);
+    driver_manager_service_unpin(owner);
     return state.last_status;
 }
 
 /**
  * @brief Report the driver's last PS/2 data byte, or 0 when no driver is registered.
+ * @return Copied byte; the matching ops/owner pin spans get_state.
  */
 uint8_t mouse_last_data(void)
 {
     struct reliefos_driver_mouse_state state;
-    if (!mouse_ops || !mouse_ops->get_state) {
+    uint32_t owner;
+    const struct reliefos_driver_mouse_ops *ops = driver_mouse_service_pin(&owner);
+    if (!ops || !ops->get_state) {
+        if (ops) driver_manager_service_unpin(owner);
         return 0;
     }
-    mouse_ops->get_state(&state);
+    ops->get_state(&state);
+    driver_manager_service_unpin(owner);
     return state.last_data;
 }
 
 /**
  * @brief Report the driver's last PS/2 ack byte, or 0 when no driver is registered.
+ * @return Copied byte; the matching ops/owner pin spans get_state.
  */
 uint8_t mouse_last_ack(void)
 {
     struct reliefos_driver_mouse_state state;
-    if (!mouse_ops || !mouse_ops->get_state) {
+    uint32_t owner;
+    const struct reliefos_driver_mouse_ops *ops = driver_mouse_service_pin(&owner);
+    if (!ops || !ops->get_state) {
+        if (ops) driver_manager_service_unpin(owner);
         return 0;
     }
-    mouse_ops->get_state(&state);
+    ops->get_state(&state);
+    driver_manager_service_unpin(owner);
     return state.last_ack;
 }
 
@@ -1318,21 +1696,34 @@ void serial_init(void)
 
 /**
  * @brief Return 1 when a serial driver is registered and reports ready.
+ * @return Driver result or 0 while absent/closing; one consistent ops/owner pin
+ * spans is_ready, with no manager lock held during the callback.
  */
 int serial_is_ready(void)
 {
-    return serial_ops && serial_ops->is_ready ? serial_ops->is_ready() : 0;
+    uint32_t owner;
+    const struct reliefos_driver_serial_ops *ops = driver_serial_service_pin(&owner);
+    if (!ops) return 0;
+    int ready = ops->is_ready ? ops->is_ready() : 0;
+    driver_manager_service_unpin(owner);
+    return ready;
 }
 
 /**
  * @brief Write text through the serial driver, or the built-in COM1 path before one loads.
+ * @param text Kernel-owned NUL-terminated text borrowed through callback return.
+ * @return None. The matching local ops/owner snapshot stays pinned across write.
  */
 void serial_write(const char *text)
 {
-    if (serial_ops && serial_ops->write) {
-        serial_ops->write(text);
+    uint32_t owner;
+    const struct reliefos_driver_serial_ops *ops = driver_serial_service_pin(&owner);
+    if (ops && ops->write) {
+        ops->write(text);
+        driver_manager_service_unpin(owner);
         return;
     }
+    if (ops) driver_manager_service_unpin(owner);
     early_serial_write(text);
 }
 
@@ -1345,38 +1736,81 @@ void e1000_init(void)
 
 /**
  * @brief Return 1 when an e1000 driver is registered and reports ready.
+ * @return Driver result or 0 while absent/closing; the matching ops/owner stays
+ * pinned until is_ready returns.
  */
 int e1000_is_ready(void)
 {
-    return e1000_ops && e1000_ops->is_ready ? e1000_ops->is_ready() : 0;
+    uint32_t owner;
+    const struct reliefos_driver_e1000_ops *ops = driver_e1000_service_pin(&owner);
+    if (!ops) return 0;
+    int ready = ops->is_ready ? ops->is_ready() : 0;
+    driver_manager_service_unpin(owner);
+    return ready;
 }
 
 /**
- * @brief Return the NIC's MAC address, or a zeroed placeholder when no driver is ready.
+ * @brief Return a kernel-owned copy of the NIC MAC, or a zeroed placeholder when absent.
+ * @return Manager cache pointer; the module's borrowed pointer is copied while its
+ * matching ops/owner snapshot remains pinned.
  */
 const uint8_t *e1000_mac(void)
 {
-    return e1000_ops && e1000_ops->mac ? e1000_ops->mac() : e1000_empty_mac;
+    uint32_t owner;
+    const struct reliefos_driver_e1000_ops *ops = driver_e1000_service_pin(&owner);
+    if (!ops || !ops->mac) {
+        if (ops) driver_manager_service_unpin(owner);
+        return e1000_empty_mac;
+    }
+    const uint8_t *borrowed = ops->mac();
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&e1000_mac_cache_lock, &flags);
+    if (borrowed) driver_memcpy(e1000_mac_cache, borrowed, sizeof(e1000_mac_cache));
+    else driver_memzero(e1000_mac_cache, sizeof(e1000_mac_cache));
+    kernel_spin_unlock_irqrestore(&e1000_mac_cache_lock, flags);
+    driver_manager_service_unpin(owner);
+    return e1000_mac_cache;
 }
 
 /**
  * @brief Send an Ethernet frame through the driver, or -19 when no driver is ready.
+ * @param frame Kernel-owned frame borrowed through send callback return.
+ * @param len Number of bytes available at frame.
+ * @return Driver result or -19 while absent/closing; one pin spans readiness and send.
  */
 int e1000_send(const void *frame, uint32_t len)
 {
-    return e1000_is_ready() ? e1000_ops->send(frame, len) : -19;
+    uint32_t owner;
+    const struct reliefos_driver_e1000_ops *ops = driver_e1000_service_pin(&owner);
+    if (!ops) return -19;
+    int ret = ops->is_ready && ops->send && ops->is_ready()
+                  ? ops->send(frame, len) : -19;
+    driver_manager_service_unpin(owner);
+    return ret;
 }
 
 /**
  * @brief Poll received frames from the driver, or -19 when no driver is ready.
+ * @param frame Kernel-owned receive buffer.
+ * @param capacity Bytes available at frame.
+ * @param out_len Receives the copied frame length when supplied by the driver.
+ * @return Driver result or -19 while absent/closing; one pin spans readiness and poll.
  */
 int e1000_poll(void *frame, uint32_t capacity, uint32_t *out_len)
 {
-    return e1000_is_ready() ? e1000_ops->poll(frame, capacity, out_len) : -19;
+    uint32_t owner;
+    const struct reliefos_driver_e1000_ops *ops = driver_e1000_service_pin(&owner);
+    if (!ops) return -19;
+    int ret = ops->is_ready && ops->poll && ops->is_ready()
+                  ? ops->poll(frame, capacity, out_len) : -19;
+    driver_manager_service_unpin(owner);
+    return ret;
 }
 
 /**
  * @brief Copy NIC identity independently of carrier state.
+ * @param info Receives kernel-owned identity fields and MAC bytes.
+ * @return None. Driver output is copied to a stack snapshot before unpin.
  */
 void e1000_get_info(struct e1000_info *info)
 {
@@ -1385,10 +1819,14 @@ void e1000_get_info(struct e1000_info *info)
         return;
     }
     *info = (struct e1000_info){0};
-    if (!e1000_ops || !e1000_ops->get_info) {
+    uint32_t owner;
+    const struct reliefos_driver_e1000_ops *ops = driver_e1000_service_pin(&owner);
+    if (!ops || !ops->get_info) {
+        if (ops) driver_manager_service_unpin(owner);
         return;
     }
-    e1000_ops->get_info(&source);
+    ops->get_info(&source);
+    driver_manager_service_unpin(owner);
     info->present = source.present;
     info->active = source.active;
     info->vendor_id = source.vendor_id;
@@ -1403,43 +1841,127 @@ void e1000_get_info(struct e1000_info *info)
 
 /**
  * @brief Configure the audio output format on the active driver, or -19 when absent.
+ * @param format Kernel-owned format borrowed through configure callback return.
+ * @return Driver result or -19 while absent/closing; one pin spans readiness and configure.
  */
 int driver_manager_audio_configure(const struct reliefos_audio_format *format)
+{ return driver_manager_audio_configure_bound(0, format); }
+
+/** @brief Configure one generation-pinned v1 audio callback table.
+ * @param generation OSS lease generation, or zero for native compatibility.
+ * @param format Borrowed sample format.
+ * @return Driver result or -ENODEV. Task context; no manager lock spans callback.
+ */
+int driver_manager_audio_configure_bound(uint32_t generation, const struct reliefos_audio_format *format)
 {
-    if (!format || !audio_ops || !audio_ops->is_ready || !audio_ops->configure ||
-        !audio_ops->is_ready()) {
+    if (!format) {
         return -19;
     }
-    return audio_ops->configure(format);
+    uint32_t owner;
+    const struct reliefos_driver_audio_ops *ops = driver_audio_service_pin_bound(generation, &owner);
+    if (!ops) return -19;
+    int ret = ops->is_ready && ops->configure && ops->is_ready()
+                  ? ops->configure(format) : -19;
+    driver_manager_service_unpin(owner);
+    return ret;
 }
 
 /**
  * @brief Write audio samples; returns -19 and a NO_DEVICE status when no driver is ready.
+ * @param data Kernel-owned sample bytes borrowed through write callback return.
+ * @param length Number of valid sample bytes.
+ * @param out_status Optional kernel-owned status destination.
+ * @return Driver result or -19 while absent/closing; one pin spans readiness and write.
  */
 long driver_manager_audio_write(const void *data, uint32_t length,
                                 uint32_t *out_status)
+{ return driver_manager_audio_write_bound(0, data, length, out_status); }
+
+/** @brief Write bytes through the exact acquired backend generation.
+ * @param generation OSS lease generation, or zero for native compatibility.
+ * @param data Borrowed samples. @param length Byte count.
+ * @param out_status Optional status output.
+ * @return Written bytes or errno. Task context; no manager lock spans callback.
+ */
+long driver_manager_audio_write_bound(uint32_t generation, const void *data, uint32_t length,
+                                      uint32_t *out_status)
 {
     if (out_status) {
         *out_status = RELIEFOS_AUDIO_STATUS_NO_DEVICE;
     }
-    if (!audio_ops || !audio_ops->is_ready || !audio_ops->write ||
-        !audio_ops->is_ready()) {
+    uint32_t owner;
+    const struct reliefos_driver_audio_ops *ops = driver_audio_service_pin_bound(generation, &owner);
+    if (!ops) {
         return -19;
     }
-    return audio_ops->write(data, length, out_status);
+    long ret = ops->is_ready && ops->write && ops->is_ready()
+                   ? ops->write(data, length, out_status) : -19;
+    driver_manager_service_unpin(owner);
+    return ret;
 }
 
 /**
  * @brief Copy the audio driver's state into out, zeroing it when no driver is ready.
+ * @param out Optional kernel-owned destination.
+ * @return None. A consistent local ops/owner pin stays live through get_state.
  */
 void driver_manager_audio_get_state(struct reliefos_audio_state *out)
+{ if (out) (void)driver_manager_audio_state_bound(0, out); }
+
+/** @brief Copy state while holding the exact backend's callback pin.
+ * @param generation OSS lease generation, or zero for native compatibility.
+ * @param out Borrowed output, cleared before attempting admission.
+ * @return Zero or -ENODEV/-EINVAL. Task context; callback has no manager lock.
+ */
+int driver_manager_audio_state_bound(uint32_t generation, struct reliefos_audio_state *out)
 {
-    if (!out) {
-        return;
-    }
+    if (!out) return -22;
     *out = (struct reliefos_audio_state){0};
-    if (audio_ops && audio_ops->is_ready && audio_ops->is_ready() &&
-        audio_ops->get_state) {
-        audio_ops->get_state(out);
+    uint32_t owner;
+    const struct reliefos_driver_audio_ops *ops = driver_audio_service_pin_bound(generation, &owner);
+    if (!ops) return -19;
+    if (ops->is_ready && ops->is_ready() && ops->get_state) ops->get_state(out);
+    driver_manager_service_unpin(owner);
+    return out->present && out->active ? 0 : -19;
+}
+
+/** @brief Reserve one OSS description on the current published v1 backend.
+ * @param generation Receives a non-reused token on success.
+ * @param state Receives real hardware state under a callback pin.
+ * @return Zero, -EINVAL, -ENODEV or -EBUSY. Task context; no lock spans callback.
+ */
+int driver_manager_audio_acquire(uint32_t *generation, struct reliefos_audio_state *state)
+{
+    if (!generation || !state) return -22;
+    *state = (struct reliefos_audio_state){0};
+    uint64_t flags;uint32_t owner, token;
+    kernel_spin_lock_irqsave(&manager_service_lock, &flags);
+    const struct reliefos_driver_audio_ops *ops = audio_ops;
+    owner = audio_owner;token = audio_generation;
+    if (!ops || !driver_manager_service_try_pin(owner)) {
+        kernel_spin_unlock_irqrestore(&manager_service_lock, flags);return -19;
     }
+    if (audio_lease_generation == token) {
+        kernel_spin_unlock_irqrestore(&manager_service_lock, flags);
+        driver_manager_service_unpin(owner);return -16;
+    }
+    audio_lease_generation = token;
+    kernel_spin_unlock_irqrestore(&manager_service_lock, flags);
+    if (ops->is_ready() && ops->get_state) ops->get_state(state);
+    driver_manager_service_unpin(owner);
+    if (!state->present || !state->active) {
+        driver_manager_audio_release(token);return -19;
+    }
+    *generation = token;return 0;
+}
+
+/** @brief Release only the lease generation held by the closing OSS description.
+ * @param generation Nonzero acquired token, possibly stale after unload.
+ * @return None. Task context; no callback or hardware access.
+ */
+void driver_manager_audio_release(uint32_t generation)
+{
+    uint64_t flags;kernel_spin_lock_irqsave(&manager_service_lock, &flags);
+    if (generation && generation == audio_lease_generation) audio_lease_generation = 0;
+    kernel_spin_unlock_irqrestore(&manager_service_lock, flags);
 }

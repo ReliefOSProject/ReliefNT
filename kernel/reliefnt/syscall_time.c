@@ -54,6 +54,12 @@ static uint64_t timespec_ticks(struct linux_timespec value)
     return ns / tick_ns + (ns % tick_ns != 0);
 }
 
+/** @brief Sleep against one retained clock domain, parking on raw scheduler ticks.
+ * @param clock Linux clock ID. @param flags Zero or TIMER_ABSTIME.
+ * @param request Borrowed user timespec. @param remaining Optional user remainder.
+ * @return Zero, errno, or the blocked-syscall marker. Task context; no locks held.
+ * Retains a validated deadline across syscall restarts and NTP clock discipline.
+ */
 int64_t syscall_nanosleep(int32_t clock, uint32_t flags, uint64_t request, uint64_t remaining)
 {
     struct task *task = sched_current_task();
@@ -63,20 +69,22 @@ int64_t syscall_nanosleep(int32_t clock, uint32_t flags, uint64_t request, uint6
     if (clock != LINUX_CLOCK_REALTIME && clock != LINUX_CLOCK_MONOTONIC &&
         clock != LINUX_CLOCK_BOOTTIME) return -LINUX_EINVAL;
     if (flags & ~LINUX_TIMER_ABSTIME) return -LINUX_EINVAL;
+    int32_t selected_clock = task->nanosleep_deadline ? task->nanosleep_clock :
+        flags & LINUX_TIMER_ABSTIME ? clock : LINUX_CLOCK_MONOTONIC;
+    struct linux_timespec clock_value;
+    int ret = time_clock_get(selected_clock, &clock_value);
+    if (ret < 0) { task->nanosleep_deadline = task->nanosleep_remaining = 0; return ret; }
+    uint64_t now = timespec_ticks(clock_value);
     if (!task->nanosleep_deadline) {
         if (!user_range_ok(request, sizeof(struct linux_timespec))) return -LINUX_EFAULT;
         struct linux_timespec value = *(const struct linux_timespec *)(uintptr_t)request;
         if (value.tv_sec < 0 || value.tv_nsec < 0 || value.tv_nsec >= 1000000000) return -LINUX_EINVAL;
         uint64_t duration = timespec_ticks(value);
         if (!duration) return 0;
-        task->nanosleep_clock = flags & LINUX_TIMER_ABSTIME ? clock : LINUX_CLOCK_MONOTONIC;
-        task->nanosleep_deadline = flags & LINUX_TIMER_ABSTIME ? duration : time_ticks() + duration;
+        task->nanosleep_clock = selected_clock;
+        task->nanosleep_deadline = flags & LINUX_TIMER_ABSTIME ? duration : now + duration;
         task->nanosleep_remaining = flags & LINUX_TIMER_ABSTIME ? 0 : remaining;
     }
-    struct linux_timespec value;
-    int ret = time_clock_get(task->nanosleep_clock, &value);
-    if (ret < 0) { task->nanosleep_deadline = task->nanosleep_remaining = 0; return ret; }
-    uint64_t now = timespec_ticks(value);
     if (now >= task->nanosleep_deadline) {
         task->nanosleep_deadline = task->nanosleep_remaining = 0;
         return 0;

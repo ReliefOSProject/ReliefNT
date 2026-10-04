@@ -20,6 +20,12 @@
 #include <linux/capability.h>
 #include <linux/sem.h>
 
+struct audio_file;
+struct audio_control_file;
+struct audio_oss_file;
+struct audio_mixer_file;
+struct audio_pcm;
+
 #define SCHED_TASK_NAME_LEN 32u
 /* Initial task-table capacity; the scheduler grows beyond this value. */
 #define SCHED_TASK_MAX 64u
@@ -45,6 +51,7 @@
 #define TASK_VMA_FLAG_SHARED  0x00000080u
 #define TASK_VMA_FLAG_LOCKED  0x00000100u
 #define TASK_VMA_FLAG_MMAP    0x00000200u
+#define TASK_VMA_FLAG_SYSV_SHM 0x00000400u
 
 #define TASK_VMA_PROT_READ  0x1u
 #define TASK_VMA_PROT_WRITE 0x2u
@@ -62,6 +69,14 @@ struct task_vma {
     uint64_t file_limit;
     struct storage_node file_node;
     struct storage_inode_ref *inode;
+    struct audio_pcm *audio_pcm;
+    struct sysv_shm_attachment *sysv_shm_attachment;
+    uint32_t audio_mmap_region;
+    uint32_t audio_mmap_generation;
+    uint32_t audio_mmap_prot;
+    uint32_t audio_mmap_reserved;
+    uint64_t audio_mmap_offset;
+    uint64_t audio_mmap_length;
 };
 
 struct task_file {
@@ -81,6 +96,16 @@ struct task_file {
     uint64_t aux;
     /* Per-descriptor device state; currently the evdev EVIOCGRAB token. */
     uint64_t aux2;
+    /* Standard PCM device state owned by the open file description. */
+    struct audio_file *audio_file;
+    /* ALSA control state owned by the open file description. */
+    struct audio_control_file *audio_control_file;
+    /* OSS /dev/dsp state owned by the open file description. */
+    struct audio_oss_file *audio_oss_file;
+    /* OSS /dev/mixer state owned by the open file description. */
+    struct audio_mixer_file *audio_mixer_file;
+    /* ALSA /dev/snd/timer state owned by the open file description. */
+    struct audio_timer_file *audio_timer_file;
     uint32_t input_vt; /* evdev graphical-VT filter, zero for the raw stream. */
     struct storage_read_cursor read_cursor;
     char path[RELIEFOS_FS_PATH_LEN];
@@ -343,6 +368,7 @@ struct task_rlimit_state {
     struct linux_rlimit64 stack;
     struct linux_rlimit64 nproc;
     struct linux_rlimit64 core;
+    struct linux_rlimit64 memlock;
 };
 
 struct sysv_sem_array;
@@ -795,6 +821,11 @@ void sched_task_vma_release(struct task *task);
 /* Called with the kernel execution lock held, before file pages are released. */
 void sched_truncate_file_mappings(const struct storage_node *node, uint64_t size);
 struct task_file *sched_task_file_at(struct task *task, uint32_t index);
+/** @brief Resolve a Linux fd, including stdio and descriptors beyond the inline table.
+ * @param task Owner under execution serialization. @param fd Nonnegative fd.
+ * @return Borrowed live descriptor slot, or NULL; does not promote or retain it.
+ */
+struct task_file *task_descriptor_for_fd(struct task *task, int fd);
 uint32_t sched_task_file_capacity(const struct task *task);
 void sched_task_file_release(struct task *task);
 /**

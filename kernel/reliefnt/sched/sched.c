@@ -3,6 +3,8 @@
  * Selects runnable tasks, handles waits/exits, and switches address spaces.
  */
 #include <reliefnt/console.h>
+#include <reliefnt/audio.h>
+#include <reliefnt/sysv_shm.h>
 #include <reliefnt/bugcheck.h>
 #include <reliefnt/arch.h>
 #include <reliefnt/paging.h>
@@ -190,8 +192,11 @@ void sched_task_vma_release(struct task *task)
     for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
         struct task_vma *vma = sched_task_vma_at(task, i);
         if (vma) {
+            sysv_shm_vma_release(task, vma);
+            if (vma->audio_pcm) audio_pcm_mmap_release(vma->audio_pcm, (enum audio_pcm_mmap_region)vma->audio_mmap_region);
             (void)storage_inode_put(vma->inode);
             vma->inode = NULL;
+            vma->audio_pcm = NULL;
         }
     }
     (void)storage_inode_put(sched_task_mm(task)->executable_inode);
@@ -201,6 +206,42 @@ void sched_task_vma_release(struct task *task)
     sched_task_mm(task)->vma_extra = NULL;
     sched_task_mm(task)->vma_extra_count = 0;
     sched_task_mm(task)->vma_extra_capacity = 0;
+}
+
+/**
+ * @brief Retain the PCM mapping reference represented by a copied VMA.
+ * @param dst Child VMA receiving the copied audio mapping metadata.
+ * @param src Parent VMA whose mapping reference is still live.
+ * @return Zero when no mapping exists or the reference was retained, else a negative errno.
+ */
+static int sched_task_vma_retain_audio(struct task_vma *dst,
+                                       const struct task_vma *src)
+{
+    if (!dst || !src || !src->audio_pcm) return 0;
+    int ret = audio_pcm_mmap_retain(src->audio_pcm,
+                          (enum audio_pcm_mmap_region)src->audio_mmap_region);
+    if (ret < 0) return ret;
+    dst->audio_pcm = src->audio_pcm;
+    dst->audio_mmap_region = src->audio_mmap_region;
+    dst->audio_mmap_generation = src->audio_mmap_generation;
+    dst->audio_mmap_prot = src->audio_mmap_prot;
+    dst->audio_mmap_offset = src->audio_mmap_offset;
+    dst->audio_mmap_length = src->audio_mmap_length;
+    return 0;
+}
+
+/** @brief Resolve a Linux descriptor number without acquiring a description.
+ * @param task Owner under the execution lock. @param fd Linux fd, not array index.
+ * @return Borrowed live slot or NULL. Includes stdio and the grown file table.
+ */
+struct task_file *task_descriptor_for_fd(struct task *task, int fd)
+{
+    if (!task || fd < 0) return NULL;
+    if (fd < 3) return sched_task_fds(task)->stdio_files[fd].used
+        ? &sched_task_fds(task)->stdio_files[fd] : NULL;
+    if (fd >= 3 + (int)sched_task_file_capacity(task)) return NULL;
+    struct task_file *file = sched_task_file_at(task, (uint32_t)(fd - 3));
+    return file && file->used ? file : NULL;
 }
 
 struct task_file *sched_task_file_at(struct task *task, uint32_t index)
@@ -488,6 +529,8 @@ static void task_init_limits(struct task *task)
         .nproc = {threads / 2, threads / 2},
         /* INIT_RLIMITS includes CORE even when CONFIG_COREDUMP is disabled. */
         .core = {0, LINUX_RLIM_INFINITY},
+        /* Linux v6.14 resource.h MLOCK_LIMIT / INIT_RLIMITS. */
+        .memlock = {8ULL * 1024ULL * 1024ULL, 8ULL * 1024ULL * 1024ULL},
         .as = {LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY},
         /* include/uapi/linux/resource.h:_STK_LIM and INIT_RLIMITS. */
         .stack = {8ULL * 1024ULL * 1024ULL, LINUX_RLIM_INFINITY}};
@@ -889,8 +932,11 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
     child->address_space.vma_extra_count = 0;
     child->address_space.vma_extra_capacity = 0;
     child->address_space.executable_inode = NULL;
-    for (uint32_t i = 0; i < SCHED_TASK_VMA_MAX; ++i)
+    for (uint32_t i = 0; i < SCHED_TASK_VMA_MAX; ++i) {
         child->address_space.vmas[i].inode = NULL;
+        child->address_space.vmas[i].audio_pcm = NULL;
+        child->address_space.vmas[i].sysv_shm_attachment = NULL;
+    }
     child->fd_table = *sched_task_fds(parent);
     child->fd_table.lock_owner = 0;
     child->fd_table.file_extra = NULL;
@@ -1017,14 +1063,27 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
         child->address_space.executable_inode = sched_task_mm(parent)->executable_inode;
         storage_inode_retain(child->address_space.executable_inode);
         for (uint32_t i = 0; i < SCHED_TASK_VMA_MAX; ++i) {
-            child->address_space.vmas[i].inode = sched_task_mm(parent)->vmas[i].inode;
-            storage_inode_retain(child->address_space.vmas[i].inode);
+            const struct task_vma *src = &sched_task_mm(parent)->vmas[i];
+            struct task_vma *dst = &child->address_space.vmas[i];
+            *dst = *src;
+            dst->inode = NULL;
+            dst->audio_pcm = NULL;
+            dst->sysv_shm_attachment = NULL;
+            if (src->inode) storage_inode_retain(dst->inode = src->inode);
+            if (sched_task_vma_retain_audio(dst, src) < 0) goto fail;
+            if (sysv_shm_vma_clone(child, dst, src) < 0) goto fail;
         }
         for (uint32_t i = 0; i < sched_task_mm(parent)->vma_extra_count; ++i) {
             struct task_vma *dst = sched_task_vma_at(child, SCHED_TASK_VMA_MAX + i);
             if (!dst) goto fail;
-            *dst = sched_task_mm(parent)->vma_extra[i];
-            storage_inode_retain(dst->inode);
+            const struct task_vma *src = &sched_task_mm(parent)->vma_extra[i];
+            *dst = *src;
+            dst->inode = NULL;
+            dst->audio_pcm = NULL;
+            dst->sysv_shm_attachment = NULL;
+            if (src->inode) storage_inode_retain(dst->inode = src->inode);
+            if (sched_task_vma_retain_audio(dst, src) < 0) goto fail;
+            if (sysv_shm_vma_clone(child, dst, src) < 0) goto fail;
         }
     }
     if (flags & CLONE_FILES) {
@@ -1094,6 +1153,7 @@ fail:
     }
     task_zero(child);
     child->state = TASK_EXITED;
+    child->running_cpu = SCHED_CPU_NONE;
     child->flags = TASK_FLAG_RESOURCES_RELEASED;
     kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
     return -12;

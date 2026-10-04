@@ -21,7 +21,9 @@ int time_clock_get(int32_t clock, struct linux_timespec *value);
  */
 void time_init(void);
 /**
- * @brief Advance the tick counter, poll USB input, and drive the scheduler.
+ * @brief Advance the clock and service devices after releasing the clock lock.
+ * @return None. IRQ context; audio service consumes at most 32 completions;
+ * no codec response wait or sleeping callback is permitted.
  */
 void time_on_tick(void);
 /**

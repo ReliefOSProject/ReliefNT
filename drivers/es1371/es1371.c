@@ -88,6 +88,7 @@ struct es1371_state {
     uint16_t channels;
     uint16_t bits_per_sample;
     uint32_t queued_bytes;
+    uint32_t leading_silence_bytes;
     uint32_t underruns;
     uint32_t overruns;
     uint32_t dma_write;
@@ -456,6 +457,9 @@ static int es1371_codec_initialize(void)
     return 0;
 }
 
+/** @brief Stop DAC DMA and discard transport and application occupancy.
+ * @return None. Caller serializes register access; no DMA allocation is freed.
+ */
 static void es1371_stop(void)
 {
     if (!es1371.io_port) {
@@ -466,6 +470,7 @@ static void es1371_stop(void)
     es1371.control &= ~ES_CONTROL_DAC1_ENABLE;
     es1371_write(ES_REG_CONTROL, es1371.control);
     es1371.queued_bytes = 0;
+    es1371.leading_silence_bytes = 0;
     es1371.dma_write = 0;
     es1371.dma_last_cursor = 0;
     es1371.dma_configured = 0;
@@ -537,6 +542,9 @@ static void es1371_ring_zero(uint32_t offset, uint32_t length)
     }
 }
 
+/** @brief Initialize a silent cyclic DMA ring while its engine is stopped.
+ * @return Zero, or -ENODEV for a missing DMA allocation. Caller holds I/O lock.
+ */
 static int es1371_start_dma(void)
 {
     uint32_t cursor;
@@ -573,6 +581,7 @@ static int es1371_start_dma(void)
     es1371.dma_last_cursor = cursor;
     es1371.dma_write = 0;
     es1371.queued_bytes = 0;
+    es1371.leading_silence_bytes = 0;
     es1371.producer_initialized = 0;
     es1371.cursor_reported = 0;
     es1371.nonzero_reported = 0;
@@ -628,6 +637,10 @@ static int es1371_cursor_reached(uint32_t previous, uint32_t current,
     return delta && distance && distance <= delta;
 }
 
+/** @brief Seed a safe silent lead after all submitted PCM has retired.
+ * @param cursor Current aligned DMA byte offset, caller holds the I/O lock.
+ * @return None. Keeps transport occupancy separate from application backlog.
+ */
 static void es1371_recover_empty(uint32_t cursor)
 {
     /* The whole ring was cleared before its first start.  While DMA is live,
@@ -637,11 +650,16 @@ static void es1371_recover_empty(uint32_t cursor)
     __sync_synchronize();
     es1371.dma_write = (cursor + ES1371_DMA_LEAD_BYTES) % ES1371_DMA_BYTES;
     es1371.queued_bytes = ES1371_DMA_LEAD_BYTES;
+    es1371.leading_silence_bytes = ES1371_DMA_LEAD_BYTES;
     es1371.producer_initialized = 1;
     es1371.empty_reported = 0;
     es1371.nonzero_range_pending = 0;
 }
 
+/** @brief Retire consumed ring bytes without replaying old PCM on later wraps.
+ * @param cursor Current aligned hardware byte offset, caller holds the I/O lock.
+ * @return None. Clears retired bytes and updates silent lead and PCM occupancy.
+ */
 static void es1371_update_consumption(uint32_t cursor)
 {
     uint32_t previous;
@@ -657,6 +675,11 @@ static void es1371_update_consumption(uint32_t cursor)
     if (!delta) {
         return;
     }
+    /* Retire only bytes strictly behind the observed cursor.  The engine
+     * loops continuously, so freed PCM must become silence before a wrap
+     * can replay it after the final drain or close. */
+    es1371_ring_zero(previous, delta);
+    __sync_synchronize();
     if (delta >= es1371.queued_bytes) {
         ++es1371.underruns;
         if (!es1371.empty_reported) {
@@ -667,6 +690,10 @@ static void es1371_update_consumption(uint32_t cursor)
         return;
     }
     es1371.queued_bytes -= delta;
+    if (delta >= es1371.leading_silence_bytes)
+        es1371.leading_silence_bytes = 0;
+    else
+        es1371.leading_silence_bytes -= delta;
     if (es1371.cursor_probe_pending) {
         es1371.cursor_progress_samples += delta;
         if (es1371.cursor_progress_samples >= ES1371_DMA_BYTES &&
@@ -820,6 +847,10 @@ static long es1371_audio_write(const void *data, uint32_t length, uint32_t *out_
     return (long)written;
 }
 
+/** @brief Read hardware progress and publish only outstanding application PCM.
+ * @param out Writable state destination, or NULL for no operation.
+ * @return None. Acquires I/O lock; may retire DMA bytes and refill idle silence.
+ */
 static void es1371_get_state(struct reliefos_audio_state *out)
 {
     if (!out) {
@@ -836,7 +867,8 @@ static void es1371_get_state(struct reliefos_audio_state *out)
         .sample_rate = es1371.sample_rate,
         .channels = es1371.channels,
         .bits_per_sample = es1371.bits_per_sample,
-        .queued_bytes = es1371.queued_bytes,
+        /* Idle transport lead is not PCM submitted by the application. */
+        .queued_bytes = es1371.queued_bytes - es1371.leading_silence_bytes,
         .underruns = es1371.underruns,
         .vendor_id = es1371.pci.vendor_id,
         .device_id = es1371.pci.device_id,
