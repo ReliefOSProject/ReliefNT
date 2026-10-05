@@ -150,6 +150,14 @@ struct task_vma *sched_task_vma_at(struct task *task, uint32_t index)
     index -= SCHED_TASK_VMA_MAX;
     if (index >= sched_task_mm(task)->vma_extra_count) {
         uint32_t wanted = index + 1u;
+        /* Slots up to capacity are already zeroed. Appending within that
+         * allocation must not relocate existing VMA entries. Growth beyond
+         * capacity can still move the store, so callers must reacquire VMA
+         * pointers after requesting new slots. */
+        if (wanted <= sched_task_mm(task)->vma_extra_capacity) {
+            sched_task_mm(task)->vma_extra_count = wanted;
+            return &sched_task_mm(task)->vma_extra[index];
+        }
         uint32_t capacity = sched_task_mm(task)->vma_extra_capacity ? sched_task_mm(task)->vma_extra_capacity : 16u;
         struct task_vma *replacement;
         while (capacity < wanted) {

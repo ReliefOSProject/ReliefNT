@@ -1326,11 +1326,6 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
     struct task *task = sched_current_task();
     uint64_t mapped_len;
     uint64_t end;
-    struct task_vma *vma;
-    struct task_vma original;
-    struct task_vma *left = NULL;
-    struct task_vma *right = NULL;
-    uint64_t page_flags = 0;
     if (!task || task->kind != TASK_KIND_USER || (addr & (PAGE_SIZE - 1ULL))) {
         return -RELIEFOS_EINVAL;
     }
@@ -1343,83 +1338,91 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
         return -RELIEFOS_EINVAL;
     }
     end = addr + mapped_len;
-    vma = task_vma_containing(task, addr, end);
-    if (!vma) return -RELIEFOS_ENOMEM;
-    if (prot & ~vma->max_prot) {
-        return -RELIEFOS_EACCES;
+    /* Validate every page first. Linux permits mprotect to cover adjacent
+     * VMAs with different attributes, but rejects a range containing a hole. */
+    uint64_t cursor = addr;
+    uint32_t split_count = 0;
+    while (cursor < end) {
+        struct task_vma *vma = task_vma_containing(task, cursor, cursor + PAGE_SIZE);
+        if (!vma) return -RELIEFOS_ENOMEM;
+        if (prot & ~vma->max_prot) return -RELIEFOS_EACCES;
+        uint64_t piece_end = vma->end < end ? vma->end : end;
+        if (piece_end <= cursor) return -RELIEFOS_ENOMEM;
+        if (cursor > vma->start) ++split_count;
+        if (piece_end < vma->end) ++split_count;
+        cursor = piece_end;
     }
-    original = *vma;
-    if (addr > original.start) {
-        left = task_vma_free_slot(task);
-        if (!left) {
+
+    /* Secure every split slot before changing PTEs. Adding slots may grow and
+     * relocate the VMA store, so keep no table pointers across this phase.
+     * If allocation fails, no page permissions or VMA metadata have changed. */
+    uint32_t free_slots = 0;
+    for (uint32_t i = 0; split_count && i < sched_task_vma_capacity(task); ++i) {
+        struct task_vma *slot = sched_task_vma_at(task, i);
+        if (slot && !slot->used) ++free_slots;
+    }
+    while (free_slots < split_count) {
+        if (!sched_task_vma_at(task, sched_task_vma_capacity(task))) {
             return -RELIEFOS_ENOMEM;
         }
-        /* Reserve this slot while looking for the optional suffix. */
-        left->used = 0xffffffffu;
+        ++free_slots;
     }
-    if (end < original.end) {
-        right = task_vma_free_slot(task);
-        if (!right) {
-            if (left) {
-                task_vma_clear(left);
+
+    /* Apply the PTE change with each mapping's own device/cache attributes. */
+    cursor = addr;
+    while (cursor < end) {
+        struct task_vma *vma = task_vma_containing(task, cursor, cursor + PAGE_SIZE);
+        if (!vma) return -RELIEFOS_ENOMEM;
+        uint64_t piece_end = vma->end < end ? vma->end : end;
+        uint64_t page_flags = 0;
+        if (prot & LINUX_PROT_WRITE) page_flags |= RELIEFNT_PAGE_WRITABLE;
+        if (!(prot & LINUX_PROT_EXEC)) page_flags |= RELIEFNT_PAGE_NOEXEC;
+        if (prot == LINUX_PROT_NONE) page_flags |= RELIEFNT_PAGE_PROTNONE;
+        if (vma->flags & TASK_VMA_FLAG_DEVICE) page_flags |= RELIEFNT_PAGE_DEVICE;
+        for (uint64_t page = cursor; page < piece_end; page += PAGE_SIZE) {
+            if (address_space_user_page_phys(sched_task_as(task), page) &&
+                !address_space_protect_user_page(sched_task_as(task), page, page_flags)) {
+                return -RELIEFOS_EACCES;
             }
-            return -RELIEFOS_ENOMEM;
         }
-        right->used = 0xffffffffu;
+        cursor = piece_end;
     }
-    if (left) {
-        task_vma_clear(left);
-    }
-    if (right) {
-        task_vma_clear(right);
-    }
-    if (prot & LINUX_PROT_WRITE) {
-        page_flags |= RELIEFNT_PAGE_WRITABLE;
-    }
-    if (!(prot & LINUX_PROT_EXEC)) {
-        page_flags |= RELIEFNT_PAGE_NOEXEC;
-    }
-    if (prot == LINUX_PROT_NONE) page_flags |= RELIEFNT_PAGE_PROTNONE;
-    if (vma->flags & TASK_VMA_FLAG_DEVICE) {
-        page_flags |= RELIEFNT_PAGE_DEVICE;
-    }
-    for (uint64_t page = addr; page < end; page += PAGE_SIZE) {
-        if (address_space_user_page_phys(sched_task_as(task), page) &&
-            !address_space_protect_user_page(sched_task_as(task), page, page_flags)) {
-            return -RELIEFOS_EACCES;
-        }
-    }
+
     /**
  * @brief A partial protection change needs independent VMA metadata. In particular, PT_GNU_RELRO protects only the GOT page while BSS in the same original load segment must remain writable and lazily mappable.
  */
-    if (addr > original.start) {
-        left = task_vma_free_slot(task);
-        if (!left) {
-            return -RELIEFOS_ENOMEM;
+    cursor = addr;
+    while (cursor < end) {
+        struct task_vma *vma = task_vma_containing(task, cursor, cursor + PAGE_SIZE);
+        if (!vma) return -RELIEFOS_ENOMEM;
+        struct task_vma original = *vma;
+        uint64_t piece_end = original.end < end ? original.end : end;
+        if (cursor > original.start) {
+            struct task_vma *left = task_vma_free_slot(task);
+            if (!left) return -RELIEFOS_ENOMEM;
+            *left = original;
+            storage_inode_retain(left->inode);
+            left->end = cursor;
         }
-        *left = original;
-        storage_inode_retain(left->inode);
-        left->end = addr;
-    }
-    if (end < original.end) {
-        right = task_vma_free_slot(task);
-        if (!right) {
-            return -RELIEFOS_ENOMEM;
+        if (piece_end < original.end) {
+            struct task_vma *right = task_vma_free_slot(task);
+            if (!right) return -RELIEFOS_ENOMEM;
+            *right = original;
+            storage_inode_retain(right->inode);
+            right->start = piece_end;
+            if (right->flags & TASK_VMA_FLAG_FILE) {
+                right->file_offset += piece_end - original.start;
+            }
         }
-        *right = original;
-        storage_inode_retain(right->inode);
-        right->start = end;
-        if (right->flags & TASK_VMA_FLAG_FILE) {
-            right->file_offset += end - original.start;
+        *vma = original;
+        vma->start = cursor;
+        vma->end = piece_end;
+        if (vma->flags & TASK_VMA_FLAG_FILE) {
+            vma->file_offset += cursor - original.start;
         }
+        vma->prot = (uint32_t)prot;
+        cursor = piece_end;
     }
-    *vma = original;
-    vma->start = addr;
-    vma->end = end;
-    if (vma->flags & TASK_VMA_FLAG_FILE) {
-        vma->file_offset += addr - original.start;
-    }
-    vma->prot = (uint32_t)prot;
     return 0;
 }
 
