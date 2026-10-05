@@ -6,6 +6,7 @@
 #include <reliefnt/page_cache.h>
 #include <reliefnt/paging.h>
 #include <reliefnt/smp.h>
+#include <reliefnt/lock.h>
 
 #define PAGE_SIZE 4096ULL
 #define PAGE_SIZE_2M 0x200000ULL
@@ -24,6 +25,13 @@ static uint64_t kernel_pd[KERNEL_PD_COUNT][512] __attribute__((aligned(4096)));
 extern void x86_64_load_cr3(uint64_t cr3);
 extern void x86_64_invlpg(uint64_t addr);
 
+/* All first-GiB kernel leaves are split before any user CR3 copies its PDEs.
+ * Later BAR attribute changes remain visible through every copied low PDE. */
+static uint64_t kernel_low_pt[512][512] __attribute__((aligned(4096)));
+#define MMIO_PAGE_MAX 4096U
+struct mmio_page { uint64_t phys, original; uint32_t refs, permanent; };
+static struct mmio_page mmio_pages[MMIO_PAGE_MAX];
+static struct kernel_spinlock mmio_lock = KERNEL_SPINLOCK_INIT;
 static bool nx_enabled;
 
 /**
@@ -118,6 +126,12 @@ void paging_init_user_identity(void)
             uint64_t addr = (table << 30) + i * PAGE_SIZE_2M;
             uint64_t flags = kernel_page_flags_for(addr);
             kernel_pd[table][i] = flags ? addr | flags : 0;
+            if (!table) {
+                for (uint32_t page = 0; page < 512; ++page)
+                    kernel_low_pt[i][page] = (addr + page * PAGE_SIZE) | (flags & ~PAGE_SIZE_FLAG);
+                kernel_pd[table][i] = (uint64_t)(uintptr_t)kernel_low_pt[i] |
+                    RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE;
+            }
         }
     }
 
@@ -172,36 +186,116 @@ void *paging_kernel_direct_map(uint64_t phys)
     return (void *)(uintptr_t)(RELIEFNT_KERNEL_DIRECT_MAP_BASE + phys);
 }
 
+/** @brief Find attribute ownership for a physical device page under mmio_lock.
+ * @param phys Page-aligned device address.
+ * @return Borrowed record or NULL. Task context, no callback or sleep.
+ */
+static struct mmio_page *mmio_find_page(uint64_t phys)
+{
+    for (uint32_t i = 0; i < MMIO_PAGE_MAX; ++i)
+        if ((mmio_pages[i].refs || mmio_pages[i].permanent) && mmio_pages[i].phys == phys) return &mmio_pages[i];
+    return NULL;
+}
+/** @brief Obtain a shared 4 KiB kernel leaf, splitting only its original PDE.
+ * @param phys Physical address in the kernel map.
+ * @return Borrowed PTE pointer, or NULL on allocation failure. mmio_lock held.
+ * Newly split page tables belong to the kernel map until shutdown, not a BAR.
+ */
+static uint64_t *mmio_leaf(uint64_t phys)
+{
+    uint64_t *pde = &kernel_pd[phys >> 30][(phys >> 21) & 511];
+    if (*pde & PAGE_SIZE_FLAG) {
+        uint64_t page = mm_alloc_page();
+        if (!page) return NULL;
+        uint64_t *pt = (void *)(uintptr_t)page;
+        uint64_t base = *pde & RELIEFNT_PHYS_ADDR_MASK & ~(PAGE_SIZE_2M - 1);
+        uint64_t flags = *pde & ~RELIEFNT_PHYS_ADDR_MASK & ~PAGE_SIZE_FLAG;
+        /* Large-page PAT is bit 12; in a 4 KiB PTE it is bit 7. */
+        if (*pde & (1ULL << 12)) flags |= RELIEFNT_PAGE_PAT;
+        for (uint32_t i = 0; i < 512; ++i) pt[i] = (base + i * PAGE_SIZE) | flags;
+        __atomic_store_n(pde, page | RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE, __ATOMIC_RELEASE);
+    }
+    if (!(*pde & RELIEFNT_PAGE_PRESENT)) return NULL;
+    return &((uint64_t *)(uintptr_t)(*pde & RELIEFNT_PHYS_ADDR_MASK))[(phys >> 12) & 511];
+}
+/** @brief Set precise device-page UC/NX attributes and claim mapping references.
+ * @param phys Page-aligned physical base; BAR validation belongs to PCI service.
+ * @param len Page-aligned nonzero length, bounded to the shared direct map.
+ * @param permanent Nonzero for bootstrap compatibility mappings.
+ * @return True on success, false on malformed range/capacity/ENOMEM/NX absence.
+ * Task context, execution transaction or pre-SMP boot; never from IRQ. All
+ * copied kernel aliases share PTEs. Unrelated neighbor attributes are preserved.
+ */
+static bool mmio_acquire(uint64_t phys, uint64_t len, bool permanent)
+{
+    if (!nx_enabled || !len || (phys & 4095) || (len & 4095) ||
+        len / PAGE_SIZE > MMIO_PAGE_MAX || !paging_kernel_direct_map_range(phys, len)) return false;
+    kernel_spin_lock(&mmio_lock);
+    uint32_t needed = 0, available = 0;
+    for (uint32_t i = 0; i < MMIO_PAGE_MAX; ++i) if (!mmio_pages[i].refs && !mmio_pages[i].permanent) ++available;
+    for (uint64_t p = phys; p < phys + len; p += PAGE_SIZE) {
+        struct mmio_page *e = mmio_find_page(p);
+        if (!e) ++needed;
+        else if (!permanent && e->refs == UINT32_MAX) { kernel_spin_unlock(&mmio_lock); return false; }
+    }
+    if (needed > available) { kernel_spin_unlock(&mmio_lock); return false; }
+    /* Prepare every shared page table before modifying any leaf attributes. */
+    for (uint64_t p = phys; p < phys + len; p += PAGE_SIZE) if (!mmio_leaf(p)) {
+        smp_flush_user_tlb(); kernel_spin_unlock(&mmio_lock); return false;
+    }
+    for (uint64_t p = phys; p < phys + len; p += PAGE_SIZE) {
+        uint64_t *pte = mmio_leaf(p);
+        struct mmio_page *e = mmio_find_page(p);
+        if (!e) {
+            for (uint32_t i = 0; i < MMIO_PAGE_MAX; ++i) if (!mmio_pages[i].refs && !mmio_pages[i].permanent) {
+                e = &mmio_pages[i]; *e = (struct mmio_page){.phys = p, .original = *pte}; break;
+            }
+        }
+        if (permanent) e->permanent = 1; else ++e->refs;
+        *pte = (*pte & ~RELIEFNT_PAGE_PAT) | RELIEFNT_PAGE_PWT | RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_NOEXEC;
+    }
+    smp_flush_user_tlb();
+    kernel_spin_unlock(&mmio_lock); return true;
+}
+/** @brief Claim a precise shared UC/NX device mapping.
+ * @param phys Aligned physical device base, validated against PCI BAR by caller.
+ * @param len Aligned mapping length.
+ * @return True on success. Task context under execution transaction/pre-SMP;
+ * caller owns one reference per page and must release it after device quiescence.
+ */
+bool paging_acquire_mmio(uint64_t phys, uint64_t len)
+{
+    return mmio_acquire(phys, len, false);
+}
+/** @brief Drop owned mapping references and restore the last owner's attributes.
+ * @param phys Page-aligned base of a previously acquired mapping.
+ * @param len Page-aligned length, matched exactly by the resource owner.
+ * @return None. Task context under execution transaction/pre-SMP, no callback.
+ * Flushes all online CPU TLBs before return; shared split tables stay kernel-owned.
+ */
+void paging_release_mmio(uint64_t phys, uint64_t len)
+{
+    if (!len || (phys & 4095) || (len & 4095) || !paging_kernel_direct_map_range(phys,len)) return;
+    kernel_spin_lock(&mmio_lock);
+    for (uint64_t p = phys; p < phys + len; p += PAGE_SIZE) {
+        struct mmio_page *e = mmio_find_page(p);
+        if (!e || !e->refs) continue;
+        if (!--e->refs && !e->permanent) *mmio_leaf(p) = e->original;
+    }
+    smp_flush_user_tlb(); kernel_spin_unlock(&mmio_lock);
+}
+/** @brief Preserve bootstrap MMIO validation API with precise permanent UC/NX.
+ * @param phys Physical device start; covering pages are rounded outward.
+ * @param len Nonzero byte length; must not wrap or exceed direct map.
+ * @return True on success. Execution transaction/pre-SMP only; no ownership
+ * transfer. Repeated compatibility validation never adds owned references.
+ */
 bool paging_mmio_uncached(uint64_t phys, uint64_t len)
 {
-    const uint64_t large = PAGE_SIZE_2M;
-    uint64_t start;
-    uint64_t end;
-
-    if (!len || !paging_kernel_direct_map_range(phys, len) ||
-        phys > UINT64_MAX - len) {
-        return false;
-    }
-    /* The bootstrap map uses 2 MiB leaves. Mark the complete leaves covering
-     * a BAR as UC (PWT|PCD); both low identity and high direct-map aliases
-     * share these page-directory entries. */
-    start = align_down(phys, large);
-    end = (phys + len + large - 1ULL) & ~(large - 1ULL);
-    if (end < phys + len || end > RELIEFNT_KERNEL_DIRECT_MAP_SIZE) {
-        return false;
-    }
-    for (uint64_t addr = start; addr < end; addr += large) {
-        uint32_t table = (uint32_t)(addr / (1ULL << 30));
-        uint32_t slot = (uint32_t)((addr % (1ULL << 30)) / large);
-        if (table >= KERNEL_PD_COUNT) {
-            return false;
-        }
-        kernel_pd[table][slot] |= RELIEFNT_PAGE_PWT | RELIEFNT_PAGE_PCD;
-        x86_64_invlpg(addr);
-        x86_64_invlpg(RELIEFNT_KERNEL_DIRECT_MAP_BASE + addr);
-    }
-    __asm__ volatile("mfence" ::: "memory");
-    return true;
+    if (!len || !paging_kernel_direct_map_range(phys,len)) return false;
+    uint64_t start = phys & ~4095ULL;
+    uint64_t end = (phys + len + 4095) & ~4095ULL;
+    return end > start && mmio_acquire(start, end - start, true);
 }
 
 /**
@@ -377,11 +471,12 @@ void address_space_destroy(struct address_space *as)
 }
 
 /**
- * Address space prepare user range.
- * @param as Value supplied by the caller.
- * @param start Value supplied by the caller.
- * @param end Value supplied by the caller.
- * @return The value or status produced by the operation.
+ * @brief Prepare missing user page tables without partial allocation on failure.
+ * @param as Address space pinned by the execution transaction.
+ * @param start First user byte in the range.
+ * @param end Exclusive range end.
+ * @return True after publishing all missing tables; false leaves existing
+ * tables unchanged and returns every page allocated by this operation.
  */
 bool address_space_prepare_user_range(struct address_space *as, uint64_t start,
                                       uint64_t end)
@@ -390,6 +485,9 @@ bool address_space_prepare_user_range(struct address_space *as, uint64_t start,
     uint64_t last_page;
     uint64_t first_table;
     uint64_t last_table;
+    /* The user window fits one directory, bounding this transaction to less
+     * than 4 KiB on the 128 KiB syscall stack. Existing tables are borrowed. */
+    uint64_t prepared[RELIEFNT_USER_PD_COUNT] = {0};
 
     if (!as || start < RELIEFNT_USER_BASE || start >= end || end > RELIEFNT_USER_TOP ||
         (start < RELIEFNT_KERNEL_HOLE_END && end > RELIEFNT_KERNEL_HOLE_START)) {
@@ -406,11 +504,18 @@ bool address_space_prepare_user_range(struct address_space *as, uint64_t start,
         if (!as->user_pt[table]) {
             uint64_t pt_phys = alloc_table();
             if (!pt_phys) {
+                for (uint64_t prior = first_table; prior < table; ++prior)
+                    if (prepared[prior]) mm_free_page(prepared[prior]);
                 return false;
             }
-            as->user_pt[table] = (uint64_t *)(uintptr_t)pt_phys;
+            prepared[table] = pt_phys;
+        }
+    }
+    for (uint64_t table = first_table; table <= last_table; ++table) {
+        if (prepared[table]) {
+            as->user_pt[table] = (uint64_t *)(uintptr_t)prepared[table];
             as->pd[LOW_PD_INDEX][RELIEFNT_USER_PD_START + table] =
-                pt_phys | RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE | RELIEFNT_PAGE_USER;
+                prepared[table] | RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE | RELIEFNT_PAGE_USER;
             x86_64_invlpg(RELIEFNT_USER_BASE + table * RELIEFNT_USER_PD_BYTES);
         }
     }

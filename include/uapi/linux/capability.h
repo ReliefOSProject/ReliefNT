@@ -36,6 +36,7 @@ typedef struct __user_cap_data_struct *cap_user_data_t;
 #define CAP_NET_BIND_SERVICE 10
 #define CAP_NET_ADMIN 12
 #define CAP_NET_RAW 13
+#define CAP_IPC_LOCK 14
 #define CAP_IPC_OWNER 15
 #define CAP_SYS_MODULE 16
 #define CAP_SYS_CHROOT 18

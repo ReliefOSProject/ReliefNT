@@ -16,14 +16,21 @@
 void driver_manager_init(void);
 /**
  * @brief Discover and load the drivers marked for boot-time activation.
+ * @return None. Boot has no outer execution transaction; the manager acquires
+ * its own transaction and releases it only around waitable module phases.
  */
 void driver_manager_autoload(void);
 /**
- * @brief Fill query with the registered drivers and set query->count; returns 0 or a negative errno.
+ * @brief Fill query with the registered drivers and set query->count.
+ * @param query Kernel-owned output and capacity descriptor.
+ * @return 0 on success, -EINVAL for null input, or -EBUSY during a lifecycle operation.
  */
 int driver_manager_list(struct reliefos_driver_list *query);
 /**
  * @brief Load, unload, or rescan the driver named in request, storing the outcome in request->status.
+ * @param request Kernel-owned, validated control request. The syscall caller holds
+ * the outer execution transaction and driverctl uses nonblocking manager admission.
+ * @return 0 or a negative errno, including -EBUSY if another lifecycle operation is active.
  */
 int driver_manager_control(struct reliefos_driver_control *request);
 
@@ -64,5 +71,37 @@ long driver_manager_audio_write(const void *data, uint32_t length,
  * @brief Copy the current audio device state into out.
  */
 void driver_manager_audio_get_state(struct reliefos_audio_state *out);
+
+/** @brief Acquire the sole OSS playback lease on the current v1 backend.
+ * @param generation Receives a non-reused backend generation on success.
+ * @param state Receives the pinned hardware's current format and queue state.
+ * @return Zero, -ENODEV or -EBUSY. Task context; no capture lease is implied.
+ */
+int driver_manager_audio_acquire(uint32_t *generation, struct reliefos_audio_state *state);
+/** @brief Release an OSS lease without affecting a newer backend generation.
+ * @param generation Generation acquired by this open-file description.
+ * @return None. Task context; a stale release is harmless.
+ */
+void driver_manager_audio_release(uint32_t generation);
+/** @brief Configure the exact leased v1 backend, rejecting stale descriptions.
+ * @param generation Acquired generation; zero preserves the native v1 API.
+ * @param format Borrowed hardware format.
+ * @return Driver result or -ENODEV. Task callback pinned through return.
+ */
+int driver_manager_audio_configure_bound(uint32_t generation, const struct reliefos_audio_format *format);
+/** @brief Write to the exact leased v1 backend, rejecting stale descriptions.
+ * @param generation Acquired generation; zero preserves the native v1 API.
+ * @param data Borrowed sample bytes. @param length Byte count.
+ * @param status Optional status output initialized to NO_DEVICE.
+ * @return Transferred bytes or errno. Task callback pinned through return.
+ */
+long driver_manager_audio_write_bound(uint32_t generation, const void *data,
+                                      uint32_t length, uint32_t *status);
+/** @brief Snapshot the exact leased backend without consulting its replacement.
+ * @param generation Acquired generation; zero preserves the native v1 API.
+ * @param state Receives zero on absence or the pinned hardware state.
+ * @return Zero or -ENODEV. Task callback pinned through return.
+ */
+int driver_manager_audio_state_bound(uint32_t generation, struct reliefos_audio_state *state);
 
 #endif

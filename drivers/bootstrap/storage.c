@@ -32,6 +32,7 @@
 #include "storage/storage_exfat.c"
 #include "storage/storage_ext4_mount.c"
 #include "storage/storage_mount.c"
+#include "storage/storage_audio.c"
 #include "storage/storage_vfs.c"
 #include "storage/storage_mounts.c"
 #include "storage/storage_tmpfs.c"

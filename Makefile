@@ -174,7 +174,7 @@ help:
 	  '  all               kernel.sys, kernel.debug, loader.elf, five .drv, kerneldebug.sys' \
 	  '  kernel            kernel.sys + kernel.debug' \
 	  '  loader            loader.elf (waits for kernel.sys: loader integrity chain)' \
-	  '  drivers           mouse.drv serial.drv e1000.drv ac97.drv es1371.drv + kerneldebug.sys' \
+	  '  drivers           mouse.drv serial.drv e1000.drv ac97.drv es1371.drv hda.drv + kerneldebug.sys' \
 	  '  headers_install   export the UAPI whitelist to $(O)/kernel-export/include' \
 	  '  install           copy products + manifest.txt to $(DESTDIR)' \
 	  '  test              host-tool tests + ABI layout + header export + UAPI compat' \

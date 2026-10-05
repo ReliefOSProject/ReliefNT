@@ -16,6 +16,7 @@ static uint32_t execution_serving_ticket;
 static uint32_t execution_owner = UINT32_MAX;
 static uint32_t execution_readers;
 static uint32_t execution_depth[SMP_MAX_CPUS];
+static uint64_t execution_outer_flags[SMP_MAX_CPUS];
 
 static uint32_t execution_cpu_index(void)
 {
@@ -98,8 +99,14 @@ void kernel_execution_lock_irqsave(uint64_t *flags)
     }
     __atomic_store_n(&execution_owner, cpu, __ATOMIC_RELAXED);
     execution_depth[cpu] = 1;
+    execution_outer_flags[cpu] = saved;
 }
 
+/** @brief Release one recursive execution ownership level and restore IRQ state.
+ * @param flags IRQ flags captured by the matching lock call; a final outer unlock
+ * restores the outer transaction state saved by the lock or suspend token.
+ * @return None. Must be called by the current execution owner.
+ */
 void kernel_execution_unlock_irqrestore(uint64_t flags)
 {
     uint32_t cpu = execution_cpu_index();
@@ -109,11 +116,80 @@ void kernel_execution_unlock_irqrestore(uint64_t flags)
         return;
     }
     if (__atomic_load_n(&execution_owner, __ATOMIC_RELAXED) == cpu && execution_depth[cpu] == 1) {
+        uint64_t outer_flags = execution_outer_flags[cpu];
         execution_depth[cpu] = 0;
+        execution_outer_flags[cpu] = 0;
         __atomic_store_n(&execution_owner, UINT32_MAX, __ATOMIC_RELAXED);
         __atomic_fetch_add(&execution_serving_ticket, 1, __ATOMIC_SEQ_CST);
+        kernel_irq_restore(outer_flags);
+        return;
     }
     kernel_irq_restore(flags);
+}
+
+/**
+ * @brief Release only an outermost execution owner while preserving its final IRQ restore state.
+ * @param token Zero-initialized storage receiving the transaction, owner CPU and IRQ states.
+ * @return 0 when suspended, -22 for bad input, -1 without current ownership, or -35 for
+ * nested ownership. Errors restore the pre-call IRQ state and do not change ownership.
+ */
+int kernel_execution_suspend_irqrestore(struct kernel_execution_suspend_token *token)
+{
+    if (!token || token->active) {
+        return -22;
+    }
+    uint64_t saved = kernel_irq_save();
+    uint32_t cpu = execution_cpu_index();
+    if (__atomic_load_n(&execution_owner, __ATOMIC_RELAXED) != cpu) {
+        kernel_irq_restore(saved);
+        return -1;
+    }
+    if (execution_depth[cpu] != 1) {
+        kernel_irq_restore(saved);
+        return -35;
+    }
+
+    token->original_irq_flags = execution_outer_flags[cpu];
+    token->wait_irq_flags = saved | (1ULL << 9);
+    token->wait_exit_irq_flags = 0;
+    token->suspended_cpu = cpu;
+    token->active = 1;
+    execution_depth[cpu] = 0;
+    execution_outer_flags[cpu] = 0;
+    __atomic_store_n(&execution_owner, UINT32_MAX, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&execution_serving_ticket, 1, __ATOMIC_SEQ_CST);
+
+    /* Enable task-phase timer/MSI progress only after ownership is fully released. */
+    kernel_irq_restore(token->wait_irq_flags);
+    return 0;
+}
+
+/**
+ * @brief Reacquire a suspended execution transaction without enabling IRQs under ownership.
+ * @param token Active suspension token; successful resume consumes it.
+ * @return 0 with execution ownership restored, -22 for an inactive token, or -35 if
+ * the current context already has execution ownership. Failure preserves the active token.
+ */
+int kernel_execution_resume_irqsave(struct kernel_execution_suspend_token *token)
+{
+    if (!token || !token->active) {
+        return -22;
+    }
+    uint64_t saved = kernel_irq_save();
+    token->wait_exit_irq_flags = saved;
+    uint32_t cpu = execution_cpu_index();
+    if (__atomic_load_n(&execution_owner, __ATOMIC_RELAXED) == cpu ||
+        execution_depth[cpu] != 0) {
+        kernel_irq_restore(saved);
+        return -35;
+    }
+
+    uint64_t resume_flags;
+    kernel_execution_lock_irqsave(&resume_flags);
+    (void)resume_flags;
+    execution_outer_flags[cpu] = token->original_irq_flags;
+    token->active = 0;
+    return 0;
 }
 
 /* Readers only mutate their independently owned address space. Writers still

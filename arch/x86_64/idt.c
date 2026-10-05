@@ -86,6 +86,38 @@ extern void irq14_stub(void);
 extern void irq15_stub(void);
 extern void irq32_stub(void);
 extern void irq_membarrier_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_50_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_51_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_52_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_53_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_54_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_55_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_56_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_57_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_58_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_59_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_5a_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_5b_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_5c_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_5d_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_5e_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_5f_stub(void);
 extern void irqff_stub(void);
 extern uint64_t x86_64_read_cr2(void);
 
@@ -194,6 +226,22 @@ void idt_init(void)
      * discards the interrupt; otherwise the CPU raises #GP with an IDT error
      * code of (0xff << 3) | 2. */
     idt_set(0x41, irq_membarrier_stub, 0);
+    idt_set(0x50, irq_msi_50_stub, 0);
+    idt_set(0x51, irq_msi_51_stub, 0);
+    idt_set(0x52, irq_msi_52_stub, 0);
+    idt_set(0x53, irq_msi_53_stub, 0);
+    idt_set(0x54, irq_msi_54_stub, 0);
+    idt_set(0x55, irq_msi_55_stub, 0);
+    idt_set(0x56, irq_msi_56_stub, 0);
+    idt_set(0x57, irq_msi_57_stub, 0);
+    idt_set(0x58, irq_msi_58_stub, 0);
+    idt_set(0x59, irq_msi_59_stub, 0);
+    idt_set(0x5a, irq_msi_5a_stub, 0);
+    idt_set(0x5b, irq_msi_5b_stub, 0);
+    idt_set(0x5c, irq_msi_5c_stub, 0);
+    idt_set(0x5d, irq_msi_5d_stub, 0);
+    idt_set(0x5e, irq_msi_5e_stub, 0);
+    idt_set(0x5f, irq_msi_5f_stub, 0);
     idt_set(0xff, irqff_stub, 0);
     /* Syscalls may select a different address space before returning. Use an
      * interrupt gate so a local timer cannot nest inside that decision and

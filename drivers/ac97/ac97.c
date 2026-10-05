@@ -64,6 +64,7 @@ struct ac97_state {
     uint16_t channels;
     uint16_t bits_per_sample;
     uint32_t queued_bytes;
+    uint32_t queued_pcm_bytes;
     uint32_t underruns;
     uint32_t overruns;
     uint32_t write_index;
@@ -81,6 +82,7 @@ struct ac97_state {
     uint32_t nonzero_consumed_reported;
     uint32_t nonzero_descriptor;
     uint16_t slot_bytes[AC97_BDL_COUNT];
+    uint8_t slot_pcm[AC97_BDL_COUNT];
     volatile uint32_t io_lock;
     uint8_t variable_rate;
 };
@@ -111,16 +113,32 @@ static void ac97_zero(void *dst, uint32_t length)
  * emulators (including QEMU and VirtualBox) intentionally ignore byte
  * accesses to these registers, so composing a word from two inb/outb calls
  * returns bogus PICB/status values and leaves the codec muted. */
+/** @brief Read one word-wide mixer or DMA register.
+ * @param port Hardware I/O port. @return Register word.
+ * Task context; testing substitutes only the hardware access boundary.
+ */
 static uint16_t ac97_io_inw(uint16_t port)
 {
+#ifdef AC97_TESTING
+    return ac97_test_inw(port);
+#else
     uint16_t value;
     __asm__ volatile("inw %1, %0" : "=a"(value) : "Nd"(port));
     return value;
+#endif
 }
 
+/** @brief Write one word-wide mixer or DMA register.
+ * @param port Hardware I/O port. @param value Register word.
+ * @return None. Task context; testing substitutes only the hardware boundary.
+ */
 static void ac97_io_outw(uint16_t port, uint16_t value)
 {
+#ifdef AC97_TESTING
+    ac97_test_outw(port,value);
+#else
     __asm__ volatile("outw %0, %1" : : "a"(value), "Nd"(port));
+#endif
 }
 
 static uint16_t ac97_read16(uint16_t port)
@@ -182,9 +200,13 @@ static void ac97_bm_write16(uint16_t offset, uint16_t value)
     ac97_io_outw((uint16_t)(ac97.bus_master_port + offset), value);
 }
 
+/** @brief Reset both DMA occupancy and application-only drain accounting.
+ * @return None. Task context with controller stopped and driver lock held.
+ */
 static void ac97_reset_stream_state(void)
 {
     ac97.queued_bytes = 0;
+    ac97.queued_pcm_bytes = 0;
     ac97.write_index = 0;
     ac97.queued_descriptors = 0;
     ac97.hw_civ = 0;
@@ -200,6 +222,7 @@ static void ac97_reset_stream_state(void)
     ac97.nonzero_consumed_reported = 0;
     ac97.nonzero_descriptor = 0;
     ac97_zero(ac97.slot_bytes, sizeof(ac97.slot_bytes));
+    ac97_zero(ac97.slot_pcm, sizeof(ac97.slot_pcm));
 }
 
 static void ac97_refill_silence_locked(void);
@@ -407,6 +430,11 @@ static void ac97_program_lvi_locked(void)
     ac97_bm_write8(AC97_PO_LVI, (uint8_t)last);
 }
 
+/** @brief Publish one descriptor, distinguishing application data from idle silence.
+ * @param data Borrowed application bytes, or NULL for driver-generated silence.
+ * @param length Frame-aligned byte count. @return Zero or -EINVAL.
+ * Task context with driver lock held; DMA owns the copied bytes after publish.
+ */
 static int ac97_queue_descriptor_locked(const uint8_t *data, uint32_t length)
 {
     uint32_t index;
@@ -436,6 +464,7 @@ static int ac97_queue_descriptor_locked(const uint8_t *data, uint32_t length)
     };
     __sync_synchronize();
     ac97.slot_bytes[index] = (uint16_t)length;
+    ac97.slot_pcm[index] = data != NULL;
     if (nonzero && !ac97.nonzero_reported) {
         ac97.nonzero_reported = 1U;
         ac97.nonzero_descriptor = index;
@@ -444,11 +473,16 @@ static int ac97_queue_descriptor_locked(const uint8_t *data, uint32_t length)
     ac97.write_index = (index + 1U) % AC97_BDL_COUNT;
     ++ac97.queued_descriptors;
     ac97.queued_bytes += length;
+    if(data)ac97.queued_pcm_bytes+=length;
     __sync_synchronize();
     ac97_program_lvi_locked();
     return 0;
 }
 
+/** @brief Consume hardware progress in DMA and application queue accounting.
+ * @return None. Task context with driver lock held; idle silence stays in DMA
+ * occupancy but cannot keep a user's drain permanently pending.
+ */
 static void ac97_refresh_locked(void)
 {
     uint16_t status;
@@ -456,6 +490,7 @@ static void ac97_refresh_locked(void)
     uint32_t picb;
     uint32_t completed;
     uint32_t consumed = 0;
+    uint32_t pcm_consumed = 0;
     uint32_t index;
     uint32_t terminal;
 
@@ -499,9 +534,11 @@ static void ac97_refresh_locked(void)
          * resetting the controller here would turn a transient underrun into
          * an audible click on every producer call. */
         ac97.queued_bytes = 0;
+        ac97.queued_pcm_bytes = 0;
         ac97.queued_descriptors = 0;
         ac97.write_index = (civ + 1U) % AC97_BDL_COUNT;
         ac97_zero(ac97.slot_bytes, sizeof(ac97.slot_bytes));
+        ac97_zero(ac97.slot_pcm, sizeof(ac97.slot_pcm));
         ac97.stream_started = 1U;
         ac97.running = (status & AC97_PO_SR_DCH) == 0U;
         ac97.last_hw_civ = civ;
@@ -511,17 +548,19 @@ static void ac97_refresh_locked(void)
     }
     if (completed) {
         index = ac97.last_hw_civ;
-        consumed = ac97.last_hw_picb ? (ac97.last_hw_picb * 2U) :
-                   ac97.slot_bytes[index];
+        consumed = ac97.last_hw_picb * 2U;
         if (consumed > ac97.slot_bytes[index]) {
             consumed = ac97.slot_bytes[index];
         }
+        if(ac97.slot_pcm[index])pcm_consumed=consumed;
         for (uint32_t count = 0; count < completed; ++count) {
             index = (ac97.last_hw_civ + count) % AC97_BDL_COUNT;
             if (count) {
                 consumed += ac97.slot_bytes[index];
+                if(ac97.slot_pcm[index])pcm_consumed+=ac97.slot_bytes[index];
             }
             ac97.slot_bytes[index] = 0;
+            ac97.slot_pcm[index] = 0;
             if (index == ac97.nonzero_descriptor &&
                 ac97.nonzero_reported && !ac97.nonzero_consumed_reported) {
                 kernel_api->console_write("[driver] ac97 first nonzero DMA descriptor consumed\n");
@@ -531,17 +570,29 @@ static void ac97_refresh_locked(void)
                 --ac97.queued_descriptors;
             }
         }
+        /* CIV may already have advanced into a partly played descriptor.
+         * Retire that prefix now: the next query only sees PICB deltas. A
+         * terminal CIV still names the descriptor retired above. */
+        if (!terminal && ac97.queued_descriptors &&
+            picb * 2U < ac97.slot_bytes[civ]) {
+            uint32_t prefix = ac97.slot_bytes[civ] - picb * 2U;
+            consumed += prefix;
+            if (ac97.slot_pcm[civ]) pcm_consumed += prefix;
+        }
     } else if (picb < ac97.last_hw_picb) {
         consumed = (ac97.last_hw_picb - picb) * 2U;
         if (consumed > ac97.queued_bytes) {
             consumed = ac97.queued_bytes;
         }
+        if(ac97.slot_pcm[ac97.last_hw_civ])pcm_consumed=consumed;
     }
     if (consumed >= ac97.queued_bytes) {
         ac97.queued_bytes = 0;
     } else {
         ac97.queued_bytes -= consumed;
     }
+    ac97.queued_pcm_bytes=pcm_consumed>=ac97.queued_pcm_bytes?0:
+        ac97.queued_pcm_bytes-pcm_consumed;
     ac97.last_hw_civ = civ;
     ac97.last_hw_picb = picb;
     if (status & AC97_PO_SR_DCH) {
@@ -553,6 +604,11 @@ static void ac97_refresh_locked(void)
     }
 }
 
+/** @brief Start an idle engine or adopt the automatic LVI restart.
+ * @return Zero when DMA runs, or -EIO if the controller stays halted.
+ * Task context with driver lock held. Updating LVI resumes a halted RUN
+ * engine; rewriting RUN would fetch PIV again and skip that descriptor.
+ */
 static int ac97_start_locked(void)
 {
     uint16_t status;
@@ -560,11 +616,15 @@ static int ac97_start_locked(void)
     if (!ac97.queued_descriptors || ac97.running) {
         return 0;
     }
-    kernel_api->outl((uint16_t)(ac97.bus_master_port + AC97_PO_BDBAR),
-                     (uint32_t)ac97.bdl_phys);
+    if (!ac97.stream_started) {
+        kernel_api->outl((uint16_t)(ac97.bus_master_port + AC97_PO_BDBAR),
+                         (uint32_t)ac97.bdl_phys);
+    }
     ac97_program_lvi_locked();
     ac97_bm_write16(AC97_PO_SR, AC97_PO_SR_CLEAR);
-    ac97_bm_write8(AC97_PO_CR, AC97_PO_CR_RUN);
+    if (!(ac97_bm_read8(AC97_PO_CR) & AC97_PO_CR_RUN)) {
+        ac97_bm_write8(AC97_PO_CR, AC97_PO_CR_RUN);
+    }
     status = AC97_PO_SR_DCH;
     for (attempt = 0; attempt < AC97_START_WAIT_SPINS; ++attempt) {
         status = ac97_bm_read16(AC97_PO_SR);
@@ -588,6 +648,10 @@ static int ac97_start_locked(void)
     return ac97.running ? 0 : -5;
 }
 
+/** @brief Refill the bounded idle lead and resume through the LVI frontier.
+ * @return None; idle silence is excluded from application drain accounting.
+ * Task context with driver lock held; descriptors stay owned until consumed.
+ */
 static void ac97_refill_silence_locked(void)
 {
     while (ac97.queued_descriptors < AC97_LEAD_DESCRIPTORS &&
@@ -654,6 +718,10 @@ static long ac97_write(const void *data, uint32_t length, uint32_t *out_status)
     return (long)written;
 }
 
+/** @brief Snapshot real format and outstanding application bytes for v1 users.
+ * @param out Borrowed output. @return None.
+ * Task context; refresh under driver lock, excluding internally generated silence.
+ */
 static void ac97_get_state(struct reliefos_audio_state *out)
 {
     if (!out) {
@@ -667,7 +735,7 @@ static void ac97_get_state(struct reliefos_audio_state *out)
         .sample_rate = ac97.sample_rate,
         .channels = ac97.channels,
         .bits_per_sample = ac97.bits_per_sample,
-        .queued_bytes = ac97.queued_bytes,
+        .queued_bytes = ac97.queued_pcm_bytes,
         .underruns = ac97.underruns,
         .vendor_id = ac97.pci.vendor_id,
         .device_id = ac97.pci.device_id,

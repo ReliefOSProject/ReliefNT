@@ -1,6 +1,29 @@
 #ifndef RELIEFOS_UAPI_LINUX_TIME_H
 #define RELIEFOS_UAPI_LINUX_TIME_H
-#include <stdint.h>
+#include <linux/types.h>
+
+/* Native x86-64 time64 shapes. Respect both glibc and musl guards, including
+ * when this UAPI is included before libc <time.h>. Freestanding kernel builds
+ * must not import host libc headers. */
+#if !defined(__time_t_defined) && !defined(__DEFINED_time_t)
+typedef __s64 time_t;
+#define __time_t_defined 1
+#define __DEFINED_time_t 1
+#endif
+
+#if !defined(_STRUCT_TIMESPEC) && !defined(__DEFINED_struct_timespec)
+#define _STRUCT_TIMESPEC 1
+#define __DEFINED_struct_timespec 1
+struct timespec {
+    __s64 tv_sec;
+    __s64 tv_nsec;
+};
+#endif
+
+struct __kernel_timespec {
+    __s64 tv_sec;
+    __s64 tv_nsec;
+};
 
 #define LINUX_CLOCK_REALTIME 0
 #define LINUX_CLOCK_MONOTONIC 1

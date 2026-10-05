@@ -26,9 +26,17 @@ uint64_t mm_free_memory_kib(void);
  */
 uint64_t mm_alloc_page(void);
 /**
- * @brief Allocate page_count contiguous physical pages; returns the base address (0 on failure).
+ * @brief Allocate contiguous physical pages using the allocator hint.
+ * @param page_count Requested 4 KiB pages.
+ * @return Owned zeroed physical base or 0; IRQ-safe allocator lock, caller frees.
  */
 uint64_t mm_alloc_pages(uint32_t page_count);
+/** @brief Claim an owned zeroed DMA run entirely below an inclusive mask.
+ * @param page_count Number of 4 KiB pages, nonzero and overflow checked.
+ * @param mask Maximum final byte bus address.
+ * @return Physical address, or 0; IRQ-safe scan/claim, no sleeping; caller frees.
+ */
+uint64_t mm_alloc_pages_below(uint32_t page_count, uint64_t mask);
 /**
  * @brief Return one physical page (phys) to the allocator.
  */
