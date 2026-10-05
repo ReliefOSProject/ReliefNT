@@ -290,7 +290,14 @@ static int signal_setup_frame(struct task *task, int sig,
             task->poll_deadline_ticks = 0;
         }
         if (sleeping) {
-            uint64_t now = time_ticks();
+            struct linux_timespec clock_value;
+            uint64_t now = task->nanosleep_deadline;
+            if (!time_clock_get(task->nanosleep_clock, &clock_value)) {
+                const uint64_t tick_ns = 1000000000ULL / RELIEFNT_TICK_HZ;
+                now = (uint64_t)clock_value.tv_sec * RELIEFNT_TICK_HZ +
+                    (uint64_t)clock_value.tv_nsec / tick_ns +
+                    ((uint64_t)clock_value.tv_nsec % tick_ns != 0);
+            }
             uint64_t ticks = task->nanosleep_deadline > now ? task->nanosleep_deadline - now : 0;
             struct linux_timespec remaining = {(int64_t)(ticks / RELIEFNT_TICK_HZ),
                 (int64_t)((ticks % RELIEFNT_TICK_HZ) * (1000000000ULL / RELIEFNT_TICK_HZ))};

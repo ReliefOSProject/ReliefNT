@@ -6,6 +6,7 @@
 #include <reliefnt/console.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/time.h>
+#include <reliefnt/audio.h>
 #include <reliefnt/usb.h>
 #include <linux/time.h>
 #include <linux/timex.h>
@@ -242,7 +243,8 @@ void time_init(void)
 }
 
 /**
- * @brief Advance ticks and the wall clock, then drive USB polling and the scheduler.
+ * @brief Advance clock and service devices with no clock lock held.
+ * @return None. IRQ context; audio consumes at most 32 completions, no waiting.
  */
 void time_on_tick(void)
 {
@@ -261,6 +263,7 @@ void time_on_tick(void)
         }
     }
     kernel_spin_unlock_irqrestore(&clock_lock, flags);
+    audio_service_tick();
     usb_poll();
     sched_on_tick();
     if ((ticks % (RELIEFNT_TICK_HZ / 10ULL)) == 0) {

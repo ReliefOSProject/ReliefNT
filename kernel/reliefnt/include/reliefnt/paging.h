@@ -110,9 +110,25 @@ void *paging_kernel_direct_map(uint64_t phys);
  * @brief Validate that a device range can be exposed with uncached semantics.
  * @param phys Physical start of the device range.
  * @param len Byte length of the range.
- * @return True when the range is page-aligned, addressable and reserved for a device.
+ * @return True when addressable and UC/NX page attributes are installed.
+ * Task context under execution transaction/pre-SMP. Compatibility mappings
+ * retain permanent attributes; no mapping reference is transferred.
  */
 bool paging_mmio_uncached(uint64_t phys, uint64_t len);
+/** @brief Acquire one UC/NX reference per device page after BAR validation.
+ * @param phys Page-aligned physical base.
+ * @param len Page-aligned nonzero bytes.
+ * @return True on success; caller releases after quiescence. Task context under
+ * execution transaction/pre-SMP; flushes every CPU, preserves neighbor flags.
+ */
+bool paging_acquire_mmio(uint64_t phys, uint64_t len);
+/** @brief Release owned device pages and restore last-reference attributes.
+ * @param phys Original aligned physical base.
+ * @param len Original aligned byte length.
+ * @return None. Task context under execution transaction/pre-SMP; TLB sync;
+ * page-table split storage remains kernel owned, device RAM is never freed.
+ */
+void paging_release_mmio(uint64_t phys, uint64_t len);
 
 /**
  * @brief Allocate and initialize an empty address space; true on success.
@@ -130,7 +146,11 @@ bool address_space_clone_cow(struct address_space *source, struct address_space 
  */
 void address_space_destroy(struct address_space *as);
 /**
- * @brief Allocate page-table structures covering the user range [start, end); true on success.
+ * @brief Prepare missing page tables atomically for a pinned user address space.
+ * @param as Address space held under execution ownership.
+ * @param start Inclusive first user byte. @param end Exclusive range end.
+ * @return True after all tables are ready; false frees all newly allocated
+ * tables without changing existing mappings.
  */
 bool address_space_prepare_user_range(struct address_space *as, uint64_t start,
                                       uint64_t end);

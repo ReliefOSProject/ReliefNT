@@ -21,7 +21,7 @@ $(LOADER_ELF): $(LOADER_OBJECTS) $(RELIEFOS_SRC)/boot/loader/linker.ld $(O_META)
 	$(Q)mkdir -p $(@D)
 	$(Q)$(TARGET_LD) -nostdlib -z max-page-size=0x1000 -T $(RELIEFOS_SRC)/boot/loader/linker.ld -o $@.tmp $(LOADER_OBJECTS)
 	$(Q)mv $@.tmp $@
-DRIVER_NAMES := mouse serial e1000 ac97 es1371
+DRIVER_NAMES := mouse serial e1000 ac97 es1371 hda
 DRIVER_OUTPUTS := $(addprefix $(O_GENERATED)/drivers/,$(addsuffix .drv,$(DRIVER_NAMES)))
 define driver_rules
 DRIVER_$(1)_SOURCES := $$(patsubst $$(RELIEFOS_SRC)/%,%,$$(shell find $$(RELIEFOS_SRC)/drivers/$(1) -type f \( -name '*.c' -o -name '*.S' \) | LC_ALL=C sort))

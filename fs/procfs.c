@@ -1,6 +1,7 @@
 /* Read-only procfs implementation for the Unix migration. */
 #include <reliefnt/mm.h>
 #include <reliefnt/driver_manager.h>
+#include <reliefnt/audio.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/smp.h>
 #include <reliefnt/storage.h>
@@ -65,6 +66,31 @@ static void proc_append_text(char *dst, uint32_t *pos, uint32_t cap, const char 
         ++(*pos);
         dst[*pos] = 0;
     }
+}
+
+static int proc_asound_card_path(const char *path, uint32_t *ordinal,
+                                 const char **leaf)
+{
+    const char *p;
+    uint32_t value = 0;
+    if (!path || __builtin_strncmp(path, "/proc/asound/card", 17) != 0)
+        return 0;
+    p = path + 17;
+    if (*p < '0' || *p > '9') return 0;
+    do {
+        uint32_t digit = (uint32_t)(*p++ - '0');
+        if (value > (UINT32_MAX - digit) / 10u) return 0;
+        value = value * 10u + digit;
+    } while (*p >= '0' && *p <= '9');
+    if (ordinal) *ordinal = value;
+    if (leaf) *leaf = *p == '/' ? p + 1 : p;
+    return *p == 0 || *p == '/';
+}
+
+static int proc_asound_card_exists(uint32_t ordinal)
+{
+    uint32_t token;
+    return audio_card_snapshot(ordinal, &token, NULL) == 0;
 }
 
 static int proc_path_kind(const char *path, const char **file_name,
@@ -160,6 +186,20 @@ static int proc_fill_content(const char *path, char *buffer, uint32_t capacity)
     if (proc_text_eq(path, "/proc/filesystems")) {
         proc_append_text(buffer, &pos, capacity,
                          "\text2\n\text4\n\tvfat\n\texfat\n\tiso9660\nnodev\tproc\nnodev\tdevfs\nnodev\tsysfs\nnodev\ttmpfs\n");
+        return 0;
+    }
+    if (proc_text_eq(path, "/proc/asound/cards")) {
+        uint32_t ordinal = 0;
+        struct audio_card_identity identity;
+        while (audio_card_snapshot(ordinal, NULL, &identity) == 0) {
+            proc_append_u64(buffer, &pos, capacity, ordinal);
+            proc_append_text(buffer, &pos, capacity, " [");
+            proc_append_text(buffer, &pos, capacity, identity.id);
+            proc_append_text(buffer, &pos, capacity, "]: ");
+            proc_append_text(buffer, &pos, capacity, identity.name);
+            proc_append_text(buffer, &pos, capacity, "\n");
+            ++ordinal;
+        }
         return 0;
     }
     if (proc_text_eq(path, "/proc/sys/kernel/hostname") ||
@@ -467,7 +507,8 @@ int proc_lookup(const char *path, struct storage_node *out)
         return 0;
     }
     if (proc_text_eq(path, "/proc") || proc_text_eq(path, "/proc/sys") ||
-        proc_text_eq(path, "/proc/sys/kernel")) {
+        proc_text_eq(path, "/proc/sys/kernel") ||
+        proc_text_eq(path, "/proc/asound")) {
         if (out) {
             *out = (struct storage_node){
                 .type = RELIEFOS_FS_TYPE_DIR,
@@ -478,6 +519,19 @@ int proc_lookup(const char *path, struct storage_node *out)
             };
         }
         return 0;
+    }
+    {
+        uint32_t ordinal;
+        const char *leaf;
+        if (proc_asound_card_path(path, &ordinal, &leaf) &&
+            *leaf == 0 && proc_asound_card_exists(ordinal)) {
+            if (out) *out = (struct storage_node){
+                .type = RELIEFOS_FS_TYPE_DIR,
+                .flags = STORAGE_NODE_FLAG_PROC,
+                .first_cluster = 0x41534443u,
+            };
+            return 0;
+        }
     }
     if (proc_mount_view(path) || proc_text_eq(path,"/proc/cpuinfo") || proc_text_eq(path,"/proc/leonos-drivers")) {
         if (out) *out = (struct storage_node){
@@ -491,6 +545,7 @@ int proc_lookup(const char *path, struct storage_node *out)
         proc_text_eq(path, "/proc/meminfo") ||
         proc_text_eq(path, "/proc/version") ||
         proc_text_eq(path, "/proc/filesystems") ||
+        proc_text_eq(path, "/proc/asound/cards") ||
         proc_text_eq(path, "/proc/sys/kernel/hostname") ||
         proc_text_eq(path, "/proc/sys/kernel/domainname") ||
         proc_text_eq(path, "/proc/sys/kernel/ostype") ||
@@ -699,7 +754,7 @@ int proc_readlink(const char *path, char *buffer, uint32_t capacity)
 int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *entry)
 {
     uint32_t index;
-    static const char *files[] = {"uptime", "meminfo", "version", "filesystems", "stat", "mounts", "self", "sys", "cpuinfo", "leonos-drivers", "cmdline"};
+    static const char *files[] = {"uptime", "meminfo", "version", "filesystems", "stat", "mounts", "self", "sys", "cpuinfo", "leonos-drivers", "cmdline", "asound"};
     if (!path || !offset || !entry) return -22;
     if (!__builtin_strncmp(path,"/sys",4) && (!path[4] || path[4]=='/')) return sysfs_readdir(path,offset,entry);
     if (proc_text_eq(path, "/proc/sys") || proc_text_eq(path, "/proc/sys/kernel")) {
@@ -710,6 +765,28 @@ int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *
         proc_copy(entry->name, sizeof(entry->name), parent ? "kernel" : values[*offset]);
         ++*offset;
         return 1;
+    }
+    if (proc_text_eq(path, "/proc/asound")) {
+        if (*offset == 0) {
+            *offset = 1;
+            entry->type = RELIEFOS_FS_TYPE_FILE;
+            proc_copy(entry->name, sizeof(entry->name), "cards");
+            return 1;
+        }
+        uint32_t ordinal = (uint32_t)(*offset - 1u);
+        if (!proc_asound_card_exists(ordinal)) return 0;
+        ++*offset;
+        entry->type = RELIEFOS_FS_TYPE_DIR;
+        proc_copy(entry->name, sizeof(entry->name), "card");
+        uint32_t pos = 4;
+        proc_append_u64(entry->name, &pos, sizeof(entry->name), ordinal);
+        return 1;
+    }
+    {
+        uint32_t ordinal;
+        const char *leaf;
+        if (proc_asound_card_path(path, &ordinal, &leaf) && *leaf == 0 &&
+            proc_asound_card_exists(ordinal)) return 0;
     }
     if (!proc_text_eq(path, "/proc")) {
         const char *file = NULL;
@@ -745,7 +822,7 @@ int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *
     index = (uint32_t)*offset;
     if (index < sizeof(files) / sizeof(files[0])) {
         entry->type = index == 5 || index == 6 ? RELIEFOS_FS_TYPE_SYMLINK :
-            index == 7 ? RELIEFOS_FS_TYPE_DIR : RELIEFOS_FS_TYPE_FILE;
+            (index == 7 || index == 11) ? RELIEFOS_FS_TYPE_DIR : RELIEFOS_FS_TYPE_FILE;
         proc_copy(entry->name, sizeof(entry->name), files[index]);
         *offset = index + 1u;
         return 1;

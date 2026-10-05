@@ -4,8 +4,10 @@
  */
 #include <reliefnt/console.h>
 #include <reliefnt/driver_manager.h>
+#include <reliefnt/driver_manager_phase.h>
 #include <reliefnt/framebuffer.h>
 #include <reliefnt/lock.h>
+#include <reliefnt/audio.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/input.h>
 #include <reliefnt/mm.h>
@@ -83,12 +85,6 @@ static int copy_user_string_fixed(char *dst, uint32_t cap, uint64_t user_ptr,
 #define STARTUP_DB_ENTRY_MAX 64U
 #define STARTUP_DENIAL_MAX 64U
 #define STARTUP_REQUEST_MAX 16U
-/* Both supported PCM drivers accept 16-bit stereo samples.  This is the
- * portable OSS queue shape reported by /dev/dsp, not driver-private DMA
- * layout. */
-#define OSS_DSP_FRAGMENT_BYTES 2048U
-#define OSS_DSP_FRAGMENT_COUNT 8U
-#define OSS_DSP_QUEUE_BYTES (OSS_DSP_FRAGMENT_BYTES * OSS_DSP_FRAGMENT_COUNT)
 #define TASK_EPOLL_MAX_ENTRIES 128u
 
 struct task_timerfd {
@@ -196,6 +192,55 @@ static uint64_t linux_stat_inode(const char *path, const struct reliefos_stat *s
     return hash ? hash : 1;
 }
 
+/** @brief Encode a standard audio node as Linux ALSA major/minor device ID.
+ * @param node Storage node carrying an audio control or PCM identity.
+ * @return Linux old-style dev_t value, or zero for a stale identity.
+ */
+static uint64_t linux_audio_rdev(const struct storage_node *node)
+{
+    uint32_t card_token;
+    uint32_t ordinal;
+    uint32_t minor;
+    int index;
+
+    if (!node) return 0;
+    if ((node->flags & STORAGE_NODE_FLAG_DEV_NODE) &&
+        !(node->flags & STORAGE_NODE_FLAG_AUDIO_PCM) &&
+        node->first_cluster == STORAGE_DEV_KIND_AUDIO)
+        return ((uint64_t)14u << 8) | 3u;
+    if ((node->flags & STORAGE_NODE_FLAG_AUDIO_MIXER) &&
+        node->first_cluster == STORAGE_DEV_KIND_AUDIO_MIXER)
+        return (uint64_t)14u << 8;
+    if (node->flags & STORAGE_NODE_FLAG_AUDIO_TIMER)
+        return ((uint64_t)116u << 8) | 33u;
+    if (!(node->flags & (STORAGE_NODE_FLAG_AUDIO_PCM |
+                                  STORAGE_NODE_FLAG_AUDIO_CONTROL |
+                                  STORAGE_NODE_FLAG_AUDIO_MIXER |
+                                  STORAGE_NODE_FLAG_AUDIO_TIMER))) return 0;
+    if (node->flags & STORAGE_NODE_FLAG_AUDIO_PCM)
+        card_token = AUDIO_DEVICE_CARD(node->volume_id);
+    else
+        card_token = node->volume_id;
+    index = audio_card_index(card_token);
+    if (index < 0) return 0;
+    ordinal = (uint32_t)index;
+    if (node->flags & STORAGE_NODE_FLAG_AUDIO_MIXER) {
+        minor = ordinal * 16u;
+        return ((uint64_t)14u << 8) | (minor & 0xffu) |
+            ((uint64_t)(minor & ~0xffu) << 12);
+    }
+    if (node->flags & STORAGE_NODE_FLAG_AUDIO_CONTROL) {
+        minor = ordinal * 32u;
+    } else {
+        uint32_t device = AUDIO_DEVICE_INDEX(node->volume_id);
+        uint32_t direction = AUDIO_DEVICE_DIRECTION(node->volume_id);
+        if (device > 7u) return 0;
+        minor = ordinal * 32u + (direction ? 24u : 16u) + device;
+    }
+    return ((uint64_t)116u << 8) | (minor & 0xffu) |
+        ((uint64_t)(minor & ~0xffu) << 12);
+}
+
 static int linux_stat_from_legacy(struct linux_stat_abi *out,
                                    const struct reliefos_stat *st,
                                    const char *path, const struct storage_node *node)
@@ -243,6 +288,13 @@ static int linux_stat_from_legacy(struct linux_stat_abi *out,
         out->st_ino = (uint64_t)node->volume_id * 16 + node->first_cluster;
         out->st_rdev = (device_major << 8) | node->first_cluster;
     }
+    if ((node && (node->flags & (STORAGE_NODE_FLAG_AUDIO_PCM |
+                                 STORAGE_NODE_FLAG_AUDIO_CONTROL |
+                                 STORAGE_NODE_FLAG_AUDIO_MIXER |
+                                 STORAGE_NODE_FLAG_AUDIO_TIMER))) ||
+        (node && (node->flags & STORAGE_NODE_FLAG_DEV_NODE) &&
+         node->first_cluster == STORAGE_DEV_KIND_AUDIO))
+        out->st_rdev = linux_audio_rdev(node);
     out->st_size = st ? (int64_t)st->size : 0;
     out->st_blksize = 4096;
     out->st_blocks = (out->st_size + 511) / 512;
@@ -657,6 +709,21 @@ static int clear_task_file_result(struct task_file *file)
         return result;
     }
     syscall_flock_release_owner(file);
+    if (file->flags & TASK_FILE_FLAG_DEV_NODE) {
+        if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_PCM)
+            (void)audio_device_close(file);
+        if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_CONTROL)
+            (void)audio_control_close(file);
+        if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_MIXER)
+            (void)audio_mixer_close(file);
+        if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_TIMER)
+            (void)audio_timer_close(file);
+        if (file->node.first_cluster == STORAGE_DEV_KIND_AUDIO &&
+            !(file->node.flags & (STORAGE_NODE_FLAG_AUDIO_PCM |
+                                  STORAGE_NODE_FLAG_AUDIO_CONTROL |
+                                  STORAGE_NODE_FLAG_AUDIO_MIXER)))
+            (void)audio_oss_close(file);
+    }
     int result = storage_inode_put(file->inode);
     file->inode = NULL;
     task_pipe_release(file);
@@ -687,6 +754,10 @@ static int clear_task_file_result(struct task_file *file)
     file->aux2 = 0;
     file->input_vt = 0;
     file->input_vt_manual = 0;
+    file->audio_file = NULL;
+    file->audio_control_file = NULL;
+    file->audio_oss_file = NULL;
+    file->audio_timer_file = NULL;
     file->read_cursor = (struct storage_read_cursor){0};
     file->flags = 0;
     file->fd_flags = 0;
@@ -928,26 +999,6 @@ void syscall_close_cloexec_files(struct task *task)
     }
 }
 
-/**
- * Task file for fd.
- * @param task Value supplied by the caller.
- * @param fd Value supplied by the caller.
- * @return The value or status produced by the operation.
- */
-struct task_file *task_descriptor_for_fd(struct task *task, int fd)
-{
-    if (!task || fd < 0) {
-        return NULL;
-    }
-    if (fd < 3) {
-        return sched_task_fds(task)->stdio_files[fd].used ? &sched_task_fds(task)->stdio_files[fd] : NULL;
-    }
-    if (fd >= 3 + (int)sched_task_file_capacity(task)) return NULL;
-    struct task_file *file = sched_task_file_at(task, (uint32_t)(fd - 3));
-    if (!file) return NULL;
-    return file->used ? file : NULL;
-}
-
 struct task_file *task_file_for_fd(struct task *task, int fd)
 {
     return task_file_description(task_descriptor_for_fd(task, fd));
@@ -1116,6 +1167,9 @@ static int task_fd_set_descriptor_flags(struct task *task, int fd, uint32_t flag
 static int syscall_ioctl_resolve_fd(struct task *task, uint64_t fd_arg)
 {
     int fd = (int)(uint32_t)fd_arg;
+    if (task && task->syscall_file && task->syscall_fd == fd &&
+        task->syscall_file_number == LINUX_SYS_IOCTL)
+        return task->syscall_file->flags & TASK_FILE_FLAG_PATH ? -RELIEFOS_EBADF : 0;
     if (task_fd_descriptor_flags(task, fd) < 0) return -RELIEFOS_EBADF;
     struct task_file *file = task_file_for_fd(task, fd);
     return file && (file->flags & TASK_FILE_FLAG_PATH) ? -RELIEFOS_EBADF : 0;
@@ -2053,9 +2107,35 @@ static int task_device_read(struct task *task, struct task_file *file,
     }
     /* The first OSS implementation is playback-only. */
     if (task_device_is(file, STORAGE_DEV_KIND_AUDIO)) {
-        return -RELIEFOS_EBADF;
+        if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_PCM)
+            return audio_device_read(task, file, buffer, length);
+        return audio_oss_read(task, file, buffer, length);
+    }
+    if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_TIMER)
+        return audio_timer_read(task, file, buffer, length);
+    if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_MIXER) return -RELIEFOS_ENODEV;
+    if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_CONTROL) {
+        if (file->flags & RELIEFOS_O_NONBLOCK)
+            return audio_control_read_file(file->audio_control_file, buffer, length);
+        return audio_control_read_task(task, file, buffer, length);
     }
     return -RELIEFOS_EBADF;
+}
+
+/** @brief Bound one device write before narrowing its 64-bit user length.
+ * @param file Borrowed description under the execution transaction.
+ * @param count Validated user byte count.
+ * @return Request bytes; no ownership, allocation, wait or IRQ change occurs.
+ * Task context. PCM adapters retain their small internal copy buffers, queue
+ * limits, short transfers and interruptible waits. Other devices use the
+ * filesystem slice. A 32 KiB PCM request avoids forcing one Doom mixed block
+ * through five syscall returns while bounding the execution transaction.
+ */
+static uint32_t task_device_write_length(const struct task_file *file, uint64_t count)
+{
+    uint32_t limit = task_device_is(file, STORAGE_DEV_KIND_AUDIO)
+        ? 32768u : RELIEFOS_FS_IO_SLICE_BYTES;
+    return count > limit ? limit : (uint32_t)count;
 }
 
 static int task_device_write(struct task *task, struct task_file *file,
@@ -2115,16 +2195,15 @@ static int task_device_write(struct task *task, struct task_file *file,
         return (int)done;
     }
     if (task_device_is(file, STORAGE_DEV_KIND_AUDIO)) {
-        uint32_t status = RELIEFOS_AUDIO_STATUS_OK;
-        long written;
-        if (length && !buffer) return -RELIEFOS_EFAULT;
-        written = driver_manager_audio_write(buffer, length, &status);
-        if (written == 0 && status == RELIEFOS_AUDIO_STATUS_WOULD_BLOCK &&
-            (file->flags & RELIEFOS_O_NONBLOCK)) {
-            return -RELIEFOS_EAGAIN;
-        }
-        return (int)written;
+        if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_PCM)
+            return audio_device_write(task, file, buffer, length);
+        return audio_oss_write(task, file, buffer, length);
     }
+    if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_TIMER)
+        return -RELIEFOS_EBADF;
+    if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_MIXER) return -RELIEFOS_EBADF;
+    if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_CONTROL)
+        return -RELIEFOS_EBADF;
     return -RELIEFOS_EBADF;
 }
 
@@ -2281,145 +2360,6 @@ static int task_evdev_ioctl(struct task_file *file, uint64_t request,
         uint32_t event_type = _IOC_NR(request) - 0x20U;
         input_evdev_capabilities(device_kind, event_type,
                                  (void *)(uintptr_t)user_arg, size);
-        return 0;
-    }
-    return -RELIEFOS_ENOTTY;
-}
-
-static int task_oss_dsp_state(struct reliefos_audio_state *out)
-{
-    if (!out) return -RELIEFOS_EINVAL;
-    driver_manager_audio_get_state(out);
-    return out->present && out->active ? 0 : -RELIEFOS_ENODEV;
-}
-
-static int task_oss_dsp_set_rate(uint32_t requested_rate, uint32_t *actual_rate)
-{
-    struct reliefos_audio_format format;
-    struct reliefos_audio_state state = {0};
-    int ret;
-    ret = task_oss_dsp_state(&state);
-    if (ret < 0) return ret;
-    format = (struct reliefos_audio_format){
-        .sample_rate = requested_rate ? requested_rate : state.sample_rate,
-        .channels = 2U,
-        .bits_per_sample = 16U,
-    };
-    if (!format.sample_rate) format.sample_rate = 48000U;
-    ret = driver_manager_audio_configure(&format);
-    if (ret < 0) return ret;
-    driver_manager_audio_get_state(&state);
-    if (actual_rate) *actual_rate = state.sample_rate;
-    return state.active ? 0 : -RELIEFOS_ENODEV;
-}
-
-static int task_oss_dsp_writable(const struct task_file *file)
-{
-    struct reliefos_audio_state state = {0};
-    if (!task_device_is(file, STORAGE_DEV_KIND_AUDIO) || !file_can_write(file) ||
-        task_oss_dsp_state(&state) < 0) {
-        return 0;
-    }
-    return state.queued_bytes + OSS_DSP_FRAGMENT_BYTES <= OSS_DSP_QUEUE_BYTES;
-}
-
-static int task_oss_dsp_ioctl(struct task_file *file, uint64_t request,
-                              uint64_t user_arg)
-{
-    struct reliefos_audio_state state = {0};
-    int value;
-    int ret;
-    if (!task_device_is(file, STORAGE_DEV_KIND_AUDIO)) return -RELIEFOS_ENOTTY;
-    if (request != SNDCTL_DSP_RESET && request != SNDCTL_DSP_SYNC &&
-        request != SNDCTL_DSP_NONBLOCK && request != SNDCTL_DSP_GETFMTS &&
-        request != SNDCTL_DSP_GETCAPS && request != SNDCTL_DSP_GETBLKSIZE &&
-        request != SNDCTL_DSP_SETFMT && request != SNDCTL_DSP_SPEED &&
-        request != SNDCTL_DSP_STEREO && request != SNDCTL_DSP_CHANNELS &&
-        request != SOUND_PCM_READ_CHANNELS && request != SOUND_PCM_READ_RATE &&
-        request != SNDCTL_DSP_GETODELAY && request != SNDCTL_DSP_GETOSPACE) {
-        return -RELIEFOS_ENOTTY;
-    }
-    ret = task_oss_dsp_state(&state);
-    if (ret < 0) return ret;
-
-    if (request == SNDCTL_DSP_RESET || request == SNDCTL_DSP_SYNC) {
-        /* Hardware drains asynchronously. There is no software-only PCM
-         * queue to reset or flush at this layer. */
-        return 0;
-    }
-    if (request == SNDCTL_DSP_NONBLOCK) {
-        file->flags |= RELIEFOS_O_NONBLOCK;
-        return 0;
-    }
-    if (request == SNDCTL_DSP_GETFMTS || request == SNDCTL_DSP_GETCAPS ||
-        request == SNDCTL_DSP_GETBLKSIZE || request == SNDCTL_DSP_SETFMT ||
-        request == SNDCTL_DSP_SPEED || request == SNDCTL_DSP_STEREO ||
-        request == SNDCTL_DSP_CHANNELS || request == SOUND_PCM_READ_CHANNELS ||
-        request == SOUND_PCM_READ_RATE || request == SNDCTL_DSP_GETODELAY) {
-        if (!user_range_ok(user_arg, sizeof(int))) return -RELIEFOS_EFAULT;
-    }
-
-    if (request == SNDCTL_DSP_GETFMTS) {
-        *(int *)(uintptr_t)user_arg = AFMT_S16_LE;
-        return 0;
-    }
-    if (request == SNDCTL_DSP_GETCAPS) {
-        *(int *)(uintptr_t)user_arg = DSP_CAP_OUTPUT;
-        return 0;
-    }
-    if (request == SNDCTL_DSP_GETBLKSIZE) {
-        *(int *)(uintptr_t)user_arg = OSS_DSP_FRAGMENT_BYTES;
-        return 0;
-    }
-    if (request == SNDCTL_DSP_SETFMT) {
-        value = *(int *)(uintptr_t)user_arg;
-        /* OSS callers use the returned value to detect the selected format. */
-        *(int *)(uintptr_t)user_arg = AFMT_S16_LE;
-        return value == AFMT_QUERY || value == AFMT_S16_LE ? 0 : -RELIEFOS_ENOTSUP;
-    }
-    if (request == SNDCTL_DSP_STEREO) {
-        value = *(int *)(uintptr_t)user_arg;
-        *(int *)(uintptr_t)user_arg = 1;
-        return value == 0 || value == 1 ? 0 : -RELIEFOS_EINVAL;
-    }
-    if (request == SNDCTL_DSP_CHANNELS) {
-        value = *(int *)(uintptr_t)user_arg;
-        *(int *)(uintptr_t)user_arg = 2;
-        return value == 0 || value == 2 ? 0 : -RELIEFOS_EINVAL;
-    }
-    if (request == SOUND_PCM_READ_CHANNELS) {
-        *(int *)(uintptr_t)user_arg = 2;
-        return 0;
-    }
-    if (request == SNDCTL_DSP_SPEED) {
-        value = *(int *)(uintptr_t)user_arg;
-        ret = task_oss_dsp_set_rate(value > 0 ? (uint32_t)value : 0, &state.sample_rate);
-        if (ret < 0) return ret;
-        *(int *)(uintptr_t)user_arg = (int)state.sample_rate;
-        return 0;
-    }
-    if (request == SOUND_PCM_READ_RATE) {
-        *(int *)(uintptr_t)user_arg = (int)state.sample_rate;
-        return 0;
-    }
-    if (request == SNDCTL_DSP_GETODELAY) {
-        *(int *)(uintptr_t)user_arg = (int)state.queued_bytes;
-        return 0;
-    }
-    if (request == SNDCTL_DSP_GETOSPACE) {
-        struct audio_buf_info info;
-        uint32_t available;
-        if (!user_range_ok(user_arg, sizeof(info))) return -RELIEFOS_EFAULT;
-        driver_manager_audio_get_state(&state);
-        available = state.queued_bytes < OSS_DSP_QUEUE_BYTES
-                        ? OSS_DSP_QUEUE_BYTES - state.queued_bytes : 0;
-        info = (struct audio_buf_info){
-            .fragments = (int)(available / OSS_DSP_FRAGMENT_BYTES),
-            .fragstotal = OSS_DSP_FRAGMENT_COUNT,
-            .fragsize = OSS_DSP_FRAGMENT_BYTES,
-            .bytes = (int)available,
-        };
-        *(struct audio_buf_info *)(uintptr_t)user_arg = info;
         return 0;
     }
     return -RELIEFOS_ENOTTY;
@@ -3686,13 +3626,18 @@ static int64_t syscall_poll_impl(struct task *task, struct pollfd *fds,
                                              file->aux2, file->input_vt)) {
                     revents |= POLLIN;
                 }
+            } else if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_MIXER) {
+                revents |= audio_mixer_poll(file, events);
             } else if (task_device_is(file, STORAGE_DEV_KIND_AUDIO)) {
-                struct reliefos_audio_state audio = {0};
-                if (task_oss_dsp_state(&audio) < 0) {
-                    revents |= POLLERR;
-                } else if ((events & POLLOUT) && task_oss_dsp_writable(file)) {
-                    revents |= POLLOUT;
+                if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_PCM) {
+                    revents |= audio_device_poll(file, events);
+                } else {
+                    revents |= audio_oss_poll(file, events);
                 }
+            } else if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_CONTROL) {
+                revents |= audio_control_poll_file(file->audio_control_file, events);
+            } else if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_TIMER) {
+                revents |= audio_timer_poll(file, events);
             } else if (task_device_is(file, STORAGE_DEV_KIND_TTY)) {
                 if (pty_input_available(task->pty_id)) revents |= POLLIN;
                 if (pty_is_hungup(task->pty_id)) {
@@ -3704,7 +3649,9 @@ static int64_t syscall_poll_impl(struct task *task, struct pollfd *fds,
             if ((events & POLLOUT) && file_can_write(file) &&
                 !task_device_is(file, STORAGE_DEV_KIND_KEYBOARD) &&
                 !task_device_is(file, STORAGE_DEV_KIND_MOUSE) &&
-                !task_device_is(file, STORAGE_DEV_KIND_AUDIO)) {
+                !task_device_is(file, STORAGE_DEV_KIND_AUDIO) &&
+                !(file->node.flags & (STORAGE_NODE_FLAG_AUDIO_CONTROL |
+                                      STORAGE_NODE_FLAG_AUDIO_MIXER))) {
                 revents |= POLLOUT;
             }
         } else if (file) {
@@ -5002,8 +4949,7 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
                     !(task->uid == 0 && storage_installer_root_active())) return -RELIEFOS_EACCES;
                 return syscall_regular_io(task,file,a1,a2,0,true,false);
             }
-            request_len = a2 > RELIEFOS_FS_IO_SLICE_BYTES
-                              ? RELIEFOS_FS_IO_SLICE_BYTES : (uint32_t)a2;
+            request_len = task_device_write_length(file, a2);
             {
                 int result = task_device_write(task, file, (const void *)(uintptr_t)a1,
                                                request_len);
@@ -5479,6 +5425,49 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
             }
             int fd = alloc_task_fd(task, &node,
                                    flags | device_flags, path);
+            if (fd >= 0 && (node.flags & STORAGE_NODE_FLAG_AUDIO_PCM)) {
+                struct task_file *file = task_file_for_fd(task, fd);
+                int audio_ret = audio_device_open(task, file);
+                if (audio_ret < 0) {
+                    if (file) clear_task_file(file);
+                    return audio_ret;
+                }
+            }
+            if (fd >= 0 && (node.flags & STORAGE_NODE_FLAG_AUDIO_CONTROL)) {
+                struct task_file *file = task_file_for_fd(task, fd);
+                int control_ret = audio_control_open(task, file);
+                if (control_ret < 0) {
+                    if (file) clear_task_file(file);
+                    return control_ret;
+                }
+            }
+            if (fd >= 0 && (node.flags & STORAGE_NODE_FLAG_AUDIO_MIXER)) {
+                struct task_file *file = task_file_for_fd(task, fd);
+                int mixer_ret = audio_mixer_open(task, file);
+                if (mixer_ret < 0) {
+                    if (file) clear_task_file(file);
+                    return mixer_ret;
+                }
+            }
+            if (fd >= 0 && (node.flags & STORAGE_NODE_FLAG_AUDIO_TIMER)) {
+                struct task_file *file = task_file_for_fd(task, fd);
+                int timer_ret = audio_timer_open(task, file);
+                if (timer_ret < 0) {
+                    if (file) clear_task_file(file);
+                    return timer_ret;
+                }
+            }
+            if (fd >= 0 && node.first_cluster == STORAGE_DEV_KIND_AUDIO &&
+                !(node.flags & (STORAGE_NODE_FLAG_AUDIO_PCM |
+                                STORAGE_NODE_FLAG_AUDIO_CONTROL |
+                                STORAGE_NODE_FLAG_AUDIO_MIXER))) {
+                struct task_file *file = task_file_for_fd(task, fd);
+                int oss_ret = audio_oss_open(task, file);
+                if (oss_ret < 0) {
+                    if (file) clear_task_file(file);
+                    return oss_ret;
+                }
+            }
             if (fd >= 0 && node.first_cluster == STORAGE_DEV_KIND_SHM) {
                 struct task_file *file = task_file_for_fd(task, fd);
                 if (!file || task_shm_attach(file) < 0) {
@@ -6279,6 +6268,14 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
         if (!file) {
             return -RELIEFOS_EBADF;
         }
+        if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_CONTROL)
+            return -LINUX_ESPIPE;
+        if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_MIXER)
+            return -LINUX_ESPIPE;
+        if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_PCM)
+            return audio_device_seek(file, offset, (int)a2, NULL);
+        if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_TIMER)
+            return audio_timer_seek(file, offset, (int)a2, NULL);
         if (file->flags & TASK_FILE_FLAG_PIPE) return -LINUX_ESPIPE;
         if (file->io_owner && file->io_owner != task->pid) return -RELIEFOS_EAGAIN;
         int refresh = storage_inode_refresh(&file->node);
@@ -6792,7 +6789,7 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
 
     if (number == LINUX_SYS_IOCTL) {
         struct task *task = sched_current_task();
-        struct task_file *file = task_file_for_fd(task, (int)a0);
+        struct task_file *file = task_file_for_io(task, (int)a0);
         if (file && file->kind == TASK_FILE_KIND_SIGNALFD) {
             /* Generic ioctl requests have already been handled. */
             return -LINUX_ENOTTY;
@@ -6809,11 +6806,20 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
         if (evdev_ret != -RELIEFOS_ENOTTY) {
             return evdev_ret;
         }
-        {
-            int oss_ret = task_oss_dsp_ioctl(file, a1, a2);
-            if (oss_ret != -RELIEFOS_ENOTTY) {
-                return oss_ret;
-            }
+        if (file && (file->node.flags & STORAGE_NODE_FLAG_AUDIO_CONTROL)) {
+            return audio_control_ioctl(task, file, a1, a2);
+        }
+        if (file && (file->node.flags & STORAGE_NODE_FLAG_AUDIO_MIXER)) {
+            return audio_mixer_ioctl(task, file, a1, a2);
+        }
+        if (file && (file->node.flags & STORAGE_NODE_FLAG_AUDIO_PCM)) {
+            return audio_device_ioctl(task, file, a1, a2);
+        }
+        if (file && (file->node.flags & STORAGE_NODE_FLAG_AUDIO_TIMER)) {
+            return audio_timer_ioctl(task, file, a1, a2);
+        }
+        if (file && task_device_is(file, STORAGE_DEV_KIND_AUDIO)) {
+            return audio_oss_ioctl(task, file, a1, a2);
         }
     }
 
@@ -7335,7 +7341,9 @@ static int syscall_eagain_is_nonblocking_device(struct task *task,
         if ((file->flags & TASK_FILE_FLAG_DEV_NODE) &&
             (task_device_is(file, STORAGE_DEV_KIND_KEYBOARD) ||
              task_device_is(file, STORAGE_DEV_KIND_MOUSE) ||
-             task_device_is(file, STORAGE_DEV_KIND_AUDIO))) {
+             task_device_is(file, STORAGE_DEV_KIND_AUDIO) ||
+             (file->node.flags & (STORAGE_NODE_FLAG_AUDIO_CONTROL |
+                                  STORAGE_NODE_FLAG_AUDIO_TIMER)))) {
             return 1;
         }
     }
@@ -7371,6 +7379,48 @@ static bool syscall_trace_task(const struct task *task)
     return true;
 }
 
+/** @brief Pin a retryable file operation's description across waits and signals.
+ * @param task Calling task under execution ownership, or NULL.
+ * @param number Linux syscall number. @param fd First syscall argument.
+ * @return Zero or allocation errno. A matching retry keeps the same object even
+ * if another thread closes/reuses fd; task_release_syscall_file ends ownership.
+ */
+static int task_begin_syscall_io(struct task *task, uint64_t number, int32_t fd)
+{
+    bool file_io = number == LINUX_SYS_READ || number == LINUX_SYS_WRITE ||
+        number == LINUX_SYS_IOCTL ||
+        number == LINUX_SYS_PREAD64 || number == LINUX_SYS_PWRITE64 ||
+        number == LINUX_SYS_READV || number == LINUX_SYS_WRITEV ||
+        number == LINUX_SYS_PREADV || number == LINUX_SYS_PWRITEV ||
+        number == LINUX_SYS_PREADV2 || number == LINUX_SYS_PWRITEV2 ||
+        number == LINUX_SYS_SENDFILE || number == LINUX_SYS_COPY_FILE_RANGE ||
+        number == LINUX_SYS_SENDTO || number == LINUX_SYS_RECVFROM ||
+        number == LINUX_SYS_SENDMSG || number == LINUX_SYS_RECVMSG ||
+        number == LINUX_SYS_SENDMMSG || number == LINUX_SYS_RECVMMSG ||
+        number == LINUX_SYS_ACCEPT || number == LINUX_SYS_ACCEPT4 || number == LINUX_SYS_CONNECT;
+    if (!task || number == LINUX_SYS_RT_SIGRETURN) return 0;
+    if ((task->syscall_file || task->syscall_pty.used) &&
+        (!file_io || task->syscall_fd != fd || task->syscall_file_number != number))
+        task_release_syscall_file(task);
+    if (!file_io || task->syscall_file || task->syscall_pty.used) return 0;
+    struct task_file *file = task_file_for_fd(task, fd);
+    if (file) {
+        task->syscall_file = task_file_get(file);
+        if (!task->syscall_file) return -RELIEFOS_ENOMEM;
+        task->syscall_fd = fd;
+        task->syscall_file_number = (uint32_t)number;
+    } else if (task_pty_fd_for_fd(task, fd) || task_pty_stream_for_fd(task, fd) >= 0) {
+        struct task_pty_fd *entry;
+        int ret = task_pty_ensure_fd(task, fd, &entry);
+        if (ret) return ret;
+        task->syscall_pty = *entry;
+        ++entry->description->references;
+        task->syscall_fd = fd;
+        task->syscall_file_number = (uint32_t)number;
+    }
+    return 0;
+}
+
 void syscall_dispatch_frame(struct trap_frame *frame)
 {
     uint64_t number;
@@ -7383,6 +7433,7 @@ void syscall_dispatch_frame(struct trap_frame *frame)
     }
     /* Several storage and GUI services still own global scratch buffers. */
     kernel_execution_lock_irqsave(&lock_flags);
+    driver_manager_process_audio_faults();
     input_process_pending();
     number = frame->rax;
     struct task *calling_task = sched_current_task();
@@ -7403,41 +7454,7 @@ void syscall_dispatch_frame(struct trap_frame *frame)
         /* sigaltstack must inspect the live user SP, not the last timer frame. */
         calling_task->frame.rsp = frame->rsp;
     }
-    bool file_io = number == LINUX_SYS_READ || number == LINUX_SYS_WRITE ||
-        number == LINUX_SYS_PREAD64 || number == LINUX_SYS_PWRITE64 ||
-        number == LINUX_SYS_READV || number == LINUX_SYS_WRITEV ||
-        number == LINUX_SYS_PREADV || number == LINUX_SYS_PWRITEV ||
-        number == LINUX_SYS_PREADV2 || number == LINUX_SYS_PWRITEV2 ||
-        number == LINUX_SYS_SENDFILE || number == LINUX_SYS_COPY_FILE_RANGE ||
-        number == LINUX_SYS_SENDTO || number == LINUX_SYS_RECVFROM ||
-        number == LINUX_SYS_SENDMSG || number == LINUX_SYS_RECVMSG ||
-        number == LINUX_SYS_SENDMMSG || number == LINUX_SYS_RECVMMSG ||
-        number == LINUX_SYS_ACCEPT || number == LINUX_SYS_ACCEPT4 || number == LINUX_SYS_CONNECT;
-    int pin_error = 0;
-    if (calling_task && number != LINUX_SYS_RT_SIGRETURN) {
-        if ((calling_task->syscall_file || calling_task->syscall_pty.used) &&
-            (!file_io || calling_task->syscall_fd != (int32_t)frame->rdi ||
-            calling_task->syscall_file_number != number)) task_release_syscall_file(calling_task);
-        if (file_io && !calling_task->syscall_file && !calling_task->syscall_pty.used) {
-            struct task_file *file = task_file_for_fd(calling_task, (int32_t)frame->rdi);
-            if (file) {
-                calling_task->syscall_file = task_file_get(file);
-                if (!calling_task->syscall_file) pin_error = -RELIEFOS_ENOMEM;
-                calling_task->syscall_fd = (int32_t)frame->rdi;
-                calling_task->syscall_file_number = (uint32_t)number;
-            } else if (task_pty_fd_for_fd(calling_task, (int32_t)frame->rdi) ||
-                       task_pty_stream_for_fd(calling_task, (int32_t)frame->rdi) >= 0) {
-                struct task_pty_fd *entry;
-                pin_error = task_pty_ensure_fd(calling_task, (int32_t)frame->rdi, &entry);
-                if (!pin_error) {
-                    calling_task->syscall_pty = *entry;
-                    ++entry->description->references;
-                    calling_task->syscall_fd = (int32_t)frame->rdi;
-                    calling_task->syscall_file_number = (uint32_t)number;
-                }
-            }
-        }
-    }
+    int pin_error = task_begin_syscall_io(calling_task, number, (int32_t)frame->rdi);
     storage_set_io_async_context(true);
     if (pin_error) {
         result = pin_error;

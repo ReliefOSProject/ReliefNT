@@ -423,6 +423,12 @@ static void vmware_drain_events(void)
     }
 }
 
+/**
+ * @brief Initialize the PS/2 auxiliary device and optional VMware absolute pointer.
+ * The boot CPU owns IRQ1/12. Mask its local IRQs only around the shared
+ * controller command-byte transaction so IRQ1 cannot consume that reply;
+ * preserve the caller's IRQ state and the keyboard configuration.
+ */
 static void mouse_hardware_init(void)
 {
     packet_index = 0;
@@ -438,15 +444,22 @@ static void mouse_hardware_init(void)
     state.absolute = false;
     mouse_reset_position();
 
+    uint64_t controller_flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(controller_flags) : : "memory");
     ps2_flush_output();
     ps2_write_command(0xa8);
     ps2_write_command(0x20);
-    uint8_t status = ps2_read_data();
-    status |= 0x02;
-    status &= (uint8_t)~0x20;
-    ps2_write_command(0x60);
-    ps2_write_data(status);
+    if (wait_output_full()) {
+        uint8_t status = x86_64_inb(PS2_DATA);
+        status |= 0x02;
+        status &= (uint8_t)~0x20;
+        ps2_write_command(0x60);
+        ps2_write_data(status);
+    }
     ps2_flush_output();
+    if (controller_flags & (1ULL << 9)) {
+        __asm__ volatile("sti" : : : "memory");
+    }
 
     int defaults_ok = mouse_write_ack(0xf6);
     int scale_ok = mouse_write_ack(0xe6);

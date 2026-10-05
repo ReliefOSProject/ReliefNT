@@ -33,6 +33,7 @@ static const struct storage_dev_entry storage_dev_entries[] = {
     {"keyboard",  STORAGE_DEV_KIND_KEYBOARD, RELIEFOS_FS_TYPE_DEVICE, 0},
     {"mouse",     STORAGE_DEV_KIND_MOUSE,    RELIEFOS_FS_TYPE_DEVICE, 0},
     {"dsp",       STORAGE_DEV_KIND_AUDIO,    RELIEFOS_FS_TYPE_DEVICE, 0},
+    {"mixer",     STORAGE_DEV_KIND_AUDIO_MIXER, RELIEFOS_FS_TYPE_DEVICE, 0},
     /* Compatibility aliases for the retired private audio interface. */
     {"audio",     STORAGE_DEV_KIND_AUDIO,    RELIEFOS_FS_TYPE_DEVICE, 0},
     {"ttyS0",     STORAGE_DEV_KIND_SERIAL,   RELIEFOS_FS_TYPE_DEVICE, 0},
@@ -47,6 +48,7 @@ static const struct storage_dev_entry storage_dev_entries[] = {
     {"stdout",    STORAGE_DEV_KIND_CONSOLE,  RELIEFOS_FS_TYPE_DEVICE, 0},
     {"stderr",    STORAGE_DEV_KIND_CONSOLE,  RELIEFOS_FS_TYPE_DEVICE, 0},
     {"input",     STORAGE_DEV_KIND_INPUT_DIR, RELIEFOS_FS_TYPE_DIR, 1},
+    {"snd",       STORAGE_DEV_KIND_SND_DIR,   RELIEFOS_FS_TYPE_DIR, 1},
     {"disk",      STORAGE_DEV_KIND_DISK_DIR, RELIEFOS_FS_TYPE_DIR, 1},
     {"pts",       STORAGE_DEV_KIND_PTS_DIR,   RELIEFOS_FS_TYPE_DIR, 1},
     {"shm",       0,                          RELIEFOS_FS_TYPE_DIR, 1},
@@ -114,7 +116,9 @@ static void storage_dev_node(const struct storage_dev_entry *entry,
         .flags = entry->directory ? STORAGE_NODE_FLAG_DEV_DIR
                                   : (STORAGE_NODE_FLAG_DEV_NODE |
                                      (entry->kind == STORAGE_DEV_KIND_FB0
-                                          ? STORAGE_NODE_FLAG_DEV_FB0 : 0u)),
+                                          ? STORAGE_NODE_FLAG_DEV_FB0 : 0u) |
+                                     (entry->kind == STORAGE_DEV_KIND_AUDIO_MIXER
+                                          ? STORAGE_NODE_FLAG_AUDIO_MIXER : 0u)),
         .first_cluster = entry->kind,
         .volume_id = STORAGE_VOLUME_ROOT,
         .size = 0,
@@ -288,6 +292,25 @@ static int storage_lookup_path_unlocked(const char *path, struct storage_node *o
             };
         }
         return 0;
+    }
+    if (g_devfs_enabled && storage_text_eq_ci(resolved, "/dev/snd")) {
+        if (out) *out = (struct storage_node){
+            .type = RELIEFOS_FS_TYPE_DIR,
+            .flags = STORAGE_NODE_FLAG_DEV_DIR,
+            .first_cluster = STORAGE_DEV_KIND_SND_DIR,
+            .volume_id = STORAGE_VOLUME_ROOT,
+        };
+        return 0;
+    }
+    if (g_devfs_enabled && !__builtin_strncmp(resolved, "/dev/snd/", 9) &&
+        resolved[9]) {
+        ret = storage_audio_timer_node(resolved + 9, out);
+        if (ret == 0) return 0;
+        ret = storage_audio_control_node(resolved + 9, out);
+        if (ret == 0) return 0;
+        ret = storage_audio_pcm_node(resolved + 9, out);
+        if (ret == 0) return 0;
+        return -2;
     }
     if (g_devfs_enabled && (storage_text_eq(resolved, "/dev/disk") ||
                             storage_text_eq(resolved, "/dev/disk/by-partuuid"))) {
@@ -746,6 +769,9 @@ static int storage_readdir_node_unlocked(const struct storage_node *node, uint64
             entry->type = RELIEFOS_FS_TYPE_SYMLINK;
             storage_copy_text(entry->name, sizeof(entry->name), uuid);
             return 1;
+        }
+        if (node->first_cluster == STORAGE_DEV_KIND_SND_DIR) {
+            return storage_audio_snd_readdir(cursor, entry);
         }
         while (*cursor < count) {
             const struct storage_dev_entry *dev = &entries[*cursor];

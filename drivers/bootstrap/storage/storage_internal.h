@@ -9,6 +9,7 @@
 #include <reliefnt/sched.h>
 #include <reliefnt/smp.h>
 #include <reliefnt/storage.h>
+#include <reliefnt/audio.h>
 #include <reliefnt/text_utf16.h>
 #include <reliefnt/tmpfs.h>
 #include <reliefnt/syscall.h>

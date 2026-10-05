@@ -9,6 +9,7 @@
 #include <reliefnt/heap.h>
 #include <reliefnt/wait.h>
 #include <reliefnt/futex.h>
+#include <reliefnt/sysv_shm.h>
 #include <reliefos/fs_abi.h>
 
 /* A 64-stage shell pipeline owns 63 pipes simultaneously.  Keep an extra
@@ -380,6 +381,11 @@ int syscall_ipc_pipe2(uint64_t user_ptr, uint64_t flags)
 int syscall_ipc_owns(uint64_t number)
 {
     switch (number) {
+    case __NR_shmget:
+    case __NR_shmat:
+    case __NR_shmdt:
+    case __NR_shmctl:
+        return 1;
     case LINUX_SYS_MSGGET:
     case LINUX_SYS_SEMGET:
     case LINUX_SYS_SEMOP:
@@ -406,6 +412,9 @@ int syscall_ipc_owns(uint64_t number)
 int64_t syscall_ipc_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
                              uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
 {
+    if (number == __NR_shmget || number == __NR_shmat ||
+        number == __NR_shmdt || number == __NR_shmctl)
+        return syscall_sysv_shm(number, a0, a1, a2);
     if (number == LINUX_SYS_PIPE2) return syscall_ipc_pipe2(a0, a1);
     if ((number >= LINUX_SYS_SEMGET && number <= LINUX_SYS_SEMCTL) || number == LINUX_SYS_SEMTIMEDOP)
         return syscall_sysv_sem(number, a0, a1, a2, a3);
