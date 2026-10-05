@@ -1,8 +1,7 @@
-#include <errno.h>
+#include <linux/errno.h>
 #include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <string.h>
 #include <reliefnt/audio.h>
 #include "hda.h"
 
@@ -306,7 +305,7 @@ int hda_stream_controller_init(struct hda_controller *c,
         c->position_phys = 0;
         return -EFAULT;
     }
-    memset((void *)c->position_buffer, 0, position_pages * 4096u);
+    __builtin_memset((void *)c->position_buffer, 0, position_pages * 4096u);
     for (uint32_t i = 0; i < count; ++i) {
         uint64_t phys = c->api->alloc_dma(1u, mask);
         if (!phys || (phys & 127u)) {
@@ -318,7 +317,7 @@ int hda_stream_controller_init(struct hda_controller *c,
             c->position_buffer = NULL;
             return phys ? -EINVAL : -ENOMEM;
         }
-        memset(&table[i], 0, sizeof(table[i]));
+        __builtin_memset(&table[i], 0, sizeof(table[i]));
         table[i].controller = c;
         table[i].index = i;
         table[i].bdl_dma.bus = phys;
@@ -396,7 +395,7 @@ int hda_pcm_format_caps(void *opaque, uint32_t device,
     struct hda_controller *c = opaque;
     if (!c || !caps || (uint32_t)direction > AUDIO_CAPTURE ||
         !c->streams || device >= c->stream_count) return -EINVAL;
-    memset(caps, 0, sizeof(*caps));
+    __builtin_memset(caps, 0, sizeof(*caps));
     caps->pcm.formats = AUDIO_FORMAT_S16_LE | AUDIO_FORMAT_S32_LE;
     caps->pcm.rates = AUDIO_RATE_44100 | AUDIO_RATE_48000;
     caps->pcm.channels_min = 1u;
@@ -455,7 +454,7 @@ int hda_pcm_open(void *opaque, uint32_t device, enum audio_direction direction,
     if (!tag) return -ENOSPC;
     int ret = hda_controller_stream_acquire(c);
     if (ret) return ret;
-    memset(&s->pcm_dma, 0, sizeof(s->pcm_dma));
+    __builtin_memset(&s->pcm_dma, 0, sizeof(s->pcm_dma));
     s->controller = c;
     s->direction = (uint8_t)direction;
     s->tag = tag;

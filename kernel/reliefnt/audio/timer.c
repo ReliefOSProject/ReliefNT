@@ -1,7 +1,6 @@
 #include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <string.h>
 
 #include <linux/errno.h>
 #include <linux/poll.h>
@@ -68,7 +67,7 @@ static void audio_timer_text(unsigned char *dst, uint32_t capacity,
                              const char *src)
 {
     if (!dst || !capacity) return;
-    memset(dst, 0, capacity);
+    __builtin_memset(dst, 0, capacity);
     if (!src) return;
     for (uint32_t i = 0; i + 1u < capacity && src[i]; ++i) dst[i] = (unsigned char)src[i];
 }

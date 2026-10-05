@@ -12,7 +12,6 @@
 #include <linux/capability.h>
 #include <linux/mman.h>
 #include <limits.h>
-#include <string.h>
 
 #define SYSV_SHM_SLOTS 4096u
 #define SYSV_SHM_ID_BITS 12u
@@ -141,7 +140,7 @@ static int64_t sysv_shm_get(struct task *task, int32_t key, uint64_t size, uint3
     for (; made < count; ++made) {
         s->pages[made] = mm_alloc_page();
         if (!s->pages[made]) break;
-        memset((void *)(uintptr_t)s->pages[made], 0, SYSV_SHM_PAGE);
+        __builtin_memset((void *)(uintptr_t)s->pages[made], 0, SYSV_SHM_PAGE);
     }
     if (made != count) {
         while (made) mm_free_page(s->pages[--made]);
@@ -340,7 +339,7 @@ static int64_t sysv_shm_control(struct task *task, int32_t id, int32_t command, 
         command != SHM_LOCK && command != SHM_UNLOCK) return -LINUX_EINVAL;
     if (command == IPC_SET) {
         if (!user_range_ok(pointer, sizeof(input))) return -LINUX_EFAULT;
-        memcpy(&input, (const void *)(uintptr_t)pointer, sizeof(input));
+        __builtin_memcpy(&input, (const void *)(uintptr_t)pointer, sizeof(input));
     }
     struct sysv_shm_segment *s = sysv_shm_find(id, command == SHM_STAT || command == SHM_STAT_ANY);
     if (!s) return -LINUX_EINVAL;

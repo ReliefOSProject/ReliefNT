@@ -2,7 +2,6 @@
 #include <linux/poll.h>
 #include <linux/soundcard.h>
 #include <stdint.h>
-#include <string.h>
 
 #include <reliefnt/audio.h>
 #include <reliefnt/futex.h>
@@ -545,7 +544,7 @@ int audio_oss_read(struct task *task, struct task_file *file,
         if (state->capture_tail_bytes) {
             uint32_t take = count - consumed < state->capture_tail_bytes
                 ? count - consumed : state->capture_tail_bytes;
-            memcpy(output + consumed, state->capture_tail, take);
+            __builtin_memcpy(output + consumed, state->capture_tail, take);
             state->capture_tail_bytes -= take;
             for (uint32_t i = 0; i < state->capture_tail_bytes; ++i)
                 state->capture_tail[i] = state->capture_tail[take + i];
@@ -609,7 +608,7 @@ int audio_oss_write(struct task *task, struct task_file *file,
                 if (chunk_bytes > sizeof(chunk)) chunk_bytes = sizeof(chunk);
                 chunk_bytes -= chunk_bytes % frame_bytes;
                 uint32_t chunk_frames = chunk_bytes / frame_bytes;
-                memcpy(chunk, input + consumed, chunk_bytes);
+                __builtin_memcpy(chunk, input + consumed, chunk_bytes);
                 long frames = audio_pcm_transfer(state->playback_pcm, chunk,
                                                  chunk_frames);
                 if (frames < 0) {
@@ -643,25 +642,25 @@ int audio_oss_write(struct task *task, struct task_file *file,
                 frame_from_tail = 1;
                 uint32_t need = frame_bytes - state->tail_bytes;
                 uint32_t take = count - consumed < need ? count - consumed : need;
-                memcpy(state->tail + state->tail_bytes, input + consumed, take);
+                __builtin_memcpy(state->tail + state->tail_bytes, input + consumed, take);
                 state->tail_bytes += take;
                 consumed += take;
                 if (state->tail_bytes < frame_bytes) break;
-                memcpy(frame, state->tail, frame_bytes);
+                __builtin_memcpy(frame, state->tail, frame_bytes);
                 state->tail_bytes = 0;
             } else if (count - consumed < frame_bytes) {
-                memcpy(state->tail, input + consumed, count - consumed);
+                __builtin_memcpy(state->tail, input + consumed, count - consumed);
                 state->tail_bytes = count - consumed;
                 consumed = count;
                 break;
             } else {
-                memcpy(frame, input + consumed, frame_bytes);
+                __builtin_memcpy(frame, input + consumed, frame_bytes);
                 frame_from_input = frame_bytes;
             }
             long frames = audio_pcm_transfer(state->playback_pcm, frame, 1);
             if (frames < 0) {
                 if (frame_from_tail && !state->tail_bytes) {
-                    memcpy(state->tail, frame, frame_bytes);
+                    __builtin_memcpy(state->tail, frame, frame_bytes);
                     state->tail_bytes = frame_bytes;
                 }
                 if (consumed) return (int)consumed;
@@ -719,26 +718,26 @@ int audio_oss_write(struct task *task, struct task_file *file,
         if (state->tail_bytes) {
             uint32_t need = frame_bytes - state->tail_bytes;
             uint32_t take = count - consumed < need ? count - consumed : need;
-            memcpy(state->tail + state->tail_bytes, input + consumed, take);
+            __builtin_memcpy(state->tail + state->tail_bytes, input + consumed, take);
             state->tail_bytes += take;
             consumed += take;
             if (state->tail_bytes < frame_bytes) break;
-            memcpy(frame, state->tail, frame_bytes);
+            __builtin_memcpy(frame, state->tail, frame_bytes);
             state->tail_bytes = 0;
         } else if (count - consumed < frame_bytes) {
-            memcpy(state->tail, input + consumed, count - consumed);
+            __builtin_memcpy(state->tail, input + consumed, count - consumed);
             state->tail_bytes = count - consumed;
             consumed = count;
             break;
         } else {
-            memcpy(frame, input + consumed, frame_bytes);
+            __builtin_memcpy(frame, input + consumed, frame_bytes);
             frame_from_input = frame_bytes;
         }
         uint32_t status = RELIEFOS_AUDIO_STATUS_OK;
         long written = driver_manager_audio_write_bound(state->legacy_generation,frame,frame_bytes,&status);
         if (written < 0) {
             if (!state->tail_bytes) {
-                memcpy(state->tail, frame, frame_bytes);
+                __builtin_memcpy(state->tail, frame, frame_bytes);
                 state->tail_bytes = frame_bytes;
             }
             if (!consumed && status == RELIEFOS_AUDIO_STATUS_WOULD_BLOCK &&
@@ -747,13 +746,13 @@ int audio_oss_write(struct task *task, struct task_file *file,
             break;
         }
         if (written == 0 && status == RELIEFOS_AUDIO_STATUS_WOULD_BLOCK) {
-            memcpy(state->tail, frame, frame_bytes);
+            __builtin_memcpy(state->tail, frame, frame_bytes);
             state->tail_bytes = frame_bytes;
             if (!consumed && (file->flags & RELIEFOS_O_NONBLOCK)) return -EAGAIN;
             break;
         }
         if ((uint32_t)written < frame_bytes) {
-            memcpy(state->tail, frame + written, frame_bytes - (uint32_t)written);
+            __builtin_memcpy(state->tail, frame + written, frame_bytes - (uint32_t)written);
             state->tail_bytes = frame_bytes - (uint32_t)written;
         }
         if (frame_from_input) consumed += frame_from_input;
@@ -838,7 +837,7 @@ int audio_oss_ioctl(struct task *task, struct task_file *file,
             struct task_file blocking = *file;
             blocking.flags &= ~RELIEFOS_O_NONBLOCK;
             uint8_t silence[256];
-            memset(silence, state->format == AFMT_U8 ? 0x80 : 0, sizeof(silence));
+            __builtin_memset(silence, state->format == AFMT_U8 ? 0x80 : 0, sizeof(silence));
             while (padding) {
                 uint32_t count = padding < sizeof(silence) ? padding : sizeof(silence);
                 int written = audio_oss_write(task, &blocking, silence, count);

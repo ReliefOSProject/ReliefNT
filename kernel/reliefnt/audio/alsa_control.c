@@ -3,7 +3,6 @@
 #include <linux/poll.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <string.h>
 
 #include <sound/asound.h>
 #include <sound/tlv.h>
@@ -81,7 +80,7 @@ static int audio_control_resolve(struct audio_control_file *file,
         struct audio_control_info info;
         ret = audio_card_control_info(file->card, i, &info);
         if (ret) return ret;
-        if (!strncmp((const char *)id->name, info.name, SNDRV_CTL_ELEM_ID_NAME_MAXLEN)) {
+        if (!__builtin_strncmp((const char *)id->name, info.name, SNDRV_CTL_ELEM_ID_NAME_MAXLEN)) {
             *control = i;
             return 0;
         }
@@ -96,7 +95,7 @@ static int audio_control_fill_id(struct audio_control_file *file, uint32_t contr
     struct audio_control_info info;
     int ret = audio_card_control_info(file->card, control, &info);
     if (ret) return ret;
-    memset(id, 0, sizeof(*id));
+    __builtin_memset(id, 0, sizeof(*id));
     id->numid = control + 1;
     id->iface = SNDRV_CTL_ELEM_IFACE_MIXER;
     audio_control_copy_name(id->name, info.name, sizeof(id->name));
@@ -200,7 +199,7 @@ int audio_alsa_control_ioctl(struct audio_control_file *file, uint64_t request,
         int ret = audio_card_identity(file->card, &identity);
         if (ret) return ret;
         struct snd_ctl_card_info *info = argument;
-        memset(info, 0, sizeof(*info));
+        __builtin_memset(info, 0, sizeof(*info));
         int card = audio_card_index(file->card);
         if (card < 0) return -ENODEV;
         info->card = card;
@@ -267,7 +266,7 @@ int audio_alsa_control_ioctl(struct audio_control_file *file, uint64_t request,
         if (ret) return ret;
         unsigned int requested_item = request_info.value.enumerated.item;
         struct snd_ctl_elem_info *out = argument;
-        memset(out, 0, sizeof(*out));
+        __builtin_memset(out, 0, sizeof(*out));
         ret = audio_control_fill_id(file, control, &out->id);
         if (ret) return ret;
         out->count = info.count;
@@ -435,7 +434,7 @@ int audio_control_read_file(struct audio_control_file *file, void *buffer,
     event.data.elem.mask = mask;
     ret = audio_control_fill_id(file, control, &event.data.elem.id);
     if (ret) return ret;
-    memcpy(buffer, &event, sizeof(event));
+    __builtin_memcpy(buffer, &event, sizeof(event));
     return (int)sizeof(event);
 }
 
@@ -575,7 +574,7 @@ int audio_control_ioctl(struct task *task, struct task_file *file,
         if (tlv->length >= 16u &&
             (payload < address || !user_range_writable(payload,16u))) return -EFAULT;
         int ret = audio_alsa_control_ioctl(file->audio_control_file,request,tlv);
-        if (!ret) memcpy((void *)(uintptr_t)payload,tlv->tlv,16u);
+        if (!ret) __builtin_memcpy((void *)(uintptr_t)payload,tlv->tlv,16u);
         return ret; /* Linux leaves the header's capacity unchanged. */
     }
     if (request == SNDRV_CTL_IOCTL_ELEM_LIST) {
