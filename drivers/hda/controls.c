@@ -2,7 +2,6 @@
 
 #include <linux/errno.h>
 #include <stddef.h>
-#include <string.h>
 
 #define HDA_VERB_GET_PIN_SENSE 0xf09u
 #define HDA_VERB_SET_UNSOLICITED_RESPONSE 0x708u
@@ -372,7 +371,7 @@ int hda_controls_init(struct hda_controls *controls, struct hda_codec *codec,
 {
     if (!controls || !codec || !codec->nodes ||
         (!speaker_route && !speaker_pin)) return -EINVAL;
-    memset(controls, 0, sizeof(*controls));
+    __builtin_memset(controls, 0, sizeof(*controls));
     for(unsigned n=0;n<5u;n++)controls->control_index[n]=n;
     controls->codec = codec;
     controls->speaker_route = speaker_route;
@@ -420,7 +419,7 @@ int hda_controls_init(struct hda_controls *controls, struct hda_codec *codec,
 void hda_controls_destroy(struct hda_controls *controls)
 {
     if (!controls) return;
-    memset(controls, 0, sizeof(*controls));
+    __builtin_memset(controls, 0, sizeof(*controls));
 }
 
 /** @brief Return the fixed registration-order control count.
@@ -447,7 +446,7 @@ int hda_controls_info(const struct hda_controls *controls, uint32_t control,
 {
     if (!controls || !info || control >= hda_controls_count(controls))
         return -EINVAL;
-    memset(info, 0, sizeof(*info));
+    __builtin_memset(info, 0, sizeof(*info));
     info->id = control;
     uint32_t caps = hda_controls_output_caps(controls);
     if ((control==HDA_CONTROL_PLAYBACK_VOLUME || control==HDA_CONTROL_PLAYBACK_MUTE) &&
@@ -525,7 +524,7 @@ static int hda_controls_read_locked(struct hda_controls *controls, uint32_t cont
 {
     if (!controls || !value || control >= hda_controls_count(controls))
         return -EINVAL;
-    memset(value, 0, sizeof(*value));
+    __builtin_memset(value, 0, sizeof(*value));
     if (control == HDA_CONTROL_PLAYBACK_VOLUME ||
         control == HDA_CONTROL_PLAYBACK_MUTE) {
         if (!controls->playback_amp_nid) return -ENODEV;

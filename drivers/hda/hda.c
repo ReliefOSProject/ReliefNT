@@ -1,7 +1,6 @@
 #include "hda.h"
 #include <linux/errno.h>
 #include <stddef.h>
-#include <string.h>
 
 #define HDA_MODULE_CONTROLLERS 16u
 #define HDA_MODULE_CARDS 16u

@@ -3,7 +3,6 @@
 #include <linux/poll.h>
 #include <linux/soundcard.h>
 #include <stdint.h>
-#include <string.h>
 
 #include <reliefnt/audio.h>
 #include <reliefnt/sched.h>
@@ -308,7 +307,7 @@ int audio_mixer_ioctl_file(struct audio_mixer_file *file, uint64_t request, void
         struct audio_card_identity identity;
         int ret = audio_card_identity(file->card, &identity);
         if (ret) return ret;
-        memset(info, 0, sizeof(*info));
+        __builtin_memset(info, 0, sizeof(*info));
         for (uint32_t i = 0; i + 1 < sizeof(info->id) && identity.id[i]; ++i) info->id[i] = identity.id[i];
         for (uint32_t i = 0; i + 1 < sizeof(info->name) && identity.name[i]; ++i) info->name[i] = identity.name[i];
         return 0;

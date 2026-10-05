@@ -1,7 +1,6 @@
 /* Registry-backed Linux sound namespace; no disk or MMIO access. */
 #include <reliefnt/audio.h>
 #include <reliefnt/storage.h>
-#include <string.h>
 
 /* storage_audio.c is also compiled directly by the focused devfs fixture,
  * where storage_state.c (the normal owner of storage_copy_text) is not

@@ -1,7 +1,6 @@
 #include <limits.h>
 #include <sound/asound.h>
 #include <stddef.h>
-#include <string.h>
 
 #include <linux/errno.h>
 #include <linux/time.h>
@@ -151,8 +150,8 @@ static void audio_pcm_silence_locked(struct audio_pcm *pcm)
     if (first > bytes) first = bytes;
     int sample = pcm->selected.format == AUDIO_FORMAT_U8 ? 0x80 : 0;
     uint8_t *buffer = audio_pcm_buffer(pcm);
-    memset(buffer + offset, sample, first);
-    if (bytes > first) memset(buffer, sample, bytes - first);
+    __builtin_memset(buffer + offset, sample, first);
+    if (bytes > first) __builtin_memset(buffer, sample, bytes - first);
     pcm->silence_covered += frames;
     __atomic_thread_fence(__ATOMIC_RELEASE);
 }
@@ -322,7 +321,7 @@ static void audio_pcm_reset_locked(struct audio_pcm *pcm)
     pcm->silence_covered = 0;
     pcm->error = 0;
     pcm->wake_seq++;
-    memset(audio_pcm_buffer(pcm), pcm->selected.format == AUDIO_FORMAT_U8 ? 0x80 : 0,
+    __builtin_memset(audio_pcm_buffer(pcm), pcm->selected.format == AUDIO_FORMAT_U8 ? 0x80 : 0,
            pcm->dma.bytes);
     audio_pcm_publish_control_locked(pcm);
 }
@@ -1229,8 +1228,8 @@ static void audio_pcm_drain_tail_locked(struct audio_pcm *pcm)
     uint8_t *buffer = audio_pcm_buffer(pcm);
     uint64_t first = ring_bytes - offset;
     if (first > bytes) first = bytes;
-    memset(buffer + offset, silence, (size_t)first);
-    if (bytes > first) memset(buffer, silence, (size_t)(bytes - first));
+    __builtin_memset(buffer + offset, silence, (size_t)first);
+    if (bytes > first) __builtin_memset(buffer, silence, (size_t)(bytes - first));
     __atomic_thread_fence(__ATOMIC_RELEASE);
 }
 
@@ -1340,8 +1339,8 @@ static void audio_pcm_copy_in(struct audio_pcm *pcm, uint64_t offset,
     uint32_t first = pcm->dma.bytes - start;
     if (first > bytes) first = bytes;
     uint8_t *buffer = audio_pcm_buffer(pcm);
-    memcpy(buffer + start, source, first);
-    if (first != bytes) memcpy(buffer, source + first, bytes - first);
+    __builtin_memcpy(buffer + start, source, first);
+    if (first != bytes) __builtin_memcpy(buffer, source + first, bytes - first);
 }
 
 static void audio_pcm_copy_out(const struct audio_pcm *pcm, uint64_t offset,
@@ -1351,8 +1350,8 @@ static void audio_pcm_copy_out(const struct audio_pcm *pcm, uint64_t offset,
     uint32_t first = pcm->dma.bytes - start;
     if (first > bytes) first = bytes;
     const uint8_t *buffer = audio_pcm_const_buffer(pcm);
-    memcpy(target, buffer + start, first);
-    if (first != bytes) memcpy(target + first, buffer, bytes - first);
+    __builtin_memcpy(target, buffer + start, first);
+    if (first != bytes) __builtin_memcpy(target + first, buffer, bytes - first);
 }
 
 /** @brief Transfer complete frames through the configured interleaved DMA ring.

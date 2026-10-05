@@ -1,6 +1,5 @@
 #include <limits.h>
 #include <stddef.h>
-#include <string.h>
 
 #include <linux/errno.h>
 #include <reliefnt/audio.h>
@@ -66,28 +65,28 @@ static int audio_alsa_mask_any(const struct snd_mask *mask)
 static int audio_alsa_mask_formats(struct snd_mask *mask, uint64_t capabilities)
 {
     struct snd_mask original = *mask;
-    memset(mask, 0, sizeof(*mask));
+    __builtin_memset(mask, 0, sizeof(*mask));
     for (size_t i = 0; i < sizeof(audio_alsa_formats) / sizeof(audio_alsa_formats[0]); ++i)
         if ((capabilities & audio_alsa_formats[i].capability) != 0)
             mask->bits[audio_alsa_formats[i].number / 32u] |=
                 1u << (audio_alsa_formats[i].number % 32u);
     for (size_t word = 0; word < sizeof(mask->bits) / sizeof(mask->bits[0]); ++word)
         mask->bits[word] &= original.bits[word];
-    return memcmp(&original, mask, sizeof(original)) != 0;
+    return __builtin_memcmp(&original, mask, sizeof(original)) != 0;
 }
 
 /** @brief Replace the access mask with the two supported interleaved modes. */
 static int audio_alsa_mask_access(struct snd_mask *mask)
 {
     struct snd_mask original = *mask;
-    memset(mask, 0, sizeof(*mask));
+    __builtin_memset(mask, 0, sizeof(*mask));
     mask->bits[SNDRV_PCM_ACCESS_MMAP_INTERLEAVED / 32u] |=
         1u << (SNDRV_PCM_ACCESS_MMAP_INTERLEAVED % 32u);
     mask->bits[SNDRV_PCM_ACCESS_RW_INTERLEAVED / 32u] |=
         1u << (SNDRV_PCM_ACCESS_RW_INTERLEAVED % 32u);
     for (size_t word = 0; word < sizeof(mask->bits) / sizeof(mask->bits[0]); ++word)
         mask->bits[word] &= original.bits[word];
-    return memcmp(&original, mask, sizeof(original)) != 0;
+    return __builtin_memcmp(&original, mask, sizeof(original)) != 0;
 }
 
 /** @brief Propagate actual per-format subformats in both directions.
@@ -116,7 +115,7 @@ static int audio_alsa_subformats(struct snd_pcm_hw_params *params,
         if (!supported) formats->bits[format->number/32u] &= ~(1u << (format->number%32u));
         candidates |= supported;
     }
-    memset(subs, 0, sizeof(*subs));
+    __builtin_memset(subs, 0, sizeof(*subs));
     subs->bits[0] = candidates;
     return candidates && audio_alsa_mask_any(formats) ? 0 : -EINVAL;
 }
@@ -376,8 +375,8 @@ int audio_alsa_refine(struct audio_pcm *pcm, struct snd_pcm_hw_params *params)
                                      SNDRV_PCM_HW_PARAM_BUFFER_TIME)) {
             return -EINVAL;
         }
-        if (!memcmp(previous.masks,params->masks,sizeof(params->masks)) &&
-            !memcmp(previous.intervals,params->intervals,sizeof(params->intervals))) break;
+        if (!__builtin_memcmp(previous.masks,params->masks,sizeof(params->masks)) &&
+            !__builtin_memcmp(previous.intervals,params->intervals,sizeof(params->intervals))) break;
         /* Bound hostile refinement requests; reject rather than returning an
          * unstable constraint set. Normal integer geometry converges rapidly. */
         if (pass >= 127u) {
@@ -389,11 +388,11 @@ int audio_alsa_refine(struct audio_pcm *pcm, struct snd_pcm_hw_params *params)
     params->cmask = 0;
     for (unsigned int i = 0;
          i <= SNDRV_PCM_HW_PARAM_LAST_MASK - SNDRV_PCM_HW_PARAM_FIRST_MASK; ++i)
-        if (memcmp(&original.masks[i], &params->masks[i], sizeof(params->masks[i])) != 0)
+        if (__builtin_memcmp(&original.masks[i], &params->masks[i], sizeof(params->masks[i])) != 0)
             params->cmask |= 1u << (SNDRV_PCM_HW_PARAM_FIRST_MASK + i);
     for (unsigned int i = 0;
          i <= SNDRV_PCM_HW_PARAM_LAST_INTERVAL - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL; ++i)
-        if (memcmp(&original.intervals[i], &params->intervals[i],
+        if (__builtin_memcmp(&original.intervals[i], &params->intervals[i],
                    sizeof(params->intervals[i])) != 0)
             params->cmask |= 1u << (SNDRV_PCM_HW_PARAM_FIRST_INTERVAL + i);
     params->rmask = 0;
@@ -504,7 +503,7 @@ static int audio_alsa_status(struct audio_pcm *pcm, struct snd_pcm_status *statu
     struct audio_pcm_status snapshot;
     int ret = audio_pcm_status(pcm, &snapshot);
     if (ret) return ret;
-    memset(status, 0, sizeof(*status));
+    __builtin_memset(status, 0, sizeof(*status));
     status->state = (snd_pcm_state_t)snapshot.state;
     status->appl_ptr = snapshot.appl_ptr;
     status->hw_ptr = snapshot.hw_ptr;
@@ -531,7 +530,7 @@ static int audio_alsa_status(struct audio_pcm *pcm, struct snd_pcm_status *statu
 static void audio_alsa_sync_status(const struct audio_pcm_status *snapshot,
                                    struct __snd_pcm_mmap_status *status)
 {
-    memset(status, 0, sizeof(*status));
+    __builtin_memset(status, 0, sizeof(*status));
     status->state = (snd_pcm_state_t)snapshot->state;
     status->hw_ptr = snapshot->hw_ptr;
     status->tstamp.tv_sec = snapshot->tstamp.tv_sec;

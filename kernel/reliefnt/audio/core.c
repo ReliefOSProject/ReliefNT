@@ -1,5 +1,4 @@
 #include <stddef.h>
-#include <string.h>
 #include <sound/asound.h>
 #include <linux/errno.h>
 #include <reliefnt/audio.h>
@@ -844,13 +843,13 @@ int audio_card_pcm_info(uint32_t card, struct snd_pcm_info *info)
     if (ret) return ret;
     int ordinal = audio_card_index(card);
     if (ordinal < 0) return -ENODEV;
-    memset(info,0,sizeof(*info));
+    __builtin_memset(info,0,sizeof(*info));
     info->device = device;
     info->stream = direction;
     info->card = ordinal;
-    memcpy(info->id,identity.id,sizeof(identity.id));
-    memcpy(info->name,identity.name,sizeof(info->name)-1u);
-    memcpy(info->subname,"subdevice #0",sizeof("subdevice #0"));
+    __builtin_memcpy(info->id,identity.id,sizeof(identity.id));
+    __builtin_memcpy(info->name,identity.name,sizeof(info->name)-1u);
+    __builtin_memcpy(info->subname,"subdevice #0",sizeof("subdevice #0"));
     info->dev_class = SNDRV_PCM_CLASS_GENERIC;
     info->dev_subclass = SNDRV_PCM_SUBCLASS_GENERIC_MIX;
     info->subdevices_count = info->subdevices_avail = 1;
