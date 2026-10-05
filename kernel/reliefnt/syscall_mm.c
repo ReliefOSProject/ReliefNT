@@ -102,6 +102,28 @@ static struct task_vma *task_vma_free_slot(struct task *task)
 }
 
 /**
+ * Find a free VMA slot without retaining a pointer across metadata growth.
+ * @param task User task whose VMA store is searched.
+ * @param index_out Receives the stable VMA slot index.
+ * @return Zero on success or a negative errno when the store cannot grow.
+ */
+static int task_vma_free_slot_index(struct task *task, uint32_t *index_out)
+{
+    if (!task || !index_out) return -RELIEFOS_EINVAL;
+    uint32_t capacity = sched_task_vma_capacity(task);
+    for (uint32_t i = 0; i < capacity; ++i) {
+        struct task_vma *vma = sched_task_vma_at(task, i);
+        if (vma && !vma->used) {
+            *index_out = i;
+            return 0;
+        }
+    }
+    if (!sched_task_vma_at(task, capacity)) return -RELIEFOS_ENOMEM;
+    *index_out = capacity;
+    return 0;
+}
+
+/**
  * Task vma attrs match.
  * @param vma Value supplied by the caller.
  * @param prot Value supplied by the caller.
@@ -1701,18 +1723,26 @@ int64_t syscall_mm_map_sysv_shm(struct task *task, uint64_t address, uint64_t le
     uint64_t end = start + length;
     if (!remap && !task_user_pages_free(task, start, end)) return -RELIEFOS_EINVAL;
     if (!task_address_space_can_map(task, start, end)) return -RELIEFOS_ENOMEM;
-    /* Allocate the metadata and every page table before replacing any mapping. */
-    struct task_vma *slot = task_vma_free_slot(task);
+    /* Reserve the metadata slot by index; SHM_REMAP may grow vma_extra. */
+    uint32_t slot_index;
+    if (task_vma_free_slot_index(task, &slot_index) < 0) return -RELIEFOS_ENOMEM;
+    struct task_vma *slot = sched_task_vma_at(task, slot_index);
     if (!slot) return -RELIEFOS_ENOMEM;
     slot->used = 0xffffffffu;
     if (!address_space_prepare_user_range(sched_task_as(task), start, end)) {
-        *slot = (struct task_vma){0};
+        slot = sched_task_vma_at(task, slot_index);
+        if (slot) *slot = (struct task_vma){0};
         return -RELIEFOS_ENOMEM;
     }
     if (remap) {
         /* The reservation is outside the range, so munmap never clears it. */
         int ret = (int)syscall_mm_munmap(start, length);
-        if (ret) { *slot = (struct task_vma){0}; return ret; }
+        slot = sched_task_vma_at(task, slot_index);
+        if (ret) {
+            if (slot) *slot = (struct task_vma){0};
+            return ret;
+        }
+        if (!slot) return -RELIEFOS_ENOMEM;
     }
     uint64_t page_flags = RELIEFNT_PAGE_SHARED;
     if (prot & LINUX_PROT_WRITE) page_flags |= RELIEFNT_PAGE_WRITABLE;
@@ -1725,9 +1755,15 @@ int64_t syscall_mm_map_sysv_shm(struct task *task, uint64_t address, uint64_t le
                                          physical, page_flags)) {
             mm_free_page(physical);
             task_unmap_pages(task, start, start + mapped);
-            *slot = (struct task_vma){0};
+            slot = sched_task_vma_at(task, slot_index);
+            if (slot) *slot = (struct task_vma){0};
             return -RELIEFOS_ENOMEM;
         }
+    }
+    slot = sched_task_vma_at(task, slot_index);
+    if (!slot) {
+        task_unmap_pages(task, start, end);
+        return -RELIEFOS_ENOMEM;
     }
     *slot = (struct task_vma){.used = 1, .start = start, .end = end,
         .prot = prot, .max_prot = max_prot,
