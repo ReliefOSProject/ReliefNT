@@ -486,11 +486,11 @@ static int userland_load_task_image_locked(struct task *task, const struct task 
             console_printf("[reliefnt] failed to map executable %s\n", task->name);
             return ret;
         }
-        task->program_break_base = loaded.program_break;
-        if (!task->program_break_base) {
-            task->program_break_base = (loaded.high_vaddr + loaded.load_bias + 4095ULL) & ~4095ULL;
+        sched_task_mm(task)->program_break_base = loaded.program_break;
+        if (!sched_task_mm(task)->program_break_base) {
+            sched_task_mm(task)->program_break_base = (loaded.high_vaddr + loaded.load_bias + 4095ULL) & ~4095ULL;
         }
-        task->program_break = task->program_break_base;
+        sched_task_mm(task)->program_break = sched_task_mm(task)->program_break_base;
         task->flags &= ~TASK_FLAG_PENDING_LOAD;
     } else if (task->image && task->image_len) {
         if (!elf64_load_address_space(sched_task_as(task), task->image, task->image_len, &loaded)) {
@@ -1031,8 +1031,8 @@ int userland_exec_current_node(const char *path, const struct storage_node *held
     task->entry = prepared->entry;
     task->stack_top = prepared->stack_top;
     task->stack_low = prepared->stack_low;
-    task->program_break_base = prepared->program_break_base;
-    task->program_break = prepared->program_break;
+    sched_task_mm(task)->program_break_base = sched_task_mm(prepared)->program_break_base;
+    sched_task_mm(task)->program_break = sched_task_mm(prepared)->program_break;
     task->loader_state = prepared->loader_state;
     sched_copy_task_exec_params(task, argc, argv, envc, envp, data, data_len);
     /* POSIX execve preserves ignored signals but resets caught dispositions. */

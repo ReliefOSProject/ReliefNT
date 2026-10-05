@@ -198,10 +198,6 @@ struct task_process_state {
     /* CPUs on which this task may execute. A zero mask is treated as all
      * discovered CPUs for compatibility with older task initializers. */
     uint64_t affinity_mask;
-    /* Linux brk(2) state; the break is process-wide and starts at the end of
-     * the executable's writable data segment. */
-    uint64_t program_break_base;
-    uint64_t program_break;
     uint32_t mlockall_flags;
 };
 
@@ -211,6 +207,9 @@ struct task_address_space_state {
     struct task_vma *vma_extra;
     uint32_t vma_extra_count;
     uint32_t vma_extra_capacity;
+    /* Linux brk(2) state belongs to the address space, shared by CLONE_VM. */
+    uint64_t program_break_base;
+    uint64_t program_break;
     uint32_t references;
     uint64_t initial_stack_top;
     uint64_t initial_stack_low;
@@ -494,8 +493,6 @@ struct task {
             uint64_t cpu_ticks;
             int32_t priority;
             uint64_t affinity_mask;
-            uint64_t program_break_base;
-            uint64_t program_break;
             uint32_t mlockall_flags;
         };
     };
@@ -507,6 +504,8 @@ struct task {
             struct task_vma *vma_extra;
             uint32_t vma_extra_count;
             uint32_t vma_extra_capacity;
+            uint64_t program_break_base;
+            uint64_t program_break;
         };
     };
     union {

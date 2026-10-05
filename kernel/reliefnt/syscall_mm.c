@@ -1154,6 +1154,7 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
 int64_t syscall_mm_brk(uint64_t requested)
 {
     struct task *task = sched_current_task();
+    struct task_address_space_state *mm;
     uint64_t base;
     uint64_t current;
     uint64_t old_page;
@@ -1161,8 +1162,9 @@ int64_t syscall_mm_brk(uint64_t requested)
     int64_t mapped;
 
     if (!task || task->kind != TASK_KIND_USER) return -RELIEFOS_EINVAL;
-    base = task->program_break_base;
-    current = task->program_break;
+    mm = sched_task_mm(task);
+    base = mm->program_break_base;
+    current = mm->program_break;
     if (!base) return current;
     if (!requested) return (int64_t)current;
     /* Linux reports the unchanged break when the requested extension cannot
@@ -1173,6 +1175,11 @@ int64_t syscall_mm_brk(uint64_t requested)
     old_page = align_up_page(current);
     new_page = align_up_page(requested);
     if (new_page > old_page) {
+        /* MAP_FIXED intentionally replaces mappings. brk(2) must first reject
+         * collisions so an adjacent mmap cannot be destroyed by heap growth. */
+        if (!task_user_pages_free(task, old_page, new_page)) {
+            return (int64_t)current;
+        }
         mapped = syscall_mm_mmap(old_page, new_page - old_page,
                                  LINUX_PROT_READ | LINUX_PROT_WRITE,
                                  LINUX_MAP_PRIVATE | LINUX_MAP_FIXED |
@@ -1183,7 +1190,7 @@ int64_t syscall_mm_brk(uint64_t requested)
             return (int64_t)current;
         }
     }
-    task->program_break = requested;
+    mm->program_break = requested;
     return (int64_t)requested;
 }
 
