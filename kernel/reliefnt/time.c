@@ -266,6 +266,9 @@ void time_on_tick(void)
     audio_service_tick();
     usb_poll();
     sched_on_tick();
+    if ((ticks % (RELIEFNT_TICK_HZ / 10ULL)) == 0) {
+        console_display_tick();
+    }
 }
 
 /**

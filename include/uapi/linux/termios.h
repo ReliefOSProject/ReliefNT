@@ -65,8 +65,11 @@ struct linux_termios2 {
 #define LINUX_CR1 0x200U
 #define LINUX_CR2 0x400U
 #define LINUX_TABDLY 0x1800U
+#define LINUX_TAB0 0x0000U
 #define LINUX_TAB1 0x800U
 #define LINUX_TAB2 0x1000U
+#define LINUX_TAB3 0x1800U
+#define LINUX_XTABS LINUX_TAB3
 #define LINUX_BSDLY 0x2000U
 #define LINUX_VTDLY 0x4000U
 #define LINUX_FFDLY 0x8000U

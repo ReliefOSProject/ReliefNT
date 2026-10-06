@@ -64,6 +64,7 @@ int input_pop(struct input_raw_event *event);
  * Raw input delivery to the desktop remains independent, so opening an
  * event device cannot consume the desktop compositor's input queue. */
 uint64_t input_evdev_cursor_now(void);
+int input_evdev_write(uint32_t device_kind, const void *buffer, uint32_t length);
 int input_evdev_read(uint32_t device_kind, uint64_t *cursor,
                      void *buffer, uint32_t length, uint64_t grab_token);
 int input_evdev_available(uint32_t device_kind, uint64_t cursor,
@@ -94,16 +95,24 @@ int input_evdev_available_vt(uint32_t device_kind, uint64_t cursor,
                              uint64_t grab_token, uint32_t number);
 /**
  * @brief Acquire or release EVIOCGRAB ownership for an event node.
- * @return New grab token on acquire/release, 0 when the device is invalid,
- *         or -16 when another client owns the exclusive grab.
+ * @param device_kind Keyboard or mouse device kind.
+ * @param current_token Stable open file description token, zero before its first grab.
+ * @param enable Non-zero requests the exclusive grab, zero drops it.
+ * @param pid Process requesting the change, used to name the new owner.
+ * @return Stable OFD token on acquire/release; negative EBUSY for any repeated
+ *         grab (including this OFD), or EINVAL for invalid device/nonowner release.
  */
 int64_t input_evdev_grab(uint32_t device_kind, uint64_t current_token,
                          int enable, uint32_t pid);
 /**
- * @brief Release a closing descriptor's grab ownership.
+ * @brief Release the grab owned by a closing open file description.
+ * @param device_kind Keyboard or mouse device kind.
+ * @param grab_token Token of the closing open file description.
+ *
+ * fork() and dup() share the token, so only the last close releases the grab;
+ * the identity of that closing process is irrelevant.
  */
-void input_evdev_release(uint32_t device_kind, uint64_t grab_token,
-                         uint32_t pid);
+void input_evdev_release(uint32_t device_kind, uint64_t grab_token);
 /**
  * @brief Copy the current key state bitmap for EVIOCGKEY.
  */

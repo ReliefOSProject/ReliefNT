@@ -10,6 +10,9 @@
 #include <reliefnt/futex.h>
 #include <reliefnt/wait.h>
 #include <reliefos/psf_font.h>
+#include <linux/vt.h>
+#include <linux/kd.h>
+#include <linux/input.h>
 
 #define PTY_MAX 32u
 #define VT_COUNT 6u
@@ -39,6 +42,8 @@ struct pty_session {
     uint8_t output[PTY_OUTPUT_CAP];
     uint32_t output_head;
     uint32_t output_tail;
+    /* OPOST processing tracks the cursor column for ONOCR/ONLRET/TAB3. */
+    uint32_t output_column;
     struct reliefos_pty_termios termios;
     struct linux_winsize winsize;
 };
@@ -48,6 +53,16 @@ static uint32_t next_generation;
 static uint8_t vt_ready;
 static uint32_t active_vt;
 static uint8_t vt_graphical[VT_COUNT];
+static struct vt_mode vt_modes[VT_COUNT];
+static int vt_keyboard_modes[VT_COUNT];
+static uint8_t vt_release_pending[VT_COUNT];
+static uint8_t vt_acquire_pending[VT_COUNT];
+/* VT hand-off signals are process-directed, never terminal job-control signals. */
+static uint32_t vt_controller_pid[VT_COUNT];
+static short vt_relsig[VT_COUNT];
+static short vt_acqsig[VT_COUNT];
+/* Destination of the hand-off currently held on a VT_PROCESS controller. */
+static uint32_t vt_switch_target;
 /* Set-1 modifier keys currently held, tracked per physical key so the derived
  * shift/ctrl/alt levels survive either side being released first. */
 #define CONSOLE_KEY_LSHIFT (1U << 0)
@@ -116,6 +131,10 @@ int pty_lookup_vt_path(const char *path, struct storage_node *node)
     if (!path || !vt_ready) return -2;
     for (i = 0; i < sizeof(prefix) - 1u; ++i) {
         if (path[i] != prefix[i]) return -2;
+    }
+    if (path[i] == '0') {
+        if (path[i + 1u]) return -2;
+        return pty_get_node(active_vt, node);
     }
     if (path[i] < '1' || path[i] > '6' || path[i + 1u]) return -2;
     return pty_get_node((uint32_t)(path[i] - '0'), node);
@@ -197,7 +216,17 @@ void pty_init(void)
     vt_display_generation = 0;
     vt_ready = 0;
     active_vt = 0;
-    for (uint32_t i = 0; i < VT_COUNT; ++i) vt_graphical[i] = 0;
+    for (uint32_t i = 0; i < VT_COUNT; ++i) {
+        vt_graphical[i] = 0;
+        vt_modes[i] = (struct vt_mode){ .mode = VT_AUTO };
+        vt_keyboard_modes[i] = K_XLATE;
+        vt_release_pending[i] = 0;
+        vt_acquire_pending[i] = 0;
+        vt_controller_pid[i] = 0;
+        vt_relsig[i] = 0;
+        vt_acqsig[i] = 0;
+    }
+    vt_switch_target = 0;
     console_modifier_keys = 0;
     console_shift_down = 0;
     console_ctrl_down = 0;
@@ -219,12 +248,247 @@ int pty_vt_init(void)
         if (id != (int32_t)number) return -12;
         sessions[number - 1u].console = 1;
         sessions[number - 1u].locked = 0;
+        vt_modes[number - 1u] = (struct vt_mode){ .mode = VT_AUTO };
+        vt_keyboard_modes[number - 1u] = K_XLATE;
+        vt_release_pending[number - 1u] = 0;
+        vt_acquire_pending[number - 1u] = 0;
+        vt_controller_pid[number - 1u] = 0;
+        vt_relsig[number - 1u] = 0;
+        vt_acqsig[number - 1u] = 0;
     }
+    vt_switch_target = 0;
     vt_display_generation = 1;
     active_vt = 1;
     vt_ready = 1;
     console_vt_activate(1, false);
     return 0;
+}
+
+/**
+ * @brief Deliver one process-directed VT controller signal, not a group broadcast.
+ * @param signal_number Registered signal; zero is an existence probe.
+ * @param process_id Controller TGID, zero if none.
+ * @return Zero if delivered, negative ESRCH or EINVAL when delivery fails.
+ */
+static int pty_vt_signal(short signal_number, uint32_t process_id)
+{
+    if (!process_id) return -3;
+    if (signal_number < 0 || (unsigned)signal_number >= KERNEL_SIGNAL_ACTION_MAX) return -22;
+    return sched_signal_user_process(process_id, (int)signal_number);
+}
+
+/** @brief Read the Linux VT ownership mode for a fixed console. */
+int pty_vt_get_mode(uint32_t pty_id, struct vt_mode *mode)
+{
+    if (!mode || !pty_vt_number(pty_id)) return -22;
+    *mode = vt_modes[pty_id - 1u];
+    return 0;
+}
+
+/**
+ * @brief Set the Linux VT ownership mode for a fixed console.
+ * @param pty_id Fixed terminal identifier, one through six.
+ * @param mode Requested mode; only VT_AUTO and VT_PROCESS are accepted.
+ * @return Zero on success, negative EINVAL for an invalid console or mode.
+ *
+ * Linux treats VT_ACKACQ as a one-shot VT_RELDISP acknowledgement and never as
+ * a persistent ownership mode, so it is rejected here.  Claiming VT_PROCESS
+ * records the caller's TGID and its release/acquire signals; returning
+ * to VT_AUTO releases the claim and abandons any hand-off in flight.
+ */
+int pty_vt_set_mode(uint32_t pty_id, const struct vt_mode *mode)
+{
+    uint32_t index;
+    if (!mode || !pty_vt_number(pty_id)) return -22;
+    if (mode->mode != VT_AUTO && mode->mode != VT_PROCESS) return -22;
+    index = pty_id - 1u;
+    vt_modes[index] = *mode;
+    vt_modes[index].frsig = 0; /* Linux ignores forced-release signals. */
+    if (vt_release_pending[index]) vt_switch_target = 0;
+    if (mode->mode == VT_AUTO) {
+        uint8_t owned_handoff = vt_release_pending[index];
+        vt_release_pending[index] = 0;
+        vt_acquire_pending[index] = 0;
+        vt_controller_pid[index] = 0;
+        vt_relsig[index] = 0;
+        vt_acqsig[index] = 0;
+        if (owned_handoff) vt_switch_target = 0;
+    } else {
+        const struct task *caller = sched_current_task();
+        vt_controller_pid[index] =
+            caller ? (caller->tgid ? caller->tgid : caller->pid) : 0;
+        vt_relsig[index] = mode->relsig;
+        vt_acqsig[index] = mode->acqsig;
+        vt_release_pending[index] = 0;
+        vt_acquire_pending[index] = 0;
+    }
+    console_printf("[reliefnt] VT mode vt=%u mode=%d relsig=%d acqsig=%d\n",
+                   pty_id, (int)vt_modes[index].mode, (int)vt_modes[index].relsig,
+                   (int)vt_modes[index].acqsig);
+    return 0;
+}
+
+/**
+ * @brief Return a fixed virtual console to its default Linux ownership state.
+ * @param pty_id Fixed terminal identifier, one through six.
+ * @return Zero on success, negative EINVAL for an invalid console.
+ *
+ * Controller recovery cancels the hand-off, restores KD_TEXT and the default
+ * keyboard mode. Plain VT_SETMODE(VT_AUTO) does not reset KD or keyboard mode.
+ */
+int pty_vt_reset_mode(uint32_t pty_id)
+{
+    uint32_t index;
+    uint8_t owned_handoff;
+    uint8_t was_graphical;
+    if (!pty_vt_number(pty_id)) return -22;
+    index = pty_id - 1u;
+    owned_handoff = vt_release_pending[index];
+    was_graphical = vt_graphical[index];
+    vt_modes[index] = (struct vt_mode){ .mode = VT_AUTO };
+    vt_release_pending[index] = 0;
+    vt_acquire_pending[index] = 0;
+    vt_controller_pid[index] = 0;
+    vt_relsig[index] = 0;
+    vt_acqsig[index] = 0;
+    if (owned_handoff) vt_switch_target = 0;
+    vt_graphical[index] = 0;
+    vt_keyboard_modes[index] = K_XLATE;
+    if (was_graphical && active_vt == pty_id) {
+        ++vt_display_generation;
+        input_set_graphical_vt(0);
+        console_vt_activate(pty_id, false);
+    }
+    (void)kernel_wait_queue_wake_all(&vt_waiters);
+    return 0;
+}
+
+/** @brief Read the Linux virtual-console keyboard translation mode. */
+int pty_vt_get_keyboard_mode(uint32_t pty_id, int *mode)
+{
+    if (!mode || !pty_vt_number(pty_id)) return -22;
+    *mode = vt_keyboard_modes[pty_id - 1u];
+    return 0;
+}
+
+/**
+ * @brief Set the Linux virtual-console keyboard translation mode.
+ * @param pty_id Fixed terminal identifier, one through six.
+ * @param mode One of K_RAW, K_XLATE, K_MEDIUMRAW, K_UNICODE or K_OFF.
+ * @return Zero on success, negative EINVAL for an invalid console or mode.
+ */
+int pty_vt_set_keyboard_mode(uint32_t pty_id, int mode)
+{
+    if (!pty_vt_number(pty_id) ||
+        (mode != K_RAW && mode != K_XLATE && mode != K_MEDIUMRAW &&
+         mode != K_UNICODE && mode != K_OFF))
+        return -22;
+    vt_keyboard_modes[pty_id - 1u] = mode;
+    return 0;
+}
+
+/**
+ * @brief Build the Linux VT_GETSTATE occupancy bitmap.
+ * @return Bit zero for tty0 and bit n for each referenced console n.
+ */
+uint32_t pty_vt_state_bitmap(void)
+{
+    uint32_t state = 1;
+    if (!vt_ready) return 0;
+    for (uint32_t i = 0; i < VT_COUNT; ++i) {
+        if (sched_pty_reference_count(i + 1u)) state |= 1u << (i + 1u);
+    }
+    return state;
+}
+
+/**
+ * @brief Return the first virtual console available for allocation.
+ * @return First unreferenced fixed console number, or -1 if none is available.
+ */
+int pty_vt_open_query(void)
+{
+    if (!vt_ready) return -1;
+    for (uint32_t i = 0; i < VT_COUNT; ++i) {
+        if (sched_pty_reference_count(i + 1u)) continue;
+        return (int)(i + 1u);
+    }
+    return -1;
+}
+
+/**
+ * @brief Commit a display switch and notify the destination controller.
+ * @param number Destination fixed VT number, one through six.
+ * @return Zero on success or negative EINVAL for an invalid console.
+ *
+ * Runs only once the outgoing VT_PROCESS controller has granted the release
+ * with VT_RELDISP(1), or immediately when the outgoing console is VT_AUTO.
+ */
+static int pty_vt_commit_switch(uint32_t number)
+{
+    if (!pty_vt_id(number)) return -22;
+    if (active_vt && active_vt <= VT_COUNT) vt_release_pending[active_vt - 1u] = 0;
+    vt_switch_target = 0;
+    ++vt_display_generation;
+    active_vt = number;
+    /* A grabbed graphical client can consume modifier releases while the
+     * display is away. Do not carry stale Ctrl/Alt state into the next VT;
+     * evdev consumers receive their independent modifier snapshot below. */
+    console_modifier_keys = 0;
+    console_shift_down = 0;
+    console_ctrl_down = 0;
+    console_alt_down = 0;
+    console_printf("[reliefnt] VT active %u graphics=%d\n", number,
+                   vt_graphical[number - 1u] != 0);
+    input_set_graphical_vt(vt_graphical[number - 1u] ? number : 0);
+    console_vt_activate(number, vt_graphical[number - 1u] != 0);
+    (void)kernel_wait_queue_wake_all(&vt_waiters);
+    if (vt_modes[number - 1u].mode == VT_PROCESS) {
+        /* The new controller keeps VT_PROCESS; the pending flag is cleared by
+         * its own VT_RELDISP(VT_ACKACQ), never by rewriting the mode. */
+        vt_acquire_pending[number - 1u] = 1;
+        if (pty_vt_signal(vt_acqsig[number - 1u], vt_controller_pid[number - 1u]) != 0) {
+            (void)pty_vt_reset_mode(number);
+        } else {
+            console_printf("[reliefnt] VT acquire signal sent for vt=%u\n", number);
+        }
+    }
+    return 0;
+}
+
+/**
+ * @brief Release or acknowledge a virtual-console hand-off.
+ * @param pty_id Fixed terminal identifier of the acknowledging controller.
+ * @param request Zero refuses a pending release; any nonzero value grants it.
+ * @return Zero on success, negative EINVAL for invalid mode/console or a
+ *         no-pending request other than VT_ACKACQ. Never returns EAGAIN.
+ *
+ * Linux uses three VT_RELDISP requests for a VT_PROCESS owner: zero refuses a
+ * pending release and leaves the active VT, graphics mode and input routing
+ * untouched; one completes the switch and signals the destination controller;
+ * With no release pending, Linux ignores VT_ACKACQ even if repeated or inactive.
+ */
+int pty_vt_release_display(uint32_t pty_id, int request)
+{
+    uint32_t index;
+    uint32_t target;
+    if (!pty_vt_number(pty_id)) return -22;
+    index = pty_id - 1u;
+    if (vt_modes[index].mode != VT_PROCESS) return -22;
+    if (!vt_release_pending[index] || !vt_switch_target) {
+        if (request != VT_ACKACQ) return -22;
+        vt_acquire_pending[index] = 0;
+        return 0;
+    }
+    if (request == 0) {
+        /* VT_FALSE: refuse the release and keep the display as it is. */
+        vt_release_pending[index] = 0;
+        vt_switch_target = 0;
+        return 0;
+    }
+    /* VT_TRUE: the controller has finished using its display. */
+    target = vt_switch_target;
+    vt_release_pending[index] = 0;
+    return pty_vt_commit_switch(target);
 }
 
 /** @brief Resolve a fixed VT after initialization.
@@ -258,20 +522,46 @@ uint64_t pty_vt_generation(void)
     return vt_display_generation;
 }
 
-/** @brief Activate and repaint a VT under the execution transaction.
- * @param number Virtual console number.
- * @return Zero on success or negative EINVAL. */
+/**
+ * @brief Request a display switch to a fixed virtual console.
+ * @param number Destination virtual console number, one through six.
+ * @return Zero on success or negative EINVAL for an invalid console.
+ *
+ * When the active console is owned by a VT_PROCESS controller this is a
+ * request only: the display, graphics mode and input routing stay where they
+ * are, the controller receives its registered release signal, and the switch is
+ * committed later by VT_RELDISP(1).  A VT_AUTO console hands over immediately.
+ */
 int pty_vt_switch(uint32_t number)
 {
+    uint32_t old_vt;
     if (!pty_vt_id(number)) return -22;
-    if (active_vt != number) {
-        ++vt_display_generation;
-        active_vt = number;
-        input_set_graphical_vt(vt_graphical[number - 1u] ? number : 0);
-        console_vt_activate(number, vt_graphical[number - 1u] != 0);
-        (void)kernel_wait_queue_wake_all(&vt_waiters);
+    if (active_vt == number) return 0;
+    old_vt = active_vt;
+    console_printf("[reliefnt] VT switch request %u -> %u\n", old_vt, number);
+    if (old_vt && vt_modes[old_vt - 1u].mode == VT_PROCESS) {
+        /* Xorg may request the same switch after the kernel has already
+         * observed Ctrl+Alt+Fn.  Keep one in-flight hand-off and one signal;
+         * a different target cannot replace the controller's pending grant. */
+        if (vt_release_pending[old_vt - 1u]) {
+            return vt_switch_target == number ? 0 : -16;
+        }
+        /* Two-phase hand-off: hold the display and ask the controller. */
+        vt_release_pending[old_vt - 1u] = 1;
+        vt_switch_target = number;
+        if (pty_vt_signal(vt_relsig[old_vt - 1u], vt_controller_pid[old_vt - 1u]) == 0) {
+            console_printf("[reliefnt] VT release signal sent for vt=%u\n", old_vt);
+            return 0;
+        }
+        (void)pty_vt_reset_mode(old_vt);
     }
-    return 0;
+    /* Linux ignores VT_AUTO switches while the outgoing display is graphics. */
+    if (old_vt && vt_graphical[old_vt - 1u]) {
+        console_printf("[reliefnt] VT switch refused: vt=%u owns the display in graphics\n",
+                       old_vt);
+        return 0;
+    }
+    return pty_vt_commit_switch(number);
 }
 
 /**
@@ -295,6 +585,7 @@ int64_t pty_vt_wait_active(uint32_t number)
 int pty_vt_set_graphics(uint32_t pty_id, int enabled)
 {
     if (!pty_vt_number(pty_id) || (enabled != 0 && enabled != 1)) return -22;
+    console_printf("[reliefnt] VT graphics vt=%u enabled=%d\n", pty_id, enabled);
     vt_graphical[pty_id - 1u] = (uint8_t)enabled;
     if (active_vt == pty_id) {
         ++vt_display_generation;
@@ -411,12 +702,13 @@ static void console_update_modifier(uint32_t held, uint8_t pressed)
  * @param pressed Non-zero for a make code, zero for a break code.
  * @return Nothing.
  *
- * Modifier tracking and the diagnostic escape hatch run for every event
- * because they neither enqueue bytes nor signal a process. Translating the key
- * to terminal bytes and feeding the console PTY's line discipline happens only
- * while the console owns the keyboard, so a GUI session cannot also drive the
- * console's foreground group. Called by the deferred input consumer under the
- * kernel execution transaction after VT initialization, never by a keyboard ISR.
+ * Keyboard translation is independent of KD display mode. OFF and raw modes
+ * suppress cooked shortcuts; raw streams include modifiers and supported E0
+ * extensions. The deferred input consumer still forwards the physical
+ * Ctrl+Alt+Fn chord while a graphical evdev grab is active, so this handler
+ * can complete a VT switch without leaking printable keys to the console.
+ * It runs after VT initialization under the kernel execution transaction,
+ * never from a keyboard ISR.
  */
 void pty_console_key_event(uint8_t keycode, uint8_t pressed)
 {
@@ -424,21 +716,73 @@ void pty_console_key_event(uint8_t keycode, uint8_t pressed)
     struct pty_session *session = find_session(pty_id);
     char bytes[8];
     uint32_t length;
+    int keyboard_mode;
+    int modifier = 1;
+    if (!session || !pty_vt_number(pty_id)) return;
     switch (keycode) {
-    case 42: console_update_modifier(CONSOLE_KEY_LSHIFT, pressed); return;
-    case 54: console_update_modifier(CONSOLE_KEY_RSHIFT, pressed); return;
-    case 58: return; /* Caps Lock: the input layer already applied the state. */
-    case 29: console_update_modifier(CONSOLE_KEY_LCTRL, pressed); return;
-    case 116: console_update_modifier(CONSOLE_KEY_RCTRL, pressed); return;
-    case 56: console_update_modifier(CONSOLE_KEY_LALT, pressed); return;
-    case 115: console_update_modifier(CONSOLE_KEY_RALT, pressed); return;
-    default: break;
+    case 42: console_update_modifier(CONSOLE_KEY_LSHIFT, pressed); break;
+    case 54: console_update_modifier(CONSOLE_KEY_RSHIFT, pressed); break;
+    case 29: console_update_modifier(CONSOLE_KEY_LCTRL, pressed); break;
+    case 116: console_update_modifier(CONSOLE_KEY_RCTRL, pressed); break;
+    case 56: console_update_modifier(CONSOLE_KEY_LALT, pressed); break;
+    case 115: console_update_modifier(CONSOLE_KEY_RALT, pressed); break;
+    case 58: break;
+    default: modifier = 0; break;
     }
-    if (vt_ready && pressed && console_ctrl_down && console_alt_down &&
+    keyboard_mode = vt_keyboard_modes[pty_id - 1u];
+    /* VT switching is handled by the console controller before keyboard
+     * translation. K_RAW/K_MEDIUMRAW must not make Ctrl+Alt+F1..F6 vanish
+     * when an evdev client still owns the device grab. */
+    if (vt_ready && (keyboard_mode == K_XLATE ||
+                     vt_graphical[pty_id - 1u]) &&
+        pressed && console_ctrl_down && console_alt_down &&
         keycode >= 59u && keycode <= 64u) {
         (void)pty_vt_switch((uint32_t)keycode - 58u);
         return;
     }
+    if (keyboard_mode == K_OFF) return;
+    if (keyboard_mode == K_RAW || keyboard_mode == K_MEDIUMRAW) {
+        uint8_t code = keycode;
+        uint8_t extended = 0;
+        if (keyboard_mode == K_RAW) {
+            switch (keycode) {
+            case 112: code = 0x5b; extended = 1; break;
+            case 113: code = 0x5c; extended = 1; break;
+            case 114: code = 0x5d; extended = 1; break;
+            case 115: code = 0x38; extended = 1; break;
+            case 116: code = 0x1d; extended = 1; break;
+            /* The existing normalized path treats these as navigation keys. */
+            case 71: case 72: case 73: case 75: case 77:
+            case 79: case 80: case 81: case 82: case 83:
+                extended = 1; break;
+            default: break;
+            }
+        } else {
+            switch (keycode) {
+            case 71: code = KEY_HOME; break; case 72: code = KEY_UP; break;
+            case 73: code = KEY_PAGEUP; break; case 75: code = KEY_LEFT; break;
+            case 77: code = KEY_RIGHT; break; case 79: code = KEY_END; break;
+            case 80: code = KEY_DOWN; break; case 81: code = KEY_PAGEDOWN; break;
+            case 82: code = KEY_INSERT; break; case 83: code = KEY_DELETE; break;
+            case 112: code = KEY_LEFTMETA; break;
+            case 113: code = KEY_RIGHTMETA; break;
+            case 114: code = KEY_COMPOSE; break;
+            case 115: code = KEY_RIGHTALT; break;
+            case 116: code = KEY_RIGHTCTRL; break;
+            default: break;
+            }
+        }
+        length = 0;
+        if (extended) bytes[length++] = (char)0xe0;
+        if (keyboard_mode == K_MEDIUMRAW && code >= 128) {
+            bytes[length++] = (char)(pressed ? 0 : 0x80);
+            bytes[length++] = (char)((code >> 7) | 0x80);
+            bytes[length++] = (char)(code | 0x80);
+        } else bytes[length++] = (char)(code | (pressed ? 0 : 0x80));
+        (void)pty_write_input(session->owner_pid, pty_id, bytes, length);
+        return;
+    }
+    if (modifier) return;
     /* Keep the diagnostic escape hatch on the logging console. */
     if (pressed && keycode == 88 && console_ctrl_down &&
         console_alt_down && console_shift_down) {
@@ -446,8 +790,7 @@ void pty_console_key_event(uint8_t keycode, uint8_t pressed)
         console_write_len(test_message, sizeof(test_message) - 1U);
         return;
     }
-    if (pty_vt_graphical_active()) return;
-    if (!pressed || !session || !console_key_to_bytes(keycode, bytes, &length)) {
+    if (!pressed || !console_key_to_bytes(keycode, bytes, &length)) {
         return;
     }
     /* Feed through the same canonical/ISIG handling used by PTY hosts. */
@@ -831,11 +1174,94 @@ uint32_t pty_output_available(uint32_t pty_id)
 }
 
 /**
+ * @brief Expand one slave output byte through OPOST processing into out; returns bytes emitted.
+ *
+ * Mirrors the Linux n_tty output rules for the flags that rewrite bytes:
+ * ONLCR, OCRNL, ONOCR, ONLRET, OLCUC and TAB3 (XTABS). The tracked cursor
+ * column feeds ONOCR/ONLRET/TAB3; without OPOST the byte passes through
+ * untouched and the column stays frozen, as on Linux.
+ *
+ * @param session PTY session whose oflag and column state apply.
+ * @param byte Output byte as written by the slave.
+ * @param out Destination of at most 8 translated bytes.
+ * @return Number of bytes placed in out; zero when the byte is suppressed.
+ */
+static uint32_t pty_output_post_process(struct pty_session *session, char byte, char out[8])
+{
+    uint32_t oflag = session->termios.c_oflag;
+    uint32_t column = session->output_column;
+    uint32_t count = 0;
+
+    if ((oflag & LINUX_OPOST) == 0) {
+        out[0] = byte;
+        return 1;
+    }
+    switch (byte) {
+    case '\n':
+        if (oflag & LINUX_ONLCR) {
+            out[count++] = '\r';
+            column = 0;
+        }
+        out[count++] = '\n';
+        if (oflag & LINUX_ONLRET) {
+            column = 0;
+        }
+        break;
+    case '\r':
+        if ((oflag & LINUX_ONOCR) && column == 0) {
+            break;
+        }
+        if (oflag & LINUX_OCRNL) {
+            out[count++] = '\n';
+            if (oflag & LINUX_ONLRET) {
+                column = 0;
+            }
+        } else {
+            out[count++] = '\r';
+            column = 0;
+        }
+        break;
+    case '\t':
+        if ((oflag & LINUX_TABDLY) == LINUX_TAB3) {
+            uint32_t spaces = 8u - (column & 7u);
+            while (spaces--) {
+                out[count++] = ' ';
+                ++column;
+            }
+        } else {
+            out[count++] = '\t';
+            column += 8u - (column & 7u);
+        }
+        break;
+    case '\b':
+        if (column) {
+            --column;
+        }
+        out[count++] = '\b';
+        break;
+    default:
+        if ((oflag & LINUX_OLCUC) && byte >= 'a' && byte <= 'z') {
+            byte = (char)(byte - 'a' + 'A');
+        }
+        out[count++] = byte;
+        if ((uint8_t)byte >= 0x20u && byte != 0x7fu) {
+            ++column;
+        }
+        break;
+    }
+    session->output_column = column;
+    return count;
+}
+
+/**
  * @brief Queue up to length bytes of output for the reader; returns bytes written, or -5 if the session is invalid.
  */
 int64_t pty_write_output(uint32_t pty_id, const char *buffer, uint32_t length)
 {
     struct pty_session *session = find_session(pty_id);
+    char staged[512];
+    uint32_t staged_length = 0;
+
     if (!session) {
         return -5;
     }
@@ -845,18 +1271,38 @@ int64_t pty_write_output(uint32_t pty_id, const char *buffer, uint32_t length)
     if (!buffer || length == 0) {
         return 0;
     }
-    if (session->console) {
-        console_vt_write(pty_id, buffer, length);
-        return (int64_t)length;
-    }
-    if (!session->output_reported) {
+    if (!session->console && !session->output_reported) {
         session->output_reported = 1;
         console_printf("[reliefnt] pty=%u first slave output len=%u\n",
                        pty_id, length);
     }
-    return (int64_t)ring_push(session->output, PTY_OUTPUT_CAP,
-                              &session->output_head, &session->output_tail,
-                              buffer, length);
+    for (uint32_t i = 0; i < length; ++i) {
+        char out[8];
+        uint32_t count = pty_output_post_process(session, buffer[i], out);
+        for (uint32_t j = 0; j < count; ++j) {
+            if (staged_length == sizeof(staged)) {
+                if (session->console) {
+                    console_vt_write(pty_id, staged, staged_length);
+                } else {
+                    (void)ring_push(session->output, PTY_OUTPUT_CAP,
+                                    &session->output_head, &session->output_tail,
+                                    staged, staged_length);
+                }
+                staged_length = 0;
+            }
+            staged[staged_length++] = out[j];
+        }
+    }
+    if (staged_length) {
+        if (session->console) {
+            console_vt_write(pty_id, staged, staged_length);
+        } else {
+            (void)ring_push(session->output, PTY_OUTPUT_CAP,
+                            &session->output_head, &session->output_tail,
+                            staged, staged_length);
+        }
+    }
+    return (int64_t)length;
 }
 
 /**
@@ -1059,7 +1505,11 @@ int pty_detach_controlling(uint32_t pty_id, uint32_t caller_pid)
         sched_clear_controlling_pty(pty_id);
         session->process_session = 0;
         session->foreground_pgid = 0;
-        if (pty_vt_number(pty_id)) (void)pty_vt_set_graphics(pty_id, 0);
+        if (pty_vt_number(pty_id) &&
+            (!vt_controller_pid[pty_id - 1u] || vt_controller_pid[pty_id - 1u] == leader)) {
+            (void)pty_vt_set_graphics(pty_id, 0);
+            (void)pty_vt_reset_mode(pty_id);
+        }
         if (group) {
             sched_signal_kernel_group(group, 1);
             sched_signal_kernel_group(group, 18);
@@ -1070,6 +1520,11 @@ int pty_detach_controlling(uint32_t pty_id, uint32_t caller_pid)
 
 void pty_process_session_exit(uint32_t tgid)
 {
+    /* The last-thread exit hook runs for every TGID, not just session leaders. */
+    for (uint32_t i = 0; i < VT_COUNT; ++i) {
+        if (vt_modes[i].mode == VT_PROCESS && vt_controller_pid[i] == tgid)
+            (void)pty_vt_reset_mode(i + 1u);
+    }
     struct task *leader = sched_find(tgid);
     if (!leader || leader->process_session != tgid) return;
     uint32_t old = leader->tty_old_pgrp;
@@ -1081,7 +1536,11 @@ void pty_process_session_exit(uint32_t tgid)
         sched_clear_controlling_pty(pty_id);
         session->process_session = 0;
         session->foreground_pgid = 0;
-        if (pty_vt_number(pty_id)) (void)pty_vt_set_graphics(pty_id, 0);
+        if (pty_vt_number(pty_id) &&
+            (!vt_controller_pid[pty_id - 1u] || vt_controller_pid[pty_id - 1u] == tgid)) {
+            (void)pty_vt_set_graphics(pty_id, 0);
+            (void)pty_vt_reset_mode(pty_id);
+        }
         if (foreground) sched_signal_kernel_group(foreground, 1);
     } else if (old) {
         sched_signal_kernel_group(old, 1);

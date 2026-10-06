@@ -25,7 +25,8 @@ void userland_loader_unlock(uint64_t flags);
 void userland_init(const struct boot_info *boot);
 void userland_enter_first(void) __attribute__((noreturn));
 /**
- * @brief End the current user process with code, freeing its resources.
+ * @brief Terminate the current user task and let the scheduler own the single exit log event.
+ * @param code Process exit status passed to the scheduler.
  */
 void userland_process_exit(uint64_t code);
 /**

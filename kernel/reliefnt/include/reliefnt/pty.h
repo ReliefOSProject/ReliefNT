@@ -9,6 +9,7 @@
 #include <reliefnt/storage.h>
 #include <reliefos/pty_abi.h>
 #include <linux/tty.h>
+#include <linux/vt.h>
 
 int pty_lookup_path(const char *path, struct storage_node *node);
 /** @brief Resolve one of the six fixed Linux virtual consoles.
@@ -42,9 +43,13 @@ uint32_t pty_vt_active(void);
  * @return Generation incremented by visible VT switches and mode activations.
  */
 uint64_t pty_vt_generation(void);
-/** @brief Activate and repaint a VT under the execution transaction.
+/** @brief Request activation of a VT under the execution transaction.
  * @param number Virtual console number.
- * @return Zero on success or negative EINVAL. */
+ * @return Zero on success or negative EINVAL.
+ *
+ * A VT_PROCESS console only receives its release signal here; the display is
+ * committed later by VT_RELDISP(1).
+ */
 int pty_vt_switch(uint32_t number);
 /**
  * @brief Block until the selected VT is active; caller holds the execution lock.
@@ -64,13 +69,50 @@ int pty_vt_graphical_active(void);
  * @param pty_id Fixed terminal identifier.
  * @return Nonzero if graphical, zero if text or invalid. */
 int pty_vt_graphical(uint32_t pty_id);
+/** @brief Read or update Linux VT ownership state. */
+int pty_vt_get_mode(uint32_t pty_id, struct vt_mode *mode);
+/**
+ * @brief Set the Linux VT ownership mode for a fixed console.
+ * @param pty_id Fixed terminal identifier, one through six.
+ * @param mode Requested mode; only VT_AUTO and VT_PROCESS are accepted.
+ * @return Zero on success, negative EINVAL for an invalid console or mode.
+ */
+int pty_vt_set_mode(uint32_t pty_id, const struct vt_mode *mode);
+/**
+ * @brief Release a console back to the default Linux text/ownership state.
+ * @param pty_id Fixed terminal identifier, one through six.
+ * @return Zero on success, negative EINVAL for an invalid console.
+ */
+int pty_vt_reset_mode(uint32_t pty_id);
+/** @brief Read or update Linux keyboard translation state. */
+int pty_vt_get_keyboard_mode(uint32_t pty_id, int *mode);
+int pty_vt_set_keyboard_mode(uint32_t pty_id, int mode);
+/**
+ * @brief Build the Linux VT_GETSTATE occupancy bitmap for the fixed consoles.
+ * @return Bit zero for tty0; bit n for console n with open references.
+ */
+uint32_t pty_vt_state_bitmap(void);
+/** @brief Find the first fixed console with no open references.
+ * @return Console number or -1 (an ioctl output value, not errno). */
+int pty_vt_open_query(void);
+/**
+ * @brief Release or acknowledge a Linux VT_PROCESS display hand-off.
+ * @param pty_id Fixed terminal identifier of the acknowledging controller.
+ * @param request Zero refuses a pending release, any nonzero value grants it.
+ * @return Zero on success; negative EINVAL for invalid console/mode or a
+ *         no-pending request other than VT_ACKACQ. ACKACQ may be repeated.
+ */
+int pty_vt_release_display(uint32_t pty_id, int request);
 /**
  * @brief Offer one physical keyboard event to the console terminal.
  * @param keycode Set-1 make/break code after 0xe0 extension normalization.
  * @param pressed Non-zero for a make code, zero for a break code.
  *
- * Modifier tracking is unconditional; terminal bytes reach the active VT
- * only while its display mode is KD_TEXT.
+ * Called only when the console input handler is not evdev-grabbed. Keyboard
+ * mode is independent of KD display mode: K_OFF suppresses tty bytes and
+ * shortcuts, raw modes encode supported scan/key codes including modifiers
+ * without cooked shortcuts, and K_XLATE/K_UNICODE translate. All byte payloads
+ * pass through termios; raw keyboard mode alone does not disable ICANON/ISIG.
  */
 void pty_console_key_event(uint8_t keycode, uint8_t pressed);
 /**
@@ -169,6 +211,9 @@ int pty_detach_controlling(uint32_t pty_id, uint32_t caller_pid);
 void pty_open_controlling(uint32_t pty_id, uint32_t caller_pid, int readable);
 /* signal_number 0 checks a write (TOSTOP), 21 a read, 22 a state change. */
 int64_t pty_check_change(uint32_t pty_id, uint32_t caller_pid, int signal_number);
+/** @brief Recover VTs controlled by the exiting process, then hang up its session.
+ * @param tgid Process whose final thread has exited; need not be a session leader.
+ * Unrelated VT controllers are preserved during session teardown. */
 void pty_process_session_exit(uint32_t tgid);
 /**
  * @brief Reclaim a hung-up PTY session when no descriptor still references it.

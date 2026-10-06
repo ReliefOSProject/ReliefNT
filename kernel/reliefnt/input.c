@@ -19,6 +19,7 @@ struct input_evdev_record {
     uint64_t sequence;
     uint32_t device_kind;
     uint32_t graphical_vt;
+    uint64_t grab_token;
     struct input_event event;
 };
 
@@ -39,6 +40,21 @@ static struct kernel_spinlock input_lock = KERNEL_SPINLOCK_INIT;
 static uint32_t input_graphical_vt;
 static struct { uint8_t keycode, pressed; } pending_keys[INPUT_QUEUE_CAP];
 static uint32_t pending_key_head, pending_key_tail;
+
+/**
+ * @brief Identify the physical keys needed for a Linux VT switch chord.
+ * @param keycode Set-1 make/break code.
+ * @return Non-zero for Ctrl, Alt or F1-F6, including break events.
+ *
+ * A graphical evdev grab must not prevent the console from seeing the VT
+ * escape chord. Printable keys remain exclusively owned by the grab holder.
+ */
+static int input_vt_chord_key(uint8_t keycode)
+{
+    return keycode == 29u || keycode == 116u ||
+           keycode == 56u || keycode == 115u ||
+           (keycode >= 59u && keycode <= 64u);
+}
 
 /**
  * @brief Deliver one physical-key event from a keyboard driver to the kernel.
@@ -86,7 +102,15 @@ void input_process_pending(void)
         pending_key_tail = (pending_key_tail + 1u) % INPUT_QUEUE_CAP;
         kernel_spin_unlock_irqrestore(&input_lock, flags);
         input_push_key(keycode, pressed);
-        pty_console_key_event(keycode, pressed);
+        kernel_spin_lock_irqsave(&input_lock, &flags);
+        /* EVIOCGRAB belongs to the graphical consumer, but the open
+         * description can outlive a VT release.  A stale grab must not make
+         * the text VT lose its console keyboard; the graphical origin filter
+         * still keeps those text-VT records out of Xorg. */
+        int grabbed = evdev_grab_token[0] != 0 && input_graphical_vt != 0;
+        kernel_spin_unlock_irqrestore(&input_lock, flags);
+        if (!grabbed || input_vt_chord_key(keycode))
+            pty_console_key_event(keycode, pressed);
     }
 }
 
@@ -131,6 +155,7 @@ static void evdev_publish(uint32_t device_kind, uint16_t type, uint16_t code,
         .sequence = evdev_next_sequence,
         .device_kind = device_kind,
         .graphical_vt = input_graphical_vt,
+        .grab_token = evdev_grab_token[evdev_device_index(device_kind)],
         .event = {
             .time_sec = (int64_t)(microseconds / 1000000ULL),
             .time_usec = (int64_t)(microseconds % 1000000ULL),
@@ -139,9 +164,7 @@ static void evdev_publish(uint32_t device_kind, uint16_t type, uint16_t code,
             .value = value,
         },
     };
-    if (type == EV_KEY) {
-        evdev_set_key(code, value);
-    }
+    if (type == EV_KEY) evdev_set_key(code, value);
     ++evdev_next_sequence;
 }
 
@@ -380,6 +403,29 @@ uint64_t input_evdev_cursor_now(void)
     return cursor;
 }
 
+/** @brief Accept injected evdev records written to an input device.
+ * @param device_kind Keyboard or mouse device kind.
+ * @param buffer Complete struct input_event records.
+ * @param length Storage size in bytes.
+ * @return Bytes consumed, or negative errno.
+ */
+int input_evdev_write(uint32_t device_kind, const void *buffer, uint32_t length)
+{
+    const struct input_event *records = (const struct input_event *)buffer;
+    uint32_t count;
+    if (!buffer && length) return -14; /* EFAULT */
+    if (length % sizeof(*records) != 0) return -22; /* EINVAL */
+    count = length / sizeof(*records);
+    for (uint32_t i = 0; i < count; ++i) {
+        const struct input_event *event = &records[i];
+        if (event->type == EV_LED && event->code == LED_CAPSL) {
+            __atomic_store_n(&caps_lock_active, event->value != 0u,
+                             __ATOMIC_RELAXED);
+        }
+    }
+    return (int)length;
+}
+
 int input_evdev_read(uint32_t device_kind, uint64_t *cursor,
                      void *buffer, uint32_t length, uint64_t grab_token)
 {
@@ -404,9 +450,11 @@ int input_evdev_read_vt(uint32_t device_kind, uint64_t *cursor,
     uint32_t count = 0;
     uint64_t flags;
     if (!cursor || !buffer || length < sizeof(*events) ||
-        (length % sizeof(*events)) != 0 || index >= INPUT_EVDEV_DEVICES) {
+        index >= INPUT_EVDEV_DEVICES) {
         return -22;
     }
+    /* Linux read() semantics: deliver only whole events; a caller buffer that
+     * is not a multiple of the record size simply holds fewer events. */
     capacity = length / sizeof(*events);
     kernel_spin_lock_irqsave(&input_lock, &flags);
     if (!evdev_present[index]) {
@@ -430,10 +478,9 @@ int input_evdev_read_vt(uint32_t device_kind, uint64_t *cursor,
             (number && record->graphical_vt != number)) {
             continue;
         }
-        /* EVIOCGRAB is exclusive: non-owning descriptors advance over events
-         * but do not observe them while another client holds the grab. */
-        if (evdev_grab_token[index] == 0 ||
-            (grab_token && grab_token == evdev_grab_token[index])) {
+        /* Route at publication time: release must not expose grabbed events
+         * to other clients that did not read/poll while the grab was held. */
+        if (!record->grab_token || record->grab_token == grab_token) {
             events[count++] = record->event;
         }
     }
@@ -476,8 +523,7 @@ int input_evdev_available_vt(uint32_t device_kind, uint64_t cursor,
             &evdev_queue[cursor % INPUT_EVDEV_QUEUE_CAP];
         if (record->sequence == cursor && record->device_kind == device_kind &&
             (!number || record->graphical_vt == number) &&
-            (evdev_grab_token[index] == 0 ||
-             (grab_token && grab_token == evdev_grab_token[index]))) {
+            (!record->grab_token || record->grab_token == grab_token)) {
             available = 1;
             break;
         }
@@ -492,44 +538,43 @@ int64_t input_evdev_grab(uint32_t device_kind, uint64_t current_token,
 {
     uint32_t index = evdev_device_index(device_kind);
     uint64_t flags;
+    int64_t token;
     if (index >= INPUT_EVDEV_DEVICES || !pid) return -22;
     kernel_spin_lock_irqsave(&input_lock, &flags);
     if (!enable) {
-        if (current_token && current_token == evdev_grab_token[index] &&
-            evdev_grab_owner[index] == pid) {
-            evdev_grab_owner[index] = 0;
-            evdev_grab_token[index] = 0;
+        /* The open file description owns the grab, so dropping it is keyed on
+         * the token: a forked child closing the shared description must be
+         * able to release it even though it never called EVIOCGRAB itself. */
+        if (!current_token || current_token != evdev_grab_token[index]) {
+            kernel_spin_unlock_irqrestore(&input_lock, flags);
+            return -22; /* EINVAL, including release without any grab */
         }
+        evdev_grab_owner[index] = 0;
+        evdev_grab_token[index] = 0;
         kernel_spin_unlock_irqrestore(&input_lock, flags);
-        return 0;
+        return (int64_t)current_token; /* OFD identity outlives its active grab. */
     }
-    if (evdev_grab_token[index] != 0 &&
-        evdev_grab_token[index] != current_token) {
+    if (evdev_grab_token[index] != 0) {
         kernel_spin_unlock_irqrestore(&input_lock, flags);
         return -16; /* EBUSY */
     }
-    if (current_token && current_token == evdev_grab_token[index] &&
-        evdev_grab_owner[index] == pid) {
-        kernel_spin_unlock_irqrestore(&input_lock, flags);
-        return (int64_t)current_token;
-    }
     if (evdev_next_grab_token == 0) evdev_next_grab_token = 1;
-    evdev_grab_token[index] = evdev_next_grab_token;
+    evdev_grab_token[index] = current_token ? current_token : evdev_next_grab_token++;
     evdev_grab_owner[index] = pid;
-    ++evdev_next_grab_token;
+    token = (int64_t)evdev_grab_token[index];
     kernel_spin_unlock_irqrestore(&input_lock, flags);
-    return (int64_t)evdev_grab_token[index];
+    return token;
 }
 
-void input_evdev_release(uint32_t device_kind, uint64_t grab_token,
-                         uint32_t pid)
+void input_evdev_release(uint32_t device_kind, uint64_t grab_token)
 {
     uint32_t index = evdev_device_index(device_kind);
     uint64_t flags;
     if (index >= INPUT_EVDEV_DEVICES || !grab_token) return;
     kernel_spin_lock_irqsave(&input_lock, &flags);
-    if (evdev_grab_token[index] == grab_token &&
-        evdev_grab_owner[index] == pid) {
+    /* Only the matching open file description may release its grab; the
+     * closing process is irrelevant because fork()/dup() share the token. */
+    if (evdev_grab_token[index] == grab_token) {
         evdev_grab_token[index] = 0;
         evdev_grab_owner[index] = 0;
     }

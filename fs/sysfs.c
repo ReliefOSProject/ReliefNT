@@ -362,6 +362,31 @@ static int sys_walk(sys_visit visit, void *ctx)
         if ((ret = sys_emit(visit, ctx, "/sys/class/graphics/fb0", A_LINK, 0,
                             "../../devices/virtual/graphics/fb0")))
             return ret;
+        /* The standard Linux PCI graphics mapping: fbdev helpers resolve the
+         * framebuffer through its owning display controller. */
+        for (uint32_t i = 0; i < pci_count; ++i) {
+            if (pci_devices[i].class_code != 0x03) continue;
+            sys_pci_path(path, "/sys/devices/pci0000:00/", i, "/graphics");
+            if ((ret = sys_emit(visit, ctx, path, A_DIR, i, 0))) return ret;
+            sys_pci_path(path, "/sys/devices/pci0000:00/", i, "/graphics/fb0");
+            if ((ret = sys_emit(visit, ctx, path, A_LINK, 0, "../../../virtual/graphics/fb0")))
+                return ret;
+            sys_pci_path(path, "/sys/bus/pci/devices/", i, "/graphics");
+            if ((ret = sys_emit(visit, ctx, path, A_DIR, i, 0))) return ret;
+            sys_pci_path(path, "/sys/bus/pci/devices/", i, "/graphics/fb0");
+            if ((ret = sys_emit(visit, ctx, path, A_LINK, 0, "../../../../virtual/graphics/fb0")))
+                return ret;
+            sys_pci_path(path, "/sys/bus/pci/devices/", i, "/graphics:fb0");
+            if ((ret = sys_emit(visit, ctx, path, A_LINK, 0, "../../../../virtual/graphics/fb0")))
+                return ret;
+            sys_pci_path(path, "../../devices/pci0000:00/", i, "");
+            if ((ret = sys_emit(visit, ctx, "/sys/class/graphics/fb0/device", A_LINK, i, path)))
+                return ret;
+            if ((ret = sys_emit(visit, ctx, "/sys/class/graphics/fb0/device/subsystem", A_LINK, 0,
+                                "../../../../bus/pci")))
+                return ret;
+            break;
+        }
         if ((ret = sys_emit(visit, ctx, "/sys/class/drm/card0", A_LINK, 0,
                             "../../devices/virtual/drm/card0")))
             return ret;

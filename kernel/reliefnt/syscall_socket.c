@@ -847,6 +847,17 @@ short task_socket_poll(const struct task_file *file, short events)
 }
 
 /**
+ * @brief Returns the receive-generation counter used by edge-triggered epoll.
+ * @param file Open socket file description to inspect.
+ * @return Monotonic receive generation, or zero for non-UNIX sockets.
+ */
+uint64_t task_socket_event_generation(const struct task_file *file)
+{
+    struct unix_socket *socket = unix_from_file(file);
+    return socket ? socket->rx_written : 0;
+}
+
+/**
  * @brief Query queued receive bytes or update a socket OFD's nonblocking flag.
  * @param file Retained socket open file description.
  * @param request Native FIONREAD or FIONBIO request.
@@ -1647,6 +1658,10 @@ static int64_t unix_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
         server->peer_path_len = socket->path_len;
         for (unsigned i = 0; i < socket->path_len; ++i) server->peer_path[i] = socket->path[i];
         listener->pending[listener->pending_count++] = server->handle;
+        /* Listening sockets use the same receive generation as streams so an
+         * ET epoll waiter observes a second connection even when accept()
+         * and the next connect() happen between two readiness probes. */
+        ++listener->rx_written;
         (void)kernel_wait_queue_wake_one(&listener->wait_accept);
         (void)kernel_wait_queue_wake_one(&listener->wait_connect);
         return 0;

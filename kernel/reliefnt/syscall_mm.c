@@ -102,21 +102,25 @@ static struct task_vma *task_vma_free_slot(struct task *task)
 }
 
 /**
- * @brief Reserve empty VMA metadata using an index stable across array growth.
- * @param task Address space whose free slot is reserved under execution ownership.
- * @return Reserved slot index, or UINT32_MAX when metadata allocation fails.
+ * Find a free VMA slot without retaining a pointer across metadata growth.
+ * @param task User task whose VMA store is searched.
+ * @param index_out Receives the stable VMA slot index.
+ * @return Zero on success or a negative errno when the store cannot grow.
  */
-static uint32_t task_vma_reserve_slot(struct task *task)
+static int task_vma_free_slot_index(struct task *task, uint32_t *index_out)
 {
-    struct task_vma *slot = task_vma_free_slot(task);
-    if (!slot) return UINT32_MAX;
-    for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
-        if (sched_task_vma_at(task, i) == slot) {
-            *slot = (struct task_vma){.used = 0xffffffffu};
-            return i;
+    if (!task || !index_out) return -RELIEFOS_EINVAL;
+    uint32_t capacity = sched_task_vma_capacity(task);
+    for (uint32_t i = 0; i < capacity; ++i) {
+        struct task_vma *vma = sched_task_vma_at(task, i);
+        if (vma && !vma->used) {
+            *index_out = i;
+            return 0;
         }
     }
-    return UINT32_MAX;
+    if (!sched_task_vma_at(task, capacity)) return -RELIEFOS_ENOMEM;
+    *index_out = capacity;
+    return 0;
 }
 
 /**
@@ -1060,7 +1064,8 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                     return -RELIEFOS_EINVAL;
                 }
                 /* The reserved VRAM includes the final partial page. */
-                bytes = align_up_page((uint64_t)fb->pitch * fb->height);
+                bytes = align_up_page(fb->max_bytes ? fb->max_bytes
+                                                    : (uint64_t)fb->pitch * fb->height);
                 if (offset > bytes || mapped_len > bytes - offset) {
                     return -RELIEFOS_EINVAL;
                 }
@@ -1224,6 +1229,7 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
 int64_t syscall_mm_brk(uint64_t requested)
 {
     struct task *task = sched_current_task();
+    struct task_address_space_state *mm;
     uint64_t base;
     uint64_t current;
     uint64_t old_page;
@@ -1231,8 +1237,9 @@ int64_t syscall_mm_brk(uint64_t requested)
     int64_t mapped;
 
     if (!task || task->kind != TASK_KIND_USER) return -RELIEFOS_EINVAL;
-    base = task->program_break_base;
-    current = task->program_break;
+    mm = sched_task_mm(task);
+    base = mm->program_break_base;
+    current = mm->program_break;
     if (!base) return current;
     if (!requested) return (int64_t)current;
     /* Linux reports the unchanged break when the requested extension cannot
@@ -1243,6 +1250,11 @@ int64_t syscall_mm_brk(uint64_t requested)
     old_page = align_up_page(current);
     new_page = align_up_page(requested);
     if (new_page > old_page) {
+        /* MAP_FIXED intentionally replaces mappings. brk(2) must first reject
+         * collisions so an adjacent mmap cannot be destroyed by heap growth. */
+        if (!task_user_pages_free(task, old_page, new_page)) {
+            return (int64_t)current;
+        }
         mapped = syscall_mm_mmap(old_page, new_page - old_page,
                                  LINUX_PROT_READ | LINUX_PROT_WRITE,
                                  LINUX_MAP_PRIVATE | LINUX_MAP_FIXED |
@@ -1253,7 +1265,7 @@ int64_t syscall_mm_brk(uint64_t requested)
             return (int64_t)current;
         }
     }
-    task->program_break = requested;
+    mm->program_break = requested;
     return (int64_t)requested;
 }
 
@@ -1396,13 +1408,6 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
     struct task *task = sched_current_task();
     uint64_t mapped_len;
     uint64_t end;
-    struct task_vma *vma;
-    struct task_vma original;
-    struct task_vma *left = NULL;
-    struct task_vma *right = NULL;
-    uint32_t vma_index = UINT32_MAX;
-    uint32_t left_index = UINT32_MAX, right_index = UINT32_MAX;
-    uint64_t page_flags = 0;
     if (!task || task->kind != TASK_KIND_USER || (addr & (PAGE_SIZE - 1ULL))) {
         return -RELIEFOS_EINVAL;
     }
@@ -1415,91 +1420,112 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
         return -RELIEFOS_EINVAL;
     }
     end = addr + mapped_len;
-    vma = task_vma_containing(task, addr, end);
-    if (!vma) return -RELIEFOS_ENOMEM;
-    if (prot & ~vma->max_prot) {
-        return -RELIEFOS_EACCES;
-    }
-    original = *vma;
-    for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i)
-        if (sched_task_vma_at(task, i) == vma) { vma_index = i; break; }
-    if ((original.flags & TASK_VMA_FLAG_DEVICE) && !original.audio_pcm) {
-        if (addr != original.start || end != original.end || prot != original.prot)
+    /* Validate every page first. Linux permits mprotect to cover adjacent
+     * VMAs with different attributes, but rejects a range containing a hole. */
+    uint64_t cursor = addr;
+    uint32_t split_count = 0;
+    while (cursor < end) {
+        struct task_vma *vma = task_vma_containing(task, cursor, cursor + PAGE_SIZE);
+        if (!vma) return -RELIEFOS_ENOMEM;
+        if (prot & ~vma->max_prot) return -RELIEFOS_EACCES;
+        uint64_t piece_end = vma->end < end ? vma->end : end;
+        /* Non-audio device mappings accept only a whole-VMA no-op change. */
+        if ((vma->flags & TASK_VMA_FLAG_DEVICE) && !vma->audio_pcm &&
+            (cursor != vma->start || piece_end != vma->end || prot != vma->prot)) {
             return -RELIEFOS_EOPNOTSUPP;
-        return 0;
+        }
+        if (piece_end <= cursor) return -RELIEFOS_ENOMEM;
+        if (cursor > vma->start) ++split_count;
+        if (piece_end < vma->end) ++split_count;
+        cursor = piece_end;
     }
-    if (addr > original.start) {
-        left_index = task_vma_reserve_slot(task);
-        if (left_index == UINT32_MAX) {
+
+    /* Secure every split slot before changing PTEs. Adding slots may grow and
+     * relocate the VMA store, so keep no table pointers across this phase.
+     * If allocation fails, no page permissions or VMA metadata have changed. */
+    uint32_t free_slots = 0;
+    for (uint32_t i = 0; split_count && i < sched_task_vma_capacity(task); ++i) {
+        struct task_vma *slot = sched_task_vma_at(task, i);
+        if (slot && !slot->used) ++free_slots;
+    }
+    while (free_slots < split_count) {
+        if (!sched_task_vma_at(task, sched_task_vma_capacity(task))) {
             return -RELIEFOS_ENOMEM;
         }
+        ++free_slots;
     }
-    if (end < original.end) {
-        right_index = task_vma_reserve_slot(task);
-        if (right_index == UINT32_MAX) {
-            if (left_index != UINT32_MAX) {
-                task_vma_clear(sched_task_vma_at(task, left_index));
+
+    /* Apply the PTE change with each mapping's own device/cache attributes. */
+    cursor = addr;
+    while (cursor < end) {
+        struct task_vma *vma = task_vma_containing(task, cursor, cursor + PAGE_SIZE);
+        if (!vma) return -RELIEFOS_ENOMEM;
+        uint64_t piece_end = vma->end < end ? vma->end : end;
+        if ((vma->flags & TASK_VMA_FLAG_DEVICE) && !vma->audio_pcm) {
+            /* Validated as a whole-VMA no-op: leave device PTEs untouched. */
+            cursor = piece_end;
+            continue;
+        }
+        uint64_t page_flags = 0;
+        if (prot & LINUX_PROT_WRITE) page_flags |= RELIEFNT_PAGE_WRITABLE;
+        if (!(prot & LINUX_PROT_EXEC)) page_flags |= RELIEFNT_PAGE_NOEXEC;
+        if (prot == LINUX_PROT_NONE) page_flags |= RELIEFNT_PAGE_PROTNONE;
+        if (vma->flags & TASK_VMA_FLAG_DEVICE) page_flags |= RELIEFNT_PAGE_DEVICE;
+        for (uint64_t page = cursor; page < piece_end; page += PAGE_SIZE) {
+            if (address_space_user_page_phys(sched_task_as(task), page) &&
+                !address_space_protect_user_page(sched_task_as(task), page, page_flags)) {
+                return -RELIEFOS_EACCES;
             }
-            return -RELIEFOS_ENOMEM;
         }
+        cursor = piece_end;
     }
-    /* The optional suffix allocation can relocate both the original VMA
-     * and the reserved prefix. Reacquire them only after all growth. */
-    vma = sched_task_vma_at(task, vma_index);
-    left = left_index == UINT32_MAX ? NULL : sched_task_vma_at(task, left_index);
-    right = right_index == UINT32_MAX ? NULL : sched_task_vma_at(task, right_index);
-    if (prot & LINUX_PROT_WRITE) {
-        page_flags |= RELIEFNT_PAGE_WRITABLE;
-    }
-    if (!(prot & LINUX_PROT_EXEC)) {
-        page_flags |= RELIEFNT_PAGE_NOEXEC;
-    }
-    if (prot == LINUX_PROT_NONE) page_flags |= RELIEFNT_PAGE_PROTNONE;
-    if (vma->flags & TASK_VMA_FLAG_DEVICE) {
-        page_flags |= RELIEFNT_PAGE_DEVICE;
-    }
-    for (uint64_t page = addr; page < end; page += PAGE_SIZE) {
-        if (address_space_user_page_phys(sched_task_as(task), page) &&
-            !address_space_protect_user_page(sched_task_as(task), page, page_flags)) {
-            if (left) task_vma_clear(left);
-            if (right) task_vma_clear(right);
-            return -RELIEFOS_EACCES;
-        }
-    }
+
     /**
  * @brief A partial protection change needs independent VMA metadata. In particular, PT_GNU_RELRO protects only the GOT page while BSS in the same original load segment must remain writable and lazily mappable.
  */
-    if (addr > original.start) {
-        *left = original;
-        sysv_shm_vma_split(left);
-        storage_inode_retain(left->inode);
-        if (left->audio_pcm) (void)audio_pcm_mmap_retain(left->audio_pcm,
-                             (enum audio_pcm_mmap_region)left->audio_mmap_region);
-        left->end = addr;
-        if (left->audio_pcm) left->audio_mmap_length = left->end - left->start;
-    }
-    if (end < original.end) {
-        *right = original;
-        sysv_shm_vma_split(right);
-        storage_inode_retain(right->inode);
-        if (right->audio_pcm) (void)audio_pcm_mmap_retain(right->audio_pcm,
-                              (enum audio_pcm_mmap_region)right->audio_mmap_region);
-        right->start = end;
-        if (right->audio_pcm) right->audio_mmap_length = right->end - right->start;
-        if (right->flags & TASK_VMA_FLAG_FILE) {
-            right->file_offset += end - original.start;
+    cursor = addr;
+    while (cursor < end) {
+        struct task_vma *vma = task_vma_containing(task, cursor, cursor + PAGE_SIZE);
+        if (!vma) return -RELIEFOS_ENOMEM;
+        struct task_vma original = *vma;
+        uint64_t piece_end = original.end < end ? original.end : end;
+        if (cursor > original.start) {
+            struct task_vma *left = task_vma_free_slot(task);
+            if (!left) return -RELIEFOS_ENOMEM;
+            *left = original;
+            sysv_shm_vma_split(left);
+            storage_inode_retain(left->inode);
+            if (left->audio_pcm) (void)audio_pcm_mmap_retain(left->audio_pcm,
+                                 (enum audio_pcm_mmap_region)left->audio_mmap_region);
+            left->end = cursor;
+            if (left->audio_pcm) left->audio_mmap_length = left->end - left->start;
         }
-    }
-    *vma = original;
-    vma->start = addr;
-    vma->end = end;
-    if (vma->flags & TASK_VMA_FLAG_FILE) {
-        vma->file_offset += addr - original.start;
-    }
-    vma->prot = (uint32_t)prot;
-    if (vma->audio_pcm) {
-        vma->audio_mmap_length = end - addr;
-        vma->audio_mmap_prot = (uint32_t)prot;
+        if (piece_end < original.end) {
+            struct task_vma *right = task_vma_free_slot(task);
+            if (!right) return -RELIEFOS_ENOMEM;
+            *right = original;
+            sysv_shm_vma_split(right);
+            storage_inode_retain(right->inode);
+            if (right->audio_pcm) (void)audio_pcm_mmap_retain(right->audio_pcm,
+                                  (enum audio_pcm_mmap_region)right->audio_mmap_region);
+            right->start = piece_end;
+            if (right->audio_pcm) right->audio_mmap_length = right->end - right->start;
+            if (right->flags & TASK_VMA_FLAG_FILE) {
+                right->file_offset += piece_end - original.start;
+            }
+        }
+        *vma = original;
+        vma->start = cursor;
+        vma->end = piece_end;
+        if (vma->flags & TASK_VMA_FLAG_FILE) {
+            vma->file_offset += cursor - original.start;
+        }
+        vma->prot = (uint32_t)prot;
+        if (vma->audio_pcm) {
+            vma->audio_mmap_length = piece_end - cursor;
+            vma->audio_mmap_prot = (uint32_t)prot;
+        }
+        cursor = piece_end;
     }
     return 0;
 }
@@ -1544,8 +1570,14 @@ int64_t syscall_mm_munmap(uint64_t addr, uint64_t len)
             ++free_slots;
         }
     }
-    if (split_count > free_slots) {
-        return -RELIEFOS_ENOMEM;
+    /* Splits need a spare VMA entry each. The growable store extends on
+     * demand, so secure the slots before mutating anything instead of
+     * refusing whenever the fixed array happens to be full. */
+    while (split_count > free_slots) {
+        if (!sched_task_vma_at(task, sched_task_vma_capacity(task))) {
+            return -RELIEFOS_ENOMEM;
+        }
+        ++free_slots;
     }
     task_unmap_pages(task, start, end);
     for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
@@ -1691,18 +1723,26 @@ int64_t syscall_mm_map_sysv_shm(struct task *task, uint64_t address, uint64_t le
     uint64_t end = start + length;
     if (!remap && !task_user_pages_free(task, start, end)) return -RELIEFOS_EINVAL;
     if (!task_address_space_can_map(task, start, end)) return -RELIEFOS_ENOMEM;
-    /* Allocate the metadata and every page table before replacing any mapping. */
-    struct task_vma *slot = task_vma_free_slot(task);
+    /* Reserve the metadata slot by index; SHM_REMAP may grow vma_extra. */
+    uint32_t slot_index;
+    if (task_vma_free_slot_index(task, &slot_index) < 0) return -RELIEFOS_ENOMEM;
+    struct task_vma *slot = sched_task_vma_at(task, slot_index);
     if (!slot) return -RELIEFOS_ENOMEM;
     slot->used = 0xffffffffu;
     if (!address_space_prepare_user_range(sched_task_as(task), start, end)) {
-        *slot = (struct task_vma){0};
+        slot = sched_task_vma_at(task, slot_index);
+        if (slot) *slot = (struct task_vma){0};
         return -RELIEFOS_ENOMEM;
     }
     if (remap) {
         /* The reservation is outside the range, so munmap never clears it. */
         int ret = (int)syscall_mm_munmap(start, length);
-        if (ret) { *slot = (struct task_vma){0}; return ret; }
+        slot = sched_task_vma_at(task, slot_index);
+        if (ret) {
+            if (slot) *slot = (struct task_vma){0};
+            return ret;
+        }
+        if (!slot) return -RELIEFOS_ENOMEM;
     }
     uint64_t page_flags = RELIEFNT_PAGE_SHARED;
     if (prot & LINUX_PROT_WRITE) page_flags |= RELIEFNT_PAGE_WRITABLE;
@@ -1715,9 +1755,15 @@ int64_t syscall_mm_map_sysv_shm(struct task *task, uint64_t address, uint64_t le
                                          physical, page_flags)) {
             mm_free_page(physical);
             task_unmap_pages(task, start, start + mapped);
-            *slot = (struct task_vma){0};
+            slot = sched_task_vma_at(task, slot_index);
+            if (slot) *slot = (struct task_vma){0};
             return -RELIEFOS_ENOMEM;
         }
+    }
+    slot = sched_task_vma_at(task, slot_index);
+    if (!slot) {
+        task_unmap_pages(task, start, end);
+        return -RELIEFOS_ENOMEM;
     }
     *slot = (struct task_vma){.used = 1, .start = start, .end = end,
         .prot = prot, .max_prot = max_prot,

@@ -457,7 +457,7 @@ static void proc_task_stat(struct task *task, struct text_stream *s)
     values[32] = task->blocked_signals & 0x7fffffff;
     values[38] = task->parent_exit_signal;
     values[39] = task->last_cpu;
-    values[47] = task->program_break_base;
+    values[47] = mm->program_break_base;
     values[48] = mm->arg_start;
     values[49] = mm->arg_end;
     values[50] = mm->env_start;

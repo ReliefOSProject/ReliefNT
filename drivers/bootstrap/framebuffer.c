@@ -3,6 +3,7 @@
 #include <reliefnt/framebuffer.h>
 #include <reliefnt/pci.h>
 #include <reliefnt/port.h>
+#include "framebuffer_fifo.h"
 #include "svga/device.h"
 #include <generated/cjk_font.h>
 
@@ -91,11 +92,14 @@ static int framebuffer_range_valid(uint64_t start, uint64_t bytes);
 #define VMWARE_SVGA_REG_FB_OFFSET 14u
 #define VMWARE_SVGA_REG_FB_MAX_SIZE 15u
 #define VMWARE_SVGA_REG_FB_SIZE 16u
+#define VMWARE_SVGA_REG_CAPABILITIES 17u
 #define VMWARE_SVGA_REG_MEM_START 18u
 #define VMWARE_SVGA_REG_MEM_SIZE 19u
 #define VMWARE_SVGA_REG_CONFIG_DONE 20u
 #define VMWARE_SVGA_REG_SYNC 21u
 #define VMWARE_SVGA_REG_BUSY 22u
+#define VMWARE_SVGA_REG_TRACES 45u
+#define VMWARE_SVGA_CAP_TRACES 0x00200000u
 #define VMWARE_SVGA_SYNC_POLL_LIMIT 4000u
 
 #define VMWARE_SVGA_FIFO_MIN 0u
@@ -117,6 +121,7 @@ struct vmware_svga_state {
     bool fifo_present;
     bool fifo_full_logged;
     bool sync_timeout_logged;
+    bool traces_enabled;
 };
 
 struct bochs_vbe_state {
@@ -496,7 +501,30 @@ static void vmware_svga_memory_fence(void)
     __asm__ volatile("mfence" ::: "memory");
 }
 
-static void framebuffer_vmware_fifo_init(void)
+/**
+ * @brief Enable VMware GFB write tracing for mmap-backed fbdev clients.
+ * @return None.
+ *
+ * Xorg's fbdev shadow framebuffer writes the scan-out surface through its
+ * mmap.  Once the SVGA FIFO is enabled those writes do not imply an UPDATE
+ * unless SVGA_REG_TRACES is explicitly enabled.  Keep the capability check
+ * here so mode/FIFO reinitialisation restores the same display semantics.
+ */
+static void framebuffer_vmware_enable_traces(void)
+{
+    vmware_svga.traces_enabled = false;
+    if (!vmware_svga.present || !vmware_svga.fifo_present) {
+        return;
+    }
+    if ((vmware_svga_read(VMWARE_SVGA_REG_CAPABILITIES) &
+         VMWARE_SVGA_CAP_TRACES) == 0u) {
+        return;
+    }
+    vmware_svga_write(VMWARE_SVGA_REG_TRACES, 1u);
+    vmware_svga.traces_enabled = true;
+}
+
+static void framebuffer_vmware_fifo_init(bool report)
 {
     uint32_t mem_start = vmware_svga_read(VMWARE_SVGA_REG_MEM_START);
     uint32_t mem_size = vmware_svga_read(VMWARE_SVGA_REG_MEM_SIZE);
@@ -508,15 +536,20 @@ static void framebuffer_vmware_fifo_init(void)
     vmware_svga_write(VMWARE_SVGA_REG_CONFIG_DONE, 0u);
     vmware_svga.fifo = 0;
     vmware_svga.fifo_present = false;
+    vmware_svga.traces_enabled = false;
     fb.auxiliary_reservation_start = 0;
     fb.auxiliary_reservation_bytes = 0;
-    if (mem_size < VMWARE_SVGA_FIFO_MIN_BYTES +
-                       VMWARE_SVGA_UPDATE_WORDS * sizeof(uint32_t) ||
+    /* The producer must retain one free byte to distinguish a full ring from
+     * an empty one; a command-sized ring can therefore never carry a packet. */
+    if (mem_size <= VMWARE_SVGA_FIFO_MIN_BYTES +
+                        VMWARE_SVGA_UPDATE_WORDS * sizeof(uint32_t) ||
         mem_size > FRAMEBUFFER_MAX_VRAM_BYTES ||
         (mem_start & (sizeof(uint32_t) - 1u)) != 0u ||
         !framebuffer_range_valid(mem_start, mem_size)) {
-        console_printf("[reliefnt] VMware SVGA FIFO unavailable mem=%p size=%u\n",
-                       (void *)(uintptr_t)mem_start, mem_size);
+        if (report) {
+            console_printf("[reliefnt] VMware SVGA FIFO unavailable mem=%p size=%u\n",
+                           (void *)(uintptr_t)mem_start, mem_size);
+        }
         return;
     }
 
@@ -538,22 +571,24 @@ static void framebuffer_vmware_fifo_init(void)
         vmware_svga.fifo[VMWARE_SVGA_FIFO_NEXT_CMD] != vmware_svga.fifo_min ||
         vmware_svga.fifo[VMWARE_SVGA_FIFO_STOP] != vmware_svga.fifo_min) {
         vmware_svga.fifo = 0;
-        console_printf("[reliefnt] VMware SVGA FIFO header validation failed\n");
+        if (report) {
+            console_printf("[reliefnt] VMware SVGA FIFO header validation failed\n");
+        }
         return;
     }
     vmware_svga.fifo_full_logged = false;
     vmware_svga.fifo_present = true;
+    framebuffer_vmware_enable_traces();
     svga_platform_bind(vmware_svga.io_port, vmware_svga.fifo, mem_size);
     fb.auxiliary_reservation_start = mem_start;
     fb.auxiliary_reservation_bytes = mem_size;
 }
 
+static void framebuffer_vmware_kick(void);
+
 static int framebuffer_vmware_fifo_update(uint32_t x, uint32_t y,
                                           uint32_t width, uint32_t height)
 {
-    if (svga.available) {
-        return svga_update(x, y, width, height) == 0;
-    }
     uint32_t next;
     uint32_t stop;
     uint32_t bytes = VMWARE_SVGA_UPDATE_WORDS * sizeof(uint32_t);
@@ -568,35 +603,34 @@ static int framebuffer_vmware_fifo_update(uint32_t x, uint32_t y,
     if (next < fifo_min || next >= vmware_svga.fifo_max ||
         stop < fifo_min || stop >= vmware_svga.fifo_max) {
         vmware_svga.fifo_present = false;
-        console_printf("[reliefnt] VMware SVGA FIFO state invalid next=%u stop=%u\n",
-                       next, stop);
         return 0;
     }
-    if (next + bytes >= vmware_svga.fifo_max) {
-        if (fifo_min + bytes >= stop) {
-            goto full;
-        }
-        next = fifo_min;
-    } else if (next < stop && next + bytes >= stop) {
+    if (!framebuffer_fifo_reserve(fifo_min, vmware_svga.fifo_max, next, stop,
+                                  bytes, &index, &next)) {
         goto full;
     }
 
-    index = next / sizeof(uint32_t);
+    index /= sizeof(uint32_t);
     vmware_svga.fifo[index] = VMWARE_SVGA_CMD_UPDATE;
     vmware_svga.fifo[index + 1u] = x;
     vmware_svga.fifo[index + 2u] = y;
     vmware_svga.fifo[index + 3u] = width;
     vmware_svga.fifo[index + 4u] = height;
     vmware_svga_memory_fence();
-    vmware_svga.fifo[VMWARE_SVGA_FIFO_NEXT_CMD] = next + bytes;
+    vmware_svga.fifo[VMWARE_SVGA_FIFO_NEXT_CMD] = next;
     vmware_svga_memory_fence();
     return 1;
 
 full:
     if (!vmware_svga.fifo_full_logged) {
-        console_printf("[reliefnt] VMware SVGA FIFO full; update will retry on next frame\n");
         vmware_svga.fifo_full_logged = true;
     }
+    /* A legacy host may leave STOP unchanged until it receives a doorbell.
+     * The preceding packet normally rings the doorbell, but a burst can fill
+     * the ring after that publication and leave the next periodic refresh
+     * with no packet to wake the host.  Re-issue the non-blocking doorbell on
+     * the full path; a later tick retries once the host advances STOP. */
+    framebuffer_vmware_kick();
     return 0;
 }
 
@@ -613,7 +647,7 @@ static void framebuffer_vmware_kick(void)
     vmware_svga_write(VMWARE_SVGA_REG_SYNC, 1u);
 }
 
-static void framebuffer_vmware_sync(void)
+static void framebuffer_vmware_sync(bool report)
 {
     if (!vmware_svga.present) {
         return;
@@ -625,7 +659,9 @@ static void framebuffer_vmware_sync(void)
         }
     }
     if (!vmware_svga.sync_timeout_logged) {
-        console_printf("[reliefnt] VMware SVGA sync timed out; continuing asynchronously\n");
+        if (report) {
+            console_printf("[reliefnt] VMware SVGA sync timed out; continuing asynchronously\n");
+        }
         vmware_svga.sync_timeout_logged = true;
     }
 }
@@ -639,6 +675,15 @@ static int framebuffer_vmware_probe(void)
     uint32_t fb_offset;
     uint32_t fb_max_size;
     uint32_t fb_size;
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth;
+    uint32_t bpp;
+    uint32_t pseudocolor;
+    uint32_t pitch;
+    uint32_t enabled;
+    int device_mode_valid;
+    int loader_mode_valid;
     uint64_t usable_bytes;
     uint32_t io_base;
 
@@ -683,6 +728,80 @@ static int framebuffer_vmware_probe(void)
         return 0;
     }
 
+    /* The boot protocol framebuffer is only a hint.  SVGA II exposes the
+     * scan-out surface through FB_START/FB_OFFSET, which may differ from the
+     * address supplied by the loader (notably with EFI GOP handoff).  Keep
+     * fbdev mmap and native drawing on the device's actual linear surface and
+     * publish the active SVGA mode so a same-mode Xorg probe does not retain
+     * stale loader geometry or pitch. */
+    width = vmware_svga_read(VMWARE_SVGA_REG_WIDTH);
+    height = vmware_svga_read(VMWARE_SVGA_REG_HEIGHT);
+    depth = vmware_svga_read(VMWARE_SVGA_REG_DEPTH);
+    bpp = vmware_svga_read(VMWARE_SVGA_REG_BITS_PER_PIXEL);
+    pseudocolor = vmware_svga_read(VMWARE_SVGA_REG_PSEUDOCOLOR);
+    pitch = vmware_svga_read(VMWARE_SVGA_REG_BYTES_PER_LINE);
+    enabled = vmware_svga_read(VMWARE_SVGA_REG_ENABLE);
+    device_mode_valid = width && height && depth == 24u && bpp == 32u &&
+        pseudocolor == 0u && (uint64_t)pitch >= (uint64_t)width * 4u &&
+        (uint64_t)pitch * height <= usable_bytes &&
+        framebuffer_range_valid((uint64_t)fb_start + fb_offset,
+                                (uint64_t)pitch * height);
+    loader_mode_valid = fb.available && fb.width && fb.height &&
+        (uint64_t)fb.pitch >= (uint64_t)fb.width * 4u &&
+        (uint64_t)fb.pitch * fb.height <= usable_bytes &&
+        framebuffer_range_valid((uint64_t)(uintptr_t)fb.pixels,
+                                (uint64_t)fb.pitch * fb.height);
+    /* The geometry registers describe the live scan-out only once the device
+     * has been enabled.  While REG_ENABLE is clear they still hold the
+     * power-on default; activate the device at the loader geometry below so
+     * Xorg inherits the same surface without the stale default pitch. */
+    if ((enabled & 1u) == 0u && loader_mode_valid) {
+        /* The loader leaves SVGA disabled while its GOP surface is visible.
+         * Xorg later writes the same mmap, so leave the device enabled before
+         * it starts; otherwise REG_TRACES is accepted but never drives the
+         * host scan-out and the first client that clears the greeter leaves a
+         * black screen.  Reprogram the loader geometry explicitly so the
+         * device surface and the inherited framebuffer stay identical. */
+        vmware_svga_write(VMWARE_SVGA_REG_ENABLE, 0u);
+        vmware_svga_write(VMWARE_SVGA_REG_WIDTH, fb.width);
+        vmware_svga_write(VMWARE_SVGA_REG_HEIGHT, fb.height);
+        vmware_svga_write(VMWARE_SVGA_REG_DEPTH, 24u);
+        vmware_svga_write(VMWARE_SVGA_REG_BITS_PER_PIXEL, 32u);
+        vmware_svga_write(VMWARE_SVGA_REG_PSEUDOCOLOR, 0u);
+        vmware_svga_write(VMWARE_SVGA_REG_ENABLE, 1u);
+        width = vmware_svga_read(VMWARE_SVGA_REG_WIDTH);
+        height = vmware_svga_read(VMWARE_SVGA_REG_HEIGHT);
+        depth = vmware_svga_read(VMWARE_SVGA_REG_DEPTH);
+        bpp = vmware_svga_read(VMWARE_SVGA_REG_BITS_PER_PIXEL);
+        pseudocolor = vmware_svga_read(VMWARE_SVGA_REG_PSEUDOCOLOR);
+        pitch = vmware_svga_read(VMWARE_SVGA_REG_BYTES_PER_LINE);
+        enabled = vmware_svga_read(VMWARE_SVGA_REG_ENABLE);
+        device_mode_valid = (enabled & 1u) != 0u && width && height &&
+            depth == 24u && bpp == 32u && pseudocolor == 0u &&
+            (uint64_t)pitch >= (uint64_t)width * 4u &&
+            (uint64_t)pitch * height <= usable_bytes &&
+            framebuffer_range_valid((uint64_t)fb_start + fb_offset,
+                                    (uint64_t)pitch * height);
+        if (device_mode_valid) {
+            console_printf("[reliefnt] VMware SVGA scan-out enabled at loader mode "
+                           "%ux%u pitch=%u\n", width, height, pitch);
+        }
+    }
+    if (device_mode_valid && (enabled & 1u) != 0u) {
+        fb.pixels = (uint32_t *)(uintptr_t)((uint64_t)fb_start + fb_offset);
+        fb.width = width;
+        fb.height = height;
+        fb.pitch = pitch;
+        fb.bpp = (uint8_t)bpp;
+        fb.bytes_per_pixel = 4u;
+        framebuffer_set_default_format();
+    } else {
+        console_printf("[reliefnt] VMware SVGA active mode unavailable "
+                       "mode=%ux%u depth=%u bpp=%u pseudo=%u pitch=%u\n",
+                       width, height, depth, bpp, pseudocolor, pitch);
+        return 0;
+    }
+
     vmware_svga.max_width = vmware_svga_read(VMWARE_SVGA_REG_MAX_WIDTH);
     vmware_svga.max_height = vmware_svga_read(VMWARE_SVGA_REG_MAX_HEIGHT);
     if (!vmware_svga.max_width || !vmware_svga.max_height) {
@@ -695,7 +814,7 @@ static int framebuffer_vmware_probe(void)
         vmware_svga.max_height = FRAMEBUFFER_MODE_MAX_HEIGHT;
     }
     vmware_svga.present = true;
-    framebuffer_vmware_fifo_init();
+    framebuffer_vmware_fifo_init(true);
 
     fb.max_width = vmware_svga.max_width;
     fb.max_height = vmware_svga.max_height;
@@ -816,6 +935,7 @@ static int framebuffer_vmware_set_mode(uint32_t width, uint32_t height)
     uint32_t fb_size;
     uint64_t usable_bytes;
     uint64_t svga_flags = 0;
+    uint64_t legacy_flags = 0;
     bool restart_3d = svga.available;
 
     if (!vmware_svga.present) {
@@ -823,6 +943,9 @@ static int framebuffer_vmware_set_mode(uint32_t width, uint32_t height)
     }
     if (restart_3d && svga_mode_begin(&svga_flags) != 0) {
         return 0;
+    }
+    if (!restart_3d) {
+        legacy_flags = svga_lock();
     }
     fb.auxiliary_reservation_start = 0;
     fb.auxiliary_reservation_bytes = 0;
@@ -837,7 +960,7 @@ static int framebuffer_vmware_set_mode(uint32_t width, uint32_t height)
      * active, mode_begin left the FIFO disabled and mode_end restores the
      * extended register block after the mode is accepted. */
     if (!restart_3d) {
-        framebuffer_vmware_fifo_init();
+        framebuffer_vmware_fifo_init(false);
     }
 
     actual_width = vmware_svga_read(VMWARE_SVGA_REG_WIDTH);
@@ -855,17 +978,19 @@ static int framebuffer_vmware_set_mode(uint32_t width, uint32_t height)
         !fb_max_size || fb_max_size > FRAMEBUFFER_MAX_VRAM_BYTES ||
         fb_offset >= fb_max_size || pitch < width * 4u ||
         !framebuffer_range_valid(fb_start, fb_max_size)) {
+        if (restart_3d) svga_mode_end(svga_flags);
+        else svga_unlock(legacy_flags);
         console_printf("[reliefnt] VMware SVGA rejected mode req=%ux%u got=%ux%u "
                        "depth=%u bpp=%u pseudo=%u pitch=%u fb=%p offset=%u size=%u max=%u\n",
                        width, height, actual_width, actual_height, depth, bpp,
                        pseudocolor, pitch, (void *)(uintptr_t)fb_start, fb_offset,
                        fb_size, fb_max_size);
-        if (restart_3d) svga_mode_end(svga_flags);
         return 0;
     }
     usable_bytes = (uint64_t)fb_max_size - fb_offset;
     if ((uint64_t)pitch * height > usable_bytes) {
         if (restart_3d) svga_mode_end(svga_flags);
+        else svga_unlock(legacy_flags);
         return 0;
     }
     fb.pixels = (uint32_t *)(uintptr_t)((uint64_t)fb_start + fb_offset);
@@ -881,18 +1006,23 @@ static int framebuffer_vmware_set_mode(uint32_t width, uint32_t height)
     fb.reservation_bytes = fb_max_size;
     framebuffer_set_default_format();
     fb.available = true;
+    if (restart_3d) {
+        svga_mode_end(svga_flags);
+        vmware_svga.fifo_min = svga.min;
+        vmware_svga.fifo_max = svga.fifo_bytes;
+        /* ENABLE=0 and CONFIG_DONE=0 may reset trace-based GFB updates.
+         * Restore them after the extended FIFO has been configured so mmap
+         * writers retain the same scan-out semantics across a mode switch. */
+        framebuffer_vmware_enable_traces();
+    } else {
+        framebuffer_vmware_sync(false);
+        svga_unlock(legacy_flags);
+    }
     console_printf("[reliefnt] VMware SVGA mode=%ux%u depth=%u bpp=%u pseudo=%u "
                    "pitch=%u fb=%p offset=%u size=%u max=%u\n",
                    fb.width, fb.height, depth, bpp, pseudocolor,
                    fb.pitch, (void *)(uintptr_t)fb_start, fb_offset, fb_size,
                    fb_max_size);
-    if (restart_3d) {
-        svga_mode_end(svga_flags);
-        vmware_svga.fifo_min = svga.min;
-        vmware_svga.fifo_max = svga.fifo_bytes;
-    } else {
-        framebuffer_vmware_sync();
-    }
     return 1;
 }
 
@@ -1210,29 +1340,45 @@ static void framebuffer_char(uint32_t x, uint32_t y, char ch, uint32_t fg, uint3
 
 void framebuffer_present_region(uint32_t x, uint32_t y, uint32_t width, uint32_t height)
 {
-    if (fb.backend != FRAMEBUFFER_BACKEND_VMWARE_SVGA || !fb.available ||
-        x >= fb.width || y >= fb.height) {
+    uint64_t flags = svga_lock();
+    if (fb.backend != FRAMEBUFFER_BACKEND_VMWARE_SVGA || !fb.available) {
+        svga_unlock(flags);
         return;
     }
-    if (width > fb.width - x) {
-        width = fb.width - x;
+    if (width == UINT32_MAX && height == UINT32_MAX) {
+        width = fb.width;
+        height = fb.height;
     }
-    if (height > fb.height - y) {
-        height = fb.height - y;
+    if (x >= fb.width || y >= fb.height) {
+        svga_unlock(flags);
+        return;
+    }
+    if (width > fb.width - x) width = fb.width - x;
+    if (height > fb.height - y) height = fb.height - y;
+    if (!width || !height) {
+        svga_unlock(flags);
+        return;
+    }
+    if (svga.available) {
+        (void)svga_update_locked(x, y, width, height);
+        svga_unlock(flags);
+        return;
     }
     if (!framebuffer_vmware_fifo_update(x, y, width, height)) {
-        /* A mode switch can invalidate the old FIFO, and a slow host can
-         * leave it full.  Drain first, rebuild only when the ring was marked
-         * invalid, then retry this exact damage region once.  This is the only
-         * synchronous drain: it runs precisely when the device is applying
-         * backpressure, instead of after every published update. */
-        framebuffer_vmware_sync();
+        /* A legacy host may only advance STOP while REG_BUSY is read.  A
+         * doorbell alone can therefore leave a full ring stuck forever and
+         * drop every later UPDATE, which presents as a black Xorg desktop.
+         * Drain with the bounded SVGA poll, rebuild an invalid ring, and
+         * retry this exact region before returning. */
+        framebuffer_vmware_sync(false);
         if (!vmware_svga.fifo_present) {
-            framebuffer_vmware_fifo_init();
+            framebuffer_vmware_fifo_init(false);
         }
-        if (!framebuffer_vmware_fifo_update(x, y, width, height)) {
-            return;
+        if (framebuffer_vmware_fifo_update(x, y, width, height)) {
+            framebuffer_vmware_kick();
         }
+        svga_unlock(flags);
+        return;
     }
     /* Publish asynchronously. Draining after every update (the previous
      * behaviour) forced a synchronous SVGA_REG_BUSY wait inside the global
@@ -1246,11 +1392,17 @@ void framebuffer_present_region(uint32_t x, uint32_t y, uint32_t width, uint32_t
      * is retried, so the ring cannot silently overrun STOP and freeze the
      * pointer. */
     framebuffer_vmware_kick();
+    svga_unlock(flags);
 }
 
 void framebuffer_present(void)
 {
-    framebuffer_present_region(0, 0, fb.width, fb.height);
+    framebuffer_present_region(0, 0, UINT32_MAX, UINT32_MAX);
+}
+
+void framebuffer_display_tick(void)
+{
+    framebuffer_present();
 }
 
 static void framebuffer_char_transparent(uint32_t x, uint32_t y, char ch, uint32_t fg)

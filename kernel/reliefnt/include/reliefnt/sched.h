@@ -107,6 +107,7 @@ struct task_file {
     /* ALSA /dev/snd/timer state owned by the open file description. */
     struct audio_timer_file *audio_timer_file;
     uint32_t input_vt; /* evdev graphical-VT filter, zero for the raw stream. */
+    uint8_t input_vt_manual; /* EVIOCSVT explicitly selected the filter mode. */
     struct storage_read_cursor read_cursor;
     char path[RELIEFOS_FS_PATH_LEN];
 };
@@ -222,10 +223,6 @@ struct task_process_state {
     /* CPUs on which this task may execute. A zero mask is treated as all
      * discovered CPUs for compatibility with older task initializers. */
     uint64_t affinity_mask;
-    /* Linux brk(2) state; the break is process-wide and starts at the end of
-     * the executable's writable data segment. */
-    uint64_t program_break_base;
-    uint64_t program_break;
     uint32_t mlockall_flags;
 };
 
@@ -235,6 +232,9 @@ struct task_address_space_state {
     struct task_vma *vma_extra;
     uint32_t vma_extra_count;
     uint32_t vma_extra_capacity;
+    /* Linux brk(2) state belongs to the address space, shared by CLONE_VM. */
+    uint64_t program_break_base;
+    uint64_t program_break;
     uint32_t references;
     uint64_t initial_stack_top;
     uint64_t initial_stack_low;
@@ -519,8 +519,6 @@ struct task {
             uint64_t cpu_ticks;
             int32_t priority;
             uint64_t affinity_mask;
-            uint64_t program_break_base;
-            uint64_t program_break;
             uint32_t mlockall_flags;
         };
     };
@@ -532,6 +530,8 @@ struct task {
             struct task_vma *vma_extra;
             uint32_t vma_extra_count;
             uint32_t vma_extra_capacity;
+            uint64_t program_break_base;
+            uint64_t program_break;
         };
     };
     union {
@@ -837,7 +837,11 @@ void sched_create_idle_task(void);
  */
 void sched_set_running(uint32_t pid);
 /**
- * @brief End task pid with exit code, releasing it once its parent reaps it.
+ * @brief Publish terminal task state and log its first exit after releasing the scheduler lock.
+ * @param pid Task identifier; PID 1 panics and an absent PID has no exit event.
+ * @param code Exit status; repeated calls retain the existing status-update and cleanup semantics.
+ * The caller must not hold scheduler_lock. Capture a bounded diagnostic under
+ * that lock; defer resource release until the CPU reservation is quiescent.
  */
 void sched_exit(uint32_t pid, uint64_t code);
 /**
@@ -1073,7 +1077,16 @@ int sched_hangup_user_tasks_for_pty(uint32_t pty_id, uint32_t keep_pid);
 int sched_kill_user_tasks_for_logout(uint32_t uid, uint32_t session_id,
                                      uint32_t keep_pid, uint64_t code);
 /**
- * @brief Wait for a child to change state (waitpid): returns child pid or a negative error.
+ * @brief Observe child events or consume a quiescent zombie, logging a successful reap after unlock.
+ * @param waiter_pid Waiting task identifier.
+ * @param wanted_pid Child or process-group selector using waitpid semantics.
+ * @param options Wait-event selection and WNOWAIT flags.
+ * @param status Optional output wait status.
+ * @param info Optional output child siginfo.
+ * @return Child PID on an observed event, zero without a matching child,
+ * -2 for an absent waiter, or -RELIEFOS_EAGAIN while a matching child is pending.
+ * The caller must not hold scheduler_lock; resource teardown and diagnostics
+ * execute outside it. WNOWAIT observes without consuming or logging a reap.
  */
 int64_t sched_wait_reap(uint32_t waiter_pid, int32_t wanted_pid,
                         uint32_t options, int *status, struct linux_siginfo *info);

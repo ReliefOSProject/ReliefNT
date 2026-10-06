@@ -36,6 +36,6 @@ struct linux_winsize {
 /* Unix98 PTY helpers. */
 #define TIOCGPTN   0x80045430UL
 #define TIOCSPTLCK 0x40045431UL
-#define TIOCGPTLCK 0x8004542eUL
+#define TIOCGPTLCK 0x80045439UL
 
 #endif

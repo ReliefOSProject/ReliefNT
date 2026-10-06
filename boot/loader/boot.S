@@ -17,10 +17,10 @@ multiboot2_header:
     .align 8
     .short 5
     /* A framebuffer improves the splash and boot log, but serial-only and
-       restricted GOP firmware must still be able to hand control to Loader. */
+       restricted GOP firmware must still be able to hand control to Loader.
+       The tag is 20 bytes: type, flags, size, width, height, depth. */
     .short 1
     .long 20
-    .long 0
     .long 0
     .long 0
     .long 32

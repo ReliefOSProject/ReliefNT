@@ -120,6 +120,12 @@ int task_socket_vector(struct task_file *file, const struct iovec *vectors,
                        uint32_t count, uint64_t total, bool writing);
 short task_socket_poll(const struct task_file *file, short events);
 /**
+ * @brief Returns the receive-generation counter for a UNIX stream socket.
+ * @param file Open socket file description to inspect.
+ * @return Monotonic receive generation, or zero for non-UNIX sockets.
+ */
+uint64_t task_socket_event_generation(const struct task_file *file);
+/**
  * @brief Handle Unix socket ioctls with native usercopy and error semantics.
  * @param file Retained Unix socket open file description.
  * @param request Linux ioctl number.

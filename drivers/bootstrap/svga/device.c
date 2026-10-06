@@ -370,13 +370,21 @@ int svga3d_shutdown(void)
     svga_unlock(flags);
     return ret;
 }
-int svga_update(uint32_t x, uint32_t y, uint32_t width, uint32_t height)
+int svga_update_locked(uint32_t x, uint32_t y, uint32_t width, uint32_t height)
 {
     uint32_t data[] = {x, y, width, height};
     struct svga_span span = {data, sizeof(data)};
+    /* UPDATE is the ordinary scanout path. Packet publication already issues
+     * the SVGA SYNC doorbell; waiting for BUSY here would hold the device lock
+     * and serialize every framebuffer present behind host progress. Explicit
+     * fences, mode transitions, and shutdown retain their synchronous paths. */
+    return svga_fifo_packet_locked(SVGA_CMD_UPDATE, false, &span, 1);
+}
+
+int svga_update(uint32_t x, uint32_t y, uint32_t width, uint32_t height)
+{
     uint64_t flags = svga_lock();
-    int ret = svga_fifo_packet_locked(SVGA_CMD_UPDATE, false, &span, 1);
-    if (!ret) ret = svga_drain_locked();
+    int ret = svga_update_locked(x, y, width, height);
     svga_unlock(flags);
     return ret;
 }

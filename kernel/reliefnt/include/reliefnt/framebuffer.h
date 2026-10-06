@@ -125,6 +125,13 @@ void framebuffer_present(void);
  */
 void framebuffer_present_region(uint32_t x, uint32_t y, uint32_t width, uint32_t height);
 /**
+ * @brief Periodically publish the mmap-backed framebuffer to the display.
+ *
+ * This is needed by legacy VMware SVGA devices where guest writes do not
+ * generate an UPDATE command themselves.
+ */
+void framebuffer_display_tick(void);
+/**
  * @brief Read the color of the pixel at (x,y).
  */
 uint32_t framebuffer_get_pixel_public(uint32_t x, uint32_t y);

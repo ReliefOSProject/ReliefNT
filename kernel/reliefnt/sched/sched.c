@@ -152,6 +152,14 @@ struct task_vma *sched_task_vma_at(struct task *task, uint32_t index)
     index -= SCHED_TASK_VMA_MAX;
     if (index >= sched_task_mm(task)->vma_extra_count) {
         uint32_t wanted = index + 1u;
+        /* Slots up to capacity are already zeroed. Appending within that
+         * allocation must not relocate existing VMA entries. Growth beyond
+         * capacity can still move the store, so callers must reacquire VMA
+         * pointers after requesting new slots. */
+        if (wanted <= sched_task_mm(task)->vma_extra_capacity) {
+            sched_task_mm(task)->vma_extra_count = wanted;
+            return &sched_task_mm(task)->vma_extra[index];
+        }
         uint32_t capacity = sched_task_mm(task)->vma_extra_capacity ? sched_task_mm(task)->vma_extra_capacity : 16u;
         struct task_vma *replacement;
         while (capacity < wanted) {
@@ -1365,11 +1373,22 @@ static void sched_mark_orphaned_group(uint32_t group)
     }
 }
 
+/**
+ * @brief Publish terminal task state and log its first exit after releasing the scheduler lock.
+ * @param pid Task identifier; PID 1 panics and an absent PID has no exit event.
+ * @param code Exit status; repeated calls retain the existing status-update and cleanup semantics.
+ * The caller must not hold scheduler_lock. Capture a bounded diagnostic under
+ * that lock; defer resource release until the CPU reservation is quiescent.
+ */
 void sched_exit(uint32_t pid, uint64_t code)
 {
     uint64_t flags;
     bool gpu_owner_quiescent = false;
     bool adopted_zombie = false;
+    bool exit_event = false;
+    uint32_t exit_pid = 0;
+    uint64_t exit_code = 0;
+    char exit_name[SCHED_TASK_NAME_LEN];
     struct task *exiting = NULL;
     if (pid == 1) bugcheck_panic("Attempted to exit PID 1");
 
@@ -1380,15 +1399,17 @@ void sched_exit(uint32_t pid, uint64_t code)
     for (uint32_t i = 0; i < task_count; ++i) {
         if (tasks[i]->pid == pid) {
             exiting = tasks[i];
+            exit_event = tasks[i]->state != TASK_EXITED;
+            if (exit_event) {
+                exit_pid = tasks[i]->pid;
+                exit_code = code;
+                task_copy_identity_text(exit_name, sizeof(exit_name), tasks[i]->name);
+            }
             tasks[i]->state = TASK_EXITED;
             tasks[i]->exit_code = code;
             tasks[i]->child_event = TASK_CHILD_EVENT_NONE;
             tasks[i]->stop_signal = 0;
             gpu_owner_quiescent = tasks[i]->running_cpu == SCHED_CPU_NONE;
-            console_printf("[reliefnt] scheduler task exited pid=%u name=%s code=%llu\n",
-                           pid,
-                           tasks[i]->name,
-                           (unsigned long long)code);
             break;
         }
     }
@@ -1430,6 +1451,12 @@ void sched_exit(uint32_t pid, uint64_t code)
          * after retirement and the mm_release futex work below. */
     }
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
+    if (exit_event) {
+        console_printf("[reliefnt] scheduler task exited pid=%u name=%s code=%llu\n",
+                       exit_pid,
+                       exit_name,
+                       (unsigned long long)exit_code);
+    }
     if (adopted_zombie) {
         struct task *reaper = sched_find(1);
         if (reaper && reaper->state != TASK_EXITED) sched_signal_user_process(1, 17);
@@ -3131,6 +3158,18 @@ static void sched_wait_info(struct linux_siginfo *info, const struct task *task,
     }
 }
 
+/**
+ * @brief Observe child events or consume a quiescent zombie, logging a successful reap after unlock.
+ * @param waiter_pid Waiting task identifier.
+ * @param wanted_pid Child or process-group selector using waitpid semantics.
+ * @param options Wait-event selection and WNOWAIT flags.
+ * @param status Optional output wait status.
+ * @param info Optional output child siginfo.
+ * @return Child PID on an observed event, zero without a matching child,
+ * -2 for an absent waiter, or -RELIEFOS_EAGAIN while a matching child is pending.
+ * The caller must not hold scheduler_lock; resource teardown and diagnostics
+ * execute outside it. WNOWAIT observes without consuming or logging a reap.
+ */
 int64_t sched_wait_reap(uint32_t waiter_pid, int32_t wanted_pid,
                         uint32_t options, int *status, struct linux_siginfo *info)
 {
@@ -3140,6 +3179,7 @@ int64_t sched_wait_reap(uint32_t waiter_pid, int32_t wanted_pid,
     uint32_t reap_pid = 0;
     int reap_status = 0;
     int found_child = 0;
+    bool reap_event = false;
     uint32_t wanted_group = 0;
     kernel_spin_lock_irqsave(&scheduler_lock, &lock_flags);
     waiter = sched_find(waiter_pid);
@@ -3236,10 +3276,13 @@ int64_t sched_wait_reap(uint32_t waiter_pid, int32_t wanted_pid,
              * storage slot happens to be reused. Unpublish under the same
              * scheduler lock as reaping so kill(pid, 0) returns ESRCH now. */
             reap_task->pid = 0;
+            reap_event = true;
+        }
+        kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
+        if (reap_event) {
             console_printf("[reliefnt] scheduler wait reaped pid=%u by pid=%u\n",
                            reap_pid, waiter_pid);
         }
-        kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
         if (status) {
             *status = reap_status;
         }

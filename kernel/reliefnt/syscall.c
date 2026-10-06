@@ -100,6 +100,7 @@ struct task_epoll_entry {
     uint32_t events;
     uint64_t data;
     uint32_t ready;
+    uint64_t generation;
     uint32_t active;
 };
 
@@ -108,6 +109,43 @@ struct task_epoll {
     uint32_t reserved;
     struct task_epoll_entry item[TASK_EPOLL_MAX_ENTRIES];
 };
+
+/**
+ * @brief Remove a descriptor from every epoll set owned by a task.
+ * @param task Descriptor-table owner.
+ * @param fd Descriptor being closed or replaced.
+ *
+ * Linux removes an epoll registration when the last descriptor reference is
+ * closed. Keeping a numeric fd here would otherwise let a later open reuse
+ * the number while dispatching the old callback pointer, which is fatal for
+ * Xorg's input thread during VT return.
+ */
+static void task_epoll_remove_fd(struct task *task, int fd)
+{
+    if (!task || fd < 0) return;
+    for (uint32_t i = 0; i < sched_task_file_capacity(task); ++i) {
+        struct task_file *file = sched_task_file_at(task, i);
+        if (!file || !file->used || !(file->flags & TASK_FILE_FLAG_EPOLL) || !file->aux)
+            continue;
+        struct task_epoll *epoll = (struct task_epoll *)(uintptr_t)file->aux;
+        for (uint32_t j = 0; j < TASK_EPOLL_MAX_ENTRIES; ++j) {
+            if (!epoll->item[j].active || epoll->item[j].fd != fd) continue;
+            epoll->item[j] = (struct task_epoll_entry){0};
+            if (epoll->entries) --epoll->entries;
+        }
+    }
+    for (uint32_t i = 0; i < SCHED_TASK_STDIO_MAX; ++i) {
+        struct task_file *file = &sched_task_fds(task)->stdio_files[i];
+        if (!file->used || !(file->flags & TASK_FILE_FLAG_EPOLL) || !file->aux)
+            continue;
+        struct task_epoll *epoll = (struct task_epoll *)(uintptr_t)file->aux;
+        for (uint32_t j = 0; j < TASK_EPOLL_MAX_ENTRIES; ++j) {
+            if (!epoll->item[j].active || epoll->item[j].fd != fd) continue;
+            epoll->item[j] = (struct task_epoll_entry){0};
+            if (epoll->entries) --epoll->entries;
+        }
+    }
+}
 
 #define RELIEFOS_FLOCK_SH 1u
 #define RELIEFOS_FLOCK_EX 2u
@@ -126,6 +164,12 @@ struct reliefos_flock_entry {
 };
 
 static struct reliefos_flock_entry reliefos_flocks[RELIEFOS_FLOCK_MAX];
+
+/* fbdev's colour map and blank state are software state on the VMware
+ * framebuffer.  Keeping them here gives standard fb clients a stable
+ * GETCMAP/PUTCMAP round trip even though SVGA scanout is true-colour. */
+static uint16_t reliefos_fb_palette[4][256];
+static uint32_t reliefos_fb_blank;
 
 #include <linux/stat.h>
 #include <linux/errno.h>
@@ -229,12 +273,20 @@ static int linux_stat_from_legacy(struct linux_stat_abi *out,
         out->st_mode = ((value.mode & LINUX_S_IFMT) ? value.mode & LINUX_S_IFMT : mode & LINUX_S_IFMT) |
             (value.mode & 07777u);
     }
-    out->st_rdev = type == RELIEFOS_FS_TYPE_DEVICE ? 1 : 0;
+    /* Fixed virtual consoles use Linux's tty major (4), which Xorg's
+     * xf86HasTTYs() probes before entering VT_PROCESS.  Dynamic /dev/pts
+     * endpoints retain the Unix98 PTY major (136); other synthetic devices
+     * continue to use the per-kind minor identity used by this devfs. */
+    uint32_t device_major = node && (node->flags & STORAGE_NODE_FLAG_PTY) &&
+                            node->first_cluster >= 1u && node->first_cluster <= 6u
+                                ? 4u : 136u;
+    out->st_rdev = type == RELIEFOS_FS_TYPE_DEVICE
+        ? (device_major << 8) | (node ? node->first_cluster : 0u) : 0;
     if (node && (node->flags & STORAGE_NODE_FLAG_DEV_BLOCK))
         out->st_rdev = storage_block_rdev(node->volume_id);
     if (node && (node->flags & STORAGE_NODE_FLAG_PTY)) {
         out->st_ino = (uint64_t)node->volume_id * 16 + node->first_cluster;
-        out->st_rdev = (136u << 8) | node->first_cluster;
+        out->st_rdev = (device_major << 8) | node->first_cluster;
     }
     if ((node && (node->flags & (STORAGE_NODE_FLAG_AUDIO_PCM |
                                  STORAGE_NODE_FLAG_AUDIO_CONTROL |
@@ -688,8 +740,7 @@ static int clear_task_file_result(struct task_file *file)
         (file->node.first_cluster == STORAGE_DEV_KIND_KEYBOARD ||
          file->node.first_cluster == STORAGE_DEV_KIND_MOUSE) &&
         file->aux2 != 0) {
-        input_evdev_release(file->node.first_cluster, file->aux2,
-                            sched_current_pid());
+        input_evdev_release(file->node.first_cluster, file->aux2);
     }
     file->used = 0;
     file->kind = 0;
@@ -701,6 +752,8 @@ static int clear_task_file_result(struct task_file *file)
     file->offset = 0;
     file->aux = 0;
     file->aux2 = 0;
+    file->input_vt = 0;
+    file->input_vt_manual = 0;
     file->audio_file = NULL;
     file->audio_control_file = NULL;
     file->audio_oss_file = NULL;
@@ -1257,7 +1310,7 @@ static int task_pty_endpoint_path(const char *path, uint32_t *pty_id)
     uint32_t digits = 0;
     if (!path || !pty_id) return 0;
     if (pty_lookup_vt_path(path, NULL) == 0) {
-        *pty_id = (uint32_t)(path[8] - '0');
+        *pty_id = path[8] == '0' ? pty_vt_active() : (uint32_t)(path[8] - '0');
         return 1;
     }
     while (*prefix && *path && *prefix == *path) { ++prefix; ++path; }
@@ -1646,6 +1699,7 @@ int task_allocate_fd(struct task *task, int minimum, struct task_file **slot)
  */
 void task_discard_file_fd(struct task *task, int fd)
 {
+    task_epoll_remove_fd(task, fd);
     syscall_record_locks_close(task, task_descriptor_for_fd(task, fd));
     clear_task_file(task_descriptor_for_fd(task, fd));
     if (fd >= 0 && fd < 3) {
@@ -1826,6 +1880,7 @@ static int task_dup2_fd(struct task *task, int old_fd, int new_fd)
     if (!new_file) { clear_task_file(&retained); return -RELIEFOS_ENOMEM; }
     struct task_pty_fd *replaced_pty = task_pty_fd_for_fd(task, new_fd);
     if (new_file->used) {
+        task_epoll_remove_fd(task, new_fd);
         syscall_record_locks_close(task, new_file);
         clear_task_file(new_file);
     }
@@ -1937,6 +1992,53 @@ static int task_device_is(const struct task_file *file, uint32_t kind)
 }
 
 /**
+ * @brief Resolve the VT that owns an evdev-opening task.
+ * @param task Current task; may be null.
+ * @return Fixed VT number, or zero for an unbound raw evdev client.
+ *
+ * Xorg opens its input devices before it switches the VT to KD_GRAPHICS.  The
+ * active-graphics bit is therefore not a reliable open-time hint.  Its
+ * inherited tty endpoint is stable across that transition, so prefer the
+ * controlling tty and then any explicit VT endpoint in the descriptor table.
+ */
+static uint32_t task_evdev_vt_hint(const struct task *task)
+{
+    const struct task_fd_table_state *fds;
+    if (!task) return 0;
+    if (pty_vt_number(task->controlling_pty_id))
+        return task->controlling_pty_id;
+    fds = sched_task_fds(task);
+    for (uint32_t i = 0; i < SCHED_TASK_PTY_FD_MAX; ++i) {
+        const struct task_pty_fd *entry = &fds->pty_fds[i];
+        if (entry->used && entry->endpoint == TASK_PTY_ENDPOINT_SLAVE &&
+            pty_vt_number(entry->pty_id))
+            return entry->pty_id;
+    }
+    return 0;
+}
+
+/**
+ * @brief Bind an evdev descriptor to a VT once its owner opens that VT.
+ * @param task Current task; may be null for an invalid syscall context.
+ * @param file Evdev open-file description to update.
+ * @return Nothing; an already-bound or otherwise unresolvable descriptor is unchanged.
+ *
+ * Xorg can open /dev/input/event* before xf86OpenConsole creates its explicit
+ * /dev/ttyN endpoint.  The open-time hint is then zero and would leave the
+ * descriptor on the raw stream forever.  Retry the same stable descriptor
+ * lookup at the first read/poll after the tty endpoint exists.  Keep the
+ * existing cursor so VT hand-off snapshots that were queued in between are
+ * still delivered to the newly bound consumer.
+ */
+static void task_evdev_bind_vt(struct task *task, struct task_file *file)
+{
+    uint32_t number;
+    if (!task || !file || file->input_vt || file->input_vt_manual) return;
+    number = task_evdev_vt_hint(task);
+    if (number) file->input_vt = number;
+}
+
+/**
  * @brief Decode a kernel-created descriptor backed by a genuine block device node.
  * @param file Descriptor to validate; may be null.
  * @param disk_id Optional physical disk ID output.
@@ -1995,6 +2097,7 @@ static int task_device_read(struct task *task, struct task_file *file,
     }
     if (task_device_is(file, STORAGE_DEV_KIND_KEYBOARD) ||
         task_device_is(file, STORAGE_DEV_KIND_MOUSE)) {
+        task_evdev_bind_vt(task, file);
         int ret = input_evdev_read_vt(file->node.first_cluster, &file->aux,
                                       buffer, length, file->aux2, file->input_vt);
         if (ret == 0 && (file->flags & RELIEFOS_O_NONBLOCK)) {
@@ -2060,6 +2163,10 @@ static int task_device_write(struct task *task, struct task_file *file,
         if (!buffer) return -RELIEFOS_EFAULT;
         return (int)pty_write_output(task->pty_id, (const char *)buffer, length);
     }
+    if (task_device_is(file, STORAGE_DEV_KIND_KEYBOARD) ||
+        task_device_is(file, STORAGE_DEV_KIND_MOUSE)) {
+        return input_evdev_write(file->node.first_cluster, buffer, length);
+    }
     if (task_device_is(file, STORAGE_DEV_KIND_CONSOLE)) {
         if (!buffer) return -RELIEFOS_EFAULT;
         console_write_len((const char *)buffer, length);
@@ -2111,6 +2218,27 @@ static void evdev_copy_text(char *dst, uint32_t capacity, const char *src)
     dst[i] = 0;
 }
 
+/**
+ * @brief Write global VT query results after a VT descriptor has been resolved.
+ * @param request VT_OPENQRY or VT_GETSTATE.
+ * @param user_arg User output address, checked for writable access here.
+ * @return Zero on success or a negative errno.
+ */
+static int task_vt_query_ioctl(uint64_t request, uint64_t user_arg)
+{
+    if (request == VT_OPENQRY) {
+        if (!user_range_writable(user_arg, sizeof(int))) return -RELIEFOS_EFAULT;
+        int free_vt = pty_vt_open_query();
+        *(int *)(uintptr_t)user_arg = free_vt;
+        return 0;
+    }
+    if (!user_range_writable(user_arg, sizeof(struct vt_stat))) return -RELIEFOS_EFAULT;
+    struct vt_stat *state = (struct vt_stat *)(uintptr_t)user_arg;
+    state->v_active = (unsigned short)pty_vt_active();
+    state->v_state = (unsigned short)pty_vt_state_bitmap();
+    return 0;
+}
+
 static int task_evdev_ioctl(struct task_file *file, uint64_t request,
                             uint64_t user_arg)
 {
@@ -2128,6 +2256,7 @@ static int task_evdev_ioctl(struct task_file *file, uint64_t request,
         __builtin_memcpy(&number, (const void *)(uintptr_t)user_arg, sizeof(number));
         if (number && !pty_vt_id(number)) return -RELIEFOS_EINVAL;
         file->input_vt = number;
+        file->input_vt_manual = 1;
         file->aux = input_evdev_cursor_now();
         return 0;
     }
@@ -2148,11 +2277,9 @@ static int task_evdev_ioctl(struct task_file *file, uint64_t request,
         return 0;
     }
     if (request == EVIOCGRAB) {
-        int enable;
+        /* Linux tests the full scalar argument for nonzero without dereferencing. */
         int64_t token;
-        if (!user_range_ok(user_arg, sizeof(int))) return -RELIEFOS_EFAULT;
-        enable = *(int *)(uintptr_t)user_arg != 0;
-        token = input_evdev_grab(device_kind, file->aux2, enable,
+        token = input_evdev_grab(device_kind, file->aux2, user_arg != 0,
                                  sched_current_pid());
         if (token < 0) return (int)token;
         file->aux2 = (uint64_t)token;
@@ -2162,6 +2289,18 @@ static int task_evdev_ioctl(struct task_file *file, uint64_t request,
         return -RELIEFOS_ENOTTY;
     }
     size = _IOC_SIZE(request);
+    if (_IOC_NR(request) == 0x03 && _IOC_DIR(request) == _IOC_READ) {
+        /* EVIOCGREP: the default key repeat delay and period. */
+        unsigned int rep[2] = {250u, 667u};
+        if (size < sizeof(rep) || !user_range_writable(user_arg, sizeof(rep)))
+            return -RELIEFOS_EFAULT;
+        __builtin_memcpy((void *)(uintptr_t)user_arg, rep, sizeof(rep));
+        return 0;
+    }
+    if (_IOC_NR(request) == 0x03 && _IOC_DIR(request) == _IOC_WRITE) {
+        /* EVIOCSREP: key repeat parameters are accepted and ignored. */
+        return 0;
+    }
     if (_IOC_NR(request) == 0x19 && _IOC_DIR(request) == _IOC_READ) {
         uint64_t leds = device_kind == STORAGE_DEV_KIND_KEYBOARD && input_caps_lock_active()
                             ? 1ULL << LED_CAPSL : 0;
@@ -2171,20 +2310,41 @@ static int task_evdev_ioctl(struct task_file *file, uint64_t request,
             ((uint8_t *)(uintptr_t)user_arg)[i] = (uint8_t)(leds >> (8U * i));
         return (int)count;
     }
+    if ((_IOC_NR(request) == 0x1a || _IOC_NR(request) == 0x1b) &&
+        _IOC_DIR(request) == _IOC_READ) {
+        /* EVIOCGSND and EVIOCGSW: no sounds or switch states exist on these
+         * devices, so the bitmaps are all zeroes. */
+        uint32_t count = size < sizeof(uint64_t) ? size : sizeof(uint64_t);
+        if (count && !user_range_writable(user_arg, count)) return -RELIEFOS_EFAULT;
+        for (uint32_t i = 0; i < count; ++i)
+            ((uint8_t *)(uintptr_t)user_arg)[i] = 0;
+        return (int)count;
+    }
     if (!size || !user_range_ok(user_arg, size)) {
         return -RELIEFOS_EFAULT;
     }
-    if (_IOC_NR(request) == 0x06 || _IOC_NR(request) == 0x07) {
+    if (_IOC_NR(request) == 0x06 || _IOC_NR(request) == 0x07 ||
+        _IOC_NR(request) == 0x08) {
         const char *value;
         if (_IOC_NR(request) == 0x06) {
             value = device_kind == STORAGE_DEV_KIND_KEYBOARD
                         ? "LeonOS PS/2 Keyboard" : "LeonOS PS/2 Mouse";
-        } else {
+        } else if (_IOC_NR(request) == 0x07) {
             value = device_kind == STORAGE_DEV_KIND_KEYBOARD
                         ? "platform/i8042/serio0" : "platform/i8042/serio1";
+        } else {
+            /* EVIOCGUNIQ: the virtual devices carry no unique serial. */
+            value = "";
         }
         evdev_copy_text((char *)(uintptr_t)user_arg, size, value);
         return 0;
+    }
+    if (_IOC_NR(request) == 0x09 || _IOC_NR(request) == 0x0a) {
+        /* EVIOCGPROP and EVIOCGMTSLOTS: no input properties and no
+         * multitouch slots are advertised on these devices. */
+        for (uint32_t i = 0; i < size; ++i)
+            ((uint8_t *)(uintptr_t)user_arg)[i] = 0;
+        return (int)size;
     }
     if (_IOC_NR(request) == 0x18) {
         input_evdev_key_state((void *)(uintptr_t)user_arg, size);
@@ -3460,6 +3620,7 @@ static int64_t syscall_poll_impl(struct task *task, struct pollfd *fds,
         } else if (file && (file->flags & TASK_FILE_FLAG_DEV_NODE)) {
             if (task_device_is(file, STORAGE_DEV_KIND_KEYBOARD) ||
                 task_device_is(file, STORAGE_DEV_KIND_MOUSE)) {
+                task_evdev_bind_vt(task, file);
                 if ((events & POLLIN) &&
                     input_evdev_available_vt(file->node.first_cluster, file->aux,
                                              file->aux2, file->input_vt)) {
@@ -3550,6 +3711,7 @@ static uint32_t epoll_to_poll(uint32_t events)
     if (events & (EPOLLIN | EPOLLRDNORM | EPOLLRDBAND | EPOLLMSG)) result |= POLLIN;
     if (events & (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND)) result |= POLLOUT;
     if (events & EPOLLPRI) result |= POLLPRI;
+    if (events & EPOLLRDHUP) result |= POLLRDHUP;
     return result;
 }
 
@@ -3688,6 +3850,7 @@ static int64_t syscall_epoll_wait_common(struct task *task, struct task_epoll *e
         struct task_epoll_entry *entry = &epoll->item[i];
         struct pollfd pollfd;
         uint32_t ready;
+        uint64_t generation;
         uint64_t deadline = task->poll_deadline_ticks;
         if (!entry->active || !entry->events) continue;
         pollfd = (struct pollfd){.fd = entry->fd, .events = (int16_t)epoll_to_poll(entry->events)};
@@ -3697,17 +3860,34 @@ static int64_t syscall_epoll_wait_common(struct task *task, struct task_epoll *e
         if (timeout_ms != 0 && deadline)
             task->poll_deadline_ticks = deadline;
         ready = poll_to_epoll(pollfd.revents);
+        generation = task_socket_event_generation(task_file_for_fd(task, entry->fd));
         if (!ready) {
             entry->ready = 0;
+            entry->generation = generation;
             continue;
         }
-        if ((entry->events & EPOLLET) && entry->ready) {
+        if (entry->events & EPOLLET) {
+            /*
+             * Edge-triggered readiness is tracked per event bit.  A UNIX
+             * stream socket is normally writable, so treating any previous
+             * readiness as a blanket suppression loses a later EPOLLIN edge
+             * whenever Xorg registers EPOLLIN|EPOLLOUT together.
+             */
+            uint32_t edge = ready & ~entry->ready;
+            uint32_t input = ready & (EPOLLIN | EPOLLPRI | EPOLLRDNORM |
+                                      EPOLLRDBAND | EPOLLMSG | EPOLLRDHUP);
+            /* A stream can be drained and refilled before the next epoll
+             * probe.  The readiness bit then never passes through zero, but
+             * rx_written still records a real new input edge. */
+            if (input && generation != entry->generation) edge |= input;
             entry->ready = ready;
-            continue;
+            entry->generation = generation;
+            if (!edge) continue;
+            ready = edge;
         }
         ((struct epoll_event *)(uintptr_t)events_ptr)[written++] =
             (struct epoll_event){.events = ready, .data = entry->data};
-        entry->ready = ready;
+        if (!(entry->events & EPOLLET)) entry->ready = ready;
         if (entry->events & EPOLLONESHOT) entry->events = 0;
     }
     if (written) {
@@ -5298,7 +5478,12 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
             if (fd >= 0 && (node.first_cluster == STORAGE_DEV_KIND_KEYBOARD ||
                             node.first_cluster == STORAGE_DEV_KIND_MOUSE)) {
                 struct task_file *file = task_file_for_fd(task, fd);
-                if (file) file->aux = input_evdev_cursor_now();
+                if (file) {
+                    file->aux = input_evdev_cursor_now();
+                    /* Bind graphical consumers to their inherited VT even
+                     * when Xorg opens evdev before KDSETMODE(KD_GRAPHICS). */
+                    file->input_vt = task_evdev_vt_hint(task);
+                }
             }
             return fd;
         }
@@ -5343,6 +5528,7 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
             struct task_file *stdio_file = task_descriptor_for_fd(task, (int)fd);
             struct task_pty_fd *pty_fd = task_pty_fd_for_fd(task, (int)fd);
             if (stdio_file) {
+                task_epoll_remove_fd(task, (int)fd);
                 syscall_record_locks_close(task, stdio_file);
                 result = clear_task_file_result(stdio_file);
             } else if (pty_fd) {
@@ -5358,6 +5544,7 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
         }
         struct task_file *descriptor = task_descriptor_for_fd(task, (int)fd);
         if (descriptor) {
+            task_epoll_remove_fd(task, (int)fd);
             syscall_record_locks_close(task, descriptor);
             return clear_task_file_result(descriptor);
         }
@@ -6692,6 +6879,7 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
     if (number == LINUX_SYS_IOCTL &&
         (a1 == FBIOGET_VSCREENINFO || a1 == FBIOPUT_VSCREENINFO ||
          a1 == FBIOGET_FSCREENINFO || a1 == FBIOPAN_DISPLAY ||
+         a1 == FBIOGETCMAP || a1 == FBIOPUTCMAP || a1 == FBIOBLANK ||
          a1 == RELIEFOS_FBIOGET_CAPABILITIES || a1 == RELIEFOS_FBIOUPDATE_REGION ||
          a1 == RELIEFOS_FBIOBLIT)) {
         struct task *task = sched_current_task();
@@ -6702,9 +6890,16 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
             !fb->available) {
             return -RELIEFOS_ENOTTY;
         }
-        if (a1 == RELIEFOS_FBIOBLIT || a1 == FBIOPUT_VSCREENINFO) {
+        /* The native present path requires a live claim on the display: a
+         * controlling VT, the active one, claimed in graphics mode.  The
+         * standard fbdev mode set has no such gate in Linux — Xorg calls
+         * FBIOPUT_VSCREENINFO during ScreenInit from a server process with
+         * no controlling terminal — so it must keep working on any open
+         * /dev/fb0 descriptor. */
+        if (a1 == RELIEFOS_FBIOBLIT) {
             if (!task || !pty_vt_number(task->controlling_pty_id)) return -RELIEFOS_EPERM;
-            if (pty_vt_active() != task->controlling_pty_id || !pty_vt_graphical_active())
+            if (pty_vt_active() != task->controlling_pty_id) return -RELIEFOS_EAGAIN;
+            if (!pty_vt_graphical_active())
                 return -RELIEFOS_EAGAIN;
         }
         if (a1 == RELIEFOS_FBIOBLIT) {
@@ -6725,6 +6920,55 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
                 framebuffer_rect(update.x, update.y, update.width, update.height, update.color);
             }
             framebuffer_present_region(update.x, update.y, update.width, update.height);
+            return 0;
+        }
+        if (a1 == FBIOBLANK) {
+            if (a2 > FB_BLANK_POWERDOWN) return -RELIEFOS_EINVAL;
+            reliefos_fb_blank = (uint32_t)a2;
+            if (a2 == FB_BLANK_UNBLANK)
+                framebuffer_present_region(0, 0, fb->width, fb->height);
+            return 0;
+        }
+        if (a1 == FBIOGETCMAP || a1 == FBIOPUTCMAP) {
+            struct fb_cmap cmap;
+            uint32_t end;
+            if (!user_range_ok(a2, sizeof(cmap))) return -RELIEFOS_EFAULT;
+            __builtin_memcpy(&cmap, (const void *)(uintptr_t)a2, sizeof(cmap));
+            if (cmap.start > 256u || cmap.len > 256u - cmap.start)
+                return -RELIEFOS_EINVAL;
+            end = cmap.start + cmap.len;
+            if (!cmap.len) return 0;
+            if (!cmap.red || !cmap.green || !cmap.blue)
+                return -RELIEFOS_EFAULT;
+            if (a1 == FBIOPUTCMAP) {
+                if (!user_range_ok(cmap.red, cmap.len * sizeof(uint16_t)) ||
+                    !user_range_ok(cmap.green, cmap.len * sizeof(uint16_t)) ||
+                    !user_range_ok(cmap.blue, cmap.len * sizeof(uint16_t)) ||
+                    (cmap.transp && !user_range_ok(cmap.transp,
+                                                    cmap.len * sizeof(uint16_t))))
+                    return -RELIEFOS_EFAULT;
+                for (uint32_t i = cmap.start; i < end; ++i) {
+                    reliefos_fb_palette[0][i] = ((const uint16_t *)(uintptr_t)cmap.red)[i - cmap.start];
+                    reliefos_fb_palette[1][i] = ((const uint16_t *)(uintptr_t)cmap.green)[i - cmap.start];
+                    reliefos_fb_palette[2][i] = ((const uint16_t *)(uintptr_t)cmap.blue)[i - cmap.start];
+                    reliefos_fb_palette[3][i] = cmap.transp
+                        ? ((const uint16_t *)(uintptr_t)cmap.transp)[i - cmap.start] : 0;
+                }
+            } else {
+                if (!user_range_writable(cmap.red, cmap.len * sizeof(uint16_t)) ||
+                    !user_range_writable(cmap.green, cmap.len * sizeof(uint16_t)) ||
+                    !user_range_writable(cmap.blue, cmap.len * sizeof(uint16_t)) ||
+                    (cmap.transp && !user_range_writable(cmap.transp,
+                                                          cmap.len * sizeof(uint16_t))))
+                    return -RELIEFOS_EFAULT;
+                for (uint32_t i = cmap.start; i < end; ++i) {
+                    ((uint16_t *)(uintptr_t)cmap.red)[i - cmap.start] = reliefos_fb_palette[0][i];
+                    ((uint16_t *)(uintptr_t)cmap.green)[i - cmap.start] = reliefos_fb_palette[1][i];
+                    ((uint16_t *)(uintptr_t)cmap.blue)[i - cmap.start] = reliefos_fb_palette[2][i];
+                    if (cmap.transp)
+                        ((uint16_t *)(uintptr_t)cmap.transp)[i - cmap.start] = reliefos_fb_palette[3][i];
+                }
+            }
             return 0;
         }
         /* Panning display is the Linux fbdev flush request: VMware SVGA
@@ -6782,8 +7026,14 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
             if (!user_range_ok(a2, sizeof(info))) return -RELIEFOS_EFAULT;
             copy_text(info.id, sizeof(info.id), "leonos-fb");
             info.smem_start = (uint64_t)(uintptr_t)fb->pixels;
-            info.smem_len = fb->pitch * fb->height;
-            info.type = 0;
+            /* Linux fbdev semantics: smem_len is the total video memory,
+             * stable across mode sets, so an existing mapping never becomes
+             * too small when the mode changes. */
+            info.smem_len = fb->max_bytes ? fb->max_bytes
+                                         : fb->pitch * fb->height;
+            info.type = FB_TYPE_PACKED_PIXELS;
+            info.visual = fb->type == MULTIBOOT2_FRAMEBUFFER_TYPE_RGB
+                              ? FB_VISUAL_TRUECOLOR : FB_VISUAL_PSEUDOCOLOR;
             info.line_length = fb->pitch;
             *(struct fb_fix_screeninfo *)(uintptr_t)a2 = info;
             return 0;
@@ -6794,8 +7044,12 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
         {
             const struct fb_var_screeninfo *info =
                 (const struct fb_var_screeninfo *)(uintptr_t)a2;
+            /* The dynamic backend owns a 32bpp surface whatever format the
+             * boot firmware advertised; accept the native 32bpp request and
+             * let framebuffer_set_mode decide what is really settable. */
             if (!info->xres || !info->yres || info->xres > fb->max_width ||
-                info->yres > fb->max_height || info->bits_per_pixel != fb->bpp) {
+                info->yres > fb->max_height ||
+                (info->bits_per_pixel != fb->bpp && info->bits_per_pixel != 32u)) {
                 return -RELIEFOS_EINVAL;
             }
             return framebuffer_set_mode(info->xres, info->yres) == 0
@@ -6806,26 +7060,41 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
     /* Linux virtual-console and keyboard-display ioctls operate on a VT
      * descriptor, never on a serial device or an unrelated PTY. */
     if (number == LINUX_SYS_IOCTL &&
-        (a1 == VT_GETSTATE || a1 == RELIEFOS_VT_GETGENERATION ||
-         a1 == VT_ACTIVATE || a1 == VT_WAITACTIVE || a1 == KDGETMODE ||
-         a1 == KDSETMODE)) {
+        (a1 == VT_OPENQRY || a1 == VT_GETMODE || a1 == VT_SETMODE ||
+         a1 == VT_GETSTATE || a1 == VT_RELDISP ||
+         a1 == RELIEFOS_VT_GETGENERATION || a1 == VT_ACTIVATE ||
+         a1 == VT_WAITACTIVE || a1 == KDGETMODE || a1 == KDSETMODE ||
+         a1 == KDGKBMODE || a1 == KDSKBMODE)) {
         struct task *task = sched_current_task();
         struct task_pty_fd *endpoint = task_pty_endpoint_for_fd(task, (int)a0);
         uint32_t id = endpoint && endpoint->endpoint == TASK_PTY_ENDPOINT_SLAVE
                           ? endpoint->pty_id : 0u;
         if (!pty_vt_number(id)) return -RELIEFOS_ENOTTY;
+        if (a1 == VT_OPENQRY) {
+            return task_vt_query_ioctl(a1, a2);
+        }
         if (a1 == RELIEFOS_VT_GETGENERATION) {
             if (!user_range_writable(a2, sizeof(uint64_t))) return -RELIEFOS_EFAULT;
             *(uint64_t *)(uintptr_t)a2 = pty_vt_generation();
             return 0;
         }
         if (a1 == VT_GETSTATE) {
-            if (!user_range_writable(a2, sizeof(struct vt_stat))) return -RELIEFOS_EFAULT;
-            *(struct vt_stat *)(uintptr_t)a2 = (struct vt_stat){
-                .v_active = (unsigned short)pty_vt_active(),
-                .v_state = 0x7eu,
-            };
-            return 0;
+            return task_vt_query_ioctl(a1, a2);
+        }
+        if (a1 == VT_GETMODE) {
+            if (!user_range_writable(a2, sizeof(struct vt_mode))) return -RELIEFOS_EFAULT;
+            return pty_vt_get_mode(id, (struct vt_mode *)(uintptr_t)a2);
+        }
+        if (a1 == VT_SETMODE) {
+            if (task->controlling_pty_id != id &&
+                !(task->cap_effective & (1ULL << CAP_SYS_TTY_CONFIG))) return -RELIEFOS_EPERM;
+            if (!user_range_ok(a2, sizeof(struct vt_mode))) return -RELIEFOS_EFAULT;
+            return pty_vt_set_mode(id, (const struct vt_mode *)(uintptr_t)a2);
+        }
+        if (a1 == VT_RELDISP) {
+            if (task->controlling_pty_id != id &&
+                !(task->cap_effective & (1ULL << CAP_SYS_TTY_CONFIG))) return -RELIEFOS_EPERM;
+            return pty_vt_release_display(id, (int)a2);
         }
         if (a1 == VT_ACTIVATE || a1 == VT_WAITACTIVE) {
             if (task->controlling_pty_id != id &&
@@ -6839,7 +7108,21 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
             *(int *)(uintptr_t)a2 = pty_vt_graphical(id) ? KD_GRAPHICS : KD_TEXT;
             return 0;
         }
-        if (task->controlling_pty_id != id) return -RELIEFOS_EPERM;
+        if (a1 == KDGKBMODE) {
+            if (!user_range_writable(a2, sizeof(int))) return -RELIEFOS_EFAULT;
+            return pty_vt_get_keyboard_mode(id, (int *)(uintptr_t)a2);
+        }
+        if (a1 == KDSKBMODE) {
+            if (task->controlling_pty_id != id &&
+                !(task->cap_effective & (1ULL << CAP_SYS_TTY_CONFIG))) return -RELIEFOS_EPERM;
+            return pty_vt_set_keyboard_mode(id, (int)a2);
+        }
+        /* KDSETMODE changes who owns the display, so it follows the same rule
+         * as the other VT ioctls: the controlling terminal or the
+         * CAP_SYS_TTY_CONFIG capability. */
+        if (task->controlling_pty_id != id &&
+            !(task->cap_effective & (1ULL << CAP_SYS_TTY_CONFIG)))
+            return -RELIEFOS_EPERM;
         if (a2 != KD_TEXT && a2 != KD_GRAPHICS) return -RELIEFOS_EINVAL;
         return pty_vt_set_graphics(id, a2 == KD_GRAPHICS);
     }

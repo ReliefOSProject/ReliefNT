@@ -138,6 +138,8 @@ int svga_gb_destroy_locked(struct svga_gb_resource *resource, uint32_t id, bool 
 
 /* Bootstrap framebuffer adapter. All register I/O uses this same lock. */
 void svga_platform_bind(uint16_t port, volatile uint32_t *fifo, uint32_t bytes);
+/** @brief Queue a 2D scanout update while the SVGA device lock is held. */
+int svga_update_locked(uint32_t x, uint32_t y, uint32_t width, uint32_t height);
 int svga_update(uint32_t x, uint32_t y, uint32_t width, uint32_t height);
 int svga_mode_begin(uint64_t *flags);
 void svga_mode_end(uint64_t flags);

@@ -176,7 +176,7 @@ static int sidecar_path_is_system_tree(const char *path)
 
 /**
  * @brief Split an absolute path into its directory and final component.
- * @param path Absolute path; ':' is not accepted in a pathname.
+ * @param path Absolute POSIX path; ':' is valid inside a component.
  * @param parent Output directory, absolute; "/" for a top-level name.
  * @param parent_cap Bytes available at `parent`.
  * @param name Output component; "." for the root directory itself, so the root
@@ -192,11 +192,6 @@ static int sidecar_parent_name(const char *path, char *parent, uint32_t parent_c
     uint32_t pos = 0;
     if (!path || path[0] != '/' || !parent || !name || parent_cap < 2 || name_cap == 0) {
         return -RELIEFOS_EINVAL;
-    }
-    for (uint32_t i = 0; path[i]; ++i) {
-        if (path[i] == ':') {
-            return -RELIEFOS_EINVAL;
-        }
     }
     if (!path[1]) {
         if (parent_cap < 2 || name_cap < 2) {

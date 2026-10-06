@@ -5,6 +5,7 @@
 static struct reliefos_utf8_stream console_utf8;
 #include <reliefnt/console.h>
 #include <reliefnt/framebuffer.h>
+#include <reliefnt/heap.h>
 #include <reliefnt/time.h>
 
 #define CONSOLE_LOG_CAP 8192
@@ -57,6 +58,52 @@ static uint32_t fb_console_tty_cursor_x;
 static uint32_t fb_console_tty_cursor_y;
 static uint8_t fb_console_tty_cursor_bpp;
 static uint8_t fb_console_tty_cursor_saved[FB_CONSOLE_CURSOR_BYTES];
+static uint8_t *console_graphic_saved;
+static size_t console_graphic_saved_bytes;
+static uint32_t console_graphic_saved_vt;
+
+/**
+ * @brief Save the graphical framebuffer before a text VT paints over it.
+ */
+static void console_save_graphic_frame(void)
+{
+    const struct framebuffer *fb = framebuffer_get();
+    uint64_t bytes64;
+    size_t bytes;
+
+    if (!fb->available || !fb->pixels || !fb->pitch || !fb->height) return;
+    bytes64 = (uint64_t)fb->pitch * fb->height;
+    if (bytes64 > (uint64_t)(size_t)-1) return;
+    bytes = (size_t)bytes64;
+    if (console_graphic_saved_bytes != bytes) {
+        if (console_graphic_saved) kernel_free(console_graphic_saved);
+        console_graphic_saved = kernel_malloc(bytes);
+        console_graphic_saved_bytes = console_graphic_saved ? bytes : 0;
+        console_graphic_saved_vt = 0;
+    }
+    if (console_graphic_saved) {
+        __builtin_memcpy(console_graphic_saved, fb->pixels, bytes);
+        console_graphic_saved_vt = console_active_vt;
+    }
+}
+
+/**
+ * @brief Restore the saved graphical framebuffer after returning from text.
+ * @return True when a saved frame was restored.
+ */
+static bool console_restore_graphic_frame(uint32_t number)
+{
+    const struct framebuffer *fb = framebuffer_get();
+    uint64_t bytes64;
+
+    if (!fb->available || !fb->pixels || !fb->pitch || !fb->height) return false;
+    bytes64 = (uint64_t)fb->pitch * fb->height;
+    if (!console_graphic_saved || console_graphic_saved_vt != number ||
+        bytes64 != console_graphic_saved_bytes) return false;
+    __builtin_memcpy(fb->pixels, console_graphic_saved, console_graphic_saved_bytes);
+    framebuffer_present();
+    return true;
+}
 
 /* Match the desktop terminal's readable ANSI palette while retaining a
  * black ANSI background for conventional TTY output. */
@@ -853,6 +900,23 @@ static void console_present(void)
     console_presenting = false;
 }
 
+/**
+ * @brief Refresh the active graphical VT's framebuffer scanout.
+ *
+ * The VMware legacy FIFO does not observe direct mmap writes from Xorg, so a
+ * periodic full-screen UPDATE is required while a graphical VT is active.
+ * This path is independent of the text-console renderer: Xorg owns the
+ * framebuffer while the active VT is graphical, even if text rendering has
+ * been disabled for that hand-off.
+ */
+void console_display_tick(void)
+{
+    if (!console_vt_graphical || !framebuffer_get()->available) {
+        return;
+    }
+    framebuffer_display_tick();
+}
+
 static void print_unsigned_raw(uint64_t value, unsigned base, bool upper)
 {
     char buf[32];
@@ -972,19 +1036,25 @@ void console_vt_write(uint32_t number, const char *s, size_t len)
  */
 void console_vt_activate(uint32_t number, bool graphical)
 {
+    bool restored = false;
     if (number < 1u || number > CONSOLE_VT_COUNT) return;
+    if (console_vt_graphical && !graphical) console_save_graphic_frame();
     fb_console_hide_tty_cursor();
     console_active_vt = number;
     console_vt_graphical = graphical;
     console_service_logs_only = true;
     console_runtime_quiet = false;
     fb_console_tty_cursor_active = !graphical;
-    if (!fb_console_enabled || !framebuffer_get()->available) return;
+    if (!framebuffer_get()->available) return;
     if (graphical) {
-        framebuffer_clear(0u);
-        framebuffer_present();
+        restored = console_restore_graphic_frame(number);
+        if (!restored) {
+            framebuffer_clear(0u);
+            framebuffer_present();
+        }
         return;
     }
+    if (!fb_console_enabled) return;
     fb_console_initialize_fullscreen();
     fb_console_clear_log();
     struct console_vt_text *screen = &vt_text[number - 1u];

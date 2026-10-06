@@ -33,6 +33,8 @@ void console_write_len(const char *s, size_t len);
 void console_vt_write(uint32_t number, const char *s, size_t len);
 /** @brief Present the active text VT or yield the framebuffer to graphics. */
 void console_vt_activate(uint32_t number, bool graphical);
+/** @brief Refresh the active graphical VT's framebuffer scanout. */
+void console_display_tick(void);
 /**
  * @brief Format and write a message to the console, printf-style.
  */
