@@ -563,7 +563,7 @@ static void e1000_driver_fini(void)
     e1000_release_rings();
 }
 
-struct reliefos_driver_module reliefos_driver_module = {
+const struct reliefos_driver_module e1000_driver_module = {
     .magic = RELIEFOS_DRIVER_MODULE_MAGIC,
     .abi_version = RELIEFOS_DRIVER_ABI_VERSION,
     .struct_size = sizeof(struct reliefos_driver_module),

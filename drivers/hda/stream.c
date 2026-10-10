@@ -777,7 +777,7 @@ uint32_t hda_stream_service_locked(struct hda_controller *c, uint32_t budget)
             s->state = HDA_STREAM_XRUN;
             if (!s->xrun_reported) {
                 s->xrun_reported = 1u;
-                audio_period_elapsed(s->card_id, s->id, s->frame_position, -EPIPE);
+                hda_audio_period_elapsed(s->card_id, s->id, s->frame_position, -EPIPE);
             }
             ++consumed;
             continue;
@@ -792,7 +792,7 @@ uint32_t hda_stream_service_locked(struct hda_controller *c, uint32_t budget)
             s->state = HDA_STREAM_XRUN;
             if (!s->xrun_reported) {
                 s->xrun_reported = 1u;
-                audio_period_elapsed(s->card_id, s->id, s->frame_position, -EPIPE);
+                hda_audio_period_elapsed(s->card_id, s->id, s->frame_position, -EPIPE);
             }
             ++consumed;
             continue;
@@ -802,7 +802,7 @@ uint32_t hda_stream_service_locked(struct hda_controller *c, uint32_t budget)
         if (completed == s->reported_frames) continue;
         s->reported_frames = completed;
         s->last_period = (uint32_t)(completed / s->selected.pcm.period_frames) % s->period_count;
-        audio_period_elapsed(s->card_id, s->id, completed, 0);
+        hda_audio_period_elapsed(s->card_id, s->id, completed, 0);
         ++consumed;
     }
     return consumed;

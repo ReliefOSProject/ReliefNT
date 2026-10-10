@@ -999,7 +999,7 @@ static void es1371_driver_fini(void)
     es1371_zero(&es1371, sizeof(es1371));
 }
 
-const struct reliefos_driver_module reliefos_driver_module = {
+const struct reliefos_driver_module es1371_driver_module = {
     .magic = RELIEFOS_DRIVER_MODULE_MAGIC,
     .abi_version = RELIEFOS_DRIVER_ABI_VERSION,
     .struct_size = sizeof(struct reliefos_driver_module),

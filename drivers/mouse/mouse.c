@@ -613,7 +613,7 @@ static void mouse_driver_fini(void)
     state.present = false;
 }
 
-struct reliefos_driver_module reliefos_driver_module = {
+const struct reliefos_driver_module mouse_driver_module = {
     .magic = RELIEFOS_DRIVER_MODULE_MAGIC,
     .abi_version = RELIEFOS_DRIVER_ABI_VERSION,
     .struct_size = sizeof(struct reliefos_driver_module),

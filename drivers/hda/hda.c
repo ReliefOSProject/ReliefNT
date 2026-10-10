@@ -67,7 +67,7 @@ static void hda_module_error(const char *stage,const struct reliefos_driver_pci_
  * @param bytes Number of bytes.
  * @return Original dst. No allocation, lock, or ownership change.
  */
-void *memset(void *dst, int value, size_t bytes)
+static void *memset(void *dst, int value, size_t bytes)
 {
     volatile unsigned char *p=dst;
     while(bytes--)*p++=(unsigned char)value;
@@ -81,7 +81,7 @@ void *memset(void *dst, int value, size_t bytes)
  * @param error Negative stream error or zero.
  * @return None. Bounded IRQ callback; no kernel symbol relocation is required.
  */
-void audio_period_elapsed(uint32_t card,uint32_t stream,uint64_t frames,int error)
+void hda_audio_period_elapsed(uint32_t card,uint32_t stream,uint64_t frames,int error)
 {
     if(kernel_api)kernel_api->audio_period_elapsed(card,stream,frames,error);
 }
@@ -959,7 +959,7 @@ static int hda_module_init(const struct reliefos_driver_kernel_api *api)
     return published_cards?0:-ENODEV;
 }
 
-const struct reliefos_driver_module reliefos_driver_module={
+const struct reliefos_driver_module hda_driver_module={
     .magic=RELIEFOS_DRIVER_MODULE_MAGIC,.abi_version=RELIEFOS_DRIVER_ABI_VERSION,
     .struct_size=sizeof(struct reliefos_driver_module),.kind=RELIEFOS_DRIVER_KIND_AUDIO,
     .name="Intel HDA",.version=1,.init=hda_module_init,.fini=hda_module_fini};

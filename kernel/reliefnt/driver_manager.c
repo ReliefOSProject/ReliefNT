@@ -1,6 +1,7 @@
 /*
- * ReliefOS kernel driver manager: owns built-in and loadable driver lifecycle.
+ * ReliefOS kernel driver manager: owns the built-in driver lifecycle.
  * Provides registration, probing, initialization, and device event dispatch.
+ * Every driver is linked into kernel.sys; there is no runtime module loader.
  */
 #include <reliefnt/console.h>
 #include <reliefnt/driver_manager.h>
@@ -16,17 +17,15 @@
 #include <reliefnt/driver_manager_phase.h>
 #include <reliefnt/lock.h>
 #include <reliefnt/panic.h>
-#include <reliefnt/storage.h>
 #include <reliefnt/time.h>
-#include <reliefos/layout.h>
 
 #include "../arch/x86_64/port.h"
 
 #define EARLY_SERIAL_COM1 0x3f8u
 #define EARLY_SERIAL_LSR  (EARLY_SERIAL_COM1 + 5u)
 
-/* Kernel diagnostics must be available before serial.drv is loaded.  Keep a
- * tiny COM1 backend here; the loadable driver later replaces it through
+/* Kernel diagnostics must be available before the serial driver registers.
+ * Keep a tiny COM1 backend here; the driver later replaces it through
  * register_serial(), without changing the public console API. */
 static int early_serial_ready;
 
@@ -52,78 +51,27 @@ static void early_serial_write(const char *text)
     }
 }
 
-#define DRIVER_DIRECTORY RELIEFOS_LAYOUT_RELIEFOS_DRIVERS
-#define DRIVER_CONFIG_PATH RELIEFOS_PATH_DRIVERS_CONF
-#define DRIVER_CONFIG_CAP 1024U
-#define DRIVER_ELF_MAX_SECTIONS 64U
-#define DRIVER_ELF_MAX_IMAGE (4U * 1024U * 1024U)
+/* Descriptors of the drivers linked into kernel.sys, in load order: serial
+ * first so console output moves off the early COM1 path, then alphabetical. */
+extern const struct reliefos_driver_module serial_driver_module;
+extern const struct reliefos_driver_module ac97_driver_module;
+extern const struct reliefos_driver_module e1000_driver_module;
+extern const struct reliefos_driver_module es1371_driver_module;
+extern const struct reliefos_driver_module hda_driver_module;
+extern const struct reliefos_driver_module mouse_driver_module;
 
-#define ELF_ET_REL 1U
-#define ELF_EM_X86_64 62U
-#define ELF_SHT_PROGBITS 1U
-#define ELF_SHT_SYMTAB 2U
-#define ELF_SHT_STRTAB 3U
-#define ELF_SHT_RELA 4U
-#define ELF_SHT_NOBITS 8U
-#define ELF_SHF_ALLOC 0x2ULL
-#define ELF_SHN_UNDEF 0U
-#define ELF_SHN_ABS 0xfff1U
-#define ELF_R_X86_64_64 1U
-#define ELF_R_X86_64_PC32 2U
-#define ELF_R_X86_64_PLT32 4U
-#define ELF_R_X86_64_32 10U
-#define ELF_R_X86_64_32S 11U
-
-struct elf64_ehdr {
-    uint8_t ident[16];
-    uint16_t type;
-    uint16_t machine;
-    uint32_t version;
-    uint64_t entry;
-    uint64_t phoff;
-    uint64_t shoff;
-    uint32_t flags;
-    uint16_t ehsize;
-    uint16_t phentsize;
-    uint16_t phnum;
-    uint16_t shentsize;
-    uint16_t shnum;
-    uint16_t shstrndx;
-};
-
-struct elf64_shdr {
-    uint32_t name;
-    uint32_t type;
-    uint64_t flags;
-    uint64_t addr;
-    uint64_t offset;
-    uint64_t size;
-    uint32_t link;
-    uint32_t info;
-    uint64_t addralign;
-    uint64_t entsize;
-};
-
-struct elf64_sym {
-    uint32_t name;
-    uint8_t info;
-    uint8_t other;
-    uint16_t shndx;
-    uint64_t value;
-    uint64_t size;
-};
-
-struct elf64_rela {
-    uint64_t offset;
-    uint64_t info;
-    int64_t addend;
+static const struct reliefos_driver_module *const builtin_modules[] = {
+    &serial_driver_module,
+    &ac97_driver_module,
+    &e1000_driver_module,
+    &es1371_driver_module,
+    &hda_driver_module,
+    &mouse_driver_module,
 };
 
 struct driver_slot {
     struct reliefos_driver_info info;
     const struct reliefos_driver_module *module;
-    uint64_t image_phys;
-    uint32_t image_pages;
     int cleanup_error;
 };
 
@@ -174,145 +122,6 @@ static void driver_copy_text(char *dst, uint32_t cap, const char *src)
 }
 
 /**
- * @brief Return 1 when left and right are equal NUL-terminated strings (NULL never equals).
- */
-static int driver_text_equal(const char *left, const char *right)
-{
-    uint32_t index = 0;
-    while (left && right && left[index] == right[index]) {
-        if (left[index] == 0) {
-            return 1;
-        }
-        ++index;
-    }
-    return 0;
-}
-
-/**
- * @brief Compare a string embedded in a buffer (bounded by available bytes) with right; the NUL must fit.
- */
-static int driver_elf_string_equal(const char *left, uint64_t available,
-                                   const char *right)
-{
-    uint64_t index = 0;
-    while (right && right[index]) {
-        if (index >= available || !left || left[index] != right[index]) {
-            return 0;
-        }
-        ++index;
-    }
-    return right && index < available && left[index] == 0;
-}
-
-/**
- * @brief Return 1 when text begins with the whole of prefix (NULL-safe).
- */
-static int driver_text_starts_with(const char *text, const char *prefix)
-{
-    uint32_t index = 0;
-    while (text && prefix && prefix[index]) {
-        if (text[index] != prefix[index]) {
-            return 0;
-        }
-        ++index;
-    }
-    return prefix && prefix[index] == 0;
-}
-
-/**
- * @brief Length of a NUL-terminated string, never reading past cap bytes.
- */
-static uint32_t driver_text_length(const char *text, uint32_t cap)
-{
-    uint32_t length = 0;
-    while (text && length < cap && text[length]) {
-        ++length;
-    }
-    return length;
-}
-
-/**
- * @brief Return 1 when name ends with the ".drv" extension.
- */
-static int driver_has_drv_suffix(const char *name)
-{
-    uint32_t length = driver_text_length(name, RELIEFOS_DRIVER_FILE_LEN);
-    return length > 4U && name[length - 4U] == '.' &&
-           name[length - 3U] == 'd' && name[length - 2U] == 'r' &&
-           name[length - 1U] == 'v';
-}
-
-/**
- * @brief True for a ".drv" name of legal length using only [A-Za-z0-9._-].
- */
-static int driver_file_name_valid(const char *file)
-{
-    uint32_t length = driver_text_length(file, RELIEFOS_DRIVER_FILE_LEN);
-    if (!driver_has_drv_suffix(file) || length == 0 || length >= RELIEFOS_DRIVER_FILE_LEN) {
-        return 0;
-    }
-    for (uint32_t index = 0; index < length; ++index) {
-        char ch = file[index];
-        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-              (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-')) {
-            return 0;
-        }
-    }
-    return 1;
-}
-
-/**
- * @brief Case-sensitive ordering compare (negative/zero/positive); NULL is treated as unequal.
- */
-static int driver_name_compare(const char *left, const char *right)
-{
-    uint32_t index = 0;
-    while (left && right && left[index] == right[index]) {
-        if (left[index] == 0) {
-            return 0;
-        }
-        ++index;
-    }
-    if (!left || !right) {
-        return left ? 1 : (right ? -1 : 0);
-    }
-    return (uint8_t)left[index] < (uint8_t)right[index] ? -1 : 1;
-}
-
-/**
- * @brief Sort comparator that forces serial.drv ahead of everything, then alphabetical order.
- */
-static int driver_load_order_compare(const char *left, const char *right)
-{
-    int left_is_serial = driver_text_equal(left, "serial.drv");
-    int right_is_serial = driver_text_equal(right, "serial.drv");
-    if (left_is_serial != right_is_serial) {
-        return left_is_serial ? -1 : 1;
-    }
-    return driver_name_compare(left, right);
-}
-
-/**
- * @brief Build "/usr/lib/reliefos/drivers/<file>" into dst, clamped to cap bytes and NUL-terminated.
- */
-static void driver_make_path(char *dst, uint32_t cap, const char *file)
-{
-    uint32_t pos = 0;
-    const char *prefix = DRIVER_DIRECTORY "/";
-    if (!dst || cap == 0) {
-        return;
-    }
-    while (prefix[pos] && pos + 1U < cap) {
-        dst[pos] = prefix[pos];
-        ++pos;
-    }
-    for (uint32_t index = 0; file && file[index] && pos + 1U < cap; ++index) {
-        dst[pos++] = file[index];
-    }
-    dst[pos] = 0;
-}
-
-/**
  * @brief Mark the slot failed, record the error text, and log it only when status is negative.
  */
 static void driver_set_error(struct driver_slot *slot, int status, const char *error)
@@ -326,28 +135,6 @@ static void driver_set_error(struct driver_slot *slot, int status, const char *e
         console_printf("[driver] %s failed status=%d: %s\n", slot->info.file,
                        status, slot->info.error);
     }
-}
-
-/**
- * @brief Round value up to a multiple of alignment, clamping alignment to 1..4096.
- */
-static uint64_t driver_align_up(uint64_t value, uint64_t alignment)
-{
-    if (alignment < 1U) {
-        alignment = 1U;
-    }
-    if (alignment > 4096U) {
-        alignment = 4096U;
-    }
-    return (value + alignment - 1U) & ~(alignment - 1U);
-}
-
-/**
- * @brief Return 1 when [offset, offset+size) fits inside total without overflow.
- */
-static int driver_range_valid(uint64_t offset, uint64_t size, uint64_t total)
-{
-    return offset <= total && size <= total - offset;
 }
 
 /**
@@ -371,316 +158,6 @@ static void driver_memcpy(void *dst, const void *src, uint64_t size)
     while (size--) {
         *out++ = *in++;
     }
-}
-
-/**
- * @brief Return 1 when drivers.conf contains a "disabled=<file>" line for this driver.
- */
-static int driver_config_disabled(const char *file)
-{
-    struct storage_node node;
-    char config[DRIVER_CONFIG_CAP];
-    uint32_t got = 0;
-    uint32_t pos = 0;
-    if (!file || storage_lookup_path(DRIVER_CONFIG_PATH, &node) < 0 ||
-        node.type != RELIEFOS_FS_TYPE_FILE || node.size == 0) {
-        return 0;
-    }
-    if (storage_read_node(&node, 0, config,
-                          node.size >= sizeof(config) ? sizeof(config) - 1U : (uint32_t)node.size,
-                          &got) < 0) {
-        return 0;
-    }
-    config[got < sizeof(config) ? got : sizeof(config) - 1U] = 0;
-    while (pos < got) {
-        uint32_t start = pos;
-        while (pos < got && config[pos] != '\n' && config[pos] != '\r') {
-            ++pos;
-        }
-        if (pos > start && driver_text_starts_with(config + start, "disabled=") &&
-            driver_text_equal(config + start + 9U, file)) {
-            return 1;
-        }
-        while (pos < got && (config[pos] == '\n' || config[pos] == '\r')) {
-            ++pos;
-        }
-    }
-    return 0;
-}
-
-/**
- * @brief Rebuild drivers.conf: a version header plus one "disabled=" line per disabled driver.
- */
-static int driver_write_config(void)
-{
-    char config[DRIVER_CONFIG_CAP];
-    uint32_t pos = 0;
-    const char *header = "version=1\n";
-    for (uint32_t index = 0; header[index] && pos + 1U < sizeof(config); ++index) {
-        config[pos++] = header[index];
-    }
-    for (uint32_t index = 0; index < RELIEFOS_DRIVER_MAX; ++index) {
-        const struct driver_slot *slot = &driver_slots[index];
-        const char *prefix = "disabled=";
-        if (!slot->info.file[0] || !(slot->info.flags & RELIEFOS_DRIVER_FLAG_DISABLED)) {
-            continue;
-        }
-        for (uint32_t j = 0; prefix[j] && pos + 1U < sizeof(config); ++j) {
-            config[pos++] = prefix[j];
-        }
-        for (uint32_t j = 0; slot->info.file[j] && pos + 1U < sizeof(config); ++j) {
-            config[pos++] = slot->info.file[j];
-        }
-        if (pos + 1U >= sizeof(config)) {
-            return -28;
-        }
-        config[pos++] = '\n';
-    }
-    config[pos] = 0;
-    return storage_write_file(DRIVER_CONFIG_PATH, config, pos);
-}
-
-/**
- * @brief Return the driver slot whose file name matches, or NULL when absent.
- */
-static struct driver_slot *driver_find_file(const char *file)
-{
-    for (uint32_t index = 0; index < RELIEFOS_DRIVER_MAX; ++index) {
-        if (driver_slots[index].info.file[0] &&
-            driver_text_equal(driver_slots[index].info.file, file)) {
-            return &driver_slots[index];
-        }
-    }
-    return 0;
-}
-
-/**
- * @brief Find a slot by file, or claim a free one and seed its disabled/autostart state from drivers.conf.
- */
-static struct driver_slot *driver_get_slot(const char *file)
-{
-    struct driver_slot *slot = driver_find_file(file);
-    if (slot) {
-        return slot;
-    }
-    for (uint32_t index = 0; index < RELIEFOS_DRIVER_MAX; ++index) {
-        slot = &driver_slots[index];
-        if (!slot->info.file[0]) {
-            driver_memzero(slot, sizeof(*slot));
-            slot->info.id = index;
-            slot->info.state = driver_config_disabled(file)
-                                   ? RELIEFOS_DRIVER_STATE_DISABLED
-                                   : RELIEFOS_DRIVER_STATE_UNLOADED;
-            slot->info.flags = RELIEFOS_DRIVER_FLAG_AUTOSTART |
-                               (slot->info.state == RELIEFOS_DRIVER_STATE_DISABLED
-                                    ? RELIEFOS_DRIVER_FLAG_DISABLED : 0U);
-            driver_copy_text(slot->info.file, sizeof(slot->info.file), file);
-            return slot;
-        }
-    }
-    return 0;
-}
-
-/**
- * @brief Read the whole file into freshly allocated memory and return its bytes and length.
- */
-static int driver_read_file(const char *path, const uint8_t **out_data, uint64_t *out_len)
-{
-    const void *data = 0;
-    size_t length = 0;
-    int ret = storage_read_file(path, &data, &length);
-    if (ret < 0 || !data || length == 0) {
-        return ret < 0 ? ret : -5;
-    }
-    *out_data = (const uint8_t *)data;
-    *out_len = (uint64_t)length;
-    return 0;
-}
-
-/**
- * @brief Release the pages that driver_read_file allocated for a file's contents.
- */
-static void driver_release_file(const void *data, uint64_t length)
-{
-    uint32_t pages = (uint32_t)((length + 4095U) / 4096U);
-    if (data && pages) {
-        mm_free_pages((uint64_t)(uintptr_t)data, pages);
-    }
-}
-
-/**
- * @brief Resolve a symbol to its runtime address: its own value if absolute, else its section base plus value.
- */
-static int driver_symbol_value(const struct elf64_sym *symbol, uint16_t shnum,
-                               const struct elf64_shdr *sections,
-                               const uint64_t section_addresses[], uint64_t *out)
-{
-    if (!symbol || !out) {
-        return -22;
-    }
-    if (symbol->shndx == ELF_SHN_ABS) {
-        *out = symbol->value;
-        return 0;
-    }
-    if (symbol->shndx == ELF_SHN_UNDEF || symbol->shndx >= shnum ||
-        !sections || symbol->value > sections[symbol->shndx].size ||
-        !section_addresses[symbol->shndx]) {
-        return -8;
-    }
-    *out = section_addresses[symbol->shndx] + symbol->value;
-    return 0;
-}
-
-/**
- * @brief Patch every RELA relocation in the loaded image; -8 on malformed data, -95 on an unknown type.
- * @param data Borrowed validated module bytes.
- * @param length Size of the source image.
- * @param header Validated ELF header.
- * @param sections Borrowed section header table.
- * @param section_addresses Loaded writable section addresses.
- * @return 0 after byte-safe relocation stores, or a negative format/type error.
- */
-static int driver_apply_relocations(const uint8_t *data, uint64_t length,
-                                    const struct elf64_ehdr *header,
-                                    const struct elf64_shdr *sections,
-                                    const uint64_t section_addresses[])
-{
-    for (uint16_t index = 0; index < header->shnum; ++index) {
-        const struct elf64_shdr *rela_section = &sections[index];
-        const struct elf64_shdr *target;
-        const struct elf64_shdr *symbols;
-        const struct elf64_shdr *strings;
-        uint64_t count;
-        if (rela_section->type != ELF_SHT_RELA) {
-            continue;
-        }
-        if (rela_section->info >= header->shnum || rela_section->link >= header->shnum ||
-            rela_section->entsize != sizeof(struct elf64_rela) ||
-            !driver_range_valid(rela_section->offset, rela_section->size, length)) {
-            return -8;
-        }
-        target = &sections[rela_section->info];
-        symbols = &sections[rela_section->link];
-        if (symbols->type != ELF_SHT_SYMTAB || symbols->link >= header->shnum ||
-            symbols->entsize != sizeof(struct elf64_sym) ||
-            !driver_range_valid(symbols->offset, symbols->size, length) ||
-            !section_addresses[rela_section->info]) {
-            return -8;
-        }
-        strings = &sections[symbols->link];
-        if (strings->type != ELF_SHT_STRTAB ||
-            !driver_range_valid(strings->offset, strings->size, length)) {
-            return -8;
-        }
-        count = rela_section->size / sizeof(struct elf64_rela);
-        for (uint64_t rel_index = 0; rel_index < count; ++rel_index) {
-            const struct elf64_rela *rela =
-                (const struct elf64_rela *)(data + rela_section->offset +
-                                            rel_index * sizeof(struct elf64_rela));
-            uint32_t symbol_index = (uint32_t)(rela->info >> 32);
-            uint32_t type = (uint32_t)rela->info;
-            uint64_t symbol_count = symbols->size / sizeof(struct elf64_sym);
-            const struct elf64_sym *symbol;
-            uint64_t symbol_value;
-            uint64_t patch;
-            int64_t value;
-            if (symbol_index >= symbol_count || rela->offset >= target->size ||
-                !driver_range_valid(rela->offset, type == ELF_R_X86_64_64 ? 8U : 4U,
-                                    target->size)) {
-                return -8;
-            }
-            symbol = (const struct elf64_sym *)(data + symbols->offset +
-                                                symbol_index * sizeof(struct elf64_sym));
-            if (driver_symbol_value(symbol, header->shnum, sections, section_addresses,
-                                    &symbol_value) < 0) {
-                return -8;
-            }
-            patch = section_addresses[rela_section->info] + rela->offset;
-            if (type == ELF_R_X86_64_64) {
-                uint64_t word = symbol_value + (uint64_t)rela->addend;
-                driver_memcpy((void *)(uintptr_t)patch, &word, sizeof(word));
-            } else if (type == ELF_R_X86_64_PC32 || type == ELF_R_X86_64_PLT32) {
-                value = (int64_t)symbol_value + rela->addend - (int64_t)patch;
-                if (value < -2147483648LL || value > 2147483647LL) {
-                    return -8;
-                }
-                uint32_t word = (uint32_t)value;
-                driver_memcpy((void *)(uintptr_t)patch, &word, sizeof(word));
-            } else if (type == ELF_R_X86_64_32 || type == ELF_R_X86_64_32S) {
-                value = (int64_t)symbol_value + rela->addend;
-                if ((type == ELF_R_X86_64_32 &&
-                     (value < 0 || (uint64_t)value > 0xffffffffULL)) ||
-                    (type == ELF_R_X86_64_32S &&
-                     (value < -2147483648LL || value > 2147483647LL))) {
-                    return -8;
-                }
-                uint32_t word = (uint32_t)value;
-                driver_memcpy((void *)(uintptr_t)patch, &word, sizeof(word));
-            } else {
-                return -95;
-            }
-        }
-    }
-    return 0;
-}
-
-/**
- * @brief Locate the exported reliefos_driver_module symbol and resolve it to a pointer in the loaded image.
- * Transitional: old driver ELFs export the legacy leonos_driver_module name,
- * so both spellings are accepted until the old ecosystem is retired.
- */
-static int driver_find_module(const uint8_t *data, uint64_t length,
-                              const struct elf64_ehdr *header,
-                              const struct elf64_shdr *sections,
-                              const uint64_t section_addresses[],
-                              const struct reliefos_driver_module **out)
-{
-    for (uint16_t index = 0; index < header->shnum; ++index) {
-        const struct elf64_shdr *symbols = &sections[index];
-        const struct elf64_shdr *strings;
-        uint64_t count;
-        if (symbols->type != ELF_SHT_SYMTAB || symbols->link >= header->shnum ||
-            symbols->entsize != sizeof(struct elf64_sym) ||
-            !driver_range_valid(symbols->offset, symbols->size, length)) {
-            continue;
-        }
-        strings = &sections[symbols->link];
-        if (strings->type != ELF_SHT_STRTAB ||
-            !driver_range_valid(strings->offset, strings->size, length)) {
-            return -8;
-        }
-        count = symbols->size / sizeof(struct elf64_sym);
-        for (uint64_t symbol_index = 0; symbol_index < count; ++symbol_index) {
-            const struct elf64_sym *symbol =
-                (const struct elf64_sym *)(data + symbols->offset +
-                                            symbol_index * sizeof(struct elf64_sym));
-            uint64_t value;
-            const char *name;
-            if (symbol->name >= strings->size) {
-                return -8;
-            }
-            name = (const char *)(data + strings->offset + symbol->name);
-            if (!driver_range_valid(symbols->offset + symbol_index * sizeof(struct elf64_sym),
-                                    sizeof(struct elf64_sym), length) ||
-                (!driver_elf_string_equal(name, strings->size - symbol->name,
-                                          "reliefos_driver_module") &&
-                 !driver_elf_string_equal(name, strings->size - symbol->name,
-                                          "leonos_driver_module"))) {
-                continue;
-            }
-            if (symbol->shndx == ELF_SHN_UNDEF || symbol->shndx >= header->shnum ||
-                symbol->value > sections[symbol->shndx].size ||
-                sizeof(struct reliefos_driver_module) >
-                    sections[symbol->shndx].size - symbol->value ||
-                driver_symbol_value(symbol, header->shnum, sections, section_addresses,
-                                    &value) < 0) {
-                return -8;
-            }
-            *out = (const struct reliefos_driver_module *)(uintptr_t)value;
-            return 0;
-        }
-    }
-    return -2;
 }
 
 /**
@@ -1050,149 +527,65 @@ static void driver_clear_services(uint32_t slot_id)
     if (detach_network) net_driver_detached();
 }
 
-/** @brief Reject a copied module before it can disturb an owned PCI function.
- * @param candidate Validated, borrowed descriptor in the new module image.
- * @return True when a loaded or retained module has the same bounded name.
- * Task context under manager admission; no callback, allocation or PCI access.
+/**
+ * @brief Claim the next free driver slot and seed its built-in bookkeeping.
+ * @return Slot with id, state and flags set, or NULL when the table is full.
  */
-static bool driver_module_name_loaded(const struct reliefos_driver_module *candidate)
+static struct driver_slot *driver_claim_slot(void)
 {
-    for (uint32_t slot = 0; slot < RELIEFOS_DRIVER_MAX; ++slot) {
-        const struct driver_slot *existing = &driver_slots[slot];
-        if (existing->info.state != RELIEFOS_DRIVER_STATE_LOADED || !existing->module)
-            continue;
-        uint32_t n;
-        for (n = 0; n < RELIEFOS_DRIVER_NAME_LEN; ++n) {
-            if (existing->module->name[n] != candidate->name[n]) break;
-            if (!candidate->name[n]) return true;
+    for (uint32_t index = 0; index < RELIEFOS_DRIVER_MAX; ++index) {
+        struct driver_slot *slot = &driver_slots[index];
+        if (!slot->info.file[0]) {
+            driver_memzero(slot, sizeof(*slot));
+            slot->info.id = index;
+            slot->info.state = RELIEFOS_DRIVER_STATE_UNLOADED;
+            slot->info.flags = RELIEFOS_DRIVER_FLAG_AUTOSTART |
+                               RELIEFOS_DRIVER_FLAG_BUILTIN;
+            return slot;
         }
-        if (n == RELIEFOS_DRIVER_NAME_LEN) return true;
     }
-    return false;
+    return 0;
 }
 
 /**
- * @brief Load ELF, initialize module, and roll back owner resources on failure.
+ * @brief Initialize one built-in module and roll back owner resources on failure.
  * @param slot Manager-owned slot under serialized task transaction.
+ * @param module Built-in descriptor linked into the kernel image.
  * @return 0 or negative errno. Task context, no registry lock during callbacks;
- * retains image if DMA STOP or fini fails; cancels service/IRQ before fini.
+ * a failed audio STOP or unsafe fini retains the slot with its recorded error.
  */
-static int driver_load_slot(struct driver_slot *slot)
+static int driver_load_builtin(struct driver_slot *slot,
+                               const struct reliefos_driver_module *module)
 {
-    char path[RELIEFOS_DRIVER_FILE_LEN + 16U];
-    const uint8_t *data = 0;
-    uint64_t length = 0;
-    const struct elf64_ehdr *header;
-    const struct elf64_shdr *sections;
-    uint64_t section_addresses[DRIVER_ELF_MAX_SECTIONS];
-    uint64_t image_size = 0;
-    uint64_t image_phys = 0;
-    uint32_t image_pages = 0;
-    const struct reliefos_driver_module *module = 0;
-    int ret = -5;
-    if (!slot || slot->info.state == RELIEFOS_DRIVER_STATE_LOADED) {
-        return slot ? 0 : -22;
+    int ret;
+    if (!slot || !module) {
+        return -22;
     }
-    if (slot->info.flags & RELIEFOS_DRIVER_FLAG_DISABLED) {
-        return -13;
+    if (slot->info.state == RELIEFOS_DRIVER_STATE_LOADED) {
+        return 0;
     }
-    driver_make_path(path, sizeof(path), slot->info.file);
-    slot->info.state = RELIEFOS_DRIVER_STATE_LOADING;
-    slot->info.error[0] = 0;
-    if ((ret = driver_read_file(path, &data, &length)) < 0) {
-        driver_set_error(slot, ret, "Cannot read module file");
-        return ret;
-    }
-    if (length < sizeof(*header)) {
-        ret = -8;
-        driver_set_error(slot, ret, "ELF header is truncated");
-        goto out;
-    }
-    header = (const struct elf64_ehdr *)data;
-    if (header->ident[0] != 0x7f || header->ident[1] != 'E' ||
-        header->ident[2] != 'L' || header->ident[3] != 'F' ||
-        header->ident[4] != 2U || header->ident[5] != 1U ||
-        header->type != ELF_ET_REL || header->machine != ELF_EM_X86_64 ||
-        header->ehsize != sizeof(*header) || header->shnum == 0 ||
-        header->shnum > DRIVER_ELF_MAX_SECTIONS ||
-        header->shentsize != sizeof(struct elf64_shdr) ||
-        !driver_range_valid(header->shoff,
-                            (uint64_t)header->shnum * sizeof(struct elf64_shdr), length)) {
-        ret = -8;
-        driver_set_error(slot, ret, "Unsupported ELF64 relocatable module");
-        goto out;
-    }
-    sections = (const struct elf64_shdr *)(data + header->shoff);
-    driver_memzero(section_addresses, sizeof(section_addresses));
-    for (uint16_t index = 0; index < header->shnum; ++index) {
-        const struct elf64_shdr *section = &sections[index];
-        if (section->type != ELF_SHT_NOBITS &&
-            !driver_range_valid(section->offset, section->size, length)) {
-            ret = -8;
-            driver_set_error(slot, ret, "ELF section exceeds module file");
-            goto out;
-        }
-        if (!(section->flags & ELF_SHF_ALLOC)) {
-            continue;
-        }
-        image_size = driver_align_up(image_size, section->addralign);
-        if (section->size > DRIVER_ELF_MAX_IMAGE || image_size > DRIVER_ELF_MAX_IMAGE - section->size) {
-            ret = -12;
-            driver_set_error(slot, ret, "Module image is too large");
-            goto out;
-        }
-        image_size += section->size;
-    }
-    if (image_size == 0) {
-        ret = -8;
-        driver_set_error(slot, ret, "Module has no allocatable sections");
-        goto out;
-    }
-    image_pages = (uint32_t)((image_size + 4095U) / 4096U);
-    image_phys = mm_alloc_pages(image_pages);
-    if (!image_phys) {
-        ret = -12;
-        driver_set_error(slot, ret, "No memory for module image");
-        goto out;
-    }
-    driver_memzero((void *)(uintptr_t)image_phys, (uint64_t)image_pages * 4096U);
-    image_size = 0;
-    for (uint16_t index = 0; index < header->shnum; ++index) {
-        const struct elf64_shdr *section = &sections[index];
-        if (!(section->flags & ELF_SHF_ALLOC)) {
-            continue;
-        }
-        image_size = driver_align_up(image_size, section->addralign);
-        section_addresses[index] = image_phys + image_size;
-        if (section->type != ELF_SHT_NOBITS && section->size) {
-            driver_memcpy((void *)(uintptr_t)section_addresses[index],
-                          data + section->offset, section->size);
-        }
-        image_size += section->size;
-    }
-    if ((ret = driver_apply_relocations(data, length, header, sections, section_addresses)) < 0) {
-        driver_set_error(slot, ret, "Unsupported or invalid module relocation");
-        goto out;
-    }
-    if ((ret = driver_find_module(data, length, header, sections, section_addresses, &module)) < 0 ||
-        !module || module->magic != RELIEFOS_DRIVER_MODULE_MAGIC ||
+    if (module->magic != RELIEFOS_DRIVER_MODULE_MAGIC ||
         module->abi_version != RELIEFOS_DRIVER_ABI_VERSION ||
         module->struct_size != sizeof(*module) || !module->name[0] || !module->init) {
-        ret = ret < 0 ? ret : -8;
+        ret = -8;
         driver_set_error(slot, ret, "Driver descriptor ABI is invalid");
-        goto out;
+        return ret;
     }
-    if (driver_module_name_loaded(module)) {
-        ret = -16;
-        driver_set_error(slot, ret, "Module name already loaded");
-        goto out;
-    }
+    slot->module = module;
+    slot->info.state = RELIEFOS_DRIVER_STATE_LOADING;
+    slot->info.error[0] = 0;
+    slot->info.kind = module->kind;
+    slot->info.abi_version = module->abi_version;
+    slot->info.version = module->version;
+    slot->info.load_address = 0;
+    slot->info.image_size = 0;
+    driver_copy_text(slot->info.name, sizeof(slot->info.name), module->name);
     loading_slot = (int32_t)slot->info.id;
     struct driver_manager_wait_scope init_scope = {0};
     if ((ret = driver_manager_wait_begin(&init_scope)) < 0) {
         loading_slot = -1;
         driver_set_error(slot, ret, "Cannot release execution transaction for init");
-        goto out;
+        return ret;
     }
     ret = module->init(&driver_kernel_api);
     driver_manager_wait_end_or_panic(&init_scope);
@@ -1202,152 +595,40 @@ static int driver_load_slot(struct driver_slot *slot)
         driver_manager_service_close(slot->info.id);
         if (driver_manager_wait_begin(&rollback_scope) < 0)
             panic("driver manager cannot suspend execution for init rollback");
-        int disconnect=audio_unregister_owner(slot->info.id,1);
+        int disconnect = audio_unregister_owner(slot->info.id, 1);
         if (disconnect) {
-            /* A failed STOP forbids reclaiming code or DMA still owned by the
-             * device. Preserve a retryable slot instead of freeing its image. */
-            slot->module=module;slot->image_phys=image_phys;slot->image_pages=image_pages;
-            slot->info.kind=module->kind;
-            slot->info.load_address=image_phys;slot->info.image_size=image_size;
-            slot->info.abi_version=module->abi_version;slot->info.version=module->version;
-            driver_copy_text(slot->info.name,sizeof(slot->info.name),module->name);
-            driver_set_error(slot,disconnect,"Audio STOP failed; module retained");
-            slot->info.state=RELIEFOS_DRIVER_STATE_LOADED;
-            image_phys=0;
+            /* A failed STOP forbids reclaiming resources still owned by the
+             * device. Keep the slot retained and its services open. */
+            slot->module = module;
+            driver_set_error(slot, disconnect, "Audio STOP failed; module retained");
+            slot->info.state = RELIEFOS_DRIVER_STATE_LOADED;
             driver_manager_wait_end_or_panic(&rollback_scope);
             driver_manager_service_enable(slot->info.id);
-            ret=disconnect;goto out;
+            return disconnect;
         }
         driver_manager_service_drain(slot->info.id);
-        driver_resources_release(slot->info.id,true);
+        driver_resources_release(slot->info.id, true);
         int cleanup = driver_run_fini(slot, module);
         driver_manager_wait_end_or_panic(&rollback_scope);
         if (cleanup < 0) {
-            slot->module=module;slot->image_phys=image_phys;slot->image_pages=image_pages;
-            slot->info.kind=module->kind;
-            slot->info.load_address=image_phys;slot->info.image_size=image_size;
-            slot->info.abi_version=module->abi_version;slot->info.version=module->version;
-            driver_copy_text(slot->info.name,sizeof(slot->info.name),module->name);
-            driver_set_error(slot,cleanup,"Unsafe teardown; module retained for retry");
-            slot->info.state=RELIEFOS_DRIVER_STATE_LOADED;
-            image_phys=0;ret=cleanup;goto out;
+            slot->module = module;
+            driver_set_error(slot, cleanup, "Unsafe teardown; module retained");
+            slot->info.state = RELIEFOS_DRIVER_STATE_LOADED;
+            return cleanup;
         }
         driver_clear_services(slot->info.id);
-        driver_resources_release(slot->info.id,false);
+        driver_resources_release(slot->info.id, false);
         driver_set_error(slot, ret, "Driver initialization failed");
-        goto out;
+        slot->module = 0;
+        return ret;
     }
     slot->module = module;
-    slot->image_phys = image_phys;
-    slot->image_pages = image_pages;
     slot->info.state = RELIEFOS_DRIVER_STATE_LOADED;
-    slot->info.kind = module->kind;
-    slot->info.abi_version = module->abi_version;
-    slot->info.version = module->version;
-    slot->info.load_address = image_phys;
-    slot->info.image_size = image_size;
-    driver_copy_text(slot->info.name, sizeof(slot->info.name), module->name);
     slot->info.error[0] = 0;
     driver_manager_service_enable(slot->info.id);
-    console_printf("[driver] loaded %s as %s abi=%u\n", slot->info.file,
-                   slot->info.name, slot->info.abi_version);
-    ret = 0;
-out:
-    loading_slot = -1;
-    driver_release_file(data, length);
-    if (ret < 0 && image_phys) {
-        mm_free_pages(image_phys, image_pages);
-    }
-    return ret;
-}
-
-/**
- * @brief Disconnect owned audio before fini, synchronize MSI, then release image.
- * @param slot Owned loaded module slot, serialized by manager transaction.
- * @param force Nonzero disconnects active leases; normal active audio is EBUSY.
- * @return 0 or negative errno. Task context. Module init/fini and task-context
- * callbacks may wait only in the released manager wait phase; ISR/service callbacks
- * must remain bounded and nonblocking and may not acquire the execution transaction.
- * Detached stream/DMA owners survive in PCM until release. A failed fini
- * retains DMA/MMIO/image with service admission closed; later unload retries.
- */
-static int driver_unload_slot(struct driver_slot *slot, uint32_t force)
-{
-    if (!slot || slot->info.state != RELIEFOS_DRIVER_STATE_LOADED || !slot->module) {
-        return -2;
-    }
-    if (!force && slot->info.kind == RELIEFOS_DRIVER_KIND_NETWORK) {
-        return -16;
-    }
-    uint32_t owner = slot->info.id;
-    driver_manager_service_close(owner);
-    struct driver_manager_wait_scope unload_scope = {0};
-    int ret = driver_manager_wait_begin(&unload_scope);
-    if (ret < 0) {
-        driver_manager_service_reopen(owner);
-        return ret;
-    }
-    ret = audio_unregister_owner(owner,force);
-    if (ret) {
-        driver_manager_wait_end_or_panic(&unload_scope);
-        driver_manager_service_reopen(owner);
-        return ret;
-    }
-    driver_manager_service_drain(owner);
-    driver_resources_release(owner,true);
-    ret = driver_run_fini(slot, slot->module);
-    driver_manager_wait_end_or_panic(&unload_scope);
-    if (ret < 0) {
-        driver_set_error(slot,ret,"Unsafe teardown; module retained for retry");
-        slot->info.state=RELIEFOS_DRIVER_STATE_LOADED;
-        return ret;
-    }
-    driver_clear_services(owner);
-    driver_resources_release(owner,false);
-    if (slot->image_phys && slot->image_pages) {
-        mm_free_pages(slot->image_phys, slot->image_pages);
-    }
-    slot->module = 0;
-    slot->image_phys = 0;
-    slot->image_pages = 0;
-    slot->info.state = (slot->info.flags & RELIEFOS_DRIVER_FLAG_DISABLED)
-                           ? RELIEFOS_DRIVER_STATE_DISABLED
-                           : RELIEFOS_DRIVER_STATE_UNLOADED;
-    slot->info.load_address = 0;
-    slot->info.image_size = 0;
-    slot->info.error[0] = 0;
-    console_printf("[driver] unloaded %s%s\n", slot->info.file,
-                   force ? " (forced)" : "");
+    console_printf("[driver] loaded %s abi=%u\n", module->name,
+                   slot->info.abi_version);
     return 0;
-}
-
-/**
- * @brief Enumerate /drivers, sort entries by load order, and register each valid file as a slot.
- */
-static void driver_scan(void)
-{
-    struct reliefos_dir_entry entries[RELIEFOS_FS_MAX_ENTRIES];
-    uint32_t count = 0;
-    if (storage_list_dir(DRIVER_DIRECTORY, entries, RELIEFOS_FS_MAX_ENTRIES, &count) < 0) {
-        console_printf("[driver] no %s directory\n", DRIVER_DIRECTORY);
-        return;
-    }
-    for (uint32_t index = 0; index < count; ++index) {
-        for (uint32_t next = index + 1U; next < count; ++next) {
-            if (driver_load_order_compare(entries[next].name, entries[index].name) < 0) {
-                struct reliefos_dir_entry entry = entries[index];
-                entries[index] = entries[next];
-                entries[next] = entry;
-            }
-        }
-    }
-    for (uint32_t index = 0; index < count; ++index) {
-        if (entries[index].type == RELIEFOS_FS_TYPE_FILE &&
-            driver_file_name_valid(entries[index].name)) {
-            /* Register this driver file as a slot for later autoload. */
-            (void)driver_get_slot(entries[index].name);
-        }
-    }
 }
 
 /**
@@ -1360,41 +641,43 @@ void driver_manager_init(void)
     console_printf("[driver] manager ready abi=%u\n", RELIEFOS_DRIVER_ABI_VERSION);
 }
 
-/** @brief Scan and load startup drivers with manager admission and execution ownership held.
- * @return None. Called only by the public boot hook or an already-admitted RESCAN action.
+/** @brief Initialize the built-in drivers with manager admission and execution ownership held.
+ * @return None. Called only by the public boot hook.
  */
-static void driver_manager_autoload_admitted(void)
+static void driver_manager_load_builtin_admitted(void)
 {
-    driver_scan();
-    for (uint32_t index = 0; index < RELIEFOS_DRIVER_MAX; ++index) {
-        struct driver_slot *slot = &driver_slots[index];
-        if (!slot->info.file[0] || slot->info.state == RELIEFOS_DRIVER_STATE_DISABLED ||
-            slot->info.state == RELIEFOS_DRIVER_STATE_LOADED) {
+    for (uint32_t index = 0;
+         index < sizeof(builtin_modules) / sizeof(builtin_modules[0]); ++index) {
+        const struct reliefos_driver_module *module = builtin_modules[index];
+        struct driver_slot *slot = driver_claim_slot();
+        if (!slot) {
+            console_printf("[driver] no free slot for builtin %s\n", module->name);
             continue;
         }
-        if (driver_load_slot(slot) < 0) {
+        driver_copy_text(slot->info.file, sizeof(slot->info.file), module->name);
+        if (driver_load_builtin(slot, module) < 0) {
             if (slot->info.state == RELIEFOS_DRIVER_STATE_LOADED) continue;
             console_printf("[driver] retrying %s\n", slot->info.file);
-            /* Second load attempt after the first failed. */
-            (void)driver_load_slot(slot);
+            /* Second init attempt after the first failed. */
+            (void)driver_load_builtin(slot, module);
         }
     }
 }
 
 /**
- * @brief Scan for drivers and load every autostart slot that is not disabled or already loaded.
+ * @brief Initialize every driver linked into the kernel image.
  * @return None. Boot has no outer execution transaction, so this hook owns a
  * short manager transaction and suspends it only around waitable module phases.
  */
-void driver_manager_autoload(void)
+void driver_manager_load_builtin(void)
 {
     if (driver_manager_phase_try_enter() < 0) {
-        console_printf("[driver] autoload skipped: manager busy\n");
+        console_printf("[driver] builtin load skipped: manager busy\n");
         return;
     }
     uint64_t execution_flags;
     kernel_execution_lock_irqsave(&execution_flags);
-    driver_manager_autoload_admitted();
+    driver_manager_load_builtin_admitted();
     kernel_execution_unlock_irqrestore(execution_flags);
     driver_manager_phase_leave();
 }
@@ -1427,66 +710,16 @@ int driver_manager_list(struct reliefos_driver_list *query)
 }
 
 /**
- * @brief Dispatch a control action (rescan, load, unload, or enable/disable boot) on a driver.
+ * @brief Reject runtime driver control actions; every driver is built into the
+ * kernel image, so there is no module to load, unload or disable at runtime.
  */
 int driver_manager_control(struct reliefos_driver_control *request)
 {
-    struct driver_slot *slot;
-    int ret;
     if (!request) {
         return -22;
     }
-    ret = driver_manager_phase_try_enter();
-    if (ret < 0) {
-        request->status = ret;
-        return ret;
-    }
-    if (request->action == RELIEFOS_DRIVER_CONTROL_RESCAN) {
-        driver_manager_autoload_admitted();
-        ret = 0;
-        goto out;
-    }
-    if (!driver_file_name_valid(request->file)) {
-        ret = -22;
-        goto out;
-    }
-    slot = driver_get_slot(request->file);
-    if (!slot) {
-        ret = -28;
-        goto out;
-    }
-    if (request->action == RELIEFOS_DRIVER_CONTROL_LOAD) {
-        ret = driver_load_slot(slot);
-    } else if (request->action == RELIEFOS_DRIVER_CONTROL_UNLOAD) {
-        ret = driver_unload_slot(slot, 0);
-    } else if (request->action == RELIEFOS_DRIVER_CONTROL_FORCE_UNLOAD) {
-        ret = driver_unload_slot(slot, 1);
-    } else if (request->action == RELIEFOS_DRIVER_CONTROL_ENABLE_BOOT ||
-               request->action == RELIEFOS_DRIVER_CONTROL_DISABLE_BOOT) {
-        uint32_t disable = request->action == RELIEFOS_DRIVER_CONTROL_DISABLE_BOOT;
-        if (disable && slot->info.state == RELIEFOS_DRIVER_STATE_LOADED) {
-            ret = driver_unload_slot(slot, 1);
-            if (ret < 0) {
-                goto out;
-            }
-        }
-        if (disable) {
-            slot->info.flags |= RELIEFOS_DRIVER_FLAG_DISABLED;
-            slot->info.state = RELIEFOS_DRIVER_STATE_DISABLED;
-        } else {
-            slot->info.flags &= ~RELIEFOS_DRIVER_FLAG_DISABLED;
-            if (slot->info.state == RELIEFOS_DRIVER_STATE_DISABLED) {
-                slot->info.state = RELIEFOS_DRIVER_STATE_UNLOADED;
-            }
-        }
-        ret = driver_write_config();
-    } else {
-        ret = -22;
-    }
-out:
-    request->status = ret;
-    driver_manager_phase_leave();
-    return ret;
+    request->status = -95;
+    return -95;
 }
 
 /**

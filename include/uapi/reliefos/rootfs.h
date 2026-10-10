@@ -70,7 +70,6 @@
     X("/usr/lib/leonos", 0755) /* old SONAME search path */ \
     X("/usr/lib/reliefos", 0755) \
     X("/usr/lib/reliefos/apps", 0755) \
-    X("/usr/lib/reliefos/drivers", 0755) \
     X("/usr/lib/reliefos/tests", 0755) \
     X("/usr/lib/modules-load.d", 0755) \
     X("/usr/lib/sysctl.d", 0755) \

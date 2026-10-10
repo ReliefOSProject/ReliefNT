@@ -4,9 +4,9 @@
 内核调试器模块（`debug/`，ET_REL 的 kerneldebug.sys）、启动加载器（`boot/loader`）、UAPI 头
 （`include/uapi`、`include/reliefos`）以及引导期驱动（`drivers/`，console/TTY
 显示后端在 `drivers/console`）。构建产物恰为
-内核侧六个制品：`kernel.sys`、`kernel.debug`、`loader.elf`、五个 `.drv`
-（mouse/serial/e1000/ac97/es1371）与 `kerneldebug.sys`。本仓库不含用户态、镜像
-或打包目标。
+内核侧四个制品：`kernel.sys`、`kernel.debug`、`loader.elf` 与
+`kerneldebug.sys`；设备驱动（mouse/serial/e1000/ac97/es1371/hda）直接链接进
+`kernel.sys`。本仓库不含用户态、镜像或打包目标。
 
 在父仓库 [ReliefOS](https://github.com/ReliefOSProject/ReliefOS) 中，本仓库挂载于
 `kernel/reliefnt/`。
@@ -68,7 +68,7 @@ make O=$PWD/out/x86_64/release ARCH=x86_64 PROFILE=release all
 
 | 目标 | 作用 |
 | --- | --- |
-| `make O=... all` | 六个内核制品（kernel.sys、kernel.debug、loader.elf、五个 .drv、kerneldebug.sys） |
+| `make O=... all` | 四个内核制品（kernel.sys、kernel.debug、loader.elf、kerneldebug.sys） |
 | `make O=... headers_install` | 按白名单导出 UAPI 头到 `$(O)/kernel-export/include` |
 | `make O=... install` | 制品与 `manifest.txt` 复制到 `$(DESTDIR)`（默认 `$(O)/kernel-install`） |
 | `make O=... test` | 宿主工具单测 + `tools/test_abi_layout.py` + `tools/test_header_export.py` |

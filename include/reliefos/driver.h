@@ -2,7 +2,7 @@
 #define RELIEFOS_DRIVER_H
 
 /*
- * Driver module (Ring-0 .drv) API plus the userland driver-control client
+ * Built-in driver (Ring-0) API plus the userland driver-control client
  * API. The control wire types and constants moved to the kernel UAPI
  * (<reliefos/driver_abi.h>); this header re-exports them so existing callers
  * keep working.

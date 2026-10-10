@@ -235,7 +235,7 @@ static void kernel_start(uint32_t magic, uint32_t multiboot_info,
         }
     }
     driver_manager_init();
-    driver_manager_autoload();
+    driver_manager_load_builtin();
     usb_init();
     net_init();
     if (kernel_debug_boot_requested(handoff)) {

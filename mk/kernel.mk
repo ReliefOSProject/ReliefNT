@@ -4,7 +4,11 @@
 # files cannot collide (plan section 6.1).
 
 KERNEL_LD_SCRIPT := $(RELIEFOS_SRC)/arch/x86_64/linker.ld
-KERNEL_SOURCE_DIRS := kernel/reliefnt drivers/console drivers/bootstrap arch mm fs net kernel/exec
+# All device drivers are linked into kernel.sys itself; there are no separate
+# loadable .drv modules anymore.
+KERNEL_SOURCE_DIRS := kernel/reliefnt drivers/console drivers/bootstrap \
+	drivers/mouse drivers/serial drivers/e1000 drivers/ac97 drivers/es1371 \
+	drivers/hda arch mm fs net kernel/exec
 # drivers/bootstrap/storage/*.c are textually included by the storage.c facade
 # and must not also become independent objects.
 KERNEL_SOURCE_EXCLUDE := drivers/bootstrap/storage

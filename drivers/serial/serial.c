@@ -76,7 +76,7 @@ static void serial_driver_fini(void)
     serial_ready = 0;
 }
 
-struct reliefos_driver_module reliefos_driver_module = {
+const struct reliefos_driver_module serial_driver_module = {
     .magic = RELIEFOS_DRIVER_MODULE_MAGIC,
     .abi_version = RELIEFOS_DRIVER_ABI_VERSION,
     .struct_size = sizeof(struct reliefos_driver_module),

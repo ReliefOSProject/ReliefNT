@@ -736,6 +736,15 @@ void hda_pcm_close(void *opaque, struct audio_hw_stream *stream);
  */
 uint32_t hda_stream_service_locked(struct hda_controller *c, uint32_t budget);
 
+/** @brief Forward stream completion through the size-checked module API.
+ * @param card Core card generation token.
+ * @param stream Hardware stream generation token.
+ * @param frames Completed frame count.
+ * @param error Negative stream error or zero.
+ * @return None. Bounded IRQ callback.
+ */
+void hda_audio_period_elapsed(uint32_t card, uint32_t stream, uint64_t frames, int error);
+
 uint8_t hda_mmio_read8(const struct hda_controller *c, uint32_t offset);
 uint16_t hda_mmio_read16(const struct hda_controller *c, uint32_t offset);
 uint32_t hda_mmio_read32(const struct hda_controller *c, uint32_t offset);

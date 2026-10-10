@@ -8,9 +8,9 @@
 # Python regression tools under tools/test_*.py run only from `make test`).
 #
 # Derived from the parent ReliefOS build entry point. The product surface here
-# is exactly the kernel side: kernel.sys, kernel.debug, loader.elf, the five
-# .drv drivers and kerneldebug.sys. Nothing in this tree reads parent or
-# product configuration.
+# is exactly the kernel side: kernel.sys, kernel.debug, loader.elf and
+# kerneldebug.sys; the device drivers are linked into kernel.sys itself. Nothing
+# in this tree reads parent or product configuration.
 
 # --- GNU Make version ------------------------------------------------------
 # Grouped targets ('&:') and the $(file) function both need 4.3.
@@ -163,7 +163,7 @@ include $(RELIEFOS_SRC)/mk/resources.mk
 # Source inventories are inputs, never implicit host executable targets.
 .SUFFIXES:
 
-.PHONY: help all kernel loader drivers boot tools fetch defconfig olddefconfig \
+.PHONY: help all kernel loader kerneldebug boot tools fetch defconfig olddefconfig \
 	menuconfig headers_install install config-sync build-info \
 	test test-tools test-abi test-header-export test-uapi-compat clean distclean
 
@@ -171,10 +171,10 @@ help:
 	@printf '%s\n' \
 	  'ReliefNT kernel build (standalone kernel checkout)' \
 	  '' \
-	  '  all               kernel.sys, kernel.debug, loader.elf, five .drv, kerneldebug.sys' \
+	  '  all               kernel.sys, kernel.debug, loader.elf, kerneldebug.sys' \
 	  '  kernel            kernel.sys + kernel.debug' \
 	  '  loader            loader.elf (waits for kernel.sys: loader integrity chain)' \
-	  '  drivers           mouse.drv serial.drv e1000.drv ac97.drv es1371.drv hda.drv + kerneldebug.sys' \
+	  '  kerneldebug       kerneldebug.sys (standalone kernel debug module)' \
 	  '  headers_install   export the UAPI whitelist to $(O)/kernel-export/include' \
 	  '  install           copy products + manifest.txt to $(DESTDIR)' \
 	  '  test              host-tool tests + ABI layout + header export + UAPI compat' \
@@ -189,9 +189,9 @@ tools: $(RELIEFOS_HOST_TOOLS)
 
 kernel: $(RELIEFOS_KERNEL_SYS) $(RELIEFOS_KERNEL_DEBUG)
 
-# `all` is exactly the six kernel products. There is no userland, no image and
+# `all` is exactly the four kernel products. There is no userland, no image and
 # no package goal in this repository.
-all: kernel loader drivers
+all: kernel loader kerneldebug
 
 # Populate the shared download cache from the locked URLs. A normal build never
 # downloads: it verifies the cache and stops with this command when bytes are
@@ -219,7 +219,7 @@ build-info: $(BUILD_INFO_HEADER)
 # sha256 per artifact. sha256sum only; no interpreter in the production chain.
 DESTDIR ?= $(O)/kernel-install
 INSTALL_PRODUCTS := $(RELIEFOS_KERNEL_SYS) $(RELIEFOS_KERNEL_DEBUG) $(KERNELDEBUG_SYS) \
-	$(LOADER_ELF) $(DRIVER_OUTPUTS)
+	$(LOADER_ELF)
 
 .PHONY: install
 install: $(INSTALL_PRODUCTS) $(HEADER_EXPORT_MANIFEST)

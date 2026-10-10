@@ -15,11 +15,11 @@
  */
 void driver_manager_init(void);
 /**
- * @brief Discover and load the drivers marked for boot-time activation.
+ * @brief Initialize the drivers linked into the kernel image.
  * @return None. Boot has no outer execution transaction; the manager acquires
  * its own transaction and releases it only around waitable module phases.
  */
-void driver_manager_autoload(void);
+void driver_manager_load_builtin(void);
 /**
  * @brief Fill query with the registered drivers and set query->count.
  * @param query Kernel-owned output and capacity descriptor.
@@ -27,10 +27,11 @@ void driver_manager_autoload(void);
  */
 int driver_manager_list(struct reliefos_driver_list *query);
 /**
- * @brief Load, unload, or rescan the driver named in request, storing the outcome in request->status.
+ * @brief Reject runtime driver control actions; drivers are built into the
+ * kernel image, so nothing can be loaded, unloaded or disabled at runtime.
  * @param request Kernel-owned, validated control request. The syscall caller holds
  * the outer execution transaction and driverctl uses nonblocking manager admission.
- * @return 0 or a negative errno, including -EBUSY if another lifecycle operation is active.
+ * @return Always -EOPNOTSUPP (-95), also stored into request->status.
  */
 int driver_manager_control(struct reliefos_driver_control *request);
 

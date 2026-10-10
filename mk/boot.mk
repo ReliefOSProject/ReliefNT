@@ -21,25 +21,6 @@ $(LOADER_ELF): $(LOADER_OBJECTS) $(RELIEFOS_SRC)/boot/loader/linker.ld $(O_META)
 	$(Q)mkdir -p $(@D)
 	$(Q)$(TARGET_LD) -nostdlib -z max-page-size=0x1000 -T $(RELIEFOS_SRC)/boot/loader/linker.ld -o $@.tmp $(LOADER_OBJECTS)
 	$(Q)mv $@.tmp $@
-DRIVER_NAMES := mouse serial e1000 ac97 es1371 hda
-DRIVER_OUTPUTS := $(addprefix $(O_GENERATED)/drivers/,$(addsuffix .drv,$(DRIVER_NAMES)))
-define driver_rules
-DRIVER_$(1)_SOURCES := $$(patsubst $$(RELIEFOS_SRC)/%,%,$$(shell find $$(RELIEFOS_SRC)/drivers/$(1) -type f \( -name '*.c' -o -name '*.S' \) | LC_ALL=C sort))
-DRIVER_$(1)_OBJECTS = $$(addprefix $$(O_OBJ)/drivers/,$$(addsuffix .o,$$(DRIVER_$(1)_SOURCES)))
-$$(O_GENERATED)/drivers/$(1).drv: $$(DRIVER_$(1)_OBJECTS) $$(O_META)/kernel-link.sig
-	$$(Q)mkdir -p $$(@D)
-	$$(Q)$$(TARGET_LD) -r -o $$@.tmp $$(DRIVER_$(1)_OBJECTS)
-	$$(Q)mv $$@.tmp $$@
-endef
-$(foreach driver,$(DRIVER_NAMES),$(eval $(call driver_rules,$(driver))))
-$(O_OBJ)/drivers/%.c.o: $(RELIEFOS_SRC)/%.c $(AUTOCONF_H) $(O_META)/kernel-cc.sig
-	$(Q)mkdir -p $(@D)
-	$(Q)$(KERNEL_CC_BASE) -MMD -MP -MF $@.d -MT $@ -c $< -o $@.tmp
-	$(Q)mv $@.tmp $@
-$(O_OBJ)/drivers/%.S.o: $(RELIEFOS_SRC)/%.S $(O_META)/kernel-as.sig
-	$(Q)mkdir -p $(@D)
-	$(Q)$(KERNEL_AS_BASE) -MMD -MP -MF $@.d -MT $@ -c $< -o $@.tmp
-	$(Q)mv $@.tmp $@
 KERNELDEBUG_SYS := $(O_GENERATED)/system/kerneldebug.sys
 $(KERNELDEBUG_SYS): $(RELIEFOS_SRC)/debug/kerneldebug.c $(AUTOCONF_H) $(O_META)/kernel-cc.sig
 	$(Q)mkdir -p $(@D)
@@ -47,8 +28,8 @@ $(KERNELDEBUG_SYS): $(RELIEFOS_SRC)/debug/kerneldebug.c $(AUTOCONF_H) $(O_META)/
 	$(Q)$(TARGET_OBJCOPY) --remove-section .llvm_addrsig --remove-section .comment --remove-section .note.GNU-stack --rename-section .note.reliefos.kerneldebug=.note.reliefos.kerneldebug,alloc,load,readonly,data,contents $@.o.tmp $@.tmp
 	$(Q)mv $@.tmp $@
 	$(Q)rm $@.o.tmp
-.PHONY: loader drivers boot
+.PHONY: loader kerneldebug boot
 loader: $(LOADER_ELF)
-drivers: $(DRIVER_OUTPUTS) $(KERNELDEBUG_SYS)
-boot: kernel loader drivers
--include $(LOADER_OBJECTS:%=%.d) $(foreach driver,$(DRIVER_NAMES),$(DRIVER_$(driver)_OBJECTS:%=%.d))
+kerneldebug: $(KERNELDEBUG_SYS)
+boot: kernel loader kerneldebug
+-include $(LOADER_OBJECTS:%=%.d)
