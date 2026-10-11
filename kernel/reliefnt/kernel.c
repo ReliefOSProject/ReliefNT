@@ -2,11 +2,11 @@
  * ReliefOS kernel bootstrap: coordinates early platform initialization.
  * Starts memory, interrupts, drivers, storage and scheduling.
  */
-#include <reliefos/boot_handoff.h>
 #include <reliefnt/arch.h>
 #include <reliefnt/apic.h>
 #include <reliefnt/console.h>
 #include <reliefnt/driver_manager.h>
+#include <reliefnt/efi_fs.h>
 #include <reliefnt/framebuffer.h>
 #include <reliefnt/input.h>
 #include <reliefnt/kernel_debug.h>
@@ -34,11 +34,13 @@
 
 static uint8_t kernel_ring0_stack[65536] __attribute__((aligned(16)));
 
-static bool boot_handoff_is_current(const struct reliefos_boot_handoff *handoff)
-{
-    return handoff && handoff->magic == RELIEFOS_BOOT_HANDOFF_MAGIC &&
-           handoff->version == RELIEFOS_BOOT_HANDOFF_VERSION;
-}
+/**
+ * @brief Scratch for the early EFI memory-map capture. GRUB on UEFI keeps boot
+ * services active and omits the Multiboot2 memory-map tags, so the kernel
+ * captures the live firmware map itself before the allocator starts. The
+ * buffer lives in kernel .bss, which mm.c reserves through the linker bounds.
+ */
+static uint8_t efi_mmap_buffer[262144] __attribute__((aligned(16)));
 
 /**
  * @brief Halt the CPU forever; used when there is nothing left to run.
@@ -73,21 +75,6 @@ static int cmdline_has(const struct boot_info *boot, const char *needle)
 }
 
 /**
- * @brief Return 1 if the two NUL-terminated strings are identical.
- */
-static int boot_text_eq(const char *a, const char *b)
-{
-    if (!a || !b) {
-        return 0;
-    }
-    while (*a && *b && *a == *b) {
-        ++a;
-        ++b;
-    }
-    return *a == 0 && *b == 0;
-}
-
-/**
  * @brief Hold the boot console until Enter is pressed after discarding queued input.
  * Called with interrupts disabled after IRQ/USB initialization and before user
  * tasks or APs are started. Keyboard and timer IRQs run during each halt; returns
@@ -111,82 +98,86 @@ static void boot_log_wait_for_enter(void)
 }
 
 /**
- * @brief Replace or append the installer-root module in boot from the loader handoff.
+ * @brief Fill boot's EFI memory-map fields from a live boot-services capture.
+ * Used when GRUB's Multiboot2 info carries neither memory-map tag.
  */
-static void boot_import_handoff_modules(struct boot_info *boot,
-                                        const struct reliefos_boot_handoff *handoff)
+static void boot_capture_efi_memory_map(struct boot_info *boot)
 {
-    if (!boot || !boot_handoff_is_current(handoff) ||
-        handoff->installer_root.end <= handoff->installer_root.start) {
+    uint64_t entry_size = 0;
+    uint32_t entry_count = 0;
+
+    if (!boot || boot->mmap_entry_count || boot->efi_mmap_entry_count) {
         return;
     }
+    if (efi_boot_memory_map(boot->efi_system_table, efi_mmap_buffer,
+                            sizeof(efi_mmap_buffer), &entry_size,
+                            &entry_count) < 0) {
+        console_printf("[reliefnt] EFI memory map unavailable; using legacy estimate\n");
+        return;
+    }
+    boot->efi_mmap_addr = (uint64_t)(uintptr_t)efi_mmap_buffer;
+    boot->efi_mmap_entry_size = (uint32_t)entry_size;
+    boot->efi_mmap_entry_count = entry_count;
+    console_printf("[reliefnt] using EFI memory map entries=%u descriptor=%u\n",
+                   entry_count, (uint32_t)entry_size);
+}
 
-    for (uint32_t i = 0; i < boot->module_count && i < 16; ++i) {
-        if (boot_text_eq(boot->modules[i].name, "reliefos-installer-root") ||
-            boot_text_eq(boot->modules[i].name, "leonos-installer-root")) {
-            boot->modules[i].start = handoff->installer_root.start;
-            boot->modules[i].end = handoff->installer_root.end;
-            return;
+/**
+ * @brief Read the boot theme from the ESP display.conf, mirroring the value
+ *        make_image.py stages there. Returns 1 (metro) when absent or unreadable.
+ */
+static uint32_t boot_load_ui_theme(void)
+{
+    static const char reliefos_path[] = "/reliefos/config/display.conf";
+    static const char legacy_path[] = "/leonos/config/display.conf";
+    static const char win95[] = "theme=win95";
+    const void *data = 0;
+    size_t len = 0;
+    const char *config;
+
+    if (efi_fs_read_file(reliefos_path, &data, &len) < 0 &&
+        efi_fs_read_file(legacy_path, &data, &len) < 0) {
+        return 1u;
+    }
+    config = (const char *)data;
+    for (size_t index = 0; index + sizeof(win95) - 1u <= len; ++index) {
+        size_t matched = 0;
+        while (matched < sizeof(win95) - 1u &&
+               config[index + matched] == win95[matched]) {
+            ++matched;
+        }
+        if (matched == sizeof(win95) - 1u) {
+            return 0u;
         }
     }
-
-    if (boot->module_count < 16) {
-        struct boot_module *module = &boot->modules[boot->module_count++];
-        module->start = handoff->installer_root.start;
-        module->end = handoff->installer_root.end;
-        module->name = handoff->installer_root.path;
-        console_printf("[reliefnt] imported installer root module start=%p bytes=%llu\n",
-                       (void *)(uintptr_t)module->start,
-                       (unsigned long long)(module->end - module->start));
-    }
+    return 1u;
 }
 
 /**
  * @brief Full boot sequence: parse Multiboot2/EFI info, then initialize every kernel subsystem in order and enter userland.
  */
-static void kernel_start(uint32_t magic, uint32_t multiboot_info,
-                         const struct reliefos_boot_handoff *handoff)
+static void kernel_start(uint32_t magic, uint32_t multiboot_info)
 {
     bool boot_log_pause;
 
     __asm__ volatile("cli");
     console_init();
-    console_set_boot_uptime_us(handoff && handoff->magic == RELIEFOS_BOOT_HANDOFF_MAGIC
-                                   ? handoff->boot_uptime_us
-                                   : 0ULL);
     const struct reliefos_system_info *system = reliefnt_system_info();
     console_printf("ReliefOS %s %s booting\n",
                    system->kernel_name,
                    system->kernel_version);
-    if (handoff && handoff->magic == RELIEFOS_BOOT_HANDOFF_MAGIC) {
-        console_printf("[reliefnt] loader handoff kernel=%p-%p\n",
-                       (void *)(uintptr_t)handoff->kernel.start,
-                       (void *)(uintptr_t)handoff->kernel.end);
-    }
 
     struct boot_info boot;
     multiboot2_parse(magic, (uintptr_t)multiboot_info, &boot);
     /**
- * @brief UEFI GRUB keeps boot services active for the second-stage loader and may therefore omit Multiboot2 memory-map tags. The loader captures a stable EFI map after loading all images; use it before the allocator falls back to the legacy 512 MiB estimate.
+ * @brief UEFI GRUB keeps boot services active and may therefore omit the Multiboot2 memory-map tags; capture the live EFI map before the allocator falls back to the legacy 512 MiB estimate.
  */
-    if (!boot.mmap_entry_count && !boot.efi_mmap_entry_count &&
-        handoff && handoff->magic == RELIEFOS_BOOT_HANDOFF_MAGIC &&
-        handoff->efi_mmap_addr && handoff->efi_mmap_entry_count) {
-        boot.efi_mmap_addr = handoff->efi_mmap_addr;
-        boot.efi_mmap_entry_size = handoff->efi_mmap_entry_size;
-        boot.efi_mmap_entry_count = handoff->efi_mmap_entry_count;
-        console_printf("[reliefnt] using loader-captured EFI memory map entries=%u descriptor=%u\n",
-                       boot.efi_mmap_entry_count, boot.efi_mmap_entry_size);
-    }
+    boot_capture_efi_memory_map(&boot);
     boot_log_pause = cmdline_has(&boot, "bootlog-pause=1");
-    if (!boot.rsdp_addr && handoff && handoff->magic == RELIEFOS_BOOT_HANDOFF_MAGIC) {
-        boot.rsdp_addr = handoff->rsdp_addr;
-    }
     /**
  * @brief Parse ACPI before the physical allocator can reclaim ACPI memory.
  */
     power_init(&boot);
-    boot_import_handoff_modules(&boot, handoff);
     platform_identity_init(&boot);
 
     arch_init();
@@ -194,19 +185,18 @@ static void kernel_start(uint32_t magic, uint32_t multiboot_info,
     ioapic_init();
     smp_init();
     framebuffer_init(&boot);
-    mm_init(&boot, handoff);
+    mm_init(&boot);
     kernel_heap_init();
     page_cache_init();
     kernel_objects_init();
     time_init();
     input_init();
     pty_init();
-    console_set_ui_theme(handoff && handoff->magic == RELIEFOS_BOOT_HANDOFF_MAGIC
-                              ? handoff->ui_theme
-                              : 1u);
-    console_enable_framebuffer(handoff && handoff->magic == RELIEFOS_BOOT_HANDOFF_MAGIC
-                                   ? &handoff->boot_log
-                                   : 0);
+    if (boot.efi_system_table) {
+        efi_fs_init(boot.efi_system_table);
+    }
+    console_set_ui_theme(boot_load_ui_theme());
+    console_enable_framebuffer();
     console_enable_vga_fallback();
     sched_init();
     sched_create_idle_task();
@@ -230,7 +220,7 @@ static void kernel_start(uint32_t magic, uint32_t multiboot_info,
                             cmdline_has(&boot, "mode=live");
         storage_mount_boot_root(&boot, ramdisk_root);
         if (ramdisk_root && !storage_ready()) {
-            console_printf("[reliefnt] installer ramdisk root not ready, retrying handoff module\n");
+            console_printf("[reliefnt] installer ramdisk root not ready, retrying installer module\n");
             storage_init_installer_root(&boot);
         }
     }
@@ -238,7 +228,7 @@ static void kernel_start(uint32_t magic, uint32_t multiboot_info,
     driver_manager_load_builtin();
     usb_init();
     net_init();
-    if (kernel_debug_boot_requested(handoff)) {
+    if (kernel_debug_boot_requested()) {
         console_printf("[reliefnt] entering kernel debug tool before userland\n");
         (void)kernel_debug_run_module();
         console_printf("[reliefnt] kernel debug tool finished; continuing normal startup\n");
@@ -282,24 +272,9 @@ static void kernel_start(uint32_t magic, uint32_t multiboot_info,
 }
 
 /**
- * @brief Validate the loader handoff and start the kernel, or idle-loop on a mismatch.
- */
-void kernel_entry(const struct reliefos_boot_handoff *handoff)
-{
-    if (!boot_handoff_is_current(handoff)) {
-        console_init();
-        console_printf("[reliefnt] rejected loader handoff abi=%u expected=%u\n",
-                       handoff ? handoff->version : 0u,
-                       RELIEFOS_BOOT_HANDOFF_VERSION);
-        kernel_idle_loop();
-    }
-    kernel_start(handoff->multiboot_magic, (uint32_t)handoff->multiboot_info, handoff);
-}
-
-/**
- * @brief Legacy Multiboot2 entry point; starts the kernel without a loader handoff.
+ * @brief Multiboot2 entry point called by the arch entry stub; starts the kernel.
  */
 void kernel_main(uint32_t magic, uint32_t multiboot_info)
 {
-    kernel_start(magic, multiboot_info, 0);
+    kernel_start(magic, multiboot_info);
 }

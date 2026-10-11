@@ -1,12 +1,11 @@
 /*
  * ReliefOS kernel-debug state and module entry interface.
- * Keeps diagnostic-mode persistence, module loading, and boot handoff policy
- * outside normal syscall and userland bootstrap code.
+ * Keeps diagnostic-mode persistence and module loading outside normal
+ * syscall and userland bootstrap code.
  */
 #ifndef RELIEFNT_KERNEL_DEBUG_H
 #define RELIEFNT_KERNEL_DEBUG_H
 
-#include <reliefos/boot_handoff.h>
 #include <reliefos/kernel_debug_abi.h>
 #include <reliefnt/types.h>
 
@@ -59,7 +58,7 @@ struct reliefos_kernel_debug_benchmark {
 typedef int (*reliefos_kernel_debug_entry_fn)(const struct reliefos_kernel_debug_api *api);
 
 int kernel_debug_control(struct reliefos_kernel_debug_control *control);
-bool kernel_debug_boot_requested(const struct reliefos_boot_handoff *handoff);
+bool kernel_debug_boot_requested(void);
 int kernel_debug_run_module(void);
 int kernel_debug_clear_state(void);
 

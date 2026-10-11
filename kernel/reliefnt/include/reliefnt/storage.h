@@ -5,7 +5,6 @@
 #ifndef RELIEFNT_STORAGE_H
 #define RELIEFNT_STORAGE_H
 
-#include <reliefos/boot_handoff.h>
 #include <reliefos/fs_abi.h>
 #include <reliefos/system_abi.h>
 #include <reliefnt/types.h>

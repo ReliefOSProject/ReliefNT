@@ -52,12 +52,23 @@ typedef efi_status_t (__attribute__((ms_abi)) *efi_locate_handle_buffer_fn)(
     void *search_key,
     uint64_t *no_handles,
     efi_handle_t **buffer);
+typedef efi_status_t (__attribute__((ms_abi)) *efi_get_memory_map_fn)(
+    uint64_t *memory_map_size,
+    void *memory_map,
+    uint64_t *map_key,
+    uint64_t *descriptor_size,
+    uint32_t *descriptor_version);
 
 struct efi_boot_services {
     struct efi_table_header hdr;
     efi_status_t (*raise_tpl)(uint64_t tpl);
     void (*restore_tpl)(uint64_t tpl);
-    char _pad1[88];
+    void *allocate_pages;
+    void *free_pages;
+    efi_get_memory_map_fn get_memory_map;
+    void *allocate_pool;
+    void *free_pool;
+    char _pad1[48];
     efi_status_t (*install_protocol_interface)(void);
     efi_status_t (*reinstall_protocol_interface)(void);
     efi_status_t (*uninstall_protocol_interface)(void);
@@ -318,6 +329,39 @@ void efi_fs_init(uint64_t system_table_addr)
 bool efi_fs_ready(void)
 {
     return ready;
+}
+
+int efi_boot_memory_map(uint64_t system_table_addr, void *buffer,
+                        uint64_t buffer_bytes, uint64_t *out_entry_size,
+                        uint32_t *out_entry_count)
+{
+    struct efi_system_table *st;
+    uint64_t map_size = buffer_bytes;
+    uint64_t map_key = 0;
+    uint64_t descriptor_size = 0;
+    uint32_t descriptor_version = 0;
+    efi_status_t status;
+
+    if (!buffer || !buffer_bytes || !out_entry_size || !out_entry_count) {
+        return -22;
+    }
+    st = (struct efi_system_table *)(uintptr_t)system_table_addr;
+    if (!st || !st->boot_services || !st->boot_services->get_memory_map) {
+        return -19;
+    }
+    status = st->boot_services->get_memory_map(&map_size, buffer, &map_key,
+                                               &descriptor_size,
+                                               &descriptor_version);
+    if (status != EFI_SUCCESS || !descriptor_size ||
+        map_size > buffer_bytes || (map_size % descriptor_size) != 0) {
+        console_printf("[reliefnt] efi memory map capture failed status=0x%llx bytes=%llu\n",
+                       (unsigned long long)status,
+                       (unsigned long long)map_size);
+        return -1;
+    }
+    *out_entry_size = descriptor_size;
+    *out_entry_count = (uint32_t)(map_size / descriptor_size);
+    return 0;
 }
 
 int efi_fs_read_file(const char *path, const void **out_data, size_t *out_len)

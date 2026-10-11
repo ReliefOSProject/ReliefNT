@@ -879,8 +879,8 @@ static int userland_prepare_runtime(void)
 /**
  * @brief Return the boot loader kernel command line captured at init time.
  * @return NUL-terminated raw command line for /proc/cmdline; never NULL, an
- * empty string when the boot handoff carried none. The string lives in boot
- * loader memory that stays mapped for the kernel lifetime.
+ * empty string when the Multiboot2 info carried none. The string lives in
+ * GRUB-provided memory that stays mapped for the kernel lifetime.
  */
 const char *userland_boot_cmdline(void)
 {

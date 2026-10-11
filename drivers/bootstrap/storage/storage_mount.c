@@ -638,7 +638,7 @@ int storage_mount_ramdisk_root(const void *image, uint64_t len)
     root->esp_sector_count = len / SECTOR_SIZE;
     storage_copy_text(root->mount_path, sizeof(root->mount_path), "/");
     /* New media use the ext-family layout (ext4 for current images). Keep
-     * FAT32 module support for existing media; the handoff kind/path are
+     * FAT32 module support for existing media; the volume kind/path are
      * unchanged. */
     const uint8_t *bytes = image_mapping;
     int mount_result;

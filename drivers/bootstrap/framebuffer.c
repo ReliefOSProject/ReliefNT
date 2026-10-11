@@ -683,7 +683,7 @@ static int framebuffer_vmware_probe(void)
     uint32_t pitch;
     uint32_t enabled;
     int device_mode_valid;
-    int loader_mode_valid;
+    int boot_mode_valid;
     uint64_t usable_bytes;
     uint32_t io_base;
 
@@ -730,10 +730,10 @@ static int framebuffer_vmware_probe(void)
 
     /* The boot protocol framebuffer is only a hint.  SVGA II exposes the
      * scan-out surface through FB_START/FB_OFFSET, which may differ from the
-     * address supplied by the loader (notably with EFI GOP handoff).  Keep
+     * address supplied at boot (notably the EFI GOP surface).  Keep
      * fbdev mmap and native drawing on the device's actual linear surface and
      * publish the active SVGA mode so a same-mode Xorg probe does not retain
-     * stale loader geometry or pitch. */
+     * stale boot geometry or pitch. */
     width = vmware_svga_read(VMWARE_SVGA_REG_WIDTH);
     height = vmware_svga_read(VMWARE_SVGA_REG_HEIGHT);
     depth = vmware_svga_read(VMWARE_SVGA_REG_DEPTH);
@@ -746,21 +746,21 @@ static int framebuffer_vmware_probe(void)
         (uint64_t)pitch * height <= usable_bytes &&
         framebuffer_range_valid((uint64_t)fb_start + fb_offset,
                                 (uint64_t)pitch * height);
-    loader_mode_valid = fb.available && fb.width && fb.height &&
+    boot_mode_valid = fb.available && fb.width && fb.height &&
         (uint64_t)fb.pitch >= (uint64_t)fb.width * 4u &&
         (uint64_t)fb.pitch * fb.height <= usable_bytes &&
         framebuffer_range_valid((uint64_t)(uintptr_t)fb.pixels,
                                 (uint64_t)fb.pitch * fb.height);
     /* The geometry registers describe the live scan-out only once the device
      * has been enabled.  While REG_ENABLE is clear they still hold the
-     * power-on default; activate the device at the loader geometry below so
+     * power-on default; activate the device at the boot handover geometry below so
      * Xorg inherits the same surface without the stale default pitch. */
-    if ((enabled & 1u) == 0u && loader_mode_valid) {
-        /* The loader leaves SVGA disabled while its GOP surface is visible.
+    if ((enabled & 1u) == 0u && boot_mode_valid) {
+        /* SVGA stays disabled while the boot handover GOP surface is visible.
          * Xorg later writes the same mmap, so leave the device enabled before
          * it starts; otherwise REG_TRACES is accepted but never drives the
          * host scan-out and the first client that clears the greeter leaves a
-         * black screen.  Reprogram the loader geometry explicitly so the
+         * black screen.  Reprogram the boot handover geometry explicitly so the
          * device surface and the inherited framebuffer stay identical. */
         vmware_svga_write(VMWARE_SVGA_REG_ENABLE, 0u);
         vmware_svga_write(VMWARE_SVGA_REG_WIDTH, fb.width);
@@ -783,7 +783,7 @@ static int framebuffer_vmware_probe(void)
             framebuffer_range_valid((uint64_t)fb_start + fb_offset,
                                     (uint64_t)pitch * height);
         if (device_mode_valid) {
-            console_printf("[reliefnt] VMware SVGA scan-out enabled at loader mode "
+            console_printf("[reliefnt] VMware SVGA scan-out enabled at boot mode "
                            "%ux%u pitch=%u\n", width, height, pitch);
         }
     }

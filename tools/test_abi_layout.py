@@ -26,7 +26,7 @@ GOLDEN = ROOT / "tools/tests/abi_layout_golden.json"
 WIRE_HEADERS = [
     "uapi/reliefos/auth_user.h", "uapi/reliefos/fs_abi.h", "uapi/reliefos/net_control.h",
     "uapi/reliefos/rootfs.h", "uapi/reliefos/syscall_abi.h",
-    "reliefos/audio.h", "reliefos/auth.h", "reliefos/boot_handoff.h", "reliefos/device.h",
+    "reliefos/audio.h", "reliefos/auth.h", "reliefos/device.h",
     "reliefos/driver.h", "reliefos/elf_abi.h", "reliefos/gpu.h", "reliefos/inputm.h",
     "reliefos/kernel_debug.h", "reliefos/net.h", "reliefos/pty.h", "reliefos/signal.h",
     "reliefos/startup.h", "reliefos/system.h",
@@ -41,7 +41,6 @@ WIRE_HEADERS = [
 # Numeric constants whose value is ABI (ioctl/magic/version/enum encodings).
 CONSTANTS = [
     "RELIEFOS_SYS_NICE",
-    "RELIEFOS_BOOT_HANDOFF_VERSION",
     "RELIEFOS_DRIVER_MODULE_MAGIC", "RELIEFOS_DRIVER_ABI_VERSION",
     "RELIEFOS_DRIVER_CONTROL_IOCTL",
     "RELIEFOS_VT_GETGENERATION", "RELIEFOS_EVIOCSVT",

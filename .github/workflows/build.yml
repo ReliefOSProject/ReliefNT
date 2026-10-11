@@ -1,6 +1,6 @@
 # Build verification for the standalone ReliefNT kernel tree: every push and
-# pull request must prove `make all` produces all nine kernel products
-# (kernel.sys, kernel.debug, loader.elf, five .drv drivers, kerneldebug.sys).
+# pull request must prove `make all` produces all three kernel products
+# (kernel.sys, kernel.debug, kerneldebug.sys).
 # Build-only by design: no tests, no artifact upload.
 
 name: Build ReliefNT

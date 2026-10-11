@@ -5,12 +5,12 @@
 #ifndef RELIEFNT_KERNEL_H
 #define RELIEFNT_KERNEL_H
 
-#include <reliefos/boot_handoff.h>
+#include <reliefnt/types.h>
 
 /**
- * @brief Top-level kernel entry point, called once after boot with the loader's handoff data.
+ * @brief Top-level kernel entry point, called once by the Multiboot2 entry stub.
  */
-void kernel_entry(const struct reliefos_boot_handoff *handoff);
+void kernel_main(uint32_t magic, uint32_t multiboot_info);
 void kernel_idle_loop(void) __attribute__((noreturn));
 
 #endif

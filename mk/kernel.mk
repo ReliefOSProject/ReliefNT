@@ -1,4 +1,4 @@
-# Kernel, boot-loader-side freestanding objects and the linker stage.
+# Kernel freestanding objects and the linker stage.
 #
 # Object paths keep the component and the source-relative path so two util.c
 # files cannot collide (plan section 6.1).

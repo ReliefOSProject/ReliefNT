@@ -2,7 +2,6 @@
  * ReliefOS x86_64 entry assembly: establishes the kernel execution environment.
  * Handles early boot, interrupt stubs, register frames, and user returns.
  */
-#ifdef RELIEFOS_KERNEL_LEGACY_MULTIBOOT
 .section .multiboot, "a"
 .align 8
 multiboot2_header:
@@ -19,13 +18,15 @@ multiboot2_header:
     .long 6
     .long 17
 
+    /* Optional framebuffer request: no preferred geometry, 32 bpp. GRUB
+     * hands over its current mode (gfxpayload), which the kernel adopts
+     * through the Multiboot2 framebuffer tag before falling back to GOP. */
     .align 8
     .short 5
-    .short 0
+    .short 1
     .long 20
     .long 0
-    .long 1024
-    .long 768
+    .long 0
     .long 32
 
     .align 8
@@ -73,7 +74,6 @@ _start:
     cli
     hlt
     jmp .halt
-#endif
 
 /** @brief Writes one byte to the x86 I/O port in `dx`. */
 .global x86_64_outb

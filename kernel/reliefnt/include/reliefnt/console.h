@@ -7,16 +7,10 @@
 
 #include <reliefnt/types.h>
 
-struct reliefos_boot_log_state;
-
 /**
  * @brief Set up the kernel console backend before any output is written.
  */
 void console_init(void);
-/**
- * @brief Record the loader's elapsed boot time so boot-log timestamps start from zero.
- */
-void console_set_boot_uptime_us(uint64_t uptime_us);
 /**
  * @brief Write a single character to the active console backend.
  */
@@ -40,9 +34,9 @@ void console_display_tick(void);
  */
 void console_printf(const char *fmt, ...);
 /**
- * @brief Route console output to the framebuffer, using the boot log state.
+ * @brief Route console output to the framebuffer, replaying the boot log.
  */
-void console_enable_framebuffer(const struct reliefos_boot_log_state *boot_log);
+void console_enable_framebuffer(void);
 /**
  * @brief Turn off framebuffer output and fall back to another backend.
  */

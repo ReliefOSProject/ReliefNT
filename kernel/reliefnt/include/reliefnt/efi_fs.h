@@ -1,6 +1,6 @@
 /*
- * ReliefOS EFI filesystem interface: declares firmware filesystem helpers.
- * Supports reading boot files and metadata from EFI-backed storage.
+ * ReliefOS EFI firmware interface: filesystem helpers plus the boot-services
+ * memory-map capture used during early boot.
  */
 #ifndef RELIEFNT_EFI_FS_H
 #define RELIEFNT_EFI_FS_H
@@ -16,6 +16,13 @@ void efi_fs_init(uint64_t system_table_addr);
  * @brief Return true once the EFI filesystem is usable.
  */
 bool efi_fs_ready(void);
+/**
+ * @brief Capture the live EFI memory map into buffer while boot services are active.
+ * Reports descriptor geometry through out_entry_size/out_entry_count.
+ */
+int efi_boot_memory_map(uint64_t system_table_addr, void *buffer,
+                        uint64_t buffer_bytes, uint64_t *out_entry_size,
+                        uint32_t *out_entry_count);
 /**
  * @brief Load the file at path into memory, returning a pointer in out_data and its size in out_len.
  */

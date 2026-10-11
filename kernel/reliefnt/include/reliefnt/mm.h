@@ -5,14 +5,13 @@
 #ifndef RELIEFNT_MM_H
 #define RELIEFNT_MM_H
 
-#include <reliefos/boot_handoff.h>
 #include <reliefnt/multiboot2.h>
 #include <reliefnt/types.h>
 
 /**
- * @brief Initialize the physical-memory allocator from the boot map and handoff data.
+ * @brief Initialize the physical-memory allocator from the boot map.
  */
-void mm_init(const struct boot_info *boot, const struct reliefos_boot_handoff *handoff);
+void mm_init(const struct boot_info *boot);
 /**
  * @brief Return total physical RAM in KiB.
  */

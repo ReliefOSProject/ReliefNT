@@ -8,6 +8,10 @@
 #include <reliefnt/paging.h>
 #include <reliefnt/lock.h>
 
+/* Bounds of the kernel image as placed by arch/x86_64/linker.ld. */
+extern char __kernel_start[];
+extern char __kernel_end[];
+
 static uint64_t total_kib;
 
 #define PAGE_SIZE 4096ULL
@@ -314,10 +318,9 @@ static void recompute_total_allocatable_kib(void)
 }
 
 /**
- * @brief Protect loader structures, framebuffer, modules, and the handoff regions from allocation.
+ * @brief Protect the kernel image, framebuffer, modules, and boot structures from allocation.
  */
-static void reserve_boot_ranges(const struct boot_info *boot,
-                                const struct reliefos_boot_handoff *handoff)
+static void reserve_boot_ranges(const struct boot_info *boot)
 {
     uint64_t boot_framebuffer_start = 0;
     uint64_t boot_framebuffer_bytes = 0;
@@ -372,16 +375,10 @@ static void reserve_boot_ranges(const struct boot_info *boot,
     for (uint32_t i = 0; i < boot->module_count; ++i) {
         reserve_range(boot->modules[i].start, boot->modules[i].end, "module");
     }
-    if (handoff && handoff->magic == RELIEFOS_BOOT_HANDOFF_MAGIC &&
-        handoff->version == RELIEFOS_BOOT_HANDOFF_VERSION) {
-        reserve_range(handoff->loader.start, handoff->loader.end, "loader");
-        reserve_range((uint64_t)(uintptr_t)handoff,
-                      (uint64_t)(uintptr_t)handoff + sizeof(*handoff),
-                      "loader-handoff");
-        reserve_range(handoff->kernel.start, handoff->kernel.end, "kernel");
-        reserve_range(handoff->installer_root.start, handoff->installer_root.end,
-                      "installer-root");
-    }
+    /* The kernel ELF bounds cover every loaded section and .bss scratch
+     * buffer (including the early EFI memory-map capture). */
+    reserve_range((uint64_t)(uintptr_t)__kernel_start,
+                  (uint64_t)(uintptr_t)__kernel_end, "kernel");
 }
 
 /**
@@ -411,7 +408,7 @@ static void print_memory_map(void)
 /**
  * @brief Reset accounting, seed free ranges from boot, reserve kernel-owned areas, then coalesce.
  */
-void mm_init(const struct boot_info *boot, const struct reliefos_boot_handoff *handoff)
+void mm_init(const struct boot_info *boot)
 {
     kernel_spin_init(&mm_lock);
     total_kib = 0;
@@ -421,7 +418,7 @@ void mm_init(const struct boot_info *boot, const struct reliefos_boot_handoff *h
         page_refs[i] = 0;
     }
     seed_free_ranges_from_boot(boot);
-    reserve_boot_ranges(boot, handoff);
+    reserve_boot_ranges(boot);
     coalesce_free_ranges();
     /**
  * @brief Report the same range the allocator can actually serve. Previously this value came from the legacy lower/upper fields and could include low reserved memory or addresses above the allocator limit.

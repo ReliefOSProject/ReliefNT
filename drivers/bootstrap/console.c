@@ -1,4 +1,3 @@
-#include <reliefos/boot_handoff.h>
 #include <reliefos/psf_font.h>
 #include <reliefos/utf8_stream.h>
 
@@ -39,7 +38,6 @@ static uint32_t console_ui_theme = 1u;
 static bool console_line_start = true;
 static bool console_runtime_quiet;
 static bool console_service_logs_only;
-static uint64_t console_boot_uptime_us;
 static bool console_presenting;
 static uint32_t fb_saved_col;
 static uint32_t fb_saved_row;
@@ -802,40 +800,6 @@ static void fb_console_ansi_feed(char ch)
     fb_console_reset_ansi();
 }
 
-static bool fb_console_use_handoff_state(const struct reliefos_boot_log_state *boot_log)
-{
-    const struct framebuffer *fb = framebuffer_get();
-    if (!boot_log || !fb->available || !boot_log->columns || !boot_log->rows ||
-        boot_log->columns > CONSOLE_MAX_COLS || boot_log->rows > CONSOLE_MAX_ROWS ||
-        boot_log->log_x >= fb->width || boot_log->log_y >= fb->height) {
-        return false;
-    }
-
-    fb_x = boot_log->log_x;
-    fb_y = boot_log->log_y;
-    fb_cols = boot_log->columns;
-    fb_rows = boot_log->rows;
-    if (fb_cols * RELIEFOS_FONT_W > fb->width - fb_x) {
-        fb_cols = (fb->width - fb_x) / RELIEFOS_FONT_W;
-    }
-    if (fb_rows * RELIEFOS_FONT_H > fb->height - fb_y) {
-        fb_rows = (fb->height - fb_y) / RELIEFOS_FONT_H;
-    }
-    if (!fb_cols || !fb_rows) {
-        return false;
-    }
-
-    fb_col = boot_log->column < fb_cols ? boot_log->column : 0u;
-    fb_row = boot_log->row < fb_rows ? boot_log->row : fb_rows - 1u;
-    fb_scroll_top = 0u;
-    fb_scroll_bottom = fb_rows - 1u;
-    fb_saved_col = fb_col;
-    fb_saved_row = fb_row;
-    fb_console_reset_attributes();
-    fb_console_reset_ansi();
-    return true;
-}
-
 static void fb_console_initialize_fullscreen(void)
 {
     const struct framebuffer *fb = framebuffer_get();
@@ -939,7 +903,7 @@ static void print_unsigned_raw(uint64_t value, unsigned base, bool upper)
 
 static void console_emit_timestamp(void)
 {
-    uint64_t uptime_us = console_boot_uptime_us + time_uptime_us();
+    uint64_t uptime_us = time_uptime_us();
     uint64_t seconds = uptime_us / 1000000ULL;
     uint64_t micros = uptime_us % 1000000ULL;
     uint64_t divisor = 1ULL;
@@ -968,11 +932,6 @@ static void console_emit_timestamp(void)
 void console_init(void)
 {
     serial_init();
-}
-
-void console_set_boot_uptime_us(uint64_t uptime_us)
-{
-    console_boot_uptime_us = uptime_us;
 }
 
 void console_set_ui_theme(uint32_t theme)
@@ -1149,16 +1108,14 @@ void console_printf(const char *fmt, ...)
     console_present();
 }
 
-void console_enable_framebuffer(const struct reliefos_boot_log_state *boot_log)
+void console_enable_framebuffer(void)
 {
     if (!framebuffer_get()->available) {
         return;
     }
     fb_console_enabled = true;
-    if (!fb_console_use_handoff_state(boot_log)) {
-        fb_console_initialize_fullscreen();
-        fb_console_clear_log();
-    }
+    fb_console_initialize_fullscreen();
+    fb_console_clear_log();
     for (size_t i = 0; i < log_len; ++i) {
         fb_console_ansi_feed(log_buffer[i]);
     }

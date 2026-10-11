@@ -522,11 +522,54 @@ int kernel_debug_clear_state(void)
     return kernel_debug_control(&control);
 }
 
-bool kernel_debug_boot_requested(const struct reliefos_boot_handoff *handoff)
+/**
+ * @brief Consume the one-shot boot marker on the boot ESP.
+ * The file is deleted whether or not its content is valid; only a matching
+ * RELIEFOS-KDBG-1 (or legacy LEONOS-KDBG-1) marker requests debug mode.
+ */
+static bool debug_consume_boot_marker(void)
 {
-    return handoff && handoff->magic == RELIEFOS_BOOT_HANDOFF_MAGIC &&
-           handoff->version == RELIEFOS_BOOT_HANDOFF_VERSION &&
-           handoff->kernel_debug_mode != 0U && debug_file_exists(KERNEL_DEBUG_ENABLED_PATH);
+    static const char marker[] = "RELIEFOS-KDBG-1\n";
+    static const char legacy_marker[] = "LEONOS-KDBG-1\n";
+    static const char legacy_path[] = "/boot/leonos/state/kerneldebug.next";
+    const char *path = RELIEFOS_PATH_BOOT_KERNELDEBUG_MARKER;
+    const char *expected = marker;
+    const void *data = 0;
+    size_t len = 0;
+    const char *value;
+
+    if (storage_read_file(path, &data, &len) < 0) {
+        path = legacy_path;
+        expected = legacy_marker;
+        if (storage_read_file(path, &data, &len) < 0) {
+            return false;
+        }
+    }
+    if (storage_unlink_boot_esp_file(path) < 0) {
+        console_printf("[reliefnt] kernel debug marker could not be consumed\n");
+    }
+    value = (const char *)data;
+    if (len != (expected == marker ? sizeof(marker) : sizeof(legacy_marker)) - 1U) {
+        mm_free_pages((uint64_t)(uintptr_t)value,
+                      (uint32_t)((len + 4095U) / 4096U));
+        return false;
+    }
+    for (size_t i = 0; i < len; ++i) {
+        if (value[i] != expected[i]) {
+            mm_free_pages((uint64_t)(uintptr_t)value,
+                          (uint32_t)((len + 4095U) / 4096U));
+            return false;
+        }
+    }
+    mm_free_pages((uint64_t)(uintptr_t)value,
+                  (uint32_t)((len + 4095U) / 4096U));
+    return true;
+}
+
+bool kernel_debug_boot_requested(void)
+{
+    bool marked = debug_consume_boot_marker();
+    return marked && debug_file_exists(KERNEL_DEBUG_ENABLED_PATH);
 }
 
 static uint64_t debug_rdtsc(void)

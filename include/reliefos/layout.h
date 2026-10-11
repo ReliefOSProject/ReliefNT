@@ -23,7 +23,7 @@
  *     /var/lib/reliefos             persistent mutable state
  *     /var/cache/reliefos           cache data
  *     /run/reliefos                 volatile per-boot IPC and session state
- *     /usr/lib/reliefos             private libraries and loader payload
+ *     /usr/lib/reliefos             private libraries and interpreter payload
  *     /usr/lib/reliefos/apps        application packages (manifest + ELF)
  *     /usr/lib/reliefos/tests       diagnostic guest probes
  *     /usr/share/reliefos           desktop resources

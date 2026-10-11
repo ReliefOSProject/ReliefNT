@@ -90,7 +90,7 @@ int64_t userland_spawn_path_argv_for_user(const char *path,
 /**
  * @brief Return the boot loader kernel command line captured at init time.
  * @return NUL-terminated raw command line backing /proc/cmdline; never NULL,
- * an empty string when the boot handoff carried none.
+ * an empty string when the Multiboot2 info carried none.
  */
 const char *userland_boot_cmdline(void);
 struct task *userland_schedule_from_frame(struct trap_frame *frame);

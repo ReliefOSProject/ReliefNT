@@ -2,11 +2,15 @@
  * ReliefOS x86_64 kernel linker script: fixes the kernel image layout.
  * Places boot, text, read-only data, writable data, and relocation sections.
  */
-ENTRY(kernel_entry)
+ENTRY(_start)
 
 SECTIONS
 {
     . = 128M;
+
+    /* Whole-image bounds for mm.c: everything GRUB loads below is reserved
+     * from the physical allocator, including .bss scratch buffers. */
+    __kernel_start = .;
 
     .multiboot ALIGN(8) : {
         KEEP(*(.multiboot))
@@ -28,6 +32,8 @@ SECTIONS
         *(COMMON)
         *(.bss .bss.*)
     }
+
+    __kernel_end = .;
 
     /* The image is linked at 128M and paging.h keeps the identity hole from
      * 128M to 192M supervisor-only; growing past it would let a user page-table

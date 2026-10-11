@@ -8,9 +8,9 @@
 # Python regression tools under tools/test_*.py run only from `make test`).
 #
 # Derived from the parent ReliefOS build entry point. The product surface here
-# is exactly the kernel side: kernel.sys, kernel.debug, loader.elf and
-# kerneldebug.sys; the device drivers are linked into kernel.sys itself. Nothing
-# in this tree reads parent or product configuration.
+# is exactly the kernel side: kernel.sys, kernel.debug and kerneldebug.sys; the
+# device drivers are linked into kernel.sys itself. Nothing in this tree reads
+# parent or product configuration.
 
 # --- GNU Make version ------------------------------------------------------
 # Grouped targets ('&:') and the $(file) function both need 4.3.
@@ -163,7 +163,7 @@ include $(RELIEFOS_SRC)/mk/resources.mk
 # Source inventories are inputs, never implicit host executable targets.
 .SUFFIXES:
 
-.PHONY: help all kernel loader kerneldebug boot tools fetch defconfig olddefconfig \
+.PHONY: help all kernel kerneldebug boot tools fetch defconfig olddefconfig \
 	menuconfig headers_install install config-sync build-info \
 	test test-tools test-abi test-header-export test-uapi-compat clean distclean
 
@@ -171,9 +171,8 @@ help:
 	@printf '%s\n' \
 	  'ReliefNT kernel build (standalone kernel checkout)' \
 	  '' \
-	  '  all               kernel.sys, kernel.debug, loader.elf, kerneldebug.sys' \
+	  '  all               kernel.sys, kernel.debug, kerneldebug.sys' \
 	  '  kernel            kernel.sys + kernel.debug' \
-	  '  loader            loader.elf (waits for kernel.sys: loader integrity chain)' \
 	  '  kerneldebug       kerneldebug.sys (standalone kernel debug module)' \
 	  '  headers_install   export the UAPI whitelist to $(O)/kernel-export/include' \
 	  '  install           copy products + manifest.txt to $(DESTDIR)' \
@@ -189,9 +188,9 @@ tools: $(RELIEFOS_HOST_TOOLS)
 
 kernel: $(RELIEFOS_KERNEL_SYS) $(RELIEFOS_KERNEL_DEBUG)
 
-# `all` is exactly the four kernel products. There is no userland, no image and
+# `all` is exactly the three kernel products. There is no userland, no image and
 # no package goal in this repository.
-all: kernel loader kerneldebug
+all: kernel kerneldebug
 
 # Populate the shared download cache from the locked URLs. A normal build never
 # downloads: it verifies the cache and stops with this command when bytes are
@@ -215,11 +214,10 @@ build-info: $(BUILD_INFO_HEADER)
 # Products plus manifest.txt. The manifest records what was installed and how
 # it was built so an installed kernel can be traced back to its inputs: format
 # version, arch, kernel git identity (or "no-git"), dirty flag, toolchain
-# identity, config and UAPI export digests, the boot handoff version and a
-# sha256 per artifact. sha256sum only; no interpreter in the production chain.
+# identity, config and UAPI export digests and a sha256 per artifact.
+# sha256sum only; no interpreter in the production chain.
 DESTDIR ?= $(O)/kernel-install
-INSTALL_PRODUCTS := $(RELIEFOS_KERNEL_SYS) $(RELIEFOS_KERNEL_DEBUG) $(KERNELDEBUG_SYS) \
-	$(LOADER_ELF)
+INSTALL_PRODUCTS := $(RELIEFOS_KERNEL_SYS) $(RELIEFOS_KERNEL_DEBUG) $(KERNELDEBUG_SYS)
 
 .PHONY: install
 install: $(INSTALL_PRODUCTS) $(HEADER_EXPORT_MANIFEST)
@@ -246,7 +244,6 @@ install: $(INSTALL_PRODUCTS) $(HEADER_EXPORT_MANIFEST)
 	  printf 'toolchain: %s\n' "$$($(TARGET_CC) --version 2>/dev/null | head -n1)"; \
 	  printf 'config_sha256: %s\n' "$$(sha256sum '$(RELIEFOS_CONFIG_FILE)' | cut -d' ' -f1)"; \
 	  printf 'uapi_sha256: %s\n' "$$(sha256sum '$(HEADER_EXPORT_MANIFEST)' | cut -d' ' -f1)"; \
-	  printf 'handoff_version: %s\n' "$$(sed -n 's/^[[:space:]]*#define[[:space:]]\{1,\}RELIEFOS_BOOT_HANDOFF_VERSION[[:space:]]\{1,\}\([0-9][0-9]*\).*/\1/p' '$(RELIEFOS_SRC)/include/reliefos/boot_handoff.h' | head -n1)"; \
 	  printf 'artifacts:\n'; \
 	  (cd "$$dest" && sha256sum $(notdir $(INSTALL_PRODUCTS)) | sed 's/^/  /'); \
 	} > "$$dest/manifest.txt.tmp"; \
