@@ -79,7 +79,7 @@ int64_t syscall_timer_gettime(uint64_t timerid, uint64_t value);
 int64_t syscall_timer_getoverrun(uint64_t timerid);
 int64_t syscall_rt_sigtimedwait(uint64_t mask, uint64_t info, uint64_t timeout, uint64_t sigset_size);
 
-#define TASK_PIPE_CAP 4096u
+#define TASK_PIPE_CAP 65535u
 
 struct task_file *task_file_for_fd(struct task *task, int fd);
 int file_can_read(const struct task_file *file);

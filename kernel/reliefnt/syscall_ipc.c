@@ -13,9 +13,9 @@
 #include <reliefos/fs_abi.h>
 
 /* A 64-stage shell pipeline owns 63 pipes simultaneously.  Keep an extra
- * ring sentinel byte so the advertised 4096-byte capacity is usable. */
+ * ring sentinel byte so the advertised capacity is usable. */
 #define TASK_PIPE_MAX 256u
-#define TASK_PIPE_CAP 4096u
+#define TASK_PIPE_CAP 65535u
 #define TASK_PIPE_RING_CAP (TASK_PIPE_CAP + 1u)
 
 struct task_pipe {
@@ -124,9 +124,15 @@ int task_pipe_read(struct task_file *file, void *buffer, uint32_t length)
     if (!pipe || (file->flags & RELIEFOS_O_ACCMODE) == RELIEFOS_O_WRONLY) return -RELIEFOS_EBADF;
     if (length == 0) return 0;
     kernel_wait_queue_remove(&pipe->wait_read, sched_current_task());
+    /* Copy contiguous runs per iteration: a 64 KiB ring drained byte-by-byte
+     * costs more than the syscalls it serves. */
     while (pipe->tail != pipe->head && count < length) {
-        ((uint8_t *)buffer)[count++] = pipe->data[pipe->tail];
-        pipe->tail = (pipe->tail + 1U) % TASK_PIPE_RING_CAP;
+        uint32_t chunk = pipe->tail < pipe->head ? pipe->head - pipe->tail
+                                                : TASK_PIPE_RING_CAP - pipe->tail;
+        if (chunk > length - count) chunk = length - count;
+        __builtin_memcpy((uint8_t *)buffer + count, pipe->data + pipe->tail, chunk);
+        pipe->tail = (pipe->tail + chunk) % TASK_PIPE_RING_CAP;
+        count += chunk;
     }
     if (count) {
         (void)kernel_wait_queue_wake_all(&pipe->wait_write);
@@ -177,8 +183,13 @@ int task_pipe_write(struct task_file *file, const void *buffer, uint32_t length)
             kernel_wait_queue_block_current(&pipe->wait_write);
             return -RELIEFOS_EAGAIN;
         }
-        pipe->data[pipe->head] = ((const uint8_t *)buffer)[count++];
-        pipe->head = next;
+        uint32_t used = (pipe->head + TASK_PIPE_RING_CAP - pipe->tail) % TASK_PIPE_RING_CAP;
+        uint32_t chunk = TASK_PIPE_CAP - used;
+        if (chunk > TASK_PIPE_RING_CAP - pipe->head) chunk = TASK_PIPE_RING_CAP - pipe->head;
+        if (chunk > length - count) chunk = length - count;
+        __builtin_memcpy(pipe->data + pipe->head, (const uint8_t *)buffer + count, chunk);
+        pipe->head = (pipe->head + chunk) % TASK_PIPE_RING_CAP;
+        count += chunk;
     }
     (void)kernel_wait_queue_wake_all(&pipe->wait_read);
     return (int)count;

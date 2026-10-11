@@ -680,7 +680,9 @@ struct task *userland_schedule_from_frame(struct trap_frame *frame)
     input_process_pending();
     struct task *current;
     struct task *next;
+    int live_fpu_saved;
 retry:
+    live_fpu_saved = 0;
     current = sched_current_task();
     if (current && current->kind == TASK_KIND_USER && frame &&
         current->state != TASK_EXITED) {
@@ -688,8 +690,14 @@ retry:
          * before validating the frame that will actually return to userspace. */
         if ((frame->cs & 3ULL) == 3ULL) {
             /* Install a pending user signal handler on this live return
-             * frame before it is published to the scheduler. */
-            arch_fpu_save(current->fpu_state);
+             * frame before it is published to the scheduler.  The FPU image
+             * is only read when a handler frame is actually built; signal
+             * queueing is serialized under the execution lock, so the
+             * pending check cannot race the delivery. */
+            if (sched_task_pending(current) & ~current->blocked_signals) {
+                arch_fpu_save(current->fpu_state);
+                live_fpu_saved = 1;
+            }
             (void)kernel_signal_deliver_pending(current, frame);
             if (current->state != TASK_EXITED && !sched_capture_current_user_frame(frame)) {
                 console_printf("[reliefnt] rejected scheduler frame pid=%u rip=0x%llx cs=0x%llx\n",
@@ -729,6 +737,11 @@ retry:
     }
     /* A task that was woken for a pending signal never passed through the
      * live-frame path above; prepare its saved frame before entering it. */
+    if (next == current && !live_fpu_saved &&
+        (sched_task_pending(next) & ~next->blocked_signals)) {
+        arch_fpu_save(next->fpu_state);
+        live_fpu_saved = 1;
+    }
     (void)kernel_signal_deliver_pending(next, &next->frame);
     if (next->state == TASK_EXITED) { frame = NULL; goto retry; }
     if (next->state == TASK_STOPPED || next->state == TASK_BLOCKED) {
@@ -742,7 +755,15 @@ retry:
         goto retry;
     }
     arch_set_user_fs(next->fs_base);
-    arch_fpu_restore(next->fpu_state);
+    /* The kernel is general-regs-only, so the hardware FPU state is still
+     * live and clean when the same task resumes: both the snapshot and the
+     * reload are only needed across a real switch. */
+    if (next != current) {
+        if (!live_fpu_saved && current && current->kind == TASK_KIND_USER &&
+            current->state != TASK_EXITED)
+            arch_fpu_save(current->fpu_state);
+        arch_fpu_restore(next->fpu_state);
+    }
     kernel_execution_unlock_irqrestore(execution_flags);
     return next;
 }

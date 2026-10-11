@@ -465,70 +465,39 @@ isr80_stub:
 /* Native x86-64 SYSCALL entry.  SYSCALL leaves the user stack untouched and
  * records the return RIP/RFLAGS in rcx/r11, so KERNEL_GS_BASE supplies the
  * per-CPU scratch slots and kernel entry stack before a normal trap frame is
- * built. */
+ * built.  Only rsp/rcx/r11 round-trip through the scratch area; every other
+ * register is pushed straight from the live one.  The SysV syscall stub
+ * contract clobbers rcx/r11, so their frame slots hold the return RIP/RFLAGS. */
 .global x86_64_syscall_entry
 .type x86_64_syscall_entry, @function
 x86_64_syscall_entry:
     swapgs
-    mov %rax, %gs:32
-    mov %rbx, %gs:40
-    mov %rcx, %gs:48
-    mov %rdx, %gs:56
-    mov %rsi, %gs:64
-    mov %rdi, %gs:72
-    mov %rbp, %gs:80
-    mov %r8, %gs:88
-    mov %r9, %gs:96
-    mov %r10, %gs:104
-    mov %r11, %gs:112
-    mov %r12, %gs:120
-    mov %r13, %gs:128
-    mov %r14, %gs:136
-    mov %r15, %gs:144
     mov %rsp, %gs:0
     mov %rcx, %gs:8
     mov %r11, %gs:16
     mov %gs:24, %rsp
     pushq $0x1b
-    mov %gs:0, %rax
-    pushq %rax
-    mov %gs:16, %rax
-    pushq %rax
+    pushq %gs:0
+    pushq %gs:16
     pushq $0x23
-    mov %gs:8, %rax
-    pushq %rax
+    pushq %gs:8
     pushq $0
     pushq $0x80
-    mov %gs:32, %rax
     pushq %rax
-    mov %gs:40, %rax
-    pushq %rax
-    mov %gs:48, %rax
-    pushq %rax
-    mov %gs:56, %rax
-    pushq %rax
-    mov %gs:64, %rax
-    pushq %rax
-    mov %gs:72, %rax
-    pushq %rax
-    mov %gs:80, %rax
-    pushq %rax
-    mov %gs:88, %rax
-    pushq %rax
-    mov %gs:96, %rax
-    pushq %rax
-    mov %gs:104, %rax
-    pushq %rax
-    mov %gs:112, %rax
-    pushq %rax
-    mov %gs:120, %rax
-    pushq %rax
-    mov %gs:128, %rax
-    pushq %rax
-    mov %gs:136, %rax
-    pushq %rax
-    mov %gs:144, %rax
-    pushq %rax
+    pushq %rbx
+    pushq %rcx
+    pushq %rdx
+    pushq %rsi
+    pushq %rdi
+    pushq %rbp
+    pushq %r8
+    pushq %r9
+    pushq %r10
+    pushq %r11
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
     mov %rsp, %rdi
     call int80_dispatch
     test %rax, %rax
@@ -543,6 +512,9 @@ x86_64_syscall_entry:
     mov %r13, %rsi
     test %rdi, %rdi
     jz 2f
+    /* The CR3 write is unconditional on purpose: without PCID the TLB is
+     * not address-space tagged, and munmap/remap and the lazy image loader
+     * rely on this full non-global flush to drop stale user translations. */
     mov %rsi, %cr3
     mov %rdi, %rsp
     jmp syscall_trap_restore_frame

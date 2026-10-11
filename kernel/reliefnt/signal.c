@@ -467,6 +467,9 @@ int64_t kernel_signal_rt_sigreturn(struct task *task, struct trap_frame *frame)
         arch_fpu_restore(task->fpu_state);
     }
     signal_context_restore(frame, context);
+    /* The restored context's rcx/r11 are live values again; drop the
+     * SYSCALL-entry marker so the return goes through iretq. */
+    frame->error = 0;
     task->blocked_signals = user_frame.uc.mask;
     task->blocked_signals &= ~((1ULL << 8) | (1ULL << 18));
     task->sigsuspend_active = 0;

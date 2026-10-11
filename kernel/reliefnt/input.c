@@ -89,6 +89,11 @@ void input_handle_scancode(uint8_t keycode, uint8_t pressed)
  */
 void input_process_pending(void)
 {
+    /* Fast path: every syscall and every task return passes through here,
+     * so skip the lock round-trip while the queue is empty. */
+    if (__atomic_load_n(&pending_key_tail, __ATOMIC_RELAXED) ==
+        __atomic_load_n(&pending_key_head, __ATOMIC_RELAXED))
+        return;
     for (uint32_t budget = 0; budget < INPUT_QUEUE_CAP; ++budget) {
         uint64_t flags;
         uint8_t keycode, pressed;

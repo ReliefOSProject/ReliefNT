@@ -2448,14 +2448,19 @@ struct task *sched_select_next_user(void)
     kernel_spin_lock_irqsave(&scheduler_lock, &flags);
     uint32_t cpu = scheduler_cpu_index();
     struct task *old = sched_find(current_pid[cpu]);
-    /* The execution transaction pins task metadata around this handoff.
-     * Switch CR3 before publishing the old task to remote CPUs/reapers,
-     * including the no-runnable-task path that enters the idle loop. */
-    paging_load_cr3(paging_kernel_cr3());
     fair_stop_cpu(cpu);
-    if (old && old->running_cpu == cpu) old->running_cpu = SCHED_CPU_NONE;
-    current_pid[cpu] = 0;
     best = fair_select(cpu);
+    if (!best || best != old) {
+        /* The execution transaction pins task metadata around this handoff.
+         * Switch CR3 before publishing the old task to remote CPUs/reapers,
+         * including the no-runnable-task path that enters the idle loop. */
+        paging_load_cr3(paging_kernel_cr3());
+        if (old && old->running_cpu == cpu) old->running_cpu = SCHED_CPU_NONE;
+        current_pid[cpu] = 0;
+    }
+    /* Same-task continuation skips the retirement above entirely: nothing is
+     * published for reapers to act on, and the return stub reloads the task
+     * CR3 (still the required full refresh) either way. */
     if (best) {
         best->state = TASK_RUNNING;
         best->running_cpu = cpu;

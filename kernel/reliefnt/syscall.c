@@ -7484,6 +7484,9 @@ void syscall_dispatch_frame(struct trap_frame *frame)
     }
     if ((number == LINUX_SYS_EXECVE || number == LINUX_SYS_EXECVEAT) && result == 0 && calling_task) {
         *frame = calling_task->frame;
+        /* The fresh image frame is not a SYSCALL stub frame; drop the
+         * SYSRET-eligible marker so the return keeps live rcx/r11 intact. */
+        frame->error = 0;
         restored_signal_frame = 1;
     }
     if (trace) console_printf("[syscall-trace] pid=%u nr=%llu result=%lld\n",

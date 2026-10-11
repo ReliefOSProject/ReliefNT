@@ -39,6 +39,17 @@ static struct kernel_spinlock clock_lock = KERNEL_SPINLOCK_INIT;
 static uint64_t wall_fraction_ns;
 static uint8_t wall_clock_valid;
 static volatile uint16_t pit_divisor;
+/* TSC interpolation replaces the PIT counter port reads on the steady-state
+ * path: each port access traps under KVM, so a lock-free reader instead
+ * samples a per-tick TSC anchor against a boot-time rate. The sequence
+ * counter lets readers detect a tick update landing inside their window
+ * rather than pairing one tick's anchor with another's count. */
+static volatile uint32_t tsc_anchor_seq;
+static volatile uint64_t tsc_anchor;
+static uint64_t tsc_per_us;
+static uint64_t tsc_calib_first;
+static uint64_t tsc_calib_span;
+static volatile uint8_t tsc_ready;
 
 /**
  * @brief Short I/O delay between CMOS register select and read.
@@ -230,6 +241,12 @@ void time_init(void)
     wall_fraction_ns = 0;
     wall_clock_valid = 0;
     pit_divisor = 0;
+    tsc_anchor_seq = 0;
+    tsc_anchor = 0;
+    tsc_per_us = 0;
+    tsc_calib_first = 0;
+    tsc_calib_span = 0;
+    tsc_ready = 0;
     if (rtc_read_unix_seconds(&wall_unix_seconds) == 0) {
         struct reliefos_time_info info;
         wall_clock_valid = 1;
@@ -242,6 +259,14 @@ void time_init(void)
     }
 }
 
+static uint64_t time_rdtsc(void)
+{
+    uint32_t low;
+    uint32_t high;
+    __asm__ volatile("lfence; rdtsc; lfence" : "=a"(low), "=d"(high) :: "memory");
+    return ((uint64_t)high << 32) | low;
+}
+
 /**
  * @brief Advance clock and service devices with no clock lock held.
  * @return None. IRQ context; audio consumes at most 32 completions, no waiting.
@@ -250,7 +275,32 @@ void time_on_tick(void)
 {
     uint64_t flags;
     kernel_spin_lock_irqsave(&clock_lock, &flags);
+    /* Publish the tick and its TSC anchor as one sequence so lock-free
+     * readers can retry instead of pairing one tick's anchor with another's
+     * count. Anchor precedes the increment so a reader that still sees the
+     * old count cannot observe a half-published boundary. */
+    ++tsc_anchor_seq;
+    tsc_anchor = time_rdtsc();
     ++ticks;
+    ++tsc_anchor_seq;
+    if (!tsc_ready) {
+        if (!tsc_calib_span) {
+            tsc_calib_first = tsc_anchor;
+            tsc_calib_span = 1;
+        } else if (tsc_calib_span < 8u) {
+            ++tsc_calib_span;
+            if (tsc_calib_span == 8u) {
+                uint64_t per_us = (tsc_anchor - tsc_calib_first) /
+                                  (7ULL * (1000000ULL / RELIEFNT_TICK_HZ));
+                if (per_us) {
+                    tsc_per_us = per_us;
+                    tsc_ready = 1;
+                } else {
+                    tsc_calib_span = 0;
+                }
+            }
+        }
+    }
     uint64_t elapsed = time_discipline_tick_ns();
     monotonic_ns += elapsed;
     if (monotonic_ns >= 1000000000) { monotonic_ns -= 1000000000; ++monotonic_seconds; }
@@ -355,6 +405,37 @@ uint64_t time_uptime_us(void)
     uint64_t tick_count;
     uint64_t elapsed_counts;
     uint16_t divisor = pit_divisor;
+
+    /* Steady-state path: interpolate between tick anchors with the TSC rate
+     * so syscall-bound readers avoid the PIT port I/O that traps under KVM.
+     * The sequence check keeps one tick's anchor paired with one tick's
+     * count; anything that slips through falls back to the PIT or, failing
+     * that, tick-granularity uptime. */
+    if (tsc_ready) {
+        for (uint32_t attempt = 0; attempt < 3U; ++attempt) {
+            uint32_t seq_before = tsc_anchor_seq;
+            if (seq_before & 1U) {
+                continue;
+            }
+            uint64_t before = ticks;
+            uint64_t anchor = tsc_anchor;
+            uint64_t sample = time_rdtsc();
+            uint32_t seq_after = tsc_anchor_seq;
+            if (seq_before != seq_after) {
+                continue;
+            }
+            uint64_t rate = tsc_per_us;
+            if (!rate) {
+                break;
+            }
+            uint64_t fraction_us = sample >= anchor ? (sample - anchor) / rate : 0ULL;
+            uint64_t tick_us = 1000000ULL / RELIEFNT_TICK_HZ;
+            if (fraction_us > tick_us) {
+                fraction_us = tick_us;
+            }
+            return (before * 1000000ULL) / RELIEFNT_TICK_HZ + fraction_us;
+        }
+    }
 
     if (!divisor) {
         return (ticks * 1000000ULL) / RELIEFNT_TICK_HZ;
