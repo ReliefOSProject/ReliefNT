@@ -50,6 +50,10 @@ void arch_fpu_restore(const void *state);
  */
 void irq_init(void);
 /**
+ * @brief Mask every legacy PIC input until irq_init() programs the controllers.
+ */
+void irq_mask_legacy_pic(void);
+/**
  * @brief Jump to user-mode code at entry with user_stack as the initial stack; never returns.
  */
 __attribute__((noreturn)) void arch_enter_user(uint64_t entry, uint64_t user_stack);

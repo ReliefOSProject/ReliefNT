@@ -94,14 +94,30 @@ static void pic_mask_all(void)
     x86_64_outb(0xff, PIC2_DATA);
 }
 
+/**
+ * @brief Mask every legacy PIC input before the kernel IDT exists.
+ *
+ * Firmware leaves the PIC unmasked and the PIT running, so IRQ0 is already
+ * pending when the kernel starts.  irq_init() remaps and unmasks what it
+ * needs; until then no hardware interrupt may reach the CPU, because a
+ * restored IF bit would deliver it through the firmware IDT.
+ */
+void irq_mask_legacy_pic(void)
+{
+    pic_mask_all();
+}
+
 static void irq_send_eoi(uint8_t irq)
 {
     if (!irq_uses_ioapic) {
         pic_send_eoi(irq);
     }
-    if (irq_uses_local_apic) {
-        apic_eoi();
-    }
+    /* The local APIC accepts every maskable interrupt that reaches this CPU,
+     * IOAPIC-routed or PIC virtual-wire, so each one needs an APIC EOI as
+     * well.  Do not gate this on irq_init()'s routing decision: a handler can
+     * run before irq_init() programs any route, and missing that EOI wedges
+     * the APIC's in-service bit and stops the tick forever. */
+    apic_eoi();
 }
 
 /**

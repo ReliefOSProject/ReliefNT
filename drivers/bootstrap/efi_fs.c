@@ -1,5 +1,6 @@
 #include <reliefnt/efi_fs.h>
 #include <reliefnt/console.h>
+#include <reliefnt/lock.h>
 #include <reliefnt/mm.h>
 
 #define EFI_BY_PROTOCOL 2ULL
@@ -273,7 +274,7 @@ static int open_path(const char *path, struct efi_file_protocol **out_file)
     return 0;
 }
 
-void efi_fs_init(uint64_t system_table_addr)
+static void efi_fs_init_impl(uint64_t system_table_addr)
 {
     struct efi_system_table *st;
     uint64_t handle_count = 0;
@@ -326,14 +327,25 @@ void efi_fs_init(uint64_t system_table_addr)
     console_printf("[reliefnt] efi fs init failed: no readable FAT32 volume\n");
 }
 
+void efi_fs_init(uint64_t system_table_addr)
+{
+    /* UEFI boot services execute at TPL with interrupts enabled and return
+     * with IF set.  Kernel callers keep interrupts disabled across firmware
+     * crossings — early boot must not run handlers before irq_init() — so
+     * every entry point below brackets its work with the caller's RFLAGS. */
+    uint64_t irq_flags = kernel_irq_save();
+    efi_fs_init_impl(system_table_addr);
+    kernel_irq_restore(irq_flags);
+}
+
 bool efi_fs_ready(void)
 {
     return ready;
 }
 
-int efi_boot_memory_map(uint64_t system_table_addr, void *buffer,
-                        uint64_t buffer_bytes, uint64_t *out_entry_size,
-                        uint32_t *out_entry_count)
+static int efi_boot_memory_map_impl(uint64_t system_table_addr, void *buffer,
+                                    uint64_t buffer_bytes, uint64_t *out_entry_size,
+                                    uint32_t *out_entry_count)
 {
     struct efi_system_table *st;
     uint64_t map_size = buffer_bytes;
@@ -364,7 +376,18 @@ int efi_boot_memory_map(uint64_t system_table_addr, void *buffer,
     return 0;
 }
 
-int efi_fs_read_file(const char *path, const void **out_data, size_t *out_len)
+int efi_boot_memory_map(uint64_t system_table_addr, void *buffer,
+                        uint64_t buffer_bytes, uint64_t *out_entry_size,
+                        uint32_t *out_entry_count)
+{
+    uint64_t irq_flags = kernel_irq_save();
+    int ret = efi_boot_memory_map_impl(system_table_addr, buffer, buffer_bytes,
+                                       out_entry_size, out_entry_count);
+    kernel_irq_restore(irq_flags);
+    return ret;
+}
+
+static int efi_fs_read_file_impl(const char *path, const void **out_data, size_t *out_len)
 {
     struct efi_file_protocol *file = 0;
     struct efi_file_info *info;
@@ -435,8 +458,16 @@ int efi_fs_read_file(const char *path, const void **out_data, size_t *out_len)
     return 0;
 }
 
-int efi_fs_list_dir(const char *path, struct reliefos_dir_entry *entries,
-                    uint32_t capacity, uint32_t *out_count)
+int efi_fs_read_file(const char *path, const void **out_data, size_t *out_len)
+{
+    uint64_t irq_flags = kernel_irq_save();
+    int ret = efi_fs_read_file_impl(path, out_data, out_len);
+    kernel_irq_restore(irq_flags);
+    return ret;
+}
+
+static int efi_fs_list_dir_impl(const char *path, struct reliefos_dir_entry *entries,
+                                uint32_t capacity, uint32_t *out_count)
 {
     struct efi_file_protocol *dir = 0;
     uint32_t count = 0;
@@ -495,4 +526,13 @@ int efi_fs_list_dir(const char *path, struct reliefos_dir_entry *entries,
     }
     *out_count = count;
     return (int)count;
+}
+
+int efi_fs_list_dir(const char *path, struct reliefos_dir_entry *entries,
+                    uint32_t capacity, uint32_t *out_count)
+{
+    uint64_t irq_flags = kernel_irq_save();
+    int ret = efi_fs_list_dir_impl(path, entries, capacity, out_count);
+    kernel_irq_restore(irq_flags);
+    return ret;
 }

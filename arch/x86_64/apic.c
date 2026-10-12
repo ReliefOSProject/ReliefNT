@@ -243,7 +243,16 @@ void apic_timer_init(uint8_t vector, uint32_t initial_count)
     lapic_write(0x380u, initial_count);
 }
 
-void apic_eoi(void) { if (local_apic_enabled) lapic_write(APIC_REG_EOI, 0); }
+void apic_eoi(void)
+{
+    /* SDM Vol. 3 10.8.1: every interrupt the local APIC accepted needs an
+     * EOI, and an EOI written with no interrupt in service is ignored.  Gate
+     * on presence, not on apic_enable(): firmware leaves the APIC enabled     * across the boot handoff, so a handler can owe an EOI before irq_init()
+     * ever calls apic_enable(). */
+    if (local_apic_present) {
+        lapic_write(APIC_REG_EOI, 0);
+    }
+}
 
 static void apic_wait_delivery(void)
 {

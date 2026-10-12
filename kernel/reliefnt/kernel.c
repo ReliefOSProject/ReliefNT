@@ -161,6 +161,11 @@ static void kernel_start(uint32_t magic, uint32_t multiboot_info)
     bool boot_log_pause;
 
     __asm__ volatile("cli");
+    /* The firmware left the legacy PIC unmasked with the PIT running, so IRQ0
+     * is pending before the first kernel instruction.  Mask every input now:
+     * any code path that restores IF would otherwise deliver that tick through
+     * the firmware IDT, whose gates no longer fit the kernel GDT. */
+    irq_mask_legacy_pic();
     console_init();
     const struct reliefos_system_info *system = reliefnt_system_info();
     console_printf("ReliefOS %s %s booting\n",
@@ -203,6 +208,11 @@ static void kernel_start(uint32_t magic, uint32_t multiboot_info)
     syscall_init();
     syscall_trace_configure(boot.cmdline);
     arch_userland_init(kernel_ring0_stack + sizeof(kernel_ring0_stack));
+    /* The kernel GDT and TSS are live now, so the kernel IDT must be loaded
+     * before anything else can take a fault or restore IF.  Until this lidt
+     * the CPU still holds the firmware IDT, whose gates select firmware GDT
+     * segments and triple fault on delivery after the GDT switch. */
+    idt_init();
     /* The bootstrap page tables are complete now, so SVGA BARs can be marked
      * UC before any 3D FIFO or guest-memory command is issued. */
     int svga_ret = svga3d_init();
@@ -213,7 +223,6 @@ static void kernel_start(uint32_t magic, uint32_t multiboot_info)
         triangle_ret = svga_ret == 0 ? svga3d_triangle_test() : svga_ret;
         console_printf("[svga3d] triangle-test=%d\n", triangle_ret);
     }
-    idt_init();
     irq_init();
     {
         bool ramdisk_root = cmdline_has(&boot, "mode=installer") ||
