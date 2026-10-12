@@ -1,7 +1,7 @@
 # headers_install 导出白名单（唯一权威清单）
 # 格式：仓库相对路径；安装后路径 = 去掉 include/uapi/ 前缀，置于 <O>/kernel-export/include/
 # 由本仓库 include/uapi/ 下的全部头文件生成（独立内核检出，阶段 2）。
-# reliefos/ 为规范声明；leonos/ 为重命名过渡期的转发别名头（同布局、单一定义）。
+# reliefos/ 为规范声明。
 include/uapi/reliefos/audio_abi.h
 include/uapi/reliefos/auth_abi.h
 include/uapi/reliefos/auth_user.h
@@ -19,23 +19,6 @@ include/uapi/reliefos/signal_abi.h
 include/uapi/reliefos/startup_abi.h
 include/uapi/reliefos/syscall_abi.h
 include/uapi/reliefos/system_abi.h
-include/uapi/leonos/audio_abi.h
-include/uapi/leonos/auth_abi.h
-include/uapi/leonos/auth_user.h
-include/uapi/leonos/device_abi.h
-include/uapi/leonos/driver_abi.h
-include/uapi/leonos/fs_abi.h
-include/uapi/leonos/gpu_abi.h
-include/uapi/leonos/inputm_abi.h
-include/uapi/leonos/kernel_debug_abi.h
-include/uapi/leonos/net_abi.h
-include/uapi/leonos/net_control.h
-include/uapi/leonos/pty_abi.h
-include/uapi/leonos/rootfs.h
-include/uapi/leonos/signal_abi.h
-include/uapi/leonos/startup_abi.h
-include/uapi/leonos/syscall_abi.h
-include/uapi/leonos/system_abi.h
 include/uapi/linux/arch_prctl.h
 include/uapi/linux/capability.h
 include/uapi/linux/dirent.h

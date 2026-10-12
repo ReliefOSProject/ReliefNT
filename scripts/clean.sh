@@ -36,23 +36,15 @@ if [ -n "$src" ]; then
     [ "$resolved" != "$source_root" ] || refuse 'resolved O is the source root'
 fi
 target=$resolved
-# Transitional: trees built before the rename carry .leonos-out with the old
-# marker text; both are recognized and neither is trusted beyond the checks.
 marker="$target/.reliefos-out"
-old_marker="$target/.leonos-out"
 [ ! -L "$marker" ] || refuse 'ownership marker is a symlink'
-[ ! -L "$old_marker" ] || refuse 'ownership marker is a symlink'
-if [ -f "$marker" ]; then
-    :
-elif [ -f "$old_marker" ]; then
-    marker=$old_marker
-else
+if [ ! -f "$marker" ]; then
     refuse "no ownership marker at $marker (not a build output directory created by this Makefile)"
 fi
-if ! grep -q -e '^reliefos-build-out version=1 ' -e '^leonos4-build-out version=1 ' "$marker"; then
+if ! grep -q '^reliefos-build-out version=1 ' "$marker"; then
     refuse "ownership marker in $target is not a ReliefOS build output marker"
 fi
-marker_root=$(sed -n -e 's/^reliefos-build-out version=1 root=//p' -e 's/^leonos4-build-out version=1 root=//p' "$marker" | head -n1)
+marker_root=$(sed -n 's/^reliefos-build-out version=1 root=//p' "$marker" | head -n1)
 if [ -n "$src" ] && [ -n "$marker_root" ] && [ "$marker_root" != "$src" ]; then
     refuse "output directory belongs to a different source root ($marker_root)"
 fi
@@ -76,7 +68,7 @@ for entry in $products; do
     fi
 done
 if [ "$keep" = 0 ]; then
-    for marker_entry in .reliefos-out .leonos-out; do
+    for marker_entry in .reliefos-out; do
         if [ -e "$resolved/$marker_entry" ] || [ -L "$resolved/$marker_entry" ]; then
             printf '  remove %s\n' "$marker_entry"
             rm -f -- "$resolved/$marker_entry"

@@ -165,7 +165,7 @@ include $(RELIEFOS_SRC)/mk/resources.mk
 
 .PHONY: help all kernel kerneldebug boot tools fetch fetch-check defconfig olddefconfig \
 	menuconfig headers_install install config-sync build-info \
-	test test-tools test-abi test-header-export test-uapi-compat clean distclean
+	test test-tools test-abi test-header-export clean distclean
 
 help:
 	@printf '%s\n' \
@@ -176,7 +176,7 @@ help:
 	  '  kerneldebug       kerneldebug.sys (standalone kernel debug module)' \
 	  '  headers_install   export the UAPI whitelist to $(O)/kernel-export/include' \
 	  '  install           copy products + manifest.txt to $(DESTDIR)' \
-	  '  test              host-tool tests + ABI layout + header export + UAPI compat' \
+	  '  test              host-tool tests + ABI layout + header export' \
 	  '  tools             the host C helpers' \
 	  '  fetch             download the locked dependencies into cache/downloads' \
 	  '  fetch-check       probe the locked URLs for HTTP errors (no downloads)' \
@@ -260,8 +260,7 @@ install: $(INSTALL_PRODUCTS) $(HEADER_EXPORT_MANIFEST)
 # --- tests -----------------------------------------------------------------
 # The two Python regression tools are boundary tests, not production chain.
 # The C host tests cover the shared host primitives and the lock-file reader.
-# LEONOS_TEST_PYTHON is the pre-rename input spelling; the new name wins.
-RELIEFOS_TEST_PYTHON ?= $(or $(LEONOS_TEST_PYTHON),python3)
+RELIEFOS_TEST_PYTHON ?= python3
 RELIEFOS_HOST_TEST_BINS := $(O_HOST)/tests/test_common $(O_HOST)/tests/test_json
 RELIEFOS_HOST_TEST_SANITISED := $(O_HOST)/tests-sanitised/test_common \
 	$(O_HOST)/tests-sanitised/test_json
@@ -334,18 +333,7 @@ test-header-export:
 	$(call RELIEFOS_LOG,RUN,tools/test_header_export.py)
 	$(Q)$(RELIEFOS_TEST_PYTHON) $(RELIEFOS_SRC)/tools/test_header_export.py
 
-# New/old UAPI dual-path compatibility (plan task 2): both include spellings
-# must coexist in one translation unit and agree on layouts and constants.
-test-uapi-compat: $(O_HOST)/tests/uapi_compat
-	@$(call RELIEFOS_LOG_SHELL,RUN,$<)
-	$(Q)$<
-
-$(O_HOST)/tests/uapi_compat: $(RELIEFOS_SRC)/tests/uapi/uapi_compat.c $(O_META)/host-cc.sig
-	$(Q)mkdir -p $(dir $@)
-	$(call RELIEFOS_LOG,HOSTCC,$<)
-	$(Q)$(HOSTCC) $(RELIEFOS_STRICT_WARNINGS) $(KERNEL_INCLUDES) $(HOST_CFLAGS) $< -o $@
-
-test: test-tools test-abi test-header-export test-uapi-compat
+test: test-tools test-abi test-header-export
 
 # --- cleaning ---------------------------------------------------------------
 # scripts/clean.sh enforces the ownership-marker safety rules: it never removes

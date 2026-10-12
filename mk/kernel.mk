@@ -97,9 +97,7 @@ endif
 # Output trees predating -MP can still reference the removed splash header.
 # Allow that dependency to be read once so the compiler can replace the stale
 # depfile. New depfiles emit empty header targets themselves via -MP.
-$(RELIEFOS_SRC)/kernel/reliefnt/include/reliefnt/boot_splash.h \
-$(RELIEFOS_SRC)/kernel/reliefnt/include/ntclks/boot_splash.h \
-$(RELIEFOS_SRC)/kernel/ntclks/include/ntclks/boot_splash.h:
+$(RELIEFOS_SRC)/kernel/reliefnt/include/reliefnt/boot_splash.h:
 
 -include $(shell find $(O_OBJ)/kernel -name '*.o.d' 2>/dev/null)
 
