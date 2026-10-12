@@ -223,6 +223,13 @@ static int proc_fill_content(const char *path, char *buffer, uint32_t capacity)
         proc_append_text(buffer, &pos, capacity, "\n");
         return 0;
     }
+    /* Linux kernel.overflowuid/overflowgid: the IDs substituted for unmapped
+     * 16-bit uids/gids. The upstream default is 65534. */
+    if (proc_text_eq(path, "/proc/sys/kernel/overflowuid") ||
+        proc_text_eq(path, "/proc/sys/kernel/overflowgid")) {
+        proc_append_text(buffer, &pos, capacity, "65534\n");
+        return 0;
+    }
     if (proc_text_eq(path, "/proc/stat")) {
         uint64_t busy = 0;
         uint64_t idle = 0;
@@ -551,6 +558,8 @@ int proc_lookup(const char *path, struct storage_node *out)
         proc_text_eq(path, "/proc/sys/kernel/ostype") ||
         proc_text_eq(path, "/proc/sys/kernel/osrelease") ||
         proc_text_eq(path, "/proc/sys/kernel/version") ||
+        proc_text_eq(path, "/proc/sys/kernel/overflowuid") ||
+        proc_text_eq(path, "/proc/sys/kernel/overflowgid") ||
         proc_text_eq(path, "/proc/stat")) {
         uint32_t len = 0;
         int ret = proc_fill_content(path, content, sizeof(content));

@@ -1075,9 +1075,9 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                 }
                 device_mapping = 1;
             } else if (file->flags & TASK_FILE_FLAG_DEV_SHM) {
-                if (task_shm_map(file, offset, mapped_len, &device_phys) < 0) {
-                    return -RELIEFOS_EINVAL;
-                }
+                int shm_map_ret = task_shm_map(file, offset, mapped_len,
+                                               (uint32_t)prot, &device_phys);
+                if (shm_map_ret < 0) return shm_map_ret;
                 device_mapping = 1;
             } else {
                 return -RELIEFOS_EINVAL;
@@ -1203,6 +1203,10 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
         if (audio_mapping_acquired)
             audio_pcm_mmap_release(audio_mapping.pcm, audio_mapping.region);
         return -RELIEFOS_ENOMEM;
+    }
+    if (device_mapping) {
+        struct task_vma *device_vma = task_vma_containing(task, start, end);
+        if (device_vma) device_vma->device_physical = device_phys;
     }
     if (audio_mapping_acquired) {
         struct task_vma *audio_vma = task_vma_containing(task, start, end);

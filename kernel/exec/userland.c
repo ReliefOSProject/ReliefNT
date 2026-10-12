@@ -434,6 +434,9 @@ static int userland_prepare_exec_credentials(struct task *next, const struct tas
     next->securebits &= ~SECBIT_KEEP_CAPS;
     next->secure_exec = setid || (next->uid &&
         (effective || (next->cap_permitted & ~next->cap_ambient)));
+    /* Linux fs/exec.c:setup_new_exec clears pdeath_signal on bprm->secureexec
+     * so a parent cannot signal a privileged program. */
+    if (next->secure_exec) next->pdeath_signal = 0;
     /* setup_new_exec resets dumpability, then commit_creds may lower it. */
     if (old->uid != old->euid || old->gid != old->egid ||
         old->euid != next->euid || old->egid != next->egid ||

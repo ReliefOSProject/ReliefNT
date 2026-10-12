@@ -1480,14 +1480,16 @@ static int64_t syscall_memfd_create(uint64_t name_ptr, uint32_t flags)
     char name[256];
     int fd;
     int ret;
-    if (!task || !name_ptr || (flags & ~(1u | 2u))) return -RELIEFOS_EINVAL;
+    if (!task || !name_ptr ||
+        (flags & ~(LINUX_MFD_CLOEXEC | LINUX_MFD_ALLOW_SEALING)))
+        return -RELIEFOS_EINVAL;
     ret = copy_user_string_fixed(name, sizeof(name), name_ptr, NULL);
     if (ret < 0) return ret;
     if (!name[0]) return -RELIEFOS_EINVAL;
     fd = alloc_task_fd(task, &node, RELIEFOS_O_RDWR, NULL);
     if (fd < 0) return fd;
     file = task_file_for_fd(task, fd);
-    if (!file || task_shm_attach(file) < 0) {
+    if (!file || task_shm_attach(file, flags) < 0) {
         if (file) clear_task_file(file);
         return -RELIEFOS_ENOMEM;
     }
@@ -1495,7 +1497,7 @@ static int64_t syscall_memfd_create(uint64_t name_ptr, uint32_t flags)
         clear_task_file(file);
         return -RELIEFOS_ENOMEM;
     }
-    if (flags & 1u) file->fd_flags = RELIEFOS_FD_CLOEXEC;
+    if (flags & LINUX_MFD_CLOEXEC) file->fd_flags = RELIEFOS_FD_CLOEXEC;
     return fd;
 }
 
@@ -5470,7 +5472,7 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
             }
             if (fd >= 0 && node.first_cluster == STORAGE_DEV_KIND_SHM) {
                 struct task_file *file = task_file_for_fd(task, fd);
-                if (!file || task_shm_attach(file) < 0) {
+                if (!file || task_shm_attach(file, 0) < 0) {
                     if (file) clear_task_file(file);
                     return -RELIEFOS_ENOMEM;
                 }
@@ -5687,6 +5689,14 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
                         ((uint32_t)a2 & (RELIEFOS_O_APPEND | RELIEFOS_O_NONBLOCK));
                 }
                 return 0;
+            }
+            if (a1 == LINUX_F_GET_SEALS || a1 == LINUX_F_ADD_SEALS) {
+                /* Linux memfd_fcntl: sealing is a shmem-file interface; pty
+                 * and stream descriptors are not sealable and report EINVAL. */
+                if (!file_fd) return -RELIEFOS_EINVAL;
+                return a1 == LINUX_F_GET_SEALS
+                    ? task_shm_get_seals(file_fd)
+                    : task_shm_add_seals(file_fd, (uint32_t)a2);
             }
         }
         return -RELIEFOS_ENOSYS;

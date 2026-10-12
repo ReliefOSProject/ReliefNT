@@ -35,7 +35,21 @@
 #define LINUX_F_SETOWN 8
 #define LINUX_F_GETOWN 9
 #define LINUX_F_DUPFD_CLOEXEC 1030
+#define LINUX_F_ADD_SEALS 1033
+#define LINUX_F_GET_SEALS 1034
 #define LINUX_FD_CLOEXEC 1
+/* memfd(2) seal bits used with F_ADD_SEALS/F_GET_SEALS. */
+#define LINUX_F_SEAL_SEAL 0x0001
+#define LINUX_F_SEAL_SHRINK 0x0002
+#define LINUX_F_SEAL_GROW 0x0004
+#define LINUX_F_SEAL_WRITE 0x0008
+#define LINUX_F_SEAL_FUTURE_WRITE 0x0010
+/* Sealing ABI without the F_SEAL_EXEC extension (Linux 5.13 and earlier);
+ * F_ADD_SEALS rejects any bit outside this set with EINVAL. */
+#define LINUX_F_ALL_SEALS 0x001f
+/* memfd_create(2) flags. */
+#define LINUX_MFD_CLOEXEC 0x0001
+#define LINUX_MFD_ALLOW_SEALING 0x0002
 #define LINUX_F_RDLCK 0
 #define LINUX_F_WRLCK 1
 #define LINUX_F_UNLCK 2

@@ -243,6 +243,15 @@ int64_t syscall_process_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
     struct task *task = sched_current_task();
     if (!task) return -LINUX_ESRCH;
     switch ((uint32_t)option) {
+    case LINUX_PR_SET_PDEATHSIG:
+        /* Linux valid_signal() admits 0 (clear) through _NSIG. */
+        if (arg2 > LINUX_NSIG) return -LINUX_EINVAL;
+        task->pdeath_signal = (uint32_t)arg2;
+        return 0;
+    case LINUX_PR_GET_PDEATHSIG:
+        if (!user_range_writable(arg2, sizeof(int))) return -RELIEFOS_EFAULT;
+        *(int *)(uintptr_t)arg2 = (int)task->pdeath_signal;
+        return 0;
     case LINUX_PR_SET_NAME: {
         char name[16] = {0};
         for (unsigned i = 0; i < sizeof(name) - 1; ++i) {

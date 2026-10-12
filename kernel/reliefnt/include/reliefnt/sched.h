@@ -67,6 +67,9 @@ struct task_vma {
     uint64_t end;
     uint64_t file_offset;
     uint64_t file_limit;
+    /* Physical base of device-backed mappings (shmem, framebuffer); zero for
+     * ordinary file and anonymous mappings. */
+    uint64_t device_physical;
     struct storage_node file_node;
     struct storage_inode_ref *inode;
     struct audio_pcm *audio_pcm;
@@ -191,6 +194,7 @@ enum task_kind {
 #define TASK_FLAG_REAP_IN_PROGRESS 0x00000080u
 #define TASK_FLAG_FORK_NOEXEC 0x00000100u
 #define TASK_FLAG_ORPHAN_NOTIFY 0x00000200u
+#define TASK_FLAG_PDEATH_NOTIFY 0x00000400u
 
 /* A stopped or continued child retains its task slot until its parent has
  * observed the state transition through waitpid. */
@@ -285,6 +289,10 @@ struct task_signal_state {
     uint32_t exit_signal;
     uint32_t parent_exit_signal;
     uint32_t parent_exit_notified;
+    /* Linux task_struct::pdeath_signal, plus the creating-thread link that
+     * matches real_parent for parent-death delivery (see copy_process). */
+    uint32_t pdeath_signal;
+    uint32_t pdeath_parent_pid;
     uint64_t ignored_signals;
 };
 
@@ -561,6 +569,10 @@ struct task {
             uint32_t exit_signal;
             uint32_t parent_exit_signal;
             uint32_t parent_exit_notified;
+            /* Linux task_struct::pdeath_signal, plus the creating-thread link that
+             * matches real_parent for parent-death delivery (see copy_process). */
+            uint32_t pdeath_signal;
+            uint32_t pdeath_parent_pid;
             uint64_t ignored_signals;
         };
     };
@@ -668,6 +680,9 @@ static inline void task_credentials_prepare(struct task *task, uint32_t euid, ui
     if (task->euid != euid || task->egid != egid || task->fsuid != fsuid ||
         task->fsgid != fsgid || (permitted & ~task->cap_permitted)) {
         sched_task_mm(task)->nondumpable = true;
+        /* Linux commit_creds clears the parent-death signal on any effective
+         * or filesystem ID change and on permitted capability gains. */
+        task->pdeath_signal = 0;
         __atomic_thread_fence(__ATOMIC_RELEASE);
     }
 }

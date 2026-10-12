@@ -704,6 +704,7 @@ uint32_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack
     task->pid = pid;
     task->start_uptime_ms = time_uptime_ms();
     task->parent_pid = parent_pid;
+    task->pdeath_parent_pid = parent_pid;
     task->parent_exit_signal = 17;
     task->process_group = task->pid;
     task->process_session = task->pid;
@@ -978,6 +979,12 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
     child->parent_exit_signal = flags & CLONE_THREAD ? 0 : flags & CLONE_PARENT
         ? sched_find(sched_task_tgid(parent))->parent_exit_signal : flags & CSIGNAL;
     child->parent_exit_notified = 0;
+    /* Linux copy_process clears pdeath_signal and records real_parent: the
+     * creating thread, or the parent's own real parent for CLONE_PARENT and
+     * CLONE_THREAD children. */
+    child->pdeath_signal = 0;
+    child->pdeath_parent_pid = flags & (CLONE_THREAD | CLONE_PARENT)
+        ? parent->pdeath_parent_pid : parent->pid;
     child->exit_signal = 0;
     child->clear_child_tid = (flags & CLONE_CHILD_CLEARTID) ? child_tid : 0;
     child->robust_list = 0;
@@ -1444,6 +1451,19 @@ void sched_exit(uint32_t pid, uint64_t code)
             }
         }
     }
+    if (exiting && exit_event) {
+        /* Linux forget_original_parent reparents each real-parent child after
+         * arming its parent-death signal, so a later prctl() can never pair a
+         * signal with a parent that has already terminated. */
+        struct task *reaper = sched_find(1);
+        uint32_t reaper_pid = (reaper && reaper != exiting &&
+                               reaper->state != TASK_EXITED) ? 1 : 0;
+        for (uint32_t i = 0; i < task_count; ++i) {
+            if (tasks[i]->pdeath_parent_pid != exit_pid) continue;
+            if (tasks[i]->pdeath_signal) tasks[i]->flags |= TASK_FLAG_PDEATH_NOTIFY;
+            tasks[i]->pdeath_parent_pid = reaper_pid;
+        }
+    }
     if (exiting) {
         /* Detach a dying parent before its task slot can be reused. */
         vfork_parent_exit_locked(exiting);
@@ -1469,6 +1489,12 @@ void sched_exit(uint32_t pid, uint64_t code)
             uint32_t group = task->process_group;
             sched_signal_kernel_group(group, 1);
             sched_signal_kernel_group(group, 18);
+        }
+        if (task && (task->flags & TASK_FLAG_PDEATH_NOTIFY)) {
+            /* Linux group_send_sig_info(pdeath_signal, ..., PIDTYPE_TGID). */
+            task->flags &= ~TASK_FLAG_PDEATH_NOTIFY;
+            if (task->pdeath_signal)
+                sched_signal_user_process(sched_task_tgid(task), (int)task->pdeath_signal);
         }
     }
     if (gpu_owner_quiescent) {
@@ -1610,6 +1636,8 @@ int sched_prepare_exec_current(struct task *task)
         leader->alarm_interval_ns = leader->alarm_last_expiry = 0;
         leader->pid = old_tid;
         task->pid = group;
+        for (uint32_t i = 0; i < task_count; ++i)
+            if (tasks[i]->pdeath_parent_pid == old_tid) tasks[i]->pdeath_parent_pid = group;
         current_pid[scheduler_cpu_index()] = group;
         kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
     }

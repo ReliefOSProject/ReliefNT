@@ -139,12 +139,14 @@ int syscall_ipc_pipe(uint64_t user_ptr);
 int syscall_ipc_pipe2(uint64_t user_ptr, uint64_t flags);
 void task_shm_retain(struct task_file *file);
 void task_shm_release(struct task_file *file);
-int task_shm_attach(struct task_file *file);
+int task_shm_attach(struct task_file *file, uint32_t create_flags);
 int task_shm_truncate(struct task_file *file, uint64_t size);
 int task_shm_read(struct task_file *file, void *buffer, uint32_t length);
 int task_shm_write(struct task_file *file, const void *buffer, uint32_t length);
 int task_shm_map(const struct task_file *file, uint64_t offset, uint64_t length,
-                 uint64_t *physical);
+                 uint32_t prot, uint64_t *physical);
+int64_t task_shm_get_seals(const struct task_file *file);
+int task_shm_add_seals(struct task_file *file, uint32_t seals);
 int syscall_fs_owns(uint64_t number);
 int64_t syscall_fs_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
                             uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5);
