@@ -163,7 +163,7 @@ include $(RELIEFOS_SRC)/mk/resources.mk
 # Source inventories are inputs, never implicit host executable targets.
 .SUFFIXES:
 
-.PHONY: help all kernel kerneldebug boot tools fetch defconfig olddefconfig \
+.PHONY: help all kernel kerneldebug boot tools fetch fetch-check defconfig olddefconfig \
 	menuconfig headers_install install config-sync build-info \
 	test test-tools test-abi test-header-export test-uapi-compat clean distclean
 
@@ -179,6 +179,7 @@ help:
 	  '  test              host-tool tests + ABI layout + header export + UAPI compat' \
 	  '  tools             the host C helpers' \
 	  '  fetch             download the locked dependencies into cache/downloads' \
+	  '  fetch-check       probe the locked URLs for HTTP errors (no downloads)' \
 	  '  defconfig / olddefconfig / menuconfig' \
 	  '  clean / distclean (distclean also removes the configuration)' \
 	  '' \
@@ -198,6 +199,13 @@ all: kernel kerneldebug
 fetch: $(RELIEFOS_DEPS_TOOL)
 	$(Q)sh $(RELIEFOS_SRC)/tools/build/fetch.sh --deps $(RELIEFOS_DEPS_TOOL) \
 		--lock $(RELIEFOS_SRC)/configs/dependencies.lock.json --cache $(RELIEFOS_CACHE) \
+		--only unifont
+
+# URL liveness for exactly the list fetch downloads.  Probes only: nothing is
+# downloaded and the cache is not touched.
+fetch-check: $(RELIEFOS_DEPS_TOOL)
+	$(Q)sh $(RELIEFOS_SRC)/tools/build/fetch-check.sh --deps $(RELIEFOS_DEPS_TOOL) \
+		--lock $(RELIEFOS_SRC)/configs/dependencies.lock.json \
 		--only unifont
 
 defconfig olddefconfig menuconfig: $(RELIEFOS_O_MARKER) $(KCONFIG_CONF) $(KCONFIG_MCONF) | $(O_CONFIG)
