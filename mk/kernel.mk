@@ -9,6 +9,8 @@ KERNEL_LD_SCRIPT := $(RELIEFOS_SRC)/arch/x86_64/linker.ld
 KERNEL_SOURCE_DIRS := kernel/reliefnt drivers/console drivers/bootstrap \
 	drivers/input/mouse drivers/tty/serial drivers/net/e1000 \
 	drivers/sound/ac97 drivers/sound/es1371 drivers/sound/hda \
+	drivers/video/vga drivers/video/framebuffer drivers/video/svga \
+	drivers/usb/uhci firmware \
 	arch mm fs net kernel/exec
 # drivers/bootstrap/storage/*.c are textually included by the storage.c facade
 # and must not also become independent objects.

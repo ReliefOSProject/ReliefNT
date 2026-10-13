@@ -29,7 +29,7 @@ Third-party components in this repository
   font embedding exception; the rest of the upstream distribution is
   GPL-2.0-or-later. See resources/licenses/unifont-LICENSE. At build time the
   glyph data is transformed into the generated cjk_font.h consumed by
-  drivers/bootstrap/framebuffer.c (see mk/resources.mk).
+  drivers/video/framebuffer/framebuffer.c (see mk/resources.mk).
 * zlib 1.3.2 puff (third_party/zlib/contrib/puff/puff.c): zlib License. See
   third_party/zlib/LICENSE. Copyright (C) 2002-2013 Mark Adler.
 * kconfig-frontends 3.12.0.0 (git submodule at third_party/kconfig-frontends):

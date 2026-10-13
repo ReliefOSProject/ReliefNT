@@ -4,7 +4,7 @@
 #include <reliefnt/pci.h>
 #include <reliefnt/port.h>
 #include "framebuffer_fifo.h"
-#include "svga/device.h"
+#include "../svga/device.h"
 #include <generated/cjk_font.h>
 
 /**
