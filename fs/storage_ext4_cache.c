@@ -1,3 +1,4 @@
+#include "../block/storage_internal.h"
 /* ext4 bounded block caches: fixed-capacity, generation-guarded, lazily
  * allocated.  This file only caches and performs bounded device I/O; it does
  * no on-disk format parsing (see storage_internal.h for the entry contract).
@@ -58,7 +59,7 @@ static uint8_t ext4_read_dma[EXT4_READAHEAD_BLOCKS * EXT4_MAX_BLOCK_SIZE]
 /* Translates a filesystem block to partition sectors, refusing anything
  * outside the volume's geometry or partition range before touching the
  * device ("bounded I/O"). */
-static int ext4_cache_block_range(const struct storage_volume *volume, uint64_t block,
+int ext4_cache_block_range(const struct storage_volume *volume, uint64_t block,
                                   uint64_t *out_lba, uint32_t *out_sectors)
 {
     uint32_t block_size;
@@ -433,7 +434,7 @@ void storage_ext4_cache_invalidate(struct storage_volume *volume)
 
 /* Called by the mount path once a cached block's metadata checksums have
  * been verified; the cache itself never parses formats. */
-static void ext4_cache_note_checksum_ok(struct storage_volume *volume, uint64_t block)
+void ext4_cache_note_checksum_ok(struct storage_volume *volume, uint64_t block)
 {
     struct storage_ext4_cache_entry *entry =
         ext4_cache_lookup(&ext4_cache_tables[EXT4_CACHE_TABLE_BLOCK], volume, block);

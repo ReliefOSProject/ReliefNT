@@ -1,3 +1,4 @@
+#include "storage_internal.h"
 struct disk_gpt_table {
     struct gpt_header primary;
     struct gpt_header backup;

@@ -1,9 +1,26 @@
-static void ahci_cpu_relax(void)
+#include "../../../block/storage_internal.h"
+
+/* Driver-private in-flight command slot: shared with the host test fixture
+ * that textually includes this driver, but with no other translation unit. */
+struct ahci_pending_command {
+    struct ahci_hba_port *port;
+    uint64_t lba;
+    uint32_t sector_count;
+    void *buffer;
+    uint64_t start_tick;
+    uint32_t owner_pid;
+    uint8_t write;
+    uint8_t active;
+};
+
+static struct ahci_pending_command ahci_pending_command;
+
+void ahci_cpu_relax(void)
 {
     __asm__ volatile("pause");
 }
 
-static void ahci_memory_barrier(void)
+void ahci_memory_barrier(void)
 {
     /* The command list and table live in normal RAM while PxCI is MMIO.
      * Keep descriptor stores on the visible side of command submission and
@@ -36,7 +53,7 @@ static int ahci_async_fast_poll_command(struct ahci_hba_port *port)
     return -RELIEFOS_EAGAIN;
 }
 
-static int ahci_wait_idle(struct ahci_hba_port *port)
+int ahci_wait_idle(struct ahci_hba_port *port)
 {
     if (storage_async_can_yield() &&
         (port->tfd & (AHCI_PORT_TFD_BSY | AHCI_PORT_TFD_DRQ)) != 0) {
@@ -51,7 +68,7 @@ static int ahci_wait_idle(struct ahci_hba_port *port)
     return -1;
 }
 
-static int ahci_wait_cmd_slot(struct ahci_hba_port *port)
+int ahci_wait_cmd_slot(struct ahci_hba_port *port)
 {
     if (storage_async_can_yield() && (port->ci | port->sact) != 0) {
         for (uint32_t i = 0; i < AHCI_ASYNC_FAST_POLL_SPINS; ++i) {
@@ -71,7 +88,7 @@ static int ahci_wait_cmd_slot(struct ahci_hba_port *port)
     return -5;
 }
 
-static void ahci_pending_clear(void)
+void ahci_pending_clear(void)
 {
     storage_memzero(&ahci_pending_command, sizeof(ahci_pending_command));
 }
@@ -185,7 +202,7 @@ void storage_drain_task_io(uint32_t pid)
     storage_release_task_io(pid);
 }
 
-static int storage_read_failure(int ret)
+int storage_read_failure(int ret)
 {
     if (ret != -RELIEFOS_EAGAIN) {
         console_printf("[storage] read failure ret=%d active_volume=%u\n",
@@ -216,7 +233,7 @@ static void ahci_start_port(struct ahci_hba_port *port)
     port->cmd |= AHCI_PORT_CMD_ST;
 }
 
-static int ahci_setup_port(struct ahci_hba_port *port)
+int ahci_setup_port(struct ahci_hba_port *port)
 {
     if (ahci_stop_port(port) < 0) {
         return -5;
@@ -400,7 +417,7 @@ static int ahci_read_atapi_blocks(struct ahci_hba_port *port, uint64_t lba,
     return ahci_pending_poll();
 }
 
-static int ahci_read_atapi_blocks_retry(struct ahci_hba_port *port, uint64_t lba,
+int ahci_read_atapi_blocks_retry(struct ahci_hba_port *port, uint64_t lba,
                                         uint32_t block_count, void *buffer)
 {
     int ret = -5;
@@ -487,7 +504,7 @@ static int ahci_write_lba(struct ahci_hba_port *port, uint64_t lba, uint32_t sec
     return ahci_pending_poll();
 }
 
-static int ahci_flush_cache(struct ahci_hba_port *port)
+int ahci_flush_cache(struct ahci_hba_port *port)
 {
     if (!port) return -19;
     if (ahci_pending_command.active) {
@@ -517,7 +534,7 @@ static int ahci_flush_cache(struct ahci_hba_port *port)
     return ahci_pending_poll();
 }
 
-static int ahci_read_lba_retry(struct ahci_hba_port *port, uint64_t lba,
+int ahci_read_lba_retry(struct ahci_hba_port *port, uint64_t lba,
                                uint32_t sector_count, void *buffer)
 {
     int ret = -5;
@@ -536,7 +553,7 @@ static int ahci_read_lba_retry(struct ahci_hba_port *port, uint64_t lba,
     return ret;
 }
 
-static int ahci_write_lba_retry(struct ahci_hba_port *port, uint64_t lba,
+int ahci_write_lba_retry(struct ahci_hba_port *port, uint64_t lba,
                                 uint32_t sector_count, const void *buffer)
 {
     int ret = -5;

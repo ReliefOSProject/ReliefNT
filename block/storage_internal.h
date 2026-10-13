@@ -972,21 +972,12 @@ int storage_ext4_free_inode(struct storage_volume *volume, uint64_t ino,
 
 struct nvme_controller;
 
-static const uint8_t esp_guid[16] = {
-    0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11,
-    0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b,
-};
-
-static const uint8_t linux_filesystem_guid[16] = {
-    0xaf, 0x3d, 0xc6, 0x0f, 0x83, 0x84, 0x72, 0x47,
-    0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4,
-};
-
-/* Microsoft Basic Data GUID in GPT's little-endian on-disk byte order. */
-static const uint8_t basic_data_guid[16] = {
-    0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44,
-    0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7,
-};
+/* GPT partition-type GUIDs in little-endian on-disk byte order; defined once
+ * by block/storage_state_data.c. */
+extern const uint8_t esp_guid[16];
+extern const uint8_t linux_filesystem_guid[16];
+/* Microsoft Basic Data GUID. */
+extern const uint8_t basic_data_guid[16];
 
 struct storage_volume {
     bool ready;
@@ -1093,22 +1084,205 @@ struct storage_volume {
 #define ext2_start_lba ext_start_lba
 #define ext2_sector_count ext_sector_count
 
-/* Host tests compile the ext4 storage fragments as standalone translation
- * units (task 5 links storage_ext4_{format,checksum,cache,alloc}.c without
- * the storage.c facade) and provide their own storage_read_device /
- * storage_write_device / storage_memzero / storage_memcpy.  The facade
- * defines these four helpers as static in earlier fragments, so plain
- * prototypes here would break that TU ("static declaration follows
- * non-static declaration"); standalone builds opt in with
- * -DRELIEFOS_STORAGE_STANDALONE_TU to get the prototypes. */
-#ifdef RELIEFOS_STORAGE_STANDALONE_TU
+
+struct fat32_dir_ref {
+    uint32_t entry_cluster;
+    uint32_t entry_offset;
+    struct fat32_dirent dirent;
+};
+
+struct fat32_dir_span {
+    uint32_t entry_cluster;
+    uint32_t entry_offset;
+};
+
+struct storage_inode_ref {
+    struct storage_inode_ref *next;
+    struct storage_node node;
+    uint64_t references;
+    bool unlinked;
+};
+
+/* ---- cross-module internal interface ------------------------------------
+ * Decoupled from the former storage.c unity translation unit: each member
+ * compiles as its own translation unit and links against these.  The block
+ * core, the filesystem families and the controller drivers keep their state
+ * private and meet only here (plus the driver-private headers). */
+/* Tags named by the prototypes below must already be visible at file scope:
+ * a struct tag first named in a parameter list has prototype scope only and
+ * would be a type distinct from the real definitions. */
+struct ide_device_info; /* drivers/storage/ide/storage_ide.h */
+struct install_disk_state; /* full definition below */
+struct nvme_controller; /* drivers/storage/nvme/storage_nvme.h */
+struct reliefos_dir_entry; /* include/uapi/reliefos/fs_abi.h */
+/* Public block-device interface (block/): sector I/O, disks, volumes. */
+bool storage_async_can_yield(void); /* block/storage_state.c */
+bool storage_mount_path_matches(const char *path, const char *mount_path); /* block/storage_state.c */
+const char *storage_transport_name(uint8_t transport); /* block/storage_block.c */
+int gpt_find_esp(void); /* block/storage_block.c */
+int storage_devlink_next(uint64_t *cursor, char uuid[37], char target[48]); /* block/storage_devlinks.c */
+int storage_devlink_target(const char *path, char target[48]); /* block/storage_devlinks.c */
+int install_clear_sectors(struct install_disk_state *disk, uint64_t lba, uint64_t sector_count); /* block/storage_installer.c */
+int install_format_exfat(struct install_disk_state *disk, uint64_t start_lba, uint64_t sector_count); /* block/storage_installer.c */
+int install_format_ext2(struct install_disk_state *disk, uint64_t start_lba, uint64_t sector_count); /* block/storage_installer.c */
+int install_format_ext4(struct install_disk_state *disk, uint64_t start_lba, uint64_t sector_count); /* block/storage_installer.c */
+int install_format_fat32(struct install_disk_state *disk, uint64_t start_lba, uint64_t sector_count); /* block/storage_installer.c */
+int install_read_sectors(struct install_disk_state *disk, uint64_t lba, uint32_t sector_count, void *buffer); /* block/storage_installer.c */
+int install_write_gpt(struct install_disk_state *disk, uint64_t sector_count, uint64_t *out_esp_lba, uint64_t *out_esp_sectors, uint64_t *out_root_lba, uint64_t *out_root_sectors); /* block/storage_installer.c */
+int install_write_sectors(struct install_disk_state *disk, uint64_t lba, uint32_t sector_count, const void *buffer); /* block/storage_installer.c */
+int storage_acquire_task_io(void); /* block/storage_state.c */
+int storage_backend_path(const char *path, char *backend_path, uint32_t backend_capacity); /* block/storage_state.c */
+int storage_dir_index_lookup(uint32_t directory_cluster, const char *name, struct storage_node *out); /* block/storage_state.c */
+int storage_flush_volume(const struct storage_volume *volume); /* block/storage_sync.c */
+int storage_guid_valid(const uint8_t guid[16]); /* block/storage_state.c */
+int storage_is_acl_metadata_name(const char *name); /* block/storage_state.c */
+int storage_memcmp(const void *a, const void *b, size_t len); /* block/storage_state.c */
+int storage_parent_path(const char *path, char *parent, uint32_t parent_cap, char *name, uint32_t name_cap); /* block/storage_state.c */
+int storage_path_cache_lookup(const char *path, struct storage_node *out); /* block/storage_state.c */
+int storage_prepare_install_disk(struct install_disk_state *disk); /* block/storage_block.c */
+int storage_read_install_disk(const struct install_disk_state *disk, uint64_t lba, uint32_t sector_count, void *buffer); /* block/storage_block.c */
+int storage_read_iso_blocks(uint64_t lba, uint32_t block_count, void *buffer); /* block/storage_block.c */
+int storage_read_sectors(uint64_t lba, uint32_t sector_count, void *buffer); /* block/storage_block.c */
+int storage_route_path(const char *path, struct storage_volume **out_volume, char *backend_path, uint32_t backend_capacity); /* block/storage_state.c */
+int storage_select_node_volume(const struct storage_node *node, struct storage_volume **old_volume); /* block/storage_state.c */
+int storage_select_volume(uint32_t volume_id); /* block/storage_state.c */
+int storage_text_eq(const char *a, const char *b); /* block/storage_state.c */
+int storage_text_eq_ci(const char *a, const char *b); /* block/storage_state.c */
+int storage_write_install_disk(const struct install_disk_state *disk, uint64_t lba, uint32_t sector_count, const void *buffer); /* block/storage_block.c */
+int storage_write_sectors(uint64_t lba, uint32_t sector_count, const void *buffer); /* block/storage_block.c */
+size_t storage_strlen(const char *s); /* block/storage_state.c */
+uint32_t min_u32(uint32_t a, uint32_t b); /* block/storage_state.c */
+uint32_t storage_crc32(const void *data, uint32_t len); /* block/storage_installer.c */
+uint64_t cluster_to_lba(uint32_t cluster); /* block/storage_state.c */
+uint64_t fat_sector_for_cluster(uint32_t cluster); /* block/storage_state.c */
+uint64_t min_u64(uint64_t a, uint64_t b); /* block/storage_state.c */
+uint64_t storage_volume_device_number(const struct storage_volume *volume); /* block/storage_state.c */
+void storage_begin_mutation(void); /* block/storage_state.c */
+void storage_cache_invalidate(void); /* block/storage_state.c */
+void storage_copy_text(char *dst, uint32_t cap, const char *src); /* block/storage_state.c */
+void storage_dir_index_store(uint32_t directory_cluster, const char *name, const struct storage_node *node); /* block/storage_state.c */
+void storage_disk_ide_device(const struct install_disk_state *disk, struct ide_device_info *device); /* block/storage_block.c */
+void storage_format_guid(const uint8_t guid[16], char *out, uint32_t cap); /* block/storage_state.c */
+void storage_make_guid(uint8_t guid[16], uint64_t tag, const struct install_disk_state *disk, uint64_t sector_count); /* block/storage_state.c */
+void storage_partition_guid_text(const uint8_t guid[16], char uuid[37]); /* block/storage_state.c */
+void storage_path_cache_store(const char *path, const struct storage_node *node); /* block/storage_state.c */
+void storage_restore_volume(struct storage_volume *old_volume); /* block/storage_state.c */
+void storage_sector_cache_invalidate(void); /* block/storage_state.c */
+void storage_volume_from_install_disk(struct storage_volume *volume, const struct install_disk_state *disk); /* block/storage_block.c */
+void storage_volume_ide_device(const struct storage_volume *volume, struct ide_device_info *device); /* block/storage_block.c */
+/* Filesystem interface (fs/): nodes, directories, paths, formats. */
+bool storage_inode_volume_busy(uint32_t volume); /* fs/storage_inode.c */
+int ed_stop(struct storage_ext4_handle *h,int ret); /* fs/storage_ext4_dir.c */
+int exfat_bitmap_get_cached(uint32_t cluster, uint8_t *allocated); /* fs/storage_exfat.c */
+int exfat_iter_dir_entry(uint32_t directory_cluster, uint8_t nofat, uint64_t wanted, struct reliefos_dir_entry *out); /* fs/storage_exfat.c */
+int exfat_lookup_path(const char *path, struct storage_node *out); /* fs/storage_exfat.c */
+int exfat_mkdir(const char *path); /* fs/storage_exfat.c */
+int exfat_read_node(const struct storage_node *node, uint64_t offset, void *buffer, uint32_t len, uint32_t *out_read); /* fs/storage_exfat.c */
+int exfat_rename(const char *old_path, const char *new_path); /* fs/storage_exfat.c */
+int exfat_rmdir(const char *path); /* fs/storage_exfat.c */
+int exfat_truncate_file(const char *path, uint64_t length); /* fs/storage_exfat.c */
+int exfat_unlink(const char *path); /* fs/storage_exfat.c */
+int exfat_write_file(const char *path, const void *buffer, uint32_t len); /* fs/storage_exfat.c */
+int exfat_write_node_path(const char *path, uint64_t offset, const void *buffer, uint32_t len, uint32_t *out_written); /* fs/storage_exfat.c */
+int ext2_cache_read(uint64_t lba, uint32_t sectors, void *buffer); /* fs/storage_ext2_cache.c */
+int ext4_cache_block_range(const struct storage_volume *volume, uint64_t block, uint64_t *out_lba, uint32_t *out_sectors); /* fs/storage_ext4_cache.c */
+int fat32_collect_chain(uint32_t first_cluster, uint32_t chain[FAT32_MAX_FILE_CLUSTERS], uint32_t *out_count); /* fs/storage_fat32.c */
+int fat32_create_dirent(uint32_t parent_cluster, const char *name, uint8_t attr, uint32_t first_cluster, uint32_t size); /* fs/storage_fat32.c */
+int fat32_delete_acl_metadata_file(uint32_t dir_cluster); /* fs/storage_fat32.c */
+int fat32_delete_dirent(uint32_t dir_cluster, const char *name, struct fat32_dirent *deleted); /* fs/storage_fat32.c */
+int fat32_dir_is_empty(uint32_t dir_cluster); /* fs/storage_fat32.c */
+int fat32_find_dirent_ref_in_dir(uint32_t dir_cluster, const char *name, struct fat32_dir_ref *out); /* fs/storage_fat32.c */
+int fat32_find_free_cluster(uint32_t *out_cluster); /* fs/storage_fat32.c */
+int fat32_find_free_dirent_span(uint32_t dir_cluster, uint32_t slots, struct fat32_dir_span *out); /* fs/storage_fat32.c */
+int fat32_find_in_dir(uint32_t dir_cluster, const char *name, struct storage_node *out); /* fs/storage_fat32.c */
+int fat32_free_chain(uint32_t first_cluster); /* fs/storage_fat32.c */
+int fat32_iter_dir_entry(uint32_t dir_cluster, uint64_t index, struct reliefos_dir_entry *entry); /* fs/storage_fat32.c */
+int fat32_make_short_alias(uint32_t dir_cluster, const char *name, uint8_t out[11]); /* fs/storage_fat32.c */
+int fat32_make_short_name(const char *name, uint8_t out[11]); /* fs/storage_fat32.c */
+int fat32_note_allocated(void); /* fs/storage_fat32.c */
+int fat32_note_freed(void); /* fs/storage_fat32.c */
+int fat32_read_cluster(uint32_t cluster, void *buffer); /* fs/storage_fat32.c */
+int fat32_read_fat_entry(uint32_t cluster, uint32_t *out_next); /* fs/storage_fat32.c */
+int fat32_update_dirent(const struct fat32_dir_ref *ref); /* fs/storage_fat32.c */
+int fat32_validate_name(const char *name); /* fs/storage_fat32.c */
+int fat32_write_cluster(uint32_t cluster, const void *buffer); /* fs/storage_fat32.c */
+int fat32_write_fat_entry(uint32_t cluster, uint32_t value); /* fs/storage_fat32.c */
+int iso9660_find_in_dir(uint32_t extent, uint32_t size, const char *name, struct storage_node *out); /* fs/storage_iso.c */
+int iso9660_iter_dir_entry(uint32_t extent, uint32_t size, uint64_t index, struct reliefos_dir_entry *entry); /* fs/storage_iso.c */
+int iso9660_mount(void); /* fs/storage_iso.c */
+int storage_audio_control_node(const char *name, struct storage_node *out); /* kernel/reliefnt/audio/storage_audio.c */
+int storage_audio_pcm_node(const char *name, struct storage_node *out); /* kernel/reliefnt/audio/storage_audio.c */
+int storage_audio_snd_readdir(uint64_t *cursor, struct reliefos_dir_entry *entry); /* kernel/reliefnt/audio/storage_audio.c */
+int storage_audio_timer_node(const char *name, struct storage_node *out); /* kernel/reliefnt/audio/storage_audio.c */
+int storage_install_identify(struct install_disk_state *disk, uint64_t *out_sectors); /* fs/storage_fat32.c */
+int storage_read_cache_fill(uint32_t first_cluster, uint32_t clusters); /* fs/storage_fat32.c */
+int storage_read_cache_lookup(uint32_t cluster, uint32_t *out_offset, uint32_t *out_clusters); /* fs/storage_fat32.c */
+int storage_read_contiguous_clusters(uint32_t first_cluster, uint32_t max_clusters, uint32_t *out_clusters, uint32_t *out_next); /* fs/storage_fat32.c */
+int storage_set_data_mount_path(struct storage_volume *volume, uint32_t disk_id, uint32_t partition_index); /* fs/storage_mount.c */
+uint32_t ext4_base_meta_blocks(const struct storage_volume *volume, uint64_t group); /* fs/storage_ext4_alloc.c */
+uint32_t fat32_lfn_entry_count(const char *name); /* fs/storage_fat32.c */
+uint32_t fat32_utf16_name(const char *name, uint16_t *utf16, uint32_t cap); /* fs/storage_fat32.c */
+uint8_t fat32_short_name_checksum(const uint8_t short_name[11]); /* fs/storage_fat32.c */
+void ev_node(struct storage_volume *v,uint64_t ino,const struct ext4_inode_view *in,struct storage_node *out); /* fs/storage_ext4_vfs.c */
+void exfat_put_u16(uint8_t *p, uint16_t value); /* fs/storage_exfat.c */
+void exfat_put_u64(uint8_t *p, uint64_t value); /* fs/storage_exfat.c */
+void ext2_cache_invalidate_range(uint64_t lba, uint32_t sectors); /* fs/storage_ext2_cache.c */
+void ext2_cache_reset(struct storage_volume *volume); /* fs/storage_ext2_cache.c */
+void ext2_cache_store(uint64_t lba, uint32_t sectors, const void *buffer); /* fs/storage_ext2_cache.c */
+void ext4_cache_note_checksum_ok(struct storage_volume *volume, uint64_t block); /* fs/storage_ext4_cache.c */
+void fat32_fill_lfn_entry(struct fat32_lfn *lfn, const uint16_t *name, uint32_t name_len, uint32_t part_index, uint32_t part_count, uint8_t checksum); /* fs/storage_fat32.c */
+void storage_format_u32(char *out, uint32_t cap, const char *prefix, uint32_t value, int partition); /* fs/storage_vfs.c */
+int ext2_mount(void); /* fs/storage_ext2.c */
+int ext2_group_desc(uint32_t group, struct ext2_group_desc *out); /* fs/storage_ext2.c */
+int ext2_read_inode(uint32_t number, struct ext2_inode *out); /* fs/storage_ext2.c */
+int ext2_write_node(const struct storage_node *node, uint64_t offset, const void *buffer,
+                    uint32_t length, uint32_t *written); /* fs/storage_ext2.c */
+int ext2_truncate_file(const struct storage_node *node, uint64_t length); /* fs/storage_ext2.c */
+int ext2_destroy_inode(uint32_t inode_no, uint8_t directory); /* fs/storage_ext2.c */
+uint8_t ed_type(uint16_t mode); /* fs/storage_ext4_dir.c */
+extern const unsigned char exfat_standard_upcase[]; /* fs/storage_exfat_upcase.inc */
+extern const unsigned int exfat_standard_upcase_len; /* fs/storage_exfat_upcase.inc */
+int fat32_mount(void); /* fs/storage_fat32.c */
+int exfat_mount(void); /* fs/storage_exfat.c */
+void exfat_cache_invalidate(void); /* fs/storage_exfat.c */
+/* Defined by fs/storage_mount.c; NVMe's namespace enumerator calls this to give
+ * root selection identical behavior to AHCI and IDE disks. */
+int storage_try_mount_root_disk(struct install_disk_state *disk); /* fs/storage_mount.c */
+struct storage_inode_ref *storage_inode_find(uint32_t volume, uint32_t inode); /* fs/storage_inode.c */
+/* Controller driver interface (drivers/storage/). */
+int ahci_flush_cache(struct ahci_hba_port *port); /* drivers/storage/ahci/storage_ahci.c */
+int ahci_read_atapi_blocks_retry(struct ahci_hba_port *port, uint64_t lba, uint32_t block_count, void *buffer); /* drivers/storage/ahci/storage_ahci.c */
+int ahci_read_lba_retry(struct ahci_hba_port *port, uint64_t lba, uint32_t sector_count, void *buffer); /* drivers/storage/ahci/storage_ahci.c */
+int ahci_setup_port(struct ahci_hba_port *port); /* drivers/storage/ahci/storage_ahci.c */
+int ahci_wait_cmd_slot(struct ahci_hba_port *port); /* drivers/storage/ahci/storage_ahci.c */
+int ahci_wait_idle(struct ahci_hba_port *port); /* drivers/storage/ahci/storage_ahci.c */
+int ahci_write_lba_retry(struct ahci_hba_port *port, uint64_t lba, uint32_t sector_count, const void *buffer); /* drivers/storage/ahci/storage_ahci.c */
+int ide_atapi_read_blocks(const struct ide_device_info *device, uint64_t lba, uint32_t blocks, void *buffer); /* drivers/storage/ide/storage_ide.c */
+int ide_flush_cache(const struct ide_device_info *device); /* drivers/storage/ide/storage_ide.c */
+int ide_identify_device(struct ide_device_info *device); /* drivers/storage/ide/storage_ide.c */
+int ide_pio_transfer(const struct ide_device_info *device, uint64_t lba, uint32_t sectors, void *buffer, uint8_t write); /* drivers/storage/ide/storage_ide.c */
+int nvme_flush_cache(struct nvme_controller *controller, uint32_t nsid); /* drivers/storage/nvme/storage_nvme.c */
+int nvme_readwrite(struct nvme_controller *controller, uint32_t nsid, uint64_t lba, uint32_t sector_count, void *buffer, uint8_t write); /* drivers/storage/nvme/storage_nvme.c */
+int storage_read_failure(int ret); /* drivers/storage/ahci/storage_ahci.c */
+uint32_t fat_offset_for_cluster(uint32_t cluster); /* drivers/storage/ide/storage_ide.c */
+void ahci_cpu_relax(void); /* drivers/storage/ahci/storage_ahci.c */
+void ahci_memory_barrier(void); /* drivers/storage/ahci/storage_ahci.c */
+void ahci_pending_clear(void); /* drivers/storage/ahci/storage_ahci.c */
+void ide_fill_device(struct ide_device_info *device, uint8_t channel, uint8_t drive, uint16_t command, uint16_t control); /* drivers/storage/ide/storage_ide.c */
+void nvme_reset_all_controllers(void); /* drivers/storage/nvme/storage_nvme.c */
+void storage_scan_nvme_controller(uint8_t bus, uint8_t slot, uint8_t function, uint8_t *root_ready); /* drivers/storage/nvme/storage_nvme.c */
+
+/* Shared primitives owned by the block core: freestanding mem* plus the
+ * sector I/O pair every family funnels through.  Host tests may compile the
+ * ext4 fragments as standalone translation units and supply their own
+ * storage_read_device / storage_write_device / storage_memzero /
+ * storage_memcpy definitions to fake a disk image. */
 void storage_memzero(void *dst, size_t len);
 void storage_memcpy(void *dst, const void *src, size_t len);
 int storage_read_device(const struct storage_volume *volume, uint64_t lba,
                         uint32_t sector_count, void *buffer);
 int storage_write_device(const struct storage_volume *volume, uint64_t lba,
                          uint32_t sector_count, const void *buffer);
-#endif
 
 struct install_disk_state {
     bool present;
@@ -1141,8 +1315,11 @@ int storage_disk_device_name(uint32_t disk_id, int32_t partition_index,
 int storage_parse_block_name(const char *name, uint32_t *disk_id,
                              int32_t *partition_index);
 
-static struct storage_volume g_volumes[STORAGE_MAX_VOLUMES];
-static struct storage_volume *g_active_volume = &g_volumes[0];
+/* Shared storage state: declared here, defined exactly once by
+ * block/storage_state_data.c.  These used to live as statics in this header,
+ * which only behaved while every storage module shared one translation unit. */
+extern struct storage_volume g_volumes[STORAGE_MAX_VOLUMES];
+extern struct storage_volume *g_active_volume;
 #define g_storage (*g_active_volume)
 
 /*
@@ -1152,63 +1329,45 @@ static struct storage_volume *g_active_volume = &g_volumes[0];
  * directory update twice.  Keep that small critical tail synchronous; normal
  * application loads, path walks and compiler header reads remain preemptible.
  */
-static bool storage_io_async_context;
-static bool storage_io_write_started;
+extern bool storage_io_async_context;
+extern bool storage_io_write_started;
 /* The AHCI command table, DMA staging areas and FAT32 caches are shared
  * globally.  A syscall that yielded for disk completion therefore owns the
  * storage state until its instruction is retried and completes. */
-static uint32_t storage_task_io_owner;
+extern uint32_t storage_task_io_owner;
 
-static struct install_disk_state g_install_disks[STORAGE_MAX_INSTALL_DISKS];
-static uint32_t g_install_disk_count;
-static uint8_t g_devfs_enabled = 1;
-static uint8_t g_installer_root_active;
+extern struct install_disk_state g_install_disks[STORAGE_MAX_INSTALL_DISKS];
+extern uint32_t g_install_disk_count;
+extern uint8_t g_devfs_enabled;
+extern uint8_t g_installer_root_active;
 
 /* AHCI uses shared command RAM and IDE PIO owns channel registers while an
  * operation is in flight.  NVMe has a queue per controller, but it shares a
  * staging page with the transport.  Serialize these synchronous operations
  * without disabling interrupts, so SMP callers cannot corrupt a command. */
-static struct kernel_spinlock storage_transport_lock = KERNEL_SPINLOCK_INIT;
+extern struct kernel_spinlock storage_transport_lock;
 
-static uint8_t ahci_received_fis[256] __attribute__((aligned(256)));
-static uint8_t ahci_cmd_table_buf[256] __attribute__((aligned(128)));
-static struct ahci_cmd_header ahci_cmd_headers[32] __attribute__((aligned(1024)));
-static uint8_t storage_scratch[STORAGE_SCRATCH_SECTORS * SECTOR_SIZE] __attribute__((aligned(4096)));
-static uint8_t storage_cluster_buf[64 * SECTOR_SIZE] __attribute__((aligned(4096)));
+extern uint8_t ahci_received_fis[256] __attribute__((aligned(256)));
+extern uint8_t ahci_cmd_table_buf[256] __attribute__((aligned(128)));
+extern struct ahci_cmd_header ahci_cmd_headers[32] __attribute__((aligned(1024)));
+extern uint8_t storage_scratch[STORAGE_SCRATCH_SECTORS * SECTOR_SIZE] __attribute__((aligned(4096)));
+extern uint8_t storage_cluster_buf[64 * SECTOR_SIZE] __attribute__((aligned(4096)));
 
 /* The public /dev block namespace is rebuilt whenever storage is probed. */
 void storage_disk_block_cache_reset(void);
-static uint8_t storage_fat_cache_data[STORAGE_FAT_CACHE_SECTORS * SECTOR_SIZE]
+extern uint8_t storage_fat_cache_data[STORAGE_FAT_CACHE_SECTORS * SECTOR_SIZE]
     __attribute__((aligned(4096)));
-static uint8_t storage_read_cache_data[STORAGE_READAHEAD_SECTORS * SECTOR_SIZE]
+extern uint8_t storage_read_cache_data[STORAGE_READAHEAD_SECTORS * SECTOR_SIZE]
     __attribute__((aligned(4096)));
 /* Directory lookups are much more frequent than file-data reads during a
  * compiler build. Keep a separate cluster cache so opening the next header
  * does not evict the directory that is being scanned from the data cache. */
-static uint8_t storage_dir_lookup_cache_data[64 * SECTOR_SIZE]
+extern uint8_t storage_dir_lookup_cache_data[64 * SECTOR_SIZE]
     __attribute__((aligned(4096)));
-static uint32_t storage_old_chain[FAT32_MAX_FILE_CLUSTERS];
-static uint32_t storage_new_chain[FAT32_MAX_FILE_CLUSTERS];
+extern uint32_t storage_old_chain[FAT32_MAX_FILE_CLUSTERS];
+extern uint32_t storage_new_chain[FAT32_MAX_FILE_CLUSTERS];
 
-struct ahci_pending_command {
-    struct ahci_hba_port *port;
-    uint64_t lba;
-    uint32_t sector_count;
-    void *buffer;
-    uint64_t start_tick;
-    uint32_t owner_pid;
-    uint8_t write;
-    uint8_t active;
-};
-
-static struct ahci_pending_command ahci_pending_command;
-
-/* Defined by storage_mount.c after transport discovery helpers.  NVMe's
- * namespace enumerator calls this to give root selection identical behavior
- * to AHCI and IDE disks. */
-static int storage_try_mount_root_disk(struct install_disk_state *disk);
-
-/* Implemented by storage_disk.c, which is included after this module. */
+/* Implemented by storage_disk.c. */
 int storage_disk_block_info(uint32_t disk_id, int32_t partition_index,
                             uint64_t *out_first_lba, uint64_t *out_sector_count);
 
@@ -1240,13 +1399,13 @@ struct storage_dir_index_entry {
     uint8_t valid;
 };
 
-static struct storage_sector_cache storage_fat_cache;
-static struct storage_sector_cache storage_read_cache;
-static struct storage_cluster_cache storage_dir_lookup_cache;
-static struct storage_path_cache_entry storage_path_cache[STORAGE_PATH_CACHE_ENTRIES];
-static uint32_t storage_path_cache_next;
-static struct storage_dir_index_entry storage_dir_index[STORAGE_DIR_INDEX_ENTRIES];
-static uint32_t storage_dir_index_next;
+extern struct storage_sector_cache storage_fat_cache;
+extern struct storage_sector_cache storage_read_cache;
+extern struct storage_cluster_cache storage_dir_lookup_cache;
+extern struct storage_path_cache_entry storage_path_cache[STORAGE_PATH_CACHE_ENTRIES];
+extern uint32_t storage_path_cache_next;
+extern struct storage_dir_index_entry storage_dir_index[STORAGE_DIR_INDEX_ENTRIES];
+extern uint32_t storage_dir_index_next;
 
 /* Keep the last file chain tail available for repeated append writes. The
  * scheduler limits each syscall to a small payload, so without this hint a
@@ -1261,7 +1420,7 @@ struct storage_write_chain_cache {
     uint8_t valid;
 };
 
-static struct storage_write_chain_cache storage_write_chain_cache;
+extern struct storage_write_chain_cache storage_write_chain_cache;
 
 /* Directory reads are issued one entry at a time. Cache the current cluster
  * and decoded entry ordinal so sequential readdir never restarts at root. */
@@ -1274,17 +1433,20 @@ struct storage_dir_iter_cache {
     uint8_t valid;
 };
 
-static struct storage_dir_iter_cache storage_dir_iter_cache;
+extern struct storage_dir_iter_cache storage_dir_iter_cache;
 
-static int fat32_mount(void);
-static int exfat_mount(void);
-static void exfat_cache_invalidate(void);
-static void storage_put_u32(uint8_t *p, uint32_t value);
-
-static uint32_t storage_get_u32(const uint8_t *p)
+static inline uint32_t storage_get_u32(const uint8_t *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static inline void storage_put_u32(uint8_t *p, uint32_t value)
+{
+    p[0] = (uint8_t)value;
+    p[1] = (uint8_t)(value >> 8);
+    p[2] = (uint8_t)(value >> 16);
+    p[3] = (uint8_t)(value >> 24);
 }
 
 #endif /* RELIEFNT_STORAGE_INTERNAL_H */

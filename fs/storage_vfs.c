@@ -1,3 +1,4 @@
+#include "../block/storage_internal.h"
 bool storage_ready(void)
 {
     return g_volumes[0].ready;
@@ -74,7 +75,7 @@ static const struct storage_dev_entry *storage_dev_find(const char *name,
     return NULL;
 }
 
-static void storage_format_u32(char *out, uint32_t cap, const char *prefix,
+void storage_format_u32(char *out, uint32_t cap, const char *prefix,
                                uint32_t value, int partition)
 {
     char digits[11];
@@ -237,8 +238,6 @@ int storage_resolve_path(const char *cwd, const char *input, char *out, uint32_t
     }
     return 0;
 }
-
-#include "../block/storage_devlinks.c"
 
 static int storage_lookup_path_unlocked(const char *path, struct storage_node *out)
 {

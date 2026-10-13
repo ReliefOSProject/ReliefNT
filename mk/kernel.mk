@@ -6,17 +6,17 @@
 KERNEL_LD_SCRIPT := $(RELIEFOS_SRC)/arch/x86_64/linker.ld
 # All device drivers are linked into kernel.sys itself; there are no separate
 # loadable .drv modules anymore.
-KERNEL_SOURCE_DIRS := kernel/reliefnt drivers/console drivers/bootstrap \
+KERNEL_SOURCE_DIRS := kernel/reliefnt drivers/console \
 	drivers/input/mouse drivers/tty/serial drivers/net/e1000 \
 	drivers/sound/ac97 drivers/sound/es1371 drivers/sound/hda \
 	drivers/video/vga drivers/video/framebuffer drivers/video/svga \
 	drivers/usb/uhci drivers/storage/ide drivers/storage/ahci \
 	drivers/storage/nvme firmware block \
 	arch mm fs net kernel/exec
-# The storage_*.c modules are textually included by the storage.c facade and
-# must not also become independent objects: they share one translation unit
-# wherever they live (block/, fs/, drivers/storage/, kernel/reliefnt/audio/).
-# "storage.c" itself is the facade and must keep compiling as that single unit.
+# The storage_*.c modules are ordinary translation units linked into the
+# kernel; they meet only through block/storage_internal.h (and the
+# driver-private headers) wherever they live (block/, fs/, drivers/storage/,
+# kernel/reliefnt/audio/).
 
 KERNEL_SOURCES_LIST := $(O_OBJ)/kernel/sources.list
 KERNEL_SOURCES_MK := $(O_OBJ)/kernel/sources.mk
@@ -68,7 +68,7 @@ $(if $(RELIEFOS_PASSIVE),,$(eval $(call RELIEFOS_SIGNATURE_RULE,kernel-link)))
 # it: a fresh output directory builds host tools on demand.
 $(KERNEL_SOURCES_LIST): FORCE $(RELIEFOS_EMIT)
 	$(Q)mkdir -p $(dir $@)
-	$(Q)find $(KERNEL_SOURCE_DIRS) -name 'storage_*.c' -prune -o \
+	$(Q)find $(KERNEL_SOURCE_DIRS) \
 	    -type f \( -name '*.c' -o -name '*.S' \) -print \
 	  | LC_ALL=C sort > $@.tmp
 	$(Q)$(RELIEFOS_EMIT) --input $@.tmp --output $@
@@ -109,9 +109,8 @@ $(RELIEFOS_SRC)/kernel/reliefnt/include/reliefnt/boot_splash.h:
 RELIEFOS_KERNEL_OBJS := $(RELIEFOS_KERNEL_CC_OBJS) $(RELIEFOS_KERNEL_AS_OBJS)
 
 # --- compilation ------------------------------------------------------------
-# One generated header per object, not one per build: the storage facade and the
-# two special dependencies below keep the graph honest without making every
-# object wait for every asset.
+# One generated header per object, not one per build: the special dependencies
+# below keep the graph honest without making every object wait for every asset.
 $(O_OBJ)/kernel/%.c.o: $(RELIEFOS_SRC)/%.c $(AUTOCONF_H) $(O_META)/kernel-cc.sig
 	$(Q)mkdir -p $(dir $@)
 	$(call RELIEFOS_LOG,CC,$<)
@@ -125,17 +124,6 @@ $(O_OBJ)/kernel/%.S.o: $(RELIEFOS_SRC)/%.S $(O_META)/kernel-as.sig
 # Extra prerequisites for the objects that consume generated headers. Depfiles
 # take over from the second build onward; these make the first build correct.
 $(O_OBJ)/kernel/kernel/reliefnt/version.c.o: $(BUILD_INFO_HEADER)
-
-# The storage facade textually includes its private modules wherever they
-# live: the block core under block/, the fs families under fs/, the
-# controller drivers under drivers/storage/ and the audio namespace glue.
-$(O_OBJ)/kernel/drivers/bootstrap/storage.c.o: \
-	$(wildcard $(RELIEFOS_SRC)/block/storage_*.c) \
-	$(wildcard $(RELIEFOS_SRC)/fs/storage_*.c) \
-	$(wildcard $(RELIEFOS_SRC)/fs/storage_*.inc) \
-	$(wildcard $(RELIEFOS_SRC)/drivers/storage/*/storage_*.c) \
-	$(RELIEFOS_SRC)/kernel/reliefnt/audio/storage_audio.c \
-	$(RELIEFOS_SRC)/block/storage_internal.h
 
 # --- generated inputs -------------------------------------------------------
 $(BUILD_INFO_HEADER): $(RELIEFOS_SRC)/configs/build-version $(RELIEFOS_VERSION_TOOL) $(O_META)/version.sig \

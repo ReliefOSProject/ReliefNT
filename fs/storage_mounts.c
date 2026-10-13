@@ -1,3 +1,4 @@
+#include "../block/storage_internal.h"
 /* Read-only mount listing for /proc/mounts and /etc/mtab. */
 int storage_node_mount_flags(const struct storage_node *node, uint64_t *mount_flags)
 {

@@ -1,3 +1,4 @@
+#include "storage_internal.h"
 /* GPT identities exposed as ordinary devfs symlinks. All callers hold the
  * execution/storage lock; the GPT range cache is invalidated on disk writes. */
 
@@ -7,7 +8,7 @@
  * @param target Output relative target (48 bytes).
  * @return One entry, zero at EOF, or a transport error.
  */
-static int storage_devlink_next(uint64_t *cursor, char uuid[37], char target[48])
+int storage_devlink_next(uint64_t *cursor, char uuid[37], char target[48])
 {
     while (*cursor < (uint64_t)g_install_disk_count * RELIEFOS_DISK_MAX_PARTITIONS) {
         uint32_t disk = *cursor / RELIEFOS_DISK_MAX_PARTITIONS;
@@ -32,7 +33,7 @@ static int storage_devlink_next(uint64_t *cursor, char uuid[37], char target[48]
  * @param target Output relative target (48 bytes).
  * @return Zero, ENOENT, ENOTUNIQ, or a disk transport error.
  */
-static int storage_devlink_target(const char *path, char target[48])
+int storage_devlink_target(const char *path, char target[48])
 {
     const char *prefix = "/dev/disk/by-partuuid/";
     uint64_t cursor = 0;

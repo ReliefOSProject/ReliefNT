@@ -236,7 +236,7 @@ static int ext4_bg_has_super(const struct storage_volume *volume, uint64_t group
 /* ext4_num_base_meta_blocks() (balloc.c:935-951) without meta_bg (rejected
  * by the feature policy): superblock backup + group descriptor table +
  * reserved descriptor table blocks. */
-static uint32_t ext4_base_meta_blocks(const struct storage_volume *volume,
+uint32_t ext4_base_meta_blocks(const struct storage_volume *volume,
                                       uint64_t group)
 {
     if (!ext4_bg_has_super(volume, group))

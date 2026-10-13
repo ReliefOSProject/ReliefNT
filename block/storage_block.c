@@ -1,4 +1,6 @@
-static void storage_volume_ide_device(const struct storage_volume *volume,
+#include "../drivers/storage/nvme/storage_nvme.h"
+#include "../drivers/storage/ide/storage_ide.h"
+void storage_volume_ide_device(const struct storage_volume *volume,
                                       struct ide_device_info *device)
 {
     if (!device) {
@@ -26,7 +28,7 @@ static void storage_volume_ide_device(const struct storage_volume *volume,
     device->sector_count = 0;
 }
 
-static void storage_disk_ide_device(const struct install_disk_state *disk,
+void storage_disk_ide_device(const struct install_disk_state *disk,
                                     struct ide_device_info *device)
 {
     if (!device) {
@@ -56,7 +58,7 @@ static uint8_t storage_volume_kind_for_transport(uint8_t transport)
     return STORAGE_VOLUME_AHCI;
 }
 
-static const char *storage_transport_name(uint8_t transport)
+const char *storage_transport_name(uint8_t transport)
 {
     if (transport == STORAGE_TRANSPORT_IDE_PIO) {
         return "ide-pio";
@@ -67,7 +69,7 @@ static const char *storage_transport_name(uint8_t transport)
     return "ahci";
 }
 
-static void storage_volume_from_install_disk(struct storage_volume *volume,
+void storage_volume_from_install_disk(struct storage_volume *volume,
                                              const struct install_disk_state *disk)
 {
     if (!volume || !disk) {
@@ -94,7 +96,7 @@ static void storage_volume_from_install_disk(struct storage_volume *volume,
     storage_copy_text(volume->device_model, sizeof(volume->device_model), disk->device_model);
 }
 
-static int storage_prepare_install_disk(struct install_disk_state *disk)
+int storage_prepare_install_disk(struct install_disk_state *disk)
 {
     if (!disk || !disk->present) {
         return -22;
@@ -118,7 +120,7 @@ static int storage_prepare_install_disk(struct install_disk_state *disk)
     return 0;
 }
 
-static int storage_read_device(const struct storage_volume *volume, uint64_t lba,
+int storage_read_device(const struct storage_volume *volume, uint64_t lba,
                                uint32_t sector_count, void *buffer)
 {
     int ret = 0;
@@ -203,7 +205,7 @@ out:
     return ret;
 }
 
-static int storage_write_device(const struct storage_volume *volume, uint64_t lba,
+int storage_write_device(const struct storage_volume *volume, uint64_t lba,
                                 uint32_t sector_count, const void *buffer)
 {
     int ret = 0;
@@ -283,7 +285,7 @@ out:
     return ret;
 }
 
-static int storage_read_install_disk(const struct install_disk_state *disk, uint64_t lba,
+int storage_read_install_disk(const struct install_disk_state *disk, uint64_t lba,
                                      uint32_t sector_count, void *buffer)
 {
     struct storage_volume volume;
@@ -295,7 +297,7 @@ static int storage_read_install_disk(const struct install_disk_state *disk, uint
     return storage_read_device(&volume, lba, sector_count, buffer);
 }
 
-static int storage_write_install_disk(const struct install_disk_state *disk, uint64_t lba,
+int storage_write_install_disk(const struct install_disk_state *disk, uint64_t lba,
                                       uint32_t sector_count, const void *buffer)
 {
     struct storage_volume volume;
@@ -307,7 +309,7 @@ static int storage_write_install_disk(const struct install_disk_state *disk, uin
     return storage_write_device(&volume, lba, sector_count, buffer);
 }
 
-static int storage_read_sectors(uint64_t lba, uint32_t sector_count, void *buffer)
+int storage_read_sectors(uint64_t lba, uint32_t sector_count, void *buffer)
 {
     return storage_read_device(&g_storage, lba, sector_count, buffer);
 }
@@ -455,7 +457,7 @@ static int storage_probe_fat32_signature(uint64_t lba)
            storage_memcmp(storage_scratch + 82u, "FAT32   ", 8u) == 0;
 }
 
-static int storage_read_iso_blocks(uint64_t lba, uint32_t block_count, void *buffer)
+int storage_read_iso_blocks(uint64_t lba, uint32_t block_count, void *buffer)
 {
     uint8_t *dst = (uint8_t *)buffer;
     if (!buffer || block_count == 0 || g_storage.filesystem != STORAGE_FILESYSTEM_ISO9660) {
@@ -505,7 +507,7 @@ static int storage_read_iso_blocks(uint64_t lba, uint32_t block_count, void *buf
     return 0;
 }
 
-static int storage_write_sectors(uint64_t lba, uint32_t sector_count, const void *buffer)
+int storage_write_sectors(uint64_t lba, uint32_t sector_count, const void *buffer)
 {
     const uint8_t *src = (const uint8_t *)buffer;
     /* RAM-backed installer roots are a writable live environment. Changes
@@ -547,7 +549,7 @@ static int storage_write_sectors(uint64_t lba, uint32_t sector_count, const void
     return 0;
 }
 
-static int gpt_find_esp(void)
+int gpt_find_esp(void)
 {
     struct gpt_header *hdr = (struct gpt_header *)(void *)storage_scratch;
     uint8_t esp_found = 0;

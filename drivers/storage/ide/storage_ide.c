@@ -1,14 +1,4 @@
-struct ide_device_info {
-    uint8_t present;
-    uint8_t atapi;
-    uint8_t lba48;
-    uint8_t channel;
-    uint8_t drive;
-    uint16_t command_base;
-    uint16_t control_base;
-    uint64_t sector_count;
-    char model[41];
-};
+#include "storage_ide.h"
 
 static void ide_io_delay(uint16_t control)
 {
@@ -67,7 +57,7 @@ static int ide_wait_ready(const struct ide_device_info *device, uint8_t want_drq
     return -110;
 }
 
-static int ide_flush_cache(const struct ide_device_info *device)
+int ide_flush_cache(const struct ide_device_info *device)
 {
     if (!device || !device->present || device->atapi) return -95;
     int ret = ide_select(device);
@@ -131,7 +121,7 @@ static void ide_copy_model(char out[41], const uint16_t *identify)
     out[pos] = 0;
 }
 
-static int ide_identify_device(struct ide_device_info *device)
+int ide_identify_device(struct ide_device_info *device)
 {
     uint16_t identify[256];
     uint8_t status;
@@ -215,7 +205,7 @@ static int ide_identify_device(struct ide_device_info *device)
     return 0;
 }
 
-static int ide_pio_transfer(const struct ide_device_info *device, uint64_t lba,
+int ide_pio_transfer(const struct ide_device_info *device, uint64_t lba,
                             uint32_t sectors, void *buffer, uint8_t write)
 {
     uint8_t *bytes = (uint8_t *)buffer;
@@ -279,7 +269,7 @@ static int ide_pio_transfer(const struct ide_device_info *device, uint64_t lba,
     }
 }
 
-static int ide_atapi_read_blocks(const struct ide_device_info *device, uint64_t lba,
+int ide_atapi_read_blocks(const struct ide_device_info *device, uint64_t lba,
                                  uint32_t blocks, void *buffer)
 {
     uint8_t packet[12] = {0};
@@ -345,7 +335,7 @@ static int ide_atapi_read_blocks(const struct ide_device_info *device, uint64_t 
     return ide_wait_ready(device, 0);
 }
 
-static void ide_fill_device(struct ide_device_info *device, uint8_t channel,
+void ide_fill_device(struct ide_device_info *device, uint8_t channel,
                             uint8_t drive, uint16_t command, uint16_t control)
 {
     storage_memzero(device, sizeof(*device));
@@ -355,7 +345,7 @@ static void ide_fill_device(struct ide_device_info *device, uint8_t channel,
     device->control_base = control;
 }
 
-static uint32_t fat_offset_for_cluster(uint32_t cluster)
+uint32_t fat_offset_for_cluster(uint32_t cluster)
 {
     return (cluster * 4u) % g_storage.bytes_per_sector;
 }

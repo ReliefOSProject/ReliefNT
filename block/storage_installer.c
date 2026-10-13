@@ -1,12 +1,6 @@
-static void storage_put_u32(uint8_t *p, uint32_t value)
-{
-    p[0] = (uint8_t)(value & 0xffu);
-    p[1] = (uint8_t)((value >> 8) & 0xffu);
-    p[2] = (uint8_t)((value >> 16) & 0xffu);
-    p[3] = (uint8_t)((value >> 24) & 0xffu);
-}
+#include "storage_internal.h"
 
-static uint32_t storage_crc32(const void *data, uint32_t len)
+uint32_t storage_crc32(const void *data, uint32_t len)
 {
     const uint8_t *p = (const uint8_t *)data;
     uint32_t crc = 0xffffffffu;
@@ -19,7 +13,7 @@ static uint32_t storage_crc32(const void *data, uint32_t len)
     return ~crc;
 }
 
-static int install_write_sectors(struct install_disk_state *disk, uint64_t lba,
+int install_write_sectors(struct install_disk_state *disk, uint64_t lba,
                                  uint32_t sector_count, const void *buffer)
 {
     const uint8_t *src = (const uint8_t *)buffer;
@@ -51,7 +45,7 @@ static int install_write_sectors(struct install_disk_state *disk, uint64_t lba,
  * @param buffer Destination buffer.
  * @return Zero on success or a negative storage error.
  */
-static int install_read_sectors(struct install_disk_state *disk, uint64_t lba,
+int install_read_sectors(struct install_disk_state *disk, uint64_t lba,
                                 uint32_t sector_count, void *buffer)
 {
     uint8_t *dst = (uint8_t *)buffer;
@@ -71,7 +65,7 @@ static int install_read_sectors(struct install_disk_state *disk, uint64_t lba,
     return 0;
 }
 
-static int install_clear_sectors(struct install_disk_state *disk, uint64_t lba,
+int install_clear_sectors(struct install_disk_state *disk, uint64_t lba,
                                  uint64_t sector_count)
 {
     storage_memzero(storage_scratch, sizeof(storage_scratch));
@@ -98,7 +92,7 @@ static uint32_t install_choose_fat32_spc(uint64_t total_sectors)
     return 8u;
 }
 
-static int install_format_fat32(struct install_disk_state *disk, uint64_t start_lba,
+int install_format_fat32(struct install_disk_state *disk, uint64_t start_lba,
                                 uint64_t sector_count)
 {
     const uint32_t reserved = 32;
@@ -471,13 +465,13 @@ static int install_format_ext_family(struct install_disk_state *disk, uint64_t s
                                     storage_scratch);
 }
 
-static int install_format_ext2(struct install_disk_state *disk, uint64_t start_lba,
+int install_format_ext2(struct install_disk_state *disk, uint64_t start_lba,
                                uint64_t sector_count)
 {
     return install_format_ext_family(disk, start_lba, sector_count, false);
 }
 
-static int install_format_ext4(struct install_disk_state *disk, uint64_t start_lba,
+int install_format_ext4(struct install_disk_state *disk, uint64_t start_lba,
                                uint64_t sector_count)
 {
     return install_format_ext_family(disk, start_lba, sector_count, true);
@@ -531,7 +525,7 @@ static uint32_t install_exfat_upcase_checksum(uint32_t sum, uint8_t value)
  * file is the Microsoft-recommended compressed UTF-16 table embedded by the
  * storage backend. It is the same standard table used by host mkfs.exfat.
  */
-static int install_format_exfat(struct install_disk_state *disk, uint64_t start_lba,
+int install_format_exfat(struct install_disk_state *disk, uint64_t start_lba,
                                 uint64_t sector_count)
 {
     uint8_t boot[SECTOR_SIZE];
@@ -715,7 +709,7 @@ static int install_format_exfat(struct install_disk_state *disk, uint64_t start_
     return 0;
 }
 
-static int install_write_gpt(struct install_disk_state *disk, uint64_t sector_count,
+int install_write_gpt(struct install_disk_state *disk, uint64_t sector_count,
                              uint64_t *out_esp_lba, uint64_t *out_esp_sectors,
                              uint64_t *out_root_lba, uint64_t *out_root_sectors)
 {

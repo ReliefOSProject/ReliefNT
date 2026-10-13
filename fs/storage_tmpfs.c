@@ -1,3 +1,4 @@
+#include "../block/storage_internal.h"
 int storage_tmpfs_get_page(const struct storage_node *node, uint64_t offset, uint64_t *phys)
 {
     if (!node || !(node->flags & STORAGE_NODE_FLAG_TMPFS) || node->volume_id >= STORAGE_MAX_VOLUMES)

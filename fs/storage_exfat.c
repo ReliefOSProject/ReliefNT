@@ -1,3 +1,4 @@
+#include "../block/storage_internal.h"
 /*
  * exFAT storage backend.
  *
@@ -163,7 +164,7 @@ static int exfat_write_sectors_resilient(uint64_t lba, uint32_t sectors,
     return 0;
 }
 
-static void exfat_cache_invalidate(void)
+void exfat_cache_invalidate(void)
 {
     /* A dirty bitmap only exists during a completed allocation/free operation;
      * flush it before dropping the cache so a volume switch cannot lose bits. */
@@ -200,7 +201,7 @@ static uint16_t exfat_get_u16(const uint8_t *p)
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
 }
 
-static void exfat_put_u16(uint8_t *p, uint16_t value)
+void exfat_put_u16(uint8_t *p, uint16_t value)
 {
     p[0] = (uint8_t)value;
     p[1] = (uint8_t)(value >> 8);
@@ -211,7 +212,7 @@ static uint64_t exfat_get_u64(const uint8_t *p)
     return (uint64_t)storage_get_u32(p) | ((uint64_t)storage_get_u32(p + 4u) << 32);
 }
 
-static void exfat_put_u64(uint8_t *p, uint64_t value)
+void exfat_put_u64(uint8_t *p, uint64_t value)
 {
     storage_put_u32(p, (uint32_t)value);
     storage_put_u32(p + 4u, (uint32_t)(value >> 32));
@@ -880,7 +881,7 @@ static int exfat_bitmap_flush(void)
     return 0;
 }
 
-static int exfat_bitmap_get_cached(uint32_t cluster, uint8_t *allocated)
+int exfat_bitmap_get_cached(uint32_t cluster, uint8_t *allocated)
 {
     uint64_t bit;
     uint64_t byte;
@@ -1354,12 +1355,12 @@ static int exfat_lookup_path_ref(const char *path, struct storage_node *out,
     return 0;
 }
 
-static int exfat_lookup_path(const char *path, struct storage_node *out)
+int exfat_lookup_path(const char *path, struct storage_node *out)
 {
     return exfat_lookup_path_ref(path, out, 0);
 }
 
-static int exfat_read_node(const struct storage_node *node, uint64_t offset,
+int exfat_read_node(const struct storage_node *node, uint64_t offset,
                            void *buffer, uint32_t len, uint32_t *out_read)
 {
     if (out_read) *out_read = 0;
@@ -1407,7 +1408,7 @@ static int exfat_write_contiguous_fat(uint32_t first, uint32_t count, uint32_t n
     return 0;
 }
 
-static int exfat_iter_dir_entry(uint32_t directory_cluster, uint8_t nofat, uint64_t wanted,
+int exfat_iter_dir_entry(uint32_t directory_cluster, uint8_t nofat, uint64_t wanted,
                                 struct reliefos_dir_entry *out)
 {
     uint8_t raw[20][EXFAT_ENTRY_SIZE];
@@ -1847,7 +1848,7 @@ static int exfat_grow_directory(uint32_t directory_cluster, uint8_t directory_no
     return 0;
 }
 
-static int exfat_write_file(const char *path, const void *buffer, uint32_t len)
+int exfat_write_file(const char *path, const void *buffer, uint32_t len)
 {
     char parent_path[RELIEFOS_FS_PATH_LEN];
     char name[RELIEFOS_FS_NAME_LEN];
@@ -1914,7 +1915,7 @@ static int exfat_write_file(const char *path, const void *buffer, uint32_t len)
     return ret;
 }
 
-static int exfat_write_node_path(const char *path, uint64_t offset,
+int exfat_write_node_path(const char *path, uint64_t offset,
                                  const void *buffer, uint32_t len, uint32_t *out_written)
 {
     struct storage_node node;
@@ -2073,7 +2074,7 @@ static int exfat_write_node_path(const char *path, uint64_t offset,
     return 0;
 }
 
-static int exfat_truncate_file(const char *path, uint64_t length)
+int exfat_truncate_file(const char *path, uint64_t length)
 {
     struct storage_node node;
     struct exfat_dir_ref ref;
@@ -2148,7 +2149,7 @@ static int exfat_truncate_file(const char *path, uint64_t length)
     return ret;
 }
 
-static int exfat_mkdir(const char *path)
+int exfat_mkdir(const char *path)
 {
     char parent_path[RELIEFOS_FS_PATH_LEN];
     char name[RELIEFOS_FS_NAME_LEN];
@@ -2277,7 +2278,7 @@ static int exfat_delete_acl_metadata_file(const struct storage_node *directory)
     return ret;
 }
 
-static int exfat_unlink(const char *path)
+int exfat_unlink(const char *path)
 {
     char parent_path[RELIEFOS_FS_PATH_LEN];
     char name[RELIEFOS_FS_NAME_LEN];
@@ -2304,7 +2305,7 @@ static int exfat_unlink(const char *path)
     return ret;
 }
 
-static int exfat_rmdir(const char *path)
+int exfat_rmdir(const char *path)
 {
     char parent_path[RELIEFOS_FS_PATH_LEN];
     char name[RELIEFOS_FS_NAME_LEN];
@@ -2334,7 +2335,7 @@ static int exfat_rmdir(const char *path)
     return ret;
 }
 
-static int exfat_rename(const char *old_path, const char *new_path)
+int exfat_rename(const char *old_path, const char *new_path)
 {
     char old_parent_path[RELIEFOS_FS_PATH_LEN];
     char new_parent_path[RELIEFOS_FS_PATH_LEN];
@@ -2407,7 +2408,7 @@ static int exfat_rename(const char *old_path, const char *new_path)
     return ret;
 }
 
-static int exfat_mount(void)
+int exfat_mount(void)
 {
     uint8_t boot[SECTOR_SIZE];
     uint8_t backup_boot[SECTOR_SIZE];

@@ -1,3 +1,5 @@
+#include <reliefnt/permissions.h>
+#include <reliefnt/page_cache.h>
 /* Explicit-volume VFS adapters. Only the compatibility wrappers consult the
  * active-volume selector; the backend and this operation table never do. */
 #include "../block/storage_internal.h"
@@ -8,7 +10,7 @@ static uint32_t ev_type(uint16_t mode)
         case 0120000:return RELIEFOS_FS_TYPE_SYMLINK; case 0010000:return RELIEFOS_FS_TYPE_FIFO;
         case 0140000:return RELIEFOS_FS_TYPE_SOCKET; default:return RELIEFOS_FS_TYPE_FILE; }
 }
-static void ev_node(struct storage_volume *v,uint64_t ino,const struct ext4_inode_view *in,struct storage_node *out)
+void ev_node(struct storage_volume *v,uint64_t ino,const struct ext4_inode_view *in,struct storage_node *out)
 {
     if (out) *out=(struct storage_node){.type=ev_type(in->mode),.flags=STORAGE_NODE_FLAG_EXT_FAMILY|
         (ino==2?STORAGE_NODE_FLAG_ROOT:0),.first_cluster=ino,.volume_id=v->volume_id,.size=in->size,

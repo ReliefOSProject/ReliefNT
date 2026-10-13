@@ -1,3 +1,4 @@
+#include "../../../block/storage_internal.h"
 /* Registry-backed Linux sound namespace; no disk or MMIO access. */
 #include <reliefnt/audio.h>
 #include <reliefnt/storage.h>
@@ -49,7 +50,7 @@ static int storage_audio_decimal(const char **cursor, uint32_t *value)
  * @param name Basename. @param out Optional borrowed output storage.
  * @return Zero or -ENOENT; task context, only a registry snapshot is acquired.
  */
-static int storage_audio_control_node(const char *name, struct storage_node *out)
+int storage_audio_control_node(const char *name, struct storage_node *out)
 {
     const char *p = name;
     uint32_t ordinal, token;
@@ -69,7 +70,7 @@ static int storage_audio_control_node(const char *name, struct storage_node *out
  * @param name Linux PCM basename. @param out Optional borrowed node output.
  * @return Zero or -ENOENT; caps callbacks run outside registry locks.
  */
-static int storage_audio_pcm_node(const char *name, struct storage_node *out)
+int storage_audio_pcm_node(const char *name, struct storage_node *out)
 {
     uint32_t ordinal, device, token;
     enum audio_direction direction;
@@ -87,7 +88,7 @@ static int storage_audio_pcm_node(const char *name, struct storage_node *out)
 }
 
 /** @brief Look up the global ALSA timer character node. */
-static int storage_audio_timer_node(const char *name, struct storage_node *out)
+int storage_audio_timer_node(const char *name, struct storage_node *out)
 {
     if (!name || __builtin_strcmp(name, "timer") != 0) return -2;
     if (out) *out = (struct storage_node){
@@ -103,7 +104,7 @@ static int storage_audio_timer_node(const char *name, struct storage_node *out)
  * @param entry Receives one Linux basename and character-device type.
  * @return One entry, zero at EOF, or -EINVAL; bounded task-context snapshots.
  */
-static int storage_audio_snd_readdir(uint64_t *cursor, struct reliefos_dir_entry *entry)
+int storage_audio_snd_readdir(uint64_t *cursor, struct reliefos_dir_entry *entry)
 {
     if (!cursor || !entry) return -22;
     if (*cursor == 0) {

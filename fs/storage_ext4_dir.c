@@ -119,7 +119,7 @@ static int ed_get_inode(struct storage_volume *v,uint64_t ino,struct ext4_inode_
     if (!in->size || in->size%v->ext4.block_size) return ed_bad(v);
     return 0;
 }
-static int ed_stop(struct storage_ext4_handle *h,int ret)
+int ed_stop(struct storage_ext4_handle *h,int ret)
 { if (ret<0) storage_ext4_journal_abort(h,ret); int stop=storage_ext4_journal_stop(h); return ret<0?ret:stop; }
 
 /* Independent table-driven implementation of the specified half-MD4 rounds
@@ -477,7 +477,7 @@ int storage_ext4_dir_remove(struct storage_volume *v,uint64_t ino,const char *na
     return ret<0?ret:ed_stop(&h,ed_remove_impl(v,ino,name,removed,false));
 }
 
-static uint8_t ed_type(uint16_t mode)
+uint8_t ed_type(uint16_t mode)
 {
     switch (mode&EXT2_S_IFMT) { case 0040000:return 2; case 0120000:return 7;
         case 0020000:return 3; case 0060000:return 4; case 0010000:return 5; case 0140000:return 6; default:return 1; }

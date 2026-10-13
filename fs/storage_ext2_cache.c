@@ -1,3 +1,4 @@
+#include "../block/storage_internal.h"
 /* Clean, write-through blocks only. Storage transactions serialize access. */
 #define EXT2_CACHE_ENTRIES 128u
 #define EXT2_CACHE_BYTES 4096u
@@ -11,7 +12,7 @@ struct ext2_cache_entry {
 static struct ext2_cache_entry *ext2_cache;
 static uint64_t ext2_cache_age;
 
-static void ext2_cache_reset(struct storage_volume *volume)
+void ext2_cache_reset(struct storage_volume *volume)
 {
     if (storage_read_cache.volume == volume) storage_read_cache.valid = 0;
     if (!ext2_cache) return;
@@ -19,7 +20,7 @@ static void ext2_cache_reset(struct storage_volume *volume)
         if (ext2_cache[i].volume == volume) ext2_cache[i].sectors = 0;
 }
 
-static void ext2_cache_invalidate_range(uint64_t lba, uint32_t sectors)
+void ext2_cache_invalidate_range(uint64_t lba, uint32_t sectors)
 {
     /* Invalidate aliases too: raw disk writes can use a temporary volume
      * object instead of the mounted partition's identity. Extra eviction on
@@ -39,7 +40,7 @@ static void ext2_cache_invalidate_range(uint64_t lba, uint32_t sectors)
     }
 }
 
-static int ext2_cache_read(uint64_t lba, uint32_t sectors, void *buffer)
+int ext2_cache_read(uint64_t lba, uint32_t sectors, void *buffer)
 {
     if (!ext2_cache) return 0;
     for (unsigned i = 0; i < EXT2_CACHE_ENTRIES; ++i) {
@@ -55,7 +56,7 @@ static int ext2_cache_read(uint64_t lba, uint32_t sectors, void *buffer)
     return 0;
 }
 
-static void ext2_cache_store(uint64_t lba, uint32_t sectors, const void *buffer)
+void ext2_cache_store(uint64_t lba, uint32_t sectors, const void *buffer)
 {
     unsigned victim = 0;
     if (!sectors || sectors > EXT2_CACHE_BYTES / SECTOR_SIZE) return;

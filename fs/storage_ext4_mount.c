@@ -1,3 +1,4 @@
+#include "../block/storage_internal.h"
 /* ext-family mount: superblock/group-descriptor reads through bounded block
  * I/O, the feature policy of record, ext2-vs-ext4 classification and
  * per-volume ext4 state.  Format parsing and checksum primitives come from

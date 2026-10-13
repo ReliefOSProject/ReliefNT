@@ -1,3 +1,4 @@
+#include "../block/storage_internal.h"
 /*
  * ReliefOS FAT/exFAT POSIX metadata sidecar.
  *

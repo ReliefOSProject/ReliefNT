@@ -1,3 +1,4 @@
+#include "../block/storage_internal.h"
 static int storage_ext4_permission_write(struct storage_volume *v,uint64_t ino,const struct ext4_inode_view *in)
 {
     struct storage_ext4_handle h; int ret=storage_ext4_journal_start(v,EXT4_JOURNAL_CREDITS,&h);

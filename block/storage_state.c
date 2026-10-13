@@ -1,3 +1,4 @@
+#include "storage_internal.h"
 static uint64_t storage_metadata_epoch = 1;
 
 uint64_t storage_metadata_generation(void)
@@ -21,7 +22,7 @@ void storage_set_io_async_context(bool enabled)
     storage_io_write_started = false;
 }
 
-static int storage_acquire_task_io(void)
+int storage_acquire_task_io(void)
 {
     uint32_t pid;
 
@@ -46,7 +47,7 @@ void storage_release_task_io(uint32_t pid)
     }
 }
 
-static bool storage_async_can_yield(void)
+bool storage_async_can_yield(void)
 {
     /* AHCI command descriptors, DMA staging buffers, filesystem caches and
      * the pending-command record are still single-instance state.  Allowing
@@ -58,7 +59,7 @@ static bool storage_async_can_yield(void)
            smp_cpu_count() <= 1u;
 }
 
-static void storage_begin_mutation(void)
+void storage_begin_mutation(void)
 {
     ++storage_metadata_epoch;
     if (storage_io_async_context) {
@@ -66,18 +67,7 @@ static void storage_begin_mutation(void)
     }
 }
 
-struct fat32_dir_ref {
-    uint32_t entry_cluster;
-    uint32_t entry_offset;
-    struct fat32_dirent dirent;
-};
-
-struct fat32_dir_span {
-    uint32_t entry_cluster;
-    uint32_t entry_offset;
-};
-
-static void storage_memzero(void *dst, size_t len)
+void storage_memzero(void *dst, size_t len)
 {
     uint8_t *p = (uint8_t *)dst;
     for (size_t i = 0; i < len; ++i) {
@@ -85,7 +75,7 @@ static void storage_memzero(void *dst, size_t len)
     }
 }
 
-static void storage_cache_invalidate(void)
+void storage_cache_invalidate(void)
 {
     ++storage_metadata_epoch;
     exfat_cache_invalidate();
@@ -104,7 +94,7 @@ static void storage_cache_invalidate(void)
     storage_write_chain_cache.valid = 0;
 }
 
-static void storage_sector_cache_invalidate(void)
+void storage_sector_cache_invalidate(void)
 {
     ++storage_metadata_epoch;
     storage_fat_cache.valid = 0;
@@ -121,7 +111,7 @@ static void storage_sector_cache_invalidate(void)
     storage_dir_iter_cache.valid = 0;
 }
 
-static void storage_memcpy(void *dst, const void *src, size_t len)
+void storage_memcpy(void *dst, const void *src, size_t len)
 {
     uint8_t *d = (uint8_t *)dst;
     const uint8_t *s = (const uint8_t *)src;
@@ -130,7 +120,7 @@ static void storage_memcpy(void *dst, const void *src, size_t len)
     }
 }
 
-static int storage_memcmp(const void *a, const void *b, size_t len)
+int storage_memcmp(const void *a, const void *b, size_t len)
 {
     const uint8_t *pa = (const uint8_t *)a;
     const uint8_t *pb = (const uint8_t *)b;
@@ -142,7 +132,7 @@ static int storage_memcmp(const void *a, const void *b, size_t len)
     return 0;
 }
 
-static size_t storage_strlen(const char *s)
+size_t storage_strlen(const char *s)
 {
     size_t n = 0;
     while (s && s[n]) {
@@ -151,7 +141,7 @@ static size_t storage_strlen(const char *s)
     return n;
 }
 
-static void storage_copy_text(char *dst, uint32_t cap, const char *src)
+void storage_copy_text(char *dst, uint32_t cap, const char *src)
 {
     uint32_t i = 0;
     if (!dst || cap == 0) {
@@ -164,7 +154,7 @@ static void storage_copy_text(char *dst, uint32_t cap, const char *src)
     dst[i] = 0;
 }
 
-static int storage_text_eq(const char *a, const char *b)
+int storage_text_eq(const char *a, const char *b)
 {
     if (!a || !b) {
         return 0;
@@ -176,7 +166,7 @@ static int storage_text_eq(const char *a, const char *b)
     return *a == 0 && *b == 0;
 }
 
-static int storage_text_eq_ci(const char *a, const char *b)
+int storage_text_eq_ci(const char *a, const char *b)
 {
     if (!a || !b) {
         return 0;
@@ -199,7 +189,7 @@ static int storage_text_eq_ci(const char *a, const char *b)
     return *a == 0 && *b == 0;
 }
 
-static int storage_path_cache_lookup(const char *path, struct storage_node *out)
+int storage_path_cache_lookup(const char *path, struct storage_node *out)
 {
     if (!path || !path[0]) {
         return 0;
@@ -223,7 +213,7 @@ static int storage_path_cache_lookup(const char *path, struct storage_node *out)
     return 0;
 }
 
-static void storage_path_cache_store(const char *path, const struct storage_node *node)
+void storage_path_cache_store(const char *path, const struct storage_node *node)
 {
     struct storage_path_cache_entry *entry;
     if (!path || !path[0] || !node) {
@@ -237,7 +227,7 @@ static void storage_path_cache_store(const char *path, const struct storage_node
     entry->valid = 1;
 }
 
-static int storage_dir_index_lookup(uint32_t directory_cluster, const char *name,
+int storage_dir_index_lookup(uint32_t directory_cluster, const char *name,
                                     struct storage_node *out)
 {
     if (directory_cluster < 2 || !name || !name[0]) {
@@ -258,7 +248,7 @@ static int storage_dir_index_lookup(uint32_t directory_cluster, const char *name
     return 0;
 }
 
-static void storage_dir_index_store(uint32_t directory_cluster, const char *name,
+void storage_dir_index_store(uint32_t directory_cluster, const char *name,
                                     const struct storage_node *node)
 {
     struct storage_dir_index_entry *entry;
@@ -292,7 +282,7 @@ static uint64_t storage_mix64(uint64_t x)
     return x;
 }
 
-static void storage_make_guid(uint8_t guid[16], uint64_t tag,
+void storage_make_guid(uint8_t guid[16], uint64_t tag,
                               const struct install_disk_state *disk,
                               uint64_t sector_count)
 {
@@ -323,7 +313,7 @@ static void storage_guid_append_hex2(char *dst, uint32_t *pos,
     dst[*pos] = 0;
 }
 
-static int storage_guid_valid(const uint8_t guid[16])
+int storage_guid_valid(const uint8_t guid[16])
 {
     uint8_t or_all = 0;
     uint8_t and_all = 0xffU;
@@ -334,7 +324,7 @@ static int storage_guid_valid(const uint8_t guid[16])
     return or_all != 0 && and_all != 0xffU;
 }
 
-static void storage_format_guid(const uint8_t guid[16], char *out, uint32_t cap)
+void storage_format_guid(const uint8_t guid[16], char *out, uint32_t cap)
 {
     uint32_t pos = 0;
     if (!out || cap < RELIEFOS_MACHINE_IDENTITY_UUID_LEN) {
@@ -353,24 +343,24 @@ static void storage_format_guid(const uint8_t guid[16], char *out, uint32_t cap)
     }
 }
 
-static int storage_is_acl_metadata_name(const char *name)
+int storage_is_acl_metadata_name(const char *name)
 {
     return storage_text_eq_ci(name, "LEONACL.SYS");
 }
 
-static uint32_t min_u32(uint32_t a, uint32_t b)
+uint32_t min_u32(uint32_t a, uint32_t b)
 {
     return a < b ? a : b;
 }
 
-static uint64_t min_u64(uint64_t a, uint64_t b)
+uint64_t min_u64(uint64_t a, uint64_t b)
 {
     return a < b ? a : b;
 }
 
 /* Caller holds the storage execution lock. Keep stat and mountinfo identities
  * equal to the registered block device; RAM/pseudo filesystems are anonymous. */
-static uint64_t storage_volume_device_number(const struct storage_volume *volume)
+uint64_t storage_volume_device_number(const struct storage_volume *volume)
 {
     uint64_t device = 0;
     if (!volume->ram_base && !volume->tmpfs) {
@@ -385,7 +375,7 @@ static uint64_t storage_volume_device_number(const struct storage_volume *volume
     return device ? device : (uint64_t)volume->volume_id + 1;
 }
 
-static int storage_select_volume(uint32_t volume_id)
+int storage_select_volume(uint32_t volume_id)
 {
     int ret = storage_acquire_task_io();
     if (ret < 0) {
@@ -398,7 +388,7 @@ static int storage_select_volume(uint32_t volume_id)
     return 0;
 }
 
-static int storage_select_node_volume(const struct storage_node *node,
+int storage_select_node_volume(const struct storage_node *node,
                                       struct storage_volume **old_volume)
 {
     int ret = storage_acquire_task_io();
@@ -418,14 +408,14 @@ static int storage_select_node_volume(const struct storage_node *node,
     return 0;
 }
 
-static void storage_restore_volume(struct storage_volume *old_volume)
+void storage_restore_volume(struct storage_volume *old_volume)
 {
     if (old_volume) {
         g_active_volume = old_volume;
     }
 }
 
-static bool storage_mount_path_matches(const char *path, const char *mount_path)
+bool storage_mount_path_matches(const char *path, const char *mount_path)
 {
     uint32_t length;
     if (!path || !mount_path || mount_path[0] != '/') {
@@ -442,7 +432,7 @@ static bool storage_mount_path_matches(const char *path, const char *mount_path)
 /* Routes a canonical global path to the mounted backend with the longest
  * matching mount point.  Backends only receive paths rooted at their own
  * filesystem, never a user-visible mount prefix. */
-static int storage_route_path(const char *path, struct storage_volume **out_volume,
+int storage_route_path(const char *path, struct storage_volume **out_volume,
                               char *backend_path, uint32_t backend_capacity)
 {
     struct storage_volume *best = NULL;
@@ -486,7 +476,7 @@ static int storage_route_path(const char *path, struct storage_volume **out_volu
     return 0;
 }
 
-static int storage_backend_path(const char *path, char *backend_path, uint32_t backend_capacity)
+int storage_backend_path(const char *path, char *backend_path, uint32_t backend_capacity)
 {
     struct storage_volume *volume;
     int ret = storage_route_path(path, &volume, backend_path, backend_capacity);
@@ -521,7 +511,7 @@ int storage_path_volume_id(const char *path, uint32_t *out_volume_id)
     return 0;
 }
 
-static int storage_parent_path(const char *path, char *parent, uint32_t parent_cap,
+int storage_parent_path(const char *path, char *parent, uint32_t parent_cap,
                                char *name, uint32_t name_cap)
 {
     char resolved[RELIEFOS_FS_PATH_LEN];
@@ -559,20 +549,20 @@ static int storage_parent_path(const char *path, char *parent, uint32_t parent_c
     return 0;
 }
 
-static uint64_t cluster_to_lba(uint32_t cluster)
+uint64_t cluster_to_lba(uint32_t cluster)
 {
     return g_storage.esp_start_lba + g_storage.data_start_sector +
            (cluster - 2u) * g_storage.sectors_per_cluster;
 }
 
-static uint64_t fat_sector_for_cluster(uint32_t cluster)
+uint64_t fat_sector_for_cluster(uint32_t cluster)
 {
     return g_storage.esp_start_lba + g_storage.fat_start_sector +
            ((cluster * 4u) / g_storage.bytes_per_sector);
 }
 
 /** @brief Format an on-disk GPT GUID with the UEFI mixed-endian UUID convention. */
-static void storage_partition_guid_text(const uint8_t guid[16], char uuid[37])
+void storage_partition_guid_text(const uint8_t guid[16], char uuid[37])
 {
     static const uint8_t order[] = {3,2,1,0,5,4,7,6,8,9,10,11,12,13,14,15};
     static const char hex[] = "0123456789abcdef";

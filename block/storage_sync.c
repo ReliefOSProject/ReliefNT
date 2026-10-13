@@ -1,3 +1,4 @@
+#include "../drivers/storage/ide/storage_ide.h"
 /* Sector completion precedes write return. fsync additionally drains the
  * device's volatile cache and propagates errors before publishing account data. */
 static int storage_flush_volume_device(const struct storage_volume *volume)
@@ -16,7 +17,7 @@ static int storage_flush_volume_device(const struct storage_volume *volume)
     return -95;
 }
 
-static int storage_flush_volume(const struct storage_volume *volume)
+int storage_flush_volume(const struct storage_volume *volume)
 {
     if (!volume || !volume->ready) return -19;
     return storage_flush_volume_device(volume);

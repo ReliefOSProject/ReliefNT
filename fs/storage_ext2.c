@@ -1,3 +1,6 @@
+#include "../block/storage_internal.h"
+#include <reliefnt/page_cache.h>
+#include <reliefnt/permissions.h>
 /* Compatibility names for existing callers and regression fixtures. All file,
  * inode, allocation and namespace operations use the native ext-family backend.
  * The raw-block cache helpers below remain solely for legacy transport tests. */
@@ -123,16 +126,16 @@ static __attribute__((unused)) uint32_t ext2_free_bitmap_bit(const uint8_t *bitm
     return count;
 }
 
-static __attribute__((unused)) int ext2_mount(void)
+__attribute__((unused)) int ext2_mount(void)
 { ext2_cache_reset(g_active_volume); return storage_ext4_mount(&g_storage); }
-static __attribute__((unused)) int ext2_group_desc(uint32_t group,struct ext2_group_desc *out)
+__attribute__((unused)) int ext2_group_desc(uint32_t group,struct ext2_group_desc *out)
 {
     struct storage_ext4_group_view g; int ret=storage_ext4_read_group(&g_storage,group,&g); if (ret<0) return ret;
     *out=(struct ext2_group_desc){.block_bitmap=g.block_bitmap,.inode_bitmap=g.inode_bitmap,
         .inode_table=g.inode_table,.free_blocks_count=g.free_blocks_count,.free_inodes_count=g.free_inodes_count,
         .used_dirs_count=g.used_dirs_count}; return 0;
 }
-static __attribute__((unused)) int ext2_read_inode(uint32_t ino,struct ext2_inode *out)
+__attribute__((unused)) int ext2_read_inode(uint32_t ino,struct ext2_inode *out)
 {
     struct ext4_inode_view in; int ret=storage_ext4_read_inode(&g_storage,ino,&in);
     if (ret==-2) { storage_memzero(out,sizeof(*out)); return 0; }
@@ -165,9 +168,9 @@ static __attribute__((unused)) int ext2_lookup_path(const char *path,struct stor
 { return storage_ext4_ops.lookup(&g_storage,path,out); }
 static __attribute__((unused)) int ext2_read_node(const struct storage_node *n,uint64_t off,void *b,uint32_t len,uint32_t *done)
 { return storage_ext4_ops.read(&g_storage,n,off,b,len,done); }
-static __attribute__((unused)) int ext2_write_node(const struct storage_node *n,uint64_t off,const void *b,uint32_t len,uint32_t *done)
+__attribute__((unused)) int ext2_write_node(const struct storage_node *n,uint64_t off,const void *b,uint32_t len,uint32_t *done)
 { return storage_ext4_ops.write(&g_storage,n,off,b,len,done); }
-static __attribute__((unused)) int ext2_truncate_file(const struct storage_node *n,uint64_t len)
+__attribute__((unused)) int ext2_truncate_file(const struct storage_node *n,uint64_t len)
 { return storage_ext4_ops.truncate(&g_storage,n,len); }
 static __attribute__((unused)) int ext2_write_file(const char *p,const void *b,uint32_t len)
 { return storage_ext4_replace(&g_storage,p,b,len); }
@@ -181,7 +184,7 @@ static __attribute__((unused)) int ext2_symlink_read(const struct storage_node *
 { return storage_ext4_ops.readlink(&g_storage,n,b,len,done); }
 static __attribute__((unused)) int ext2_mark_special(const char *p,const struct storage_node *n,uint32_t mode)
 { return storage_ext4_mark_special(&g_storage,p,n,mode); }
-static __attribute__((unused)) int ext2_destroy_inode(uint32_t ino,uint8_t directory)
+__attribute__((unused)) int ext2_destroy_inode(uint32_t ino,uint8_t directory)
 {
     (void)directory; struct ext4_inode_view in; int ret=storage_ext4_read_inode(&g_storage,ino,&in); if (ret<0) return ret;
     struct storage_node node; ev_node(&g_storage,ino,&in,&node); page_cache_invalidate_node(&node);

@@ -1,4 +1,6 @@
-static int fat32_mount(void)
+#include "../drivers/storage/nvme/storage_nvme.h"
+#include "../drivers/storage/ide/storage_ide.h"
+int fat32_mount(void)
 {
     struct fat32_bpb *bpb = (struct fat32_bpb *)(void *)storage_scratch;
     uint16_t fs_info_sector;
@@ -65,7 +67,7 @@ static int fat32_mount(void)
     return 0;
 }
 
-static int fat32_read_fat_entry(uint32_t cluster, uint32_t *out_next)
+int fat32_read_fat_entry(uint32_t cluster, uint32_t *out_next)
 {
     uint32_t sector = fat_sector_for_cluster(cluster);
     uint32_t offset = fat_offset_for_cluster(cluster);
@@ -106,7 +108,7 @@ static int fat32_read_fat_entry(uint32_t cluster, uint32_t *out_next)
     return 0;
 }
 
-static int storage_read_cache_lookup(uint32_t cluster, uint32_t *out_offset,
+int storage_read_cache_lookup(uint32_t cluster, uint32_t *out_offset,
                                      uint32_t *out_clusters)
 {
     uint64_t lba;
@@ -132,7 +134,7 @@ static int storage_read_cache_lookup(uint32_t cluster, uint32_t *out_offset,
     return 1;
 }
 
-static int storage_read_contiguous_clusters(uint32_t first_cluster,
+int storage_read_contiguous_clusters(uint32_t first_cluster,
                                             uint32_t max_clusters,
                                             uint32_t *out_clusters,
                                             uint32_t *out_next)
@@ -158,7 +160,7 @@ static int storage_read_contiguous_clusters(uint32_t first_cluster,
     }
 }
 
-static int storage_read_cache_fill(uint32_t first_cluster, uint32_t clusters)
+int storage_read_cache_fill(uint32_t first_cluster, uint32_t clusters)
 {
     uint32_t sectors;
     uint64_t lba;
@@ -205,7 +207,7 @@ static int fat32_read_lookup_cluster(uint32_t cluster, void *buffer)
     return 0;
 }
 
-static int fat32_write_fat_entry(uint32_t cluster, uint32_t value)
+int fat32_write_fat_entry(uint32_t cluster, uint32_t value)
 {
     uint32_t sector_offset = (cluster * 4u) / g_storage.bytes_per_sector;
     uint32_t offset = fat_offset_for_cluster(cluster);
@@ -279,7 +281,7 @@ static int fat32_write_fsinfo(void)
     return 0;
 }
 
-static int fat32_note_allocated(void)
+int fat32_note_allocated(void)
 {
     if (g_storage.fat_fsinfo_valid && g_storage.fat_free_clusters > 0) {
         --g_storage.fat_free_clusters;
@@ -287,7 +289,7 @@ static int fat32_note_allocated(void)
     return fat32_write_fsinfo();
 }
 
-static int fat32_note_freed(void)
+int fat32_note_freed(void)
 {
     if (g_storage.fat_fsinfo_valid &&
         g_storage.fat_free_clusters < g_storage.data_cluster_count) {
@@ -296,7 +298,7 @@ static int fat32_note_freed(void)
     return fat32_write_fsinfo();
 }
 
-static int fat32_read_cluster(uint32_t cluster, void *buffer)
+int fat32_read_cluster(uint32_t cluster, void *buffer)
 {
     uint32_t cache_offset;
     uint32_t cache_clusters;
@@ -314,7 +316,7 @@ static int fat32_read_cluster(uint32_t cluster, void *buffer)
     return storage_read_sectors(cluster_to_lba(cluster), g_storage.sectors_per_cluster, buffer);
 }
 
-static int fat32_write_cluster(uint32_t cluster, const void *buffer)
+int fat32_write_cluster(uint32_t cluster, const void *buffer)
 {
     if (cluster < 2 || !buffer) {
         return -2;
@@ -322,7 +324,7 @@ static int fat32_write_cluster(uint32_t cluster, const void *buffer)
     return storage_write_sectors(cluster_to_lba(cluster), g_storage.sectors_per_cluster, buffer);
 }
 
-static int storage_install_identify(struct install_disk_state *disk, uint64_t *out_sectors)
+int storage_install_identify(struct install_disk_state *disk, uint64_t *out_sectors)
 {
     uint16_t *id = (uint16_t *)storage_scratch;
     int ret;
@@ -431,7 +433,7 @@ static char fat32_upper_char(char ch)
     return ch;
 }
 
-static int fat32_make_short_name(const char *name, uint8_t out[11])
+int fat32_make_short_name(const char *name, uint8_t out[11])
 {
     uint32_t dot = 0xffffffffu;
     uint32_t len = 0;
@@ -477,7 +479,7 @@ static int fat32_short_name_eq(const uint8_t lhs[11], const uint8_t rhs[11])
     return storage_memcmp(lhs, rhs, 11) == 0;
 }
 
-static int fat32_find_free_cluster(uint32_t *out_cluster)
+int fat32_find_free_cluster(uint32_t *out_cluster)
 {
     uint32_t max_cluster;
     uint32_t start;
@@ -508,7 +510,7 @@ static int fat32_find_free_cluster(uint32_t *out_cluster)
     return -28;
 }
 
-static int fat32_collect_chain(uint32_t first_cluster, uint32_t chain[FAT32_MAX_FILE_CLUSTERS], uint32_t *out_count)
+int fat32_collect_chain(uint32_t first_cluster, uint32_t chain[FAT32_MAX_FILE_CLUSTERS], uint32_t *out_count)
 {
     uint32_t count = 0;
     uint32_t cluster = first_cluster;
@@ -538,7 +540,7 @@ static int fat32_collect_chain(uint32_t first_cluster, uint32_t chain[FAT32_MAX_
     return 0;
 }
 
-static int fat32_free_chain(uint32_t first_cluster)
+int fat32_free_chain(uint32_t first_cluster)
 {
     uint32_t cluster = first_cluster;
     uint32_t count = 0;
@@ -679,7 +681,7 @@ static int fat32_is_lfn_char_valid(char ch)
     }
 }
 
-static int fat32_validate_name(const char *name)
+int fat32_validate_name(const char *name)
 {
     uint32_t len = (uint32_t)storage_strlen(name);
     uint16_t utf16[260];
@@ -778,7 +780,7 @@ static int fat32_short_name_exists_in_dir(uint32_t dir_cluster, const uint8_t sh
     }
 }
 
-static int fat32_make_short_alias(uint32_t dir_cluster, const char *name, uint8_t out[11])
+int fat32_make_short_alias(uint32_t dir_cluster, const char *name, uint8_t out[11])
 {
     const char *base_start = 0;
     const char *ext_start = 0;
@@ -838,7 +840,7 @@ static int fat32_make_short_alias(uint32_t dir_cluster, const char *name, uint8_
     return -28;
 }
 
-static uint8_t fat32_short_name_checksum(const uint8_t short_name[11])
+uint8_t fat32_short_name_checksum(const uint8_t short_name[11])
 {
     uint8_t sum = 0;
     for (uint32_t i = 0; i < 11; ++i) {
@@ -847,7 +849,7 @@ static uint8_t fat32_short_name_checksum(const uint8_t short_name[11])
     return sum;
 }
 
-static uint32_t fat32_utf16_name(const char *name, uint16_t *utf16, uint32_t cap)
+uint32_t fat32_utf16_name(const char *name, uint16_t *utf16, uint32_t cap)
 {
     uint32_t utf16_len = 0;
     if (text_utf8_to_utf16le(name, (uint32_t)storage_strlen(name), utf16, cap,
@@ -857,14 +859,14 @@ static uint32_t fat32_utf16_name(const char *name, uint16_t *utf16, uint32_t cap
     return utf16_len;
 }
 
-static uint32_t fat32_lfn_entry_count(const char *name)
+uint32_t fat32_lfn_entry_count(const char *name)
 {
     uint16_t utf16[260];
     uint32_t len = fat32_utf16_name(name, utf16, sizeof(utf16) / sizeof(utf16[0]));
     return (len + 12u) / 13u;
 }
 
-static void fat32_fill_lfn_entry(struct fat32_lfn *lfn,
+void fat32_fill_lfn_entry(struct fat32_lfn *lfn,
                                  const uint16_t *name, uint32_t name_len,
                                  uint32_t part_index, uint32_t part_count,
                                  uint8_t checksum)
@@ -898,7 +900,7 @@ static void fat32_fill_lfn_entry(struct fat32_lfn *lfn,
     }
 }
 
-static int fat32_find_in_dir(uint32_t dir_cluster, const char *name, struct storage_node *out)
+int fat32_find_in_dir(uint32_t dir_cluster, const char *name, struct storage_node *out)
 {
     uint32_t cluster = dir_cluster;
     uint16_t lfn_parts[20][13];
@@ -976,7 +978,7 @@ static int fat32_find_in_dir(uint32_t dir_cluster, const char *name, struct stor
     }
 }
 
-static int fat32_find_dirent_ref_in_dir(uint32_t dir_cluster, const char *name, struct fat32_dir_ref *out)
+int fat32_find_dirent_ref_in_dir(uint32_t dir_cluster, const char *name, struct fat32_dir_ref *out)
 {
     uint32_t cluster = dir_cluster;
     uint16_t lfn_parts[20][13];
@@ -1051,7 +1053,7 @@ static int fat32_find_dirent_ref_in_dir(uint32_t dir_cluster, const char *name, 
     }
 }
 
-static int fat32_update_dirent(const struct fat32_dir_ref *ref)
+int fat32_update_dirent(const struct fat32_dir_ref *ref)
 {
     int ret;
     if (!ref || ref->entry_cluster < 2 || ref->entry_offset + sizeof(struct fat32_dirent) > g_storage.cluster_bytes) {
@@ -1108,7 +1110,7 @@ static int fat32_name_needs_lfn(const char *name, uint8_t short_name[11], uint8_
     return 1;
 }
 
-static int fat32_find_free_dirent_span(uint32_t dir_cluster, uint32_t slots,
+int fat32_find_free_dirent_span(uint32_t dir_cluster, uint32_t slots,
                                        struct fat32_dir_span *out)
 {
     uint32_t cluster = dir_cluster;
@@ -1177,7 +1179,7 @@ static int fat32_find_free_dirent_span(uint32_t dir_cluster, uint32_t slots,
     }
 }
 
-static int fat32_create_dirent(uint32_t parent_cluster, const char *name, uint8_t attr,
+int fat32_create_dirent(uint32_t parent_cluster, const char *name, uint8_t attr,
                                uint32_t first_cluster, uint32_t size)
 {
     struct fat32_dir_span span;
@@ -1237,7 +1239,7 @@ static int fat32_create_dirent(uint32_t parent_cluster, const char *name, uint8_
     return 0;
 }
 
-static int fat32_delete_dirent(uint32_t dir_cluster, const char *name,
+int fat32_delete_dirent(uint32_t dir_cluster, const char *name,
                                struct fat32_dirent *deleted)
 {
     uint32_t cluster = dir_cluster;
@@ -1328,7 +1330,7 @@ static int fat32_delete_dirent(uint32_t dir_cluster, const char *name,
     }
 }
 
-static int fat32_delete_acl_metadata_file(uint32_t dir_cluster)
+int fat32_delete_acl_metadata_file(uint32_t dir_cluster)
 {
     struct storage_node meta;
     int ret = fat32_find_in_dir(dir_cluster, "LEONACL.SYS", &meta);
@@ -1354,7 +1356,7 @@ static int fat32_delete_acl_metadata_file(uint32_t dir_cluster)
     return 0;
 }
 
-static int fat32_dir_is_empty(uint32_t dir_cluster)
+int fat32_dir_is_empty(uint32_t dir_cluster)
 {
     uint32_t cluster = dir_cluster;
     for (;;) {
@@ -1393,7 +1395,7 @@ static int fat32_dir_is_empty(uint32_t dir_cluster)
     }
 }
 
-static int fat32_iter_dir_entry(uint32_t dir_cluster, uint64_t index, struct reliefos_dir_entry *entry)
+int fat32_iter_dir_entry(uint32_t dir_cluster, uint64_t index, struct reliefos_dir_entry *entry)
 {
     uint32_t cluster = dir_cluster;
     uint64_t emitted = 0;

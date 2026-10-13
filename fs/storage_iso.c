@@ -1,3 +1,4 @@
+#include "../block/storage_internal.h"
 static uint32_t iso_u32_le(const uint8_t *p)
 {
     return (uint32_t)p[0] |
@@ -14,7 +15,7 @@ static uint32_t iso_u32_be(const uint8_t *p)
            (uint32_t)p[3];
 }
 
-static int iso9660_mount(void)
+int iso9660_mount(void)
 {
     const uint8_t *pvd = storage_scratch;
     const uint8_t *root;
@@ -128,7 +129,7 @@ static void iso_copy_name(char *dst, uint32_t cap, const uint8_t *record_name,
     dst[out] = 0;
 }
 
-static int iso9660_find_in_dir(uint32_t extent, uint32_t size, const char *name,
+int iso9660_find_in_dir(uint32_t extent, uint32_t size, const char *name,
                                struct storage_node *out)
 {
     uint32_t offset = 0;
@@ -169,7 +170,7 @@ static int iso9660_find_in_dir(uint32_t extent, uint32_t size, const char *name,
     return -2;
 }
 
-static int iso9660_iter_dir_entry(uint32_t extent, uint32_t size, uint64_t index,
+int iso9660_iter_dir_entry(uint32_t extent, uint32_t size, uint64_t index,
                                   struct reliefos_dir_entry *entry)
 {
     uint32_t offset = 0;

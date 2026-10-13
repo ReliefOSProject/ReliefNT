@@ -10,11 +10,10 @@
  * an unrelated worker thread.
  */
 
+#include "storage_nvme.h"
+
 #define NVME_MAX_CONTROLLERS 8u
 #define NVME_QUEUE_DEPTH 32u
-#define NVME_PAGE_SIZE 4096u
-#define NVME_IO_BUFFER_PAGES 32u
-#define NVME_MAX_SECTORS (NVME_IO_BUFFER_PAGES * (NVME_PAGE_SIZE / SECTOR_SIZE))
 #define NVME_MAX_PRP_ENTRIES (NVME_IO_BUFFER_PAGES - 1u)
 #define NVME_WAIT_SPINS 40000000u
 #define NVME_MAX_NAMESPACE_SCAN_PAGES 8u
@@ -69,45 +68,7 @@ struct __attribute__((packed)) nvme_completion {
     uint16_t status;
 };
 
-struct nvme_controller {
-    uint8_t present;
-    uint8_t ready;
-    uint8_t bus;
-    uint8_t slot;
-    uint8_t function;
-    uint16_t controller_index;
-    uint8_t cq_phase_admin;
-    uint8_t cq_phase_io;
-    uint16_t queue_depth;
-    uint16_t admin_sq_tail;
-    uint16_t admin_cq_head;
-    uint16_t io_sq_tail;
-    uint16_t io_cq_head;
-    uint16_t next_command_id;
-    uint32_t doorbell_stride;
-    uint32_t namespace_count;
-    uint64_t cap;
-    volatile uint8_t *mmio;
-    uint64_t admin_sq_phys;
-    uint64_t admin_cq_phys;
-    uint64_t io_sq_phys;
-    uint64_t io_cq_phys;
-    uint64_t identify_phys;
-    uint64_t namespace_list_phys;
-    uint64_t io_buffer_phys;
-    uint64_t prp_list_phys;
-    struct nvme_command *admin_sq;
-    struct nvme_completion *admin_cq;
-    struct nvme_command *io_sq;
-    struct nvme_completion *io_cq;
-    uint8_t *identify_buffer;
-    uint8_t *namespace_list;
-    uint8_t *io_buffer;
-    uint64_t *prp_list;
-    uint32_t io_buffer_pages;
-    char model[41];
-    struct kernel_spinlock lock;
-};
+
 
 static struct nvme_controller g_nvme_controllers[NVME_MAX_CONTROLLERS];
 static uint32_t g_nvme_controller_count;
@@ -117,7 +78,7 @@ static void nvme_write32(const struct nvme_controller *controller, uint32_t offs
 static int nvme_wait_ready(const struct nvme_controller *controller, uint8_t wanted);
 static void nvme_release_controller_memory(struct nvme_controller *controller);
 
-static void nvme_reset_all_controllers(void)
+void nvme_reset_all_controllers(void)
 {
     for (uint32_t i = 0; i < g_nvme_controller_count; ++i) {
         struct nvme_controller *controller = &g_nvme_controllers[i];
@@ -713,7 +674,7 @@ static int nvme_readwrite_once(struct nvme_controller *controller, uint32_t nsid
     return ret;
 }
 
-static int nvme_readwrite(struct nvme_controller *controller, uint32_t nsid,
+int nvme_readwrite(struct nvme_controller *controller, uint32_t nsid,
                           uint64_t lba, uint32_t sector_count, void *buffer,
                           uint8_t write)
 {
@@ -731,7 +692,7 @@ static int nvme_readwrite(struct nvme_controller *controller, uint32_t nsid,
     return ret;
 }
 
-static int nvme_flush_cache(struct nvme_controller *controller, uint32_t nsid)
+int nvme_flush_cache(struct nvme_controller *controller, uint32_t nsid)
 {
     int ret;
     struct nvme_command command = {0};
@@ -814,7 +775,7 @@ static void nvme_register_namespace(struct nvme_controller *controller, uint32_t
     }
 }
 
-static void storage_scan_nvme_controller(uint8_t bus, uint8_t slot, uint8_t function,
+void storage_scan_nvme_controller(uint8_t bus, uint8_t slot, uint8_t function,
                                          uint8_t *root_ready)
 {
     struct nvme_controller *controller;

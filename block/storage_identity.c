@@ -1,3 +1,4 @@
+#include "storage_internal.h"
 void storage_boot_identity(struct reliefos_machine_identity *identity)
 {
     const struct storage_volume *root = &g_volumes[0];

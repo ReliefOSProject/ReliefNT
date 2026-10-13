@@ -1,29 +1,19 @@
+#include "../block/storage_internal.h"
 #include <reliefnt/page_cache.h>
 #include <reliefnt/permissions.h>
 
 /* Reference ext2 inodes independently of directory links. The storage execution
  * lock protects this list as well as lookup, unlink and inode allocation. */
-struct storage_inode_ref {
-    struct storage_inode_ref *next;
-    struct storage_node node;
-    uint64_t references;
-    bool unlinked;
-};
 static struct storage_inode_ref *storage_inode_refs;
-static int ext2_read_inode(uint32_t number, struct ext2_inode *out);
-static int ext2_destroy_inode(uint32_t inode_no, uint8_t directory);
-static int ext2_write_node(const struct storage_node *node, uint64_t offset, const void *buffer,
-                           uint32_t len, uint32_t *out_written);
-static int ext2_truncate_file(const struct storage_node *node, uint64_t length);
 
-static struct storage_inode_ref *storage_inode_find(uint32_t volume, uint32_t inode)
+struct storage_inode_ref *storage_inode_find(uint32_t volume, uint32_t inode)
 {
     for (struct storage_inode_ref *ref = storage_inode_refs; ref; ref = ref->next)
         if (ref->node.volume_id == volume && ref->node.first_cluster == inode) return ref;
     return NULL;
 }
 
-static bool storage_inode_volume_busy(uint32_t volume)
+bool storage_inode_volume_busy(uint32_t volume)
 {
     for (struct storage_inode_ref *ref = storage_inode_refs; ref; ref = ref->next)
         if (ref->node.volume_id == volume) return true;

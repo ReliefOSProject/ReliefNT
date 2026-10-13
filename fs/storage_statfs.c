@@ -1,3 +1,4 @@
+#include "../block/storage_internal.h"
 static bool ext2_statfs_super_group(uint32_t group, bool sparse)
 {
     if (!sparse || group <= 1) return true;

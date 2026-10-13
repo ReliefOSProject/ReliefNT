@@ -1,3 +1,4 @@
+#include "../drivers/storage/ide/storage_ide.h"
 static int storage_path_append_u32(char *path, uint32_t capacity, uint32_t *position,
                                    uint32_t value)
 {
@@ -112,7 +113,7 @@ int storage_parse_block_name(const char *name, uint32_t *disk_id,
     return -22;
 }
 
-static int storage_set_data_mount_path(struct storage_volume *volume, uint32_t disk_id,
+int storage_set_data_mount_path(struct storage_volume *volume, uint32_t disk_id,
                                        uint32_t partition_index)
 {
     uint32_t position;
@@ -184,7 +185,7 @@ static void storage_copy_disk_transport(struct storage_volume *volume,
 static int storage_mount_ext_family(struct storage_volume *root)
 { return storage_ext4_mount(root); }
 
-static int storage_try_mount_root_disk(struct install_disk_state *disk)
+int storage_try_mount_root_disk(struct install_disk_state *disk)
 {
     struct storage_volume *root = &g_volumes[STORAGE_VOLUME_ROOT];
     struct storage_volume *old = g_active_volume;
