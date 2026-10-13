@@ -7,8 +7,9 @@ KERNEL_LD_SCRIPT := $(RELIEFOS_SRC)/arch/x86_64/linker.ld
 # All device drivers are linked into kernel.sys itself; there are no separate
 # loadable .drv modules anymore.
 KERNEL_SOURCE_DIRS := kernel/reliefnt drivers/console drivers/bootstrap \
-	drivers/mouse drivers/serial drivers/e1000 drivers/ac97 drivers/es1371 \
-	drivers/hda arch mm fs net kernel/exec
+	drivers/input/mouse drivers/tty/serial drivers/net/e1000 \
+	drivers/sound/ac97 drivers/sound/es1371 drivers/sound/hda \
+	arch mm fs net kernel/exec
 # drivers/bootstrap/storage/*.c are textually included by the storage.c facade
 # and must not also become independent objects.
 KERNEL_SOURCE_EXCLUDE := drivers/bootstrap/storage
