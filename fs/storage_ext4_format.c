@@ -4,7 +4,7 @@
  * output views are left unspecified and a negative RELIEFOS_* errno is
  * returned (-RELIEFOS_EINVAL for format violations, -RELIEFOS_EOVERFLOW
  * for offset+size arithmetic overflow). */
-#include "../drivers/bootstrap/storage/storage_internal.h"
+#include "../block/storage_internal.h"
 
 /* Field offsets in the little-endian on-disk structs (linux/fs/ext4/
  * ext4.h and ext4_extents.h, Linux v7.3-rc5 reference tree). */

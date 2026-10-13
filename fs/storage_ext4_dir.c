@@ -1,7 +1,7 @@
 /* Native ext-family directory records and bounded two-level HTREEs.
  * Disk layout and hash behavior follow the ext4 format specification. No
  * directory-sized table is retained: splits sort at most one leaf's entries. */
-#include "../drivers/bootstrap/storage/storage_internal.h"
+#include "../block/storage_internal.h"
 
 static int ed_bad(struct storage_volume *v) { v->ext4.fs_error=1; return -RELIEFOS_EIO; }
 static unsigned ed_name_len(const char *s)

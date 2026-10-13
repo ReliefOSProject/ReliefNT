@@ -4,7 +4,7 @@
  * the revoke table uses a bounded-memory rescan instead of dropping revokes.
  * All entry points require the storage execution lock (never a device lock).
  * Sources: Linux fs/jbd2/{journal,commit,recovery}.c, include/linux/jbd2.h. */
-#include "../drivers/bootstrap/storage/storage_internal.h"
+#include "../block/storage_internal.h"
 #define EJ_MAGIC 0xc03b3998u
 #define EJ_CSUM2 8u
 #define EJ_CSUM3 16u

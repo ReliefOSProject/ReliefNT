@@ -1,6 +1,6 @@
 /* Explicit-volume VFS adapters. Only the compatibility wrappers consult the
  * active-volume selector; the backend and this operation table never do. */
-#include "../drivers/bootstrap/storage/storage_internal.h"
+#include "../block/storage_internal.h"
 
 static uint32_t ev_type(uint16_t mode)
 {

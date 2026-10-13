@@ -238,7 +238,7 @@ int storage_resolve_path(const char *cwd, const char *input, char *out, uint32_t
     return 0;
 }
 
-#include "storage_devlinks.c"
+#include "../block/storage_devlinks.c"
 
 static int storage_lookup_path_unlocked(const char *path, struct storage_node *out)
 {

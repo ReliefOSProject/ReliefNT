@@ -11,13 +11,12 @@ KERNEL_SOURCE_DIRS := kernel/reliefnt drivers/console drivers/bootstrap \
 	drivers/sound/ac97 drivers/sound/es1371 drivers/sound/hda \
 	drivers/video/vga drivers/video/framebuffer drivers/video/svga \
 	drivers/usb/uhci drivers/storage/ide drivers/storage/ahci \
-	drivers/storage/nvme firmware \
+	drivers/storage/nvme firmware block \
 	arch mm fs net kernel/exec
 # The storage_*.c modules are textually included by the storage.c facade and
 # must not also become independent objects: they share one translation unit
-# wherever they live (drivers/bootstrap/storage/, fs/, drivers/storage/).
+# wherever they live (block/, fs/, drivers/storage/, kernel/reliefnt/audio/).
 # "storage.c" itself is the facade and must keep compiling as that single unit.
-KERNEL_SOURCE_EXCLUDE := drivers/bootstrap/storage
 
 KERNEL_SOURCES_LIST := $(O_OBJ)/kernel/sources.list
 KERNEL_SOURCES_MK := $(O_OBJ)/kernel/sources.mk
@@ -69,8 +68,7 @@ $(if $(RELIEFOS_PASSIVE),,$(eval $(call RELIEFOS_SIGNATURE_RULE,kernel-link)))
 # it: a fresh output directory builds host tools on demand.
 $(KERNEL_SOURCES_LIST): FORCE $(RELIEFOS_EMIT)
 	$(Q)mkdir -p $(dir $@)
-	$(Q)find $(KERNEL_SOURCE_DIRS) \( -path '$(KERNEL_SOURCE_EXCLUDE)/*' -o \
-	    -name 'storage_*.c' \) -prune -o \
+	$(Q)find $(KERNEL_SOURCE_DIRS) -name 'storage_*.c' -prune -o \
 	    -type f \( -name '*.c' -o -name '*.S' \) -print \
 	  | LC_ALL=C sort > $@.tmp
 	$(Q)$(RELIEFOS_EMIT) --input $@.tmp --output $@
@@ -129,14 +127,15 @@ $(O_OBJ)/kernel/%.S.o: $(RELIEFOS_SRC)/%.S $(O_META)/kernel-as.sig
 $(O_OBJ)/kernel/kernel/reliefnt/version.c.o: $(BUILD_INFO_HEADER)
 
 # The storage facade textually includes its private modules wherever they
-# live: the remaining glue under storage/, the fs families under fs/ and the
-# controller drivers under drivers/storage/.
+# live: the block core under block/, the fs families under fs/, the
+# controller drivers under drivers/storage/ and the audio namespace glue.
 $(O_OBJ)/kernel/drivers/bootstrap/storage.c.o: \
-	$(wildcard $(RELIEFOS_SRC)/drivers/bootstrap/storage/*.c) \
+	$(wildcard $(RELIEFOS_SRC)/block/storage_*.c) \
 	$(wildcard $(RELIEFOS_SRC)/fs/storage_*.c) \
 	$(wildcard $(RELIEFOS_SRC)/fs/storage_*.inc) \
 	$(wildcard $(RELIEFOS_SRC)/drivers/storage/*/storage_*.c) \
-	$(RELIEFOS_SRC)/drivers/bootstrap/storage/storage_internal.h
+	$(RELIEFOS_SRC)/kernel/reliefnt/audio/storage_audio.c \
+	$(RELIEFOS_SRC)/block/storage_internal.h
 
 # --- generated inputs -------------------------------------------------------
 $(BUILD_INFO_HEADER): $(RELIEFOS_SRC)/configs/build-version $(RELIEFOS_VERSION_TOOL) $(O_META)/version.sig \

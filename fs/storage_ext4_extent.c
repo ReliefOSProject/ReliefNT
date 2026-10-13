@@ -1,7 +1,7 @@
 /* Bounded, non-recursive extent/indirect lookup. Callers serialize a volume
  * through the storage execution lock; no pointer survives a cache lookup.
  * Linux fs/ext4/extents.c and ext4_extents.h define the disk format. */
-#include "../drivers/bootstrap/storage/storage_internal.h"
+#include "../block/storage_internal.h"
 
 static int ext4_map_bad(struct storage_volume *volume)
 {
