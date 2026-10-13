@@ -1,7 +1,7 @@
 /* Inline and single-block ext4 extended attributes, including shared-block
  * copy-on-write. Namespace authorization belongs to the VFS/LSM owner; this
  * backend exposes user.* and preserves other on-disk namespaces unchanged. */
-#include "storage_internal.h"
+#include "../drivers/bootstrap/storage/storage_internal.h"
 #define AX_MAGIC 0xea020000u
 struct ax_item { const uint8_t *name,*value; uint32_t size; uint8_t index,len; };
 struct ax_context {

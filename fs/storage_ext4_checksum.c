@@ -13,7 +13,7 @@
  *   -RELIEFOS_EIO   checksum mismatch
  *   -RELIEFOS_EINVAL  NULL pointer or out-of-range length/size argument
  */
-#include "storage_internal.h"
+#include "../drivers/bootstrap/storage/storage_internal.h"
 
 /* On-disk offsets (linux/fs/ext4/ext4.h:1369/402/231). */
 #define CS_SB_FEATURE_RO_COMPAT 0x64

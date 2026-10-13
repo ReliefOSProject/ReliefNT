@@ -1,6 +1,6 @@
 /* Native ext-family inode reads and range I/O. Higher VFS operations are
  * added after journaled mutations (tasks 8-11). */
-#include "storage_internal.h"
+#include "../drivers/bootstrap/storage/storage_internal.h"
 bool storage_ext4_is_ext_family(const struct storage_volume *v)
 { return v && (v->filesystem==STORAGE_FILESYSTEM_EXT2 || v->filesystem==STORAGE_FILESYSTEM_EXT4); }
 

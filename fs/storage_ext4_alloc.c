@@ -23,7 +23,7 @@
  * superblock free counts and the cached descriptor/bitmap/superblock blocks
  * (storage_ext4_cache_mark_dirty); journal handles wrap these dirty
  * metadata updates through the task 7 transaction wrappers below. */
-#include "storage_internal.h"
+#include "../drivers/bootstrap/storage/storage_internal.h"
 
 /* Group descriptor field offsets (ext4.h:402-432). */
 #define AGD_BLOCK_BITMAP_LO 0x00

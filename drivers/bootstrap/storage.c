@@ -1,36 +1,38 @@
 /*
  * ReliefOS storage facade.
  *
- * The implementation is split by responsibility under storage/.  These
- * modules are included into one translation unit deliberately: the storage
- * cache, active-volume selector, and transport scratch buffers remain private
- * to the storage subsystem while each feature has a focused source file.
+ * The implementation is split by responsibility: filesystem families live
+ * under fs/, storage controllers under drivers/storage/, and the remaining
+ * storage-module glue under storage/.  These modules are included into one
+ * translation unit deliberately: the storage cache, active-volume selector,
+ * and transport scratch buffers remain private to the storage subsystem
+ * while each feature has a focused source file.
  */
 #include "storage/storage_internal.h"
 #include <reliefnt/tmpfs.h>
 #include "storage/storage_state.c"
-#include "storage/storage_ext2_cache.c"
-#include "storage/storage_ide.c"
-#include "storage/storage_ahci.c"
-#include "storage/storage_nvme.c"
+#include "../../fs/storage_ext2_cache.c"
+#include "../storage/ide/storage_ide.c"
+#include "../storage/ahci/storage_ahci.c"
+#include "../storage/nvme/storage_nvme.c"
 #include "storage/storage_block.c"
-#include "storage/storage_ext4_format.c"
-#include "storage/storage_ext4_checksum.c"
-#include "storage/storage_ext4_cache.c"
-#include "storage/storage_ext4_alloc.c"
-#include "storage/storage_ext4_extent.c"
-#include "storage/storage_ext4_ops.c"
-#include "storage/storage_ext4_xattr.c"
-#include "storage/storage_ext4_journal.c"
-#include "storage/storage_ext4_dir.c"
+#include "../../fs/storage_ext4_format.c"
+#include "../../fs/storage_ext4_checksum.c"
+#include "../../fs/storage_ext4_cache.c"
+#include "../../fs/storage_ext4_alloc.c"
+#include "../../fs/storage_ext4_extent.c"
+#include "../../fs/storage_ext4_ops.c"
+#include "../../fs/storage_ext4_xattr.c"
+#include "../../fs/storage_ext4_journal.c"
+#include "../../fs/storage_ext4_dir.c"
 #include "storage/storage_sync.c"
-#include "storage/storage_iso.c"
-#include "storage/storage_fat32.c"
+#include "../../fs/storage_iso.c"
+#include "../../fs/storage_fat32.c"
 #include "storage/storage_inode.c"
-#include "storage/storage_ext4_vfs.c"
-#include "storage/storage_ext2.c"
-#include "storage/storage_exfat.c"
-#include "storage/storage_ext4_mount.c"
+#include "../../fs/storage_ext4_vfs.c"
+#include "../../fs/storage_ext2.c"
+#include "../../fs/storage_exfat.c"
+#include "../../fs/storage_ext4_mount.c"
 #include "storage/storage_mount.c"
 #include "storage/storage_audio.c"
 #include "storage/storage_vfs.c"
