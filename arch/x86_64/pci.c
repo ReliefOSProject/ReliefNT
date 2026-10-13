@@ -161,15 +161,91 @@ int pci_read_device(uint8_t bus, uint8_t slot, uint8_t function,
     return 0;
 }
 
-/**
- * Pci find device.
- * @param vendor_id Identifier or flags controlling the operation.
- * @param device_id Identifier or flags controlling the operation.
- * @param out Output storage updated by the function.
- * @return The value or status produced by the operation.
+/* PCI enumeration cache. A full config-space probe walks 256*32*8 addresses and
+ * costs one CF8/CFC transaction each; under hardware virtualization every one of
+ * those is a VM exit. Drivers used to pay that scan once per pci_find_device call
+ * (e1000 alone issues several per init). The cache records the present functions
+ * once in bus/slot/function order and serves every lookup from the snapshot.
  */
-int pci_find_device(uint16_t vendor_id, uint16_t device_id,
-                    struct pci_device *out)
+struct pci_cache_entry {
+    struct pci_device dev;
+    uint8_t header_type;
+    uint8_t enum_visible;
+};
+
+#define PCI_CACHE_MAX 256u
+
+static struct pci_cache_entry pci_cache[PCI_CACHE_MAX];
+static uint32_t pci_cache_count;
+static int pci_cache_overflow;
+static volatile int pci_cache_ready;
+static struct kernel_spinlock pci_enum_lock = KERNEL_SPINLOCK_INIT;
+
+/** @brief Snapshot every present function in stable bus/slot/function order.
+ * @return None. Caller holds pci_enum_lock; per-read config lock taken inside.
+ */
+static void pci_scan_fill(void)
+{
+    pci_cache_count = 0;
+    pci_cache_overflow = 0;
+    for (uint16_t bus = 0; bus < 256; ++bus) {
+        for (uint8_t slot = 0; slot < 32; ++slot) {
+            uint8_t multifunction = 0;
+            for (uint8_t function = 0; function < 8; ++function) {
+                struct pci_device dev;
+                if (pci_read_device((uint8_t)bus, slot, function, &dev) < 0) {
+                    if (function == 0) {
+                        break;
+                    }
+                    continue;
+                }
+                uint8_t header = (uint8_t)((pci_config_read32((uint8_t)bus, slot,
+                                            function, 0x0c) >> 16) & 0xffu);
+                if (function == 0) {
+                    multifunction = (uint8_t)(header & 0x80u);
+                }
+                if (pci_cache_count >= PCI_CACHE_MAX) {
+                    pci_cache_overflow = 1;
+                    continue;
+                }
+                struct pci_cache_entry *entry = &pci_cache[pci_cache_count++];
+                entry->dev = dev;
+                entry->header_type = header;
+                /* pci_enumerate's historical walk breaks past function 0 of a
+                 * non-multifunction device; mirror that so only function 0 of
+                 * such a slot is visible to enumeration. */
+                entry->enum_visible = (function == 0 || multifunction) ? 1u : 0u;
+            }
+        }
+    }
+}
+
+/** @brief Build the enumeration snapshot on first use.
+ * @return None. Double-checked under a lock disjoint from the non-recursive
+ * config lock, so the fill can take the config lock per read without deadlock.
+ */
+static void pci_cache_ensure(void)
+{
+    uint64_t flags;
+    if (pci_cache_ready) {
+        return;
+    }
+    kernel_spin_lock_irqsave(&pci_enum_lock, &flags);
+    if (!pci_cache_ready) {
+        pci_scan_fill();
+        pci_cache_ready = 1;
+    }
+    kernel_spin_unlock_irqrestore(&pci_enum_lock, flags);
+}
+
+/** @brief Brute-force first-match scan, used only when the snapshot overflowed.
+ * @param vendor_id Vendor half of the device identity.
+ * @param device_id Device half of the device identity.
+ * @param out Receives the first match in bus/slot/function order.
+ * @return 0 on match, -1 when absent.
+ */
+static int pci_live_find(uint16_t vendor_id, uint16_t device_id,
+                         struct pci_device *out)
 {
     for (uint16_t bus = 0; bus < 256; ++bus) {
         for (uint8_t slot = 0; slot < 32; ++slot) {
@@ -193,6 +269,54 @@ int pci_find_device(uint16_t vendor_id, uint16_t device_id,
     return -1;
 }
 
+/** @brief Brute-force ordinal lookup, used only when the snapshot overflowed.
+ * @param index Zero-based ordinal among enumerate-visible functions.
+ * @param out Receives the index-th module-facing identity.
+ * @return 0, -EINVAL or -ENODEV, matching pci_enumerate.
+ */
+static int pci_live_nth(uint32_t index, struct reliefos_driver_pci_device *out)
+{
+    for (uint32_t b = 0; b < 256; ++b) for (uint32_t s = 0; s < 32; ++s)
+        for (uint32_t f = 0; f < 8; ++f) {
+            struct pci_device d;
+            if (pci_read_device(b, s, f, &d) < 0) { if (!f) break; continue; }
+            uint8_t header = (pci_config_read32(b, s, f, 0x0c) >> 16) & 0xff;
+            if (!index--) {
+                *out = (struct reliefos_driver_pci_device){.bus=b,.slot=s,.function=f,
+                    .class_code=d.class_code,.vendor_id=d.vendor_id,.device_id=d.device_id,
+                    .subclass=d.subclass,.prog_if=d.prog_if,.header_type=header}; return 0;
+            }
+            if (!f && !(header & 0x80)) break;
+        }
+    return -19;
+}
+
+/**
+ * Pci find device.
+ * @param vendor_id Identifier or flags controlling the operation.
+ * @param device_id Identifier or flags controlling the operation.
+ * @param out Output storage updated by the function.
+ * @return The value or status produced by the operation.
+ */
+int pci_find_device(uint16_t vendor_id, uint16_t device_id,
+                    struct pci_device *out)
+{
+    pci_cache_ensure();
+    if (pci_cache_overflow) {
+        return pci_live_find(vendor_id, device_id, out);
+    }
+    for (uint32_t i = 0; i < pci_cache_count; ++i) {
+        struct pci_device *dev = &pci_cache[i].dev;
+        if (dev->vendor_id == vendor_id && dev->device_id == device_id) {
+            if (out) {
+                *out = *dev;
+            }
+            return 0;
+        }
+    }
+    return -1;
+}
+
 /** @brief Enumerate every present PCI function by stable bus/slot/function index.
  * @param index Zero-based ordinal among present functions.
  * @param out Receives complete module-facing identity; borrowed output.
@@ -201,18 +325,24 @@ int pci_find_device(uint16_t vendor_id, uint16_t device_id,
 int pci_enumerate(uint32_t index, struct reliefos_driver_pci_device *out)
 {
     if (!out) return -22;
-    for (uint32_t b = 0; b < 256; ++b) for (uint32_t s = 0; s < 32; ++s)
-        for (uint32_t f = 0; f < 8; ++f) {
-            struct pci_device d;
-            if (pci_read_device(b,s,f,&d) < 0) { if (!f) break; continue; }
-            uint8_t header = (pci_config_read32(b,s,f,0x0c) >> 16) & 0xff;
-            if (!index--) {
-                *out = (struct reliefos_driver_pci_device){.bus=b,.slot=s,.function=f,
-                    .class_code=d.class_code,.vendor_id=d.vendor_id,.device_id=d.device_id,
-                    .subclass=d.subclass,.prog_if=d.prog_if,.header_type=header}; return 0;
-            }
-            if (!f && !(header & 0x80)) break;
+    pci_cache_ensure();
+    if (pci_cache_overflow) {
+        return pci_live_nth(index, out);
+    }
+    for (uint32_t i = 0; i < pci_cache_count; ++i) {
+        struct pci_cache_entry *entry = &pci_cache[i];
+        if (!entry->enum_visible) {
+            continue;
         }
+        if (!index--) {
+            struct pci_device *d = &entry->dev;
+            *out = (struct reliefos_driver_pci_device){.bus=d->bus,.slot=d->slot,
+                .function=d->function,.class_code=d->class_code,
+                .vendor_id=d->vendor_id,.device_id=d->device_id,
+                .subclass=d->subclass,.prog_if=d->prog_if,
+                .header_type=entry->header_type}; return 0;
+        }
+    }
     return -19;
 }
 
