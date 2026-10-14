@@ -99,6 +99,18 @@ uint64_t paging_kernel_cr3(void);
  */
 void paging_load_cr3(uint64_t cr3);
 /**
+ * @brief Reload CR3 on return-to-user only when the address space changed since the last load.
+ */
+void paging_load_cr3_if_changed(uint64_t cr3);
+/**
+ * @brief Record that a mapping changed so the next user return reloads CR3.
+ */
+void paging_note_mm_change(void);
+/**
+ * @brief Current mm-change sequence, for the conditional CR3 reload check.
+ */
+uint64_t paging_mm_change_seq(void);
+/**
  * @brief Return true when [phys, phys + len) is reachable through the shared kernel direct map.
  */
 bool paging_kernel_direct_map_range(uint64_t phys, uint64_t len);

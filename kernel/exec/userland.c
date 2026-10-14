@@ -542,6 +542,11 @@ static bool userland_load_task_image(struct task *task)
     bool result;
     uint64_t execution_flags;
     uint64_t loader_flags;
+    /* An already-started task with a live user RIP needs no image work; skip
+     * the execution/loader lock round-trip entirely (matches the early-out in
+     * userland_load_task_image_locked). This is the per-return hot path. */
+    if (task && (task->flags & TASK_FLAG_STARTED) && task->frame.rip != 0)
+        return true;
     /* Keep the lock order consistent with page-fault lazy mapping:
      * execution transaction -> ELF scratch lock -> storage.  Taking the ELF
      * lock first here used to deadlock with a CPU handling a file-backed page
@@ -700,8 +705,8 @@ retry:
             if (sched_task_pending(current) & ~current->blocked_signals) {
                 arch_fpu_save(current->fpu_state);
                 live_fpu_saved = 1;
+                (void)kernel_signal_deliver_pending(current, frame);
             }
-            (void)kernel_signal_deliver_pending(current, frame);
             if (current->state != TASK_EXITED && !sched_capture_current_user_frame(frame)) {
                 console_printf("[reliefnt] rejected scheduler frame pid=%u rip=0x%llx cs=0x%llx\n",
                                current->pid,
@@ -709,6 +714,17 @@ retry:
                                (unsigned long long)frame->cs);
                 kernel_execution_unlock_irqrestore(execution_flags);
                 return NULL;
+            }
+            /* Fast path: same user task resumes with no delivered signal and no
+             * pending reschedule. The return frame is captured above; skip the
+             * whole scheduler round (fair_sync O(CPUs+tasks) + pick + bookkeeping)
+             * that would otherwise run on every syscall return. */
+            if (!live_fpu_saved && !sched_need_resched &&
+                current->kind == TASK_KIND_USER &&
+                (current->state == TASK_RUNNING || current->state == TASK_READY)) {
+                arch_set_user_fs(current->fs_base);
+                kernel_execution_unlock_irqrestore(execution_flags);
+                return current;
             }
         } else {
             console_printf("[reliefnt] ignored invalid scheduler frame pid=%u rip=0x%llx cs=0x%llx\n",

@@ -167,9 +167,50 @@ uint64_t paging_kernel_cr3(void)
  * Paging load cr3.
  * @param cr3 Value supplied by the caller.
  */
+static volatile uint64_t mm_change_seq;
+static uint64_t cr3_loaded[SMP_MAX_CPUS];
+static uint64_t cr3_loaded_seq[SMP_MAX_CPUS];
+
 void paging_load_cr3(uint64_t cr3)
 {
-    x86_64_load_cr3(cr3 ? cr3 : paging_kernel_cr3());
+    uint64_t value = cr3 ? cr3 : paging_kernel_cr3();
+    x86_64_load_cr3(value);
+    uint32_t cpu = smp_current_cpu();
+    cr3_loaded[cpu] = value;
+    cr3_loaded_seq[cpu] = mm_change_seq;
+}
+
+/**
+ * @brief Record that a mapping changed so the next user return reloads CR3.
+ */
+void paging_note_mm_change(void)
+{
+    ++mm_change_seq;
+}
+
+/**
+ * @brief Current mm-change sequence, for the conditional CR3 reload check.
+ */
+uint64_t paging_mm_change_seq(void)
+{
+    return mm_change_seq;
+}
+
+/**
+ * @brief Reload CR3 on return-to-user only when the address space changed.
+ *
+ * The per-page invlpg at each mapping site already drops the specific stale
+ * translation; a return to the same task that mapped nothing keeps its live
+ * TLB.  The sequence check reloads conservatively after any mapping change,
+ * preserving the full non-global flush the lazy loader and munmap rely on.
+ */
+void paging_load_cr3_if_changed(uint64_t cr3)
+{
+    uint64_t value = cr3 ? cr3 : paging_kernel_cr3();
+    uint32_t cpu = smp_current_cpu();
+    if (value == cr3_loaded[cpu] && mm_change_seq == cr3_loaded_seq[cpu])
+        return;
+    paging_load_cr3(value);
 }
 
 bool paging_kernel_direct_map_range(uint64_t phys, uint64_t len)
@@ -398,7 +439,7 @@ bool address_space_clone_cow(struct address_space *source, struct address_space 
                 flags |= RELIEFNT_PAGE_COW;
                 source->user_pt[table][slot] = phys | (entry & RELIEFNT_PAGE_PRESENT) |
                                                RELIEFNT_PAGE_USER | flags;
-                x86_64_invlpg(page);
+                x86_64_invlpg(page); paging_note_mm_change();
             }
             if (entry & RELIEFNT_PAGE_DEVICE) {
                 cached = 0;
@@ -517,6 +558,7 @@ bool address_space_prepare_user_range(struct address_space *as, uint64_t start,
             as->pd[LOW_PD_INDEX][RELIEFNT_USER_PD_START + table] =
                 prepared[table] | RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE | RELIEFNT_PAGE_USER;
             x86_64_invlpg(RELIEFNT_USER_BASE + table * RELIEFNT_USER_PD_BYTES);
+            paging_note_mm_change();
         }
     }
     return true;
@@ -565,7 +607,7 @@ bool address_space_map_user_page(struct address_space *as, uint64_t vaddr,
     as->user_pt[table][slot] = phys | RELIEFNT_PAGE_USER | flags |
         ((flags & RELIEFNT_PAGE_PROTNONE) ? 0 : RELIEFNT_PAGE_PRESENT);
     ++as->user_page_count;
-    x86_64_invlpg(page);
+    x86_64_invlpg(page); paging_note_mm_change();
     return true;
 }
 
@@ -612,7 +654,7 @@ bool address_space_protect_user_page(struct address_space *as, uint64_t vaddr,
     as->user_pt[table][slot] = (entry & RELIEFNT_PHYS_ADDR_MASK) |
         RELIEFNT_PAGE_USER | flags |
         ((flags & RELIEFNT_PAGE_PROTNONE) ? 0 : RELIEFNT_PAGE_PRESENT);
-    x86_64_invlpg(page);
+    x86_64_invlpg(page); paging_note_mm_change();
     return true;
 }
 
@@ -645,7 +687,7 @@ uint64_t address_space_unmap_user_page(struct address_space *as, uint64_t vaddr)
     if (as->user_page_count) {
         --as->user_page_count;
     }
-    x86_64_invlpg(page);
+    x86_64_invlpg(page); paging_note_mm_change();
     return entry & RELIEFNT_PHYS_ADDR_MASK;
 }
 
@@ -690,6 +732,7 @@ bool address_space_retry_mapped_user_page(const struct address_space *as,
     /* A peer sharing this mm may have resolved the same fault before this
      * CPU acquired the fault lock. Discard its old translation before retry. */
     x86_64_invlpg(align_down(vaddr, PAGE_SIZE));
+    paging_note_mm_change();
     return true;
 }
 
@@ -856,7 +899,7 @@ bool address_space_handle_cow_fault(struct address_space *as, uint64_t vaddr)
                                RELIEFNT_PAGE_WRITABLE | RELIEFNT_PAGE_NOEXEC |
                                (entry & (RELIEFNT_PAGE_PWT | RELIEFNT_PAGE_PCD |
                                          RELIEFNT_PAGE_PAT));
-    x86_64_invlpg(page);
+    x86_64_invlpg(page); paging_note_mm_change();
     if (page_cache_owns(old_phys)) page_cache_release(old_phys);
     else mm_free_page(old_phys);
     return true;

@@ -4,6 +4,7 @@
  */
 #include <reliefnt/console.h>
 #include <reliefnt/types.h>
+#include <reliefnt/smp.h>
 
 #define X86_CR0_MP (1ULL << 1)
 #define X86_CR0_EM (1ULL << 2)
@@ -29,7 +30,16 @@ static uint64_t read_msr(uint32_t msr)
 
 void arch_set_user_fs(uint64_t base)
 {
+    /* FS_BASE is a per-CPU MSR; skip the wrmsr (a VM-exit under KVM) when this
+     * CPU already holds the value, e.g. the same task resuming after a syscall. */
+    static uint64_t fs_base_loaded[SMP_MAX_CPUS];
+    static uint8_t fs_base_valid[SMP_MAX_CPUS];
+    uint32_t cpu = smp_current_cpu();
+    if (fs_base_valid[cpu] && base == fs_base_loaded[cpu])
+        return;
     write_msr(X86_IA32_FS_BASE, base);
+    fs_base_loaded[cpu] = base;
+    fs_base_valid[cpu] = 1;
 }
 
 uint64_t arch_get_user_fs(void)

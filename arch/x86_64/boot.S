@@ -225,8 +225,10 @@ arch_enter_user:
 .global arch_enter_user_frame
 .type arch_enter_user_frame, @function
 arch_enter_user_frame:
-    mov %rsi, %cr3
-    mov %rdi, %rsp
+    mov %rdi, %r14
+    mov %rsi, %rdi
+    call paging_load_cr3_if_changed
+    mov %r14, %rsp
     jmp trap_restore_frame
 
 .macro ISR_NOERR name vector
@@ -343,8 +345,10 @@ isr14_stub:
     mov %r13, %rsi
     test %rdi, %rdi
     jz 1f
-    mov %rsi, %cr3
-    mov %rdi, %rsp
+    mov %rdi, %r14
+    mov %rsi, %rdi
+    call paging_load_cr3_if_changed
+    mov %r14, %rsp
     jmp trap_restore_frame
 1:
     jmp trap_restore_frame
@@ -388,8 +392,10 @@ isr14_stub:
     mov %r13, %rsi
     test %rdi, %rdi
     jz 1f
-    mov %rsi, %cr3
-    mov %rdi, %rsp
+    mov %rdi, %r14
+    mov %rsi, %rdi
+    call paging_load_cr3_if_changed
+    mov %r14, %rsp
     jmp trap_restore_frame
 1:
     jmp trap_restore_frame
@@ -453,8 +459,10 @@ isr80_stub:
     mov %r13, %rsi
     test %rdi, %rdi
     jz 1f
-    mov %rsi, %cr3
-    mov %rdi, %rsp
+    mov %rdi, %r14
+    mov %rsi, %rdi
+    call paging_load_cr3_if_changed
+    mov %r14, %rsp
     jmp trap_restore_frame
 1:
     /* A syscall that terminates or replaces the current task must never
@@ -512,11 +520,14 @@ x86_64_syscall_entry:
     mov %r13, %rsi
     test %rdi, %rdi
     jz 2f
-    /* The CR3 write is unconditional on purpose: without PCID the TLB is
-     * not address-space tagged, and munmap/remap and the lazy image loader
-     * rely on this full non-global flush to drop stale user translations. */
-    mov %rsi, %cr3
-    mov %rdi, %rsp
+    /* Reload CR3 only when the address space changed: without PCID the TLB is
+     * not address-space tagged, so a mapping change needs the full non-global
+     * flush that paging_load_cr3_if_changed preserves; a return to the same
+     * task that mapped nothing keeps its live TLB instead of flushing. */
+    mov %rdi, %r14
+    mov %rsi, %rdi
+    call paging_load_cr3_if_changed
+    mov %r14, %rsp
     jmp syscall_trap_restore_frame
 2:
     mov %rsp, %rdi

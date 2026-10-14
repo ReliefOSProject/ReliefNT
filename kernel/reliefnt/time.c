@@ -329,24 +329,51 @@ uint64_t time_ticks(void)
     return ticks;
 }
 
+/** @brief Nanoseconds elapsed since the last tick anchor, sub-tick TSC-resolved.
+ * @return Interpolated fraction in [0, one nominal tick]; 0 when TSC not ready.
+ * Caller holds the clock lock, so the anchor/rate cannot change mid-read.
+ */
+static uint64_t time_subtick_fraction_ns(void)
+{
+    if (!tsc_ready) return 0;
+    uint64_t rate = tsc_per_us;
+    if (!rate) return 0;
+    uint64_t now = time_rdtsc();
+    if (now < tsc_anchor) return 0;
+    uint64_t frac_ns = ((now - tsc_anchor) / rate) * 1000ULL;
+    uint64_t tick_ns = 1000000000ULL / RELIEFNT_TICK_HZ;
+    return frac_ns > tick_ns ? tick_ns : frac_ns;
+}
+
 /** @brief Read a consistent clock snapshot with the timekeeper lock held. */
 static int time_clock_get_locked(int32_t clock, struct linux_timespec *value)
 {
+    uint64_t fraction;
     switch (clock) {
     case LINUX_CLOCK_REALTIME:
-    case LINUX_CLOCK_REALTIME_COARSE:
     case 11: /* CLOCK_TAI */
+        fraction = time_subtick_fraction_ns();
+        value->tv_sec = wall_clock_valid ? (int64_t)wall_unix_seconds : (int64_t)monotonic_seconds;
+        value->tv_nsec = (wall_clock_valid ? wall_fraction_ns : monotonic_ns) + fraction;
+        if (value->tv_nsec >= 1000000000LL) { value->tv_nsec -= 1000000000LL; ++value->tv_sec; }
+        if (clock == 11) value->tv_sec += time_discipline_tai();
+        return 0;
+    case LINUX_CLOCK_REALTIME_COARSE:
         value->tv_sec = wall_clock_valid ? (int64_t)wall_unix_seconds : (int64_t)monotonic_seconds;
         value->tv_nsec = wall_clock_valid ? wall_fraction_ns : monotonic_ns;
-        if (clock == 11) value->tv_sec += time_discipline_tai();
         return 0;
     case LINUX_CLOCK_MONOTONIC_RAW:
         value->tv_sec = ticks / RELIEFNT_TICK_HZ;
         value->tv_nsec = ticks % RELIEFNT_TICK_HZ * (1000000000ULL / RELIEFNT_TICK_HZ);
         return 0;
     case LINUX_CLOCK_MONOTONIC:
-    case LINUX_CLOCK_MONOTONIC_COARSE:
     case LINUX_CLOCK_BOOTTIME:
+        fraction = time_subtick_fraction_ns();
+        value->tv_sec = monotonic_seconds;
+        value->tv_nsec = monotonic_ns + fraction;
+        if (value->tv_nsec >= 1000000000LL) { value->tv_nsec -= 1000000000LL; ++value->tv_sec; }
+        return 0;
+    case LINUX_CLOCK_MONOTONIC_COARSE:
         value->tv_sec = monotonic_seconds;
         value->tv_nsec = monotonic_ns;
         return 0;

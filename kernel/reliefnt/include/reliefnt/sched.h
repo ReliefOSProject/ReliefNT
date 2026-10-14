@@ -935,6 +935,9 @@ void sched_quiesce_exited_current(void);
  * @return CPU-reserved task, or NULL with the kernel CR3 active.
  */
 struct task *sched_select_next_user(void);
+/* Nonzero when a reschedule is warranted; a returning task may skip the full
+ * scheduler round while this is clear. See sched_select_next_user. */
+extern volatile int sched_need_resched;
 /* Reclaim the task just saved by this CPU when no other task is runnable. */
 struct task *sched_reclaim_current_user(void);
 struct trap_frame *sched_task_frame(struct task *task);

@@ -33,9 +33,16 @@
  * because wait queues and interrupt paths may retain struct task pointers. */
 static struct task **tasks;
 static uint32_t task_count;
+/* Set when a reschedule is warranted (tick, wakeup); a returning task may skip
+ * the full scheduler round while this is clear. Cleared by sched_select_next_user. */
+volatile int sched_need_resched;
 static uint32_t task_capacity;
 static uint32_t next_pid = 1;
 static uint32_t current_pid[SMP_MAX_CPUS];
+/* Per-CPU O(1) mirror of the task owning current_pid[]. Updated at every
+ * current_pid write so sched_current_task() and the frame capture avoid a
+ * linear task-table scan on each syscall return. */
+static struct task *current_task[SMP_MAX_CPUS];
 static uint32_t next_session_id = 1;
 static uint64_t scheduler_ticks;
 static uint64_t scheduler_loads[3];
@@ -482,7 +489,7 @@ void sched_init(void)
     task_count = 0;
     task_capacity = 0;
     next_pid = 1;
-    for (uint32_t i = 0; i < SMP_MAX_CPUS; ++i) current_pid[i] = 0;
+    for (uint32_t i = 0; i < SMP_MAX_CPUS; ++i) { current_pid[i] = 0; current_task[i] = NULL; }
     next_session_id = 1;
     scheduler_ticks = 0;
     for (unsigned i = 0; i < 3; ++i) scheduler_loads[i] = 0;
@@ -1350,6 +1357,7 @@ void sched_set_running(uint32_t pid)
     }
     fair_stop_cpu(cpu);
     current_pid[cpu] = pid;
+    current_task[cpu] = selected;
     for (uint32_t i = 0; i < task_count; ++i) {
         if (tasks[i] == selected) {
             tasks[i]->state = TASK_RUNNING;
@@ -1639,6 +1647,7 @@ int sched_prepare_exec_current(struct task *task)
         for (uint32_t i = 0; i < task_count; ++i)
             if (tasks[i]->pdeath_parent_pid == old_tid) tasks[i]->pdeath_parent_pid = group;
         current_pid[scheduler_cpu_index()] = group;
+        current_task[scheduler_cpu_index()] = task;
         kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
     }
     if (task->shared_sighand) {
@@ -2009,6 +2018,9 @@ void sched_on_tick(void)
     struct task *current;
     uint64_t flags;
     kernel_spin_lock_irqsave(&scheduler_lock, &flags);
+    /* Bound any same-task fast-path to one tick: a returning task may skip the
+     * scheduler round while need_resched is clear, so re-arm it every tick. */
+    sched_need_resched = 1;
     ++scheduler_ticks;
     if (scheduler_ticks % (5 * RELIEFNT_TICK_HZ) == 0) {
         uint32_t active = 0;
@@ -2384,7 +2396,10 @@ bool sched_volume_in_use(uint32_t volume_id)
  */
 struct task *sched_current_task(void)
 {
-    return sched_find(scheduler_current_pid());
+    struct task *task = current_task[scheduler_cpu_index()];
+    /* current_task is NULL only when no user task owns this CPU (idle), where
+     * the pid-0 idle task is still the historical answer for sched_find(). */
+    return task ? task : sched_find(scheduler_current_pid());
 }
 
 /**
@@ -2399,13 +2414,8 @@ bool sched_capture_current_user_frame(const struct trap_frame *frame)
     struct task *current = NULL;
 
     kernel_spin_lock_irqsave(&scheduler_lock, &flags);
-    for (uint32_t i = 0; i < task_count; ++i) {
-        if (tasks[i]->pid == current_pid[cpu]) {
-            current = tasks[i];
-            break;
-        }
-    }
-    if (!current || current->kind != TASK_KIND_USER ||
+    current = current_task[cpu];
+    if (!current || current->pid != current_pid[cpu] || current->kind != TASK_KIND_USER ||
         current->state == TASK_EXITED || current->running_cpu != cpu) {
         kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
         return false;
@@ -2454,6 +2464,7 @@ void sched_quiesce_exited_current(void)
                 tasks[i]->running_cpu == SCHED_CPU_NONE) {
                 tasks[i]->running_cpu = SCHED_CPU_NONE;
                 current_pid[cpu] = 0;
+                current_task[cpu] = NULL;
                 gpu_owner = pid;
             }
             break;
@@ -2485,6 +2496,7 @@ struct task *sched_select_next_user(void)
         paging_load_cr3(paging_kernel_cr3());
         if (old && old->running_cpu == cpu) old->running_cpu = SCHED_CPU_NONE;
         current_pid[cpu] = 0;
+        current_task[cpu] = NULL;
     }
     /* Same-task continuation skips the retirement above entirely: nothing is
      * published for reapers to act on, and the return stub reloads the task
@@ -2494,9 +2506,11 @@ struct task *sched_select_next_user(void)
         best->running_cpu = cpu;
         best->last_cpu = cpu;
         current_pid[cpu] = best->pid;
+        current_task[cpu] = best;
         fair_running[cpu] = best;
         fair_started[cpu] = fair_now();
     }
+    sched_need_resched = 0;
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
     return best;
 }
@@ -2617,6 +2631,10 @@ void sched_mark_ready(uint32_t pid)
     task->wake_tick = 0;
     task->wait_window_id = 0;
     task->state = TASK_READY;
+    /* A newly runnable task must be considered for scheduling on the next
+     * return-to-user boundary; the syscall fast-path skips the scheduler round
+     * only while this is clear (plus the per-tick re-evaluation below). */
+    sched_need_resched = 1;
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
 }
 
