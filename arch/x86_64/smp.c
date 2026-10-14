@@ -186,8 +186,29 @@ void smp_release_aps(void)
 
 uint32_t smp_cpu_count(void) { return cpu_count; }
 
+/* RDTSCP availability (CPUID.80000001H.EDX[27]); -1 = not yet probed. */
+static int smp_rdtscp_supported = -1;
+
 uint32_t smp_current_cpu(void)
 {
+    /* Fast path: each CPU programmed IA32_TSC_AUX = cpu_index + 1 at init
+     * (arch_setup_cpu), and RDTSCP returns it in ECX without a serializing
+     * LAPIC MMIO read.  The APIC lookup below is only a correctness fallback
+     * for a CPU whose TSC_AUX is still at its reset value 0 (early AP entry)
+     * or a CPU without RDTSCP. */
+    if (smp_rdtscp_supported < 0) {
+        uint32_t a, b, c, d;
+        __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                         : "a"(0x80000001u), "c"(0));
+        (void)a; (void)b; (void)c;
+        smp_rdtscp_supported = (int)((d >> 27) & 1u);
+    }
+    if (smp_rdtscp_supported) {
+        uint32_t lo, hi, aux;
+        __asm__ volatile("rdtscp" : "=a"(lo), "=d"(hi), "=c"(aux) :: "memory");
+        (void)lo; (void)hi;
+        if (aux != 0 && aux <= SMP_MAX_CPUS) return aux - 1u;
+    }
     uint32_t id = apic_id();
     for (uint32_t i = 0; i < cpu_count; ++i) {
         if (cpus[i].apic_id == id) return i;

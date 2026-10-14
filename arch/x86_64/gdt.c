@@ -23,6 +23,7 @@
 #define X86_IA32_SFMASK 0xc0000084u
 #define X86_IA32_EFER 0xc0000080u
 #define X86_IA32_KERNEL_GS_BASE 0xc0000102u
+#define X86_IA32_TSC_AUX 0xc0000103u
 
 struct x86_64_syscall_cpu_data {
     uint64_t user_rsp;
@@ -178,6 +179,10 @@ static void arch_setup_cpu(uint32_t cpu_index, void *kernel_stack_top)
     write_msr(X86_IA32_SFMASK, 0x700ULL); /* IF, TF and DF */
     write_msr(X86_IA32_KERNEL_GS_BASE,
               (uint64_t)(uintptr_t)&x86_64_syscall_cpu_data[cpu_index]);
+    /* RDTSCP returns this in ECX.  Encode cpu_index + 1 so smp_current_cpu()
+     * can tell a programmed per-CPU id from the reset value 0 and fall back to
+     * the APIC lookup on a CPU that has not run this init yet. */
+    write_msr(X86_IA32_TSC_AUX, (uint64_t)cpu_index + 1u);
 }
 
 /**
