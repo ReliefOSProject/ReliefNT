@@ -3,6 +3,7 @@
  * Entries retain physical pages until invalidated or replaced while idle.
  */
 #include <reliefnt/lock.h>
+#include <reliefnt/console.h>
 #include <reliefnt/mm.h>
 #include <reliefnt/page_cache.h>
 
@@ -48,6 +49,9 @@ void page_cache_init(void)
     for (uint32_t i = 0; i < PAGE_CACHE_MAX; ++i) {
         entries[i] = (struct page_cache_entry){0};
     }
+    console_info("[memory] executable page cache slots=%u page_bytes=%llu capacity_kib=%llu\n",
+                 PAGE_CACHE_MAX, (unsigned long long)PAGE_CACHE_PAGE_SIZE,
+                 (unsigned long long)(PAGE_CACHE_MAX * PAGE_CACHE_PAGE_SIZE / 1024u));
 }
 
 int page_cache_lookup(const struct storage_node *node, uint64_t offset,

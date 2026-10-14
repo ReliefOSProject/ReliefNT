@@ -66,7 +66,7 @@ static void copy_fpu_state(void *dst, const void *src)
  */
 void arch_init(void)
 {
-    console_printf("[reliefnt] arch/x86_64 initialized\n");
+    console_info("[reliefnt] arch/x86_64 initialized\n");
 }
 
 /**
@@ -89,7 +89,7 @@ void arch_fpu_init(void)
 
     __asm__ volatile("fninit\n\tldmxcsr %0" : : "m"(default_mxcsr) : "memory");
     __asm__ volatile("fxsave64 (%0)" : : "r"(initial_fpu_state) : "memory");
-    console_printf("[reliefnt] x87/SSE task state enabled\n");
+    console_info("[reliefnt] x87/SSE task state enabled\n");
 }
 
 /**

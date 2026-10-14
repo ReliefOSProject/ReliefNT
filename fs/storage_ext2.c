@@ -26,7 +26,7 @@ static __attribute__((unused)) int ext2_read_sectors_resilient(uint64_t lba, uin
         return ret;
     }
     if (ext2_read_recovery_logs < 8u) {
-        console_printf("[reliefnt] ext2 bulk read failed lba=%llu sectors=%u ret=%d; "
+        console_warn("[reliefnt] ext2 bulk read failed lba=%llu sectors=%u ret=%d; "
                        "retrying sectors\n", (unsigned long long)lba, sectors, ret);
         ++ext2_read_recovery_logs;
     }
@@ -37,7 +37,7 @@ static __attribute__((unused)) int ext2_read_sectors_resilient(uint64_t lba, uin
                 return ret;
             }
             if (ext2_read_recovery_logs < 8u) {
-                console_printf("[reliefnt] ext2 sector read failed lba=%llu ret=%d\n",
+                console_error("[reliefnt] ext2 sector read failed lba=%llu ret=%d\n",
                                (unsigned long long)(lba + i), ret);
                 ++ext2_read_recovery_logs;
             }
@@ -45,7 +45,7 @@ static __attribute__((unused)) int ext2_read_sectors_resilient(uint64_t lba, uin
         }
     }
     if (ext2_read_recovery_logs < 8u) {
-        console_printf("[reliefnt] ext2 sector fallback recovered lba=%llu sectors=%u\n",
+        console_warn("[reliefnt] ext2 sector fallback recovered lba=%llu sectors=%u\n",
                        (unsigned long long)lba, sectors);
         ++ext2_read_recovery_logs;
     }

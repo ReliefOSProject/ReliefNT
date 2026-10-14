@@ -156,7 +156,7 @@ void irq_init(void)
         if (routed) {
             pic_mask_all();
             irq_uses_ioapic = true;
-            console_printf("[reliefnt] IOAPIC owns PIT/keyboard/mouse, PIT=%uHz BSP=%u\n",
+            console_info("[reliefnt] IOAPIC owns PIT/keyboard/mouse, PIT=%uHz BSP=%u\n",
                            (unsigned)RELIEFNT_TICK_HZ, (unsigned)apic_bsp_id());
             return;
         }
@@ -164,11 +164,11 @@ void irq_init(void)
          * delivery alive after SMP enables the BSP local APIC. */
         apic_enable_legacy_pic();
         irq_uses_local_apic = apic_enabled();
-        console_printf("[reliefnt] PIC virtual-wire owns IRQ0/1/12, PIT=%uHz\n",
+        console_info("[reliefnt] PIC virtual-wire owns IRQ0/1/12, PIT=%uHz\n",
                        (unsigned)RELIEFNT_TICK_HZ);
         return;
     }
-    console_printf("[reliefnt] PIC remapped, PIT=%uHz, IRQ0/1/12 enabled\n",
+    console_info("[reliefnt] PIC remapped, PIT=%uHz, IRQ0/1/12 enabled\n",
                    (unsigned)RELIEFNT_TICK_HZ);
 }
 

@@ -5,9 +5,11 @@ static struct reliefos_utf8_stream console_utf8;
 #include <reliefnt/console.h>
 #include <reliefnt/framebuffer.h>
 #include <reliefnt/heap.h>
+#include <reliefnt/lock.h>
+#include <reliefnt/smp.h>
 #include <reliefnt/time.h>
 
-#define CONSOLE_LOG_CAP 8192
+#define CONSOLE_LOG_CAP 65536
 #define CONSOLE_MAX_COLS 512u
 #define CONSOLE_MAX_ROWS 192u
 #define FB_ANSI_MAX_PARAMS 16u
@@ -26,6 +28,7 @@ static bool console_vt_graphical;
 
 static char log_buffer[CONSOLE_LOG_CAP];
 static size_t log_len;
+static size_t log_start;
 static bool fb_console_enabled;
 static bool vga_console_enabled;
 static uint32_t fb_x;
@@ -39,6 +42,10 @@ static bool console_line_start = true;
 static bool console_runtime_quiet;
 static bool console_service_logs_only;
 static bool console_presenting;
+static uint32_t console_log_owner = UINT32_MAX;
+static const char *const console_log_prefixes[] = {
+    "[DEBUG] ", "[INFO] ", "[WARN] ", "[ERROR] ", "[FATAL] ",
+};
 static uint32_t fb_saved_col;
 static uint32_t fb_saved_row;
 static uint32_t fb_console_fg_color;
@@ -174,13 +181,21 @@ static void fb_console_reset_ansi(void)
 static void log_store(char ch)
 {
     if (log_len < CONSOLE_LOG_CAP) {
-        log_buffer[log_len++] = ch;
+        log_buffer[(log_start + log_len++) % CONSOLE_LOG_CAP] = ch;
     } else {
-        for (size_t i = 1; i < CONSOLE_LOG_CAP; ++i) {
-            log_buffer[i - 1] = log_buffer[i];
-        }
-        log_buffer[CONSOLE_LOG_CAP - 1] = ch;
+        log_buffer[log_start] = ch;
+        log_start = (log_start + 1u) % CONSOLE_LOG_CAP;
     }
+}
+
+static size_t console_log_replay_start(void)
+{
+    size_t first = 0;
+    if (log_len == CONSOLE_LOG_CAP) {
+        while (first < log_len && log_buffer[(log_start + first) % CONSOLE_LOG_CAP] != '\n') ++first;
+        if (first < log_len) ++first;
+    }
+    return first;
 }
 
 static void fb_console_clear_log_line(uint32_t row)
@@ -1021,28 +1036,86 @@ void console_vt_activate(uint32_t number, bool graphical)
     console_present();
 }
 
-void console_printf(const char *fmt, ...)
+static void console_log_putc(enum console_log_level level, char character)
 {
-    va_list ap;
-
-    if (console_runtime_quiet && console_is_reliefnt_format(fmt)) {
-        return;
-    }
-
-    if (fmt && fmt[0] && console_line_start) {
+    if (console_line_start && character != '\n' && character != '\r') {
         console_emit_timestamp();
+        const char *prefix = console_log_prefixes[level];
+        while (*prefix) console_emit_raw(*prefix++);
     }
-    va_start(ap, fmt);
+    bool line_start = console_line_start;
+    console_emit_raw(character);
+    if (character == '\r' && line_start) console_line_start = true;
+}
 
+static void console_log_string(enum console_log_level level, const char *text)
+{
+    while (text && *text) console_log_putc(level, *text++);
+}
+
+static void console_log_number(enum console_log_level level, uint64_t value,
+                               unsigned base, bool upper, unsigned width,
+                               bool zero_pad, bool negative)
+{
+    char digits_buffer[32];
+    const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    unsigned count = 0;
+    do {
+        digits_buffer[count++] = digits[value % base];
+        value /= base;
+    } while (value && count < sizeof(digits_buffer));
+    unsigned length = count + (negative ? 1u : 0u);
+    if (negative && zero_pad) console_log_putc(level, '-');
+    while (width > length) {
+        console_log_putc(level, zero_pad ? '0' : ' ');
+        --width;
+    }
+    if (negative && !zero_pad) console_log_putc(level, '-');
+    while (count) console_log_putc(level, digits_buffer[--count]);
+}
+
+static void console_vlog(enum console_log_level level, const char *fmt, va_list arguments)
+{
+    if (!fmt || !*fmt) return;
+    if ((unsigned)level > CONSOLE_LOG_FATAL) level = CONSOLE_LOG_INFO;
+    if (level < CONSOLE_LOG_WARN && console_runtime_quiet &&
+        console_is_reliefnt_format(fmt)) return;
+    uint64_t flags = kernel_irq_save();
+    uint32_t cpu = smp_current_cpu();
+    bool acquired = false;
+    if (__atomic_load_n(&console_log_owner, __ATOMIC_RELAXED) != cpu) {
+        do {
+            uint32_t expected = UINT32_MAX;
+            acquired = __atomic_compare_exchange_n(&console_log_owner, &expected,
+                cpu, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+            if (acquired || level == CONSOLE_LOG_FATAL) break;
+            smp_membarrier_poll();
+            __asm__ volatile("pause" ::: "memory");
+        } while (!acquired);
+    }
+
+    if (!console_line_start) console_emit_raw('\n');
     for (const char *p = fmt; *p; ++p) {
         if (*p != '%') {
-            console_putc(*p);
+            console_log_putc(level, *p);
             continue;
         }
 
         ++p;
+        if (!*p) {
+            console_log_putc(level, '%');
+            break;
+        }
+        bool zero_pad = *p == '0';
+        unsigned width = 0;
+        while (*p >= '0' && *p <= '9') {
+            width = width < 64u ? width * 10u + (unsigned)(*p - '0') : 64u;
+            if (width > 64u) width = 64u;
+            ++p;
+        }
         bool long_flag = false;
         bool long_long_flag = false;
+        bool size_flag = false;
         if (*p == 'l') {
             long_flag = true;
             ++p;
@@ -1050,62 +1123,101 @@ void console_printf(const char *fmt, ...)
                 long_long_flag = true;
                 ++p;
             }
+        } else if (*p == 'z') {
+            size_flag = true;
+            ++p;
         }
+        if (!*p) break;
 
         switch (*p) {
         case 's': {
-            const char *s = va_arg(ap, const char *);
-            console_write(s ? s : "(null)");
+            const char *text = va_arg(arguments, const char *);
+            console_log_string(level, text ? text : "(null)");
             break;
         }
         case 'c':
-            console_putc((char)va_arg(ap, int));
+            console_log_putc(level, (char)va_arg(arguments, int));
             break;
         case 'd':
         case 'i': {
-            int64_t v = long_long_flag ? va_arg(ap, long long)
-                        : long_flag  ? va_arg(ap, long)
-                                     : va_arg(ap, int);
-            if (v < 0) {
-                console_putc('-');
-                v = -v;
-            }
-            print_unsigned_raw((uint64_t)v, 10, false);
+            int64_t value = long_long_flag ? va_arg(arguments, long long)
+                         : long_flag ? va_arg(arguments, long)
+                         : size_flag ? va_arg(arguments, ptrdiff_t)
+                                     : va_arg(arguments, int);
+            uint64_t magnitude = value < 0 ? 0ULL - (uint64_t)value : (uint64_t)value;
+            console_log_number(level, magnitude, 10, false, width, zero_pad, value < 0);
             break;
         }
         case 'u': {
-            uint64_t v = long_long_flag ? va_arg(ap, unsigned long long)
-                         : long_flag  ? va_arg(ap, unsigned long)
-                                      : va_arg(ap, unsigned int);
-            print_unsigned_raw(v, 10, false);
+            uint64_t value = long_long_flag ? va_arg(arguments, unsigned long long)
+                          : long_flag ? va_arg(arguments, unsigned long)
+                          : size_flag ? va_arg(arguments, size_t)
+                                      : va_arg(arguments, unsigned int);
+            console_log_number(level, value, 10, false, width, zero_pad, false);
             break;
         }
         case 'x':
         case 'X': {
-            uint64_t v = long_long_flag ? va_arg(ap, unsigned long long)
-                         : long_flag  ? va_arg(ap, unsigned long)
-                                      : va_arg(ap, unsigned int);
-            print_unsigned_raw(v, 16, *p == 'X');
+            uint64_t value = long_long_flag ? va_arg(arguments, unsigned long long)
+                          : long_flag ? va_arg(arguments, unsigned long)
+                          : size_flag ? va_arg(arguments, size_t)
+                                      : va_arg(arguments, unsigned int);
+            console_log_number(level, value, 16, *p == 'X', width, zero_pad, false);
             break;
         }
         case 'p': {
-            uintptr_t v = (uintptr_t)va_arg(ap, void *);
-            console_write("0x");
-            print_unsigned_raw(v, 16, false);
+            uintptr_t value = (uintptr_t)va_arg(arguments, void *);
+            console_log_string(level, "0x");
+            console_log_number(level, value, 16, false, width, zero_pad, false);
             break;
         }
         case '%':
-            console_putc('%');
+            console_log_putc(level, '%');
             break;
         default:
-            console_putc('%');
-            console_putc(*p);
+            console_log_putc(level, '%');
+            console_log_putc(level, *p);
             break;
         }
     }
 
-    va_end(ap);
+    if (!console_line_start) console_emit_raw('\n');
     console_present();
+    if (acquired) __atomic_store_n(&console_log_owner, UINT32_MAX, __ATOMIC_RELEASE);
+    kernel_irq_restore(flags);
+}
+
+void console_log(enum console_log_level level, const char *fmt, ...)
+{
+    va_list arguments;
+    va_start(arguments, fmt);
+    console_vlog(level, fmt, arguments);
+    va_end(arguments);
+}
+
+void console_printf(const char *fmt, ...)
+{
+    va_list arguments;
+    va_start(arguments, fmt);
+    console_vlog(CONSOLE_LOG_INFO, fmt, arguments);
+    va_end(arguments);
+}
+
+void console_log_write(const char *text)
+{
+    if (!text) return;
+    enum console_log_level level = CONSOLE_LOG_INFO;
+    for (unsigned candidate = CONSOLE_LOG_DEBUG; candidate <= CONSOLE_LOG_FATAL; ++candidate) {
+        const char *prefix = console_log_prefixes[candidate];
+        size_t matched = 0;
+        while (prefix[matched] && text[matched] == prefix[matched]) ++matched;
+        if (!prefix[matched]) {
+            level = (enum console_log_level)candidate;
+            text += matched;
+            break;
+        }
+    }
+    console_log(level, "%s", text);
 }
 
 void console_enable_framebuffer(void)
@@ -1116,8 +1228,8 @@ void console_enable_framebuffer(void)
     fb_console_enabled = true;
     fb_console_initialize_fullscreen();
     fb_console_clear_log();
-    for (size_t i = 0; i < log_len; ++i) {
-        fb_console_ansi_feed(log_buffer[i]);
+    for (size_t i = console_log_replay_start(); i < log_len; ++i) {
+        fb_console_ansi_feed(log_buffer[(log_start + i) % CONSOLE_LOG_CAP]);
     }
     console_present();
 }
@@ -1136,7 +1248,7 @@ void console_enable_vga_fallback(void)
     }
     vga_init();
     vga_console_enabled = true;
-    for (size_t i = 0; i < log_len; ++i) {
-        vga_putc(log_buffer[i]);
+    for (size_t i = console_log_replay_start(); i < log_len; ++i) {
+        vga_putc(log_buffer[(log_start + i) % CONSOLE_LOG_CAP]);
     }
 }

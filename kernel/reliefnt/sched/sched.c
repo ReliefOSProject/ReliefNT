@@ -503,7 +503,7 @@ void sched_init(void)
         scheduler_cpu_idle_ticks[i] = 0;
     }
     fair_clock = 0;
-    console_printf("[reliefnt] EEVDF scheduler initialized\n");
+    console_info("[reliefnt] EEVDF scheduler initialized\n");
 }
 
 /**
@@ -676,7 +676,7 @@ uint32_t sched_create_kernel_task(const char *name, uint64_t entry)
     task->pty_id = 0;
     task_clear_identity(task);
     task_copy_cwd(task, "/");
-    console_printf("[reliefnt] task pid=%u name=%s entry=0x%llx\n",
+    console_debug("[reliefnt] task pid=%u name=%s entry=0x%llx\n",
                    task->pid, task->name, (unsigned long long)task->entry);
     kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
     return task->pid;
@@ -777,7 +777,7 @@ uint32_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack
             task->affinity_mask = parent->affinity_mask;
         }
     }
-    console_printf("[reliefnt] task pid=%u ppid=%u name=%s user entry=0x%llx stack=0x%llx flags=0x%x\n",
+    console_debug("[reliefnt] task pid=%u ppid=%u name=%s user entry=0x%llx stack=0x%llx flags=0x%x\n",
                    task->pid,
                    task->parent_pid,
                    task->name,
@@ -1480,7 +1480,7 @@ void sched_exit(uint32_t pid, uint64_t code)
     }
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
     if (exit_event) {
-        console_printf("[reliefnt] scheduler task exited pid=%u name=%s code=%llu\n",
+        console_debug("[reliefnt] scheduler task exited pid=%u name=%s code=%llu\n",
                        exit_pid,
                        exit_name,
                        (unsigned long long)exit_code);
@@ -2531,7 +2531,7 @@ struct trap_frame *sched_task_frame(struct task *task)
     if (!task || task->kind != TASK_KIND_USER || task->state == TASK_EXITED ||
         !task_frame_valid(task, &task->frame)) {
         if (task) {
-            console_printf("[reliefnt] rejected invalid user frame pid=%u rip=0x%llx rsp=0x%llx cr3=0x%llx\n",
+            console_error("[reliefnt] rejected invalid user frame pid=%u rip=0x%llx rsp=0x%llx cr3=0x%llx\n",
                            task->pid,
                            (unsigned long long)task->frame.rip,
                            (unsigned long long)task->frame.rsp,
@@ -3331,7 +3331,7 @@ int64_t sched_wait_reap(uint32_t waiter_pid, int32_t wanted_pid,
         }
         kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
         if (reap_event) {
-            console_printf("[reliefnt] scheduler wait reaped pid=%u by pid=%u\n",
+            console_debug("[reliefnt] scheduler wait reaped pid=%u by pid=%u\n",
                            reap_pid, waiter_pid);
         }
         if (status) {
@@ -3503,7 +3503,7 @@ uint32_t sched_next_session_id(void)
 void sched_dump(void)
 {
     for (uint32_t i = 0; i < task_count; ++i) {
-        console_printf("[reliefnt] task[%u] pid=%u ppid=%u uid=%u role=%u name=%s state=%u kind=%u flags=0x%x\n",
+        console_debug("[reliefnt] task[%u] pid=%u ppid=%u uid=%u role=%u name=%s state=%u kind=%u flags=0x%x\n",
                        i,
                        tasks[i]->pid,
                        tasks[i]->parent_pid,

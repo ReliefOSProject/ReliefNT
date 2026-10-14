@@ -315,7 +315,7 @@ int svga3d_init(void)
         !paging_mmio_uncached(fb->reservation_start, fb->reservation_bytes)) {
         probe_result("mmio-cache", SVGA_ENOTSUP);
         svga_unlock(flags);
-        console_printf("[svga3d] UC mapping failed; retaining 2D\n");
+        console_warn("[svga3d] UC mapping failed; retaining 2D\n");
         return SVGA_ENOTSUP;
     }
 #endif
@@ -336,7 +336,8 @@ int svga3d_init(void)
     }
     svga_unlock(flags);
 #ifndef SVGA_HOST_TEST
-    console_printf("[svga3d] init=%d caps=0x%x fifo=0x%x host=0x%x guest=0x%x\n",
+    console_log(ret < 0 ? CONSOLE_LOG_WARN : CONSOLE_LOG_INFO,
+                "[svga3d] init=%d caps=0x%x fifo=0x%x host=0x%x guest=0x%x\n",
                    ret, svga.caps, svga.fifo_caps, svga.host_version, SVGA3D_HWVERSION_WS8_B1);
 #endif
     return ret;

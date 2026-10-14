@@ -3,6 +3,7 @@
  * Handles are index plus generation values, preventing stale descriptor reuse.
  */
 #include <reliefnt/object.h>
+#include <reliefnt/console.h>
 
 static struct kernel_object_table global_objects;
 
@@ -33,6 +34,7 @@ void kernel_object_table_init(struct kernel_object_table *table)
 void kernel_objects_init(void)
 {
     kernel_object_table_init(&global_objects);
+    console_info("[objects] global handle slots=%u generation_bits=16\n", KERNEL_OBJECT_MAX);
 }
 
 struct kernel_object_table *kernel_objects(void)

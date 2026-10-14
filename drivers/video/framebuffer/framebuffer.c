@@ -547,7 +547,7 @@ static void framebuffer_vmware_fifo_init(bool report)
         (mem_start & (sizeof(uint32_t) - 1u)) != 0u ||
         !framebuffer_range_valid(mem_start, mem_size)) {
         if (report) {
-            console_printf("[reliefnt] VMware SVGA FIFO unavailable mem=%p size=%u\n",
+            console_warn("[reliefnt] VMware SVGA FIFO unavailable mem=%p size=%u\n",
                            (void *)(uintptr_t)mem_start, mem_size);
         }
         return;
@@ -572,7 +572,7 @@ static void framebuffer_vmware_fifo_init(bool report)
         vmware_svga.fifo[VMWARE_SVGA_FIFO_STOP] != vmware_svga.fifo_min) {
         vmware_svga.fifo = 0;
         if (report) {
-            console_printf("[reliefnt] VMware SVGA FIFO header validation failed\n");
+            console_error("[reliefnt] VMware SVGA FIFO header validation failed\n");
         }
         return;
     }
@@ -660,7 +660,7 @@ static void framebuffer_vmware_sync(bool report)
     }
     if (!vmware_svga.sync_timeout_logged) {
         if (report) {
-            console_printf("[reliefnt] VMware SVGA sync timed out; continuing asynchronously\n");
+            console_warn("[reliefnt] VMware SVGA sync timed out; continuing asynchronously\n");
         }
         vmware_svga.sync_timeout_logged = true;
     }
@@ -721,7 +721,7 @@ static int framebuffer_vmware_probe(void)
      * with the mode, whereas FB_MAX_SIZE is the SVGA II VRAM capacity. */
     usable_bytes = (uint64_t)fb_max_size - fb_offset;
     if (usable_bytes < framebuffer_current_bytes()) {
-        console_printf("[reliefnt] VMware SVGA framebuffer too small fb=%p offset=%u "
+        console_error("[reliefnt] VMware SVGA framebuffer too small fb=%p offset=%u "
                        "size=%u max=%u current=%u\n",
                        (void *)(uintptr_t)fb_start, fb_offset, fb_size, fb_max_size,
                        (uint32_t)framebuffer_current_bytes());
@@ -783,7 +783,7 @@ static int framebuffer_vmware_probe(void)
             framebuffer_range_valid((uint64_t)fb_start + fb_offset,
                                     (uint64_t)pitch * height);
         if (device_mode_valid) {
-            console_printf("[reliefnt] VMware SVGA scan-out enabled at boot mode "
+            console_info("[reliefnt] VMware SVGA scan-out enabled at boot mode "
                            "%ux%u pitch=%u\n", width, height, pitch);
         }
     }
@@ -796,7 +796,7 @@ static int framebuffer_vmware_probe(void)
         fb.bytes_per_pixel = 4u;
         framebuffer_set_default_format();
     } else {
-        console_printf("[reliefnt] VMware SVGA active mode unavailable "
+        console_warn("[reliefnt] VMware SVGA active mode unavailable "
                        "mode=%ux%u depth=%u bpp=%u pseudo=%u pitch=%u\n",
                        width, height, depth, bpp, pseudocolor, pitch);
         return 0;
@@ -823,7 +823,7 @@ static int framebuffer_vmware_probe(void)
     fb.capabilities = FRAMEBUFFER_CAP_MODE_SET;
     fb.reservation_start = fb_start;
     fb.reservation_bytes = fb_max_size;
-    console_printf("[reliefnt] VMware SVGA detected io=0x%x fb=%p offset=%u size=%u "
+    console_info("[reliefnt] VMware SVGA detected io=0x%x fb=%p offset=%u size=%u "
                    "max=%u limits=%ux%u fifo=%p\n",
                    vmware_svga.io_port, (void *)(uintptr_t)fb_start, fb_offset,
                    fb_size, fb_max_size, vmware_svga.max_width,
@@ -980,7 +980,7 @@ static int framebuffer_vmware_set_mode(uint32_t width, uint32_t height)
         !framebuffer_range_valid(fb_start, fb_max_size)) {
         if (restart_3d) svga_mode_end(svga_flags);
         else svga_unlock(legacy_flags);
-        console_printf("[reliefnt] VMware SVGA rejected mode req=%ux%u got=%ux%u "
+        console_error("[reliefnt] VMware SVGA rejected mode req=%ux%u got=%ux%u "
                        "depth=%u bpp=%u pseudo=%u pitch=%u fb=%p offset=%u size=%u max=%u\n",
                        width, height, actual_width, actual_height, depth, bpp,
                        pseudocolor, pitch, (void *)(uintptr_t)fb_start, fb_offset,
@@ -1018,7 +1018,7 @@ static int framebuffer_vmware_set_mode(uint32_t width, uint32_t height)
         framebuffer_vmware_sync(false);
         svga_unlock(legacy_flags);
     }
-    console_printf("[reliefnt] VMware SVGA mode=%ux%u depth=%u bpp=%u pseudo=%u "
+    console_info("[reliefnt] VMware SVGA mode=%ux%u depth=%u bpp=%u pseudo=%u "
                    "pitch=%u fb=%p offset=%u size=%u max=%u\n",
                    fb.width, fb.height, depth, bpp, pseudocolor,
                    fb.pitch, (void *)(uintptr_t)fb_start, fb_offset, fb_size,
@@ -1085,7 +1085,7 @@ static void framebuffer_init_from_gop(uint64_t system_table_addr)
     efi_handle_t *handles = 0;
     efi_status_t status = st->boot_services->locate_handle_buffer(2, &gop_guid, 0, &handle_count, &handles);
     if (status || handle_count == 0 || !handles) {
-        console_printf("[reliefnt] GOP locate failed status=0x%llx handles=%llu\n",
+        console_error("[reliefnt] GOP locate failed status=0x%llx handles=%llu\n",
                        (unsigned long long)status,
                        (unsigned long long)handle_count);
         return;
@@ -1137,7 +1137,7 @@ static void framebuffer_init_from_gop(uint64_t system_table_addr)
             framebuffer_set_default_format();
         }
         fb.available = framebuffer_color_format_valid(&fb);
-        console_printf("[reliefnt] GOP framebuffer base=%p size=%llu format=%u "
+        console_info("[reliefnt] GOP framebuffer base=%p size=%llu format=%u "
                        "R=%u/%u G=%u/%u B=%u/%u\n",
                        (void *)(uintptr_t)gop->mode->framebuffer_base,
                        (unsigned long long)gop->mode->framebuffer_size,
@@ -1148,7 +1148,7 @@ static void framebuffer_init_from_gop(uint64_t system_table_addr)
         return;
     }
 
-    console_printf("[reliefnt] GOP protocol present but no usable mode\n");
+    console_info("[reliefnt] GOP protocol present but no usable mode\n");
     (void)guid_equal;
 }
 
@@ -1185,19 +1185,19 @@ void framebuffer_init(const struct boot_info *boot)
     }
 
     if (fb.available) {
-        console_printf("[reliefnt] framebuffer %ux%u pitch=%u bpp=%u bytespp=%u type=%u "
+        console_info("[reliefnt] framebuffer %ux%u pitch=%u bpp=%u bytespp=%u type=%u "
                        "R=%u/%u G=%u/%u B=%u/%u\n",
                        fb.width, fb.height, fb.pitch, fb.bpp, fb.bytes_per_pixel, fb.type,
                        fb.red_field_position, fb.red_mask_size,
                        fb.green_field_position, fb.green_mask_size,
                        fb.blue_field_position, fb.blue_mask_size);
         if (fb.capabilities & FRAMEBUFFER_CAP_MODE_SET) {
-            console_printf("[reliefnt] dynamic framebuffer backend=%u max=%ux%u vram=%u KiB\n",
+            console_info("[reliefnt] dynamic framebuffer backend=%u max=%ux%u vram=%u KiB\n",
                            fb.backend, fb.max_width, fb.max_height,
                            fb.max_bytes / 1024u);
         }
     } else {
-        console_printf("[reliefnt] framebuffer unavailable, VGA fallback active\n");
+        console_warn("[reliefnt] framebuffer unavailable, VGA fallback active\n");
     }
 }
 
@@ -1233,7 +1233,7 @@ int framebuffer_set_mode(uint32_t width, uint32_t height)
         return -1;
     }
     if (changed) {
-        console_printf("[reliefnt] framebuffer mode changed backend=%u %ux%u pitch=%u\n",
+        console_info("[reliefnt] framebuffer mode changed backend=%u %ux%u pitch=%u\n",
                        fb.backend, fb.width, fb.height, fb.pitch);
         return 0;
     }

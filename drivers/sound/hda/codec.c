@@ -2593,7 +2593,7 @@ void hda_codec_dump(const struct hda_codec *codec)
     char line[192];
     uint32_t used = 0u;
     line[0] = '\0';
-    hda_codec_append_text(line, &used, sizeof(line), "[hda] codec cad=0x");
+    hda_codec_append_text(line, &used, sizeof(line), "[DEBUG] [hda] codec cad=0x");
     hda_codec_append_hex(line, &used, sizeof(line), codec->cad, 2u);
     hda_codec_append_text(line, &used, sizeof(line), " vendor=0x");
     hda_codec_append_hex(line, &used, sizeof(line), codec->vendor_id, 8u);
@@ -2610,7 +2610,7 @@ void hda_codec_dump(const struct hda_codec *codec)
         if (!node->present) continue;
         used = 0u;
         line[0] = '\0';
-        hda_codec_append_text(line, &used, sizeof(line), "[hda] nid=0x");
+        hda_codec_append_text(line, &used, sizeof(line), "[DEBUG] [hda] nid=0x");
         hda_codec_append_hex(line, &used, sizeof(line), nid, 2u);
         hda_codec_append_text(line, &used, sizeof(line), " type=0x");
         hda_codec_append_hex(line, &used, sizeof(line), node->type, 2u);

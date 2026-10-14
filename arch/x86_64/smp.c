@@ -152,7 +152,7 @@ void smp_init(void)
     smp_ready = cpu_count <= 1;
     smp_scheduler_started = cpu_count <= 1;
     smp_bsp_user_entry_pending = cpu_count <= 1;
-    console_printf("[reliefnt] SMP topology CPUs=%u BSP APIC=%u discovered=%u\n",
+    console_info("[reliefnt] SMP topology CPUs=%u BSP APIC=%u discovered=%u\n",
                    (unsigned)cpu_count, (unsigned)apic_bsp_id(),
                    (unsigned)discovered);
 }
@@ -250,13 +250,13 @@ void smp_start_aps(void)
         if (id == apic_id()) {
             cpus[i].online = 1;
             cpus[i].started = 1;
-            console_printf("[reliefnt] SMP CPU%u is current BSP APIC=%u\n",
+            console_info("[reliefnt] SMP CPU%u is current BSP APIC=%u\n",
                            (unsigned)i, (unsigned)id);
             continue;
         }
         stack = mm_alloc_pages(AP_STACK_PAGES);
         if (!stack) {
-            console_printf("[reliefnt] SMP AP%u stack allocation failed\n", (unsigned)i);
+            console_error("[reliefnt] SMP AP%u stack allocation failed\n", (unsigned)i);
             continue;
         }
         cpus[i].stack = stack + (uint64_t)AP_STACK_PAGES * 4096ULL;
@@ -275,15 +275,16 @@ void smp_start_aps(void)
             cpus[i].started = 0;
             /* Do not release a timed-out AP stack: a delayed SIPI may still
              * enter the trampoline and use it after this barrier expires. */
-            console_printf("[reliefnt] SMP APIC %u failed to come online\n", (unsigned)id);
+            console_error("[reliefnt] SMP APIC %u failed to come online\n", (unsigned)id);
         } else {
-            console_printf("[reliefnt] SMP CPU%u APIC=%u online\n", (unsigned)i, (unsigned)id);
+            console_info("[reliefnt] SMP CPU%u APIC=%u online\n", (unsigned)i, (unsigned)id);
         }
     }
     smp_ready = 1;
     uint32_t online = 0;
     for (uint32_t i = 0; i < cpu_count; ++i) online += cpus[i].online != 0;
-    console_printf("[reliefnt] SMP ready online=%u/%u\n", (unsigned)online, (unsigned)cpu_count);
+    console_log(online < cpu_count ? CONSOLE_LOG_WARN : CONSOLE_LOG_INFO,
+                "[reliefnt] SMP ready online=%u/%u\n", (unsigned)online, (unsigned)cpu_count);
 }
 
 void smp_ap_entry(uint32_t cpu_index)

@@ -1024,7 +1024,7 @@ static int hda_enter_immediate_mode(struct hda_controller *c)
                             HDA_PCI_COMMAND) & HDA_PCI_COMMAND_MASTER)) return -EIO;
     c->transport_mode = HDA_TRANSPORT_IMMEDIATE;
     c->api->console_write(
-        "[hda] ring init failed; using immediate command transport (no unsolicited)\n");
+        "[WARN] [hda] ring init failed; using immediate command transport (no unsolicited)\n");
     return 0;
 }
 

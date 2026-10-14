@@ -546,7 +546,7 @@ static bool debug_consume_boot_marker(void)
         }
     }
     if (storage_unlink_boot_esp_file(path) < 0) {
-        console_printf("[reliefnt] kernel debug marker could not be consumed\n");
+        console_warn("[reliefnt] kernel debug marker could not be consumed\n");
     }
     value = (const char *)data;
     if (len != (expected == marker ? sizeof(marker) : sizeof(legacy_marker)) - 1U) {
@@ -839,14 +839,14 @@ int kernel_debug_run_module(void)
     };
     int ret = storage_read_file(KERNEL_DEBUG_MODULE_PATH, &image, &len);
     if (ret < 0) {
-        console_printf("[reliefnt] kernel debug module missing ret=%d\n", ret);
+        console_warn("[reliefnt] kernel debug module missing ret=%d\n", ret);
         debug_write("\033[31mKernel debug module missing.\033[0m\n");
         debug_menu();
         return 0;
     }
     ret = debug_load_module(image, len, &api);
     if (ret < 0) {
-        console_printf("[reliefnt] kernel debug module rejected or failed ret=%d\n", ret);
+        console_error("[reliefnt] kernel debug module rejected or failed ret=%d\n", ret);
         debug_write("\033[31mKernel debug module rejected or failed.\033[0m\n");
     }
     mm_free_pages((uint64_t)(uintptr_t)image, (uint32_t)((len + 4095U) / 4096U));

@@ -39,7 +39,7 @@ int fat32_mount(void)
     data_sectors = total_sectors - g_storage.data_start_sector;
     g_storage.data_cluster_count = data_sectors / g_storage.sectors_per_cluster;
     if (g_storage.cluster_bytes > sizeof(storage_cluster_buf)) {
-        console_printf("[reliefnt] storage FAT32 cluster too large=%u\n", g_storage.cluster_bytes);
+        console_error("[reliefnt] storage FAT32 cluster too large=%u\n", g_storage.cluster_bytes);
         return -2;
     }
     if (fs_info_sector > 0 && fs_info_sector < bpb->reserved_sector_count &&
@@ -98,7 +98,7 @@ int fat32_read_fat_entry(uint32_t cluster, uint32_t *out_next)
     }
     offset += (uint32_t)(sector - storage_fat_cache.first_lba) * SECTOR_SIZE;
     if (offset + sizeof(uint32_t) > storage_fat_cache.sector_count * SECTOR_SIZE) {
-        console_printf("[storage] fat entry range cluster=%u sector=%llu offset=%u cache_sectors=%u\n",
+        console_error("[storage] fat entry range cluster=%u sector=%llu offset=%u cache_sectors=%u\n",
                        cluster, (unsigned long long)sector, offset,
                        storage_fat_cache.sector_count);
         return -5;

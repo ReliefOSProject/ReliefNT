@@ -1444,13 +1444,13 @@ int storage_mount_block_partition(uint32_t disk_id, uint32_t partition_index,
     char mounted_path[RELIEFOS_FS_PATH_LEN];
     uint32_t requested_filesystem;
 
-    console_printf("[storage] mount enter disk=%u part=%u target=%s fs=%s flags=%llu\n",
+    console_debug("[storage] mount enter disk=%u part=%u target=%s fs=%s flags=%llu\n",
                    disk_id, partition_index, target ? target : "(auto)",
                    filesystem_name ? filesystem_name : "auto",
                    (unsigned long long)flags);
     if ((flags & ~(uint64_t)(MS_NOSUID | MS_NOEXEC)) ||
         storage_filesystem_from_name(filesystem_name, &requested_filesystem) < 0) {
-        console_printf("[storage] mount invalid arguments flags=%llu fs_name=%s\n",
+        console_error("[storage] mount invalid arguments flags=%llu fs_name=%s\n",
                        (unsigned long long)flags,
                        filesystem_name ? filesystem_name : "(null)");
         return -22;
@@ -1458,35 +1458,35 @@ int storage_mount_block_partition(uint32_t disk_id, uint32_t partition_index,
     if (target && target[0]) {
         ret = storage_mount_path_allowed(target);
         if (ret < 0) {
-            console_printf("[storage] mount path not allowed target=%s ret=%d\n",
+            console_info("[storage] mount path not allowed target=%s ret=%d\n",
                            target, ret);
             return ret;
         }
     }
     ret = storage_acquire_task_io();
     if (ret < 0) {
-        console_printf("[storage] mount acquire io failed ret=%d\n", ret);
+        console_error("[storage] mount acquire io failed ret=%d\n", ret);
         return ret;
     }
     ret = disk_manage_prepare(disk_id, &disk, &sector_count);
     if (ret < 0) {
-        console_printf("[storage] mount disk prepare failed disk=%u ret=%d\n", disk_id, ret);
+        console_error("[storage] mount disk prepare failed disk=%u ret=%d\n", disk_id, ret);
         return ret;
     }
     ret = disk_partition_mutable(disk);
     if (ret < 0) {
-        console_printf("[storage] mount disk immutable disk=%u ret=%d\n", disk_id, ret);
+        console_info("[storage] mount disk immutable disk=%u ret=%d\n", disk_id, ret);
         return ret;
     }
     ret = disk_gpt_load(disk, sector_count, &table);
     if (ret < 0 || partition_index >= table.primary.partition_entry_count) {
-        console_printf("[storage] mount gpt load failed disk=%u part=%u ret=%d\n",
+        console_error("[storage] mount gpt load failed disk=%u part=%u ret=%d\n",
                        disk_id, partition_index, ret < 0 ? ret : -22);
         return ret < 0 ? ret : -22;
     }
     ret = disk_gpt_entries_valid(&table);
     if (ret < 0) {
-        console_printf("[storage] mount gpt entries invalid disk=%u part=%u ret=%d\n",
+        console_error("[storage] mount gpt entries invalid disk=%u part=%u ret=%d\n",
                        disk_id, partition_index, ret);
         return ret;
     }
@@ -1514,17 +1514,17 @@ int storage_mount_block_partition(uint32_t disk_id, uint32_t partition_index,
     }
     ret = disk_partition_filesystem(disk, &entry, &filesystem);
     if (ret < 0) {
-        console_printf("[storage] mount filesystem probe failed disk=%u part=%u ret=%d\n",
+        console_error("[storage] mount filesystem probe failed disk=%u part=%u ret=%d\n",
                        disk_id, partition_index, ret);
         return ret;
     }
     if (!disk_filesystem_format_supported(filesystem)) {
-        console_printf("[storage] mount unsupported filesystem disk=%u part=%u fs=%u\n",
+        console_warn("[storage] mount unsupported filesystem disk=%u part=%u fs=%u\n",
                        disk_id, partition_index, filesystem);
         return -95;
     }
     if (requested_filesystem && requested_filesystem != filesystem) {
-        console_printf("[storage] mount filesystem mismatch disk=%u part=%u detected=%u requested=%u\n",
+        console_warn("[storage] mount filesystem mismatch disk=%u part=%u detected=%u requested=%u\n",
                        disk_id, partition_index, filesystem, requested_filesystem);
         return -22;
     }
@@ -1579,7 +1579,7 @@ int storage_mount_block_partition(uint32_t disk_id, uint32_t partition_index,
     if (ret == 0) {
         volume->data_partition_mount = 1;
         volume->ready = true;
-        console_printf("[reliefnt] storage mounted data partition disk=%u entry=%u path=%s fs=%s\\n",
+        console_info("[reliefnt] storage mounted data partition disk=%u entry=%u path=%s fs=%s\n",
                        disk_id, partition_index, volume->mount_path,
                        filesystem == RELIEFOS_DISK_FILESYSTEM_FAT32 ? "fat32" :
                        (filesystem == RELIEFOS_DISK_FILESYSTEM_EXFAT ? "exfat" :
@@ -1661,7 +1661,7 @@ int storage_unmount_path(const char *target, uint32_t *out_volume_id)
     if (g_active_volume == &g_volumes[volume_id]) {
         g_active_volume = &g_volumes[STORAGE_VOLUME_ROOT];
     }
-    console_printf("[reliefnt] storage unmounted data partition disk=%u entry=%u path=%s\\n",
+    console_info("[reliefnt] storage unmounted data partition disk=%u entry=%u path=%s\n",
                    g_volumes[volume_id].source_disk_id,
                    g_volumes[volume_id].source_partition_index, target);
     tmpfs_destroy(g_volumes[volume_id].tmpfs);
@@ -1847,7 +1847,7 @@ int storage_install_mount_target(uint32_t disk_id)
     ret = gpt_find_esp();
     if (ret == 0 && target->exfat_start_lba) {
         ret = exfat_mount();
-        console_printf("[reliefnt] installer exFAT target mount returned %d\n", ret);
+        console_info("[reliefnt] installer exFAT target mount returned %d\n", ret);
     }
     if (ret == 0 && target->filesystem != STORAGE_FILESYSTEM_EXFAT && target->ext2_start_lba) {
         ret = ext2_mount();
@@ -1866,7 +1866,7 @@ int storage_install_mount_target(uint32_t disk_id)
         g_active_volume = esp;
         ret = fat32_mount();
         if (ret < 0) {
-            console_printf("[reliefnt] installer ESP mount failed ret=%d lba=%llu sectors=%llu\n",
+            console_error("[reliefnt] installer ESP mount failed ret=%d lba=%llu sectors=%llu\n",
                            ret, (unsigned long long)esp->esp_start_lba,
                            (unsigned long long)esp->esp_sector_count);
         }
@@ -1874,7 +1874,7 @@ int storage_install_mount_target(uint32_t disk_id)
     }
     if (ret == 0 && (target->filesystem == STORAGE_FILESYSTEM_EXFAT ||
                      storage_ext4_is_ext_family(target))) {
-        console_printf("[reliefnt] installer target mounted root=/target %s_lba=%llu esp=/target/boot esp_lba=%llu disk=%u port=%u\n",
+        console_info("[reliefnt] installer target mounted root=/target %s_lba=%llu esp=/target/boot esp_lba=%llu disk=%u port=%u\n",
                        target->filesystem == STORAGE_FILESYSTEM_EXFAT ? "exfat" :
                        (target->filesystem == STORAGE_FILESYSTEM_EXT4 ? "ext4" : "ext2"),
                        (unsigned long long)(target->filesystem == STORAGE_FILESYSTEM_EXFAT

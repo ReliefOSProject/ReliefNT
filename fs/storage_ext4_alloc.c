@@ -303,7 +303,7 @@ static void ext4_mark_volume_error(struct storage_volume *volume, uint64_t group
                                    int inode_bitmap)
 {
     if (!volume->ext4.fs_error) {
-        console_printf("[reliefnt] ext4 %s bitmap checksum error group=%llu\n",
+        console_error("[reliefnt] ext4 %s bitmap checksum error group=%llu\n",
                        inode_bitmap ? "inode" : "block",
                        (unsigned long long)group);
     }

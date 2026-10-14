@@ -75,6 +75,28 @@ make O=$PWD/out/x86_64/release ARCH=x86_64 PROFILE=release all
 | `make O=... clean` | 清理输出目录（`distclean` 连同配置一起清理；`cache/` 永远保留） |
 | `make help` | 全部目标与变量 |
 
+## 内核日志
+
+内核诊断统一为 `[启动后秒数] [等级] [子系统] 消息`，等级为 `DEBUG`、`INFO`、
+`WARN`、`ERROR` 和 `FATAL`。`DEBUG` 用于寄存器、映射和事件跟踪，`INFO` 用于
+正常状态，`WARN` 用于降级或恢复，`ERROR` 用于操作失败，`FATAL` 用于无法继续
+启动或内核异常。全部等级默认保留，早期时钟尚未初始化时启动时间为零。
+
+内核代码使用 `console_debug/info/warn/error/fatal`，或显式传入等级的
+`console_log`；旧 `console_printf` 兼容入口按 `INFO` 输出。驱动 ABI 的
+`console_write` 回调同样经过日志入口，支持消息开头的 `[DEBUG] `、`[INFO] `、
+`[WARN] `、`[ERROR] `、`[FATAL] ` 标记，未标记的旧驱动消息默认为 `INFO`。
+同一消息的多行均带等级，格式化输出支持整数宽度、补零、`l`、`ll` 和 `z`。
+
+普通日志按 CPU 归属和中断状态串行输出；致命日志不等待其他 CPU 持有的日志锁。
+启动回放使用 64 KiB 环形缓冲区，满时保留最新完整日志行。用户态终端、PTY、
+`/dev/console` 和串口写入继续使用原始输出接口，不添加内核日志等级；内核
+调试器的交互屏幕也保持原有显示。
+
+启动日志记录构建身份、固件及模块、CPU 型号和特征、物理内存及页缓存容量、
+PCI 清单、显示后端与 3D 探测结果、根文件系统选择、驱动加载摘要、虚拟终端、
+PID 1 以及在线 CPU 数量。设备不可用、回退和初始化失败保留具体状态或错误码。
+
 ## 许可证
 
 本仓库自有源码以 Apache License 2.0 发布（[LICENSE](LICENSE)）；GNU Unifont、

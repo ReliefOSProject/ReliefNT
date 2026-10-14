@@ -204,11 +204,12 @@ int storage_try_mount_root_disk(struct install_disk_state *disk)
             /* A named exFAT root is authoritative. Never silently mount the
              * ESP as / when its metadata is corrupt: that hides the real
              * failure and starts an incomplete system. */
-            console_printf("[reliefnt] attempting exFAT mount lba=%llu sectors=%u\n",
+            console_info("[reliefnt] attempting exFAT mount lba=%llu sectors=%u\n",
                            (unsigned long long)root->exfat_start_lba,
                            (unsigned int)root->exfat_sector_count);
             ret = exfat_mount();
-            console_printf("[reliefnt] exfat_mount returned %d\n", ret);
+            console_log(ret < 0 ? CONSOLE_LOG_WARN : CONSOLE_LOG_INFO,
+                        "[reliefnt] exfat_mount returned %d\n", ret);
             if (ret < 0 && root->ext_start_lba) {
                 ret = storage_mount_ext_family(root);
             }
@@ -218,17 +219,17 @@ int storage_try_mount_root_disk(struct install_disk_state *disk)
             /* A GPT disk with an ESP but no recognized root must fail
              * explicitly. Mounting the ESP as / leaves a seemingly bootable
              * system with no /system tree and hides the real storage error. */
-            console_printf("[reliefnt] GPT root filesystem not identified; refusing ESP fallback\n");
+            console_warn("[reliefnt] GPT root filesystem not identified; refusing ESP fallback\n");
             ret = -2;
         }
     }
     if (ret == 0) {
         root->ready = true;
         if (storage_mount_runtime_boot() < 0) {
-            console_printf("[reliefnt] storage boot ESP mount unavailable\n");
+            console_warn("[reliefnt] storage boot ESP mount unavailable\n");
         }
         disk->boot_root = 1;
-        console_printf("[reliefnt] storage ready transport=%s pci=%u:%u.%u unit=%u root=%s\n",
+        console_info("[reliefnt] storage ready transport=%s pci=%u:%u.%u unit=%u root=%s\n",
                        storage_transport_name(disk->transport),
                        disk->bus, disk->slot, disk->function,
                        disk->transport == STORAGE_TRANSPORT_NVME ? disk->nvme_nsid : disk->port,
@@ -299,7 +300,7 @@ static void storage_scan_ide_controller(uint8_t bus, uint8_t slot, uint8_t funct
     control[1] = (native & 4u) ? ide_pci_bar_io(bus, slot, function, 0x1c,
                                                 IDE_SECONDARY_CTRL_DEFAULT)
                                : IDE_SECONDARY_CTRL_DEFAULT;
-    console_printf("[reliefnt] IDE controller detected pci=%u:%u.%u primary=0x%x/0x%x secondary=0x%x/0x%x\n",
+    console_info("[reliefnt] IDE controller detected pci=%u:%u.%u primary=0x%x/0x%x secondary=0x%x/0x%x\n",
                    bus, slot, function, command[0], control[0], command[1], control[1]);
     for (uint8_t channel = 0; channel < 2u; ++channel) {
         for (uint8_t drive = 0; drive < 2u; ++drive) {
@@ -309,7 +310,7 @@ static void storage_scan_ide_controller(uint8_t bus, uint8_t slot, uint8_t funct
             if (ide_identify_device(&device) < 0) {
                 continue;
             }
-            console_printf("[reliefnt] IDE %s detected channel=%s drive=%s model=\"%s\" sectors=%llu lba48=%u\n",
+            console_info("[reliefnt] IDE %s detected channel=%s drive=%s model=\"%s\" sectors=%llu lba48=%u\n",
                            device.atapi ? "ATAPI" : "disk",
                            channel ? "secondary" : "primary",
                            drive ? "slave" : "master", device.model,
@@ -346,7 +347,7 @@ static void storage_scan_ide_controller(uint8_t bus, uint8_t slot, uint8_t funct
                     continue;
                 }
                 optical->ready = true;
-                console_printf("[reliefnt] storage auto-mounted iso9660 path=%s transport=ide-pio\n",
+                console_info("[reliefnt] storage auto-mounted iso9660 path=%s transport=ide-pio\n",
                                optical->mount_path);
                 ++*optical_slot;
                 ++*optical_index;
@@ -467,7 +468,7 @@ void storage_init(void)
                         {
                             int mount_ret = iso9660_mount();
                             if (mount_ret < 0) {
-                                console_printf("[reliefnt] storage failed to mount iso9660 cdrom=%u ahci=%u:%u.%u port=%u error=%d\\n",
+                                console_error("[reliefnt] storage failed to mount iso9660 cdrom=%u ahci=%u:%u.%u port=%u error=%d\n",
                                                optical_index, bus, slot, func, port, mount_ret);
                                 storage_memzero(optical, sizeof(*optical));
                                 continue;
@@ -485,7 +486,7 @@ void storage_init(void)
                             }
                         }
                         optical->ready = true;
-                        console_printf("[reliefnt] storage auto-mounted iso9660 path=%s ahci=%u:%u.%u port=%u blocks=%llu\n",
+                        console_info("[reliefnt] storage auto-mounted iso9660 path=%s ahci=%u:%u.%u port=%u blocks=%llu\n",
                                        optical->mount_path,
                                        bus, slot, func, port,
                                        (unsigned long long)optical->iso_sector_count);
@@ -519,7 +520,7 @@ void storage_init(void)
     storage_sort_install_disks();
     g_active_volume = &g_volumes[0];
     if (!root_ready) {
-        console_printf("[reliefnt] storage init failed: no AHCI/IDE/NVMe GPT ESP/root filesystem found\n");
+        console_error("[reliefnt] storage init failed: no AHCI/IDE/NVMe GPT ESP/root filesystem found\n");
     }
 }
 
@@ -572,7 +573,7 @@ void storage_mount_boot_root(const struct boot_info *boot, bool ramdisk_root)
         const char *root_fs = g_volumes[STORAGE_VOLUME_ROOT].filesystem == STORAGE_FILESYSTEM_EXT4
                                   ? "ext4"
                                   : storage_root_filesystem_name();
-        console_printf("[reliefnt] storage boot root from probed disks root=%s fs=%s\n",
+        console_info("[reliefnt] storage boot root from probed disks root=%s fs=%s\n",
                        root_fs, root_fs);
         return;
     }
@@ -589,13 +590,13 @@ void storage_mount_boot_root(const struct boot_info *boot, bool ramdisk_root)
         g_active_volume = &g_volumes[STORAGE_VOLUME_ROOT];
         g_installer_root_active = 0;
         storage_cache_invalidate();
-        console_printf("[reliefnt] storage boot root has no installer module; physical root cleared\n");
+        console_warn("[reliefnt] storage boot root has no installer module; physical root cleared\n");
         return;
     }
     if (storage_mount_ramdisk_root((const void *)(uintptr_t)start, length) < 0) {
         storage_memzero(g_volumes, sizeof(g_volumes));
         g_active_volume = &g_volumes[0];
-        console_printf("[reliefnt] storage installer ramdisk root not mounted bytes=%llu\n",
+        console_warn("[reliefnt] storage installer ramdisk root not mounted bytes=%llu\n",
                        (unsigned long long)length);
         return;
     }
@@ -603,7 +604,7 @@ void storage_mount_boot_root(const struct boot_info *boot, bool ramdisk_root)
      * target ESP at /target/boot. */
     storage_memzero(&g_volumes[STORAGE_VOLUME_BOOT], sizeof(g_volumes[STORAGE_VOLUME_BOOT]));
     g_active_volume = &g_volumes[STORAGE_VOLUME_ROOT];
-    console_printf("[reliefnt] storage boot root from installer ramdisk root=/\n");
+    console_info("[reliefnt] storage boot root from installer ramdisk root=/\n");
 }
 
 int storage_mount_ramdisk_root(const void *image, uint64_t len)
@@ -664,7 +665,7 @@ int storage_mount_ramdisk_root(const void *image, uint64_t len)
     }
     root->ready = true;
     g_installer_root_active = 1;
-    console_printf("[reliefnt] storage installer root ready ramdisk=%p kernel_map=%p bytes=%llu mode=direct fs=%s\n",
+    console_info("[reliefnt] storage installer root ready ramdisk=%p kernel_map=%p bytes=%llu mode=direct fs=%s\n",
                    image,
                    image_mapping,
                    (unsigned long long)len,
@@ -697,7 +698,7 @@ void storage_init_installer_root(const struct boot_info *boot)
                 } else {
                     mount_ret = -22;
                 }
-                console_printf("[reliefnt] installer root ramdisk module mount failed ret=%d bytes=%llu\n",
+                console_error("[reliefnt] installer root ramdisk module mount failed ret=%d bytes=%llu\n",
                                mount_ret,
                                (unsigned long long)(mod->end > mod->start
                                    ? mod->end - mod->start : 0));
@@ -706,6 +707,6 @@ void storage_init_installer_root(const struct boot_info *boot)
         }
     }
     if (!found) {
-        console_printf("[reliefnt] installer root ramdisk module not found; ensure GRUB had enough RAM to load /install/root.fat\n");
+        console_warn("[reliefnt] installer root ramdisk module not found; ensure GRUB had enough RAM to load /install/root.fat\n");
     }
 }

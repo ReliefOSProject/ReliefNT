@@ -595,7 +595,7 @@ static int storage_read_node_cursor_unlocked(const struct storage_node *node, ui
                 return storage_read_failure(ret);
             }
             if (next >= FAT32_EOC || next < 2u) {
-                console_printf("[storage] fat skip invalid cluster=%u next=%u off=%llu\n",
+                console_error("[storage] fat skip invalid cluster=%u next=%u off=%llu\n",
                                cluster, next, (unsigned long long)offset);
                 storage_restore_volume(old_volume);
                 return -5;
@@ -663,7 +663,7 @@ static int storage_read_node_cursor_unlocked(const struct storage_node *node, ui
                     next_cluster = next;
                 }
                 if (next_cluster < 2u || next_cluster >= FAT32_EOC) {
-                    console_printf("[storage] fat cursor invalid cluster=%u next=%u next_cluster=%u advanced=%u cache_clusters=%u consumed=%u off=%llu size=%llu\n",
+                    console_error("[storage] fat cursor invalid cluster=%u next=%u next_cluster=%u advanced=%u cache_clusters=%u consumed=%u off=%llu size=%llu\n",
                                    cluster, next, next_cluster, advanced, cache_clusters,
                                    consumed, (unsigned long long)offset,
                                    (unsigned long long)node->size);
@@ -680,7 +680,7 @@ static int storage_read_node_cursor_unlocked(const struct storage_node *node, ui
             break;
         }
         if (next >= FAT32_EOC) {
-            console_printf("[storage] fat mid eoc cluster=%u next=%u done=%u len=%u off=%llu size=%llu\n",
+            console_error("[storage] fat mid eoc cluster=%u next=%u done=%u len=%u off=%llu size=%llu\n",
                            cluster, next, done, len, (unsigned long long)offset,
                            (unsigned long long)node->size);
             if (cursor) {
@@ -690,7 +690,7 @@ static int storage_read_node_cursor_unlocked(const struct storage_node *node, ui
             return -5;
         }
         if (next < 2u) {
-            console_printf("[storage] fat mid bad cluster=%u next=%u done=%u len=%u off=%llu size=%llu\n",
+            console_error("[storage] fat mid bad cluster=%u next=%u done=%u len=%u off=%llu size=%llu\n",
                            cluster, next, done, len, (unsigned long long)offset,
                            (unsigned long long)node->size);
             if (cursor) {

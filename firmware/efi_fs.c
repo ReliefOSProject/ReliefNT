@@ -266,7 +266,7 @@ static int open_path(const char *path, struct efi_file_protocol **out_file)
 
     status = root_dir->open(root_dir, out_file, efi_path, EFI_FILE_MODE_READ, 0);
     if (status != EFI_SUCCESS || !*out_file) {
-        console_printf("[reliefnt] efi fs open failed path=%s status=0x%llx\n",
+        console_error("[reliefnt] efi fs open failed path=%s status=0x%llx\n",
                        path,
                        (unsigned long long)status);
         return status_to_errno(status);
@@ -285,14 +285,14 @@ static void efi_fs_init_impl(uint64_t system_table_addr)
         return;
     }
     if (!system_table_addr) {
-        console_printf("[reliefnt] efi fs init skipped: no EFI system table\n");
+        console_warn("[reliefnt] efi fs init skipped: no EFI system table\n");
         return;
     }
 
     st = (struct efi_system_table *)(uintptr_t)system_table_addr;
     if (!st || !st->boot_services || !st->boot_services->locate_handle_buffer ||
         !st->boot_services->handle_protocol) {
-        console_printf("[reliefnt] efi fs init failed: boot services unavailable\n");
+        console_warn("[reliefnt] efi fs init failed: boot services unavailable\n");
         return;
     }
 
@@ -300,7 +300,7 @@ static void efi_fs_init_impl(uint64_t system_table_addr)
     status = boot_services->locate_handle_buffer(EFI_BY_PROTOCOL, &sfs_guid, 0,
                                                  &handle_count, &handles);
     if (status != EFI_SUCCESS || handle_count == 0 || !handles) {
-        console_printf("[reliefnt] efi fs locate failed status=0x%llx handles=%llu\n",
+        console_error("[reliefnt] efi fs locate failed status=0x%llx handles=%llu\n",
                        (unsigned long long)status,
                        (unsigned long long)handle_count);
         return;
@@ -318,13 +318,13 @@ static void efi_fs_init_impl(uint64_t system_table_addr)
         if (status == EFI_SUCCESS && volume) {
             root_dir = volume;
             ready = true;
-            console_printf("[reliefnt] efi fs root volume ready handles=%llu\n",
+            console_info("[reliefnt] efi fs root volume ready handles=%llu\n",
                            (unsigned long long)handle_count);
             return;
         }
     }
 
-    console_printf("[reliefnt] efi fs init failed: no readable FAT32 volume\n");
+    console_error("[reliefnt] efi fs init failed: no readable FAT32 volume\n");
 }
 
 void efi_fs_init(uint64_t system_table_addr)
@@ -366,7 +366,7 @@ static int efi_boot_memory_map_impl(uint64_t system_table_addr, void *buffer,
                                                &descriptor_version);
     if (status != EFI_SUCCESS || !descriptor_size ||
         map_size > buffer_bytes || (map_size % descriptor_size) != 0) {
-        console_printf("[reliefnt] efi memory map capture failed status=0x%llx bytes=%llu\n",
+        console_error("[reliefnt] efi memory map capture failed status=0x%llx bytes=%llu\n",
                        (unsigned long long)status,
                        (unsigned long long)map_size);
         return -1;
@@ -418,7 +418,7 @@ static int efi_fs_read_file_impl(const char *path, const void **out_data, size_t
 
     status = file->get_info(file, &file_info_guid, &info_size, info_buf);
     if (status != EFI_SUCCESS || info_size < sizeof(struct efi_file_info)) {
-        console_printf("[reliefnt] efi fs get_info failed path=%s status=0x%llx size=%llu\n",
+        console_error("[reliefnt] efi fs get_info failed path=%s status=0x%llx size=%llu\n",
                        path,
                        (unsigned long long)status,
                        (unsigned long long)info_size);
@@ -444,7 +444,7 @@ static int efi_fs_read_file_impl(const char *path, const void **out_data, size_t
     status = file->read(file, &read_size, (void *)(uintptr_t)phys);
     close_file(file);
     if (status != EFI_SUCCESS || read_size != file_size) {
-        console_printf("[reliefnt] efi fs read failed path=%s status=0x%llx read=%llu size=%llu\n",
+        console_error("[reliefnt] efi fs read failed path=%s status=0x%llx read=%llu size=%llu\n",
                        path,
                        (unsigned long long)status,
                        (unsigned long long)read_size,

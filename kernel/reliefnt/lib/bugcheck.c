@@ -424,11 +424,11 @@ static __attribute__((noreturn)) void bugcheck_commit(struct bugcheck_info *info
         draw_bugcheck_fb(info);
         bugcheck_halt_forever();
     }
-    console_printf("\n[bugcheck] %s\n", info->reason ? info->reason : "KERNEL PANIC");
+    console_fatal("\n[bugcheck] %s\n", info->reason ? info->reason : "KERNEL PANIC");
     if (info->detail) {
-        console_printf("[bugcheck] detail=%s\n", info->detail);
+        console_fatal("[bugcheck] detail=%s\n", info->detail);
     }
-    console_printf("[bugcheck] pid=%u task=%s mode=%s vec=%llu err=0x%llx rip=0x%llx cr2=0x%llx rsp=0x%llx ss=0x%llx cs=0x%llx rflags=0x%llx ticks=%llu uptime_ms=%llu\n",
+    console_fatal("[bugcheck] pid=%u task=%s mode=%s vec=%llu err=0x%llx rip=0x%llx cr2=0x%llx rsp=0x%llx ss=0x%llx cs=0x%llx rflags=0x%llx ticks=%llu uptime_ms=%llu\n",
                    info->pid,
                    info->task_name,
                    fault_mode(info),
@@ -447,7 +447,7 @@ static __attribute__((noreturn)) void bugcheck_commit(struct bugcheck_info *info
         uint32_t pos = 0;
         pf_line[0] = 0;
         append_page_fault_flags(pf_line, &pos, sizeof(pf_line), info->error);
-        console_printf("[bugcheck] page_fault cr2=0x%llx %s\n",
+        console_fatal("[bugcheck] page_fault cr2=0x%llx %s\n",
                        (unsigned long long)info->cr2,
                        pf_line);
     }

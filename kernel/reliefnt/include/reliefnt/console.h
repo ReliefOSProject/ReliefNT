@@ -30,9 +30,26 @@ void console_vt_activate(uint32_t number, bool graphical);
 /** @brief Refresh the active graphical VT's framebuffer scanout. */
 void console_display_tick(void);
 /**
- * @brief Format and write a message to the console, printf-style.
+ * @brief Format INFO-level kernel diagnostics; raw output uses console_write.
  */
 void console_printf(const char *fmt, ...);
+
+enum console_log_level {
+    CONSOLE_LOG_DEBUG,
+    CONSOLE_LOG_INFO,
+    CONSOLE_LOG_WARN,
+    CONSOLE_LOG_ERROR,
+    CONSOLE_LOG_FATAL,
+};
+
+void console_log(enum console_log_level level, const char *fmt, ...);
+void console_log_write(const char *text);
+
+#define console_debug(...) console_log(CONSOLE_LOG_DEBUG, __VA_ARGS__)
+#define console_info(...) console_log(CONSOLE_LOG_INFO, __VA_ARGS__)
+#define console_warn(...) console_log(CONSOLE_LOG_WARN, __VA_ARGS__)
+#define console_error(...) console_log(CONSOLE_LOG_ERROR, __VA_ARGS__)
+#define console_fatal(...) console_log(CONSOLE_LOG_FATAL, __VA_ARGS__)
 /**
  * @brief Route console output to the framebuffer, replaying the boot log.
  */

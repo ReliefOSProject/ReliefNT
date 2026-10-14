@@ -597,7 +597,7 @@ static int task_map_anonymous_pages(struct task *task, uint64_t start, uint64_t 
         uint64_t phys = mm_alloc_page();
         if (!phys || !address_space_map_user_page(sched_task_as(task), page, phys, page_flags)) {
             uint64_t mapped_kib = (page - start) / 1024ULL;
-            console_printf("[reliefnt] anonymous mmap failed pid=%u range=0x%llx-0x%llx "
+            console_warn("[reliefnt] anonymous mmap failed pid=%u range=0x%llx-0x%llx "
                            "at=0x%llx mapped=%llu KiB free=%llu KiB vmas=%u cause=%s\n",
                            task ? task->pid : 0,
                            (unsigned long long)start,
@@ -935,7 +935,7 @@ int syscall_handle_task_page_fault(struct task *task, uint64_t fault_addr, uint6
                 (vma->flags & TASK_VMA_FLAG_MMAP) &&
                 (ret == -RELIEFOS_EINVAL || ret == -RELIEFOS_ENOSPC))
                 task->page_fault_signal = LINUX_SIGBUS;
-            console_printf("[reliefnt] lazy file map failed pid=%u page=0x%llx "
+            console_error("[reliefnt] lazy file map failed pid=%u page=0x%llx "
                            "fault=0x%llx error=0x%llx vma=0x%llx-0x%llx "
                            "flags=0x%x file_off=0x%llx file_limit=0x%llx ret=%d\n",
                            task->pid, (unsigned long long)page,
@@ -1100,7 +1100,7 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
         start = anonymous ? task_find_mmap_region(task, mapped_len)
                           : task_find_file_mmap_region(task, mapped_len);
         if (!start) {
-            console_printf("[reliefnt] mmap virtual range unavailable pid=%u bytes=%llu "
+            console_warn("[reliefnt] mmap virtual range unavailable pid=%u bytes=%llu "
                            "top=0x%llx vmas=%u\n",
                            task->pid,
                            (unsigned long long)mapped_len,
@@ -1131,7 +1131,7 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     if (!(flags & LINUX_MAP_FIXED) && !task_address_space_can_map(task, start, end)) return -RELIEFOS_ENOMEM;
     if (!task_vma_can_record_mapping(task, start, end, prot, vma_flags,
                                      file ? &file->node : NULL, offset, max_prot)) {
-        console_printf("[reliefnt] mmap VMA slots exhausted pid=%u bytes=%llu vmas=%u\n",
+        console_warn("[reliefnt] mmap VMA slots exhausted pid=%u bytes=%llu vmas=%u\n",
                        task->pid,
                        (unsigned long long)mapped_len,
                        task_vma_count(task));

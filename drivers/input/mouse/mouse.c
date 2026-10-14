@@ -1,5 +1,6 @@
 #include <reliefos/driver.h>
 
+#include <reliefnt/console.h>
 #include <reliefnt/framebuffer.h>
 #include <reliefnt/input.h>
 #include <reliefnt/mouse.h>
@@ -23,13 +24,6 @@ static const struct framebuffer *module_framebuffer_get(void)
     return &module_framebuffer;
 }
 
-static void module_console_notice(void)
-{
-    if (kernel_api && kernel_api->console_write) {
-        // kernel_api->console_write("[driver] mouse activity\n");
-    }
-}
-
 #define framebuffer_get() module_framebuffer_get()
 #define input_push_mouse(x, y, dx, dy, buttons) \
     kernel_api->input_push_mouse((x), (y), (dx), (dy), (buttons))
@@ -37,7 +31,6 @@ static void module_console_notice(void)
     kernel_api->input_push_mouse_wheel((x), (y), (wheel), (buttons))
 #define x86_64_inb(port) kernel_api->inb((port))
 #define x86_64_outb(value, port) kernel_api->outb((port), (value))
-#define console_printf(...) module_console_notice()
 
 #define PS2_DATA 0x60
 #define PS2_STATUS 0x64
@@ -163,7 +156,7 @@ static void mouse_publish(int32_t new_x, int32_t new_y, uint8_t buttons, const c
     ++events;
     input_push_mouse(state.x, state.y, state.x - old_x, state.y - old_y, state.buttons);
     if (events <= 8) {
-        console_printf("[reliefnt] %s mouse event #%u buttons=%u pos=%d,%d delta=%d,%d\n",
+        console_debug("[reliefnt] %s mouse event #%u buttons=%u pos=%d,%d delta=%d,%d\n",
                        tag,
                        events,
                        state.buttons,
@@ -183,7 +176,7 @@ static void mouse_publish_wheel(int32_t wheel, const char *tag)
     ++events;
     input_push_mouse_wheel(state.x, state.y, wheel, state.buttons);
     if (events <= 8) {
-        console_printf("[reliefnt] %s mouse wheel #%u delta=%d pos=%d,%d buttons=%u\n",
+        console_debug("[reliefnt] %s mouse wheel #%u delta=%d pos=%d,%d buttons=%u\n",
                        tag,
                        events,
                        (int)wheel,
@@ -478,7 +471,7 @@ static void mouse_hardware_init(void)
     (void)scale_ok;
     (void)resolution_ok;
     (void)sample_ok;
-    console_printf("[reliefnt] mouse init ps2 defaults=%d scale=%d res=%d sample=%d wheel=%d enable=%d vmware=%d absolute=%d version=0x%x at %d,%d\n",
+    console_info("[reliefnt] mouse init ps2 defaults=%d scale=%d res=%d sample=%d wheel=%d enable=%d vmware=%d absolute=%d version=0x%x at %d,%d\n",
                    defaults_ok,
                    scale_ok,
                    resolution_ok,

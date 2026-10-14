@@ -118,7 +118,7 @@ static int exfat_read_sectors_resilient(uint64_t lba, uint32_t sectors,
         int ret = exfat_transport_read(lba, chunk, data);
         if (ret == -RELIEFOS_EAGAIN) return ret;
         if (ret < 0 && chunk > 1u) {
-            console_printf("[reliefnt] exfat transport read batch failed lba=%llu sectors=%u ret=%d; retrying sectors\n",
+            console_warn("[reliefnt] exfat transport read batch failed lba=%llu sectors=%u ret=%d; retrying sectors\n",
                            (unsigned long long)lba, chunk, ret);
             ret = 0;
             for (uint32_t i = 0; i < chunk; ++i) {
@@ -126,7 +126,7 @@ static int exfat_read_sectors_resilient(uint64_t lba, uint32_t sectors,
                                                data + (size_t)i * SECTOR_SIZE);
                 if (one == -RELIEFOS_EAGAIN) return one;
                 if (one < 0) {
-                    console_printf("[reliefnt] exfat transport read sector failed lba=%llu ret=%d\n",
+                    console_error("[reliefnt] exfat transport read sector failed lba=%llu ret=%d\n",
                                    (unsigned long long)(lba + i), one);
                     return one;
                 }
@@ -154,7 +154,7 @@ static int exfat_write_sectors_resilient(uint64_t lba, uint32_t sectors,
     if (!data || !sectors) return -22;
     ret = exfat_transport_write(lba, sectors, data);
     if (ret >= 0 || sectors == 1u) return ret;
-    console_printf("[reliefnt] exfat write batch fallback lba=%llu sectors=%u ret=%d\n",
+    console_warn("[reliefnt] exfat write batch fallback lba=%llu sectors=%u ret=%d\n",
                    (unsigned long long)lba, sectors, ret);
     for (uint32_t i = 0; i < sectors; ++i) {
         storage_memcpy(storage_scratch, data + (size_t)i * SECTOR_SIZE, SECTOR_SIZE);
@@ -251,7 +251,7 @@ static int exfat_boot_checksum(uint64_t base_lba, uint32_t *out_checksum)
         int ret = exfat_read_sectors_resilient(base_lba + sector, 1u,
                                                storage_scratch);
         if (ret < 0) {
-            console_printf("[reliefnt] exfat boot checksum read failed lba=%llu sector=%u ret=%d\n",
+            console_error("[reliefnt] exfat boot checksum read failed lba=%llu sector=%u ret=%d\n",
                            (unsigned long long)(base_lba + sector), sector, ret);
             return ret;
         }
@@ -274,22 +274,22 @@ static int exfat_boot_region_valid(uint64_t base_lba, uint8_t boot_sector[SECTOR
     if (read_ret == 0) {
         storage_memcpy(boot_sector, storage_scratch, SECTOR_SIZE);
     }
-    console_printf("[reliefnt] exfat_boot_region_valid: storage_read_sectors(lba=%llu) returned %d\n",
+    console_debug("[reliefnt] exfat_boot_region_valid: storage_read_sectors(lba=%llu) returned %d\n",
                    (unsigned long long)base_lba, read_ret);
     if (read_ret < 0) {
-        console_printf("[reliefnt] exfat_boot_region_valid: read failed at lba=%llu\n",
+        console_error("[reliefnt] exfat_boot_region_valid: read failed at lba=%llu\n",
                        (unsigned long long)base_lba);
         return read_ret;
     }
-    console_printf("[reliefnt] exfat_boot_region_valid: signature bytes: %c%c%c%c%c%c%c%c\n",
+    console_debug("[reliefnt] exfat_boot_region_valid: signature bytes: %c%c%c%c%c%c%c%c\n",
                    boot_sector[3], boot_sector[4], boot_sector[5], boot_sector[6],
                    boot_sector[7], boot_sector[8], boot_sector[9], boot_sector[10]);
     if (storage_memcmp(boot_sector + 3u, "EXFAT   ", 8u) != 0) {
-        console_printf("[reliefnt] exfat_boot_region_valid: signature mismatch\n");
+        console_debug("[reliefnt] exfat_boot_region_valid: signature mismatch\n");
         return -2;
     }
     if (boot_sector[510] != 0x55u || boot_sector[511] != 0xaau) {
-        console_printf("[reliefnt] exfat_boot_region_valid: boot signature invalid: %x %x\n",
+        console_error("[reliefnt] exfat_boot_region_valid: boot signature invalid: %x %x\n",
                        boot_sector[510], boot_sector[511]);
         return -2;
     }
@@ -300,20 +300,20 @@ static int exfat_boot_region_valid(uint64_t base_lba, uint8_t boot_sector[SECTOR
         read_ret = exfat_read_sectors_resilient(base_lba + sector, 1u,
                                                 storage_scratch);
         if (read_ret < 0) {
-            console_printf("[reliefnt] exfat_boot_region_valid: read failed at sector %u ret=%d\n",
+            console_error("[reliefnt] exfat_boot_region_valid: read failed at sector %u ret=%d\n",
                            sector, read_ret);
             return read_ret;
         }
         if (sector <= 8u) {
             if (storage_scratch[510] != 0x55u || storage_scratch[511] != 0xaau) {
-                console_printf("[reliefnt] exfat_boot_region_valid: extended boot sector %u signature invalid: %x %x\n",
+                console_error("[reliefnt] exfat_boot_region_valid: extended boot sector %u signature invalid: %x %x\n",
                                sector, storage_scratch[510], storage_scratch[511]);
                 return -5;
             }
         } else {
             for (uint32_t byte = 0; byte < SECTOR_SIZE; ++byte) {
                 if (storage_scratch[byte] != 0u) {
-                    console_printf("[reliefnt] exfat_boot_region_valid: reserved sector %u not zero at byte %u\n",
+                    console_info("[reliefnt] exfat_boot_region_valid: reserved sector %u not zero at byte %u\n",
                                    sector, byte);
                     return -5;
                 }
@@ -322,26 +322,26 @@ static int exfat_boot_region_valid(uint64_t base_lba, uint8_t boot_sector[SECTOR
     }
     read_ret = exfat_boot_checksum(base_lba, &checksum);
     if (read_ret < 0) {
-        console_printf("[reliefnt] exfat_boot_region_valid: checksum read failed ret=%d\n",
+        console_error("[reliefnt] exfat_boot_region_valid: checksum read failed ret=%d\n",
                        read_ret);
         return read_ret;
     }
-    console_printf("[reliefnt] exfat_boot_region_valid: computed checksum = 0x%08x\n", checksum);
+    console_debug("[reliefnt] exfat_boot_region_valid: computed checksum = 0x%08x\n", checksum);
     read_ret = exfat_read_sectors_resilient(base_lba + 11u, 1u, storage_scratch);
     if (read_ret < 0) {
-        console_printf("[reliefnt] exfat_boot_region_valid: failed to read checksum sector ret=%d\n",
+        console_error("[reliefnt] exfat_boot_region_valid: failed to read checksum sector ret=%d\n",
                        read_ret);
         return read_ret;
     }
     for (uint32_t off = 0; off < SECTOR_SIZE; off += 4u) {
         uint32_t stored = storage_get_u32(storage_scratch + off);
         if (stored != checksum) {
-            console_printf("[reliefnt] exfat_boot_region_valid: checksum mismatch at offset %u: stored=0x%08x computed=0x%08x\n",
+            console_warn("[reliefnt] exfat_boot_region_valid: checksum mismatch at offset %u: stored=0x%08x computed=0x%08x\n",
                            off, stored, checksum);
             return -5;
         }
     }
-    console_printf("[reliefnt] exfat_boot_region_valid: all checks passed\n");
+    console_debug("[reliefnt] exfat_boot_region_valid: all checks passed\n");
     return 0;
 }
 
@@ -361,7 +361,7 @@ static int exfat_fat_cache_load(uint64_t lba)
     {
         int ret = exfat_read_sectors_resilient(first, count, exfat_fat_cache_data);
         if (ret < 0) {
-            console_printf("[reliefnt] exfat FAT cache read failed volume=%u lba=%llu sectors=%u ret=%d\n",
+            console_error("[reliefnt] exfat FAT cache read failed volume=%u lba=%llu sectors=%u ret=%d\n",
                            g_storage.volume_id, (unsigned long long)first, count, ret);
             exfat_fat_cache_valid = 0;
             exfat_fat_cache_volume = 0;
@@ -610,7 +610,7 @@ static int exfat_read_stream(uint32_t first, uint8_t nofat, uint64_t offset,
     {
         int ret = exfat_cluster_at(first, nofat, cluster_index, &cluster);
         if (ret < 0) {
-        console_printf("[reliefnt] exfat stream cluster lookup failed first=%u nofat=%u index=%llu\n",
+        console_error("[reliefnt] exfat stream cluster lookup failed first=%u nofat=%u index=%llu\n",
                        first, nofat, (unsigned long long)cluster_index);
             return ret;
         }
@@ -639,7 +639,7 @@ static int exfat_read_stream(uint32_t first, uint8_t nofat, uint64_t offset,
                 uint32_t next;
                 if (nofat) {
                     if (!exfat_cluster_valid(cluster + 1u)) {
-                        console_printf("[reliefnt] exfat stream contiguous chain ended first=%u cluster=%u done=%u len=%u\n",
+                        console_error("[reliefnt] exfat stream contiguous chain ended first=%u cluster=%u done=%u len=%u\n",
                                        first, cluster, done, len);
                         return -5;
                     }
@@ -647,12 +647,12 @@ static int exfat_read_stream(uint32_t first, uint8_t nofat, uint64_t offset,
                 } else {
                     int fat_ret = exfat_read_fat(cluster, &next);
                     if (fat_ret < 0) {
-                        console_printf("[reliefnt] exfat stream FAT read failed first=%u cluster=%u done=%u len=%u ret=%d\n",
+                        console_error("[reliefnt] exfat stream FAT read failed first=%u cluster=%u done=%u len=%u ret=%d\n",
                                        first, cluster, done, len, fat_ret);
                         return fat_ret;
                     }
                     if (next < 2u || next >= EXFAT_EOC || !exfat_cluster_valid(next)) {
-                        console_printf("[reliefnt] exfat stream FAT chain ended first=%u cluster=%u done=%u len=%u next=%u\n",
+                        console_error("[reliefnt] exfat stream FAT chain ended first=%u cluster=%u done=%u len=%u next=%u\n",
                                        first, cluster, done, len, next);
                         return -5;
                     }
@@ -685,7 +685,7 @@ static int exfat_read_stream(uint32_t first, uint8_t nofat, uint64_t offset,
             uint32_t next;
             if (nofat) {
                 if (!exfat_cluster_valid(cluster + 1u)) {
-                    console_printf("[reliefnt] exfat stream contiguous chain ended first=%u cluster=%u done=%u len=%u\n",
+                    console_error("[reliefnt] exfat stream contiguous chain ended first=%u cluster=%u done=%u len=%u\n",
                                    first, cluster, done, len);
                     return -5;
                 }
@@ -693,12 +693,12 @@ static int exfat_read_stream(uint32_t first, uint8_t nofat, uint64_t offset,
             } else {
                 int fat_ret = exfat_read_fat(cluster, &next);
                 if (fat_ret < 0) {
-                    console_printf("[reliefnt] exfat stream FAT read failed first=%u cluster=%u done=%u len=%u ret=%d\n",
+                    console_error("[reliefnt] exfat stream FAT read failed first=%u cluster=%u done=%u len=%u ret=%d\n",
                                    first, cluster, done, len, fat_ret);
                     return fat_ret;
                 }
                 if (next < 2u || next >= EXFAT_EOC || !exfat_cluster_valid(next)) {
-                    console_printf("[reliefnt] exfat stream FAT chain ended first=%u cluster=%u done=%u len=%u next=%u\n",
+                    console_error("[reliefnt] exfat stream FAT chain ended first=%u cluster=%u done=%u len=%u next=%u\n",
                                    first, cluster, done, len, next);
                     return -5;
                 }
@@ -741,14 +741,14 @@ static int exfat_write_stream(uint32_t first, uint8_t nofat, uint64_t offset,
             uint32_t part = min_u32(take, SECTOR_SIZE - sector_offset);
             ret = exfat_read_sectors_resilient(lba, 1u, storage_scratch);
             if (ret < 0) {
-                console_printf("[reliefnt] exfat stream read-modify-read failed first=%u nofat=%u lba=%llu ret=%d\n",
+                console_error("[reliefnt] exfat stream read-modify-read failed first=%u nofat=%u lba=%llu ret=%d\n",
                                first, nofat, (unsigned long long)lba, ret);
                 return ret;
             }
             storage_memcpy(storage_scratch + sector_offset, src + done, part);
             ret = exfat_write_sectors_resilient(lba, 1u, storage_scratch);
             if (ret < 0) {
-                console_printf("[reliefnt] exfat stream read-modify-write failed first=%u nofat=%u lba=%llu ret=%d\n",
+                console_error("[reliefnt] exfat stream read-modify-write failed first=%u nofat=%u lba=%llu ret=%d\n",
                                first, nofat, (unsigned long long)lba, ret);
                 return ret;
             }
@@ -784,7 +784,7 @@ static int exfat_write_stream(uint32_t first, uint8_t nofat, uint64_t offset,
             storage_memcpy(storage_cluster_buf, src + done, sectors * SECTOR_SIZE);
             ret = exfat_write_sectors_resilient(lba, sectors, storage_cluster_buf);
             if (ret < 0) {
-                console_printf("[reliefnt] exfat stream bulk write failed first=%u nofat=%u lba=%llu sectors=%u done=%u ret=%d\n",
+                console_error("[reliefnt] exfat stream bulk write failed first=%u nofat=%u lba=%llu sectors=%u done=%u ret=%d\n",
                                first, nofat, (unsigned long long)lba, sectors, done, ret);
                 return ret;
             }
@@ -795,14 +795,14 @@ static int exfat_write_stream(uint32_t first, uint8_t nofat, uint64_t offset,
         if (take) {
             ret = exfat_read_sectors_resilient(lba, 1u, storage_scratch);
             if (ret < 0) {
-                console_printf("[reliefnt] exfat stream tail read failed first=%u nofat=%u lba=%llu ret=%d\n",
+                console_error("[reliefnt] exfat stream tail read failed first=%u nofat=%u lba=%llu ret=%d\n",
                                first, nofat, (unsigned long long)lba, ret);
                 return ret;
             }
             storage_memcpy(storage_scratch, src + done, take);
             ret = exfat_write_sectors_resilient(lba, 1u, storage_scratch);
             if (ret < 0) {
-                console_printf("[reliefnt] exfat stream tail write failed first=%u nofat=%u lba=%llu ret=%d\n",
+                console_error("[reliefnt] exfat stream tail write failed first=%u nofat=%u lba=%llu ret=%d\n",
                                first, nofat, (unsigned long long)lba, ret);
                 return ret;
             }
@@ -847,7 +847,7 @@ static int exfat_bitmap_cache_load(uint64_t byte_offset)
         int ret = exfat_read_stream(g_storage.exfat_bitmap_cluster, g_storage.exfat_bitmap_nofat,
                                     aligned, exfat_bitmap_cache_data, bytes);
         if (ret < 0) {
-            console_printf("[reliefnt] exfat bitmap cache read failed volume=%u offset=%llu bytes=%u ret=%d\n",
+            console_error("[reliefnt] exfat bitmap cache read failed volume=%u offset=%llu bytes=%u ret=%d\n",
                            g_storage.volume_id, (unsigned long long)aligned, bytes, ret);
             exfat_bitmap_cache_valid = 0;
             exfat_bitmap_cache_volume = 0;
@@ -870,7 +870,7 @@ static int exfat_bitmap_flush(void)
                                      exfat_bitmap_cache_offset, exfat_bitmap_cache_data,
                                      exfat_bitmap_cache_bytes);
         if (ret < 0) {
-            console_printf("[reliefnt] exfat bitmap flush failed volume=%u offset=%llu bytes=%u ret=%d\n",
+            console_error("[reliefnt] exfat bitmap flush failed volume=%u offset=%llu bytes=%u ret=%d\n",
                            g_storage.volume_id,
                            (unsigned long long)exfat_bitmap_cache_offset,
                            exfat_bitmap_cache_bytes, ret);
@@ -934,7 +934,7 @@ static int exfat_load_upcase_table(void)
         g_storage.exfat_upcase_length > sizeof(storage_exfat_upcase_data) ||
         (g_storage.exfat_upcase_length & 1u) != 0u ||
         !exfat_cluster_valid(g_storage.exfat_upcase_cluster)) {
-        console_printf("[reliefnt] exfat upcase parameters invalid volume=%u cluster=%u length=%llu count=%u\n",
+        console_error("[reliefnt] exfat upcase parameters invalid volume=%u cluster=%u length=%llu count=%u\n",
                        g_storage.volume_id, g_storage.exfat_upcase_cluster,
                        (unsigned long long)g_storage.exfat_upcase_length,
                        g_storage.exfat_cluster_count);
@@ -946,7 +946,7 @@ static int exfat_load_upcase_table(void)
         int ret = exfat_read_stream(g_storage.exfat_upcase_cluster, g_storage.exfat_upcase_nofat,
                                     0, storage_exfat_upcase_data, raw_length);
         if (ret < 0) {
-        console_printf("[reliefnt] exfat upcase read failed offset=0 length=%u first=%u nofat=%u\n",
+        console_error("[reliefnt] exfat upcase read failed offset=0 length=%u first=%u nofat=%u\n",
                        raw_length, g_storage.exfat_upcase_cluster,
                        g_storage.exfat_upcase_nofat);
             return ret;
@@ -957,7 +957,7 @@ static int exfat_load_upcase_table(void)
         checksum += storage_exfat_upcase_data[i];
     }
     if (checksum != g_storage.exfat_upcase_checksum) {
-        console_printf("[reliefnt] exfat upcase checksum mismatch calculated=%u stored=%u first=%u,%u,%u,%u nofat=%u\n",
+        console_warn("[reliefnt] exfat upcase checksum mismatch calculated=%u stored=%u first=%u,%u,%u,%u nofat=%u\n",
                        checksum, g_storage.exfat_upcase_checksum,
                        storage_exfat_upcase_data[0], storage_exfat_upcase_data[1],
                        storage_exfat_upcase_data[2], storage_exfat_upcase_data[3],
@@ -982,14 +982,14 @@ static int exfat_load_upcase_table(void)
         value = exfat_get_u16(storage_exfat_upcase_data + offset);
         offset += 2u;
         if (value == 0u || value > 65536u - codepoint) {
-            console_printf("[reliefnt] exfat upcase decode run invalid value=%u codepoint=%u\n",
+            console_error("[reliefnt] exfat upcase decode run invalid value=%u codepoint=%u\n",
                            value, codepoint);
             return -5;
         }
         while (value--) table[codepoint] = (uint16_t)codepoint, ++codepoint;
     }
     if (codepoint != 65536u) {
-        console_printf("[reliefnt] exfat upcase decode incomplete codepoint=%u offset=%llu\n",
+        console_error("[reliefnt] exfat upcase decode incomplete codepoint=%u offset=%llu\n",
                        codepoint, (unsigned long long)offset);
         return -5;
     }
@@ -1070,7 +1070,7 @@ static int exfat_dir_cache_load(uint32_t directory_cluster, uint8_t nofat,
     ret = exfat_cluster_at(directory_cluster, nofat, cluster_index, &physical_cluster);
     if (ret < 0) {
         exfat_dir_cache_valid = 0;
-        console_printf("[reliefnt] exfat directory cache cluster lookup failed volume=%u dir=%u nofat=%u offset=%llu index=%llu ret=%d\n",
+        console_error("[reliefnt] exfat directory cache cluster lookup failed volume=%u dir=%u nofat=%u offset=%llu index=%llu ret=%d\n",
                        g_storage.volume_id, directory_cluster, nofat,
                        (unsigned long long)aligned,
                        (unsigned long long)cluster_index, ret);
@@ -1083,7 +1083,7 @@ static int exfat_dir_cache_load(uint32_t directory_cluster, uint8_t nofat,
         exfat_dir_cache_valid = 0;
         exfat_dir_cache_volume = 0;
         exfat_dir_cache_bytes = 0;
-        console_printf("[reliefnt] exfat directory cache load failed volume=%u dir=%u nofat=%u index=%llu lba=%llu bytes=%u sectors=%u ret=%d\n",
+        console_error("[reliefnt] exfat directory cache load failed volume=%u dir=%u nofat=%u index=%llu lba=%llu bytes=%u sectors=%u ret=%d\n",
                        g_storage.volume_id, directory_cluster, nofat,
                        (unsigned long long)cluster_index,
                        (unsigned long long)lba, bytes,
@@ -1111,7 +1111,7 @@ static int exfat_dir_read_entry(uint32_t directory_cluster, uint8_t nofat,
         offset + EXFAT_ENTRY_SIZE > exfat_dir_cache_offset + exfat_dir_cache_bytes) {
         ret = exfat_dir_cache_load(directory_cluster, nofat, offset);
         if (ret < 0) {
-            console_printf("[reliefnt] exfat directory entry read failed cluster=%u nofat=%u index=%u ret=%d\n",
+            console_error("[reliefnt] exfat directory entry read failed cluster=%u nofat=%u index=%u ret=%d\n",
                            directory_cluster, nofat, index, ret);
             return ret;
         }
@@ -1133,7 +1133,7 @@ static int exfat_dir_write_entry(uint32_t directory_cluster, uint8_t nofat,
         offset + EXFAT_ENTRY_SIZE > exfat_dir_cache_offset + exfat_dir_cache_bytes) {
         ret = exfat_dir_cache_load(directory_cluster, nofat, offset);
         if (ret < 0) {
-            console_printf("[reliefnt] exfat directory entry load failed cluster=%u nofat=%u index=%u ret=%d\n",
+            console_error("[reliefnt] exfat directory entry load failed cluster=%u nofat=%u index=%u ret=%d\n",
                            directory_cluster, nofat, index, ret);
             return ret;
         }
@@ -1142,7 +1142,7 @@ static int exfat_dir_write_entry(uint32_t directory_cluster, uint8_t nofat,
                    entry, EXFAT_ENTRY_SIZE);
     ret = exfat_write_stream(directory_cluster, nofat, offset, entry, EXFAT_ENTRY_SIZE);
     if (ret < 0) {
-        console_printf("[reliefnt] exfat directory entry write failed cluster=%u nofat=%u index=%u ret=%d\n",
+        console_error("[reliefnt] exfat directory entry write failed cluster=%u nofat=%u index=%u ret=%d\n",
                        directory_cluster, nofat, index, ret);
         exfat_dir_cache_valid = 0;
     }
@@ -1267,7 +1267,7 @@ static int exfat_find_in_dir_ref(uint32_t directory_cluster, uint8_t nofat, cons
         uint8_t first[EXFAT_ENTRY_SIZE];
         int ret = exfat_dir_read_entry(directory_cluster, nofat, (uint32_t)pos, first);
         if (ret < 0) {
-            console_printf("[reliefnt] exfat lookup failed dir=%u nofat=%u name=%s index=%u ret=%d\n",
+            console_error("[reliefnt] exfat lookup failed dir=%u nofat=%u name=%s index=%u ret=%d\n",
                            directory_cluster, nofat, wanted, (uint32_t)pos, ret);
             return ret;
         }
@@ -1281,7 +1281,7 @@ static int exfat_find_in_dir_ref(uint32_t directory_cluster, uint8_t nofat, cons
             ret = exfat_read_file_set(directory_cluster, nofat, (uint32_t)pos, raw, &count,
                                       name, &length, &node);
             if (ret < 0) {
-                console_printf("[reliefnt] exfat lookup entry-set invalid dir=%u nofat=%u name=%s index=%u ret=%d\n",
+                console_error("[reliefnt] exfat lookup entry-set invalid dir=%u nofat=%u name=%s index=%u ret=%d\n",
                                directory_cluster, nofat, wanted, (uint32_t)pos, ret);
                 return ret;
             }
@@ -1464,7 +1464,7 @@ static int exfat_find_free_span(uint32_t directory_cluster, uint8_t nofat,
             uint8_t entry[EXFAT_ENTRY_SIZE];
             int ret = exfat_dir_read_entry(directory_cluster, nofat, (uint32_t)pos, entry);
             if (ret < 0) {
-                console_printf("[reliefnt] exfat find-free-span read failed dir=%u nofat=%u needed=%u pos=%u ret=%d\n",
+                console_error("[reliefnt] exfat find-free-span read failed dir=%u nofat=%u needed=%u pos=%u ret=%d\n",
                                directory_cluster, nofat, needed, (uint32_t)pos, ret);
                 return ret;
             }
@@ -1491,7 +1491,7 @@ static int exfat_find_free_span(uint32_t directory_cluster, uint8_t nofat,
                 if (nofat) return -28;
                 ret = exfat_grow_directory(directory_cluster, nofat, self_ref);
                 if (ret < 0) {
-                    console_printf("[reliefnt] exfat find-free-span grow after end failed dir=%u needed=%u pos=%u ret=%d\n",
+                    console_error("[reliefnt] exfat find-free-span grow after end failed dir=%u needed=%u pos=%u ret=%d\n",
                                    directory_cluster, needed, (uint32_t)pos, ret);
                     return ret;
                 }
@@ -1500,7 +1500,7 @@ static int exfat_find_free_span(uint32_t directory_cluster, uint8_t nofat,
             }
         }
         if (grew) continue;
-        console_printf("[reliefnt] exfat find-free-span exhausted dir=%u needed=%u\n",
+        console_error("[reliefnt] exfat find-free-span exhausted dir=%u needed=%u\n",
                        directory_cluster, needed);
         return -28;
     }
@@ -1697,7 +1697,7 @@ static int exfat_write_file_set(const struct exfat_dir_ref *ref, uint8_t entries
                                 sector_base, storage_scratch, SECTOR_SIZE);
         if (ret < 0) {
             exfat_dir_cache_valid = 0;
-            console_printf("[reliefnt] exfat entry-set read-modify-read failed dir=%u nofat=%u index=%u lba-offset=%llu entries=%u ret=%d\n",
+            console_error("[reliefnt] exfat entry-set read-modify-read failed dir=%u nofat=%u index=%u lba-offset=%llu entries=%u ret=%d\n",
                            ref->directory_cluster, ref->directory_nofat,
                            ref->first_entry + i, (unsigned long long)sector_base, run, ret);
             return ret;
@@ -1710,7 +1710,7 @@ static int exfat_write_file_set(const struct exfat_dir_ref *ref, uint8_t entries
                                  sector_base, storage_scratch, SECTOR_SIZE);
         if (ret < 0) {
             exfat_dir_cache_valid = 0;
-            console_printf("[reliefnt] exfat entry-set sector write failed dir=%u nofat=%u index=%u offset=%llu entries=%u ret=%d\n",
+            console_error("[reliefnt] exfat entry-set sector write failed dir=%u nofat=%u index=%u offset=%llu entries=%u ret=%d\n",
                            ref->directory_cluster, ref->directory_nofat,
                            ref->first_entry + i, (unsigned long long)sector_base, run, ret);
             return ret;
@@ -1740,7 +1740,7 @@ static int exfat_create_entry(uint32_t directory_cluster, uint8_t directory_nofa
     ret = exfat_find_free_span(directory_cluster, directory_nofat, self_ref,
                                names + 2u, &index);
     if (ret < 0) {
-        console_printf("[reliefnt] exfat create entry free-span failed dir=%u name=%s needed=%u ret=%d\n",
+        console_error("[reliefnt] exfat create entry free-span failed dir=%u name=%s needed=%u ret=%d\n",
                        directory_cluster, name, names + 2u, ret);
         return ret;
     }
@@ -1767,10 +1767,10 @@ static int exfat_create_entry(uint32_t directory_cluster, uint8_t directory_nofa
     ref.secondary_count = (uint8_t)(names + 1u);
     ret = exfat_write_file_set(&ref, entries);
     if (ret < 0) {
-        console_printf("[reliefnt] exfat create entry failed dir=%u name=%s index=%u entries=%u ret=%d\n",
+        console_error("[reliefnt] exfat create entry failed dir=%u name=%s index=%u entries=%u ret=%d\n",
                        directory_cluster, name, index, names + 2u, ret);
     } else {
-        console_printf("[reliefnt] exfat create entry committed dir=%u name=%s index=%u entries=%u\n",
+        console_debug("[reliefnt] exfat create entry committed dir=%u name=%s index=%u entries=%u\n",
                        directory_cluster, name, index, names + 2u);
     }
     if (ret == 0 && out_ref) *out_ref = ref;
@@ -1822,21 +1822,21 @@ static int exfat_grow_directory(uint32_t directory_cluster, uint8_t directory_no
     ret = exfat_write_fat(new_cluster, EXFAT_EOC);
     if (ret < 0) {
         (void)exfat_free_clusters(new_cluster, new_nofat, g_storage.cluster_bytes);
-        console_printf("[reliefnt] exfat directory grow stage=link-new cluster=%u ret=%d\n",
+        console_error("[reliefnt] exfat directory grow stage=link-new cluster=%u ret=%d\n",
                        new_cluster, ret);
         return ret;
     }
     ret = exfat_zero_clusters(new_cluster, new_nofat, 1u);
     if (ret < 0) {
         (void)exfat_free_clusters(new_cluster, new_nofat, g_storage.cluster_bytes);
-        console_printf("[reliefnt] exfat directory grow stage=zero cluster=%u ret=%d\n",
+        console_error("[reliefnt] exfat directory grow stage=zero cluster=%u ret=%d\n",
                        new_cluster, ret);
         return ret;
     }
     ret = exfat_write_fat(tail, new_cluster);
     if (ret < 0) {
         (void)exfat_free_clusters(new_cluster, new_nofat, g_storage.cluster_bytes);
-        console_printf("[reliefnt] exfat directory grow stage=link-tail tail=%u new=%u ret=%d\n",
+        console_error("[reliefnt] exfat directory grow stage=link-tail tail=%u new=%u ret=%d\n",
                        tail, new_cluster, ret);
         return ret;
     }
@@ -1866,7 +1866,7 @@ int exfat_write_file(const char *path, const void *buffer, uint32_t len)
     if (ret < 0) return ret;
     ret = exfat_lookup_path_ref(parent_path, &parent, &parent_ref);
     if (ret < 0) {
-        console_printf("[reliefnt] exfat write file parent lookup failed path=%s parent=%s ret=%d\n",
+        console_error("[reliefnt] exfat write file parent lookup failed path=%s parent=%s ret=%d\n",
                        path, parent_path, ret);
         return ret;
     }
@@ -1875,7 +1875,7 @@ int exfat_write_file(const char *path, const void *buffer, uint32_t len)
                                 (parent.flags & STORAGE_NODE_FLAG_EXFAT_NOFAT) != 0,
                                 name, &old, &old_ref);
     if (ret != 0 && ret != -2) {
-        console_printf("[reliefnt] exfat write file lookup failed path=%s parent=%s name=%s ret=%d\n",
+        console_error("[reliefnt] exfat write file lookup failed path=%s parent=%s name=%s ret=%d\n",
                        path, parent_path, name, ret);
     }
     if (ret == 0 && old.type != RELIEFOS_FS_TYPE_FILE) return -21;
@@ -1894,7 +1894,7 @@ int exfat_write_file(const char *path, const void *buffer, uint32_t len)
              (ret = exfat_zero_stream_range(first, nofat, len,
                                             (uint64_t)clusters * g_storage.cluster_bytes - len)) < 0)) {
             (void)exfat_free_clusters(first, nofat, len);
-            console_printf("[reliefnt] exfat write file payload failed path=%s first=%u nofat=%u len=%u ret=%d\n",
+            console_error("[reliefnt] exfat write file payload failed path=%s first=%u nofat=%u len=%u ret=%d\n",
                            path, first, nofat, len, ret);
             return ret;
         }
@@ -1969,7 +1969,7 @@ int exfat_write_node_path(const char *path, uint64_t offset,
         add_clusters = new_clusters - old_clusters;
         ret = exfat_allocate_clusters(add_clusters, &new_first, &new_nofat);
         if (ret < 0) {
-            console_printf("[reliefnt] exfat write path=%s stage=allocate old_clusters=%u new_clusters=%u count=%u ret=%d\n",
+            console_error("[reliefnt] exfat write path=%s stage=allocate old_clusters=%u new_clusters=%u count=%u ret=%d\n",
                            path, old_clusters, new_clusters, add_clusters, ret);
             return ret;
         }
@@ -1993,14 +1993,14 @@ int exfat_write_node_path(const char *path, uint64_t offset,
                 ret = exfat_write_fat(old_tail, new_first);
             }
             if (ret < 0) {
-                console_printf("[reliefnt] exfat write path=%s stage=link-old-chain first=%u tail=%u new=%u ret=%d\n",
+                console_error("[reliefnt] exfat write path=%s stage=link-old-chain first=%u tail=%u new=%u ret=%d\n",
                                path, node.first_cluster, old_tail, new_first, ret);
                 return ret;
             }
             if (new_nofat) {
                 ret = exfat_write_contiguous_fat(new_first, add_clusters, EXFAT_EOC);
                 if (ret < 0) {
-                    console_printf("[reliefnt] exfat write path=%s stage=link-new-chain first=%u count=%u ret=%d\n",
+                    console_error("[reliefnt] exfat write path=%s stage=link-new-chain first=%u count=%u ret=%d\n",
                                    path, new_first, add_clusters, ret);
                     return ret;
                 }
@@ -2016,14 +2016,14 @@ int exfat_write_node_path(const char *path, uint64_t offset,
     if (offset > node.size &&
         (ret = exfat_zero_stream_range(new_first, final_nofat, node.size,
                                        offset - node.size)) < 0) {
-        console_printf("[reliefnt] exfat write path=%s stage=hole-zero first=%u nofat=%u offset=%llu length=%llu ret=-5\n",
+        console_error("[reliefnt] exfat write path=%s stage=hole-zero first=%u nofat=%u offset=%llu length=%llu ret=-5\n",
                        path, new_first, final_nofat, (unsigned long long)node.size,
                        (unsigned long long)(offset - node.size));
         return ret;
     }
     ret = exfat_write_stream(new_first, final_nofat, offset, buffer, len);
     if (ret < 0) {
-        console_printf("[reliefnt] exfat write path=%s stage=data first=%u nofat=%u offset=%llu length=%u ret=%d\n",
+        console_error("[reliefnt] exfat write path=%s stage=data first=%u nofat=%u offset=%llu length=%u ret=%d\n",
                        path, new_first, final_nofat, (unsigned long long)offset, len, ret);
         return ret;
     }
@@ -2033,7 +2033,7 @@ int exfat_write_node_path(const char *path, uint64_t offset,
         if (data_end < allocated_bytes &&
             (ret = exfat_zero_stream_range(new_first, final_nofat, data_end,
                                            allocated_bytes - data_end)) < 0) {
-            console_printf("[reliefnt] exfat write path=%s stage=tail-zero first=%u nofat=%u offset=%llu length=%llu ret=%d\n",
+            console_error("[reliefnt] exfat write path=%s stage=tail-zero first=%u nofat=%u offset=%llu length=%llu ret=%d\n",
                            path, new_first, final_nofat, (unsigned long long)data_end,
                            (unsigned long long)(allocated_bytes - data_end), ret);
             return ret;
@@ -2041,7 +2041,7 @@ int exfat_write_node_path(const char *path, uint64_t offset,
     }
     ret = exfat_update_entry_data(&ref, new_first, length, final_nofat);
     if (ret < 0) {
-        console_printf("[reliefnt] exfat write path=%s stage=dir-update first=%u nofat=%u size=%llu ret=%d\n",
+        console_error("[reliefnt] exfat write path=%s stage=dir-update first=%u nofat=%u size=%llu ret=%d\n",
                        path, new_first, final_nofat, (unsigned long long)length, ret);
         return ret;
     }
@@ -2176,14 +2176,14 @@ int exfat_mkdir(const char *path)
         ret = exfat_write_fat(cluster, EXFAT_EOC);
         if (ret < 0) {
             (void)exfat_free_clusters(cluster, nofat, g_storage.cluster_bytes);
-            console_printf("[reliefnt] exfat mkdir stage=link cluster=%u ret=%d\n", cluster, ret);
+            console_error("[reliefnt] exfat mkdir stage=link cluster=%u ret=%d\n", cluster, ret);
             return ret;
         }
     }
     ret = exfat_zero_clusters(cluster, 0u, 1u);
     if (ret < 0) {
         (void)exfat_free_clusters(cluster, 0u, g_storage.cluster_bytes);
-        console_printf("[reliefnt] exfat mkdir stage=zero cluster=%u ret=%d\n", cluster, ret);
+        console_error("[reliefnt] exfat mkdir stage=zero cluster=%u ret=%d\n", cluster, ret);
         return ret;
     }
     ret = exfat_create_entry(parent.first_cluster,
@@ -2192,7 +2192,7 @@ int exfat_mkdir(const char *path)
                              name, 1u, cluster, g_storage.cluster_bytes, 0u, 0);
     if (ret < 0) {
         (void)exfat_free_clusters(cluster, 0u, g_storage.cluster_bytes);
-        console_printf("[reliefnt] exfat mkdir stage=entry name=%s cluster=%u ret=%d\n",
+        console_error("[reliefnt] exfat mkdir stage=entry name=%s cluster=%u ret=%d\n",
                        name, cluster, ret);
         return ret;
     }
@@ -2427,21 +2427,21 @@ int exfat_mount(void)
      * boot region. Validate both copies and require identical geometry; a
      * damaged backup is otherwise indistinguishable from a later metadata
      * update and can make recovery tools choose the wrong layout. */
-    console_printf("[reliefnt] exfat_mount: validating boot region at lba=%llu\n",
+    console_debug("[reliefnt] exfat_mount: validating boot region at lba=%llu\n",
                    (unsigned long long)g_storage.exfat_start_lba);
     ret = exfat_boot_region_valid(g_storage.exfat_start_lba, boot);
     if (ret < 0) {
-        console_printf("[reliefnt] exfat_mount: primary boot region invalid ret=%d\n", ret);
+        console_error("[reliefnt] exfat_mount: primary boot region invalid ret=%d\n", ret);
         return ret;
     }
     ret = exfat_boot_region_valid(g_storage.exfat_start_lba + 12u, backup_boot);
     if (ret < 0) {
-        console_printf("[reliefnt] exfat_mount: backup boot region invalid ret=%d\n", ret);
+        console_error("[reliefnt] exfat_mount: backup boot region invalid ret=%d\n", ret);
         return ret;
     }
     for (uint32_t off = 64u; off < 112u; ++off) {
         if (boot[off] != backup_boot[off]) {
-            console_printf("[reliefnt] exfat_mount: boot/backup mismatch at offset %u\n", off);
+            console_warn("[reliefnt] exfat_mount: boot/backup mismatch at offset %u\n", off);
             return -5;
         }
     }
@@ -2475,17 +2475,17 @@ int exfat_mount(void)
     ret = exfat_read_sectors_resilient(g_storage.exfat_start_lba + fat_offset,
                                        1u, storage_scratch);
     if (ret < 0) {
-        console_printf("[reliefnt] exfat_mount: FAT reserved sector read failed ret=%d\n", ret);
+        console_error("[reliefnt] exfat_mount: FAT reserved sector read failed ret=%d\n", ret);
         return ret;
     }
     if (storage_get_u32(storage_scratch) != 0xfffffff8u ||
         storage_get_u32(storage_scratch + 4u) != 0xffffffffu) {
-        console_printf("[reliefnt] exfat_mount: FAT reserved entries invalid\n");
+        console_error("[reliefnt] exfat_mount: FAT reserved entries invalid\n");
         return -5;
     }
     ret = exfat_validate_fat_chain(root_cluster);
     if (ret < 0) {
-        console_printf("[reliefnt] exfat_mount: root FAT chain invalid cluster=%u\n", root_cluster);
+        console_error("[reliefnt] exfat_mount: root FAT chain invalid cluster=%u\n", root_cluster);
         return ret;
     }
     limit = exfat_dir_entry_limit();
@@ -2493,29 +2493,29 @@ int exfat_mount(void)
         uint8_t entry[EXFAT_ENTRY_SIZE];
             ret = exfat_dir_read_entry(root_cluster, 0u, (uint32_t)pos, entry);
             if (ret < 0) {
-                console_printf("[reliefnt] exfat_mount: root directory read failed index=%u ret=%d\n",
+                console_error("[reliefnt] exfat_mount: root directory read failed index=%u ret=%d\n",
                                (uint32_t)pos, ret);
                 return ret;
             }
         if (entry[0] == 0u) break;
         if (entry[0] == 0x83u) {
-            if (label_found || entry[1] > 11u) { console_printf("[reliefnt] exfat_mount: invalid volume label entry\n"); return -5; }
+            if (label_found || entry[1] > 11u) { console_error("[reliefnt] exfat_mount: invalid volume label entry\n"); return -5; }
             for (uint32_t byte = 2u + entry[1] * 2u; byte < EXFAT_ENTRY_SIZE; ++byte) {
-                if (entry[byte] != 0u) { console_printf("[reliefnt] exfat_mount: volume label padding nonzero\n"); return -5; }
+                if (entry[byte] != 0u) { console_error("[reliefnt] exfat_mount: volume label padding nonzero\n"); return -5; }
             }
             label_found = 1u;
         } else if (entry[0] == EXFAT_ENTRY_BITMAP && !bitmap_found) {
             uint32_t cluster = storage_get_u32(entry + 20u);
             uint64_t length = exfat_get_u64(entry + 24u);
-            if (entry[1] & (uint8_t)~1u) { console_printf("[reliefnt] exfat_mount: bitmap flags invalid=%x\n", entry[1]); return -5; }
+            if (entry[1] & (uint8_t)~1u) { console_error("[reliefnt] exfat_mount: bitmap flags invalid=%x\n", entry[1]); return -5; }
             if (!exfat_cluster_valid(cluster) ||
                 length < ((uint64_t)cluster_count + 7u) / 8u ||
-                length > (uint64_t)cluster_count * g_storage.cluster_bytes) { console_printf("[reliefnt] exfat_mount: bitmap geometry invalid cluster=%u length=%llu\n", cluster, (unsigned long long)length); return -5; }
+                length > (uint64_t)cluster_count * g_storage.cluster_bytes) { console_error("[reliefnt] exfat_mount: bitmap geometry invalid cluster=%u length=%llu\n", cluster, (unsigned long long)length); return -5; }
             g_storage.exfat_bitmap_cluster = cluster;
             g_storage.exfat_bitmap_length = length;
             ret = exfat_system_stream_mode(cluster, length, &g_storage.exfat_bitmap_nofat);
             if (ret < 0) {
-                console_printf("[reliefnt] exfat_mount: invalid allocation bitmap stream cluster=%u length=%llu\n",
+                console_error("[reliefnt] exfat_mount: invalid allocation bitmap stream cluster=%u length=%llu\n",
                                cluster, (unsigned long long)length);
                 return ret;
             }
@@ -2525,32 +2525,32 @@ int exfat_mount(void)
         } else if (entry[0] == EXFAT_ENTRY_UPCASE && !upcase_found) {
             uint32_t cluster = storage_get_u32(entry + 20u);
             uint64_t length = exfat_get_u64(entry + 24u);
-            if (entry[1] != 0u || entry[2] != 0u || entry[3] != 0u) { console_printf("[reliefnt] exfat_mount: upcase reserved fields invalid\n"); return -5; }
+            if (entry[1] != 0u || entry[2] != 0u || entry[3] != 0u) { console_error("[reliefnt] exfat_mount: upcase reserved fields invalid\n"); return -5; }
             if (!exfat_cluster_valid(cluster) || length < 2u ||
-                length > (uint64_t)cluster_count * g_storage.cluster_bytes) { console_printf("[reliefnt] exfat_mount: upcase geometry invalid cluster=%u length=%llu\n", cluster, (unsigned long long)length); return -5; }
+                length > (uint64_t)cluster_count * g_storage.cluster_bytes) { console_error("[reliefnt] exfat_mount: upcase geometry invalid cluster=%u length=%llu\n", cluster, (unsigned long long)length); return -5; }
             g_storage.exfat_upcase_checksum = storage_get_u32(entry + 4u);
             g_storage.exfat_upcase_cluster = cluster;
             g_storage.exfat_upcase_length = length;
             ret = exfat_system_stream_mode(cluster, length, &g_storage.exfat_upcase_nofat);
             if (ret < 0) {
-                console_printf("[reliefnt] exfat_mount: invalid upcase stream cluster=%u length=%llu\n",
+                console_error("[reliefnt] exfat_mount: invalid upcase stream cluster=%u length=%llu\n",
                                cluster, (unsigned long long)length);
                 return ret;
             }
             upcase_found = 1;
         } else if (entry[0] == EXFAT_ENTRY_UPCASE) {
-            console_printf("[reliefnt] exfat_mount: duplicate upcase system entry\n"); return -5;
+            console_error("[reliefnt] exfat_mount: duplicate upcase system entry\n"); return -5;
         }
     }
     if (!bitmap_found || !upcase_found) {
-        console_printf("[reliefnt] exfat_mount: missing system entries bitmap=%u upcase=%u\n",
+        console_warn("[reliefnt] exfat_mount: missing system entries bitmap=%u upcase=%u\n",
                        bitmap_found, upcase_found);
         return -2;
     }
     {
         uint8_t allocated;
         if (exfat_read_bitmap_bit(root_cluster, &allocated) < 0 || !allocated) {
-            console_printf("[reliefnt] exfat_mount: root cluster not allocated cluster=%u\n", root_cluster);
+            console_error("[reliefnt] exfat_mount: root cluster not allocated cluster=%u\n", root_cluster);
             return -5;
         }
     }
@@ -2575,7 +2575,7 @@ int exfat_mount(void)
                  g_storage.exfat_upcase_cluster + (uint32_t)(upcase_clusters - 1u) &&
             g_storage.exfat_upcase_cluster <=
                  g_storage.exfat_bitmap_cluster + (uint32_t)(bitmap_clusters - 1u))) {
-            console_printf("[reliefnt] exfat_mount: system stream geometry/alias invalid bitmap=%u upcase=%u\n",
+            console_error("[reliefnt] exfat_mount: system stream geometry/alias invalid bitmap=%u upcase=%u\n",
                            g_storage.exfat_bitmap_cluster, g_storage.exfat_upcase_cluster);
             return -5;
         }
@@ -2583,7 +2583,7 @@ int exfat_mount(void)
          * aliasing would let a normal file write corrupt allocation metadata. */
         if (exfat_fat_chain_contains(root_cluster, g_storage.exfat_bitmap_cluster) == 1 ||
             exfat_fat_chain_contains(root_cluster, g_storage.exfat_upcase_cluster) == 1) {
-            console_printf("[reliefnt] exfat_mount: system stream aliases root directory\n");
+            console_error("[reliefnt] exfat_mount: system stream aliases root directory\n");
             return -5;
         }
         for (uint64_t i = 0u; i < bitmap_clusters; ++i) {
@@ -2592,7 +2592,7 @@ int exfat_mount(void)
                                    g_storage.exfat_bitmap_nofat,
                                    i, &bitmap_cluster);
             if (ret < 0) {
-                console_printf("[reliefnt] exfat_mount: bitmap cluster chain invalid index=%u ret=%d\n",
+                console_error("[reliefnt] exfat_mount: bitmap cluster chain invalid index=%u ret=%d\n",
                                (uint32_t)i, ret);
                 return ret;
             }
@@ -2600,7 +2600,7 @@ int exfat_mount(void)
                                               g_storage.exfat_upcase_nofat,
                                               g_storage.exfat_upcase_length,
                                               bitmap_cluster) == 1) {
-                console_printf("[reliefnt] exfat_mount: bitmap overlaps upcase cluster=%u\n", bitmap_cluster);
+                console_error("[reliefnt] exfat_mount: bitmap overlaps upcase cluster=%u\n", bitmap_cluster);
                 return -5;
             }
         }
@@ -2610,7 +2610,7 @@ int exfat_mount(void)
                                    g_storage.exfat_upcase_nofat,
                                    i, &upcase_cluster);
             if (ret < 0) {
-                console_printf("[reliefnt] exfat_mount: upcase cluster chain invalid index=%u ret=%d\n",
+                console_error("[reliefnt] exfat_mount: upcase cluster chain invalid index=%u ret=%d\n",
                                (uint32_t)i, ret);
                 return ret;
             }
@@ -2618,12 +2618,12 @@ int exfat_mount(void)
                 uint8_t allocated;
                 ret = exfat_read_bitmap_bit(upcase_cluster, &allocated);
                 if (ret < 0) {
-                    console_printf("[reliefnt] exfat_mount: upcase bitmap read failed cluster=%u ret=%d\n",
+                    console_error("[reliefnt] exfat_mount: upcase bitmap read failed cluster=%u ret=%d\n",
                                    upcase_cluster, ret);
                     return ret;
                 }
                 if (!allocated) {
-                    console_printf("[reliefnt] exfat_mount: upcase cluster unallocated cluster=%u\n", upcase_cluster);
+                    console_error("[reliefnt] exfat_mount: upcase cluster unallocated cluster=%u\n", upcase_cluster);
                     return -5;
                 }
             }
@@ -2634,7 +2634,7 @@ int exfat_mount(void)
                                    g_storage.exfat_bitmap_nofat,
                                    i, &bitmap_cluster);
             if (ret < 0) {
-                console_printf("[reliefnt] exfat_mount: bitmap cluster chain invalid (verify) index=%u ret=%d\n",
+                console_error("[reliefnt] exfat_mount: bitmap cluster chain invalid (verify) index=%u ret=%d\n",
                                (uint32_t)i, ret);
                 return ret;
             }
@@ -2642,12 +2642,12 @@ int exfat_mount(void)
                 uint8_t allocated;
                 ret = exfat_read_bitmap_bit(bitmap_cluster, &allocated);
                 if (ret < 0) {
-                    console_printf("[reliefnt] exfat_mount: bitmap allocation read failed cluster=%u ret=%d\n",
+                    console_error("[reliefnt] exfat_mount: bitmap allocation read failed cluster=%u ret=%d\n",
                                    bitmap_cluster, ret);
                     return ret;
                 }
                 if (!allocated) {
-                    console_printf("[reliefnt] exfat_mount: bitmap cluster unallocated cluster=%u\n", bitmap_cluster);
+                    console_error("[reliefnt] exfat_mount: bitmap cluster unallocated cluster=%u\n", bitmap_cluster);
                     return -5;
                 }
             }
@@ -2662,7 +2662,7 @@ int exfat_mount(void)
                                         &value, 1u);
                 if (ret < 0) return ret;
                 if ((value & (uint8_t)(1u << (bit & 7u))) != 0u) {
-                    console_printf("[reliefnt] exfat_mount: bitmap has reserved bit=%llu set\n",
+                    console_error("[reliefnt] exfat_mount: bitmap has reserved bit=%llu set\n",
                                    (unsigned long long)bit);
                     return -5;
                 }
@@ -2672,7 +2672,7 @@ int exfat_mount(void)
     storage_exfat_upcase_ready[g_storage.volume_id] = 0u;
     ret = exfat_load_upcase_table();
     if (ret < 0) {
-        console_printf("[reliefnt] exfat_mount: upcase table load/checksum failed ret=%d cluster=%u length=%llu\n",
+        console_error("[reliefnt] exfat_mount: upcase table load/checksum failed ret=%d cluster=%u length=%llu\n",
                        ret,
                        g_storage.exfat_upcase_cluster,
                        (unsigned long long)g_storage.exfat_upcase_length);

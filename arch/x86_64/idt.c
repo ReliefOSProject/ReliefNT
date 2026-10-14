@@ -273,7 +273,7 @@ void exception_dispatch(uint64_t vector, uint64_t error, uint64_t rip, uint64_t 
     if (vector == 2 || vector == 8 || vector == 18) {
         bugcheck_exception(vector, error, rip, cs, rflags, rsp, ss, cr2);
     }
-    console_printf("[reliefnt] exception vector=%llu error=0x%llx rip=0x%llx cs=0x%llx rflags=0x%llx rsp=0x%llx ss=0x%llx\n",
+    console_fatal("[reliefnt] exception vector=%llu error=0x%llx rip=0x%llx cs=0x%llx rflags=0x%llx rsp=0x%llx ss=0x%llx\n",
                    (unsigned long long)vector,
                    (unsigned long long)error,
                    (unsigned long long)rip,
@@ -281,12 +281,12 @@ void exception_dispatch(uint64_t vector, uint64_t error, uint64_t rip, uint64_t 
                    (unsigned long long)rflags,
                    (unsigned long long)rsp,
                    (unsigned long long)ss);
-    console_printf("[reliefnt] exception mode=%s cr2=0x%llx ticks=%llu\n",
+    console_fatal("[reliefnt] exception mode=%s cr2=0x%llx ticks=%llu\n",
                    mode,
                    (unsigned long long)cr2,
                    (unsigned long long)time_ticks());
     if (vector == 14) {
-        console_printf("[reliefnt] page fault flags present=%u write=%u user=%u reserved=%u fetch=%u\n",
+        console_fatal("[reliefnt] page fault flags present=%u write=%u user=%u reserved=%u fetch=%u\n",
                        (unsigned)(error & 1u),
                        (unsigned)((error >> 1) & 1u),
                        (unsigned)((error >> 2) & 1u),
@@ -469,7 +469,7 @@ static void signal_user_page_fault(struct trap_frame *frame, uint64_t cr2)
     }
     format_user_page_fault_report(report, sizeof(report), task, frame, cr2);
     uint32_t signal = task->page_fault_signal == 7 ? 7 : 11;
-    console_printf("[reliefnt] user page fault signal=%u pid=%u name=%s cr2=0x%llx rip=0x%llx error=0x%llx\n",
+    console_warn("[reliefnt] user page fault signal=%u pid=%u name=%s cr2=0x%llx rip=0x%llx error=0x%llx\n",
                    signal,
                    task->pid,
                    task->name,
@@ -530,12 +530,12 @@ struct task *page_fault_dispatch(struct trap_frame *frame)
         kernel_execution_unlock_irqrestore(execution_flags);
         bugcheck_exception(14, 0, 0, 0, 0, 0, 0, cr2);
     }
-    console_printf("[reliefnt] page fault unhandled cr2=0x%llx error=0x%llx rip=0x%llx cs=0x%llx\n",
+    console_fatal("[reliefnt] page fault unhandled cr2=0x%llx error=0x%llx rip=0x%llx cs=0x%llx\n",
                    (unsigned long long)cr2,
                    (unsigned long long)frame->error,
                    (unsigned long long)frame->rip,
                    (unsigned long long)frame->cs);
-    console_printf("[reliefnt] page fault flags present=%u write=%u user=%u reserved=%u fetch=%u\n",
+    console_fatal("[reliefnt] page fault flags present=%u write=%u user=%u reserved=%u fetch=%u\n",
                    (unsigned)(frame->error & 1u),
                    (unsigned)((frame->error >> 1) & 1u),
                    (unsigned)((frame->error >> 2) & 1u),

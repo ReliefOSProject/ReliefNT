@@ -462,14 +462,14 @@ static bool elf64_task_range_available(const struct task *task, uint64_t start, 
     uint64_t stack_low;
     if (!task || start < RELIEFNT_USER_BASE || start >= end || end > RELIEFNT_USER_TOP ||
         task->stack_top < (uint64_t)RELIEFNT_USER_STACK_PAGES * PAGE_SIZE) {
-        console_printf("[reliefnt] ELF range invalid start=0x%llx end=0x%llx stack=0x%llx\n",
+        console_error("[reliefnt] ELF range invalid start=0x%llx end=0x%llx stack=0x%llx\n",
                        (unsigned long long)start, (unsigned long long)end,
                        task ? (unsigned long long)task->stack_top : 0ULL);
         return false;
     }
     stack_low = task->stack_top - (uint64_t)RELIEFNT_USER_STACK_MAX_PAGES * PAGE_SIZE;
     if (end > stack_low) {
-        console_printf("[reliefnt] ELF range overlaps stack start=0x%llx end=0x%llx stack=0x%llx\n",
+        console_error("[reliefnt] ELF range overlaps stack start=0x%llx end=0x%llx stack=0x%llx\n",
                        (unsigned long long)start, (unsigned long long)end,
                        (unsigned long long)stack_low);
         return false;
@@ -477,7 +477,7 @@ static bool elf64_task_range_available(const struct task *task, uint64_t start, 
     for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
         const struct task_vma *vma = sched_task_vma_at((struct task *)task, i);
         if (vma && vma->used && start < vma->end && end > vma->start) {
-            console_printf("[reliefnt] ELF range overlaps VMA=%u range=0x%llx-0x%llx existing=0x%llx-0x%llx\n",
+            console_error("[reliefnt] ELF range overlaps VMA=%u range=0x%llx-0x%llx existing=0x%llx-0x%llx\n",
                            i, (unsigned long long)start, (unsigned long long)end,
                            (unsigned long long)vma->start, (unsigned long long)vma->end);
             return false;
@@ -605,7 +605,7 @@ static int elf64_map_one(struct task *task, const struct storage_node *node,
     uint32_t free_vmas = 0;
     uint64_t program_break = 0;
     if (!elf64_segments_nonoverlapping(eh, image, node->size, bias, info->dynamic)) {
-        console_printf("[reliefnt] ELF %s segment layout rejected bias=0x%llx\n",
+        console_error("[reliefnt] ELF %s segment layout rejected bias=0x%llx\n",
                        image_name, (unsigned long long)bias);
         return -8;
     }
@@ -622,7 +622,7 @@ static int elf64_map_one(struct task *task, const struct storage_node *node,
         }
     }
     if (!loads || loads > free_vmas) {
-        console_printf("[reliefnt] ELF %s VMA capacity rejected loads=%u free=%u\n",
+        console_error("[reliefnt] ELF %s VMA capacity rejected loads=%u free=%u\n",
                        image_name, loads, free_vmas);
         return -12;
     }
@@ -642,12 +642,12 @@ static int elf64_map_one(struct task *task, const struct storage_node *node,
         start = align_down(bias + ph->p_vaddr);
         end = align_up(bias + ph->p_vaddr + ph->p_memsz);
         if (!end) {
-            console_printf("[reliefnt] ELF %s LOAD[%u] address overflow\n", image_name, i);
+            console_error("[reliefnt] ELF %s LOAD[%u] address overflow\n", image_name, i);
             return -8;
         }
         page_delta = ph->p_vaddr - align_down(ph->p_vaddr);
         if (ph->p_offset < page_delta) {
-            console_printf("[reliefnt] ELF %s LOAD[%u] file offset rejected\n", image_name, i);
+            console_error("[reliefnt] ELF %s LOAD[%u] file offset rejected\n", image_name, i);
             return -8;
         }
         file_offset = ph->p_offset - page_delta;
@@ -655,13 +655,13 @@ static int elf64_map_one(struct task *task, const struct storage_node *node,
             legacy_vma = elf64_legacy_shared_page_vma(task, node, start, end, file_offset);
         }
         if (!legacy_vma && !elf64_task_range_available(task, start, end)) {
-            console_printf("[reliefnt] ELF %s LOAD[%u] range rejected 0x%llx-0x%llx\n",
+            console_error("[reliefnt] ELF %s LOAD[%u] range rejected 0x%llx-0x%llx\n",
                            image_name, i, (unsigned long long)start,
                            (unsigned long long)end);
             return -8;
         }
         if (!address_space_prepare_user_range(sched_task_as(task), start, end)) {
-            console_printf("[reliefnt] ELF %s LOAD[%u] page table preparation failed "
+            console_error("[reliefnt] ELF %s LOAD[%u] page table preparation failed "
                            "0x%llx-0x%llx\n",
                            image_name, i, (unsigned long long)start,
                            (unsigned long long)end);
@@ -669,7 +669,7 @@ static int elf64_map_one(struct task *task, const struct storage_node *node,
         }
         vma = legacy_vma ? legacy_vma : elf64_task_free_vma(task);
         if (!vma) {
-            console_printf("[reliefnt] ELF %s LOAD[%u] VMA capacity rejected\n", image_name, i);
+            console_error("[reliefnt] ELF %s LOAD[%u] VMA capacity rejected\n", image_name, i);
             return -12;
         }
         if (ph->p_flags & PF_W) {
@@ -684,7 +684,7 @@ static int elf64_map_one(struct task *task, const struct storage_node *node,
         if (legacy_vma) {
             if ((legacy_vma->prot | prot) & TASK_VMA_PROT_WRITE &&
                 (legacy_vma->prot | prot) & TASK_VMA_PROT_EXEC) {
-                console_printf("[reliefnt] ELF %s LOAD[%u] legacy W+X page rejected\n",
+                console_error("[reliefnt] ELF %s LOAD[%u] legacy W+X page rejected\n",
                                image_name, i);
                 return -8;
             }
@@ -747,16 +747,16 @@ int elf64_map_task_image(struct task *task, const struct storage_node *node,
     int ret;
 
     if (!task || !node || !out) {
-        console_printf("[reliefnt] ELF task image request is invalid\n");
+        console_error("[reliefnt] ELF task image request is invalid\n");
         return -22;
     }
     ret = elf64_read_headers(node, &image, &image_len);
     if (ret < 0) {
-        console_printf("[reliefnt] ELF main header read failed\n");
+        console_error("[reliefnt] ELF main header read failed\n");
         return ret;
     }
     if (!elf64_probe_image(image, image_len, node->size, false, &main_info)) {
-        console_printf("[reliefnt] ELF main header validation failed\n");
+        console_error("[reliefnt] ELF main header validation failed\n");
         return -8;
     }
     main_eh = image;
@@ -764,7 +764,7 @@ int elf64_map_task_image(struct task *task, const struct storage_node *node,
         main_bias = elf64_choose_bias(&main_info, false);
         if (!main_bias || main_info.entry > UINT64_MAX - main_bias ||
             main_info.phdr_vaddr > UINT64_MAX - main_bias) {
-            console_printf("[reliefnt] ELF main ASLR layout rejected span=0x%llx\n",
+            console_error("[reliefnt] ELF main ASLR layout rejected span=0x%llx\n",
                            (unsigned long long)(main_info.high_vaddr - main_info.low_vaddr));
             return -8;
         }
@@ -777,7 +777,7 @@ int elf64_map_task_image(struct task *task, const struct storage_node *node,
         }
     }
     if (!entry_found) {
-        console_printf("[reliefnt] ELF main entry is outside an executable LOAD segment\n");
+        console_error("[reliefnt] ELF main entry is outside an executable LOAD segment\n");
         return -8;
     }
     ret = elf64_map_one(task, node, image, &main_info, main_bias, "main");
@@ -799,7 +799,7 @@ int elf64_map_task_image(struct task *task, const struct storage_node *node,
                                  interpreter_path, sizeof(interpreter_path), false);
     if (!ret) ret = storage_lookup_path(interpreter_path, &interp_node);
     if (ret < 0) {
-        console_printf("[reliefnt] ELF interpreter lookup failed path=%s\n", main_info.interp);
+        console_error("[reliefnt] ELF interpreter lookup failed path=%s\n", main_info.interp);
         return ret;
     }
     ret = fs_permissions_check(task, interpreter_path, FS_ACCESS_EXEC, false);
@@ -808,22 +808,22 @@ int elf64_map_task_image(struct task *task, const struct storage_node *node,
         sched_task_mm(task)->nondumpable = true;
     ret = elf64_read_headers(&interp_node, &interp_image, &interp_len);
     if (ret < 0) {
-        console_printf("[reliefnt] ELF interpreter header read failed\n");
+        console_error("[reliefnt] ELF interpreter header read failed\n");
         return ret == -8 ? -80 : ret;
     }
     if (!elf64_probe_image(interp_image, interp_len, interp_node.size, true, &interp_info)) {
-        console_printf("[reliefnt] ELF interpreter header validation failed\n");
+        console_error("[reliefnt] ELF interpreter header validation failed\n");
         return -80;
     }
     if (interp_info.abi_major != main_info.abi_major) {
-        console_printf("[reliefnt] ELF ABI mismatch main=%u interpreter=%u\n",
+        console_error("[reliefnt] ELF ABI mismatch main=%u interpreter=%u\n",
                        main_info.abi_major, interp_info.abi_major);
         return -80;
     }
     interp_bias = elf64_choose_bias(&interp_info, true);
     interp_eh = interp_image;
     if (!interp_bias || interp_info.entry > UINT64_MAX - interp_bias) {
-        console_printf("[reliefnt] ELF interpreter ASLR layout rejected span=0x%llx\n",
+        console_error("[reliefnt] ELF interpreter ASLR layout rejected span=0x%llx\n",
                        (unsigned long long)(interp_info.high_vaddr - interp_info.low_vaddr));
         return -8;
     }

@@ -939,7 +939,7 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
             command != RB_POWER_OFF) {
             return -RELIEFOS_EINVAL;
         }
-        console_printf("[reliefnt] reboot(2) requested by pid=%u command=0x%x\n",
+        console_info("[reliefnt] reboot(2) requested by pid=%u command=0x%x\n",
                        task->pid, command);
         if (command == RB_AUTOBOOT) power_reboot();
         power_shutdown();

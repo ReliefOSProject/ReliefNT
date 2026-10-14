@@ -48,7 +48,7 @@ static uint32_t published_cards;
 static void hda_module_error(const char *stage,const struct reliefos_driver_pci_device *dev,
                              uint8_t cad,int error)
 {
-    char line[120];unsigned n=0;const char *prefix="[hda] ";const char *hex="0123456789abcdef";
+    char line[120];unsigned n=0;const char *prefix="[ERROR] [hda] ";const char *hex="0123456789abcdef";
     while(*prefix)line[n++]=*prefix++;
     while(*stage && n<64)line[n++]=*stage++;
     const char *label=" bdf=";while(*label)line[n++]=*label++;
@@ -895,7 +895,7 @@ static void hda_module_fini(void)
         if(ret){if(!first_error)first_error=ret;link=&owner->next;continue;}
         *link=owner->next;kernel_api->free_pages(owner->phys,owner->pages);
     }
-    if(first_error){kernel_api->console_write("[hda] unsafe teardown retained for retry\n");
+    if(first_error){kernel_api->console_write("[WARN] [hda] unsafe teardown retained for retry\n");
         kernel_api->report_teardown_failure(first_error);return;}
     published_cards=0;kernel_api=NULL;
 }

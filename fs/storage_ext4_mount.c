@@ -59,14 +59,14 @@ int storage_ext4_feature_policy(const struct storage_ext4_super_view *view,
      * interpretation). */
     bad = view->feature_incompat & ~EXT4_INCOMPAT_ALLOWED;
     if (bad != 0) {
-        console_printf("[reliefnt] ext4 mount rejected incompat=0x%x\n", bad);
+        console_error("[reliefnt] ext4 mount rejected incompat=0x%x\n", bad);
         out->verdict = STORAGE_EXT4_FEATURE_REJECT;
         return -RELIEFOS_EOPNOTSUPP;
     }
     /* Compat never blocks, except FAST_COMMIT: it changes how the journal is
      * interpreted (spec: affects on-disk interpretation -> reject). */
     if ((view->feature_compat & EXT4_FEATURE_COMPAT_FAST_COMMIT) != 0) {
-        console_printf("[reliefnt] ext4 mount rejected compat=0x%x\n",
+        console_error("[reliefnt] ext4 mount rejected compat=0x%x\n",
                        EXT4_FEATURE_COMPAT_FAST_COMMIT);
         out->verdict = STORAGE_EXT4_FEATURE_REJECT;
         return -RELIEFOS_EOPNOTSUPP;
@@ -74,7 +74,7 @@ int storage_ext4_feature_policy(const struct storage_ext4_super_view *view,
     /* Quota/bigalloc/project/verity change on-disk interpretation too. */
     bad = view->feature_ro_compat & EXT4_RO_COMPAT_REJECT;
     if (bad != 0) {
-        console_printf("[reliefnt] ext4 mount rejected ro_compat=0x%x\n", bad);
+        console_error("[reliefnt] ext4 mount rejected ro_compat=0x%x\n", bad);
         out->verdict = STORAGE_EXT4_FEATURE_REJECT;
         return -RELIEFOS_EOPNOTSUPP;
     }
@@ -268,7 +268,7 @@ int storage_ext4_mount(struct storage_volume *volume)
         ext4_get_le32(storage_scratch + SB_BACKUP_BGS + 4);
     flex_log = storage_scratch[SB_LOG_GROUPS_PER_FLEX];
     if (flex_log > EXT4_MAX_FLEX_LOG) {
-        console_printf("[reliefnt] ext4 mount clamped s_log_groups_per_flex "
+        console_warn("[reliefnt] ext4 mount clamped s_log_groups_per_flex "
                        "%u -> %u\n",
                        (unsigned)flex_log, (unsigned)EXT4_MAX_FLEX_LOG);
         flex_log = (uint8_t)EXT4_MAX_FLEX_LOG;
@@ -409,7 +409,7 @@ int storage_ext4_mount(struct storage_volume *volume)
                              ? " journal-needs-recovery"
                              : decision.read_only_reason == STORAGE_EXT4_READ_ONLY_JOURNAL_CORRUPT
                                    ? " journal-corrupt" : "";
-    console_printf("[reliefnt] ext4 mount ok fs=%s blocks=%llu groups=%llu%s\n",
+    console_info("[reliefnt] ext4 mount ok fs=%s blocks=%llu groups=%llu%s\n",
                    filesystem == STORAGE_FILESYSTEM_EXT4 ? "ext4" : "ext2",
                    (unsigned long long)view.blocks_count,
                    (unsigned long long)view.group_count, reason);

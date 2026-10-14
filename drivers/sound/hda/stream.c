@@ -140,7 +140,7 @@ static void hda_stream_position_error(const struct hda_stream *s,const char *rea
 {
     const struct reliefos_driver_kernel_api *api=s->controller->api;
     if(!api || !api->console_write)return;
-    char line[256];unsigned n=0;const char *text="[hda-pos] reason=";
+    char line[256];unsigned n=0;const char *text="[WARN] [hda-pos] reason=";
     while(*text)line[n++]=*text++;
     while(*reason)line[n++]=*reason++;
     const char *labels[]={" sd="," last="," pos="," cbl="," wall_prev=",

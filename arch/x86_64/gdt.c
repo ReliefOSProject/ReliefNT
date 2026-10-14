@@ -162,7 +162,7 @@ static void arch_setup_cpu(uint32_t cpu_index, void *kernel_stack_top)
     if (!syscall_entry_stack[cpu_index]) {
         syscall_entry_stack[cpu_index] = mm_alloc_pages(ARCH_SYSCALL_STACK_SIZE / 4096u);
         if (!syscall_entry_stack[cpu_index]) {
-            console_printf("[reliefnt] CPU%u syscall stack allocation failed\n", cpu_index);
+            console_error("[reliefnt] CPU%u syscall stack allocation failed\n", cpu_index);
             for (;;) __asm__ volatile("cli; hlt");
         }
     }

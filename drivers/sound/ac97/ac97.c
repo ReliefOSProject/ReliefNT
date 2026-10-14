@@ -319,7 +319,7 @@ static int ac97_configure_mixer_locked(void)
              * correct unmute request; do not reject an otherwise usable PCM
              * codec merely because that optional readback is conservative. */
             if (!warned) {
-                kernel_api->console_write("[driver] ac97 codec mixer readback muted\n");
+                kernel_api->console_write("[WARN] [driver] ac97 codec mixer readback muted\n");
                 warned = 1;
             }
         }
@@ -356,7 +356,7 @@ static void ac97_codec_initialize(void)
         }
     }
     if ((power & AC97_POWER_READY_MASK) != AC97_POWER_READY_MASK) {
-        kernel_api->console_write("[driver] ac97 codec power-ready bits unavailable; continuing\n");
+        kernel_api->console_write("[WARN] [driver] ac97 codec power-ready bits unavailable; continuing\n");
     }
 }
 
@@ -468,7 +468,7 @@ static int ac97_queue_descriptor_locked(const uint8_t *data, uint32_t length)
     if (nonzero && !ac97.nonzero_reported) {
         ac97.nonzero_reported = 1U;
         ac97.nonzero_descriptor = index;
-        kernel_api->console_write("[driver] ac97 first nonzero PCM descriptor queued\n");
+        kernel_api->console_write("[DEBUG] [driver] ac97 first nonzero PCM descriptor queued\n");
     }
     ac97.write_index = (index + 1U) % AC97_BDL_COUNT;
     ++ac97.queued_descriptors;
@@ -526,7 +526,7 @@ static void ac97_refresh_locked(void)
     if (completed > ac97.queued_descriptors) {
         ++ac97.underruns;
         if (!ac97.underrun_reported) {
-            kernel_api->console_write("[driver] ac97 DMA underrun; refilling silence\n");
+            kernel_api->console_write("[WARN] [driver] ac97 DMA underrun; refilling silence\n");
             ac97.underrun_reported = 1U;
         }
         /* The hardware may still be running on the descriptor at CIV.  Drop
@@ -563,7 +563,7 @@ static void ac97_refresh_locked(void)
             ac97.slot_pcm[index] = 0;
             if (index == ac97.nonzero_descriptor &&
                 ac97.nonzero_reported && !ac97.nonzero_consumed_reported) {
-                kernel_api->console_write("[driver] ac97 first nonzero DMA descriptor consumed\n");
+                kernel_api->console_write("[DEBUG] [driver] ac97 first nonzero DMA descriptor consumed\n");
                 ac97.nonzero_consumed_reported = 1U;
             }
             if (ac97.queued_descriptors) {
@@ -643,7 +643,7 @@ static int ac97_start_locked(void)
         kernel_api->console_write("[driver] ac97 DMA ring started (loop, period=2048)\n");
         ac97_log_position(status);
     } else {
-        kernel_api->console_write("[driver] ac97 DMA start rejected\n");
+        kernel_api->console_write("[ERROR] [driver] ac97 DMA start rejected\n");
     }
     return ac97.running ? 0 : -5;
 }
@@ -692,7 +692,7 @@ static long ac97_write(const void *data, uint32_t length, uint32_t *out_status)
         if (ac97.queued_descriptors >= AC97_BDL_COUNT) {
             ++ac97.overruns;
             if (!ac97.overrun_reported) {
-                kernel_api->console_write("[driver] ac97 DMA queue full; short write\n");
+                kernel_api->console_write("[WARN] [driver] ac97 DMA queue full; short write\n");
                 ac97.overrun_reported = 1U;
             }
             break;

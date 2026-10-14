@@ -386,10 +386,10 @@ static void reserve_boot_ranges(const struct boot_info *boot)
  */
 static void print_memory_map(void)
 {
-    console_printf("[reliefnt] physical memory free ranges=%u reserved=%u\n",
+    console_info("[reliefnt] physical memory free ranges=%u reserved=%u\n",
                    free_range_count, reserved_range_count);
     for (uint32_t i = 0; i < reserved_range_count; ++i) {
-        console_printf("[reliefnt] reserved[%u] %s 0x%llx-0x%llx (%llu KiB)\n",
+        console_debug("[reliefnt] reserved[%u] %s 0x%llx-0x%llx (%llu KiB)\n",
                        i,
                        reserved_ranges[i].name ? reserved_ranges[i].name : "reserved",
                        (unsigned long long)reserved_ranges[i].start,
@@ -397,7 +397,7 @@ static void print_memory_map(void)
                        (unsigned long long)((reserved_ranges[i].end - reserved_ranges[i].start) / 1024));
     }
     for (uint32_t i = 0; i < free_range_count; ++i) {
-        console_printf("[reliefnt] free[%u] 0x%llx-0x%llx (%llu KiB)\n",
+        console_debug("[reliefnt] free[%u] 0x%llx-0x%llx (%llu KiB)\n",
                        i,
                        (unsigned long long)free_ranges[i].start,
                        (unsigned long long)free_ranges[i].end,
@@ -434,7 +434,7 @@ void mm_init(const struct boot_info *boot)
         }
     }
     if (!free_pages) {
-        console_printf("[reliefnt] no memory for physical page bitmap\n");
+        console_fatal("[reliefnt] no memory for physical page bitmap\n");
         free_page_count = 0;
         allocation_hint = MM_PAGE_COUNT;
         return;
@@ -451,7 +451,7 @@ void mm_init(const struct boot_info *boot)
         }
     }
 
-    console_printf("[reliefnt] mm initialized usable=%llu KiB mmap_entries=%u efi_mmap_entries=%u\n",
+    console_info("[reliefnt] mm initialized usable=%llu KiB mmap_entries=%u efi_mmap_entries=%u\n",
                    (unsigned long long)total_kib,
                    boot->mmap_entry_count,
                    boot->efi_mmap_entry_count);

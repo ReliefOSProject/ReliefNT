@@ -3,6 +3,7 @@
  * Uses the physical page allocator while the kernel remains identity mapped.
  */
 #include <reliefnt/heap.h>
+#include <reliefnt/console.h>
 #include <reliefnt/mm.h>
 
 #define KERNEL_HEAP_MAGIC 0x4c484541u
@@ -16,6 +17,8 @@ struct kernel_heap_header {
 
 void kernel_heap_init(void)
 {
+    console_info("[memory] kernel heap allocator=page-backed page_bytes=%u header_bytes=%u\n",
+                 KERNEL_PAGE_SIZE, (unsigned)sizeof(struct kernel_heap_header));
 }
 
 void *kernel_malloc(size_t size)

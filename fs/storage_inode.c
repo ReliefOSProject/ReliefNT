@@ -102,7 +102,7 @@ int storage_inode_put(struct storage_inode_ref *reference)
     } else {
         /* Keep failed deletion metadata reserved; do not recycle this inode or
          * unmount the volume as though cleanup had succeeded. */
-        console_printf("[storage] inode release failed volume=%u inode=%u ret=%d\n",
+        console_error("[storage] inode release failed volume=%u inode=%u ret=%d\n",
                        reference->node.volume_id, reference->node.first_cluster, ret);
     }
     kernel_execution_unlock_irqrestore(flags);

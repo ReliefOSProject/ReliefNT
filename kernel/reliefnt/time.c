@@ -251,11 +251,11 @@ void time_init(void)
         struct reliefos_time_info info;
         wall_clock_valid = 1;
         unix_to_datetime(wall_unix_seconds, &info);
-        console_printf("[reliefnt] rtc wall clock %u-%u-%u %u:%u:%u\n",
+        console_info("[reliefnt] rtc wall clock %u-%u-%u %u:%u:%u\n",
                        info.year, info.month, info.day,
                        info.hour, info.minute, info.second);
     } else {
-        console_printf("[reliefnt] rtc wall clock unavailable\n");
+        console_warn("[reliefnt] rtc wall clock unavailable\n");
     }
 }
 
@@ -531,7 +531,7 @@ int time_set_wall_clock_ns(uint64_t unix_seconds, uint32_t nanoseconds)
     wall_clock_valid = 1;
     time_discipline_clear();
     kernel_spin_unlock_irqrestore(&clock_lock, flags);
-    console_printf("[reliefnt] wall clock set %u-%u-%u %u:%u:%u\n",
+    console_info("[reliefnt] wall clock set %u-%u-%u %u:%u:%u\n",
                    info.year, info.month, info.day, info.hour,
                    info.minute, info.second);
     return 0;

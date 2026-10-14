@@ -99,7 +99,7 @@ static void ahci_log_pending_failure(const char *reason,
     if (!port) {
         return;
     }
-    console_printf("[reliefnt] ahci %s op=%s owner=%u lba=%llu sectors=%u "
+    console_error("[reliefnt] ahci %s op=%s owner=%u lba=%llu sectors=%u "
                    "ci=0x%x is=0x%x tfd=0x%x serr=0x%x\n",
                    reason,
                    ahci_pending_command.write ? "write" : "read",
@@ -205,7 +205,7 @@ void storage_drain_task_io(uint32_t pid)
 int storage_read_failure(int ret)
 {
     if (ret != -RELIEFOS_EAGAIN) {
-        console_printf("[storage] read failure ret=%d active_volume=%u\n",
+        console_error("[storage] read failure ret=%d active_volume=%u\n",
                        ret, g_active_volume ? g_active_volume->volume_id : 99u);
     }
     return ret == -RELIEFOS_EAGAIN ? ret : -5;
@@ -264,12 +264,12 @@ static int ahci_recover_port(struct ahci_hba_port *port, uint32_t attempt)
     if (!port) {
         return -22;
     }
-    console_printf("[reliefnt] ahci recovering port after I/O failure attempt=%u "
+    console_warn("[reliefnt] ahci recovering port after I/O failure attempt=%u "
                    "ci=0x%x is=0x%x tfd=0x%x serr=0x%x\n",
                    attempt, port->ci, port->is, port->tfd, port->serr);
     ahci_pending_clear();
     if (ahci_setup_port(port) < 0) {
-        console_printf("[reliefnt] ahci port recovery failed attempt=%u\n", attempt);
+        console_error("[reliefnt] ahci port recovery failed attempt=%u\n", attempt);
         return -5;
     }
     return 0;

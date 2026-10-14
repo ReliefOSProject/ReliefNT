@@ -1549,7 +1549,7 @@ static void net_socket_handle_tcp(uint32_t src_ip, uint16_t src_port,
         return;
     }
     if (net_socket_trace_tls(socket)) {
-        console_printf("[net] tls rx socket=%d state=%u flags=0x%x seq=%u ack=%u payload=%u expected=%u\n",
+        console_debug("[net] tls rx socket=%d state=%u flags=0x%x seq=%u ack=%u payload=%u expected=%u\n",
                        socket->handle, socket->state, flags, seq, ack,
                        payload_len, socket->remote_seq);
     }
@@ -1574,7 +1574,7 @@ static void net_socket_handle_tcp(uint32_t src_ip, uint16_t src_port,
             socket->syn_deadline = 0;
             net_socket_touch(socket);
             if (net_socket_trace_tls(socket)) {
-                console_printf("[net] tls connected socket=%d local=%u remote=%u\n",
+                console_debug("[net] tls connected socket=%d local=%u remote=%u\n",
                                socket->handle, socket->local_port,
                                socket->remote_port);
             }
@@ -1620,12 +1620,12 @@ static void net_socket_handle_tcp(uint32_t src_ip, uint16_t src_port,
             socket->status = RELIEFOS_NET_STATUS_OK;
             net_socket_touch(socket);
             if (net_socket_trace_tls(socket)) {
-                console_printf("[net] tls rx accepted socket=%d bytes=%u queued=%u next=%u overflow=%u\n",
+                console_debug("[net] tls rx accepted socket=%d bytes=%u queued=%u next=%u overflow=%u\n",
                                socket->handle, copy_len, socket->rx_len,
                                socket->remote_seq, overflow);
             }
         } else if (net_socket_trace_tls(socket)) {
-            console_printf("[net] tls rx ignored socket=%d seq=%u expected=%u bytes=%u\n",
+            console_debug("[net] tls rx ignored socket=%d seq=%u expected=%u bytes=%u\n",
                            socket->handle, seq, socket->remote_seq, payload_len);
         }
         (void)net_send_tcp_to_mac(socket->dst_mac, net_config.local_ip,
@@ -1959,29 +1959,25 @@ static uint32_t net_ensure_ipv4_config(uint32_t timeout_ms, int require_dns)
 }
 
 /**
- * Net console ipv4.
- * @param ip Value supplied by the caller.
- */
-static void net_console_ipv4(uint32_t ip)
-{
-    console_printf("%u.%u.%u.%u",
-                   (ip >> 24) & 0xffu, (ip >> 16) & 0xffu,
-                   (ip >> 8) & 0xffu, ip & 0xffu);
-}
-
-/**
  * Net log config.
  * @param prefix Value supplied by the caller.
  */
 static void net_log_config(const char *prefix)
 {
-    console_printf("%s ip=", prefix);
-    net_console_ipv4(net_config.local_ip);
-    console_printf(" gateway=");
-    net_console_ipv4(net_config.gateway_ip);
-    console_printf(" dns=");
-    net_console_ipv4(net_config.dns_ip);
-    console_printf("\n");
+    console_info("%s ip=%u.%u.%u.%u gateway=%u.%u.%u.%u dns=%u.%u.%u.%u\n",
+                 prefix,
+                 (net_config.local_ip >> 24) & 0xffu,
+                 (net_config.local_ip >> 16) & 0xffu,
+                 (net_config.local_ip >> 8) & 0xffu,
+                 net_config.local_ip & 0xffu,
+                 (net_config.gateway_ip >> 24) & 0xffu,
+                 (net_config.gateway_ip >> 16) & 0xffu,
+                 (net_config.gateway_ip >> 8) & 0xffu,
+                 net_config.gateway_ip & 0xffu,
+                 (net_config.dns_ip >> 24) & 0xffu,
+                 (net_config.dns_ip >> 16) & 0xffu,
+                 (net_config.dns_ip >> 8) & 0xffu,
+                 net_config.dns_ip & 0xffu);
 }
 
 /**
@@ -1993,7 +1989,7 @@ void net_init(void)
     e1000_init();
     net_set_static_fallback();
     if (!e1000_is_ready()) {
-        console_printf("[reliefnt] net unavailable: no active e1000\n");
+        console_info("[reliefnt] net unavailable: no active e1000\n");
         return;
     }
     net_log_config("[reliefnt] interface ready; OpenRC DHCP client owns configuration");
@@ -2989,7 +2985,7 @@ int net_socket_send(struct reliefos_net_socket_io *request, uint32_t owner_pid)
         }
         target_seq = seq + chunk;
         if (net_socket_trace_tls(socket)) {
-            console_printf("[net] tls tx socket=%d seq=%u ack=%u bytes=%u target=%u\n",
+            console_debug("[net] tls tx socket=%d seq=%u ack=%u bytes=%u target=%u\n",
                            socket->handle, seq, socket->remote_seq, chunk,
                            target_seq);
         }
@@ -3037,7 +3033,7 @@ int net_socket_send(struct reliefos_net_socket_io *request, uint32_t owner_pid)
         if (!net_tcp_seq_after_or_equal(socket->acked_seq, target_seq)) {
             request->status = RELIEFOS_NET_STATUS_TCP_TIMEOUT;
             if (net_socket_trace_tls(socket)) {
-                console_printf("[net] tls tx timeout socket=%d target=%u acked=%u state=%u\n",
+                console_warn("[net] tls tx timeout socket=%d target=%u acked=%u state=%u\n",
                                socket->handle, target_seq, socket->acked_seq,
                                socket->state);
             }
@@ -3129,7 +3125,7 @@ int net_socket_recv(struct reliefos_net_socket_io *request, uint32_t owner_pid)
     }
     request->status = RELIEFOS_NET_STATUS_TCP_TIMEOUT;
     if (net_socket_trace_tls(socket)) {
-        console_printf("[net] tls rx timeout socket=%d state=%u expected=%u queued=%u fin=%u\n",
+        console_warn("[net] tls rx timeout socket=%d state=%u expected=%u queued=%u fin=%u\n",
                        socket->handle, socket->state, socket->remote_seq,
                        socket->rx_len, socket->fin_received);
     }

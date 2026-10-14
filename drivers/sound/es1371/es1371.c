@@ -451,7 +451,7 @@ static int es1371_codec_initialize(void)
     }
     es1371_log_codec(reset, vendor1, vendor2, power, master, pcm);
     if (master != 0U || pcm != 0U) {
-        kernel_api->console_write("[driver] es1371 codec mixer readback mismatch\n");
+        kernel_api->console_write("[WARN] [driver] es1371 codec mixer readback mismatch\n");
         return -5;
     }
     return 0;
@@ -615,7 +615,7 @@ static int es1371_enable_dma(void)
     es1371.dma_last_cursor = cursor;
     es1371.dma_running = 1;
     if (!(es1371_read(ES_REG_CONTROL) & ES_CONTROL_DAC1_ENABLE)) {
-        kernel_api->console_write("[driver] es1371 DAC1 enable rejected\n");
+        kernel_api->console_write("[ERROR] [driver] es1371 DAC1 enable rejected\n");
         es1371.dma_running = 0;
         return -5;
     }
@@ -683,7 +683,7 @@ static void es1371_update_consumption(uint32_t cursor)
     if (delta >= es1371.queued_bytes) {
         ++es1371.underruns;
         if (!es1371.empty_reported) {
-            kernel_api->console_write("[driver] es1371 DMA underrun; refilling silence\n");
+            kernel_api->console_write("[WARN] [driver] es1371 DMA underrun; refilling silence\n");
             es1371.empty_reported = 1;
         }
         es1371_recover_empty(cursor);
@@ -698,13 +698,13 @@ static void es1371_update_consumption(uint32_t cursor)
         es1371.cursor_progress_samples += delta;
         if (es1371.cursor_progress_samples >= ES1371_DMA_BYTES &&
             !es1371.cursor_progress_reported) {
-            kernel_api->console_write("[driver] es1371 DMA cursor remains advancing\n");
+            kernel_api->console_write("[DEBUG] [driver] es1371 DMA cursor remains advancing\n");
             es1371.cursor_progress_reported = 1U;
         }
     }
     if (es1371.nonzero_range_pending &&
         es1371_cursor_reached(previous, cursor, es1371.nonzero_range_end)) {
-        kernel_api->console_write("[driver] es1371 first nonzero DMA range consumed\n");
+        kernel_api->console_write("[DEBUG] [driver] es1371 first nonzero DMA range consumed\n");
         es1371.nonzero_range_pending = 0;
     }
 }
@@ -738,7 +738,7 @@ static int es1371_queue_block(const uint8_t *data, uint32_t length)
     if (free_bytes < length) {
         ++es1371.overruns;
         if (!es1371.overrun_reported) {
-            kernel_api->console_write("[driver] es1371 DMA queue full; short write\n");
+            kernel_api->console_write("[WARN] [driver] es1371 DMA queue full; short write\n");
             es1371.overrun_reported = 1;
         }
         return -11;
@@ -750,7 +750,7 @@ static int es1371_queue_block(const uint8_t *data, uint32_t length)
     es1371.queued_bytes += length;
     es1371.empty_reported = 0;
     if (nonzero && !es1371.nonzero_reported) {
-        kernel_api->console_write("[driver] es1371 first nonzero PCM buffer queued\n");
+        kernel_api->console_write("[DEBUG] [driver] es1371 first nonzero PCM buffer queued\n");
         es1371.nonzero_reported = 1;
         es1371.nonzero_range_start = write_offset;
         es1371.nonzero_range_end = (write_offset + length) % ES1371_DMA_BYTES;
@@ -808,8 +808,8 @@ static long es1371_audio_write(const void *data, uint32_t length, uint32_t *out_
     if (es1371.cursor_probe_pending && !es1371.cursor_reported) {
         uint32_t after = es1371_dma_cursor();
         kernel_api->console_write(after != es1371.cursor_probe_baseline
-            ? "[driver] es1371 DMA cursor advancing\n"
-            : "[driver] es1371 DMA cursor stalled\n");
+            ? "[DEBUG] [driver] es1371 DMA cursor advancing\n"
+            : "[WARN] [driver] es1371 DMA cursor stalled\n");
         es1371.cursor_reported = 1U;
         es1371.cursor_probe_pending = 0U;
     }
@@ -946,7 +946,7 @@ static int es1371_hardware_init(void)
     }
     es1371_write(ES_REG_SRC, 0);
     if (es1371_codec_initialize() < 0) {
-        kernel_api->console_write("[driver] es1371 codec initialization failed\n");
+        kernel_api->console_write("[ERROR] [driver] es1371 codec initialization failed\n");
         return -110;
     }
 

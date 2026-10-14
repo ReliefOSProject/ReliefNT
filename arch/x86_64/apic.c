@@ -184,7 +184,7 @@ void apic_init(void)
     }
     discover_madt();
     if (!cpu_count && local_apic_present) cpu_apic_ids[cpu_count++] = bsp_apic_id;
-    console_printf("[reliefnt] local APIC %s base=0x%llx MADT CPUs=%u BSP=%u\n",
+    console_info("[reliefnt] local APIC %s base=0x%llx MADT CPUs=%u BSP=%u\n",
                    local_apic_present ? "detected" : "unavailable",
                    (unsigned long long)local_apic_base, (unsigned)cpu_count,
                    (unsigned)bsp_apic_id);
@@ -193,7 +193,7 @@ void apic_init(void)
 void ioapic_init(void)
 {
     ioapic_present = ioapic_count != 0;
-    console_printf("[reliefnt] IOAPIC %s count=%u\n",
+    console_info("[reliefnt] IOAPIC %s count=%u\n",
                    ioapic_present ? "detected" : "unavailable", (unsigned)ioapic_count);
 }
 
@@ -343,7 +343,7 @@ bool ioapic_route_irq(uint32_t irq, uint8_t vector, uint32_t destination)
         ioapic_write(io, redir, IOAPIC_REDIR_MASKED);
         ioapic_write(io, (uint8_t)(redir + 1u), (destination & 0xffu) << 24);
         ioapic_write(io, redir, (uint32_t)vector | redirection_flags);
-        console_printf("[reliefnt] IOAPIC route ISA IRQ%u GSI%u vector=0x%x BSP=%u\n",
+        console_info("[reliefnt] IOAPIC route ISA IRQ%u GSI%u vector=0x%x BSP=%u\n",
                        (unsigned)irq, (unsigned)gsi, (unsigned)vector,
                        (unsigned)destination);
         return true;

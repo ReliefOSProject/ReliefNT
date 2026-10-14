@@ -4203,7 +4203,7 @@ static int64_t syscall_openat2(uint64_t dirfd, uint64_t pathname,
 
 void syscall_init(void)
 {
-    console_printf("[reliefnt] Linux x86_64 syscall ABI registered\n");
+    console_info("[reliefnt] Linux x86_64 syscall ABI registered\n");
 }
 
 /**
@@ -4785,7 +4785,7 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
     }
     if (number == LINUX_SYS_SYNC) {
         int ret = storage_sync_all();
-        if (ret < 0) console_printf("[storage] sync failed ret=%d\n", ret);
+        if (ret < 0) console_error("[storage] sync failed ret=%d\n", ret);
         return 0;
     }
     if (number == LINUX_SYS_SYNCFS) {
@@ -6621,7 +6621,7 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
                                             target, filesystem[0] ? filesystem : NULL,
                                             a3, NULL);
         if (ret < 0) {
-            console_printf("[reliefnt] mount syscall failed source=%s target=%s fs=%s ret=%d\n",
+            console_error("[reliefnt] mount syscall failed source=%s target=%s fs=%s ret=%d\n",
                            source, target, filesystem[0] ? filesystem : "auto", ret);
         }
         return ret < 0 ? storage_errno(ret) : 0;
@@ -7448,7 +7448,7 @@ void syscall_dispatch_frame(struct trap_frame *frame)
     number = frame->rax;
     struct task *calling_task = sched_current_task();
     bool trace = syscall_trace_task(calling_task);
-    if (trace) console_printf("[syscall-trace] pid=%u nr=%llu args=%llx,%llx,%llx,%llx,%llx,%llx\n",
+    if (trace) console_debug("[syscall-trace] pid=%u nr=%llu args=%llx,%llx,%llx,%llx,%llx,%llx\n",
         calling_task->pid, (unsigned long long)number,
         (unsigned long long)frame->rdi, (unsigned long long)frame->rsi,
         (unsigned long long)frame->rdx, (unsigned long long)frame->r10,
@@ -7499,7 +7499,7 @@ void syscall_dispatch_frame(struct trap_frame *frame)
         frame->error = 0;
         restored_signal_frame = 1;
     }
-    if (trace) console_printf("[syscall-trace] pid=%u nr=%llu result=%lld\n",
+    if (trace) console_debug("[syscall-trace] pid=%u nr=%llu result=%lld\n",
         calling_task->pid, (unsigned long long)number, (long long)result);
     eagain_from_nonblocking =
         result == -RELIEFOS_EAGAIN &&

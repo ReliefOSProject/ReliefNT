@@ -25,7 +25,7 @@ void multiboot2_parse(uint32_t magic, uintptr_t info_addr, struct boot_info *out
     out->multiboot_info = (uint64_t)info_addr;
 
     if (magic != MULTIBOOT2_BOOTLOADER_MAGIC || info_addr == 0) {
-        console_printf("[reliefnt] invalid multiboot2 handoff magic=0x%x info=%p\n",
+        console_error("[reliefnt] invalid multiboot2 handoff magic=0x%x info=%p\n",
                        magic, (void *)info_addr);
         return;
     }
@@ -115,7 +115,7 @@ void multiboot2_parse(uint32_t magic, uintptr_t info_addr, struct boot_info *out
         cursor = align8(cursor + tag->size);
     }
 
-    console_printf("[reliefnt] GRUB handoff ok bootloader=%s cmdline=%s modules=%u\n",
+    console_info("[reliefnt] GRUB handoff ok bootloader=%s cmdline=%s modules=%u\n",
                    out->bootloader ? out->bootloader : "(unknown)",
                    out->cmdline ? out->cmdline : "(none)",
                    out->module_count);

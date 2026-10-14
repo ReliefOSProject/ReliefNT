@@ -354,7 +354,7 @@ void platform_identity_init(const struct boot_info *boot)
     platform_identity.version = RELIEFOS_MACHINE_IDENTITY_VERSION;
     copy_text(platform_identity.source, sizeof(platform_identity.source), "unavailable");
     if (!boot || !boot->efi_system_table) {
-        console_printf("[reliefnt] platform identity unavailable: no EFI system table\n");
+        console_warn("[reliefnt] platform identity unavailable: no EFI system table\n");
         return;
     }
     st = (struct efi_system_table *)(uintptr_t)boot->efi_system_table;
@@ -363,14 +363,14 @@ void platform_identity_init(const struct boot_info *boot)
                   sizeof(platform_identity.firmware_vendor),
                   st->firmware_vendor);
     if (!st->configuration_table || st->number_of_table_entries > 256ULL) {
-        console_printf("[reliefnt] platform identity unavailable: no EFI config table\n");
+        console_warn("[reliefnt] platform identity unavailable: no EFI config table\n");
         return;
     }
     for (uint64_t i = 0; i < st->number_of_table_entries; ++i) {
         struct efi_configuration_table *table = &st->configuration_table[i];
         if (guid_equal(&table->vendor_guid, &smbios3_guid) &&
             parse_smbios3(table->vendor_table) == 0) {
-            console_printf("[reliefnt] platform inventory source=SMBIOS3 uuid=%s\n",
+            console_info("[reliefnt] platform inventory source=SMBIOS3 uuid=%s\n",
                            platform_identity.platform_uuid);
             return;
         }
@@ -379,12 +379,12 @@ void platform_identity_init(const struct boot_info *boot)
         struct efi_configuration_table *table = &st->configuration_table[i];
         if (guid_equal(&table->vendor_guid, &smbios2_guid) &&
             parse_smbios2(table->vendor_table) == 0) {
-            console_printf("[reliefnt] platform inventory source=SMBIOS2 uuid=%s\n",
+            console_info("[reliefnt] platform inventory source=SMBIOS2 uuid=%s\n",
                            platform_identity.platform_uuid);
             return;
         }
     }
-    console_printf("[reliefnt] platform identity unavailable: no usable SMBIOS table\n");
+    console_warn("[reliefnt] platform identity unavailable: no usable SMBIOS table\n");
 }
 
 /**

@@ -322,7 +322,7 @@ int pty_vt_set_mode(uint32_t pty_id, const struct vt_mode *mode)
         vt_release_pending[index] = 0;
         vt_acquire_pending[index] = 0;
     }
-    console_printf("[reliefnt] VT mode vt=%u mode=%d relsig=%d acqsig=%d\n",
+    console_info("[reliefnt] VT mode vt=%u mode=%d relsig=%d acqsig=%d\n",
                    pty_id, (int)vt_modes[index].mode, (int)vt_modes[index].relsig,
                    (int)vt_modes[index].acqsig);
     return 0;
@@ -437,7 +437,7 @@ static int pty_vt_commit_switch(uint32_t number)
     console_shift_down = 0;
     console_ctrl_down = 0;
     console_alt_down = 0;
-    console_printf("[reliefnt] VT active %u graphics=%d\n", number,
+    console_info("[reliefnt] VT active %u graphics=%d\n", number,
                    vt_graphical[number - 1u] != 0);
     input_set_graphical_vt(vt_graphical[number - 1u] ? number : 0);
     console_vt_activate(number, vt_graphical[number - 1u] != 0);
@@ -449,7 +449,7 @@ static int pty_vt_commit_switch(uint32_t number)
         if (pty_vt_signal(vt_acqsig[number - 1u], vt_controller_pid[number - 1u]) != 0) {
             (void)pty_vt_reset_mode(number);
         } else {
-            console_printf("[reliefnt] VT acquire signal sent for vt=%u\n", number);
+            console_debug("[reliefnt] VT acquire signal sent for vt=%u\n", number);
         }
     }
     return 0;
@@ -538,7 +538,7 @@ int pty_vt_switch(uint32_t number)
     if (!pty_vt_id(number)) return -22;
     if (active_vt == number) return 0;
     old_vt = active_vt;
-    console_printf("[reliefnt] VT switch request %u -> %u\n", old_vt, number);
+    console_info("[reliefnt] VT switch request %u -> %u\n", old_vt, number);
     if (old_vt && vt_modes[old_vt - 1u].mode == VT_PROCESS) {
         /* Xorg may request the same switch after the kernel has already
          * observed Ctrl+Alt+Fn.  Keep one in-flight hand-off and one signal;
@@ -550,14 +550,14 @@ int pty_vt_switch(uint32_t number)
         vt_release_pending[old_vt - 1u] = 1;
         vt_switch_target = number;
         if (pty_vt_signal(vt_relsig[old_vt - 1u], vt_controller_pid[old_vt - 1u]) == 0) {
-            console_printf("[reliefnt] VT release signal sent for vt=%u\n", old_vt);
+            console_debug("[reliefnt] VT release signal sent for vt=%u\n", old_vt);
             return 0;
         }
         (void)pty_vt_reset_mode(old_vt);
     }
     /* Linux ignores VT_AUTO switches while the outgoing display is graphics. */
     if (old_vt && vt_graphical[old_vt - 1u]) {
-        console_printf("[reliefnt] VT switch refused: vt=%u owns the display in graphics\n",
+        console_warn("[reliefnt] VT switch refused: vt=%u owns the display in graphics\n",
                        old_vt);
         return 0;
     }
@@ -585,7 +585,7 @@ int64_t pty_vt_wait_active(uint32_t number)
 int pty_vt_set_graphics(uint32_t pty_id, int enabled)
 {
     if (!pty_vt_number(pty_id) || (enabled != 0 && enabled != 1)) return -22;
-    console_printf("[reliefnt] VT graphics vt=%u enabled=%d\n", pty_id, enabled);
+    console_info("[reliefnt] VT graphics vt=%u enabled=%d\n", pty_id, enabled);
     vt_graphical[pty_id - 1u] = (uint8_t)enabled;
     if (active_vt == pty_id) {
         ++vt_display_generation;
@@ -786,8 +786,7 @@ void pty_console_key_event(uint8_t keycode, uint8_t pressed)
     /* Keep the diagnostic escape hatch on the logging console. */
     if (pressed && keycode == 88 && console_ctrl_down &&
         console_alt_down && console_shift_down) {
-        static const char test_message[] = "\r\nTest message\r\n";
-        console_write_len(test_message, sizeof(test_message) - 1U);
+        console_info("[console] diagnostic shortcut received on VT%u\n", pty_id);
         return;
     }
     if (!pressed || !console_key_to_bytes(keycode, bytes, &length)) {
@@ -871,7 +870,7 @@ int32_t pty_create(uint32_t owner_pid)
                 if (!sessions[i].winsize.ws_row) sessions[i].winsize.ws_row = 24;
                 if (!sessions[i].winsize.ws_col) sessions[i].winsize.ws_col = 80;
             }
-            console_printf("[reliefnt] pty create owner=%u id=%u session=%u pgrp=%u\n",
+            console_debug("[reliefnt] pty create owner=%u id=%u session=%u pgrp=%u\n",
                            owner_pid, (uint32_t)(i + 1),
                            sessions[i].process_session,
                            sessions[i].foreground_pgid);
@@ -1048,7 +1047,7 @@ int64_t pty_write_input(uint32_t owner_pid, uint32_t pty_id, const char *buffer,
     }
     if (!session->console && !session->input_reported) {
         session->input_reported = 1;
-        console_printf("[reliefnt] pty=%u first master input owner=%u len=%u\n",
+        console_debug("[reliefnt] pty=%u first master input owner=%u len=%u\n",
                        pty_id, session->owner_pid, length);
     }
     for (uint32_t i = 0; i < length; ++i) {
@@ -1273,7 +1272,7 @@ int64_t pty_write_output(uint32_t pty_id, const char *buffer, uint32_t length)
     }
     if (!session->console && !session->output_reported) {
         session->output_reported = 1;
-        console_printf("[reliefnt] pty=%u first slave output len=%u\n",
+        console_debug("[reliefnt] pty=%u first slave output len=%u\n",
                        pty_id, length);
     }
     for (uint32_t i = 0; i < length; ++i) {

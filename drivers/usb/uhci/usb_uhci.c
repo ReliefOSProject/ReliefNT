@@ -789,7 +789,7 @@ static int uhci_enumerate_device(uint32_t controller_id, uint8_t root_port,
     }
     if (usb_control_no_data(controller, address, low_speed, max_packet,
                             0, USB_REQ_SET_CONFIGURATION, configuration, 0) < 0) {
-        console_printf("[usb] UHCI port=%u set configuration failed\n", port);
+        console_error("[usb] UHCI port=%u set configuration failed\n", port);
         return -1;
     }
     if (hub_found && hub_depth < USB_UHCI_MAX_HUB_DEPTH) {
@@ -803,7 +803,7 @@ static int uhci_enumerate_device(uint32_t controller_id, uint8_t root_port,
             if (hub_ports > USB_UHCI_MAX_HUB_PORTS) {
                 hub_ports = USB_UHCI_MAX_HUB_PORTS;
             }
-            console_printf("[usb] UHCI hub address=%u ports=%u depth=%u\n",
+            console_info("[usb] UHCI hub address=%u ports=%u depth=%u\n",
                            address, hub_ports, hub_depth);
             for (uint8_t hub_port = 1; hub_port <= hub_ports; ++hub_port) {
                 (void)uhci_enumerate_device(controller_id, hub_port, address,
@@ -824,13 +824,13 @@ static int uhci_enumerate_device(uint32_t controller_id, uint8_t root_port,
             usb_control_no_data(controller, address, low_speed, max_packet,
                                 0x21u, USB_REQ_SET_IDLE, 0,
                                 pending[i].interface_number) < 0) {
-            console_printf("[usb] UHCI port=%u HID interface=%u protocol setup failed\n",
+            console_error("[usb] UHCI port=%u HID interface=%u protocol setup failed\n",
                            port, pending[i].interface_number);
             continue;
         }
         qh_index = controller->qh_count;
         if (uhci_schedule_add(controller_id, qh_index) < 0) {
-            console_printf("[usb] UHCI port=%u HID interface=%u schedule full\n",
+            console_error("[usb] UHCI port=%u HID interface=%u schedule full\n",
                            port, pending[i].interface_number);
             continue;
         }
@@ -852,7 +852,7 @@ static int uhci_enumerate_device(uint32_t controller_id, uint8_t root_port,
             device->x = fb && fb->available ? (int32_t)(fb->width / 2u) : 0;
             device->y = fb && fb->available ? (int32_t)(fb->height / 2u) : 0;
         }
-        console_printf("[usb] UHCI HID %s address=%u port=%u endpoint=%u packet=%u speed=%s\n",
+        console_info("[usb] UHCI HID %s address=%u port=%u endpoint=%u packet=%u speed=%s\n",
                        device->keyboard ? "keyboard" : "mouse", address, port,
                        device->endpoint, device->max_packet,
                        low_speed ? "low" : "full");
@@ -962,7 +962,9 @@ void usb_init(void)
         }
     }
     if (found) {
-        console_printf("[usb] UHCI controllers=%u HID polling enabled\n", found);
+        console_info("[usb] UHCI controllers=%u HID polling enabled\n", found);
+    } else {
+        console_info("[usb] no active UHCI controller; USB HID polling disabled\n");
     }
 }
 

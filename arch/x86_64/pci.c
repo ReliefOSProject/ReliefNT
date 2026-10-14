@@ -3,6 +3,7 @@
  * Provides low-level configuration-space reads and writes for drivers.
  */
 #include <reliefnt/pci.h>
+#include <reliefnt/console.h>
 #include <reliefnt/lock.h>
 #include <reliefnt/paging.h>
 
@@ -227,6 +228,7 @@ static void pci_scan_fill(void)
 static void pci_cache_ensure(void)
 {
     uint64_t flags;
+    bool scanned = false;
     if (pci_cache_ready) {
         return;
     }
@@ -234,8 +236,16 @@ static void pci_cache_ensure(void)
     if (!pci_cache_ready) {
         pci_scan_fill();
         pci_cache_ready = 1;
+        scanned = true;
     }
     kernel_spin_unlock_irqrestore(&pci_enum_lock, flags);
+    if (scanned) {
+        console_info("[pci] inventory cached_functions=%u capacity=%u\n",
+                     pci_cache_count, PCI_CACHE_MAX);
+        if (pci_cache_overflow) {
+            console_warn("[pci] inventory cache full; lookups use exhaustive scan\n");
+        }
+    }
 }
 
 /** @brief Brute-force first-match scan, used only when the snapshot overflowed.

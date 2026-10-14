@@ -132,7 +132,8 @@ static void driver_set_error(struct driver_slot *slot, int status, const char *e
     slot->info.state = RELIEFOS_DRIVER_STATE_FAILED;
     driver_copy_text(slot->info.error, sizeof(slot->info.error), error);
     if (status < 0) {
-        console_printf("[driver] %s failed status=%d: %s\n", slot->info.file,
+        console_log(status == -19 ? CONSOLE_LOG_INFO : CONSOLE_LOG_ERROR,
+                    "[driver] %s failed status=%d: %s\n", slot->info.file,
                        status, slot->info.error);
     }
 }
@@ -465,7 +466,7 @@ static const struct reliefos_driver_kernel_api driver_kernel_api = {
     .outl = driver_api_outl,
     .alloc_pages = mm_alloc_pages,
     .free_pages = mm_free_pages,
-    .console_write = console_write,
+    .console_write = console_log_write,
     .input_push_mouse = input_push_mouse,
     .input_push_mouse_wheel = input_push_mouse_wheel,
     .framebuffer_size = driver_api_framebuffer_size,
@@ -626,7 +627,7 @@ static int driver_load_builtin(struct driver_slot *slot,
     slot->info.state = RELIEFOS_DRIVER_STATE_LOADED;
     slot->info.error[0] = 0;
     driver_manager_service_enable(slot->info.id);
-    console_printf("[driver] loaded %s abi=%u\n", module->name,
+    console_info("[driver] loaded %s abi=%u\n", module->name,
                    slot->info.abi_version);
     return 0;
 }
@@ -638,7 +639,9 @@ void driver_manager_init(void)
 {
     driver_memzero(driver_slots, sizeof(driver_slots));
     mouse_cache = (struct mouse_state){0};
-    console_printf("[driver] manager ready abi=%u\n", RELIEFOS_DRIVER_ABI_VERSION);
+    console_info("[driver] manager ready abi=%u slots=%u builtins=%u\n",
+                 RELIEFOS_DRIVER_ABI_VERSION, RELIEFOS_DRIVER_MAX,
+                 (unsigned)(sizeof(builtin_modules) / sizeof(builtin_modules[0])));
 }
 
 /** @brief Initialize the built-in drivers with manager admission and execution ownership held.
@@ -651,17 +654,25 @@ static void driver_manager_load_builtin_admitted(void)
         const struct reliefos_driver_module *module = builtin_modules[index];
         struct driver_slot *slot = driver_claim_slot();
         if (!slot) {
-            console_printf("[driver] no free slot for builtin %s\n", module->name);
+            console_warn("[driver] no free slot for builtin %s\n", module->name);
             continue;
         }
         driver_copy_text(slot->info.file, sizeof(slot->info.file), module->name);
         if (driver_load_builtin(slot, module) < 0) {
             if (slot->info.state == RELIEFOS_DRIVER_STATE_LOADED) continue;
-            console_printf("[driver] retrying %s\n", slot->info.file);
+            console_warn("[driver] retrying %s\n", slot->info.file);
             /* Second init attempt after the first failed. */
             (void)driver_load_builtin(slot, module);
         }
     }
+    uint32_t loaded = 0;
+    uint32_t inactive = 0;
+    for (uint32_t index = 0; index < RELIEFOS_DRIVER_MAX; ++index) {
+        if (!driver_slots[index].info.file[0]) continue;
+        if (driver_slots[index].info.state == RELIEFOS_DRIVER_STATE_LOADED) ++loaded;
+        else ++inactive;
+    }
+    console_info("[driver] built-in summary loaded=%u inactive=%u\n", loaded, inactive);
 }
 
 /**
@@ -672,7 +683,7 @@ static void driver_manager_load_builtin_admitted(void)
 void driver_manager_load_builtin(void)
 {
     if (driver_manager_phase_try_enter() < 0) {
-        console_printf("[driver] builtin load skipped: manager busy\n");
+        console_warn("[driver] builtin load skipped: manager busy\n");
         return;
     }
     uint64_t execution_flags;
