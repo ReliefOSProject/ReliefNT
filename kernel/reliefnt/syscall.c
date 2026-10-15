@@ -7257,7 +7257,28 @@ static int64_t syscall_dispatch_regs(uint64_t number, uint64_t a0, uint64_t a1,
                                      uint64_t a2, uint64_t a3, uint64_t a4,
                                      uint64_t a5)
 {
-    task_console_materialize_stdio(sched_current_task());
+    /* Hot null/time reads never touch fds 0-2 and are owned by no subsystem, so
+     * the legacy dispatcher is exactly where the ownership scan would land them.
+     * Short-circuit both the per-call stdio materialization and the ownership
+     * scan for the fixed-cost path.  Everything else materializes first (so
+     * fcntl/dup/fork still see real stdio descriptions) and takes the full
+     * ownership scan unchanged. */
+    switch (number) {
+    case LINUX_SYS_GETPID:
+    case LINUX_SYS_GETPPID:
+    case LINUX_SYS_GETTID:
+    case LINUX_SYS_GETUID:
+    case LINUX_SYS_GETEUID:
+    case LINUX_SYS_GETGID:
+    case LINUX_SYS_GETEGID:
+    case LINUX_SYS_CLOCK_GETTIME:
+    case LINUX_SYS_CLOCK_GETRES:
+    case LINUX_SYS_GETTIMEOFDAY:
+        return syscall_dispatch_regs_legacy(number, a0, a1, a2, a3, a4, a5);
+    default:
+        task_console_materialize_stdio(sched_current_task());
+        break;
+    }
     /* Linux ioctl's fd and cmd are unsigned int on native x86-64. */
     if (number == LINUX_SYS_IOCTL) {
         a0 = (uint32_t)a0;
