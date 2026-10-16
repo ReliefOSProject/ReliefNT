@@ -543,6 +543,26 @@ void sched_init(void)
     console_info("[reliefnt] EEVDF scheduler initialized\n");
 }
 
+/* Keep the scheduler-private tree node next to its task without changing
+ * struct task's size or any externally visible task field offset. */
+struct sched_task_object {
+    struct task task;
+    struct eevdf_node fair_node;
+};
+_Static_assert(__builtin_offsetof(struct sched_task_object, task) == 0,
+               "task must be the first member of its private allocation");
+
+static void task_fair_bind(struct task *task)
+{
+    eevdf_bind(&task->fair, &((struct sched_task_object *)task)->fair_node);
+}
+
+static void task_fair_reset(struct task *task)
+{
+    task->fair = (struct eevdf_entity){0};
+    task_fair_bind(task);
+}
+
 /**
  * @brief Clear every byte of a task struct so it starts from a well-defined zero state.
  */
@@ -554,6 +574,7 @@ static void task_zero(struct task *task)
     for (size_t i = 0; i < sizeof(*task); ++i) {
         ((uint8_t *)task)[i] = 0;
     }
+    task_fair_bind(task);
 }
 
 /** @brief Drop the resource-limit reference only when a task is reaped/recycled. */
@@ -651,10 +672,12 @@ static struct task *alloc_task_slot(void)
         task_capacity = new_capacity;
     }
 
-    tasks[task_count] = (struct task *)kernel_malloc(sizeof(struct task));
-    if (!tasks[task_count]) {
+    struct sched_task_object *object =
+        (struct sched_task_object *)kernel_malloc(sizeof(*object));
+    if (!object) {
         return NULL;
     }
+    tasks[task_count] = &object->task;
     task_zero(tasks[task_count]);
     return tasks[task_count++];
 }
@@ -971,7 +994,7 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
     }
     task_zero(child);
     *child = *parent;
-    child->fair = (struct eevdf_entity){0};
+    task_fair_reset(child);
     child->limits = *sched_task_limits(parent);
     child->limits.references = 1;
     child->shared_limits = NULL;

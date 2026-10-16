@@ -44,10 +44,7 @@ static void fair_stop_cpu(uint32_t cpu)
 
 static uint32_t fair_count(uint32_t cpu)
 {
-    uint32_t count = 0;
-    for (struct eevdf_entity *e = fair_queues[cpu].head; e; e = e->next)
-        if (!e->delayed) ++count;
-    return count;
+    return fair_queues[cpu].nr_active;
 }
 
 static uint32_t fair_choose_cpu(const struct task *task)
@@ -96,7 +93,7 @@ static void fair_sync(void)
             if (cpu == SCHED_CPU_NONE) continue;
             e->cpu = cpu;
             eevdf_enqueue(&fair_queues[cpu], e, task->priority);
-        } else e->delayed = false;
+        } else eevdf_set_delayed(e, false);
     }
 }
 
