@@ -32,7 +32,7 @@
 #include <reliefnt/wait.h>
 #include <reliefos/layout.h>
 
-static int64_t syscall_dispatch_regs(uint64_t number, uint64_t a0, uint64_t a1,
+static int64_t syscall_dispatch_regs(struct task *task, uint64_t number, uint64_t a0, uint64_t a1,
                                      uint64_t a2, uint64_t a3, uint64_t a4,
                                      uint64_t a5);
 static int copy_user_string_fixed(char *dst, uint32_t cap, uint64_t user_ptr,
@@ -4378,7 +4378,7 @@ int64_t syscall_dispatch(const struct syscall_frame *frame)
     case LINUX_SYS_TIME:
     case LINUX_SYS_GETCPU:
     case LINUX_SYS_CLOSE_RANGE:
-        return syscall_dispatch_regs(frame->number, frame->args[0], frame->args[1],
+        return syscall_dispatch_regs(sched_current_task(), frame->number, frame->args[0], frame->args[1],
                                      frame->args[2], frame->args[3], frame->args[4],
                                      frame->args[5]);
     case LINUX_SYS_CLOCK_GETRES:
@@ -4387,11 +4387,11 @@ int64_t syscall_dispatch(const struct syscall_frame *frame)
     case LINUX_SYS_SET_ROBUST_LIST:
     case LINUX_SYS_GET_ROBUST_LIST:
     case LINUX_SYS_ARCH_PRCTL:
-        return syscall_dispatch_regs(frame->number, frame->args[0], frame->args[1],
+        return syscall_dispatch_regs(sched_current_task(), frame->number, frame->args[0], frame->args[1],
                                      frame->args[2], frame->args[3], frame->args[4],
                                      frame->args[5]);
     case LINUX_SYS_PAUSE:
-        return syscall_dispatch_regs(frame->number, 0, 0, 0, 0, 0, 0);
+        return syscall_dispatch_regs(sched_current_task(), frame->number, 0, 0, 0, 0, 0, 0);
     case LINUX_SYS_RT_SIGRETURN:
         /* rt_sigreturn restores the live trap frame directly. The regs-only
          * debug dispatch entry has no frame to restore and returns ENOSYS. */
@@ -7276,7 +7276,7 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
  * Syscall dispatch regs.
  * @param frame Value supplied by the caller.
  */
-static int64_t syscall_dispatch_regs(uint64_t number, uint64_t a0, uint64_t a1,
+static int64_t syscall_dispatch_regs(struct task *task, uint64_t number, uint64_t a0, uint64_t a1,
                                      uint64_t a2, uint64_t a3, uint64_t a4,
                                      uint64_t a5)
 {
@@ -7287,6 +7287,17 @@ static int64_t syscall_dispatch_regs(uint64_t number, uint64_t a0, uint64_t a1,
      * fcntl/dup/fork still see real stdio descriptions) and takes the full
      * ownership scan unchanged. */
     switch (number) {
+    case LINUX_SYS_READ:
+    case LINUX_SYS_WRITE:
+        /* Entry already pinned this exact open description. These operations
+         * cannot observe unrelated implicit standard streams; fcntl/dup/fork
+         * still materialize them through the ordinary path. Keep all buffer,
+         * access-mode and device checks in the shared read/write backend. */
+        if (task && task->syscall_file && task->syscall_fd == (int32_t)a0 &&
+            task->syscall_file_number == number)
+            return syscall_dispatch_regs_legacy(number, a0, a1, a2, a3, a4, a5);
+        task_console_materialize_stdio(task);
+        break;
     case LINUX_SYS_GETPID:
     case LINUX_SYS_GETPPID:
     case LINUX_SYS_GETTID:
@@ -7299,7 +7310,7 @@ static int64_t syscall_dispatch_regs(uint64_t number, uint64_t a0, uint64_t a1,
     case LINUX_SYS_GETTIMEOFDAY:
         return syscall_dispatch_regs_legacy(number, a0, a1, a2, a3, a4, a5);
     default:
-        task_console_materialize_stdio(sched_current_task());
+        task_console_materialize_stdio(task);
         break;
     }
     /* Linux ioctl's fd and cmd are unsigned int on native x86-64. */
@@ -7528,7 +7539,7 @@ void syscall_dispatch_frame(struct trap_frame *frame)
     } else if (number == LINUX_SYS_FORK) {
         result = sched_fork_current(frame);
     } else {
-        result = syscall_dispatch_regs(number,
+        result = syscall_dispatch_regs(calling_task, number,
                                        frame->rdi,
                                        frame->rsi,
                                        frame->rdx,

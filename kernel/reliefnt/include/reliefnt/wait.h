@@ -16,6 +16,7 @@ struct task;
 struct kernel_wait_queue {
     struct kernel_spinlock lock;
     struct task *waiters[KERNEL_WAIT_QUEUE_MAX];
+    uint32_t minimum[KERNEL_WAIT_QUEUE_MAX];
     uint32_t count;
 };
 
@@ -24,6 +25,8 @@ int kernel_wait_queue_add(struct kernel_wait_queue *queue, struct task *task);
 void kernel_wait_queue_remove(struct kernel_wait_queue *queue, struct task *task);
 uint32_t kernel_wait_queue_wake_one(struct kernel_wait_queue *queue);
 uint32_t kernel_wait_queue_wake_all(struct kernel_wait_queue *queue);
+/** @brief Wake every waiter whose minimum resource requirement is available. */
+uint32_t kernel_wait_queue_wake_satisfied(struct kernel_wait_queue *queue, uint32_t available);
 /** @brief Read the generation of globally published pollable-readiness changes. */
 uint64_t kernel_poll_readiness_generation(void);
 /** @brief Publish a pollable-readiness change and wake all global poll waiters. */
@@ -49,5 +52,7 @@ bool kernel_poll_wait_registered(const struct task *task);
  * entry to avoid stale registrations after a timer wakeup.
  */
 void kernel_wait_queue_block_current(struct kernel_wait_queue *queue);
+/** @brief Block with a minimum resource requirement; unconditional wakes ignore it. */
+void kernel_wait_queue_block_current_minimum(struct kernel_wait_queue *queue, uint32_t minimum);
 
 #endif

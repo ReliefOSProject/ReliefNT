@@ -17,6 +17,7 @@
 #define TASK_PIPE_MAX 256u
 #define TASK_PIPE_CAP 65535u
 #define TASK_PIPE_RING_CAP (TASK_PIPE_CAP + 1u)
+#define TASK_PIPE_BUF 4096u
 
 struct task_pipe {
     uint8_t used;
@@ -123,8 +124,10 @@ int task_pipe_read(struct task_file *file, void *buffer, uint32_t length)
 {
     struct task_pipe *pipe = task_pipe_for_file(file);
     uint32_t count = 0;
+    bool was_full;
     if (!pipe || (file->flags & RELIEFOS_O_ACCMODE) == RELIEFOS_O_WRONLY) return -RELIEFOS_EBADF;
     if (length == 0) return 0;
+    was_full = (pipe->head + 1u) % TASK_PIPE_RING_CAP == pipe->tail;
     kernel_wait_queue_remove(&pipe->wait_read, sched_current_task());
     /* Copy contiguous runs per iteration: a 64 KiB ring drained byte-by-byte
      * costs more than the syscalls it serves. */
@@ -137,8 +140,14 @@ int task_pipe_read(struct task_file *file, void *buffer, uint32_t length)
         count += chunk;
     }
     if (count) {
-        (void)kernel_wait_queue_wake_all(&pipe->wait_write);
-        kernel_poll_readiness_notify();
+        uint32_t used = (pipe->head + TASK_PIPE_RING_CAP - pipe->tail) % TASK_PIPE_RING_CAP;
+        /* Retrying an atomic writer before its complete request fits only
+         * switches to a task that immediately blocks again. Wake every
+         * satisfiable writer so cancellation cannot strand available space. */
+        (void)kernel_wait_queue_wake_satisfied(&pipe->wait_write, TASK_PIPE_CAP - used);
+        /* Only full -> nonfull adds POLLOUT readiness. Atomic writers can
+         * require more space; their threshold wakeups above are independent. */
+        if (was_full) kernel_poll_readiness_notify();
         return (int)count;
     }
     if (!pipe->writers) return 0;
@@ -168,10 +177,14 @@ int task_pipe_write(struct task_file *file, const void *buffer, uint32_t length)
     {
         uint32_t used = (pipe->head + TASK_PIPE_RING_CAP - pipe->tail) % TASK_PIPE_RING_CAP;
         uint32_t free_bytes = TASK_PIPE_CAP - used;
-        /* Linux guarantees that writes up to PIPE_BUF are atomic. */
-        if (length <= TASK_PIPE_CAP && free_bytes < length) {
+        /* Small nonblocking writes are all-or-nothing. Larger ones may
+         * consume the available space, as Linux/POSIX require. Blocking
+         * writes retain their existing full-request wait policy. */
+        uint32_t minimum = (file->flags & RELIEFOS_O_NONBLOCK) && length > TASK_PIPE_BUF
+                               ? 1u : length;
+        if (length <= TASK_PIPE_CAP && free_bytes < minimum) {
             if (file->flags & RELIEFOS_O_NONBLOCK) return -RELIEFOS_EAGAIN;
-            kernel_wait_queue_block_current(&pipe->wait_write);
+            kernel_wait_queue_block_current_minimum(&pipe->wait_write, length);
             return -RELIEFOS_EAGAIN;
         }
     }
@@ -184,7 +197,7 @@ int task_pipe_write(struct task_file *file, const void *buffer, uint32_t length)
                 return (int)count;
             }
             if (file->flags & RELIEFOS_O_NONBLOCK) return -RELIEFOS_EAGAIN;
-            kernel_wait_queue_block_current(&pipe->wait_write);
+            kernel_wait_queue_block_current_minimum(&pipe->wait_write, 1);
             return -RELIEFOS_EAGAIN;
         }
         uint32_t used = (pipe->head + TASK_PIPE_RING_CAP - pipe->tail) % TASK_PIPE_RING_CAP;

@@ -2521,6 +2521,35 @@ bool sched_capture_current_user_frame(const struct trap_frame *frame)
 }
 
 /**
+ * Save a syscall/timer return frame while preserving the current CPU's fair
+ * accounting interval.  This fast path is deliberately narrower than full
+ * capture: callers must schedule normally for signals, newly runnable work,
+ * a blocked/exited task, an image replacement, or an affinity change.
+ */
+bool sched_try_resume_current_user_frame(const struct trap_frame *frame)
+{
+    uint64_t flags;
+    uint32_t cpu = scheduler_cpu_index();
+    bool resume = false;
+
+    kernel_spin_lock_irqsave(&scheduler_lock, &flags);
+    struct task *current = current_task[cpu];
+    if (current && current->pid == current_pid[cpu] &&
+        current->kind == TASK_KIND_USER && current->state == TASK_RUNNING &&
+        current->running_cpu == cpu && !(current->flags & TASK_FLAG_PENDING_LOAD) &&
+        !((__atomic_load_n(&current->pending_signals, __ATOMIC_ACQUIRE) |
+           __atomic_load_n(sched_task_process_pending(current), __ATOMIC_ACQUIRE)) &
+          ~current->blocked_signals) &&
+        !__atomic_load_n(&sched_resched_pending[cpu], __ATOMIC_ACQUIRE) &&
+        task_cpu_allowed(current, cpu) && task_frame_valid(current, frame)) {
+        current->frame = *frame;
+        resume = true;
+    }
+    kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
+    return resume;
+}
+
+/**
  * A remote exit may mark a task terminal while it is still executing in
  * Ring-3 on this CPU.  Keep its address space and descriptor table alive
  * until this CPU reaches a scheduling boundary, then drop only this CPU's

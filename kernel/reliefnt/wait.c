@@ -22,10 +22,12 @@ void kernel_wait_queue_init(struct kernel_wait_queue *queue)
     queue->count = 0;
     for (uint32_t i = 0; i < KERNEL_WAIT_QUEUE_MAX; ++i) {
         queue->waiters[i] = NULL;
+        queue->minimum[i] = 0;
     }
 }
 
-int kernel_wait_queue_add(struct kernel_wait_queue *queue, struct task *task)
+static int kernel_wait_queue_add_minimum(struct kernel_wait_queue *queue,
+                                         struct task *task, uint32_t minimum)
 {
     uint64_t flags;
     if (!queue || !task) {
@@ -36,6 +38,7 @@ int kernel_wait_queue_add(struct kernel_wait_queue *queue, struct task *task)
     kernel_spin_lock_irqsave(&queue->lock, &flags);
     for (uint32_t i = 0; i < queue->count; ++i) {
         if (queue->waiters[i] == task) {
+            queue->minimum[i] = minimum;
             kernel_spin_unlock_irqrestore(&queue->lock, flags);
             return 0;
         }
@@ -44,10 +47,16 @@ int kernel_wait_queue_add(struct kernel_wait_queue *queue, struct task *task)
         kernel_spin_unlock_irqrestore(&queue->lock, flags);
         return -1;
     }
+    queue->minimum[queue->count] = minimum;
     queue->waiters[queue->count++] = task;
     task->waiting_queue = queue;
     kernel_spin_unlock_irqrestore(&queue->lock, flags);
     return 0;
+}
+
+int kernel_wait_queue_add(struct kernel_wait_queue *queue, struct task *task)
+{
+    return kernel_wait_queue_add_minimum(queue, task, 0);
 }
 
 void kernel_wait_queue_remove(struct kernel_wait_queue *queue, struct task *task)
@@ -61,8 +70,10 @@ void kernel_wait_queue_remove(struct kernel_wait_queue *queue, struct task *task
         if (queue->waiters[i] == task) {
             for (uint32_t j = i + 1; j < queue->count; ++j) {
                 queue->waiters[j - 1] = queue->waiters[j];
+                queue->minimum[j - 1] = queue->minimum[j];
             }
             queue->waiters[--queue->count] = NULL;
+            queue->minimum[queue->count] = 0;
             if (task->waiting_queue == queue) task->waiting_queue = NULL;
             break;
         }
@@ -70,7 +81,8 @@ void kernel_wait_queue_remove(struct kernel_wait_queue *queue, struct task *task
     kernel_spin_unlock_irqrestore(&queue->lock, flags);
 }
 
-static uint32_t kernel_wait_queue_wake_one_raw(struct kernel_wait_queue *queue)
+static uint32_t kernel_wait_queue_wake_one_raw(struct kernel_wait_queue *queue,
+                                              uint32_t available)
 {
     uint64_t flags;
     struct task *task = NULL;
@@ -78,17 +90,24 @@ static uint32_t kernel_wait_queue_wake_one_raw(struct kernel_wait_queue *queue)
         return 0;
     }
     kernel_spin_lock_irqsave(&queue->lock, &flags);
-    if (queue->count) {
-        task = queue->waiters[0];
-        for (uint32_t i = 1; i < queue->count; ++i) {
+    for (uint32_t index = 0; index < queue->count; ++index) {
+        if (queue->minimum[index] > available) continue;
+        task = queue->waiters[index];
+        /* Keep the registration linked while the scheduler uses the task.
+         * Exit cleanup takes this queue lock before freeing task storage.
+         * Interruptible wake also leaves SIGSTOP/vfork suspension intact. */
+        sched_wake_interruptible(task);
+        for (uint32_t i = index + 1; i < queue->count; ++i) {
             queue->waiters[i - 1] = queue->waiters[i];
+            queue->minimum[i - 1] = queue->minimum[i];
         }
         queue->waiters[--queue->count] = NULL;
+        queue->minimum[queue->count] = 0;
         if (task->waiting_queue == queue) task->waiting_queue = NULL;
+        break;
     }
     kernel_spin_unlock_irqrestore(&queue->lock, flags);
     if (task) {
-        sched_mark_ready(task->pid);
         return 1;
     }
     return 0;
@@ -97,7 +116,7 @@ static uint32_t kernel_wait_queue_wake_one_raw(struct kernel_wait_queue *queue)
 static uint32_t kernel_wait_queue_wake_all_raw(struct kernel_wait_queue *queue)
 {
     uint32_t count = 0;
-    while (kernel_wait_queue_wake_one_raw(queue)) {
+    while (kernel_wait_queue_wake_one_raw(queue, UINT32_MAX)) {
         ++count;
     }
     return count;
@@ -105,12 +124,19 @@ static uint32_t kernel_wait_queue_wake_all_raw(struct kernel_wait_queue *queue)
 
 uint32_t kernel_wait_queue_wake_one(struct kernel_wait_queue *queue)
 {
-    return kernel_wait_queue_wake_one_raw(queue);
+    return kernel_wait_queue_wake_one_raw(queue, UINT32_MAX);
 }
 
 uint32_t kernel_wait_queue_wake_all(struct kernel_wait_queue *queue)
 {
     return kernel_wait_queue_wake_all_raw(queue);
+}
+
+uint32_t kernel_wait_queue_wake_satisfied(struct kernel_wait_queue *queue, uint32_t available)
+{
+    uint32_t count = 0;
+    while (kernel_wait_queue_wake_one_raw(queue, available)) ++count;
+    return count;
 }
 
 uint64_t kernel_poll_readiness_generation(void)
@@ -133,9 +159,12 @@ void kernel_poll_readiness_notify(void)
     while (count-- && poll_waiters.count) {
         struct task *task = poll_waiters.waiters[0];
         sched_wake_interruptible(task);
-        for (uint32_t i = 1; i < poll_waiters.count; ++i)
+        for (uint32_t i = 1; i < poll_waiters.count; ++i) {
             poll_waiters.waiters[i - 1] = poll_waiters.waiters[i];
+            poll_waiters.minimum[i - 1] = poll_waiters.minimum[i];
+        }
         poll_waiters.waiters[--poll_waiters.count] = NULL;
+        poll_waiters.minimum[poll_waiters.count] = 0;
         if (task->waiting_queue == &poll_waiters) task->waiting_queue = NULL;
     }
     kernel_spin_unlock_irqrestore(&poll_waiters.lock, flags);
@@ -169,6 +198,7 @@ int kernel_poll_wait_current(uint64_t generation, uint64_t wake_tick)
             kernel_spin_unlock_irqrestore(&poll_waiters.lock, flags);
             return -1;
         }
+        poll_waiters.minimum[poll_waiters.count] = 0;
         poll_waiters.waiters[poll_waiters.count++] = task;
         task->waiting_queue = &poll_waiters;
     }
@@ -187,9 +217,12 @@ void kernel_poll_wait_remove(struct task *task)
     kernel_spin_lock_irqsave(&poll_waiters.lock, &flags);
     for (uint32_t i = 0; i < poll_waiters.count; ++i) {
         if (poll_waiters.waiters[i] != task) continue;
-        for (uint32_t j = i + 1; j < poll_waiters.count; ++j)
+        for (uint32_t j = i + 1; j < poll_waiters.count; ++j) {
             poll_waiters.waiters[j - 1] = poll_waiters.waiters[j];
+            poll_waiters.minimum[j - 1] = poll_waiters.minimum[j];
+        }
         poll_waiters.waiters[--poll_waiters.count] = NULL;
+        poll_waiters.minimum[poll_waiters.count] = 0;
         if (task->waiting_queue == &poll_waiters) task->waiting_queue = NULL;
         break;
     }
@@ -212,7 +245,7 @@ bool kernel_poll_wait_registered(const struct task *task)
     return found;
 }
 
-void kernel_wait_queue_block_current(struct kernel_wait_queue *queue)
+void kernel_wait_queue_block_current_minimum(struct kernel_wait_queue *queue, uint32_t minimum)
 {
     struct task *task;
     if (!queue) {
@@ -222,11 +255,16 @@ void kernel_wait_queue_block_current(struct kernel_wait_queue *queue)
     if (!task || task->pid == 0 || task->state == TASK_EXITED) {
         return;
     }
-    if (kernel_wait_queue_add(queue, task) < 0) {
+    if (kernel_wait_queue_add_minimum(queue, task, minimum) < 0) {
         return;
     }
     /* The syscall epilogue rewinds the interrupted int 0x80 and retries it
      * after wakeup, so returning EAGAIN internally is not observable to user
      * space unless the descriptor is O_NONBLOCK (handled by the caller). */
     sched_block_current();
+}
+
+void kernel_wait_queue_block_current(struct kernel_wait_queue *queue)
+{
+    kernel_wait_queue_block_current_minimum(queue, 0);
 }

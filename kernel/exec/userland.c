@@ -713,6 +713,15 @@ retry:
                 live_fpu_saved = 1;
                 (void)kernel_signal_deliver_pending(current, frame);
             }
+            /* Keep a syscall's RUNNING state and fair-accounting interval
+             * intact when the same task can safely return immediately. A
+             * rejected attempt falls through to full capture and selection. */
+            if (!live_fpu_saved &&
+                sched_try_resume_current_user_frame(frame)) {
+                arch_set_user_fs(current->fs_base);
+                kernel_execution_unlock_irqrestore(execution_flags);
+                return current;
+            }
             if (current->state != TASK_EXITED && !sched_capture_current_user_frame(frame)) {
                 console_error("[reliefnt] rejected scheduler frame pid=%u rip=0x%llx cs=0x%llx\n",
                                current->pid,
@@ -720,20 +729,6 @@ retry:
                                (unsigned long long)frame->cs);
                 kernel_execution_unlock_irqrestore(execution_flags);
                 return NULL;
-            }
-            /* Fast path: same user task resumes with no delivered signal and no
-             * pending reschedule. The return frame is captured above; skip the
-             * whole scheduler round (fair_sync O(CPUs+tasks) + pick + bookkeeping)
-             * that would otherwise run on every syscall return. Affinity can
-             * change in the syscall without setting the reschedule hint. */
-            if (!live_fpu_saved && !sched_current_cpu_needs_resched() &&
-                current->kind == TASK_KIND_USER &&
-                (current->state == TASK_RUNNING || current->state == TASK_READY) &&
-                (!current->affinity_mask ||
-                 (current->affinity_mask & (1ULL << smp_current_cpu())))) {
-                arch_set_user_fs(current->fs_base);
-                kernel_execution_unlock_irqrestore(execution_flags);
-                return current;
             }
         } else {
             console_warn("[reliefnt] ignored invalid scheduler frame pid=%u rip=0x%llx cs=0x%llx\n",

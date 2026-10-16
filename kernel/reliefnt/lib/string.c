@@ -9,11 +9,13 @@
  */
 void *memset(void *dst, int value, size_t len)
 {
-    unsigned char *p = (unsigned char *)dst;
-    while (len--) {
-        *p++ = (unsigned char)value;
-    }
-    return dst;
+    void *result = dst;
+    /* Exact byte counts keep unaligned and page-boundary callers safe. */
+    __asm__ volatile("cld; rep stosb"
+                     : "+D"(dst), "+c"(len)
+                     : "a"((unsigned char)value)
+                     : "memory", "cc");
+    return result;
 }
 
 /**
@@ -21,12 +23,13 @@ void *memset(void *dst, int value, size_t len)
  */
 void *memcpy(void *dst, const void *src, size_t len)
 {
-    unsigned char *d = (unsigned char *)dst;
-    const unsigned char *s = (const unsigned char *)src;
-    while (len--) {
-        *d++ = *s++;
-    }
-    return dst;
+    void *result = dst;
+    /* No SIMD state is touched, including on interrupt and syscall paths. */
+    __asm__ volatile("cld; rep movsb"
+                     : "+D"(dst), "+S"(src), "+c"(len)
+                     :
+                     : "memory", "cc");
+    return result;
 }
 
 /**

@@ -40,12 +40,11 @@ bool user_range_ok(uint64_t ptr, uint64_t len)
         return true;
     }
     for (page = align_down_page(ptr); page < end; page += PAGE_SIZE) {
-        if (!address_space_user_page_readable(sched_task_as(task), page) &&
-            !syscall_handle_user_page_fault(page, 0)) {
-            return false;
-        }
         if (!address_space_user_page_readable(sched_task_as(task), page)) {
-            return false;
+            if (!syscall_handle_user_page_fault(page, 0) ||
+                !address_space_user_page_readable(sched_task_as(task), page)) {
+                return false;
+            }
         }
     }
     return true;
@@ -63,9 +62,10 @@ bool user_range_writable(uint64_t ptr, uint64_t len)
     if (!task || task->kind != TASK_KIND_USER || !user_range_ok(ptr, len)) return false;
     if (!len) return true;
     for (uint64_t page = align_down_page(ptr); page < ptr + len; page += PAGE_SIZE) {
-        if (!address_space_user_page_writable(sched_task_as(task), page) &&
-            !address_space_handle_cow_fault(sched_task_as(task), page)) return false;
-        if (!address_space_user_page_writable(sched_task_as(task), page)) return false;
+        if (!address_space_user_page_writable(sched_task_as(task), page)) {
+            if (!address_space_handle_cow_fault(sched_task_as(task), page) ||
+                !address_space_user_page_writable(sched_task_as(task), page)) return false;
+        }
     }
     return true;
 }

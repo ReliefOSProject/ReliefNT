@@ -928,6 +928,13 @@ bool sched_volume_has_writers(uint32_t volume_id);
  * @return True on capture; false if the frame or CPU ownership is invalid.
  */
 bool sched_capture_current_user_frame(const struct trap_frame *frame);
+/**
+ * @brief Save a valid frame and continue the current task without ending its fair-accounting interval.
+ * @param frame Live user context to publish while holding the execution transaction.
+ * @return True only when the task is still RUNNING on this CPU, has no pending
+ *         reschedule or deliverable signal, and remains eligible on this CPU.
+ */
+bool sched_try_resume_current_user_frame(const struct trap_frame *frame);
 /** Release this CPU's ownership after its current task was marked EXITED. */
 void sched_quiesce_exited_current(void);
 /**
