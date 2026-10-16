@@ -39,12 +39,20 @@ static uint32_t fb_col;
 static uint32_t fb_row;
 static uint32_t console_ui_theme = 1u;
 static bool console_line_start = true;
-static bool console_runtime_quiet;
 static bool console_service_logs_only;
 static bool console_presenting;
+static bool console_log_color_enabled;
+static uint8_t vga_ansi_state;
 static uint32_t console_log_owner = UINT32_MAX;
 static const char *const console_log_prefixes[] = {
     "[DEBUG] ", "[INFO] ", "[WARN] ", "[ERROR] ", "[FATAL] ",
+};
+static const char *const console_log_colors[] = {
+    "\033[38;2;128;144;160m",
+    "\033[38;2;144;168;160m",
+    "\033[38;2;192;168;112m",
+    "\033[38;2;192;128;128m",
+    "\033[38;2;176;128;160m",
 };
 static uint32_t fb_saved_col;
 static uint32_t fb_saved_row;
@@ -118,16 +126,6 @@ static const uint32_t fb_ansi_colors[16] = {
     0x00708090u, 0x00ff8484u, 0x008de39au, 0x00f0d37bu,
     0x009bb7ffu, 0x00e8a5ffu, 0x0088e8fau, 0x00ffffffu,
 };
-
-static bool console_is_reliefnt_format(const char *fmt)
-{
-    static const char prefix[] = "[reliefnt]";
-    if (!fmt) return false;
-    for (uint32_t i = 0; i < sizeof(prefix) - 1u; ++i) {
-        if (!fmt[i] || fmt[i] != prefix[i]) return false;
-    }
-    return true;
-}
 
 enum fb_ansi_state {
     FB_ANSI_NORMAL = 0,
@@ -848,6 +846,19 @@ static void fb_console_initialize_fullscreen(void)
     framebuffer_present();
 }
 
+static void vga_console_ansi_feed(char character)
+{
+    if (vga_ansi_state == 0u) {
+        if (character == '\033') vga_ansi_state = 1u;
+        else vga_putc(character);
+    } else if (vga_ansi_state == 1u) {
+        vga_ansi_state = character == '[' ? 2u : 0u;
+    } else if ((unsigned char)character >= 0x40u &&
+               (unsigned char)character <= 0x7eu) {
+        vga_ansi_state = 0u;
+    }
+}
+
 static void console_emit_raw(char ch)
 {
     char s[2] = {ch, 0};
@@ -949,6 +960,25 @@ void console_init(void)
     serial_init();
 }
 
+void console_log_configure(const char *cmdline)
+{
+    console_log_color_enabled = true;
+    const char *cursor = cmdline;
+    while (cursor && *cursor) {
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' || *cursor == '\n') ++cursor;
+        const char *end = cursor;
+        while (*end && *end != ' ' && *end != '\t' && *end != '\r' && *end != '\n') ++end;
+        size_t length = (size_t)(end - cursor);
+        if (length == sizeof("logcolor=0") - 1u) {
+            if (__builtin_memcmp(cursor, "logcolor=0", length) == 0)
+                console_log_color_enabled = false;
+            else if (__builtin_memcmp(cursor, "logcolor=1", length) == 0)
+                console_log_color_enabled = true;
+        }
+        cursor = end;
+    }
+}
+
 void console_set_ui_theme(uint32_t theme)
 {
     console_ui_theme = theme == 0u ? 0u : 1u;
@@ -1012,12 +1042,21 @@ void console_vt_activate(uint32_t number, bool graphical)
 {
     bool restored = false;
     if (number < 1u || number > CONSOLE_VT_COUNT) return;
+    bool preserve_text = !graphical && !console_vt_graphical &&
+        (console_active_vt == number || (!console_active_vt && number == 1u));
+    if (!console_active_vt) {
+        struct console_vt_text *boot_screen = &vt_text[0];
+        boot_screen->length = 0;
+        for (size_t index = console_log_replay_start();
+             index < log_len && boot_screen->length < CONSOLE_VT_TEXT_CAP; ++index)
+            boot_screen->bytes[boot_screen->length++] =
+                log_buffer[(log_start + index) % CONSOLE_LOG_CAP];
+    }
     if (console_vt_graphical && !graphical) console_save_graphic_frame();
     fb_console_hide_tty_cursor();
     console_active_vt = number;
     console_vt_graphical = graphical;
     console_service_logs_only = true;
-    console_runtime_quiet = false;
     fb_console_tty_cursor_active = !graphical;
     if (!framebuffer_get()->available) return;
     if (graphical) {
@@ -1029,19 +1068,35 @@ void console_vt_activate(uint32_t number, bool graphical)
         return;
     }
     if (!fb_console_enabled) return;
+    if (preserve_text) {
+        console_present();
+        return;
+    }
     fb_console_initialize_fullscreen();
-    fb_console_clear_log();
     struct console_vt_text *screen = &vt_text[number - 1u];
     for (size_t i = 0; i < screen->length; ++i) fb_console_ansi_feed(screen->bytes[i]);
     console_present();
+}
+
+static void console_log_control(const char *sequence)
+{
+    serial_write(sequence);
+    for (const char *cursor = sequence; *cursor; ++cursor) {
+        log_store(*cursor);
+        if (!console_service_logs_only) {
+            fb_console_ansi_feed(*cursor);
+        }
+    }
 }
 
 static void console_log_putc(enum console_log_level level, char character)
 {
     if (console_line_start && character != '\n' && character != '\r') {
         console_emit_timestamp();
+        if (console_log_color_enabled) console_log_control(console_log_colors[level]);
         const char *prefix = console_log_prefixes[level];
         while (*prefix) console_emit_raw(*prefix++);
+        if (console_log_color_enabled) console_log_control("\033[0m");
     }
     bool line_start = console_line_start;
     console_emit_raw(character);
@@ -1078,8 +1133,6 @@ static void console_vlog(enum console_log_level level, const char *fmt, va_list 
 {
     if (!fmt || !*fmt) return;
     if ((unsigned)level > CONSOLE_LOG_FATAL) level = CONSOLE_LOG_INFO;
-    if (level < CONSOLE_LOG_WARN && console_runtime_quiet &&
-        console_is_reliefnt_format(fmt)) return;
     uint64_t flags = kernel_irq_save();
     uint32_t cpu = smp_current_cpu();
     bool acquired = false;
@@ -1248,7 +1301,8 @@ void console_enable_vga_fallback(void)
     }
     vga_init();
     vga_console_enabled = true;
+    vga_ansi_state = 0u;
     for (size_t i = console_log_replay_start(); i < log_len; ++i) {
-        vga_putc(log_buffer[(log_start + i) % CONSOLE_LOG_CAP]);
+        vga_console_ansi_feed(log_buffer[(log_start + i) % CONSOLE_LOG_CAP]);
     }
 }

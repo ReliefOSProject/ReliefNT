@@ -495,6 +495,7 @@ static const struct reliefos_driver_kernel_api driver_kernel_api = {
     .audio_set_service = audio_card_set_service,
     .report_teardown_failure = driver_report_teardown_failure,
     .audio_request_disconnect = audio_request_controller_disconnect,
+    .console_log = console_log,
 };
 
 /**

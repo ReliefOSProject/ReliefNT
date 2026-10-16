@@ -168,6 +168,9 @@ static void kernel_start(uint32_t magic, uint32_t multiboot_info)
      * the firmware IDT, whose gates no longer fit the kernel GDT. */
     irq_mask_legacy_pic();
     console_init();
+    struct boot_info boot;
+    multiboot2_parse(magic, (uintptr_t)multiboot_info, &boot);
+    console_log_configure(boot.cmdline);
     const struct reliefos_system_info *system = reliefnt_system_info();
     console_info("ReliefOS %s %s booting\n",
                    system->kernel_name,
@@ -176,8 +179,9 @@ static void kernel_start(uint32_t magic, uint32_t multiboot_info)
                  system->architecture, system->build_time,
                  (unsigned)sizeof(kernel_ring0_stack));
 
-    struct boot_info boot;
-    multiboot2_parse(magic, (uintptr_t)multiboot_info, &boot);
+    console_info("[reliefnt] GRUB handoff ok bootloader=%s cmdline=%s modules=%u\n",
+                 boot.bootloader ? boot.bootloader : "(unknown)",
+                 boot.cmdline ? boot.cmdline : "(none)", boot.module_count);
     console_info("[boot] firmware=%s acpi_rsdp=%p multiboot_mmap=%u efi_mmap=%u\n",
                  boot.efi_system_table ? "UEFI" : "legacy",
                  (void *)(uintptr_t)boot.rsdp_addr,
@@ -342,6 +346,7 @@ static void kernel_start(uint32_t magic, uint32_t multiboot_info)
                  online_cpus, smp_cpu_count(),
                  (unsigned long long)mm_free_memory_kib());
 
+    console_vt_activate(1, false);
     userland_enter_first();
     kernel_idle_loop();
 }

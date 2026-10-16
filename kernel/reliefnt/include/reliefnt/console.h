@@ -6,6 +6,7 @@
 #define RELIEFNT_CONSOLE_H
 
 #include <reliefnt/types.h>
+#include <reliefos/kernel_log.h>
 
 /**
  * @brief Set up the kernel console backend before any output is written.
@@ -34,14 +35,7 @@ void console_display_tick(void);
  */
 void console_printf(const char *fmt, ...);
 
-enum console_log_level {
-    CONSOLE_LOG_DEBUG,
-    CONSOLE_LOG_INFO,
-    CONSOLE_LOG_WARN,
-    CONSOLE_LOG_ERROR,
-    CONSOLE_LOG_FATAL,
-};
-
+void console_log_configure(const char *cmdline);
 void console_log(enum console_log_level level, const char *fmt, ...);
 void console_log_write(const char *text);
 

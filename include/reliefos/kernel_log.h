@@ -1,0 +1,12 @@
+#ifndef RELIEFOS_KERNEL_LOG_H
+#define RELIEFOS_KERNEL_LOG_H
+
+enum console_log_level {
+    CONSOLE_LOG_DEBUG,
+    CONSOLE_LOG_INFO,
+    CONSOLE_LOG_WARN,
+    CONSOLE_LOG_ERROR,
+    CONSOLE_LOG_FATAL,
+};
+
+#endif

@@ -260,7 +260,6 @@ int pty_vt_init(void)
     vt_display_generation = 1;
     active_vt = 1;
     vt_ready = 1;
-    console_vt_activate(1, false);
     return 0;
 }
 

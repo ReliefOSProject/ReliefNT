@@ -83,15 +83,29 @@ make O=$PWD/out/x86_64/release ARCH=x86_64 PROFILE=release all
 启动或内核异常。全部等级默认保留，早期时钟尚未初始化时启动时间为零。
 
 内核代码使用 `console_debug/info/warn/error/fatal`，或显式传入等级的
-`console_log`；旧 `console_printf` 兼容入口按 `INFO` 输出。驱动 ABI 的
-`console_write` 回调同样经过日志入口，支持消息开头的 `[DEBUG] `、`[INFO] `、
-`[WARN] `、`[ERROR] `、`[FATAL] ` 标记，未标记的旧驱动消息默认为 `INFO`。
+`console_log`；旧 `console_printf` 兼容入口按 `INFO` 输出。内核和驱动共享
+`<reliefos/kernel_log.h>` 中的等级枚举；所有内置驱动通过 ABI 的 `console_log`
+回调显式传递等级和格式参数，不再自行拼接等级、时间戳或颜色。该回调为 ABI v1
+末尾的大小门控扩展，使用前检查 `RELIEFOS_DRIVER_LOG_API_SIZE`。旧版 ABI 的
+`console_write` 仅保留兼容：已知等级标记由内核转换，未标记消息按 `INFO` 输出。
 同一消息的多行均带等级，格式化输出支持整数宽度、补零、`l`、`ll` 和 `z`。
+
+等级标签默认使用低饱和度 ANSI 真彩色，不加粗、不闪烁；时间戳和正文不染色。
+在 GRUB 的 `multiboot2` 行追加 `logcolor=0` 可从第一条启动日志起关闭内核日志
+ANSI 配色，`logcolor=1` 显式开启（默认）。参数按完整 token 匹配，可用空格或
+制表符分隔；重复指定时最后一个有效值生效。串口和 framebuffer 使用相同格式，
+VGA 文本回退过滤 ANSI 控制序列，不显示转义乱码。该选项不改变用户态程序或
+交互式内核调试器自己的 ANSI 输出。
 
 普通日志按 CPU 归属和中断状态串行输出；致命日志不等待其他 CPU 持有的日志锁。
 启动回放使用 64 KiB 环形缓冲区，满时保留最新完整日志行。用户态终端、PTY、
 `/dev/console` 和串口写入继续使用原始输出接口，不添加内核日志等级；内核
 调试器的交互屏幕也保持原有显示。
+
+启动日志输出到最后的 `boot complete` 后才交给 tty1；接管时保留已有文字和
+光标位置，PID 1/OpenRC 输出直接接在后面，不再清屏。启动日志也纳入 tty1
+文本历史，切换到其他 VT 或离开图形模式后可以恢复。重复激活当前文本 VT
+不会重置画面；真正切换 VT、图形程序接管，以及程序主动清屏仍正常生效。
 
 启动日志记录构建身份、固件及模块、CPU 型号和特征、物理内存及页缓存容量、
 PCI 清单、显示后端与 3D 探测结果、根文件系统选择、驱动加载摘要、虚拟终端、

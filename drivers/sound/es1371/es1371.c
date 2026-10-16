@@ -119,26 +119,18 @@ static struct es1371_state es1371;
 static uint32_t es1371_read(uint16_t offset);
 static void es1371_write(uint16_t offset, uint32_t value);
 
-static void es1371_hex32(char *out, uint32_t value)
-{
-    static const char digits[] = "0123456789abcdef";
-    for (uint32_t index = 0; index < 8U; ++index) {
-        out[index] = digits[(value >> ((7U - index) * 4U)) & 0x0fU];
-    }
-}
-
 static void es1371_log_registers(void)
 {
-    char line[] = "[driver] es1371 regs ctl=0x00000000 serial=0x00000000 "
-                  "status=0x00000000 size=0x00000000 count=0x00000000\n";
     if (es1371.diagnostics_reported) return;
     es1371_write(ES_REG_MEM_PAGE, ES_PAGE_DAC);
-    es1371_hex32(line + 27U, es1371_read(ES_REG_CONTROL));
-    es1371_hex32(line + 45U, es1371_read(ES_REG_SERIAL));
-    es1371_hex32(line + 63U, es1371_read(ES_REG_STATUS));
-    es1371_hex32(line + 79U, es1371_read(ES_REG_DAC1_SIZE));
-    es1371_hex32(line + 96U, es1371_read(ES_REG_DAC1_COUNT));
-    kernel_api->console_write(line);
+    uint32_t control = es1371_read(ES_REG_CONTROL);
+    uint32_t serial = es1371_read(ES_REG_SERIAL);
+    uint32_t status = es1371_read(ES_REG_STATUS);
+    uint32_t size = es1371_read(ES_REG_DAC1_SIZE);
+    uint32_t count = es1371_read(ES_REG_DAC1_COUNT);
+    kernel_api->console_log(CONSOLE_LOG_DEBUG,
+        "[driver] es1371 regs ctl=0x%08x serial=0x%08x status=0x%08x size=0x%08x count=0x%08x\n",
+        control, serial, status, size, count);
     es1371.diagnostics_reported = 1U;
 }
 
@@ -382,27 +374,14 @@ static void es1371_sleep_ms(uint32_t milliseconds)
     }
 }
 
-static void es1371_hex16(char *out, uint16_t value)
-{
-    static const char digits[] = "0123456789abcdef";
-    for (uint32_t index = 0; index < 4U; ++index) {
-        out[index] = digits[(value >> ((3U - index) * 4U)) & 0x0fU];
-    }
-}
-
 static void es1371_log_codec(uint16_t reset, uint16_t vendor1,
                               uint16_t vendor2, uint16_t power,
                               uint16_t master, uint16_t pcm)
 {
-    char line[] = "[driver] es1371 codec reset=0x0000 vendor=0x00000000 "
-                  "power=0x0000 master=0x0000 pcm=0x0000\n";
-    es1371_hex16(line + 30U, reset);
-    es1371_hex16(line + 44U, vendor1);
-    es1371_hex16(line + 48U, vendor2);
-    es1371_hex16(line + 61U, power);
-    es1371_hex16(line + 75U, master);
-    es1371_hex16(line + 86U, pcm);
-    kernel_api->console_write(line);
+    kernel_api->console_log(CONSOLE_LOG_DEBUG,
+        "[driver] es1371 codec reset=0x%04x vendor=0x%04x%04x power=0x%04x master=0x%04x pcm=0x%04x\n",
+        (unsigned)reset, (unsigned)vendor1, (unsigned)vendor2,
+        (unsigned)power, (unsigned)master, (unsigned)pcm);
 }
 
 static int es1371_codec_initialize(void)
@@ -451,7 +430,7 @@ static int es1371_codec_initialize(void)
     }
     es1371_log_codec(reset, vendor1, vendor2, power, master, pcm);
     if (master != 0U || pcm != 0U) {
-        kernel_api->console_write("[WARN] [driver] es1371 codec mixer readback mismatch\n");
+        kernel_api->console_log(CONSOLE_LOG_WARN, "[driver] es1371 codec mixer readback mismatch\n");
         return -5;
     }
     return 0;
@@ -594,7 +573,7 @@ static int es1371_start_dma(void)
     es1371.cursor_progress_samples = 0;
     es1371.cursor_progress_reported = 0;
     es1371.diagnostics_reported = 0;
-    kernel_api->console_write("[driver] es1371 DMA ring prepared (loop, period=2048)\n");
+    kernel_api->console_log(CONSOLE_LOG_INFO, "[driver] es1371 DMA ring prepared (loop, period=2048)\n");
     es1371_log_registers();
     return 0;
 }
@@ -615,11 +594,11 @@ static int es1371_enable_dma(void)
     es1371.dma_last_cursor = cursor;
     es1371.dma_running = 1;
     if (!(es1371_read(ES_REG_CONTROL) & ES_CONTROL_DAC1_ENABLE)) {
-        kernel_api->console_write("[ERROR] [driver] es1371 DAC1 enable rejected\n");
+        kernel_api->console_log(CONSOLE_LOG_ERROR, "[driver] es1371 DAC1 enable rejected\n");
         es1371.dma_running = 0;
         return -5;
     }
-    kernel_api->console_write("[driver] es1371 DMA ring started (loop, period=2048)\n");
+    kernel_api->console_log(CONSOLE_LOG_INFO, "[driver] es1371 DMA ring started (loop, period=2048)\n");
     return 0;
 }
 
@@ -683,7 +662,7 @@ static void es1371_update_consumption(uint32_t cursor)
     if (delta >= es1371.queued_bytes) {
         ++es1371.underruns;
         if (!es1371.empty_reported) {
-            kernel_api->console_write("[WARN] [driver] es1371 DMA underrun; refilling silence\n");
+            kernel_api->console_log(CONSOLE_LOG_WARN, "[driver] es1371 DMA underrun; refilling silence\n");
             es1371.empty_reported = 1;
         }
         es1371_recover_empty(cursor);
@@ -698,13 +677,13 @@ static void es1371_update_consumption(uint32_t cursor)
         es1371.cursor_progress_samples += delta;
         if (es1371.cursor_progress_samples >= ES1371_DMA_BYTES &&
             !es1371.cursor_progress_reported) {
-            kernel_api->console_write("[DEBUG] [driver] es1371 DMA cursor remains advancing\n");
+            kernel_api->console_log(CONSOLE_LOG_DEBUG, "[driver] es1371 DMA cursor remains advancing\n");
             es1371.cursor_progress_reported = 1U;
         }
     }
     if (es1371.nonzero_range_pending &&
         es1371_cursor_reached(previous, cursor, es1371.nonzero_range_end)) {
-        kernel_api->console_write("[DEBUG] [driver] es1371 first nonzero DMA range consumed\n");
+        kernel_api->console_log(CONSOLE_LOG_DEBUG, "[driver] es1371 first nonzero DMA range consumed\n");
         es1371.nonzero_range_pending = 0;
     }
 }
@@ -738,7 +717,7 @@ static int es1371_queue_block(const uint8_t *data, uint32_t length)
     if (free_bytes < length) {
         ++es1371.overruns;
         if (!es1371.overrun_reported) {
-            kernel_api->console_write("[WARN] [driver] es1371 DMA queue full; short write\n");
+            kernel_api->console_log(CONSOLE_LOG_WARN, "[driver] es1371 DMA queue full; short write\n");
             es1371.overrun_reported = 1;
         }
         return -11;
@@ -750,7 +729,7 @@ static int es1371_queue_block(const uint8_t *data, uint32_t length)
     es1371.queued_bytes += length;
     es1371.empty_reported = 0;
     if (nonzero && !es1371.nonzero_reported) {
-        kernel_api->console_write("[DEBUG] [driver] es1371 first nonzero PCM buffer queued\n");
+        kernel_api->console_log(CONSOLE_LOG_DEBUG, "[driver] es1371 first nonzero PCM buffer queued\n");
         es1371.nonzero_reported = 1;
         es1371.nonzero_range_start = write_offset;
         es1371.nonzero_range_end = (write_offset + length) % ES1371_DMA_BYTES;
@@ -807,9 +786,10 @@ static long es1371_audio_write(const void *data, uint32_t length, uint32_t *out_
     es1371_ack_dac1_irq();
     if (es1371.cursor_probe_pending && !es1371.cursor_reported) {
         uint32_t after = es1371_dma_cursor();
-        kernel_api->console_write(after != es1371.cursor_probe_baseline
-            ? "[DEBUG] [driver] es1371 DMA cursor advancing\n"
-            : "[WARN] [driver] es1371 DMA cursor stalled\n");
+        kernel_api->console_log(after != es1371.cursor_probe_baseline
+            ? CONSOLE_LOG_DEBUG : CONSOLE_LOG_WARN,
+            "[driver] es1371 DMA cursor %s\n",
+            after != es1371.cursor_probe_baseline ? "advancing" : "stalled");
         es1371.cursor_reported = 1U;
         es1371.cursor_probe_pending = 0U;
     }
@@ -946,7 +926,7 @@ static int es1371_hardware_init(void)
     }
     es1371_write(ES_REG_SRC, 0);
     if (es1371_codec_initialize() < 0) {
-        kernel_api->console_write("[ERROR] [driver] es1371 codec initialization failed\n");
+        kernel_api->console_log(CONSOLE_LOG_ERROR, "[driver] es1371 codec initialization failed\n");
         return -110;
     }
 
@@ -965,7 +945,7 @@ static int es1371_hardware_init(void)
     es1371.sample_rate = default_format.sample_rate;
     es1371.channels = default_format.channels;
     es1371.bits_per_sample = default_format.bits_per_sample;
-    kernel_api->console_write("[driver] es1371 ready (PCM DAC1 stereo, nonblocking)\n");
+    kernel_api->console_log(CONSOLE_LOG_INFO, "[driver] es1371 ready (PCM DAC1 stereo, nonblocking)\n");
     return 0;
 }
 
@@ -978,7 +958,7 @@ static int es1371_driver_init(const struct reliefos_driver_kernel_api *api)
         .get_state = es1371_get_state,
     };
     if (!api || api->abi_version != RELIEFOS_DRIVER_ABI_VERSION ||
-        api->struct_size < sizeof(*api)) {
+        api->struct_size < RELIEFOS_DRIVER_LOG_API_SIZE || !api->console_log) {
         return -22;
     }
     kernel_api = api;

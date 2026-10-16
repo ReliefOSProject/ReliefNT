@@ -48,17 +48,10 @@ static uint32_t published_cards;
 static void hda_module_error(const char *stage,const struct reliefos_driver_pci_device *dev,
                              uint8_t cad,int error)
 {
-    char line[120];unsigned n=0;const char *prefix="[ERROR] [hda] ";const char *hex="0123456789abcdef";
-    while(*prefix)line[n++]=*prefix++;
-    while(*stage && n<64)line[n++]=*stage++;
-    const char *label=" bdf=";while(*label)line[n++]=*label++;
-    line[n++]=hex[dev->bus>>4];line[n++]=hex[dev->bus&15];line[n++]=':';
-    line[n++]=hex[dev->slot>>4];line[n++]=hex[dev->slot&15];line[n++]='.';
-    line[n++]=hex[dev->function&15];label=" cad=";while(*label)line[n++]=*label++;
-    line[n++]=hex[cad&15];label=" errno=";while(*label)line[n++]=*label++;
-    uint32_t value=(uint32_t)error;if(error<0){line[n++]='-';value=0u-value;}
-    char digits[10];unsigned count=0;do{digits[count++]=(char)('0'+value%10);value/=10;}while(value);
-    while(count)line[n++]=digits[--count];line[n++]='\n';line[n]=0;kernel_api->console_write(line);
+    kernel_api->console_log(CONSOLE_LOG_ERROR,
+        "[hda] %s bdf=%02x:%02x.%x cad=%x errno=%d\n", stage,
+        (unsigned)dev->bus, (unsigned)dev->slot, (unsigned)dev->function,
+        (unsigned)cad, error);
 }
 
 /** @brief Clear module-local bytes without an external libc dependency.
@@ -895,7 +888,7 @@ static void hda_module_fini(void)
         if(ret){if(!first_error)first_error=ret;link=&owner->next;continue;}
         *link=owner->next;kernel_api->free_pages(owner->phys,owner->pages);
     }
-    if(first_error){kernel_api->console_write("[WARN] [hda] unsafe teardown retained for retry\n");
+    if(first_error){kernel_api->console_log(CONSOLE_LOG_WARN, "[hda] unsafe teardown retained for retry\n");
         kernel_api->report_teardown_failure(first_error);return;}
     published_cards=0;kernel_api=NULL;
 }
@@ -907,11 +900,11 @@ static void hda_module_fini(void)
 static int hda_module_init(const struct reliefos_driver_kernel_api *api)
 {
     if(!api || api->abi_version!=RELIEFOS_DRIVER_ABI_VERSION ||
-        api->struct_size<RELIEFOS_DRIVER_DISCONNECT_API_SIZE || !api->report_teardown_failure ||
+        api->struct_size<RELIEFOS_DRIVER_LOG_API_SIZE || !api->report_teardown_failure ||
         !api->audio_request_disconnect ||
         !api->pci_enumerate || !api->alloc_pages || !api->free_pages ||
         !api->audio_register_card || !api->audio_unregister_card || !api->audio_period_elapsed ||
-        !api->audio_control_changed || !api->audio_set_service || !api->console_write)return -EINVAL;
+        !api->audio_control_changed || !api->audio_set_service || !api->console_log)return -EINVAL;
     if(controllers)return -EBUSY;
     kernel_api=api;published_cards=0;unsigned controller_count=0;
     for(uint32_t index=0;index<65536u;index++){
@@ -953,7 +946,7 @@ static int hda_module_init(const struct reliefos_driver_kernel_api *api)
             if(!owner->hw.card_id)hda_controller_set_card_id(&owner->hw,card->id);
             ret=api->audio_set_service(card->id,hda_card_service,card);if(ret)return ret;
             published_cards++;
-            api->console_write("[hda] registered usable codec card\n");
+            api->console_log(CONSOLE_LOG_INFO, "[hda] registered usable codec card\n");
         }
     }
     return published_cards?0:-ENODEV;

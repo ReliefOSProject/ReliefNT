@@ -5,20 +5,10 @@
 
 static const struct reliefos_driver_kernel_api *kernel_api;
 
-static void e1000_log(const char *severity, const char *message)
+static void e1000_log(enum console_log_level level, const char *message)
 {
-    if (kernel_api && kernel_api->console_write) {
-        char line[256];
-        size_t used = 0;
-        const char *parts[] = {severity, "[e1000] ", message};
-        for (size_t part = 0; part < sizeof(parts) / sizeof(parts[0]); ++part) {
-            const char *text = parts[part];
-            while (*text && used < sizeof(line) - 2u) line[used++] = *text++;
-        }
-        line[used++] = '\n';
-        line[used] = 0;
-        kernel_api->console_write(line);
-    }
+    if (kernel_api && kernel_api->console_log)
+        kernel_api->console_log(level, "[e1000] %s\n", message);
 }
 
 #define mm_alloc_pages(pages) kernel_api->alloc_pages((pages))
@@ -335,15 +325,15 @@ static void e1000_hardware_init(void)
     if (e1000_find(&dev) < 0) {
         struct reliefos_driver_pci_device other;
         if (kernel_api->pci_find(0x1022, 0x2000, &other) == 0)
-            e1000_log("[WARN] ", "VMware PCnet detected; select ethernet0.virtualDev = e1000 in the powered-off VM configuration");
-        else e1000_log("[INFO] ", "no supported Intel PCI device found");
+            e1000_log(CONSOLE_LOG_WARN, "VMware PCnet detected; select ethernet0.virtualDev = e1000 in the powered-off VM configuration");
+        else e1000_log(CONSOLE_LOG_INFO, "no supported Intel PCI device found");
         return;
     }
     g_e1000.present = 1;
     g_e1000.pci = dev;
     mmio = e1000_bar0_mmio(&dev);
     if (!mmio) {
-        e1000_log("[ERROR] ", "BAR0 MMIO is unassigned or outside the supported 32-bit mapping");
+        e1000_log(CONSOLE_LOG_ERROR, "BAR0 MMIO is unassigned or outside the supported 32-bit mapping");
         return;
     }
     g_e1000.mmio_base = (uintptr_t)mmio;
@@ -361,23 +351,23 @@ static void e1000_hardware_init(void)
     e1000_reg_write(E1000_REG_CTRL, e1000_reg_read(E1000_REG_CTRL) | E1000_CTRL_RST);
     kernel_api->sleep_ms(20);
     if (e1000_reg_read(E1000_REG_CTRL) & E1000_CTRL_RST) {
-        e1000_log("[ERROR] ", "controller reset timed out");
+        e1000_log(CONSOLE_LOG_ERROR, "controller reset timed out");
         return;
     }
     e1000_reg_write(E1000_REG_IMC, 0xffffffffu);
     (void)e1000_reg_read(E1000_REG_ICR);
     if (e1000_read_mac() < 0) {
-        e1000_log("[ERROR] ", "no valid hardware MAC in RAR or EEPROM");
+        e1000_log(CONSOLE_LOG_ERROR, "no valid hardware MAC in RAR or EEPROM");
         return;
     }
     e1000_reg_write(E1000_REG_CTRL, e1000_reg_read(E1000_REG_CTRL) | E1000_CTRL_SLU);
     if (e1000_alloc_rings() < 0) {
-        e1000_log("[ERROR] ", "ring allocation failed");
+        e1000_log(CONSOLE_LOG_ERROR, "ring allocation failed");
         return;
     }
     e1000_configure_rx_tx();
     g_e1000.active = 1;
-    e1000_log("[INFO] ", "descriptor rings initialized; hardware MAC loaded");
+    e1000_log(CONSOLE_LOG_INFO, "descriptor rings initialized; hardware MAC loaded");
 }
 
 static int e1000_is_ready(void)
@@ -544,7 +534,7 @@ static int e1000_driver_init(const struct reliefos_driver_kernel_api *api)
         .get_info = e1000_driver_get_info,
     };
     if (!api || api->abi_version != RELIEFOS_DRIVER_ABI_VERSION ||
-        api->struct_size < sizeof(*api)) {
+        api->struct_size < RELIEFOS_DRIVER_LOG_API_SIZE || !api->console_log) {
         return -22;
     }
     kernel_api = api;

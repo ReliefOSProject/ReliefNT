@@ -114,9 +114,4 @@ void multiboot2_parse(uint32_t magic, uintptr_t info_addr, struct boot_info *out
 
         cursor = align8(cursor + tag->size);
     }
-
-    console_info("[reliefnt] GRUB handoff ok bootloader=%s cmdline=%s modules=%u\n",
-                   out->bootloader ? out->bootloader : "(unknown)",
-                   out->cmdline ? out->cmdline : "(none)",
-                   out->module_count);
 }

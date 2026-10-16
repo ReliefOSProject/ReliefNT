@@ -12,6 +12,7 @@
 #include <reliefos/driver_audio.h>
 #include <reliefos/audio_abi.h>
 #include <reliefos/driver_abi.h>
+#include <reliefos/kernel_log.h>
 
 #define RELIEFOS_DRIVER_ABI_VERSION 1U
 #define RELIEFOS_DRIVER_MODULE_MAGIC 0x4c445256U
@@ -224,6 +225,7 @@ struct reliefos_driver_kernel_api {
      * STOP leases for retry. Other controller BDFs remain available.
      */
     int (*audio_request_disconnect)(uint32_t card);
+    void (*console_log)(enum console_log_level level, const char *fmt, ...);
 };
 
 #define RELIEFOS_DRIVER_AUDIO_API_SIZE \
@@ -236,6 +238,9 @@ struct reliefos_driver_kernel_api {
 #define RELIEFOS_DRIVER_DISCONNECT_API_SIZE \
     (offsetof(struct reliefos_driver_kernel_api, audio_request_disconnect) + \
      sizeof(((struct reliefos_driver_kernel_api *)0)->audio_request_disconnect))
+#define RELIEFOS_DRIVER_LOG_API_SIZE \
+    (offsetof(struct reliefos_driver_kernel_api, console_log) + \
+     sizeof(((struct reliefos_driver_kernel_api *)0)->console_log))
 
 struct reliefos_driver_module {
     uint32_t magic;

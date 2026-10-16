@@ -139,21 +139,12 @@ static void hda_stream_position_error(const struct hda_stream *s,const char *rea
                                       uint32_t last,uint32_t wall_prev)
 {
     const struct reliefos_driver_kernel_api *api=s->controller->api;
-    if(!api || !api->console_write)return;
-    char line[256];unsigned n=0;const char *text="[WARN] [hda-pos] reason=";
-    while(*text)line[n++]=*text++;
-    while(*reason)line[n++]=*reason++;
-    const char *labels[]={" sd="," last="," pos="," cbl="," wall_prev=",
-                          " wall_before="," wall_after="," frames="};
-    uint32_t values[]={s->index,last,position,s->cbl,
-                       wall_prev,before,after,s->selected.pcm.buffer_frames};
-    const char *hex="0123456789abcdef";
-    for(unsigned i=0;i<8;i++){
-        text=labels[i];while(*text)line[n++]=*text++;
-        line[n++]='0';line[n++]='x';
-        for(int shift=28;shift>=0;shift-=4)line[n++]=hex[(values[i]>>shift)&15u];
-    }
-    line[n++]='\n';line[n]=0;api->console_write(line);
+    if(!api || api->struct_size<RELIEFOS_DRIVER_LOG_API_SIZE || !api->console_log)return;
+    api->console_log(CONSOLE_LOG_WARN,
+        "[hda-pos] reason=%s sd=0x%08x last=0x%08x pos=0x%08x cbl=0x%08x "
+        "wall_prev=0x%08x wall_before=0x%08x wall_after=0x%08x frames=0x%08x\n",
+        reason, (unsigned)s->index, last, position, s->cbl,
+        wall_prev, before, after, s->selected.pcm.buffer_frames);
 }
 
 /** @brief Advance one hardware byte position into a monotonic frame count.

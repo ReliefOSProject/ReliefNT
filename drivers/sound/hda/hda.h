@@ -1164,7 +1164,7 @@ int hda_controls_card_write(void *opaque, uint32_t control,
  * @par Context
  * Task diagnostics while codec metadata remains alive.
  * @par Ownership and locks/IRQ
- * Reads immutable CPU metadata and borrows api->console_write; does not expose pointers, lock, or issue verbs.
+ * Reads immutable CPU metadata and borrows api->console_log; does not expose pointers, lock, or issue verbs.
  */
 void hda_codec_dump(const struct hda_codec *codec);
 

@@ -973,7 +973,8 @@ static int hda_quiesce_dma(struct hda_controller *c)
  */
 static int hda_enter_immediate_mode(struct hda_controller *c)
 {
-    if (!c->api->console_write) return -EOPNOTSUPP;
+    if (c->api->struct_size < RELIEFOS_DRIVER_LOG_API_SIZE || !c->api->console_log)
+        return -EOPNOTSUPP;
     int ret = hda_quiesce_dma(c);
     if (ret) return ret;
     ret = hda_reset_link(c);
@@ -1023,8 +1024,8 @@ static int hda_enter_immediate_mode(struct hda_controller *c)
     if (!(c->api->pci_read16(c->dev.bus, c->dev.slot, c->dev.function,
                             HDA_PCI_COMMAND) & HDA_PCI_COMMAND_MASTER)) return -EIO;
     c->transport_mode = HDA_TRANSPORT_IMMEDIATE;
-    c->api->console_write(
-        "[WARN] [hda] ring init failed; using immediate command transport (no unsolicited)\n");
+    c->api->console_log(CONSOLE_LOG_WARN,
+        "[hda] ring init failed; using immediate command transport (no unsolicited)\n");
     return 0;
 }
 

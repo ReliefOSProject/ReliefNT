@@ -2531,52 +2531,6 @@ done:
     return ret;
 }
 
-/** @brief Append bounded text to a caller-provided diagnostic line.
- * @param out Output line buffer.
- * @param used Current output cursor, updated on success/truncation.
- * @param capacity Total bytes in the buffer including terminator space.
- * @param text NUL-terminated text to append.
- * @return None; appends as much as fits while retaining a terminator slot.
- *
- * @par Context
- * Task-context codec diagnostics.
- * @par Ownership and locks/IRQ
- * Caller owns the stack buffer; no allocation, lock, or device access.
- */
-static void hda_codec_append_text(char *out, uint32_t *used, uint32_t capacity,
-                                  const char *text)
-{
-    if (!out || !used || !text || !capacity) return;
-    while (*text && *used + 1u < capacity) out[(*used)++] = *text++;
-    out[*used] = '\0';
-}
-
-/** @brief Append a fixed-width lowercase hexadecimal value to a diagnostic line.
- * @param out Output line buffer.
- * @param used Current output cursor, updated after emitted digits.
- * @param capacity Total bytes in the line including terminator space.
- * @param value Value whose least significant @p digits are emitted.
- * @param digits Number of hexadecimal digits, from 1 through 8.
- * @return None; emits bounded numeric text without revealing pointers.
- *
- * @par Context
- * Task-context codec diagnostics.
- * @par Ownership and locks/IRQ
- * Caller owns the output buffer; no allocation, lock, or hardware access.
- */
-static void hda_codec_append_hex(char *out, uint32_t *used, uint32_t capacity,
-                                 uint32_t value, uint8_t digits)
-{
-    static const char hex[] = "0123456789abcdef";
-    if (!out || !used || !capacity || digits > 8u) return;
-    while (digits && *used + 1u < capacity) {
-        uint8_t shift = (uint8_t)((digits - 1u) * 4u);
-        out[(*used)++] = hex[(value >> shift) & 0x0fu];
-        --digits;
-    }
-    out[*used] = '\0';
-}
-
 /** @brief Emit codec identity, NID capabilities/defaults, and expanded graph edges.
  * @param codec Successfully probed immutable codec metadata.
  * @return None; no output is emitted for a missing cache or console callback.
@@ -2584,71 +2538,36 @@ static void hda_codec_append_hex(char *out, uint32_t *used, uint32_t capacity,
  * @par Context
  * Task diagnostics while probe metadata is alive; this does not query hardware.
  * @par Ownership and locks/IRQ
- * Reads CPU metadata only and borrows console_write. Output contains numeric codec/NID values and never a kernel address.
+ * Reads CPU metadata only and borrows console_log. Output contains numeric codec/NID values and never a kernel address.
  */
 void hda_codec_dump(const struct hda_codec *codec)
 {
-    if (!codec || !codec->probed || !codec->api || !codec->api->console_write)
+    if (!codec || !codec->probed || !codec->api ||
+        codec->api->struct_size < RELIEFOS_DRIVER_LOG_API_SIZE || !codec->api->console_log)
         return;
-    char line[192];
-    uint32_t used = 0u;
-    line[0] = '\0';
-    hda_codec_append_text(line, &used, sizeof(line), "[DEBUG] [hda] codec cad=0x");
-    hda_codec_append_hex(line, &used, sizeof(line), codec->cad, 2u);
-    hda_codec_append_text(line, &used, sizeof(line), " vendor=0x");
-    hda_codec_append_hex(line, &used, sizeof(line), codec->vendor_id, 8u);
-    hda_codec_append_text(line, &used, sizeof(line), " revision=0x");
-    hda_codec_append_hex(line, &used, sizeof(line), codec->revision_id, 8u);
-    hda_codec_append_text(line, &used, sizeof(line),
-                          " implementation_id(first_afg)=0x");
-    hda_codec_append_hex(line, &used, sizeof(line), codec->subsystem_id, 8u);
-    hda_codec_append_text(line, &used, sizeof(line), "\n");
-    codec->api->console_write(line);
+    const struct reliefos_driver_kernel_api *api = codec->api;
+    api->console_log(CONSOLE_LOG_DEBUG,
+        "[hda] codec cad=0x%02x vendor=0x%08x revision=0x%08x implementation_id(first_afg)=0x%08x\n",
+        (unsigned)codec->cad, codec->vendor_id, codec->revision_id, codec->subsystem_id);
 
     for (uint32_t nid = 1u; nid < HDA_CODEC_MAX_NIDS; ++nid) {
         const struct hda_codec_node *node = &codec->nodes[nid];
         if (!node->present) continue;
-        used = 0u;
-        line[0] = '\0';
-        hda_codec_append_text(line, &used, sizeof(line), "[DEBUG] [hda] nid=0x");
-        hda_codec_append_hex(line, &used, sizeof(line), nid, 2u);
-        hda_codec_append_text(line, &used, sizeof(line), " type=0x");
-        hda_codec_append_hex(line, &used, sizeof(line), node->type, 2u);
-        hda_codec_append_text(line, &used, sizeof(line), " caps=0x");
-        hda_codec_append_hex(line, &used, sizeof(line), node->widget_caps, 8u);
-        hda_codec_append_text(line, &used, sizeof(line), " pin_caps=0x");
-        hda_codec_append_hex(line, &used, sizeof(line), node->pin_caps, 8u);
-        hda_codec_append_text(line, &used, sizeof(line), " default=0x");
-        hda_codec_append_hex(line, &used, sizeof(line), node->pin_default, 8u);
-        hda_codec_append_text(line, &used, sizeof(line), " rates=0x");
-        hda_codec_append_hex(line, &used, sizeof(line), node->pcm_rates, 8u);
-        hda_codec_append_text(line, &used, sizeof(line), " formats=0x");
-        hda_codec_append_hex(line, &used, sizeof(line), node->stream_formats, 8u);
-        if (node->type == HDA_WIDGET_FUNCTION_GROUP) {
-            hda_codec_append_text(line, &used, sizeof(line),
-                                  " implementation_id=0x");
-            hda_codec_append_hex(line, &used, sizeof(line),
-                                 node->implementation_id, 8u);
-        }
-        hda_codec_append_text(line, &used, sizeof(line), " connections=0x");
-        hda_codec_append_hex(line, &used, sizeof(line), node->connection_count, 3u);
-        hda_codec_append_text(line, &used, sizeof(line), "\n");
-        codec->api->console_write(line);
+        api->console_log(CONSOLE_LOG_DEBUG,
+            "[hda] nid=0x%02x type=0x%02x caps=0x%08x pin_caps=0x%08x default=0x%08x "
+            "rates=0x%08x formats=0x%08x connections=0x%03x\n",
+            nid, (unsigned)node->type, node->widget_caps, node->pin_caps,
+            node->pin_default, node->pcm_rates, node->stream_formats,
+            (unsigned)node->connection_count);
+        if (node->type == HDA_WIDGET_FUNCTION_GROUP)
+            api->console_log(CONSOLE_LOG_DEBUG,
+                "[hda] nid=0x%02x implementation_id=0x%08x\n", nid, node->implementation_id);
 
         const uint8_t *connections = NULL;
         if (hda_codec_connection_slice(codec, node, &connections)) continue;
-        for (uint32_t i = 0u; i < node->connection_count; ++i) {
-            used = 0u;
-            line[0] = '\0';
-            hda_codec_append_text(line, &used, sizeof(line),
-                                  "[hda] connection owner=0x");
-            hda_codec_append_hex(line, &used, sizeof(line), nid, 2u);
-            hda_codec_append_text(line, &used, sizeof(line), " index=0x");
-            hda_codec_append_hex(line, &used, sizeof(line), i, 2u);
-            hda_codec_append_text(line, &used, sizeof(line), " nid=0x");
-            hda_codec_append_hex(line, &used, sizeof(line), connections[i], 2u);
-            hda_codec_append_text(line, &used, sizeof(line), "\n");
-            codec->api->console_write(line);
-        }
+        for (uint32_t index = 0u; index < node->connection_count; ++index)
+            api->console_log(CONSOLE_LOG_DEBUG,
+                "[hda] connection owner=0x%02x index=0x%02x nid=0x%02x\n",
+                nid, index, (unsigned)connections[index]);
     }
 }
