@@ -163,9 +163,9 @@ include $(RELIEFOS_SRC)/mk/resources.mk
 # Source inventories are inputs, never implicit host executable targets.
 .SUFFIXES:
 
-.PHONY: help all kernel kerneldebug boot tools fetch fetch-check defconfig olddefconfig \
+.PHONY: help all kernel kerneldebug vdso boot tools fetch fetch-check defconfig olddefconfig \
 	menuconfig headers_install install config-sync build-info \
-	test test-tools test-abi test-header-export clean distclean
+	test test-tools test-abi test-header-export test-vdso clean distclean
 
 help:
 	@printf '%s\n' \
@@ -174,6 +174,8 @@ help:
 	  '  all               kernel.sys, kernel.debug, kerneldebug.sys' \
 	  '  kernel            kernel.sys + kernel.debug' \
 	  '  kerneldebug       kerneldebug.sys (standalone kernel debug module)' \
+	  '  vdso              build the versioned x86-64 vDSO and embedded object' \
+	  '  test-vdso         inspect and run the generated vDSO ELF' \
 	  '  headers_install   export the UAPI whitelist to $(O)/kernel-export/include' \
 	  '  install           copy products + manifest.txt to $(DESTDIR)' \
 	  '  test              host-tool tests + ABI layout + header export' \
@@ -188,6 +190,12 @@ help:
 tools: $(RELIEFOS_HOST_TOOLS)
 
 kernel: $(RELIEFOS_KERNEL_SYS) $(RELIEFOS_KERNEL_DEBUG)
+
+vdso: $(VDSO_ELF) $(VDSO_BLOB_OBJECT)
+
+test-vdso:
+	$(call RELIEFOS_LOG,RUN,tools/test_vdso.py)
+	$(Q)$(RELIEFOS_TEST_PYTHON) $(RELIEFOS_SRC)/tools/test_vdso.py --output $(O)/test-vdso
 
 # `all` is exactly the three kernel products. There is no userland, no image and
 # no package goal in this repository.

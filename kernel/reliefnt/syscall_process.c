@@ -863,21 +863,13 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
         return 0;
     }
     if (number == LINUX_SYS_CLOCK_GETRES) {
-        struct linux_timespec value;
+        struct linux_timespec resolution;
         int32_t clock_id = (int32_t)a0;
-        int ret = time_clock_get(clock_id, &value);
+        int ret = time_clock_getres(clock_id, &resolution);
         if (ret < 0) return ret;
         if (!a1) return 0;
-        if (!user_range_writable(a1, 16)) return -RELIEFOS_EFAULT;
-        /* Interpolated clocks are sub-tick; coarse/raw stay at the tick. */
-        int64_t res_ns = 1;
-        if (clock_id == LINUX_CLOCK_MONOTONIC_COARSE ||
-            clock_id == LINUX_CLOCK_REALTIME_COARSE ||
-            clock_id == LINUX_CLOCK_MONOTONIC_RAW) {
-            res_ns = (int64_t)(1000000000ULL / RELIEFNT_TICK_HZ);
-        }
-        ((int64_t *)(uintptr_t)a1)[0] = 0;
-        ((int64_t *)(uintptr_t)a1)[1] = res_ns;
+        if (!user_range_writable(a1, sizeof(resolution))) return -RELIEFOS_EFAULT;
+        *(struct linux_timespec *)(uintptr_t)a1 = resolution;
         return 0;
     }
     if (number == LINUX_SYS_GETTID) {

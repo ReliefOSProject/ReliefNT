@@ -30,16 +30,33 @@ void time_discipline_clear(void)
     leap_second = UINT64_MAX;
 }
 
-uint64_t time_discipline_tick_ns(void)
+static uint64_t discipline_tick_ns(int64_t *next_remainder,
+                                   uint64_t *next_fractional_tick)
 {
     int64_t frequency = frequency_q32 + frequency_remainder;
     int64_t correction = frequency / (int64_t)RELIEFNT_TICK_HZ;
-    frequency_remainder = frequency % (int64_t)RELIEFNT_TICK_HZ;
+    int64_t remainder = frequency % (int64_t)RELIEFNT_TICK_HZ;
     int64_t total = tick_us * 1000 * Q32 + correction + phase_tick_q32 + adjust_tick_q32;
     /* Limits on tick, oscillator and phase guarantee a positive tick. */
     uint64_t scaled = (uint64_t)total + fractional_tick;
-    fractional_tick = scaled & (Q32 - 1);
+    if (next_remainder) *next_remainder = remainder;
+    if (next_fractional_tick) *next_fractional_tick = scaled & (Q32 - 1);
     return scaled >> 32;
+}
+
+uint64_t time_discipline_tick_ns(void)
+{
+    int64_t remainder;
+    uint64_t fraction;
+    uint64_t elapsed = discipline_tick_ns(&remainder, &fraction);
+    frequency_remainder = remainder;
+    fractional_tick = fraction;
+    return elapsed;
+}
+
+uint64_t time_discipline_peek_tick_ns(void)
+{
+    return discipline_tick_ns(NULL, NULL);
 }
 
 int time_discipline_second(uint64_t seconds)

@@ -17,6 +17,7 @@
 #include <reliefnt/lock.h>
 #include <reliefnt/smp.h>
 #include <reliefnt/userland.h>
+#include <reliefnt/vdso.h>
 #include <reliefnt/svga.h>
 #include <reliefos/layout.h>
 #include <reliefnt/permissions.h>
@@ -229,7 +230,7 @@ static int write_user_u64(const struct address_space *as, uint64_t vaddr, uint64
 /**
  * @brief Lay out argv/envp (and the dynamic-launch record) on the task's user stack and point the initial frame at them.
  */
-static int prepare_user_exec_stack(struct task *task, const char *execfn)
+static int prepare_user_exec_stack(struct task *task, const char *execfn, uint64_t vdso_ehdr)
 {
     uint64_t sp;
     uint64_t argc_base;
@@ -243,7 +244,7 @@ static int prepare_user_exec_stack(struct task *task, const char *execfn)
     size_t path_len;
     uint64_t argv_bytes;
     uint64_t envp_bytes;
-    const uint64_t auxv_count = 16;
+    enum { auxv_count = 17 };
     const uint64_t auxv_bytes = auxv_count * 2 * sizeof(uint64_t);
     enum {
         AT_NULL = 0,
@@ -262,6 +263,7 @@ static int prepare_user_exec_stack(struct task *task, const char *execfn)
         AT_RSEQ_FEATURE_SIZE = 27,
         AT_RSEQ_ALIGN = 28,
         AT_EXECFN = 31,
+        AT_SYSINFO_EHDR = 33,
     };
     uint64_t launch_base = 0;
     if (!task) {
@@ -362,6 +364,7 @@ static int prepare_user_exec_stack(struct task *task, const char *execfn)
             AT_RSEQ_FEATURE_SIZE, 32,
             AT_RSEQ_ALIGN, 32,
             AT_EXECFN, execfn_base,
+            AT_SYSINFO_EHDR, vdso_ehdr,
             AT_NULL, 0,
         };
         for (uint32_t i = 0; i < sizeof(auxv) / sizeof(auxv[0]); ++i) {
@@ -523,7 +526,10 @@ static int userland_load_task_image_locked(struct task *task, const struct task 
         int ret = userland_prepare_exec_credentials(task, old);
         if (ret < 0) return ret;
     }
-    int ret = prepare_user_exec_stack(task, execfn);
+    uint64_t vdso_ehdr;
+    int ret = vdso_map_task(task, &vdso_ehdr);
+    if (ret < 0) return ret;
+    ret = prepare_user_exec_stack(task, execfn, vdso_ehdr);
     if (ret < 0) {
         console_error("[reliefnt] failed to prepare argv/envp for %s\n", task->name);
         return ret;
@@ -718,10 +724,13 @@ retry:
             /* Fast path: same user task resumes with no delivered signal and no
              * pending reschedule. The return frame is captured above; skip the
              * whole scheduler round (fair_sync O(CPUs+tasks) + pick + bookkeeping)
-             * that would otherwise run on every syscall return. */
+             * that would otherwise run on every syscall return. Affinity can
+             * change in the syscall without setting the reschedule hint. */
             if (!live_fpu_saved && !sched_need_resched &&
                 current->kind == TASK_KIND_USER &&
-                (current->state == TASK_RUNNING || current->state == TASK_READY)) {
+                (current->state == TASK_RUNNING || current->state == TASK_READY) &&
+                (!current->affinity_mask ||
+                 (current->affinity_mask & (1ULL << smp_current_cpu())))) {
                 arch_set_user_fs(current->fs_base);
                 kernel_execution_unlock_irqrestore(execution_flags);
                 return current;

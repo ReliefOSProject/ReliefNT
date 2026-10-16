@@ -108,6 +108,63 @@ $(RELIEFOS_SRC)/kernel/reliefnt/include/reliefnt/boot_splash.h:
 
 RELIEFOS_KERNEL_OBJS := $(RELIEFOS_KERNEL_CC_OBJS) $(RELIEFOS_KERNEL_AS_OBJS)
 
+# The freestanding vDSO is a separate ELF artifact. Its C source deliberately
+# stays outside KERNEL_SOURCE_DIRS: the normal inventory contains kernel code,
+# while this object is produced from the finished ELF and embedded read-only.
+VDSO_SOURCE_DIR := $(RELIEFOS_SRC)/vdso
+VDSO_DATA_HEADER := $(RELIEFOS_SRC)/kernel/reliefnt/include/reliefnt/vdso_data.h
+VDSO_C_SOURCE := $(VDSO_SOURCE_DIR)/clock.c
+VDSO_LINKER_SCRIPT := $(VDSO_SOURCE_DIR)/vdso.lds
+VDSO_VERSION_SCRIPT := $(VDSO_SOURCE_DIR)/vdso.map
+VDSO_C_OBJECT := $(O_OBJ)/vdso/clock.c.o
+VDSO_ELF := $(O_GENERATED)/vdso/vdso.so
+VDSO_BLOB_ASM := $(O_GENERATED)/vdso/vdso_blob.S
+VDSO_BLOB_OBJECT := $(O_OBJ)/kernel/vdso/vdso_blob.S.o
+RELIEFOS_KERNEL_EXTRA_OBJS := $(VDSO_BLOB_OBJECT)
+
+VDSO_CFLAGS := -target $(TRIPLE_KERNEL) $(RELIEFOS_OPTIMIZATION_FLAGS) \
+	-std=c11 -ffreestanding -fPIC -fvisibility=hidden -fno-builtin \
+	-fno-stack-protector -fno-plt -fno-unwind-tables \
+	-fno-asynchronous-unwind-tables -mno-red-zone -mgeneral-regs-only \
+	-Wall -Wextra -Werror -MMD -MP -I$(RELIEFOS_SRC)/kernel/reliefnt/include
+VDSO_LDFLAGS := -m elf_x86_64 -shared -nostdlib -z max-page-size=0x1000 \
+	--hash-style=both --no-undefined --build-id=none \
+	-soname linux-vdso.so.1 --version-script=$(VDSO_VERSION_SCRIPT)
+
+RELIEFOS_SIG_vdso-cc := argv=$(TARGET_CC) $(VDSO_CFLAGS)|path=$(call reliefos_absolute,$(TARGET_CC))|identity=$(shell $(TARGET_CC) --version 2>&1 | head -n1)
+RELIEFOS_SIG_vdso-link := argv=$(TARGET_LD) $(VDSO_LDFLAGS) -T $(VDSO_LINKER_SCRIPT)|path=$(call reliefos_absolute,$(TARGET_LD))|identity=$(shell $(TARGET_LD) --version 2>&1 | head -n1)
+$(if $(RELIEFOS_PASSIVE),,$(eval $(call RELIEFOS_SIGNATURE_RULE,vdso-cc)))
+$(if $(RELIEFOS_PASSIVE),,$(eval $(call RELIEFOS_SIGNATURE_RULE,vdso-link)))
+
+$(O_OBJ)/vdso $(O_GENERATED)/vdso $(O_OBJ)/kernel/vdso:
+	$(Q)mkdir -p $@
+
+$(VDSO_C_OBJECT): $(VDSO_C_SOURCE) $(VDSO_DATA_HEADER) $(O_META)/vdso-cc.sig | $(O_OBJ)/vdso
+	$(call RELIEFOS_LOG,VDSoCC,$<)
+	$(Q)$(TARGET_CC) $(VDSO_CFLAGS) -MF $@.d -c $< -o $@
+
+$(VDSO_ELF): $(VDSO_C_OBJECT) $(VDSO_LINKER_SCRIPT) $(VDSO_VERSION_SCRIPT) \
+	$(O_META)/vdso-link.sig | $(O_GENERATED)/vdso
+	$(call RELIEFOS_LOG,VDSoLD,$@)
+	$(Q)$(TARGET_LD) $(VDSO_LDFLAGS) -T $(VDSO_LINKER_SCRIPT) -o $@ $(VDSO_C_OBJECT)
+
+$(VDSO_BLOB_ASM): $(VDSO_ELF) | $(O_GENERATED)/vdso
+	$(Q){ \
+		printf '%s\n' '.section .rodata.reliefnt_vdso,"a",@progbits' \
+			'.balign 16' '.global reliefnt_vdso_image_start' \
+			'.type reliefnt_vdso_image_start,@object' 'reliefnt_vdso_image_start:'; \
+		printf '.incbin "%s"\n' '$(VDSO_ELF)'; \
+		printf '%s\n' '.global reliefnt_vdso_image_end' \
+			'.type reliefnt_vdso_image_end,@object' 'reliefnt_vdso_image_end:' \
+			'.size reliefnt_vdso_image_start,reliefnt_vdso_image_end-reliefnt_vdso_image_start'; \
+	} > $@.tmp && mv $@.tmp $@
+
+$(VDSO_BLOB_OBJECT): $(VDSO_BLOB_ASM) $(O_META)/kernel-as.sig | $(O_OBJ)/kernel/vdso
+	$(call RELIEFOS_LOG,VDSoAS,$<)
+	$(Q)$(KERNEL_AS_BASE) $(KERNEL_AFLAGS) -MF $@.d -c $< -o $@
+
+-include $(VDSO_C_OBJECT).d $(VDSO_BLOB_OBJECT).d
+
 # --- compilation ------------------------------------------------------------
 # One generated header per object, not one per build: the special dependencies
 # below keep the graph honest without making every object wait for every asset.
@@ -139,12 +196,12 @@ $(BUILD_INFO_HEADER): $(RELIEFOS_SRC)/configs/build-version $(RELIEFOS_VERSION_T
 # Grouped target: kernel.unstripped is the only output of the link, but the two
 # objcopy products are derived from it independently, so each gets its own rule
 # and neither can be mistaken for a complete-image stamp.
-$(KERNEL_UNSTRIPPED): $(RELIEFOS_KERNEL_OBJS) $(KERNEL_LD_SCRIPT) \
+$(KERNEL_UNSTRIPPED): $(RELIEFOS_KERNEL_OBJS) $(RELIEFOS_KERNEL_EXTRA_OBJS) $(KERNEL_LD_SCRIPT) \
 	$(KERNEL_SOURCES_LIST) $(O_META)/kernel-link.sig | $(O_GENERATED)/system
 	$(Q)mkdir -p $(dir $@)
 	$(call RELIEFOS_LOG,LD,$@)
 	$(Q)$(KERNEL_LD_BASE) $(KERNEL_LDFLAGS) -o $@ \
-	    $(RELIEFOS_KERNEL_CC_OBJS) $(RELIEFOS_KERNEL_AS_OBJS)
+	    $(RELIEFOS_KERNEL_CC_OBJS) $(RELIEFOS_KERNEL_AS_OBJS) $(RELIEFOS_KERNEL_EXTRA_OBJS)
 
 $(RELIEFOS_KERNEL_SYS): $(KERNEL_UNSTRIPPED) $(O_META)/kernel-objcopy.sig | $(O_GENERATED)/system
 	$(call RELIEFOS_LOG,IMAGE,$@)

@@ -11,6 +11,8 @@
 #include <linux/time.h>
 #include <linux/timex.h>
 #include <reliefnt/time_discipline.h>
+#include <reliefnt/smp.h>
+#include <reliefnt/vdso_data.h>
 #include <reliefnt/lock.h>
 #include <linux/errno.h>
 
@@ -46,10 +48,34 @@ static volatile uint16_t pit_divisor;
  * rather than pairing one tick's anchor with another's count. */
 static volatile uint32_t tsc_anchor_seq;
 static volatile uint64_t tsc_anchor;
+static volatile uint64_t uptime_tsc_anchor;
 static uint64_t tsc_per_us;
 static uint64_t tsc_calib_first;
+static uint64_t tsc_calib_previous;
+static uint64_t tsc_calib_min_interval;
+static uint64_t tsc_calib_max_interval;
+static uint64_t tsc_calib_confirm_rate;
 static uint64_t tsc_calib_span;
 static volatile uint8_t tsc_ready;
+/* A separate continuous, discipline-aware anchor is used only when RDTSC has
+ * been proven safe for user mode. The legacy syscall clock remains intact on
+ * systems that do not meet that condition. */
+static uint8_t tsc_trusted;
+static uint64_t hres_cycle_last, hres_mult, hres_max_cycles, hres_resolution_ns;
+static struct reliefnt_vdso_timestamp hres_realtime, hres_monotonic;
+static struct reliefnt_vdso_timestamp monotonic_floor;
+static uint8_t monotonic_floor_valid;
+static struct reliefnt_vdso_data *vdso_data;
+
+#define TIME_NOMINAL_TICK_NS (1000000000ULL / RELIEFNT_TICK_HZ)
+#define TIME_NOMINAL_TICK_US (1000000ULL / RELIEFNT_TICK_HZ)
+#define TIME_TSC_MIN_CYCLES_PER_US 100ULL
+#define TIME_TSC_MAX_CYCLES_PER_US 10000ULL
+
+#if defined(RELIEFNT_TIME_HOST_TEST)
+extern uint64_t time_test_rdtsc(void);
+extern bool time_test_tsc_safe(void);
+#endif
 
 /**
  * @brief Short I/O delay between CMOS register select and read.
@@ -243,10 +269,22 @@ void time_init(void)
     pit_divisor = 0;
     tsc_anchor_seq = 0;
     tsc_anchor = 0;
+    uptime_tsc_anchor = 0;
     tsc_per_us = 0;
     tsc_calib_first = 0;
+    tsc_calib_previous = 0;
+    tsc_calib_min_interval = 0;
+    tsc_calib_max_interval = 0;
+    tsc_calib_confirm_rate = 0;
     tsc_calib_span = 0;
     tsc_ready = 0;
+    tsc_trusted = 0;
+    hres_cycle_last = hres_mult = hres_max_cycles = hres_resolution_ns = 0;
+    hres_realtime = (struct reliefnt_vdso_timestamp){0, 0};
+    hres_monotonic = (struct reliefnt_vdso_timestamp){0, 0};
+    monotonic_floor = (struct reliefnt_vdso_timestamp){0, 0};
+    monotonic_floor_valid = 0;
+    vdso_data = 0;
     if (rtc_read_unix_seconds(&wall_unix_seconds) == 0) {
         struct reliefos_time_info info;
         wall_clock_valid = 1;
@@ -261,10 +299,362 @@ void time_init(void)
 
 static uint64_t time_rdtsc(void)
 {
+#if defined(RELIEFNT_TIME_HOST_TEST)
+    return time_test_rdtsc();
+#else
     uint32_t low;
     uint32_t high;
     __asm__ volatile("lfence; rdtsc; lfence" : "=a"(low), "=d"(high) :: "memory");
     return ((uint64_t)high << 32) | low;
+#endif
+}
+
+static bool time_tsc_hardware_safe(void)
+{
+#if defined(RELIEFNT_TIME_HOST_TEST)
+    return time_test_tsc_safe();
+#else
+    uint32_t eax, ebx, ecx, edx;
+    uint32_t max_basic, max_extended;
+    __asm__ volatile("cpuid" : "=a"(max_basic), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                     : "a"(0), "c"(0));
+    if (max_basic < 1) return false;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                     : "a"(1), "c"(0));
+    if (!(edx & (1u << 4))) return false; /* CPUID.1:EDX.TSC */
+    __asm__ volatile("cpuid" : "=a"(max_extended), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                     : "a"(0x80000000u), "c"(0));
+    if (max_extended < 0x80000007u) return false;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                     : "a"(0x80000007u), "c"(0));
+    if (!(edx & (1u << 8))) return false; /* invariant TSC */
+    uint64_t cr4;
+    __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+    if (cr4 & (1ULL << 2)) return false; /* CR4.TSD prevents user RDTSC */
+    return true;
+#endif
+}
+
+static bool time_tsc_calibration_sane(void)
+{
+    return tsc_ready && tsc_per_us >= TIME_TSC_MIN_CYCLES_PER_US &&
+           tsc_per_us <= TIME_TSC_MAX_CYCLES_PER_US;
+}
+
+static bool time_tsc_candidate_safe(void)
+{
+    uint32_t online = 0;
+    uint32_t count = smp_cpu_count();
+    uint64_t interval_ns = time_discipline_peek_tick_ns();
+    /* smp_cpu_count() reports discovered CPUs, including APs not yet released
+     * to userspace. Keep the vDSO on the syscall path until the machine is
+     * known to be single-CPU; another CPU could otherwise race this check. */
+    if (count != 1) return false;
+    for (uint32_t cpu = 0; cpu < count; ++cpu) {
+        if (smp_cpu_online(cpu)) ++online;
+    }
+    return online == 1 && time_tsc_calibration_sane() &&
+           interval_ns >= TIME_NOMINAL_TICK_NS / 2 &&
+           interval_ns <= TIME_NOMINAL_TICK_NS * 2 && time_tsc_hardware_safe();
+}
+
+static uint64_t time_cycles_to_ns(uint64_t cycles, uint64_t mult)
+{
+    __uint128_t result = ((__uint128_t)cycles * mult) >> RELIEFNT_VDSO_SHIFT;
+    return result > UINT64_MAX ? UINT64_MAX : (uint64_t)result;
+}
+
+static void time_timestamp_add_ns(struct reliefnt_vdso_timestamp *timestamp,
+                                  uint64_t nanoseconds)
+{
+    uint64_t seconds = nanoseconds / 1000000000ULL;
+    uint64_t subsecond = nanoseconds % 1000000000ULL;
+    uint64_t nsec = timestamp->nsec + subsecond;
+    if (nsec >= 1000000000ULL) {
+        nsec -= 1000000000ULL;
+        ++seconds;
+    }
+    if (timestamp->sec >= 0 && seconds > (uint64_t)(INT64_MAX - timestamp->sec)) {
+        timestamp->sec = INT64_MAX;
+        timestamp->nsec = 999999999ULL;
+        return;
+    }
+    timestamp->sec += (int64_t)seconds;
+    timestamp->nsec = nsec;
+}
+
+static void time_timestamp_add_signed_seconds(struct reliefnt_vdso_timestamp *timestamp,
+                                               int32_t seconds)
+{
+    if (seconds > 0 && timestamp->sec > INT64_MAX - seconds) {
+        timestamp->sec = INT64_MAX;
+        timestamp->nsec = 999999999ULL;
+    } else if (seconds < 0 && timestamp->sec < INT64_MIN - seconds) {
+        timestamp->sec = INT64_MIN;
+        timestamp->nsec = 0;
+    } else {
+        timestamp->sec += seconds;
+    }
+}
+
+static void time_timestamp_to_timespec(const struct reliefnt_vdso_timestamp *base,
+                                      uint64_t nanoseconds,
+                                      struct linux_timespec *value)
+{
+    struct reliefnt_vdso_timestamp result = *base;
+    time_timestamp_add_ns(&result, nanoseconds);
+    value->tv_sec = result.sec;
+    value->tv_nsec = (int64_t)result.nsec;
+}
+
+static bool time_timestamp_less(const struct reliefnt_vdso_timestamp *left,
+                                const struct reliefnt_vdso_timestamp *right)
+{
+    return left->sec < right->sec ||
+           (left->sec == right->sec && left->nsec < right->nsec);
+}
+
+static void time_monotonic_floor_advance_locked(struct reliefnt_vdso_timestamp *value)
+{
+    if (monotonic_floor_valid && time_timestamp_less(value, &monotonic_floor)) {
+        *value = monotonic_floor;
+    } else {
+        monotonic_floor = *value;
+        monotonic_floor_valid = 1;
+    }
+}
+
+static uint64_t time_legacy_fraction_at(uint64_t sample)
+{
+    if (!tsc_ready || !tsc_per_us || sample < tsc_anchor) return 0;
+    uint64_t fraction = ((sample - tsc_anchor) / tsc_per_us) * 1000ULL;
+    return fraction > TIME_NOMINAL_TICK_NS ? TIME_NOMINAL_TICK_NS : fraction;
+}
+
+static void time_hres_configure_locked(uint64_t anchor, uint64_t interval_ns)
+{
+    /* With sane calibration and bounded discipline input, interval_ns is far
+     * below 2^32 and tsc_per_us * nominal_tick_us is below 2^27. This keeps
+     * the Q32 scale in native 64-bit arithmetic on the freestanding kernel.
+     * Round the multiplier upward when its rational value is not representable:
+     * rounding down and discarding the low Q32 product bits at every tick
+     * otherwise loses a nanosecond repeatedly at common TSC rates. */
+    uint64_t denominator = tsc_per_us * TIME_NOMINAL_TICK_US;
+    if (denominator && interval_ns <= (UINT64_MAX >> RELIEFNT_VDSO_SHIFT)) {
+        uint64_t numerator = interval_ns << RELIEFNT_VDSO_SHIFT;
+        uint64_t quotient = numerator / denominator;
+        uint64_t remainder = numerator % denominator;
+        hres_mult = quotient + (remainder != 0);
+    } else {
+        hres_mult = 0;
+    }
+    /* Q32 remains a finite fixed-point scale; this prevents the demonstrated
+     * per-full-tick negative bias but does not certify absolute UTC accuracy. */
+    hres_cycle_last = anchor;
+    hres_max_cycles = tsc_per_us * TIME_NOMINAL_TICK_US;
+    hres_resolution_ns = (hres_mult >> RELIEFNT_VDSO_SHIFT) +
+                         ((hres_mult & 0xffffffffULL) != 0);
+    if (!hres_resolution_ns) hres_resolution_ns = 1;
+}
+
+static void time_hres_settle_locked(uint64_t sample)
+{
+    if (!tsc_trusted) return;
+    uint64_t elapsed = sample >= hres_cycle_last ? sample - hres_cycle_last : 0;
+    uint64_t nanoseconds = time_cycles_to_ns(elapsed, hres_mult);
+    time_timestamp_add_ns(&hres_monotonic, nanoseconds);
+    if (wall_clock_valid) {
+        time_timestamp_add_ns(&hres_realtime, nanoseconds);
+    } else {
+        hres_realtime = hres_monotonic;
+    }
+    hres_cycle_last = sample;
+}
+
+static void time_hres_from_legacy_locked(uint64_t sample)
+{
+    uint64_t fraction = time_legacy_fraction_at(sample);
+    hres_monotonic.sec = (int64_t)monotonic_seconds;
+    hres_monotonic.nsec = monotonic_ns;
+    time_timestamp_add_ns(&hres_monotonic, fraction);
+    if (wall_clock_valid) {
+        hres_realtime.sec = (int64_t)wall_unix_seconds;
+        hres_realtime.nsec = wall_fraction_ns;
+        time_timestamp_add_ns(&hres_realtime, fraction);
+    } else {
+        hres_realtime = hres_monotonic;
+    }
+}
+
+static void time_hres_enable_locked(uint64_t sample)
+{
+    time_hres_from_legacy_locked(sample);
+    time_monotonic_floor_advance_locked(&hres_monotonic);
+    tsc_trusted = 1;
+    time_hres_configure_locked(sample, time_discipline_peek_tick_ns());
+}
+
+static void time_hres_disable_locked(uint64_t sample)
+{
+    if (!tsc_trusted) return;
+    time_hres_settle_locked(sample);
+    time_monotonic_floor_advance_locked(&hres_monotonic);
+    /* Pivot the old syscall clock forward before returning to its legacy
+     * interpolation, so losing a hardware guarantee cannot move monotonic
+     * time backwards. Keep the uptime interpolation anchor independent. */
+    struct reliefnt_vdso_timestamp coarse_mono = {
+        (int64_t)monotonic_seconds, monotonic_ns
+    };
+    if (time_timestamp_less(&coarse_mono, &hres_monotonic)) {
+        monotonic_seconds = (uint64_t)hres_monotonic.sec;
+        monotonic_ns = hres_monotonic.nsec;
+    }
+    if (wall_clock_valid) {
+        struct reliefnt_vdso_timestamp coarse_real = {
+            (int64_t)wall_unix_seconds, wall_fraction_ns
+        };
+        if (time_timestamp_less(&coarse_real, &hres_realtime)) {
+            wall_unix_seconds = (uint64_t)hres_realtime.sec;
+            wall_fraction_ns = hres_realtime.nsec;
+        }
+    }
+    tsc_anchor = sample;
+    tsc_trusted = 0;
+}
+
+static void time_hres_refresh_safety_locked(uint64_t sample)
+{
+    bool safe = time_tsc_candidate_safe();
+    if (tsc_trusted && !safe) {
+        time_hres_disable_locked(sample);
+    } else if (!tsc_trusted && safe) {
+        time_hres_enable_locked(sample);
+    }
+}
+
+static void time_vdso_publish_locked(void)
+{
+    struct reliefnt_vdso_data *data = vdso_data;
+    if (!data) return;
+
+    uint32_t seq = __atomic_load_n(&data->seq, __ATOMIC_RELAXED);
+    if (seq & 1u) ++seq;
+    __atomic_store_n(&data->seq, seq + 1u, __ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+    uint32_t clock_mask = (1u << LINUX_CLOCK_MONOTONIC_COARSE);
+    uint32_t hres_mask = 0;
+    uint32_t mode = RELIEFNT_VDSO_MODE_NONE;
+    if (wall_clock_valid) clock_mask |= 1u << LINUX_CLOCK_REALTIME_COARSE;
+    if (tsc_trusted) {
+        clock_mask |= (1u << LINUX_CLOCK_MONOTONIC);
+        if (wall_clock_valid) clock_mask |= 1u << LINUX_CLOCK_REALTIME;
+        hres_mask = (1u << LINUX_CLOCK_MONOTONIC);
+        if (wall_clock_valid) hres_mask |= 1u << LINUX_CLOCK_REALTIME;
+        mode = RELIEFNT_VDSO_MODE_TSC;
+    }
+
+    __atomic_store_n(&data->clock_mode, mode, __ATOMIC_RELAXED);
+    __atomic_store_n(&data->clock_mask, clock_mask, __ATOMIC_RELAXED);
+    __atomic_store_n(&data->hres_mask, hres_mask, __ATOMIC_RELAXED);
+    __atomic_store_n(&data->cycle_last, tsc_trusted ? hres_cycle_last : 0,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&data->mult, tsc_trusted ? hres_mult : 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&data->max_cycles, tsc_trusted ? hres_max_cycles : 0,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&data->resolution_ns, tsc_trusted ? hres_resolution_ns : 0,
+                     __ATOMIC_RELAXED);
+    for (uint32_t i = 0; i < RELIEFNT_VDSO_CLOCKS; ++i) {
+        struct reliefnt_vdso_timestamp value = {0, 0};
+        if (tsc_trusted && i == LINUX_CLOCK_REALTIME) value = hres_realtime;
+        else if (tsc_trusted && i == LINUX_CLOCK_MONOTONIC) value = hres_monotonic;
+        else if (i == LINUX_CLOCK_REALTIME_COARSE && wall_clock_valid) {
+            value.sec = (int64_t)wall_unix_seconds;
+            value.nsec = wall_fraction_ns;
+        } else if (i == LINUX_CLOCK_MONOTONIC_COARSE) {
+            value.sec = (int64_t)monotonic_seconds;
+            value.nsec = monotonic_ns;
+        }
+        __atomic_store_n(&data->basetime[i].sec, value.sec, __ATOMIC_RELAXED);
+        __atomic_store_n(&data->basetime[i].nsec, value.nsec, __ATOMIC_RELAXED);
+    }
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&data->seq, seq + 2u, __ATOMIC_RELEASE);
+}
+
+/* Start a new candidate window at the most recent sample. A disturbed PIT
+ * callback can bunch one interval even while the average of the whole window
+ * looks plausible, so calibration uses individually checked intervals and
+ * requires a stable seven-interval window before enabling TSC timekeeping. */
+static void time_tsc_calibration_restart(uint64_t sample)
+{
+    tsc_calib_first = sample;
+    tsc_calib_previous = sample;
+    tsc_calib_min_interval = UINT64_MAX;
+    tsc_calib_max_interval = 0;
+    tsc_calib_span = 1;
+}
+
+static void time_tsc_calibration_reject(uint64_t sample)
+{
+    tsc_calib_confirm_rate = 0;
+    time_tsc_calibration_restart(sample);
+}
+
+static void time_tsc_calibration_sample(uint64_t sample)
+{
+    const uint64_t minimum = TIME_TSC_MIN_CYCLES_PER_US * TIME_NOMINAL_TICK_US;
+    const uint64_t maximum = TIME_TSC_MAX_CYCLES_PER_US * TIME_NOMINAL_TICK_US;
+
+    if (!tsc_calib_span) {
+        time_tsc_calibration_restart(sample);
+        return;
+    }
+    if (tsc_calib_span >= 8u) return;
+
+    if (sample <= tsc_calib_previous) {
+        time_tsc_calibration_reject(sample);
+        return;
+    }
+    uint64_t interval = sample - tsc_calib_previous;
+    if (interval < minimum || interval > maximum) {
+        time_tsc_calibration_reject(sample);
+        return;
+    }
+
+    tsc_calib_previous = sample;
+    if (interval < tsc_calib_min_interval) tsc_calib_min_interval = interval;
+    if (interval > tsc_calib_max_interval) tsc_calib_max_interval = interval;
+    ++tsc_calib_span;
+    if (tsc_calib_span == 8u) {
+        uint64_t interval_spread = tsc_calib_max_interval - tsc_calib_min_interval;
+        uint64_t per_us = (sample - tsc_calib_first) /
+                          (7ULL * TIME_NOMINAL_TICK_US);
+        if (interval_spread > tsc_calib_min_interval / 100u ||
+            per_us < TIME_TSC_MIN_CYCLES_PER_US ||
+            per_us > TIME_TSC_MAX_CYCLES_PER_US) {
+            time_tsc_calibration_reject(sample);
+            return;
+        }
+
+        if (!tsc_calib_confirm_rate) {
+            tsc_calib_confirm_rate = per_us;
+            time_tsc_calibration_restart(sample);
+            return;
+        }
+
+        uint64_t lower_rate = per_us < tsc_calib_confirm_rate ?
+                              per_us : tsc_calib_confirm_rate;
+        uint64_t rate_difference = per_us < tsc_calib_confirm_rate ?
+                                   tsc_calib_confirm_rate - per_us :
+                                   per_us - tsc_calib_confirm_rate;
+        if (rate_difference <= lower_rate / 100u) {
+            tsc_per_us = per_us;
+            tsc_ready = 1;
+        } else {
+            time_tsc_calibration_reject(sample);
+        }
+    }
 }
 
 /**
@@ -275,31 +665,20 @@ void time_on_tick(void)
 {
     uint64_t flags;
     kernel_spin_lock_irqsave(&clock_lock, &flags);
+    uint64_t anchor = time_rdtsc();
+    if (tsc_trusted) time_hres_settle_locked(anchor);
     /* Publish the tick and its TSC anchor as one sequence so lock-free
      * readers can retry instead of pairing one tick's anchor with another's
      * count. Anchor precedes the increment so a reader that still sees the
      * old count cannot observe a half-published boundary. */
     ++tsc_anchor_seq;
-    tsc_anchor = time_rdtsc();
+    tsc_anchor = anchor;
+    uptime_tsc_anchor = anchor;
     ++ticks;
     ++tsc_anchor_seq;
+    int32_t leap_correction = 0;
     if (!tsc_ready) {
-        if (!tsc_calib_span) {
-            tsc_calib_first = tsc_anchor;
-            tsc_calib_span = 1;
-        } else if (tsc_calib_span < 8u) {
-            ++tsc_calib_span;
-            if (tsc_calib_span == 8u) {
-                uint64_t per_us = (tsc_anchor - tsc_calib_first) /
-                                  (7ULL * (1000000ULL / RELIEFNT_TICK_HZ));
-                if (per_us) {
-                    tsc_per_us = per_us;
-                    tsc_ready = 1;
-                } else {
-                    tsc_calib_span = 0;
-                }
-            }
-        }
+        time_tsc_calibration_sample(tsc_anchor);
     }
     uint64_t elapsed = time_discipline_tick_ns();
     monotonic_ns += elapsed;
@@ -309,9 +688,18 @@ void time_on_tick(void)
         if (wall_fraction_ns >= 1000000000) {
             wall_fraction_ns -= 1000000000;
             ++wall_unix_seconds;
-            wall_unix_seconds += time_discipline_second(wall_unix_seconds);
+            leap_correction = time_discipline_second(wall_unix_seconds);
+            wall_unix_seconds += leap_correction;
         }
     }
+    if (tsc_trusted && leap_correction) {
+        time_timestamp_add_signed_seconds(&hres_realtime, leap_correction);
+    }
+    time_hres_refresh_safety_locked(anchor);
+    if (tsc_trusted) {
+        time_hres_configure_locked(anchor, time_discipline_peek_tick_ns());
+    }
+    time_vdso_publish_locked();
     kernel_spin_unlock_irqrestore(&clock_lock, flags);
     audio_service_tick();
     usb_poll();
@@ -335,14 +723,12 @@ uint64_t time_ticks(void)
  */
 static uint64_t time_subtick_fraction_ns(void)
 {
-    if (!tsc_ready) return 0;
-    uint64_t rate = tsc_per_us;
-    if (!rate) return 0;
-    uint64_t now = time_rdtsc();
-    if (now < tsc_anchor) return 0;
-    uint64_t frac_ns = ((now - tsc_anchor) / rate) * 1000ULL;
-    uint64_t tick_ns = 1000000000ULL / RELIEFNT_TICK_HZ;
-    return frac_ns > tick_ns ? tick_ns : frac_ns;
+    uint64_t sample = time_rdtsc();
+    if (tsc_trusted) {
+        uint64_t elapsed = sample >= hres_cycle_last ? sample - hres_cycle_last : 0;
+        return time_cycles_to_ns(elapsed, hres_mult);
+    }
+    return time_legacy_fraction_at(sample);
 }
 
 /** @brief Read a consistent clock snapshot with the timekeeper lock held. */
@@ -353,10 +739,23 @@ static int time_clock_get_locked(int32_t clock, struct linux_timespec *value)
     case LINUX_CLOCK_REALTIME:
     case 11: /* CLOCK_TAI */
         fraction = time_subtick_fraction_ns();
-        value->tv_sec = wall_clock_valid ? (int64_t)wall_unix_seconds : (int64_t)monotonic_seconds;
-        value->tv_nsec = (wall_clock_valid ? wall_fraction_ns : monotonic_ns) + fraction;
-        if (value->tv_nsec >= 1000000000LL) { value->tv_nsec -= 1000000000LL; ++value->tv_sec; }
-        if (clock == 11) value->tv_sec += time_discipline_tai();
+        if (tsc_trusted) {
+            time_timestamp_to_timespec(&hres_realtime, fraction, value);
+        } else {
+            value->tv_sec = wall_clock_valid ? (int64_t)wall_unix_seconds : (int64_t)monotonic_seconds;
+            value->tv_nsec = (wall_clock_valid ? wall_fraction_ns : monotonic_ns) + fraction;
+        }
+        if (!tsc_trusted && value->tv_nsec >= 1000000000LL) {
+            value->tv_nsec -= 1000000000LL;
+            ++value->tv_sec;
+        }
+        if (clock == 11) {
+            struct reliefnt_vdso_timestamp tai = {value->tv_sec,
+                                                   (uint64_t)value->tv_nsec};
+            time_timestamp_add_signed_seconds(&tai, time_discipline_tai());
+            value->tv_sec = tai.sec;
+            value->tv_nsec = (int64_t)tai.nsec;
+        }
         return 0;
     case LINUX_CLOCK_REALTIME_COARSE:
         value->tv_sec = wall_clock_valid ? (int64_t)wall_unix_seconds : (int64_t)monotonic_seconds;
@@ -369,9 +768,24 @@ static int time_clock_get_locked(int32_t clock, struct linux_timespec *value)
     case LINUX_CLOCK_MONOTONIC:
     case LINUX_CLOCK_BOOTTIME:
         fraction = time_subtick_fraction_ns();
-        value->tv_sec = monotonic_seconds;
-        value->tv_nsec = monotonic_ns + fraction;
-        if (value->tv_nsec >= 1000000000LL) { value->tv_nsec -= 1000000000LL; ++value->tv_sec; }
+        if (tsc_trusted) {
+            time_timestamp_to_timespec(&hres_monotonic, fraction, value);
+        } else {
+            value->tv_sec = monotonic_seconds;
+            value->tv_nsec = monotonic_ns + fraction;
+        }
+        if (!tsc_trusted && value->tv_nsec >= 1000000000LL) {
+            value->tv_nsec -= 1000000000LL;
+            ++value->tv_sec;
+        }
+        {
+            struct reliefnt_vdso_timestamp timestamp = {
+                value->tv_sec, (uint64_t)value->tv_nsec
+            };
+            time_monotonic_floor_advance_locked(&timestamp);
+            value->tv_sec = timestamp.sec;
+            value->tv_nsec = (int64_t)timestamp.nsec;
+        }
         return 0;
     case LINUX_CLOCK_MONOTONIC_COARSE:
         value->tv_sec = monotonic_seconds;
@@ -391,14 +805,65 @@ int time_clock_get(int32_t clock, struct linux_timespec *value)
     return result;
 }
 
+int time_clock_getres(int32_t clock, struct linux_timespec *value)
+{
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&clock_lock, &flags);
+    struct linux_timespec now;
+    int result = time_clock_get_locked(clock, &now);
+    if (result == 0) {
+        uint64_t resolution = TIME_NOMINAL_TICK_NS;
+        if (clock == LINUX_CLOCK_REALTIME_COARSE ||
+            clock == LINUX_CLOCK_MONOTONIC_COARSE ||
+            clock == LINUX_CLOCK_MONOTONIC_RAW) {
+            resolution = TIME_NOMINAL_TICK_NS;
+        } else if (tsc_trusted) {
+            resolution = hres_resolution_ns;
+        } else if (tsc_ready && tsc_per_us) {
+            /* The legacy syscall interpolation divides whole microseconds. */
+            resolution = 1000;
+        }
+        if (value) {
+            value->tv_sec = 0;
+            value->tv_nsec = (int64_t)resolution;
+        }
+    }
+    kernel_spin_unlock_irqrestore(&clock_lock, flags);
+    return result;
+}
+
+void time_vdso_bind(struct reliefnt_vdso_data *data)
+{
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&clock_lock, &flags);
+    vdso_data = data;
+    if (data) {
+        uint64_t sample = time_rdtsc();
+        time_hres_refresh_safety_locked(sample);
+        time_vdso_publish_locked();
+    }
+    kernel_spin_unlock_irqrestore(&clock_lock, flags);
+}
+
 /** @brief Apply real oscillator/phase discipline and return its current state. */
 int time_adjust(struct linux_timex *value, bool privileged)
 {
     uint64_t flags;
     kernel_spin_lock_irqsave(&clock_lock, &flags);
+    uint64_t sample = time_rdtsc();
+    time_hres_refresh_safety_locked(sample);
     struct linux_timespec now;
     time_clock_get_locked(LINUX_CLOCK_REALTIME, &now);
     int result = time_discipline_adjust(value, &now, privileged);
+    if (result >= 0) {
+        sample = time_rdtsc();
+        if (tsc_trusted) {
+            time_hres_settle_locked(sample);
+            time_hres_configure_locked(sample, time_discipline_peek_tick_ns());
+        }
+        time_hres_refresh_safety_locked(sample);
+        time_vdso_publish_locked();
+    }
     kernel_spin_unlock_irqrestore(&clock_lock, flags);
     return result;
 }
@@ -445,7 +910,7 @@ uint64_t time_uptime_us(void)
                 continue;
             }
             uint64_t before = ticks;
-            uint64_t anchor = tsc_anchor;
+            uint64_t anchor = uptime_tsc_anchor;
             uint64_t sample = time_rdtsc();
             uint32_t seq_after = tsc_anchor_seq;
             if (seq_before != seq_after) {
@@ -526,10 +991,18 @@ int time_set_wall_clock_ns(uint64_t unix_seconds, uint32_t nanoseconds)
     }
     uint64_t flags;
     kernel_spin_lock_irqsave(&clock_lock, &flags);
+    uint64_t sample = time_rdtsc();
+    time_hres_refresh_safety_locked(sample);
+    if (tsc_trusted) time_hres_settle_locked(sample);
     wall_unix_seconds = unix_seconds;
     wall_fraction_ns = nanoseconds;
     wall_clock_valid = 1;
+    hres_realtime.sec = (int64_t)unix_seconds;
+    hres_realtime.nsec = nanoseconds;
     time_discipline_clear();
+    if (tsc_trusted) time_hres_configure_locked(sample, time_discipline_peek_tick_ns());
+    time_hres_refresh_safety_locked(sample);
+    time_vdso_publish_locked();
     kernel_spin_unlock_irqrestore(&clock_lock, flags);
     console_info("[reliefnt] wall clock set %u-%u-%u %u:%u:%u\n",
                    info.year, info.month, info.day, info.hour,

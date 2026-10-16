@@ -15,6 +15,7 @@ struct linux_timex;
 /** @brief Apply/query the actual clock discipline with privilege checked by the caller. */
 int time_adjust(struct linux_timex *value, bool privileged);
 int time_clock_get(int32_t clock, struct linux_timespec *value);
+int time_clock_getres(int32_t clock, struct linux_timespec *value);
 
 /**
  * @brief Initialize the tick counter and read the RTC wall clock.
