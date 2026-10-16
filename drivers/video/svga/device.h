@@ -81,6 +81,7 @@ struct svga_device {
     uint32_t context_limit, surface_limit, gmr_limit, page_limit, pages;
     uint64_t surface_bytes, surface_limit_bytes;
     bool bound, fifo_ready, available, memory_ready, transitioning;
+    bool traces_enabled;
     bool gb_active;
     uint32_t mob_max_bytes;
     struct svga_mob otables[SVGA_OTABLE_DX9_MAX];
@@ -98,12 +99,20 @@ extern struct svga_device svga;
 
 /* Callers hold the shared device lock for every _locked helper. */
 uint64_t svga_lock(void);
+/** @brief Attempt the shared device lock once with IRQ state saved.
+ * @param flags Receives the saved IRQ state when the lock is acquired.
+ * @return True when acquired; false without holding the lock on contention.
+ */
+bool svga_try_lock_irqsave(uint64_t *flags);
 void svga_unlock(uint64_t flags);
 void svga_barrier(void);
 void svga_relax(void);
 void svga_bind(const struct svga_ops *ops, volatile uint32_t *fifo, uint32_t bytes);
 int svga_configure_locked(bool extended);
 int svga_fifo_packet_locked(uint32_t id, bool three_d, const struct svga_span *spans, uint32_t count);
+/** @brief Queue a FIFO packet without waiting for space; full returns SVGA_EBUSY. */
+int svga_fifo_packet_try_locked(uint32_t id, bool three_d,
+                                const struct svga_span *spans, uint32_t count);
 void svga_fifo_defer_notify_locked(void);
 void svga_fifo_flush_notify_locked(void);
 int svga_drain_locked(void);
@@ -140,7 +149,11 @@ int svga_gb_destroy_locked(struct svga_gb_resource *resource, uint32_t id, bool 
 void svga_platform_bind(uint16_t port, volatile uint32_t *fifo, uint32_t bytes);
 /** @brief Queue a 2D scanout update while the SVGA device lock is held. */
 int svga_update_locked(uint32_t x, uint32_t y, uint32_t width, uint32_t height);
+/** @brief Queue an UPDATE without waiting when FIFO space is unavailable. */
+int svga_update_try_locked(uint32_t x, uint32_t y, uint32_t width, uint32_t height);
 int svga_update(uint32_t x, uint32_t y, uint32_t width, uint32_t height);
+/** @brief Restore CAP_TRACES policy while the shared device lock is held. */
+bool svga_restore_traces_locked(void);
 int svga_mode_begin(uint64_t *flags);
 void svga_mode_end(uint64_t flags);
 uint32_t svga_read_register(uint32_t reg);

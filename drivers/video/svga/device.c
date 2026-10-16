@@ -8,6 +8,8 @@
 #include <reliefnt/console.h>
 static struct kernel_spinlock device_lock = KERNEL_SPINLOCK_INIT;
 static uint16_t io_port;
+#else
+static volatile uint32_t host_device_lock;
 #endif
 
 struct svga_device svga;
@@ -15,17 +17,45 @@ struct svga_device svga;
 uint64_t svga_lock(void)
 {
 #ifdef SVGA_HOST_TEST
-    return 0;
+    uint32_t expected;
+    do {
+        expected = 0;
+        if (__atomic_compare_exchange_n(&host_device_lock, &expected, 1, false,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            return 0;
+        }
+        svga_relax();
+    } while (true);
 #else
     uint64_t flags;
     kernel_spin_lock_irqsave(&device_lock, &flags);
     return flags;
 #endif
 }
+bool svga_try_lock_irqsave(uint64_t *flags)
+{
+    if (!flags) return false;
+#ifdef SVGA_HOST_TEST
+    uint32_t expected = 0;
+    *flags = 0;
+    return __atomic_compare_exchange_n(&host_device_lock, &expected, 1, false,
+                                       __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+#else
+    uint32_t expected = 0;
+    *flags = kernel_irq_save();
+    if (__atomic_compare_exchange_n(&device_lock.state, &expected, 1, false,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+        return true;
+    }
+    kernel_irq_restore(*flags);
+    return false;
+#endif
+}
 void svga_unlock(uint64_t flags)
 {
 #ifdef SVGA_HOST_TEST
     (void)flags;
+    __atomic_store_n(&host_device_lock, 0, __ATOMIC_RELEASE);
 #else
     kernel_spin_unlock_irqrestore(&device_lock, flags);
 #endif
@@ -65,6 +95,20 @@ void svga_bind(const struct svga_ops *ops, volatile uint32_t *fifo, uint32_t byt
     svga.fifo = fifo;
     svga.fifo_bytes = bytes;
     svga.bound = true;
+    svga.traces_enabled = false;
+}
+
+/** @brief Restore the host's trace-based guest-framebuffer update policy. */
+bool svga_restore_traces_locked(void)
+{
+    if (!svga.bound) {
+        svga.traces_enabled = false;
+        return false;
+    }
+    svga.caps = svga.ops.read(SVGA_REG_CAPABILITIES);
+    svga.traces_enabled = (svga.caps & SVGA_CAP_TRACES) != 0;
+    if (svga.traces_enabled) svga.ops.write(SVGA_REG_TRACES, 1);
+    return svga.traces_enabled;
 }
 
 /* Record the original failure before a four-register 2D FIFO replaces it. */
@@ -87,6 +131,7 @@ int svga_configure_locked(bool extended)
         return SVGA_ENODEV;
     }
     svga.ops.write(SVGA_REG_CONFIG_DONE, 0);
+    svga.traces_enabled = false;
     svga.fifo_ready = false;
     svga.available = false;
     svga.caps = svga.ops.read(SVGA_REG_CAPABILITIES);
@@ -125,6 +170,7 @@ int svga_configure_locked(bool extended)
     if (!svga.generation) ++svga.generation;
     svga.next_fence = 1;
     svga.issued_fence = 0;
+    (void)svga_restore_traces_locked();
     if (extended) (void)svga_negotiate_locked();
     return 0;
 }
@@ -365,6 +411,7 @@ int svga3d_shutdown(void)
     int ret = svga_shutdown_locked();
     if (!ret && svga.bound) {
         svga.ops.write(SVGA_REG_CONFIG_DONE, 0);
+        svga.traces_enabled = false;
         svga.fifo_ready = false;
         if (svga_configure_locked(false) != 0) ret = SVGA_EIO;
     }
@@ -382,6 +429,14 @@ int svga_update_locked(uint32_t x, uint32_t y, uint32_t width, uint32_t height)
     return svga_fifo_packet_locked(SVGA_CMD_UPDATE, false, &span, 1);
 }
 
+/** @brief Publish a scanout UPDATE without waiting when the FIFO is full. */
+int svga_update_try_locked(uint32_t x, uint32_t y, uint32_t width, uint32_t height)
+{
+    uint32_t data[] = {x, y, width, height};
+    struct svga_span span = {data, sizeof(data)};
+    return svga_fifo_packet_try_locked(SVGA_CMD_UPDATE, false, &span, 1);
+}
+
 int svga_update(uint32_t x, uint32_t y, uint32_t width, uint32_t height)
 {
     uint64_t flags = svga_lock();
@@ -395,6 +450,7 @@ int svga_mode_begin(uint64_t *flags)
     int ret = svga_shutdown_locked();
     if (!ret && svga.bound) {
         svga.ops.write(SVGA_REG_CONFIG_DONE, 0);
+        svga.traces_enabled = false;
         svga.fifo_ready = false;
         svga.available = false;
     }

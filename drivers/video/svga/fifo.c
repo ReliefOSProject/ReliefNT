@@ -48,8 +48,10 @@ void svga_fifo_flush_notify_locked(void)
     fifo_wake_locked();
 }
 
-int svga_fifo_packet_locked(uint32_t id, bool three_d,
-                            const struct svga_span *spans, uint32_t count)
+/** @brief Publish one packet, optionally returning immediately on backpressure. */
+static int fifo_packet_locked(uint32_t id, bool three_d,
+                              const struct svga_span *spans, uint32_t count,
+                              bool wait_for_space)
 {
     uint32_t bytes = three_d ? 8 : 4, next = 0, stop = 0;
     if (count && !spans) return SVGA_EINVAL;
@@ -66,6 +68,11 @@ int svga_fifo_packet_locked(uint32_t id, bool three_d,
         if (ret) return ret;
         uint32_t free_bytes = next >= stop ? svga.fifo_bytes - next + stop - svga.min : stop - next;
         if (bytes < free_bytes) break;
+        if (!wait_for_space) {
+            fifo_wake_locked();
+            (void)svga.ops.read(SVGA_REG_BUSY);
+            return SVGA_EBUSY;
+        }
         if (poll == SVGA_POLL_LIMIT) return SVGA_ETIMEDOUT;
         if (!poll) fifo_wake_locked();
         (void)svga.ops.read(SVGA_REG_BUSY);
@@ -84,6 +91,18 @@ int svga_fifo_packet_locked(uint32_t id, bool three_d,
     if (reserve) svga.fifo[SVGA_FIFO_RESERVED] = 0;
     if (!svga.fifo_notify_deferred) fifo_wake_locked();
     return 0;
+}
+
+int svga_fifo_packet_locked(uint32_t id, bool three_d,
+                            const struct svga_span *spans, uint32_t count)
+{
+    return fifo_packet_locked(id, three_d, spans, count, true);
+}
+
+int svga_fifo_packet_try_locked(uint32_t id, bool three_d,
+                                const struct svga_span *spans, uint32_t count)
+{
+    return fifo_packet_locked(id, three_d, spans, count, false);
 }
 
 int svga_command_locked(uint32_t id, const void *data, uint32_t bytes)

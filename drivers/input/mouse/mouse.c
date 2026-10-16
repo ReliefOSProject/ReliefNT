@@ -495,11 +495,14 @@ static void mouse_hardware_poll(void)
         if ((status & 0x01) == 0) {
             break;
         }
+        /* IRQ12 may run while the 8042 output buffer holds a keyboard byte.
+         * Leave that byte for IRQ1, which owns ACK handling and scan-code
+         * state; consuming it here would silently lose key releases. */
+        if ((status & 0x20) == 0) {
+            break;
+        }
         uint8_t data = x86_64_inb(PS2_DATA);
         last_data = data;
-        if ((status & 0x20) == 0) {
-            continue;
-        }
         saw_aux_data = 1;
         if (vmware_absolute) {
             continue;

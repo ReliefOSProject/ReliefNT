@@ -5,6 +5,14 @@
 #include <reliefnt/sched.h>
 #include <reliefnt/wait.h>
 
+/* Poll/select/epoll share one conservative readiness queue. The generation
+ * closes the check-to-sleep race for publishers that cannot share the syscall
+ * execution transaction (notably input IRQ publication). */
+static struct kernel_wait_queue poll_waiters = {
+    .lock = KERNEL_SPINLOCK_INIT,
+};
+static uint64_t poll_readiness_generation;
+
 void kernel_wait_queue_init(struct kernel_wait_queue *queue)
 {
     if (!queue) {
@@ -62,7 +70,7 @@ void kernel_wait_queue_remove(struct kernel_wait_queue *queue, struct task *task
     kernel_spin_unlock_irqrestore(&queue->lock, flags);
 }
 
-uint32_t kernel_wait_queue_wake_one(struct kernel_wait_queue *queue)
+static uint32_t kernel_wait_queue_wake_one_raw(struct kernel_wait_queue *queue)
 {
     uint64_t flags;
     struct task *task = NULL;
@@ -86,13 +94,122 @@ uint32_t kernel_wait_queue_wake_one(struct kernel_wait_queue *queue)
     return 0;
 }
 
-uint32_t kernel_wait_queue_wake_all(struct kernel_wait_queue *queue)
+static uint32_t kernel_wait_queue_wake_all_raw(struct kernel_wait_queue *queue)
 {
     uint32_t count = 0;
-    while (kernel_wait_queue_wake_one(queue)) {
+    while (kernel_wait_queue_wake_one_raw(queue)) {
         ++count;
     }
     return count;
+}
+
+uint32_t kernel_wait_queue_wake_one(struct kernel_wait_queue *queue)
+{
+    return kernel_wait_queue_wake_one_raw(queue);
+}
+
+uint32_t kernel_wait_queue_wake_all(struct kernel_wait_queue *queue)
+{
+    return kernel_wait_queue_wake_all_raw(queue);
+}
+
+uint64_t kernel_poll_readiness_generation(void)
+{
+    return __atomic_load_n(&poll_readiness_generation, __ATOMIC_ACQUIRE);
+}
+
+void kernel_poll_readiness_notify(void)
+{
+    __atomic_add_fetch(&poll_readiness_generation, 1, __ATOMIC_SEQ_CST);
+    /* Keep each task linked until sched_wake_interruptible() has finished.
+     * The queue lock pins its task storage against exit cleanup, which also
+     * removes waiting_queue under this lock. Unlike sched_mark_ready(), this
+     * wake must leave TASK_STOPPED tasks stopped. Holding the lock across the
+     * bounded (64-task) batch prevents a busy publisher from repeatedly
+     * waking pollers that register after this generation change. */
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&poll_waiters.lock, &flags);
+    uint32_t count = poll_waiters.count;
+    while (count-- && poll_waiters.count) {
+        struct task *task = poll_waiters.waiters[0];
+        sched_wake_interruptible(task);
+        for (uint32_t i = 1; i < poll_waiters.count; ++i)
+            poll_waiters.waiters[i - 1] = poll_waiters.waiters[i];
+        poll_waiters.waiters[--poll_waiters.count] = NULL;
+        if (task->waiting_queue == &poll_waiters) task->waiting_queue = NULL;
+    }
+    kernel_spin_unlock_irqrestore(&poll_waiters.lock, flags);
+}
+
+int kernel_poll_wait_current(uint64_t generation, uint64_t wake_tick)
+{
+    struct task *task = sched_current_task();
+    uint64_t flags;
+    uint32_t i;
+    bool found = false;
+
+    if (!task || !task->pid || task->state == TASK_EXITED) return -1;
+    kernel_spin_lock_irqsave(&poll_waiters.lock, &flags);
+    if (__atomic_load_n(&poll_readiness_generation, __ATOMIC_ACQUIRE) != generation) {
+        kernel_spin_unlock_irqrestore(&poll_waiters.lock, flags);
+        return 0;
+    }
+    if (task->waiting_queue && task->waiting_queue != &poll_waiters) {
+        kernel_spin_unlock_irqrestore(&poll_waiters.lock, flags);
+        return -1;
+    }
+    for (i = 0; i < poll_waiters.count; ++i) {
+        if (poll_waiters.waiters[i] == task) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        if (poll_waiters.count >= KERNEL_WAIT_QUEUE_MAX) {
+            kernel_spin_unlock_irqrestore(&poll_waiters.lock, flags);
+            return -1;
+        }
+        poll_waiters.waiters[poll_waiters.count++] = task;
+        task->waiting_queue = &poll_waiters;
+    }
+    /* Holding poll_waiters.lock across the state transition prevents a
+     * publisher that increments the generation after the equality check
+     * from emptying the queue until the task is visibly blocked. */
+    sched_sleep_current_until(wake_tick);
+    kernel_spin_unlock_irqrestore(&poll_waiters.lock, flags);
+    return 1;
+}
+
+void kernel_poll_wait_remove(struct task *task)
+{
+    uint64_t flags;
+    if (!task) return;
+    kernel_spin_lock_irqsave(&poll_waiters.lock, &flags);
+    for (uint32_t i = 0; i < poll_waiters.count; ++i) {
+        if (poll_waiters.waiters[i] != task) continue;
+        for (uint32_t j = i + 1; j < poll_waiters.count; ++j)
+            poll_waiters.waiters[j - 1] = poll_waiters.waiters[j];
+        poll_waiters.waiters[--poll_waiters.count] = NULL;
+        if (task->waiting_queue == &poll_waiters) task->waiting_queue = NULL;
+        break;
+    }
+    kernel_spin_unlock_irqrestore(&poll_waiters.lock, flags);
+}
+
+bool kernel_poll_wait_registered(const struct task *task)
+{
+    uint64_t flags;
+    bool found = false;
+    if (!task) return false;
+    kernel_spin_lock_irqsave(&poll_waiters.lock, &flags);
+    for (uint32_t i = 0; i < poll_waiters.count; ++i) {
+        if (poll_waiters.waiters[i] == task) {
+            found = true;
+            break;
+        }
+    }
+    kernel_spin_unlock_irqrestore(&poll_waiters.lock, flags);
+    return found;
 }
 
 void kernel_wait_queue_block_current(struct kernel_wait_queue *queue)

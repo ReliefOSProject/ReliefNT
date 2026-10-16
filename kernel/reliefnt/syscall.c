@@ -3531,14 +3531,15 @@ static int stat_for_fd(int fd, struct task *task, struct reliefos_stat *st)
 }
 
 /**
- * @brief Park the caller for one scheduler tick and report a retryable EAGAIN.
+ * @brief Park the caller until readiness, the one-tick backstop, or timeout.
  *
- * The int 0x80 epilogue rewinds the instruction, so the poll rescans its
- * descriptors after every tick until an event arrives or the deadline set in
- * poll_deadline_ticks expires. This gives poll its POSIX timeout without a
- * dedicated wait queue.
+ * Pollable sources publish a generation change and wake this shared queue.
+ * The generation comparison is atomic with queue registration, closing the
+ * check-to-sleep race. The tick deadline remains a conservative backstop for
+ * readiness sources that do not publish notifications.
  */
-static int64_t syscall_poll_park(struct task *task, int64_t timeout_ms)
+static int64_t syscall_poll_park(struct task *task, int64_t timeout_ms,
+                                 uint64_t generation, bool can_wait_for_readiness)
 {
     uint64_t now = time_ticks();
     if (!task->poll_deadline_ticks) {
@@ -3549,18 +3550,29 @@ static int64_t syscall_poll_park(struct task *task, int64_t timeout_ms)
         task->poll_deadline_ticks = 0;
         return 0;
     }
+    if (can_wait_for_readiness) {
+        int parked = kernel_poll_wait_current(generation, now + 1u);
+        if (parked >= 0) {
+            /* The syscall epilogue rewinds int $0x80 for this sentinel without
+             * sleeping again. On a generation mismatch it retries immediately;
+             * on success the publisher or one-tick deadline makes it runnable. */
+            return KERNEL_SYSCALL_BLOCKED;
+        }
+    }
     return -RELIEFOS_EAGAIN;
 }
 
 static int64_t syscall_poll_impl(struct task *task, struct pollfd *fds,
-                                 uint32_t nfds, int64_t timeout_ms)
+                                 uint32_t nfds, int64_t timeout_ms,
+                                 uint64_t generation)
 {
     uint64_t ready = 0;
     timeout_ms = (int32_t)timeout_ms;
 
     if (!nfds) {
         /* poll(NULL, 0, timeout) is the classic millisecond sleep idiom. */
-        if (timeout_ms != 0) return syscall_poll_park(task, timeout_ms);
+        if (timeout_ms != 0)
+            return syscall_poll_park(task, timeout_ms, generation, false);
         task->poll_deadline_ticks = 0;
         return 0;
     }
@@ -3691,20 +3703,23 @@ static int64_t syscall_poll_impl(struct task *task, struct pollfd *fds,
         task->poll_deadline_ticks = 0;
         return 0;
     }
-    return syscall_poll_park(task, timeout_ms);
+    return syscall_poll_park(task, timeout_ms, generation, true);
 }
 
 int64_t syscall_poll(uint64_t fds_ptr, uint64_t count, int64_t timeout_ms)
 {
     struct task *task = sched_current_task();
     uint32_t nfds = (uint32_t)count;
+    kernel_poll_wait_remove(task);
     if (!task || nfds > sched_task_limits(task)->nofile.rlim_cur) {
         return -RELIEFOS_EINVAL;
     }
     if (nfds && !user_range_writable(fds_ptr, (uint64_t)nfds * sizeof(struct pollfd))) {
         return -RELIEFOS_EFAULT;
     }
-    return syscall_poll_impl(task, (struct pollfd *)(uintptr_t)fds_ptr, nfds, timeout_ms);
+    uint64_t generation = kernel_poll_readiness_generation();
+    return syscall_poll_impl(task, (struct pollfd *)(uintptr_t)fds_ptr, nfds,
+                             timeout_ms, generation);
 }
 
 static uint32_t epoll_to_poll(uint32_t events)
@@ -3815,6 +3830,7 @@ static int64_t syscall_epoll_ctl(uint64_t epfd_arg, uint64_t op_arg,
                 .active = 1,
             };
             ++epoll->entries;
+            kernel_poll_readiness_notify();
             return 0;
         }
         return -RELIEFOS_ENOSPC;
@@ -3824,6 +3840,7 @@ static int64_t syscall_epoll_ctl(uint64_t epfd_arg, uint64_t op_arg,
         epoll->item[found].events = event.events;
         epoll->item[found].data = event.data;
         epoll->item[found].ready = 0;
+        kernel_poll_readiness_notify();
         return 0;
     }
     if (op == EPOLL_CTL_DEL) {
@@ -3848,6 +3865,7 @@ static int64_t syscall_epoll_wait_common(struct task *task, struct task_epoll *e
     if (!user_range_writable(events_ptr, (uint64_t)maxevents * sizeof(struct epoll_event)))
         return -RELIEFOS_EFAULT;
     if (timeout_ms < -1) return -RELIEFOS_EINVAL;
+    uint64_t poll_generation = kernel_poll_readiness_generation();
     for (uint32_t i = 0; i < TASK_EPOLL_MAX_ENTRIES && written < maxevents; ++i) {
         struct task_epoll_entry *entry = &epoll->item[i];
         struct pollfd pollfd;
@@ -3856,7 +3874,7 @@ static int64_t syscall_epoll_wait_common(struct task *task, struct task_epoll *e
         uint64_t deadline = task->poll_deadline_ticks;
         if (!entry->active || !entry->events) continue;
         pollfd = (struct pollfd){.fd = entry->fd, .events = (int16_t)epoll_to_poll(entry->events)};
-        (void)syscall_poll_impl(task, &pollfd, 1, 0);
+        (void)syscall_poll_impl(task, &pollfd, 1, 0, poll_generation);
         /* poll(..., 0) is only a readiness probe here. Its zero-timeout
          * cleanup must not erase epoll_wait's blocking deadline. */
         if (timeout_ms != 0 && deadline)
@@ -3901,7 +3919,7 @@ static int64_t syscall_epoll_wait_common(struct task *task, struct task_epoll *e
         task->poll_deadline_ticks = 0;
         return 0;
     }
-    return syscall_poll_park(task, timeout_ms);
+    return syscall_poll_park(task, timeout_ms, poll_generation, epoll->entries != 0);
 }
 
 static int64_t syscall_epoll_wait(uint64_t epfd_arg, uint64_t events_ptr,
@@ -3909,6 +3927,7 @@ static int64_t syscall_epoll_wait(uint64_t epfd_arg, uint64_t events_ptr,
 {
     struct task *task = sched_current_task();
     struct task_epoll *epoll;
+    kernel_poll_wait_remove(task);
     if (!task || epfd_arg > INT32_MAX || maxevents_arg > UINT32_MAX)
         return -RELIEFOS_EBADF;
     epoll = task_epoll_for_fd(task, (int)epfd_arg);
@@ -4023,6 +4042,7 @@ static int64_t syscall_select_common(uint64_t nfds_arg, uint64_t read_ptr,
     int64_t timeout_ms = -1;
     int64_t result;
 
+    kernel_poll_wait_remove(task);
     if (!task || nfds > LINUX_SELECT_MAX_FDS) return -RELIEFOS_EINVAL;
     bytes = ((nfds + 63) / 64) * sizeof(uint64_t);
     if (bytes) {
@@ -4086,7 +4106,8 @@ static int64_t syscall_select_common(uint64_t nfds_arg, uint64_t read_ptr,
             fd_map[at++] = (int)fd;
         }
     }
-    result = syscall_poll_impl(task, pollfds, selected, timeout_ms);
+    uint64_t generation = kernel_poll_readiness_generation();
+    result = syscall_poll_impl(task, pollfds, selected, timeout_ms, generation);
     if (result < 0) goto select_out;
     if (read_ptr && bytes) __builtin_memset((void *)(uintptr_t)read_ptr, 0, bytes);
     if (write_ptr && bytes) __builtin_memset((void *)(uintptr_t)write_ptr, 0, bytes);
@@ -4938,6 +4959,7 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
             if (value == UINT64_MAX) return -RELIEFOS_EINVAL;
             if (UINT64_MAX - 1ULL - file->aux < value) return -RELIEFOS_EAGAIN;
             file->aux += value;
+            kernel_poll_readiness_notify();
             return sizeof(uint64_t);
         }
         if (file->flags & TASK_FILE_FLAG_DEV_SHM) {
@@ -5050,6 +5072,7 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
             value = file->aux2 ? 1 : file->aux;
             file->aux -= value;
             *(uint64_t *)(uintptr_t)a1 = value;
+            kernel_poll_readiness_notify();
             return sizeof(uint64_t);
         }
         if (file->flags & TASK_FILE_FLAG_TIMERFD) {

@@ -726,7 +726,7 @@ retry:
              * whole scheduler round (fair_sync O(CPUs+tasks) + pick + bookkeeping)
              * that would otherwise run on every syscall return. Affinity can
              * change in the syscall without setting the reschedule hint. */
-            if (!live_fpu_saved && !sched_need_resched &&
+            if (!live_fpu_saved && !sched_current_cpu_needs_resched() &&
                 current->kind == TASK_KIND_USER &&
                 (current->state == TASK_RUNNING || current->state == TASK_READY) &&
                 (!current->affinity_mask ||

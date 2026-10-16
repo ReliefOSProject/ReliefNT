@@ -33,9 +33,9 @@
  * because wait queues and interrupt paths may retain struct task pointers. */
 static struct task **tasks;
 static uint32_t task_count;
-/* Set when a reschedule is warranted (tick, wakeup); a returning task may skip
- * the full scheduler round while this is clear. Cleared by sched_select_next_user. */
-volatile int sched_need_resched;
+/* A returning task may skip the full scheduler round only when its own CPU
+ * has no pending tick or runnable-task notification. */
+static volatile uint32_t sched_resched_pending[SMP_MAX_CPUS];
 static uint32_t task_capacity;
 static uint32_t next_pid = 1;
 static uint32_t current_pid[SMP_MAX_CPUS];
@@ -84,6 +84,39 @@ static uint32_t scheduler_cpu_index(void)
 {
     uint32_t cpu = smp_current_cpu();
     return cpu < SMP_MAX_CPUS ? cpu : 0;
+}
+
+static void sched_request_reschedule_cpu(uint32_t cpu)
+{
+    if (cpu < SMP_MAX_CPUS)
+        __atomic_store_n(&sched_resched_pending[cpu], 1, __ATOMIC_RELEASE);
+}
+
+/* Waking a task can make it eligible on any CPU allowed by its affinity. Mark
+ * every online CPU here so a remote wake cannot be hidden by another CPU's
+ * scheduler round. Wake callers are serialized with scheduling either by
+ * scheduler_lock or by the kernel execution transaction. */
+static void sched_request_reschedule_all_online(void)
+{
+    uint32_t count = smp_cpu_count();
+    uint32_t current = scheduler_cpu_index();
+    if (count > SMP_MAX_CPUS) count = SMP_MAX_CPUS;
+    for (uint32_t cpu = 0; cpu < count; ++cpu)
+        if (cpu == current || smp_cpu_online(cpu)) sched_request_reschedule_cpu(cpu);
+    if (current >= count) sched_request_reschedule_cpu(current);
+}
+
+/* This helper deliberately does not take scheduler_lock: callers must have
+ * already serialized their runnable-state transition (or hold that lock). */
+void sched_notify_runnable(void)
+{
+    sched_request_reschedule_all_online();
+}
+
+bool sched_current_cpu_needs_resched(void)
+{
+    return __atomic_load_n(&sched_resched_pending[scheduler_cpu_index()],
+                           __ATOMIC_ACQUIRE) != 0;
 }
 
 static uint64_t user_task_count_locked(uint32_t uid)
@@ -489,7 +522,11 @@ void sched_init(void)
     task_count = 0;
     task_capacity = 0;
     next_pid = 1;
-    for (uint32_t i = 0; i < SMP_MAX_CPUS; ++i) { current_pid[i] = 0; current_task[i] = NULL; }
+    for (uint32_t i = 0; i < SMP_MAX_CPUS; ++i) {
+        current_pid[i] = 0;
+        current_task[i] = NULL;
+        __atomic_store_n(&sched_resched_pending[i], 0, __ATOMIC_RELAXED);
+    }
     next_session_id = 1;
     scheduler_ticks = 0;
     for (unsigned i = 0; i < 3; ++i) scheduler_loads[i] = 0;
@@ -676,6 +713,7 @@ uint32_t sched_create_kernel_task(const char *name, uint64_t entry)
     task->pty_id = 0;
     task_clear_identity(task);
     task_copy_cwd(task, "/");
+    sched_request_reschedule_all_online();
     console_debug("[reliefnt] task pid=%u name=%s entry=0x%llx\n",
                    task->pid, task->name, (unsigned long long)task->entry);
     kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
@@ -854,6 +892,7 @@ static void vfork_child_done_locked(struct task *child)
         parent->wake_tick = 0;
         parent->wait_window_id = 0;
         parent->state = TASK_READY;
+        sched_request_reschedule_all_online();
     }
 }
 
@@ -1159,6 +1198,7 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
         parent->state = TASK_BLOCKED;
     }
     child->state = TASK_READY;
+    sched_request_reschedule_all_online();
     kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
     return (int64_t)child_pid;
 
@@ -1339,6 +1379,7 @@ void sched_set_running(uint32_t pid)
 {
     uint64_t flags;
     uint32_t cpu = scheduler_cpu_index();
+    bool made_ready = false;
     kernel_spin_lock_irqsave(&scheduler_lock, &flags);
     struct task *selected = NULL;
     for (uint32_t i = 0; i < task_count; ++i) {
@@ -1366,6 +1407,7 @@ void sched_set_running(uint32_t pid)
         } else if (tasks[i]->state == TASK_RUNNING && tasks[i]->running_cpu == cpu) {
             tasks[i]->state = TASK_READY;
             tasks[i]->running_cpu = SCHED_CPU_NONE;
+            made_ready = true;
         }
     }
     if (selected->fair.queued && selected->fair.cpu != cpu)
@@ -1373,6 +1415,7 @@ void sched_set_running(uint32_t pid)
     fair_sync();
     fair_running[cpu] = selected;
     fair_started[cpu] = fair_now();
+    if (made_ready) sched_request_reschedule_all_online();
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
 }
 
@@ -1691,6 +1734,7 @@ void sched_exec_replace_mm(struct task *task, const struct address_space *replac
 void sched_signalfd_reconfigure(struct task *updater)
 {
     uint64_t flags;
+    bool woke = false;
     kernel_spin_lock_irqsave(&scheduler_lock, &flags);
     for (uint32_t i = 0; i < task_count; ++i) {
         struct task *task = tasks[i];
@@ -1700,13 +1744,16 @@ void sched_signalfd_reconfigure(struct task *updater)
                 task->signalfd_wait_mask = task->syscall_file->aux;
             task->wake_tick = 0;
             task->state = TASK_READY;
+            woke = true;
         }
     }
+    if (woke) sched_request_reschedule_all_online();
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
 }
 
 static void sched_wake_process_signal(uint32_t tgid, uint64_t bit)
 {
+    bool woke = false;
     for (uint32_t i = 0; i < task_count; ++i) {
         struct task *task = tasks[i];
         if (sched_task_tgid(task) == tgid && task->state == TASK_BLOCKED &&
@@ -1715,8 +1762,10 @@ static void sched_wake_process_signal(uint32_t tgid, uint64_t bit)
             task->wake_tick = 0;
             task->wait_window_id = 0;
             task->state = TASK_READY;
+            woke = true;
         }
     }
+    if (woke) sched_request_reschedule_all_online();
 }
 
 /* Publish one group-exit notification, after the last user frame retires.
@@ -1988,6 +2037,7 @@ static void sched_posix_timer_expire(void)
                             (!target->vfork_child || kernel_signal_fatal_pending(target))) {
                             target->wake_tick = 0;
                             target->state = TASK_READY;
+                            sched_request_reschedule_all_online();
                         }
                     }
                 } else {
@@ -2016,11 +2066,12 @@ static void sched_posix_timer_expire(void)
 void sched_on_tick(void)
 {
     struct task *current;
+    bool woke = false;
     uint64_t flags;
     kernel_spin_lock_irqsave(&scheduler_lock, &flags);
-    /* Bound any same-task fast-path to one tick: a returning task may skip the
-     * scheduler round while need_resched is clear, so re-arm it every tick. */
-    sched_need_resched = 1;
+    /* Each CPU owns its reschedule request; another CPU's scheduler round must
+     * not consume this tick's preemption decision. */
+    sched_request_reschedule_cpu(scheduler_cpu_index());
     ++scheduler_ticks;
     if (scheduler_ticks % (5 * RELIEFNT_TICK_HZ) == 0) {
         uint32_t active = 0;
@@ -2046,6 +2097,7 @@ void sched_on_tick(void)
             tasks[i]->wake_tick = 0;
             tasks[i]->wait_window_id = 0;
             tasks[i]->state = TASK_READY;
+            woke = true;
             /* A blocked task may still be reserved by the CPU that is
              * finishing its syscall.  Preserve that reservation; the owner
              * will either reclaim it or release it when selecting another
@@ -2054,6 +2106,7 @@ void sched_on_tick(void)
     }
     sched_alarm_expire();
     sched_posix_timer_expire();
+    if (woke) sched_request_reschedule_all_online();
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
 }
 
@@ -2068,6 +2121,7 @@ void sched_on_cpu_tick(void)
     uint64_t flags;
 
     kernel_spin_lock_irqsave(&scheduler_lock, &flags);
+    sched_request_reschedule_cpu(cpu);
     current = sched_find(current_pid[cpu]);
     if (current && current->state == TASK_RUNNING && current->running_cpu == cpu) {
         ++scheduler_busy_ticks;
@@ -2109,6 +2163,7 @@ void sched_yield_current(void)
     fair_account_cpu(cpu, fair_now());
     struct task *task = sched_current_task();
     if (task && task->fair.queued) eevdf_yield(&task->fair);
+    sched_request_reschedule_cpu(cpu);
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
 }
 
@@ -2510,7 +2565,7 @@ struct task *sched_select_next_user(void)
         fair_running[cpu] = best;
         fair_started[cpu] = fair_now();
     }
-    sched_need_resched = 0;
+    __atomic_store_n(&sched_resched_pending[cpu], 0, __ATOMIC_RELEASE);
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
     return best;
 }
@@ -2604,6 +2659,7 @@ void sched_wake_interruptible(struct task *task)
         task->wake_tick = 0;
         task->wait_window_id = 0;
         task->state = TASK_READY;
+        sched_request_reschedule_all_online();
     }
     /* running_cpu prevents another CPU from claiming a not-yet-retired frame. */
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
@@ -2634,7 +2690,7 @@ void sched_mark_ready(uint32_t pid)
     /* A newly runnable task must be considered for scheduling on the next
      * return-to-user boundary; the syscall fast-path skips the scheduler round
      * only while this is clear (plus the per-tick re-evaluation below). */
-    sched_need_resched = 1;
+    sched_request_reschedule_all_online();
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
 }
 
@@ -2723,6 +2779,7 @@ void sched_signal_job_control(uint32_t tgid, int signal_number)
                 continue;
             }
             task->state = task->vfork_child ? TASK_BLOCKED : TASK_READY;
+            if (task->state == TASK_READY) sched_request_reschedule_all_online();
             task->stop_signal = 0;
             task->child_event = TASK_CHILD_EVENT_CONTINUED;
         } else {

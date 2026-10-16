@@ -185,6 +185,7 @@ int kernel_signal_queue_task_info(struct task *task, int signal_number,
     if (task->signalfd_waiting && task->state == TASK_BLOCKED && !sched_vfork_waiting(task)) {
         task->wake_tick = 0;
         task->state = TASK_READY;
+        sched_notify_runnable();
     }
     if (signal_number != 9 && signal_number != 19 &&
         (task->blocked_signals & bit) && !(task->sigwait_mask & bit)) {
@@ -201,6 +202,7 @@ int kernel_signal_queue_task_info(struct task *task, int signal_number,
             task->wake_tick = 0;
             task->wait_window_id = 0;
             task->state = TASK_READY;
+            sched_notify_runnable();
         }
         return 0;
     }

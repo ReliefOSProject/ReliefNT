@@ -331,6 +331,7 @@ static void unix_wake_peer(struct unix_socket *socket)
     if (!peer) return;
     (void)kernel_wait_queue_wake_all(&peer->wait_rx);
     (void)kernel_wait_queue_wake_all(&peer->wait_tx);
+    kernel_poll_readiness_notify();
 }
 
 static void unix_release_handle(uint32_t handle)
@@ -372,6 +373,7 @@ static void unix_release_handle(uint32_t handle)
     (void)kernel_wait_queue_wake_all(&socket->wait_tx);
     (void)kernel_wait_queue_wake_all(&socket->wait_accept);
     (void)kernel_wait_queue_wake_all(&socket->wait_connect);
+    kernel_poll_readiness_notify();
     (void)kernel_object_remove(kernel_objects(), handle, KERNEL_OBJECT_SOCKET, NULL);
     for (uint32_t i = 0; i < UNIX_SOCKET_MAX; ++i) {
         if (unix_sockets[i] == socket) unix_sockets[i] = NULL;
@@ -538,6 +540,7 @@ static int unix_read_data(struct task_file *file, void *buffer, uint32_t length,
             ++socket->rx_read;
             kernel_free(p);
             (void)kernel_wait_queue_wake_all(&socket->wait_tx);
+            kernel_poll_readiness_notify();
         }
         return result;
     }
@@ -716,6 +719,7 @@ static int unix_send_packet(struct task_file *file, struct unix_socket *peer,
     peer->packet_bytes += length;
     ++peer->rx_written;
     (void)kernel_wait_queue_wake_all(&peer->wait_rx);
+    kernel_poll_readiness_notify();
     return (int)length;
 }
 
@@ -765,6 +769,7 @@ static int unix_write_data(struct task_file *file, const void *buffer, uint32_t 
     }
     peer->rx_written += count;
     (void)kernel_wait_queue_wake_all(&peer->wait_rx);
+    kernel_poll_readiness_notify();
     return (int)count;
 }
 
@@ -1591,6 +1596,7 @@ static int64_t unix_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
         socket->backlog = (uint32_t)a1 >= UNIX_SOCKET_BACKLOG_MAX ? UNIX_SOCKET_BACKLOG_MAX - 1 : (uint32_t)a1;
         socket->state = UNIX_SOCKET_LISTEN;
         socket->credentials = (struct ucred){(int32_t)sched_task_tgid(task), task->euid, task->egid};
+        kernel_poll_readiness_notify();
         return 0;
     }
     if (number == __NR_connect) {
@@ -1601,6 +1607,7 @@ static int64_t unix_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
                 socket->peer_handle = 0;
                 socket->peer_path_len = 0;
                 socket->state = UNIX_SOCKET_OPEN;
+                kernel_poll_readiness_notify();
                 return 0;
             }
             struct unix_socket *peer;
@@ -1610,6 +1617,7 @@ static int64_t unix_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
             socket->peer_path_len = peer->path_len;
             for (unsigned i = 0; i < peer->path_len; ++i) socket->peer_path[i] = peer->path[i];
             socket->state = UNIX_SOCKET_CONNECTED;
+            kernel_poll_readiness_notify();
             return 0;
         }
         char path[109], resolved[RELIEFOS_FS_PATH_LEN];
@@ -1664,6 +1672,7 @@ static int64_t unix_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
         ++listener->rx_written;
         (void)kernel_wait_queue_wake_one(&listener->wait_accept);
         (void)kernel_wait_queue_wake_one(&listener->wait_connect);
+        kernel_poll_readiness_notify();
         return 0;
     }
     if (number == __NR_accept4) {
@@ -1698,6 +1707,7 @@ static int64_t unix_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
         accepted->unaccepted = 0;
         unix_release_handle(handle); /* drop the listener's pending reference */
         (void)kernel_wait_queue_wake_one(&socket->wait_connect);
+        kernel_poll_readiness_notify();
         return fd;
     }
     if (number == __NR_getsockname || number == __NR_getpeername) {

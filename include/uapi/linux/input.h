@@ -39,6 +39,7 @@ struct input_absinfo {
 #define EV_CNT (EV_MAX + 1)
 
 #define SYN_REPORT 0
+#define SYN_DROPPED 3
 
 /* The keyboard stream uses Linux input key codes, not the historical
  * ReliefOS GUI scan-code constants. */

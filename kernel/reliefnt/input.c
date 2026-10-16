@@ -8,12 +8,15 @@
 #include <reliefnt/pty.h>
 #include <reliefnt/storage.h>
 #include <reliefnt/time.h>
+#include <reliefnt/wait.h>
 #include <linux/input.h>
 
 #define INPUT_QUEUE_CAP 512U
 #define INPUT_EVDEV_QUEUE_CAP 1024U
 #define INPUT_EVDEV_DEVICES 2U
 #define INPUT_EVDEV_KEY_BYTES ((KEY_CNT + 7U) / 8U)
+#define INPUT_EVDEV_CURSOR_SYNC_REPORT (1ULL << 63)
+#define INPUT_EVDEV_CURSOR_SEQUENCE_MASK (~INPUT_EVDEV_CURSOR_SYNC_REPORT)
 
 struct input_evdev_record {
     uint64_t sequence;
@@ -28,6 +31,11 @@ static struct input_evdev_record evdev_queue[INPUT_EVDEV_QUEUE_CAP];
 static volatile uint32_t head;
 static volatile uint32_t tail;
 static uint64_t evdev_next_sequence;
+static uint64_t evdev_first_sequence;
+static uint32_t evdev_first_slot;
+static uint32_t evdev_next_slot;
+static uint32_t evdev_record_count;
+static uint64_t evdev_last_lost_sequence[INPUT_EVDEV_DEVICES];
 static uint8_t evdev_mouse_buttons;
 static int32_t evdev_mouse_x;
 static int32_t evdev_mouse_y;
@@ -121,9 +129,70 @@ void input_process_pending(void)
 
 static uint64_t evdev_oldest_sequence(void)
 {
-    return evdev_next_sequence > INPUT_EVDEV_QUEUE_CAP
-               ? evdev_next_sequence - INPUT_EVDEV_QUEUE_CAP
-               : 1U;
+    return evdev_record_count ? evdev_first_sequence : evdev_next_sequence;
+}
+
+/* Sequence IDs use the low 63 bits so the cursor's high bit can carry its
+ * pending-SYN_REPORT state. Zero is skipped, leaving it available for the
+ * existing uninitialized-cursor convention. */
+static uint64_t evdev_sequence_next(uint64_t sequence)
+{
+    return sequence == INPUT_EVDEV_CURSOR_SEQUENCE_MASK ? 1U : sequence + 1U;
+}
+
+static uint64_t evdev_sequence_distance(uint64_t from, uint64_t to)
+{
+    return to >= from ? to - from
+                      : INPUT_EVDEV_CURSOR_SEQUENCE_MASK - from + to;
+}
+
+static int evdev_sequence_before(uint64_t first, uint64_t second)
+{
+    return first != second &&
+           evdev_sequence_distance(first, second) <
+               (INPUT_EVDEV_CURSOR_SEQUENCE_MASK / 2U);
+}
+
+static int evdev_sequence_before_or_equal(uint64_t first, uint64_t second)
+{
+    return second != 0 && (first == second ||
+                           evdev_sequence_before(first, second));
+}
+
+static uint32_t evdev_slot_for_sequence(uint64_t sequence)
+{
+    uint64_t offset = evdev_sequence_distance(evdev_first_sequence, sequence);
+    return (evdev_first_slot + (uint32_t)(offset % INPUT_EVDEV_QUEUE_CAP)) %
+           INPUT_EVDEV_QUEUE_CAP;
+}
+
+/* The cursor is already stored per open file description in task_file.aux.
+ * Reserve its top bit to remember the second half of an overflow notification
+ * when a caller's buffer can hold SYN_DROPPED but not its following report. */
+static uint64_t evdev_cursor_sequence(uint64_t cursor)
+{
+    return cursor & INPUT_EVDEV_CURSOR_SEQUENCE_MASK;
+}
+
+static struct input_event evdev_synthetic_sync(uint16_t code)
+{
+    uint64_t microseconds = time_uptime_us();
+    return (struct input_event){
+        .time_sec = (int64_t)(microseconds / 1000000ULL),
+        .time_usec = (int64_t)(microseconds % 1000000ULL),
+        .type = EV_SYN,
+        .code = code,
+        .value = 0,
+    };
+}
+
+static int evdev_record_matches(const struct input_evdev_record *record,
+                                uint32_t device_kind, uint64_t grab_token,
+                                uint32_t number)
+{
+    return record->device_kind == device_kind &&
+           (!number || record->graphical_vt == number) &&
+           (!record->grab_token || record->grab_token == grab_token);
 }
 
 static uint32_t evdev_device_index(uint32_t device_kind)
@@ -155,7 +224,21 @@ static void evdev_publish(uint32_t device_kind, uint16_t type, uint16_t code,
     struct input_evdev_record *record;
     uint64_t microseconds = time_uptime_us();
 
-    record = &evdev_queue[evdev_next_sequence % INPUT_EVDEV_QUEUE_CAP];
+    record = &evdev_queue[evdev_next_slot];
+    if (evdev_record_count == INPUT_EVDEV_QUEUE_CAP) {
+        uint32_t lost_index = evdev_device_index(record->device_kind);
+        if (lost_index < INPUT_EVDEV_DEVICES) {
+            evdev_last_lost_sequence[lost_index] = record->sequence;
+        }
+        evdev_first_sequence = evdev_sequence_next(evdev_first_sequence);
+        evdev_first_slot = (evdev_first_slot + 1U) % INPUT_EVDEV_QUEUE_CAP;
+    } else {
+        if (!evdev_record_count) {
+            evdev_first_sequence = evdev_next_sequence;
+            evdev_first_slot = evdev_next_slot;
+        }
+        ++evdev_record_count;
+    }
     *record = (struct input_evdev_record){
         .sequence = evdev_next_sequence,
         .device_kind = device_kind,
@@ -170,7 +253,8 @@ static void evdev_publish(uint32_t device_kind, uint16_t type, uint16_t code,
         },
     };
     if (type == EV_KEY) evdev_set_key(code, value);
-    ++evdev_next_sequence;
+    evdev_next_sequence = evdev_sequence_next(evdev_next_sequence);
+    evdev_next_slot = (evdev_next_slot + 1U) % INPUT_EVDEV_QUEUE_CAP;
 }
 
 static uint16_t evdev_keycode(uint8_t keycode)
@@ -280,6 +364,12 @@ void input_init(void)
     head = 0;
     tail = 0;
     evdev_next_sequence = 1;
+    evdev_first_sequence = 1;
+    evdev_first_slot = 0;
+    evdev_next_slot = 0;
+    evdev_record_count = 0;
+    for (uint32_t i = 0; i < INPUT_EVDEV_DEVICES; ++i)
+        evdev_last_lost_sequence[i] = 0;
     input_graphical_vt = 0;
     pending_key_head = pending_key_tail = 0;
     evdev_mouse_buttons = 0;
@@ -328,6 +418,7 @@ void input_push_mouse(int32_t x, int32_t y, int32_t dx, int32_t dy, uint8_t butt
     (void)evdev_publish_mouse_buttons(buttons);
     evdev_publish(STORAGE_DEV_KIND_MOUSE, EV_SYN, SYN_REPORT, 0);
     kernel_spin_unlock_irqrestore(&input_lock, flags);
+    kernel_poll_readiness_notify();
 }
 
 void input_push_mouse_wheel(int32_t x, int32_t y, int32_t wheel, uint8_t buttons)
@@ -354,6 +445,7 @@ void input_push_mouse_wheel(int32_t x, int32_t y, int32_t wheel, uint8_t buttons
         evdev_publish(STORAGE_DEV_KIND_MOUSE, EV_SYN, SYN_REPORT, 0);
     }
     kernel_spin_unlock_irqrestore(&input_lock, flags);
+    if (published) kernel_poll_readiness_notify();
 }
 
 void input_push_key(uint8_t keycode, uint8_t pressed)
@@ -379,6 +471,7 @@ void input_push_key(uint8_t keycode, uint8_t pressed)
                   pressed ? (down ? 2 : 1) : 0);
     evdev_publish(STORAGE_DEV_KIND_KEYBOARD, EV_SYN, SYN_REPORT, 0);
     kernel_spin_unlock_irqrestore(&input_lock, flags);
+    kernel_poll_readiness_notify();
 }
 
 int input_pop(struct input_raw_event *event)
@@ -454,6 +547,9 @@ int input_evdev_read_vt(uint32_t device_kind, uint64_t *cursor,
     uint32_t capacity;
     uint32_t count = 0;
     uint64_t flags;
+    uint64_t sequence;
+    uint64_t oldest;
+    int report_pending;
     if (!cursor || !buffer || length < sizeof(*events) ||
         index >= INPUT_EVDEV_DEVICES) {
         return -22;
@@ -466,29 +562,53 @@ int input_evdev_read_vt(uint32_t device_kind, uint64_t *cursor,
         kernel_spin_unlock_irqrestore(&input_lock, flags);
         return -19; /* ENODEV */
     }
-    if (*cursor == 0 || *cursor < evdev_oldest_sequence()) {
-        *cursor = evdev_oldest_sequence();
+
+    sequence = evdev_cursor_sequence(*cursor);
+    report_pending = (*cursor & INPUT_EVDEV_CURSOR_SYNC_REPORT) != 0;
+    oldest = evdev_oldest_sequence();
+    if (sequence == 0) {
+        /* An uninitialized/fresh cursor starts at the oldest retained record
+         * without claiming it lost events before it existed. */
+        sequence = oldest;
+    } else {
+        /* Only a lost record from this device needs client resynchronization;
+         * other-device-only wraparound advances the cursor without false loss. */
+        if (!report_pending && evdev_sequence_before(sequence, oldest) &&
+            evdev_sequence_before_or_equal(
+                sequence, evdev_last_lost_sequence[index])) {
+            events[count++] = evdev_synthetic_sync(SYN_DROPPED);
+            report_pending = 1;
+        }
+        if (evdev_sequence_before(sequence, oldest)) sequence = oldest;
     }
-    while (*cursor < evdev_next_sequence && count < capacity) {
+    if (report_pending && count < capacity) {
+        events[count++] = evdev_synthetic_sync(SYN_REPORT);
+        report_pending = 0;
+        /* The synthetic report closes the loss episode at this point.
+         * Drop all retained backlog: it may start mid-frame and can disagree
+         * with EVIOCGKEY/EVIOCGABS state queried for recovery. Snapshot the
+         * tail while holding input_lock, then resume with future records. */
+        sequence = evdev_next_sequence;
+    }
+    while (sequence != evdev_next_sequence && count < capacity) {
+        uint64_t offset = evdev_sequence_distance(oldest, sequence);
+        if (offset >= evdev_record_count) break;
         const struct input_evdev_record *record =
-            &evdev_queue[*cursor % INPUT_EVDEV_QUEUE_CAP];
-        if (record->sequence != *cursor) {
+            &evdev_queue[evdev_slot_for_sequence(sequence)];
+        if (record->sequence != sequence) {
             /* The producer is locked out. Rewinding on a damaged record
              * would rescan it forever with interrupts disabled. */
-            ++(*cursor);
+            sequence = evdev_sequence_next(sequence);
             continue;
         }
-        ++(*cursor);
-        if (record->device_kind != device_kind ||
-            (number && record->graphical_vt != number)) {
-            continue;
-        }
+        sequence = evdev_sequence_next(sequence);
         /* Route at publication time: release must not expose grabbed events
          * to other clients that did not read/poll while the grab was held. */
-        if (!record->grab_token || record->grab_token == grab_token) {
+        if (evdev_record_matches(record, device_kind, grab_token, number)) {
             events[count++] = record->event;
         }
     }
+    *cursor = sequence | (report_pending ? INPUT_EVDEV_CURSOR_SYNC_REPORT : 0);
     kernel_spin_unlock_irqrestore(&input_lock, flags);
     return (int)(count * sizeof(*events));
 }
@@ -512,6 +632,9 @@ int input_evdev_available_vt(uint32_t device_kind, uint64_t cursor,
     uint32_t index = evdev_device_index(device_kind);
     uint64_t flags;
     int available = 0;
+    int report_pending;
+    uint64_t sequence;
+    uint64_t oldest;
     if (index >= INPUT_EVDEV_DEVICES) {
         return 0;
     }
@@ -520,19 +643,32 @@ int input_evdev_available_vt(uint32_t device_kind, uint64_t cursor,
         kernel_spin_unlock_irqrestore(&input_lock, flags);
         return 0;
     }
-    if (cursor == 0 || cursor < evdev_oldest_sequence()) {
-        cursor = evdev_oldest_sequence();
-    }
-    while (cursor < evdev_next_sequence) {
-        const struct input_evdev_record *record =
-            &evdev_queue[cursor % INPUT_EVDEV_QUEUE_CAP];
-        if (record->sequence == cursor && record->device_kind == device_kind &&
-            (!number || record->graphical_vt == number) &&
-            (!record->grab_token || record->grab_token == grab_token)) {
-            available = 1;
-            break;
+    sequence = evdev_cursor_sequence(cursor);
+    report_pending = (cursor & INPUT_EVDEV_CURSOR_SYNC_REPORT) != 0;
+    oldest = evdev_oldest_sequence();
+    if (report_pending) {
+        available = 1;
+    } else if (sequence != 0 && evdev_sequence_before(sequence, oldest) &&
+               evdev_sequence_before_or_equal(
+                   sequence, evdev_last_lost_sequence[index])) {
+        /* read() must emit a loss marker even if all surviving records are
+         * filtered out for this reader. */
+        available = 1;
+    } else {
+        if (sequence == 0 || evdev_sequence_before(sequence, oldest))
+            sequence = oldest;
+        while (sequence != evdev_next_sequence) {
+            uint64_t offset = evdev_sequence_distance(oldest, sequence);
+            if (offset >= evdev_record_count) break;
+            const struct input_evdev_record *record =
+                &evdev_queue[evdev_slot_for_sequence(sequence)];
+            if (record->sequence == sequence &&
+                evdev_record_matches(record, device_kind, grab_token, number)) {
+                available = 1;
+                break;
+            }
+            sequence = evdev_sequence_next(sequence);
         }
-        ++cursor;
     }
     kernel_spin_unlock_irqrestore(&input_lock, flags);
     return available;

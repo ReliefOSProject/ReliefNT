@@ -956,6 +956,7 @@ int pty_destroy(uint32_t owner_pid, uint32_t pty_id)
         sched_signal_user_process(sid, 1);
         sched_signal_user_process(sid, 18);
     }
+    kernel_poll_readiness_notify();
     pty_reap_hungup(pty_id);
     return 0;
 }
@@ -1035,6 +1036,7 @@ int64_t pty_read_output(uint32_t owner_pid, uint32_t pty_id, char *buffer, uint3
 int64_t pty_write_input(uint32_t owner_pid, uint32_t pty_id, const char *buffer, uint32_t length)
 {
     struct pty_session *session = find_session(pty_id);
+    uint32_t input_before = pty_input_available(pty_id);
     uint32_t written = 0;
     if (!session || (owner_pid && session->owner_pid != owner_pid)) {
         return -22;
@@ -1113,6 +1115,8 @@ int64_t pty_write_input(uint32_t owner_pid, uint32_t pty_id, const char *buffer,
         }
         ++written;
     }
+    if (pty_input_available(pty_id) != input_before)
+        kernel_poll_readiness_notify();
     return (int64_t)written;
 }
 
@@ -1258,6 +1262,7 @@ static uint32_t pty_output_post_process(struct pty_session *session, char byte, 
 int64_t pty_write_output(uint32_t pty_id, const char *buffer, uint32_t length)
 {
     struct pty_session *session = find_session(pty_id);
+    uint32_t output_before = pty_output_available(pty_id);
     char staged[512];
     uint32_t staged_length = 0;
 
@@ -1301,6 +1306,8 @@ int64_t pty_write_output(uint32_t pty_id, const char *buffer, uint32_t length)
                             staged, staged_length);
         }
     }
+    if (pty_output_available(pty_id) != output_before)
+        kernel_poll_readiness_notify();
     return (int64_t)length;
 }
 

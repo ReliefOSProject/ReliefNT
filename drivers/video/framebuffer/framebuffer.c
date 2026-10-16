@@ -121,7 +121,6 @@ struct vmware_svga_state {
     bool fifo_present;
     bool fifo_full_logged;
     bool sync_timeout_logged;
-    bool traces_enabled;
 };
 
 struct bochs_vbe_state {
@@ -512,19 +511,17 @@ static void vmware_svga_memory_fence(void)
  */
 static void framebuffer_vmware_enable_traces(void)
 {
-    vmware_svga.traces_enabled = false;
+    uint64_t flags = svga_lock();
     if (!vmware_svga.present || !vmware_svga.fifo_present) {
+        svga.traces_enabled = false;
+        svga_unlock(flags);
         return;
     }
-    if ((vmware_svga_read(VMWARE_SVGA_REG_CAPABILITIES) &
-         VMWARE_SVGA_CAP_TRACES) == 0u) {
-        return;
-    }
-    vmware_svga_write(VMWARE_SVGA_REG_TRACES, 1u);
-    vmware_svga.traces_enabled = true;
+    (void)svga_restore_traces_locked();
+    svga_unlock(flags);
 }
 
-static void framebuffer_vmware_fifo_init(bool report)
+static void framebuffer_vmware_fifo_init(bool report, bool device_lock_held)
 {
     uint32_t mem_start = vmware_svga_read(VMWARE_SVGA_REG_MEM_START);
     uint32_t mem_size = vmware_svga_read(VMWARE_SVGA_REG_MEM_SIZE);
@@ -534,9 +531,9 @@ static void framebuffer_vmware_fifo_init(bool report)
      * the guest-owned ring, then publish CONFIG_DONE only after every header
      * field has been written. */
     vmware_svga_write(VMWARE_SVGA_REG_CONFIG_DONE, 0u);
+    svga.traces_enabled = false;
     vmware_svga.fifo = 0;
     vmware_svga.fifo_present = false;
-    vmware_svga.traces_enabled = false;
     fb.auxiliary_reservation_start = 0;
     fb.auxiliary_reservation_bytes = 0;
     /* The producer must retain one free byte to distinguish a full ring from
@@ -578,8 +575,12 @@ static void framebuffer_vmware_fifo_init(bool report)
     }
     vmware_svga.fifo_full_logged = false;
     vmware_svga.fifo_present = true;
-    framebuffer_vmware_enable_traces();
     svga_platform_bind(vmware_svga.io_port, vmware_svga.fifo, mem_size);
+    if (device_lock_held) {
+        (void)svga_restore_traces_locked();
+    } else {
+        framebuffer_vmware_enable_traces();
+    }
     fb.auxiliary_reservation_start = mem_start;
     fb.auxiliary_reservation_bytes = mem_size;
 }
@@ -814,7 +815,7 @@ static int framebuffer_vmware_probe(void)
         vmware_svga.max_height = FRAMEBUFFER_MODE_MAX_HEIGHT;
     }
     vmware_svga.present = true;
-    framebuffer_vmware_fifo_init(true);
+    framebuffer_vmware_fifo_init(true, false);
 
     fb.max_width = vmware_svga.max_width;
     fb.max_height = vmware_svga.max_height;
@@ -960,7 +961,7 @@ static int framebuffer_vmware_set_mode(uint32_t width, uint32_t height)
      * active, mode_begin left the FIFO disabled and mode_end restores the
      * extended register block after the mode is accepted. */
     if (!restart_3d) {
-        framebuffer_vmware_fifo_init(false);
+        framebuffer_vmware_fifo_init(false, true);
     }
 
     actual_width = vmware_svga_read(VMWARE_SVGA_REG_WIDTH);
@@ -1221,6 +1222,9 @@ int framebuffer_set_mode(uint32_t width, uint32_t height)
         return -1;
     }
     if (fb.width == width && fb.height == height && fb.bpp == 32u) {
+        if (fb.backend == FRAMEBUFFER_BACKEND_VMWARE_SVGA) {
+            framebuffer_vmware_enable_traces();
+        }
         return 0;
     }
 
@@ -1338,10 +1342,22 @@ static void framebuffer_char(uint32_t x, uint32_t y, char ch, uint32_t fg, uint3
     }
 }
 
-void framebuffer_present_region(uint32_t x, uint32_t y, uint32_t width, uint32_t height)
+/** @brief Present a region, optionally dropping timer work under backpressure. */
+static void framebuffer_present_region_internal(uint32_t x, uint32_t y,
+                                                uint32_t width, uint32_t height,
+                                                bool timer_refresh)
 {
-    uint64_t flags = svga_lock();
+    uint64_t flags;
+    if (timer_refresh) {
+        if (!svga_try_lock_irqsave(&flags)) return;
+    } else {
+        flags = svga_lock();
+    }
     if (fb.backend != FRAMEBUFFER_BACKEND_VMWARE_SVGA || !fb.available) {
+        svga_unlock(flags);
+        return;
+    }
+    if (timer_refresh && svga.traces_enabled) {
         svga_unlock(flags);
         return;
     }
@@ -1360,11 +1376,22 @@ void framebuffer_present_region(uint32_t x, uint32_t y, uint32_t width, uint32_t
         return;
     }
     if (svga.available) {
-        (void)svga_update_locked(x, y, width, height);
+        if (timer_refresh) {
+            (void)svga_update_try_locked(x, y, width, height);
+        } else {
+            (void)svga_update_locked(x, y, width, height);
+        }
         svga_unlock(flags);
         return;
     }
     if (!framebuffer_vmware_fifo_update(x, y, width, height)) {
+        if (timer_refresh) {
+            /* One BUSY read lets legacy VMware hosts advance STOP; the next
+             * periodic full-frame refresh retries after host progress. */
+            (void)vmware_svga_read(VMWARE_SVGA_REG_BUSY);
+            svga_unlock(flags);
+            return;
+        }
         /* A legacy host may only advance STOP while REG_BUSY is read.  A
          * doorbell alone can therefore leave a full ring stuck forever and
          * drop every later UPDATE, which presents as a black Xorg desktop.
@@ -1372,7 +1399,7 @@ void framebuffer_present_region(uint32_t x, uint32_t y, uint32_t width, uint32_t
          * retry this exact region before returning. */
         framebuffer_vmware_sync(false);
         if (!vmware_svga.fifo_present) {
-            framebuffer_vmware_fifo_init(false);
+            framebuffer_vmware_fifo_init(false, true);
         }
         if (framebuffer_vmware_fifo_update(x, y, width, height)) {
             framebuffer_vmware_kick();
@@ -1395,6 +1422,11 @@ void framebuffer_present_region(uint32_t x, uint32_t y, uint32_t width, uint32_t
     svga_unlock(flags);
 }
 
+void framebuffer_present_region(uint32_t x, uint32_t y, uint32_t width, uint32_t height)
+{
+    framebuffer_present_region_internal(x, y, width, height, false);
+}
+
 void framebuffer_present(void)
 {
     framebuffer_present_region(0, 0, UINT32_MAX, UINT32_MAX);
@@ -1402,7 +1434,7 @@ void framebuffer_present(void)
 
 void framebuffer_display_tick(void)
 {
-    framebuffer_present();
+    framebuffer_present_region_internal(0, 0, UINT32_MAX, UINT32_MAX, true);
 }
 
 static void framebuffer_char_transparent(uint32_t x, uint32_t y, char ch, uint32_t fg)

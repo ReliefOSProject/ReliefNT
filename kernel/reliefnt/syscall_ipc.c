@@ -61,6 +61,7 @@ void task_pipe_retain(struct task_file *file)
         ++pipe->readers;
         ++pipe->reader_generation;
     }
+    kernel_poll_readiness_notify();
 }
 
 /**
@@ -94,6 +95,7 @@ void task_pipe_release(struct task_file *file)
             kernel_free(removed);
         }
     }
+    kernel_poll_readiness_notify();
 }
 
 static int alloc_task_pipe_fd(struct task *task, uint32_t pipe_handle, int write_end)
@@ -136,6 +138,7 @@ int task_pipe_read(struct task_file *file, void *buffer, uint32_t length)
     }
     if (count) {
         (void)kernel_wait_queue_wake_all(&pipe->wait_write);
+        kernel_poll_readiness_notify();
         return (int)count;
     }
     if (!pipe->writers) return 0;
@@ -177,6 +180,7 @@ int task_pipe_write(struct task_file *file, const void *buffer, uint32_t length)
         if (next == pipe->tail) {
             if (count) {
                 (void)kernel_wait_queue_wake_all(&pipe->wait_read);
+                kernel_poll_readiness_notify();
                 return (int)count;
             }
             if (file->flags & RELIEFOS_O_NONBLOCK) return -RELIEFOS_EAGAIN;
@@ -192,6 +196,7 @@ int task_pipe_write(struct task_file *file, const void *buffer, uint32_t length)
         count += chunk;
     }
     (void)kernel_wait_queue_wake_all(&pipe->wait_read);
+    kernel_poll_readiness_notify();
     return (int)count;
 }
 
