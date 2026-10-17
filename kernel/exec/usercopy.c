@@ -59,9 +59,24 @@ bool user_range_ok(uint64_t ptr, uint64_t len)
 bool user_range_writable(uint64_t ptr, uint64_t len)
 {
     struct task *task = sched_current_task();
-    if (!task || task->kind != TASK_KIND_USER || !user_range_ok(ptr, len)) return false;
+    if (!task || task->kind != TASK_KIND_USER) return false;
     if (!len) return true;
-    for (uint64_t page = align_down_page(ptr); page < ptr + len; page += PAGE_SIZE) {
+
+    /* Match user_range_ok's bounds checks before computing the end. A writable
+     * PTE is present and user-accessible, which also implies readable on x86.
+     * Keep this shortcut to one page: multi-page ranges must validate every
+     * readable page before any COW page can be changed below. */
+    if (ptr < RELIEFNT_USER_BASE || ptr > RELIEFNT_USER_TOP ||
+        len > RELIEFNT_USER_TOP - ptr) return false;
+    uint64_t end = ptr + len;
+    uint64_t first_page = align_down_page(ptr);
+    if (first_page == align_down_page(end - 1) &&
+        address_space_user_page_writable(sched_task_as(task), first_page)) {
+        return true;
+    }
+
+    if (!user_range_ok(ptr, len)) return false;
+    for (uint64_t page = first_page; page < end; page += PAGE_SIZE) {
         if (!address_space_user_page_writable(sched_task_as(task), page)) {
             if (!address_space_handle_cow_fault(sched_task_as(task), page) ||
                 !address_space_user_page_writable(sched_task_as(task), page)) return false;

@@ -13,6 +13,36 @@ static struct kernel_wait_queue poll_waiters = {
 };
 static uint64_t poll_readiness_generation;
 
+/* fast_state is only a hint for conservative lock-free early returns. The
+ * waiter arrays and count remain authoritative under queue->lock. */
+static uint64_t kernel_wait_queue_fast_state(const struct kernel_wait_queue *queue)
+{
+    return __atomic_load_n(&queue->fast_state, __ATOMIC_ACQUIRE);
+}
+
+static void kernel_wait_queue_publish_fast_state(struct kernel_wait_queue *queue)
+{
+    uint64_t state = 0;
+    if (queue->count) {
+        uint32_t minimum = UINT32_MAX;
+        for (uint32_t i = 0; i < queue->count; ++i) {
+            if (queue->minimum[i] < minimum) minimum = queue->minimum[i];
+        }
+        state = ((uint64_t)queue->count << 32) | minimum;
+    }
+    __atomic_store_n(&queue->fast_state, state, __ATOMIC_RELEASE);
+}
+
+/* Publish a conservative nonempty/minimum-zero hint before adding or changing
+ * a waiter. Readers that see it must take the queue lock and recheck the
+ * canonical entries after registration starts. A concurrent publisher may
+ * still have read the old empty hint before this store: IRQ-facing callers
+ * must retain their condition/epoch recheck around registration and sleep. */
+static void kernel_wait_queue_publish_busy_fast_state(struct kernel_wait_queue *queue)
+{
+    __atomic_store_n(&queue->fast_state, (uint64_t)1u << 32, __ATOMIC_RELEASE);
+}
+
 void kernel_wait_queue_init(struct kernel_wait_queue *queue)
 {
     if (!queue) {
@@ -24,6 +54,7 @@ void kernel_wait_queue_init(struct kernel_wait_queue *queue)
         queue->waiters[i] = NULL;
         queue->minimum[i] = 0;
     }
+    __atomic_store_n(&queue->fast_state, 0, __ATOMIC_RELEASE);
 }
 
 static int kernel_wait_queue_add_minimum(struct kernel_wait_queue *queue,
@@ -38,7 +69,9 @@ static int kernel_wait_queue_add_minimum(struct kernel_wait_queue *queue,
     kernel_spin_lock_irqsave(&queue->lock, &flags);
     for (uint32_t i = 0; i < queue->count; ++i) {
         if (queue->waiters[i] == task) {
+            kernel_wait_queue_publish_busy_fast_state(queue);
             queue->minimum[i] = minimum;
+            kernel_wait_queue_publish_fast_state(queue);
             kernel_spin_unlock_irqrestore(&queue->lock, flags);
             return 0;
         }
@@ -47,9 +80,13 @@ static int kernel_wait_queue_add_minimum(struct kernel_wait_queue *queue,
         kernel_spin_unlock_irqrestore(&queue->lock, flags);
         return -1;
     }
+    /* Registration and task->waiting_queue publication happen under the
+     * execution transaction, but IRQ publishers may still inspect the hint. */
+    kernel_wait_queue_publish_busy_fast_state(queue);
     queue->minimum[queue->count] = minimum;
     queue->waiters[queue->count++] = task;
     task->waiting_queue = queue;
+    kernel_wait_queue_publish_fast_state(queue);
     kernel_spin_unlock_irqrestore(&queue->lock, flags);
     return 0;
 }
@@ -62,7 +99,10 @@ int kernel_wait_queue_add(struct kernel_wait_queue *queue, struct task *task)
 void kernel_wait_queue_remove(struct kernel_wait_queue *queue, struct task *task)
 {
     uint64_t flags;
-    if (!queue || !task) {
+    /* Registration and task teardown are serialized by the global syscall
+     * execution lock. Once a registration starts, add publishes BUSY before
+     * task->waiting_queue can refer to this queue. */
+    if (!queue || !task || !kernel_wait_queue_fast_state(queue)) {
         return;
     }
     kernel_spin_lock_irqsave(&queue->lock, &flags);
@@ -78,6 +118,7 @@ void kernel_wait_queue_remove(struct kernel_wait_queue *queue, struct task *task
             break;
         }
     }
+    kernel_wait_queue_publish_fast_state(queue);
     kernel_spin_unlock_irqrestore(&queue->lock, flags);
 }
 
@@ -86,7 +127,12 @@ static uint32_t kernel_wait_queue_wake_one_raw(struct kernel_wait_queue *queue,
 {
     uint64_t flags;
     struct task *task = NULL;
+    uint64_t state;
     if (!queue) {
+        return 0;
+    }
+    state = kernel_wait_queue_fast_state(queue);
+    if (!state || (available != UINT32_MAX && (uint32_t)state > available)) {
         return 0;
     }
     kernel_spin_lock_irqsave(&queue->lock, &flags);
@@ -106,6 +152,7 @@ static uint32_t kernel_wait_queue_wake_one_raw(struct kernel_wait_queue *queue,
         if (task->waiting_queue == queue) task->waiting_queue = NULL;
         break;
     }
+    kernel_wait_queue_publish_fast_state(queue);
     kernel_spin_unlock_irqrestore(&queue->lock, flags);
     if (task) {
         return 1;
@@ -166,6 +213,7 @@ void kernel_poll_readiness_notify(void)
         poll_waiters.waiters[--poll_waiters.count] = NULL;
         poll_waiters.minimum[poll_waiters.count] = 0;
         if (task->waiting_queue == &poll_waiters) task->waiting_queue = NULL;
+        kernel_wait_queue_publish_fast_state(&poll_waiters);
     }
     kernel_spin_unlock_irqrestore(&poll_waiters.lock, flags);
 }
@@ -198,10 +246,15 @@ int kernel_poll_wait_current(uint64_t generation, uint64_t wake_tick)
             kernel_spin_unlock_irqrestore(&poll_waiters.lock, flags);
             return -1;
         }
+        /* Keep lock-free removers from treating a partially published poll
+         * registration as an empty queue. Generation validation and notify's
+         * unconditional lock still close the readiness check-to-sleep race. */
+        kernel_wait_queue_publish_busy_fast_state(&poll_waiters);
         poll_waiters.minimum[poll_waiters.count] = 0;
         poll_waiters.waiters[poll_waiters.count++] = task;
         task->waiting_queue = &poll_waiters;
     }
+    kernel_wait_queue_publish_fast_state(&poll_waiters);
     /* Holding poll_waiters.lock across the state transition prevents a
      * publisher that increments the generation after the equality check
      * from emptying the queue until the task is visibly blocked. */
@@ -213,7 +266,9 @@ int kernel_poll_wait_current(uint64_t generation, uint64_t wake_tick)
 void kernel_poll_wait_remove(struct task *task)
 {
     uint64_t flags;
-    if (!task) return;
+    /* Poll registration/removal for a task is within the syscall execution
+     * transaction. The BUSY publication precedes any new task pointer. */
+    if (!task || !kernel_wait_queue_fast_state(&poll_waiters)) return;
     kernel_spin_lock_irqsave(&poll_waiters.lock, &flags);
     for (uint32_t i = 0; i < poll_waiters.count; ++i) {
         if (poll_waiters.waiters[i] != task) continue;
@@ -226,6 +281,7 @@ void kernel_poll_wait_remove(struct task *task)
         if (task->waiting_queue == &poll_waiters) task->waiting_queue = NULL;
         break;
     }
+    kernel_wait_queue_publish_fast_state(&poll_waiters);
     kernel_spin_unlock_irqrestore(&poll_waiters.lock, flags);
 }
 

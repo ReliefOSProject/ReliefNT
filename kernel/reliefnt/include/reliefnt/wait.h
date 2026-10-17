@@ -18,6 +18,9 @@ struct kernel_wait_queue {
     struct task *waiters[KERNEL_WAIT_QUEUE_MAX];
     uint32_t minimum[KERNEL_WAIT_QUEUE_MAX];
     uint32_t count;
+    /* Atomic hint published under lock: high word is count, low word is the
+     * smallest waiter threshold. Zero means empty; the arrays remain canonical. */
+    uint64_t fast_state;
 };
 
 void kernel_wait_queue_init(struct kernel_wait_queue *queue);
