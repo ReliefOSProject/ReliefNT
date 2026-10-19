@@ -208,7 +208,7 @@ static void gpu_record_error_locked(const struct svga_gpu_context *c, int status
         .fifo_min = svga.fifo[SVGA_FIFO_MIN], .fifo_max = svga.fifo[SVGA_FIFO_MAX],
         .fifo_next = svga.fifo[SVGA_FIFO_NEXT_CMD], .fifo_stop = svga.fifo[SVGA_FIFO_STOP],
         .fifo_fence = svga.fifo[SVGA_FIFO_FENCE], .issued_fence = svga.issued_fence,
-        .fifo_busy = svga.min > SVGA_FIFO_BUSY * 4u ? svga.fifo[SVGA_FIFO_BUSY] : UINT32_MAX,
+        .fifo_busy = svga.fifo_busy_present ? svga.fifo[SVGA_FIFO_BUSY] : UINT32_MAX,
         .submitted_frames = svga.gpu_stats.submitted, .completed_frames = svga.gpu_stats.completed};
 }
 

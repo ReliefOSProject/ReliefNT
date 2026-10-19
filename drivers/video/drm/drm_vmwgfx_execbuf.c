@@ -5,6 +5,7 @@
 #include <reliefnt/heap.h>
 #include <reliefnt/lock.h>
 #include <reliefnt/futex.h>
+#include <reliefnt/panic.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/time.h>
 #include <reliefnt/usercopy.h>
@@ -24,6 +25,9 @@
 #define DRM_VMW_EXEC_BOS_MAX 128u
 #define DRM_VMW_EXEC_OUTPUT_BYTES_MAX (256u * 1024u)
 #define DRM_VMW_EXEC_ATTACHMENT_CACHE_TICKS 100u
+#define DRM_VMW_FENCE_WAIT_FAST_POLL_US 500u
+#define DRM_VMW_FENCE_WAIT_FAST_POLL_SAMPLES 8192u
+#define DRM_VMW_FENCE_WAIT_FAST_CLOCK_RESOLUTION_NS 1000
 
 struct drm_vmwgfx_exec_work;
 
@@ -343,7 +347,16 @@ static struct drm_vmwgfx_fence *drm_vmwgfx_fence_lookup_get(
     return fence;
 }
 
-static bool drm_vmwgfx_fence_remove(struct drm_file *file, uint32_t handle)
+/**
+ * @brief Remove a fence handle, optionally requiring its retained object.
+ * @param file DRM file whose user-visible fence list is searched.
+ * @param handle User-visible fence handle to remove.
+ * @param expected If non-NULL, the handle must still name this retained fence.
+ * @return True if the matching user-visible reference was removed.
+ */
+static bool drm_vmwgfx_fence_remove_retained(
+    struct drm_file *file, uint32_t handle,
+    struct drm_vmwgfx_fence *expected)
 {
     struct drm_vmwgfx_fence *removed = NULL;
     bool found = false;
@@ -351,7 +364,9 @@ static bool drm_vmwgfx_fence_remove(struct drm_file *file, uint32_t handle)
     kernel_spin_lock_irqsave(&drm_vmwgfx_fence_lock, &flags);
     struct drm_vmwgfx_fence **link = file
         ? (struct drm_vmwgfx_fence **)&file->vmwgfx_fences : NULL;
-    while (link && *link && (*link)->handle != handle) link = &(*link)->next;
+    while (link && *link &&
+           ((*link)->handle != handle || (expected && *link != expected)))
+        link = &(*link)->next;
     if (link && *link) {
         found = true;
         removed = *link;
@@ -367,6 +382,11 @@ static bool drm_vmwgfx_fence_remove(struct drm_file *file, uint32_t handle)
     kernel_spin_unlock_irqrestore(&drm_vmwgfx_fence_lock, flags);
     if (removed) kernel_free(removed);
     return found;
+}
+
+static bool drm_vmwgfx_fence_remove(struct drm_file *file, uint32_t handle)
+{
+    return drm_vmwgfx_fence_remove_retained(file, handle, NULL);
 }
 
 static int drm_vmwgfx_map_svga_status(int status)
@@ -1906,6 +1926,75 @@ static uint64_t drm_vmwgfx_timeout_ticks(uint64_t timeout_us)
     return ticks + fraction;
 }
 
+/**
+ * @brief Try a short, unlocked poll for a FENCE_WAIT attempt.
+ * @param fence Immutable retained SVGA fence token; no fence object is touched
+ *        while execution ownership is suspended.
+ * @param signaled Set true when a successful status sample passes. A conclusive
+ *        in-flight sample is honored even if its return crosses the budget.
+ * @param status Set to the mapped SVGA error if a poll returns a hard error.
+ * @param now Updated from the kernel tick clock after execution ownership is
+ *        reacquired, before the caller makes timeout or sleep decisions.
+ * @return True if the unlocked poll ran and execution ownership was restored;
+ *         false if the fine-clock or suspend guard declined it.
+ *
+ * The 500 us budget limits starting further samples within the polling
+ * window; it is not an absolute CPU or wall-time deadline. An in-flight
+ * status call, interrupt, or VM deschedule can carry that window past the
+ * budget, and a conclusive completion is still accepted. Interrupts remain
+ * enabled while global execution ownership is suspended. A finite
+ * 8192-sample ceiling also bounds polling if the fine clock stops or moves
+ * backward. The suspend token is held while no global execution transaction
+ * or SVGA lock is held. A failed resume violates kernel ownership invariants,
+ * so shared state must not be touched afterward. Reacquiring the execution
+ * transaction can add further contention.
+ */
+static bool drm_vmwgfx_fence_wait_fast_poll(
+    svga_handle fence, bool *signaled, int *status, uint64_t *now)
+{
+    if (!signaled || !status || !now) return false;
+
+    struct linux_timespec resolution = {0};
+    if (time_clock_getres(LINUX_CLOCK_MONOTONIC, &resolution) != 0 ||
+        resolution.tv_sec != 0 || resolution.tv_nsec <= 0 ||
+        resolution.tv_nsec > DRM_VMW_FENCE_WAIT_FAST_CLOCK_RESOLUTION_NS)
+        return false;
+
+    struct kernel_execution_suspend_token token = {0};
+    if (kernel_execution_suspend_irqrestore(&token) != 0) return false;
+
+    const uint64_t started_us = time_uptime_us();
+    for (uint32_t sample = 0;
+         sample < DRM_VMW_FENCE_WAIT_FAST_POLL_SAMPLES; ++sample) {
+        uint64_t before_us = time_uptime_us();
+        if (before_us < started_us ||
+            before_us - started_us >= DRM_VMW_FENCE_WAIT_FAST_POLL_US)
+            break;
+
+        bool sample_signaled = false;
+        int sample_status = svga_fence_status(fence, &sample_signaled);
+        uint64_t after_us = time_uptime_us();
+        bool within_budget = after_us >= started_us &&
+            after_us - started_us < DRM_VMW_FENCE_WAIT_FAST_POLL_US;
+
+        if (sample_status && sample_status != SVGA_EBUSY) {
+            *status = drm_vmwgfx_map_svga_status(sample_status);
+            break;
+        }
+        if (sample_status == 0 && sample_signaled) {
+            *signaled = true;
+            break;
+        }
+        if (!within_budget) break;
+        __asm__ volatile("pause" ::: "memory");
+    }
+
+    if (kernel_execution_resume_irqsave(&token) != 0)
+        panic("drm: failed to resume FENCE_WAIT execution ownership");
+    *now = time_ticks();
+    return true;
+}
+
 static void drm_vmwgfx_fence_wait_finish(
     struct task *task, struct drm_vmwgfx_task_continuation *continuation)
 {
@@ -1962,9 +2051,71 @@ static int64_t drm_vmwgfx_fence_wait(
         else drm_vmwgfx_fence_put(fence);
         return status;
     }
+    if (!resumed && !signaled && now < deadline) {
+        /* Only the first blocking attempt owns a fresh lookup_get reference;
+         * resumed continuations retain the original fence and cookie while
+         * following the same lazy/non-lazy scheduling choice below. */
+        (void)drm_vmwgfx_fence_wait_fast_poll(
+            fence->token, &signaled, &status, &now);
+    } else if (resumed && !arg->lazy && !signaled && now < deadline) {
+        /* The continuation owns the primary reference. Pin a separate local
+         * reference and copy the immutable status token before dropping
+         * execution ownership, then validate the original continuation only
+         * after ownership is restored. */
+        struct drm_vmwgfx_task_continuation *expected_continuation =
+            continuation;
+        struct drm_vmwgfx_fence *poll_fence = fence;
+        drm_vmwgfx_fence_get(poll_fence);
+        const svga_handle poll_token = poll_fence->token;
+        const struct drm_vmw_fence_wait_arg poll_snapshot = *arg;
+        const uint64_t poll_deadline = deadline;
+        bool poll_ran = drm_vmwgfx_fence_wait_fast_poll(
+            poll_token, &signaled, &status, &now);
+
+        if (poll_ran) {
+            bool continuation_valid = task->state != TASK_EXITED &&
+                task->drm_vmwgfx_continuation == expected_continuation;
+            if (continuation_valid) {
+                const struct drm_vmw_fence_wait_arg *saved =
+                    &expected_continuation->snapshot.wait;
+                continuation_valid =
+                    expected_continuation->kind == DRM_VMW_CONT_FENCE_WAIT &&
+                    drm_vmwgfx_continuation_matches(expected_continuation,
+                        task, task->syscall_file, file, command,
+                        user_argument) &&
+                    expected_continuation->fence_object == poll_fence &&
+                    expected_continuation->fence == poll_token &&
+                    expected_continuation->deadline == poll_deadline &&
+                    saved->handle == poll_snapshot.handle &&
+                    saved->cookie_valid == poll_snapshot.cookie_valid &&
+                    saved->kernel_cookie == poll_snapshot.kernel_cookie &&
+                    saved->timeout_us == poll_snapshot.timeout_us &&
+                    saved->lazy == poll_snapshot.lazy &&
+                    saved->flags == poll_snapshot.flags &&
+                    saved->wait_options == poll_snapshot.wait_options &&
+                    saved->pad64 == poll_snapshot.pad64;
+            }
+            drm_vmwgfx_fence_put(poll_fence);
+            if (!continuation_valid) {
+                /* Cancellation or task exit won while unlocked. Leave any
+                 * replacement continuation untouched and return through the
+                 * normal scheduler boundary; the next syscall attempt follows
+                 * the existing restart/cleanup path. */
+                sched_request_reschedule_current();
+                return KERNEL_SYSCALL_BLOCKED;
+            }
+        } else {
+            drm_vmwgfx_fence_put(poll_fence);
+        }
+    }
+    if (status) {
+        if (resumed) drm_vmwgfx_fence_wait_finish(task, continuation);
+        else drm_vmwgfx_fence_put(fence);
+        return status;
+    }
     if (signaled) {
         if (arg->wait_options & DRM_VMW_WAIT_OPTION_UNREF)
-            (void)drm_vmwgfx_fence_remove(file, arg->handle);
+            (void)drm_vmwgfx_fence_remove_retained(file, arg->handle, fence);
         if (resumed) drm_vmwgfx_fence_wait_finish(task, continuation);
         else drm_vmwgfx_fence_put(fence);
         return 0;
@@ -1996,7 +2147,10 @@ static int64_t drm_vmwgfx_fence_wait(
     }
     continuation->snapshot.wait = *arg;
     continuation->deadline = deadline;
-    sched_sleep_current_until(now + 1u);
+    if (arg->lazy)
+        sched_sleep_current_until(now + 1u);
+    else
+        sched_request_reschedule_current();
     return KERNEL_SYSCALL_BLOCKED;
 }
 

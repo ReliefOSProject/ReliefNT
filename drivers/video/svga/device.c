@@ -1,11 +1,13 @@
 #include "device.h"
+#include <reliefnt/console.h>
 #ifndef SVGA_HOST_TEST
 #include <reliefnt/lock.h>
 #include <reliefnt/mm.h>
 #include <reliefnt/paging.h>
 #include <reliefnt/port.h>
 #include <reliefnt/framebuffer.h>
-#include <reliefnt/console.h>
+#include <reliefnt/pci.h>
+#include <reliefnt/drm.h>
 static struct kernel_spinlock device_lock = KERNEL_SPINLOCK_INIT;
 static uint16_t io_port;
 #else
@@ -121,8 +123,181 @@ static int probe_result(const char *stage, int status)
     return status;
 }
 
+#ifndef SVGA_HOST_TEST
+#define SVGA_CACHE_PAGE_SIZE 4096ULL
+/** @brief Round a physical byte range to pages and validate the direct map.
+ * @param phys Inclusive byte start.
+ * @param bytes Nonzero byte length.
+ * @param page_start Receives the rounded inclusive page start.
+ * @param page_length Receives the nonzero rounded length.
+ * @return True when rounding is overflow-safe and the complete range is in the
+ * kernel direct map.
+ */
+static bool svga_page_range(uint64_t phys, uint64_t bytes,
+                            uint64_t *page_start, uint64_t *page_length)
+{
+    if (!bytes || bytes > UINT64_MAX - phys) return false;
+    uint64_t end = phys + bytes;
+    if (end > UINT64_MAX - (SVGA_CACHE_PAGE_SIZE - 1)) return false;
+    uint64_t start = phys & ~(SVGA_CACHE_PAGE_SIZE - 1);
+    uint64_t rounded_end = (end + SVGA_CACHE_PAGE_SIZE - 1) &
+                           ~(SVGA_CACHE_PAGE_SIZE - 1);
+    if (rounded_end <= start ||
+        !paging_kernel_direct_map_range(start, rounded_end - start)) return false;
+    *page_start = start;
+    *page_length = rounded_end - start;
+    return true;
+}
+
+/** @brief Test overlap between two already validated page ranges.
+ * @param a First aligned page-range start.
+ * @param a_length First nonzero page-range length.
+ * @param b Second aligned page-range start.
+ * @param b_length Second nonzero page-range length.
+ * @return True when the half-open ranges overlap.
+ */
+static bool svga_page_ranges_overlap(uint64_t a, uint64_t a_length,
+                                     uint64_t b, uint64_t b_length)
+{
+    return a < b + b_length && b < a + a_length;
+}
+
+/** @brief Quiesce the legacy FIFO before a PCI BAR size probe.
+ * @return Zero after BUSY clears and CONFIG_DONE is disabled, or ETIMEDOUT.
+ * Caller holds svga_lock; no BAR decode change occurs on timeout.
+ */
+static int svga_quiesce_fifo_for_bar_probe_locked(void)
+{
+    svga.ops.write(SVGA_REG_SYNC, 1);
+    for (uint32_t i = 0; i < SVGA_POLL_LIMIT; ++i) {
+        if (!svga.ops.read(SVGA_REG_BUSY)) {
+            svga.ops.write(SVGA_REG_CONFIG_DONE, 0);
+            svga.traces_enabled = false;
+            return 0;
+        }
+        svga_relax();
+    }
+    return SVGA_ETIMEDOUT;
+}
+
+/** @brief Install the FIFO's safe default-WB policy or UC fallback.
+ * @param fb Current framebuffer physical reservations.
+ * @param report Optional caller-owned output report, zeroed and populated when
+ *        non-NULL; borrowed only for this call and never retained. This helper
+ *        records diagnostics there but does not print while svga_lock is held.
+ * @return Zero when WB or legacy UC/NX is installed, otherwise ENOTSUP.
+ * Called only after shutdown and legacy FIFO drain under svga_lock. The
+ * scan-out reservation remains UC/NX; the FIFO keeps its supervisor mapping
+ * and is made non-executable when WB+NX succeeds.
+ */
+static int svga_prepare_fifo_cache_policy(const struct framebuffer *fb,
+                                          struct svga_cache_report *report)
+{
+    if (report) *report = (struct svga_cache_report){0};
+    if (!fb || !fb->auxiliary_reservation_start ||
+        !fb->auxiliary_reservation_bytes ||
+        fb->auxiliary_reservation_start != (uint64_t)(uintptr_t)svga.fifo ||
+        fb->auxiliary_reservation_bytes != svga.fifo_bytes) {
+        if (report) report->reason = "reservation-mismatch";
+        return SVGA_ENOTSUP;
+    }
+
+    uint64_t fifo_page, fifo_page_bytes, vram_page, vram_page_bytes;
+    if (!svga_page_range(fb->auxiliary_reservation_start,
+                         fb->auxiliary_reservation_bytes,
+                         &fifo_page, &fifo_page_bytes) ||
+        !svga_page_range(fb->reservation_start, fb->reservation_bytes,
+                         &vram_page, &vram_page_bytes)) {
+        if (report) report->reason = "physical-range";
+        return SVGA_ENOTSUP;
+    }
+
+    if (!paging_mmio_uncached(fb->reservation_start, fb->reservation_bytes)) {
+        if (report) report->reason = "vram-uc-pin";
+        return SVGA_ENOTSUP;
+    }
+
+    const char *reason = NULL;
+    if (fb->auxiliary_reservation_start < RELIEFNT_USER_TOP) {
+        reason = "below-user-top";
+    } else if (svga_page_ranges_overlap(fifo_page, fifo_page_bytes,
+                                       vram_page, vram_page_bytes)) {
+        reason = "overlaps-vram";
+    } else {
+        struct pci_device primary;
+        if (drm_device_pci_identity(&primary) < 0) {
+            reason = "no-registered-primary";
+        } else if (primary.vendor_id != 0x15adu || primary.device_id != 0x0405u) {
+            reason = "primary-identity";
+        } else if (!pci_device_bar_contains(&primary, 2, fifo_page,
+                                             fifo_page_bytes)) {
+            reason = "bar2-range";
+        } else if (paging_mmio_writeback_nx(fifo_page, fifo_page_bytes)) {
+            if (report)
+                report->policy = "default-PTE WB+NX requested for validated BAR2";
+            return 0;
+        } else {
+            reason = "wb-policy-or-capacity";
+        }
+    }
+
+    if (!paging_mmio_uncached(fb->auxiliary_reservation_start,
+                              fb->auxiliary_reservation_bytes)) {
+        if (report) report->reason = "fifo-uc-pin";
+        return SVGA_ENOTSUP;
+    }
+    if (report) {
+        report->policy = "UC+NX fallback";
+        report->reason = reason ? reason : "unknown";
+    }
+    return 0;
+}
+#endif
+
+/** @brief Emit a cache-policy outcome after the SVGA lock has been released.
+ * @param report Selected policy or cache setup/restoration failure; NULL is ignored.
+ * Console presentation can re-enter the framebuffer and acquire svga_lock.
+ */
+void svga_report_cache_result_unlocked(const struct svga_cache_report *report)
+{
+    if (!report) return;
+    if (!report->status) {
+        if (!report->policy) return;
+        if (report->reason) {
+            console_log(CONSOLE_LOG_WARN,
+                        "[svga3d] FIFO cache policy: %s reason=%s\n",
+                        report->policy, report->reason);
+        } else {
+            console_log(CONSOLE_LOG_INFO,
+                        "[svga3d] FIFO cache policy: %s\n", report->policy);
+        }
+        return;
+    }
+    if (report->legacy_restored) {
+        console_log(CONSOLE_LOG_WARN,
+                    "[svga3d] FIFO cache setup failed reason=%s status=%d; legacy 2D restored\n",
+                    report->reason ? report->reason : "unknown", report->status);
+    } else {
+        console_log(CONSOLE_LOG_ERROR,
+                    "[svga3d] FIFO cache setup failed reason=%s status=%d; legacy 2D restore failed\n",
+                    report->reason ? report->reason : "unknown", report->status);
+    }
+}
+
+/** @brief Restore the legacy FIFO after a post-drain cache-policy failure.
+ * @param cache_status Original cache-validation or mapping failure.
+ * @return The original failure when legacy reconfiguration succeeds, otherwise
+ *         SVGA_EIO. Caller holds svga_lock; this preserves working 2D scanout.
+ */
+int svga_restore_legacy_after_cache_error_locked(int cache_status)
+{
+    if (!cache_status) return 0;
+    return svga_configure_locked(false) == 0 ? cache_status : SVGA_EIO;
+}
+
 int svga_configure_locked(bool extended)
 {
+    svga.fifo_busy_present = false;
     if (svga.gb_active) return SVGA_EBUSY;
     if (extended) {
         svga.probe = (struct svga_probe_info){.stage = "fifo-setup", .status = SVGA_EIO};
@@ -140,16 +315,26 @@ int svga_configure_locked(bool extended)
     if (extended) svga.probe.enable = svga.ops.read(SVGA_REG_ENABLE);
     /* Keep the legacy path's four DWORD header. SVGA_FIFO_MIN is a byte
      * offset, so this yields the 16-byte minimum used by the 2D adapter. */
+    bool extended_fifo = extended &&
+        (svga.caps & SVGA_CAP_EXTENDED_FIFO) != 0;
+    uint32_t raw_mem_regs = 0;
     uint32_t regs = 4;
-    if (extended && (svga.caps & SVGA_CAP_EXTENDED_FIFO)) {
-        regs = svga.ops.read(SVGA_REG_MEM_REGS);
-        svga.probe.mem_regs = regs;
+    if (extended_fifo) {
+        raw_mem_regs = svga.ops.read(SVGA_REG_MEM_REGS);
+        svga.probe.mem_regs = raw_mem_regs;
+        regs = raw_mem_regs;
         if (regs < SVGA_FIFO_NUM_REGS) regs = SVGA_FIFO_NUM_REGS;
         if (regs > (svga.fifo_bytes - 10240) / 4)
             return probe_result("fifo-registers", SVGA_EIO);
     }
     svga.min = regs * 4;
     if (extended) svga.probe.fifo_min = svga.min;
+    const uint64_t fifo_busy_end =
+        ((uint64_t)SVGA_FIFO_BUSY + 1u) * sizeof(uint32_t);
+    bool fifo_busy_present = extended_fifo &&
+        raw_mem_regs > SVGA_FIFO_BUSY &&
+        fifo_busy_end <= svga.min && fifo_busy_end <= svga.fifo_bytes &&
+        svga.min <= svga.fifo_bytes;
     svga.fifo[SVGA_FIFO_MIN] = svga.min;
     svga.fifo[SVGA_FIFO_MAX] = svga.fifo_bytes;
     svga.fifo[SVGA_FIFO_NEXT_CMD] = svga.min;
@@ -159,13 +344,15 @@ int svga_configure_locked(bool extended)
         svga.fifo[SVGA_FIFO_RESERVED] = 0;
         svga.fifo[SVGA_FIFO_FENCE] = 0;
     }
-    if (regs > SVGA_FIFO_BUSY) svga.fifo[SVGA_FIFO_BUSY] = 0;
+    if (fifo_busy_present) svga.fifo[SVGA_FIFO_BUSY] = 0;
     svga_barrier();
     svga.ops.write(SVGA_REG_CONFIG_DONE, 1);
     if (svga.fifo[SVGA_FIFO_MIN] != svga.min || svga.fifo[SVGA_FIFO_MAX] != svga.fifo_bytes) {
+        svga.fifo_busy_present = false;
         if (extended) probe_result("fifo-header", SVGA_EIO);
         return SVGA_EIO;
     }
+    svga.fifo_busy_present = fifo_busy_present;
     svga.fifo_caps = regs > SVGA_FIFO_CAPABILITIES ? svga.fifo[SVGA_FIFO_CAPABILITIES] : 0;
     svga.fifo_ready = true;
     ++svga.generation;
@@ -398,23 +585,33 @@ int svga3d_capability(uint32_t index, uint32_t *out)
 int svga3d_init(void)
 {
     uint64_t flags = svga_lock();
+    struct svga_cache_report cache_report = {0};
+    bool cache_report_ready = false;
     svga.probe = (struct svga_probe_info){.stage = "not-bound", .status = SVGA_ENODEV};
     if (!svga.bound) {
         svga_unlock(flags);
         return SVGA_ENODEV;
     }
-#ifndef SVGA_HOST_TEST
-    const struct framebuffer *fb = framebuffer_get();
-    if (!paging_mmio_uncached((uint64_t)(uintptr_t)svga.fifo, svga.fifo_bytes) ||
-        !paging_mmio_uncached(fb->reservation_start, fb->reservation_bytes)) {
-        probe_result("mmio-cache", SVGA_ENOTSUP);
-        svga_unlock(flags);
-        console_warn("[svga3d] UC mapping failed; retaining 2D\n");
-        return SVGA_ENOTSUP;
-    }
-#endif
     int ret = svga_shutdown_locked();
     if (ret) probe_result("drain", ret);
+#ifndef SVGA_HOST_TEST
+    if (!ret) {
+        ret = svga_quiesce_fifo_for_bar_probe_locked();
+        if (ret) probe_result("fifo-drain", ret);
+    }
+    if (!ret) {
+        int cache_status = svga_prepare_fifo_cache_policy(framebuffer_get(),
+                                                          &cache_report);
+        cache_report_ready = true;
+        if (cache_status) {
+            probe_result("mmio-cache", cache_status);
+            cache_report.status = cache_status;
+            int restore_result = svga_restore_legacy_after_cache_error_locked(cache_status);
+            cache_report.legacy_restored = restore_result == cache_status;
+            ret = restore_result;
+        }
+    }
+#endif
     if (!ret) {
         svga.memory_ready = true;
         ret = svga_configure_locked(true);
@@ -429,6 +626,7 @@ int svga3d_init(void)
         }
     }
     svga_unlock(flags);
+    if (cache_report_ready) svga_report_cache_result_unlocked(&cache_report);
 #ifndef SVGA_HOST_TEST
     console_log(ret < 0 ? CONSOLE_LOG_WARN : CONSOLE_LOG_INFO,
                 "[svga3d] init=%d caps=0x%x fifo=0x%x host=0x%x guest=0x%x\n",

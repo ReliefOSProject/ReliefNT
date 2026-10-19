@@ -181,9 +181,17 @@ static void put_word(uint32_t *next, uint32_t word, bool reserve)
     }
 }
 
+/** @brief Notify the host after publishing FIFO work with an explicit SYNC.
+ * @note The caller holds the SVGA lock. The barrier keeps published FIFO
+ *       contents visible before the SYNC doorbell.
+ */
 static void fifo_wake_locked(void)
 {
     svga_barrier();
+    if (svga.fifo_busy_present && !svga.fifo[SVGA_FIFO_BUSY]) {
+        svga.fifo[SVGA_FIFO_BUSY] = 1;
+        svga_barrier();
+    }
     svga.ops.write(SVGA_REG_SYNC, 1);
 }
 
@@ -419,6 +427,94 @@ static void batch_metadata_free(struct svga_batch_metadata *metadata)
     batch_metadata_release(allocation_bytes);
 }
 
+/** @brief Reserve one source-bounded operation array without the device lock.
+ * The array grows geometrically from four records up to operation_capacity.
+ * Only live records are copied; allocation failure leaves its prior storage,
+ * capacity, and all operation counts untouched.
+ * @param batch Open batch whose metadata owns the operation array.
+ * @param array Query, shader, or binding operation array to reserve.
+ * @param needed Required record count, no larger than operation_capacity.
+ * @return Zero on success, SVGA_ENOMEM on bounded capacity/allocation failure,
+ *         or SVGA_EINVAL when the batch metadata is inconsistent.
+ */
+int svga_batch_operation_reserve(struct svga_batch *batch,
+                                 enum svga_batch_operation_array array,
+                                 uint32_t needed)
+{
+    if (!batch || !batch->metadata || batch->submitted) return SVGA_EINVAL;
+    struct svga_batch_metadata *metadata = batch->metadata;
+    void *old_storage;
+    uint32_t old_capacity;
+    uint32_t live_count;
+    size_t record_bytes;
+    switch (array) {
+    case SVGA_BATCH_OPERATION_ARRAY_QUERY:
+        old_storage = metadata->query_ops;
+        old_capacity = metadata->query_op_capacity;
+        live_count = batch->query_op_count;
+        record_bytes = sizeof(struct svga_batch_query_op);
+        break;
+    case SVGA_BATCH_OPERATION_ARRAY_SHADER:
+        old_storage = metadata->shader_ops;
+        old_capacity = metadata->shader_op_capacity;
+        live_count = batch->shader_op_count;
+        record_bytes = sizeof(struct svga_batch_shader_op);
+        break;
+    case SVGA_BATCH_OPERATION_ARRAY_BINDING:
+        old_storage = metadata->binding_ops;
+        old_capacity = metadata->binding_op_capacity;
+        live_count = batch->binding_op_count;
+        record_bytes = sizeof(struct svga_batch_binding_op);
+        break;
+    default:
+        return SVGA_EINVAL;
+    }
+    if (needed > metadata->operation_capacity) return SVGA_ENOMEM;
+    if (old_capacity > metadata->operation_capacity || live_count > old_capacity ||
+        ((old_capacity == 0) != (old_storage == NULL)))
+        return SVGA_EINVAL;
+    if (needed <= old_capacity) return 0;
+
+    uint32_t new_capacity = old_capacity ? old_capacity : 4u;
+    if (new_capacity > metadata->operation_capacity)
+        new_capacity = metadata->operation_capacity;
+    while (new_capacity < needed) {
+        if (new_capacity > metadata->operation_capacity - new_capacity) {
+            new_capacity = metadata->operation_capacity;
+            break;
+        }
+        new_capacity *= 2u;
+    }
+    if (new_capacity < needed || new_capacity > SIZE_MAX / record_bytes)
+        return SVGA_ENOMEM;
+    size_t new_bytes = (size_t)new_capacity * record_bytes;
+    void *new_storage = kernel_malloc(new_bytes);
+    if (!new_storage) return SVGA_ENOMEM;
+    if (live_count)
+        __builtin_memcpy(new_storage, old_storage,
+                         (size_t)live_count * record_bytes);
+
+    switch (array) {
+    case SVGA_BATCH_OPERATION_ARRAY_QUERY:
+        metadata->query_ops = new_storage;
+        metadata->query_op_capacity = new_capacity;
+        break;
+    case SVGA_BATCH_OPERATION_ARRAY_SHADER:
+        metadata->shader_ops = new_storage;
+        metadata->shader_op_capacity = new_capacity;
+        break;
+    case SVGA_BATCH_OPERATION_ARRAY_BINDING:
+        metadata->binding_ops = new_storage;
+        metadata->binding_op_capacity = new_capacity;
+        break;
+    default:
+        kernel_free(new_storage);
+        return SVGA_EINVAL;
+    }
+    kernel_free(old_storage);
+    return 0;
+}
+
 /**
  * @brief Initialize bounded batch storage and source-sized heap metadata.
  * @param batch Writable caller-owned batch state.
@@ -427,7 +523,7 @@ static void batch_metadata_free(struct svga_batch_metadata *metadata)
  * @param output_capacity Storage capacity in bytes, at most 256 KiB.
  * @param source_bytes Accepted source size in bytes, at most 64 KiB.
  * @return Zero on success, SVGA_EINVAL for invalid bounds, or SVGA_ENOMEM for
- *         sidecar/operation-array allocation failure.
+ *         metadata reservation/allocation failure.
  */
 int svga_batch_init_sized(struct svga_batch *batch, uint32_t generation,
                           uint32_t *storage, uint32_t output_capacity,
@@ -469,18 +565,6 @@ int svga_batch_init_sized(struct svga_batch *batch, uint32_t generation,
     __builtin_memset(metadata, 0, sizeof(*metadata));
     metadata->operation_capacity = operation_capacity;
     metadata->allocation_bytes = allocation_bytes;
-    if (operation_capacity) {
-        metadata->query_ops = kernel_malloc(query_bytes);
-        metadata->shader_ops = kernel_malloc(shader_bytes);
-        metadata->binding_ops = kernel_malloc(binding_bytes);
-        if (!metadata->query_ops || !metadata->shader_ops || !metadata->binding_ops) {
-            batch_metadata_free(metadata);
-            return SVGA_ENOMEM;
-        }
-        __builtin_memset(metadata->query_ops, 0, query_bytes);
-        __builtin_memset(metadata->shader_ops, 0, shader_bytes);
-        __builtin_memset(metadata->binding_ops, 0, binding_bytes);
-    }
     *batch = (struct svga_batch){.generation = generation,
         .capacity = output_capacity, .source_bytes = source_bytes,
         .words = storage, .metadata = metadata,
@@ -642,28 +726,37 @@ int svga_batch_submit_locked(struct svga_batch *batch, svga_handle *fence)
             SVGA_BATCH_MAX_GMR_REFS);
         return SVGA_EINVAL;
     }
-    if (batch->shader_op_count > batch->metadata->operation_capacity) {
+    if (batch->metadata->shader_op_capacity >
+            batch->metadata->operation_capacity ||
+        batch->shader_op_count > batch->metadata->shader_op_capacity ||
+        (batch->shader_op_count && !batch->metadata->shader_ops)) {
         svga_batch_submit_failure_set(batch,
             SVGA_BATCH_SUBMIT_REASON_BATCH_SHAPE,
             SVGA_BATCH_SUBMIT_INDEX_NONE,
             SVGA_BATCH_SUBMIT_DETAIL_SHADER_OP_COUNT, batch->shader_op_count,
-            batch->metadata->operation_capacity);
+            batch->metadata->shader_op_capacity);
         return SVGA_EINVAL;
     }
-    if (batch->binding_op_count > batch->metadata->operation_capacity) {
+    if (batch->metadata->binding_op_capacity >
+            batch->metadata->operation_capacity ||
+        batch->binding_op_count > batch->metadata->binding_op_capacity ||
+        (batch->binding_op_count && !batch->metadata->binding_ops)) {
         svga_batch_submit_failure_set(batch,
             SVGA_BATCH_SUBMIT_REASON_BATCH_SHAPE,
             SVGA_BATCH_SUBMIT_INDEX_NONE,
             SVGA_BATCH_SUBMIT_DETAIL_BINDING_OP_COUNT, batch->binding_op_count,
-            batch->metadata->operation_capacity);
+            batch->metadata->binding_op_capacity);
         return SVGA_EINVAL;
     }
-    if (batch->query_op_count > batch->metadata->operation_capacity) {
+    if (batch->metadata->query_op_capacity >
+            batch->metadata->operation_capacity ||
+        batch->query_op_count > batch->metadata->query_op_capacity ||
+        (batch->query_op_count && !batch->metadata->query_ops)) {
         svga_batch_submit_failure_set(batch,
             SVGA_BATCH_SUBMIT_REASON_BATCH_SHAPE,
             SVGA_BATCH_SUBMIT_INDEX_NONE,
             SVGA_BATCH_SUBMIT_DETAIL_QUERY_OP_COUNT, batch->query_op_count,
-            batch->metadata->operation_capacity);
+            batch->metadata->query_op_capacity);
         return SVGA_EINVAL;
     }
     if (batch->operation_count > batch->metadata->operation_capacity) {

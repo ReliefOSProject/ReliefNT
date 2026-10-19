@@ -69,6 +69,19 @@ int pci_read_device(uint8_t bus, uint8_t slot, uint8_t function,
 int pci_find_device(uint16_t vendor_id, uint16_t device_id,
                     struct pci_device *out);
 
+/** @brief Check a range against one exact device BAR without scanning other BARs.
+ * @param device Exact device identity selected by the registered driver.
+ * @param bar Zero-based BAR index in the function's header.
+ * @param phys Physical start of the range, including page-rounded coverage.
+ * @param bytes Nonzero length; the complete page-aligned range must fit the
+ * probed BAR size.
+ * @return True only for that function's implemented memory BAR. Task context
+ * under execution ownership after the device has drained; the probe disables
+ * PCI decode only while serialized config access is held.
+ */
+bool pci_device_bar_contains(const struct pci_device *device, uint8_t bar,
+                             uint64_t phys, uint64_t bytes);
+
 /** @brief Enumerate every present PCI function by stable bus/slot/function index.
  * @param index Zero-based ordinal among present functions.
  * @param out Receives complete module-facing identity; borrowed output.

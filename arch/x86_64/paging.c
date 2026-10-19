@@ -30,9 +30,13 @@ extern void x86_64_invlpg(uint64_t addr);
 static uint64_t kernel_low_pt[512][512] __attribute__((aligned(4096)));
 #define MMIO_RUN_MAX 256U
 #define MMIO_LEASE_MAX 128U
+enum mmio_cache_policy {
+    MMIO_CACHE_POLICY_UC = 1,
+    MMIO_CACHE_POLICY_WB = 2,
+};
 struct mmio_run {
     uint64_t start, end, original_flags;
-    uint32_t refs, permanent;
+    uint32_t refs, permanent, policy;
 };
 struct mmio_lease { uint64_t start, end; uint32_t refs; };
 static struct mmio_run mmio_runs[MMIO_RUN_MAX], mmio_work[MMIO_RUN_MAX];
@@ -276,7 +280,8 @@ static bool mmio_run_append(const struct mmio_run *run, uint32_t *count)
     if (*count && mmio_work[*count - 1].end == run->start) {
         struct mmio_run *previous = &mmio_work[*count - 1];
         if (previous->original_flags == run->original_flags &&
-            previous->refs == run->refs && previous->permanent == run->permanent) {
+            previous->refs == run->refs && previous->permanent == run->permanent &&
+            previous->policy == run->policy) {
             previous->end = run->end;
             return true;
         }
@@ -294,7 +299,7 @@ static bool mmio_run_append(const struct mmio_run *run, uint32_t *count)
  * @return True if every run fit. Page-table leaves were preflighted already.
  */
 static bool mmio_append_new_range(uint64_t start, uint64_t end, bool permanent,
-                                  uint32_t *count)
+                                  enum mmio_cache_policy policy, uint32_t *count)
 {
     uint64_t run_start = start, original_flags = 0;
     bool have_run = false;
@@ -302,9 +307,18 @@ static bool mmio_append_new_range(uint64_t start, uint64_t end, bool permanent,
         uint64_t *pte = mmio_existing_leaf(p);
         if (!pte) return false;
         uint64_t flags = *pte & ~RELIEFNT_PHYS_ADDR_MASK;
+        if (policy == MMIO_CACHE_POLICY_WB) {
+            if (!(flags & RELIEFNT_PAGE_PRESENT) ||
+                !(flags & RELIEFNT_PAGE_WRITABLE) ||
+                (flags & RELIEFNT_PAGE_USER) ||
+                (*pte & RELIEFNT_PHYS_ADDR_MASK) != p ||
+                (flags & (RELIEFNT_PAGE_PWT | RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_PAT)))
+                return false;
+        }
         if (have_run && flags != original_flags) {
             struct mmio_run run = {run_start, p, original_flags,
-                                   permanent ? 0u : 1u, permanent ? 1u : 0u};
+                                   permanent ? 0u : 1u, permanent ? 1u : 0u,
+                                   (uint32_t)policy};
             if (!mmio_run_append(&run, count)) return false;
             run_start = p;
             original_flags = flags;
@@ -316,7 +330,8 @@ static bool mmio_append_new_range(uint64_t start, uint64_t end, bool permanent,
     }
     if (have_run) {
         struct mmio_run run = {run_start, end, original_flags,
-                               permanent ? 0u : 1u, permanent ? 1u : 0u};
+                               permanent ? 0u : 1u, permanent ? 1u : 0u,
+                               (uint32_t)policy};
         if (!mmio_run_append(&run, count)) return false;
     }
     return true;
@@ -330,6 +345,7 @@ static bool mmio_append_new_range(uint64_t start, uint64_t end, bool permanent,
  * @return False on reference or interval-capacity exhaustion.
  */
 static bool mmio_plan_acquire(uint64_t start, uint64_t end, bool permanent,
+                              enum mmio_cache_policy policy,
                               uint32_t *count)
 {
     uint32_t out = 0;
@@ -338,7 +354,7 @@ static bool mmio_plan_acquire(uint64_t start, uint64_t end, bool permanent,
         const struct mmio_run *old = &mmio_runs[i];
         if (old->end <= start || old->start >= end) {
             if (old->start >= end && cursor < end) {
-                if (!mmio_append_new_range(cursor, end, permanent, &out)) return false;
+                if (!mmio_append_new_range(cursor, end, permanent, policy, &out)) return false;
                 cursor = end;
             }
             if (!mmio_run_append(old, &out)) return false;
@@ -348,7 +364,7 @@ static bool mmio_plan_acquire(uint64_t start, uint64_t end, bool permanent,
         uint64_t first = old->start < start ? start : old->start;
         uint64_t last = old->end > end ? end : old->end;
         if (cursor < first) {
-            if (!mmio_append_new_range(cursor, first, permanent, &out)) return false;
+            if (!mmio_append_new_range(cursor, first, permanent, policy, &out)) return false;
         }
         if (old->start < first) {
             struct mmio_run prefix = *old;
@@ -359,6 +375,7 @@ static bool mmio_plan_acquire(uint64_t start, uint64_t end, bool permanent,
         struct mmio_run overlap = *old;
         overlap.start = first;
         overlap.end = last;
+        if (overlap.policy != (uint32_t)policy) return false;
         if (permanent) {
             overlap.permanent = 1;
         } else {
@@ -374,7 +391,7 @@ static bool mmio_plan_acquire(uint64_t start, uint64_t end, bool permanent,
         }
         cursor = last;
     }
-    if (cursor < end && !mmio_append_new_range(cursor, end, permanent, &out)) return false;
+    if (cursor < end && !mmio_append_new_range(cursor, end, permanent, policy, &out)) return false;
     *count = out;
     return true;
 }
@@ -532,7 +549,8 @@ static bool mmio_verify_leaves(uint64_t start, uint64_t end)
  * sorted interval registry preserves original flags and coalesces identical
  * runs; page-table splits may remain after a failed preflight.
  */
-static bool mmio_acquire(uint64_t phys, uint64_t len, bool permanent)
+static bool mmio_acquire(uint64_t phys, uint64_t len, bool permanent,
+                         enum mmio_cache_policy policy)
 {
     if (!nx_enabled || !mmio_valid_aligned_range(phys, len)) return false;
     uint64_t end = phys + len;
@@ -552,7 +570,7 @@ static bool mmio_acquire(uint64_t phys, uint64_t len, bool permanent)
         return false;
     }
     uint32_t run_count = 0;
-    if (!mmio_plan_acquire(phys, end, permanent, &run_count) ||
+    if (!mmio_plan_acquire(phys, end, permanent, policy, &run_count) ||
         !mmio_registry_fits(run_count, lease_count) || !mmio_verify_leaves(phys, end)) {
         smp_flush_user_tlb();
         kernel_spin_unlock(&mmio_lock);
@@ -561,8 +579,11 @@ static bool mmio_acquire(uint64_t phys, uint64_t len, bool permanent)
 
     for (uint64_t p = phys; p < end; p += PAGE_SIZE) {
         uint64_t *pte = mmio_existing_leaf(p);
-        *pte = (*pte & ~RELIEFNT_PAGE_PAT) | RELIEFNT_PAGE_PWT |
-               RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_NOEXEC;
+        if (policy == MMIO_CACHE_POLICY_UC)
+            *pte = (*pte & ~RELIEFNT_PAGE_PAT) | RELIEFNT_PAGE_PWT |
+                   RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_NOEXEC;
+        else
+            *pte |= RELIEFNT_PAGE_NOEXEC;
     }
     for (uint32_t i = 0; i < run_count; ++i) mmio_runs[i] = mmio_work[i];
     mmio_run_count = run_count;
@@ -582,7 +603,7 @@ static bool mmio_acquire(uint64_t phys, uint64_t len, bool permanent)
  */
 bool paging_acquire_mmio(uint64_t phys, uint64_t len)
 {
-    return mmio_acquire(phys, len, false);
+    return mmio_acquire(phys, len, false, MMIO_CACHE_POLICY_UC);
 }
 /** @brief Drop owned mapping references and restore the last owner's attributes.
  * @param phys Page-aligned base of a previously acquired mapping.
@@ -647,7 +668,21 @@ bool paging_mmio_uncached(uint64_t phys, uint64_t len)
     if (byte_end > UINT64_MAX - (PAGE_SIZE - 1)) return false;
     uint64_t start = phys & ~(PAGE_SIZE - 1);
     uint64_t end = (byte_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    return end > start && mmio_acquire(start, end - start, true);
+    return end > start && mmio_acquire(start, end - start, true, MMIO_CACHE_POLICY_UC);
+}
+
+/** @brief Pin an exact page-aligned default-cache device aperture WB/NX.
+ * @param phys Page-aligned physical base.
+ * @param len Page-aligned nonzero bytes.
+ * @return True after an idempotent permanent claim; false if any PTE already
+ * is not a present writable supervisor identity mapping with default-cache
+ * attributes, a UC interval overlaps, NX is unavailable, or validation and
+ * bounded registry planning fail. Pages are never changed before the complete
+ * policy/range plan is valid. Task context after device quiescence.
+ */
+bool paging_mmio_writeback_nx(uint64_t phys, uint64_t len)
+{
+    return mmio_acquire(phys, len, true, MMIO_CACHE_POLICY_WB);
 }
 
 /**

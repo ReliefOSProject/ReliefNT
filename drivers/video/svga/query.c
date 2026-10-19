@@ -216,7 +216,8 @@ static bool query_batch_has_capacity(const struct svga_batch *batch)
 {
     return batch->metadata &&
            batch->operation_count < batch->metadata->operation_capacity &&
-           batch->query_op_count < batch->metadata->operation_capacity;
+           batch->query_op_count < batch->metadata->query_op_capacity &&
+           batch->metadata->query_ops;
 }
 
 /** @brief Validate a borrowed result attachment while svga_lock is held.
@@ -405,6 +406,12 @@ int svga_batch_query_begin(struct svga_batch *batch, svga_handle context,
 {
     if (!batch || !context || batch->submitted || !batch->metadata)
         return SVGA_EINVAL;
+    if (batch->operation_count >= batch->metadata->operation_capacity ||
+        batch->query_op_count >= batch->metadata->operation_capacity)
+        return SVGA_ENOMEM;
+    int reserve = svga_batch_operation_reserve(batch,
+        SVGA_BATCH_OPERATION_ARRAY_QUERY, batch->query_op_count + 1u);
+    if (reserve) return reserve;
     uint64_t flags;
     if (!svga_try_lock_irqsave(&flags)) return SVGA_EBUSY;
     int cid = svga_find_context(context), ret = SVGA_EINVAL;
@@ -429,6 +436,12 @@ int svga_batch_query_end(struct svga_batch *batch, svga_handle context,
 {
     if (!batch || !context || !result || batch->submitted || !batch->metadata)
         return SVGA_EINVAL;
+    if (batch->operation_count >= batch->metadata->operation_capacity ||
+        batch->query_op_count >= batch->metadata->operation_capacity)
+        return SVGA_ENOMEM;
+    int reserve = svga_batch_operation_reserve(batch,
+        SVGA_BATCH_OPERATION_ARRAY_QUERY, batch->query_op_count + 1u);
+    if (reserve) return reserve;
     uint64_t flags;
     if (!svga_try_lock_irqsave(&flags)) return SVGA_EBUSY;
     int cid = svga_find_context(context), ret = SVGA_EINVAL;
@@ -453,6 +466,12 @@ int svga_batch_query_wait(struct svga_batch *batch, svga_handle context,
 {
     if (!batch || !context || !result || batch->submitted || !batch->metadata)
         return SVGA_EINVAL;
+    if (batch->operation_count >= batch->metadata->operation_capacity ||
+        batch->query_op_count >= batch->metadata->operation_capacity)
+        return SVGA_ENOMEM;
+    int reserve = svga_batch_operation_reserve(batch,
+        SVGA_BATCH_OPERATION_ARRAY_QUERY, batch->query_op_count + 1u);
+    if (reserve) return reserve;
     uint64_t flags;
     if (!svga_try_lock_irqsave(&flags)) return SVGA_EBUSY;
     int cid = svga_find_context(context), ret = SVGA_EINVAL;
@@ -479,12 +498,15 @@ int svga_query_validate_batch_locked(struct svga_batch *batch)
             SVGA_BATCH_SUBMIT_DETAIL_QUERY_METADATA, 0, 1);
         return SVGA_EINVAL;
     }
-    if (batch->query_op_count > batch->metadata->operation_capacity) {
+    if (batch->metadata->query_op_capacity >
+            batch->metadata->operation_capacity ||
+        batch->query_op_count > batch->metadata->query_op_capacity ||
+        (batch->query_op_count && !batch->metadata->query_ops)) {
         svga_batch_submit_failure_set(batch,
             SVGA_BATCH_SUBMIT_REASON_QUERY,
             SVGA_BATCH_SUBMIT_INDEX_NONE,
             SVGA_BATCH_SUBMIT_DETAIL_QUERY_METADATA,
-            batch->query_op_count, batch->metadata->operation_capacity);
+            batch->query_op_count, batch->metadata->query_op_capacity);
         return SVGA_EINVAL;
     }
     if (!batch->query_op_count) return 0;
@@ -738,6 +760,10 @@ void svga_query_commit_batch_locked(const struct svga_batch *batch,
 {
     if (!batch || !batch->metadata) return;
     struct svga_batch_metadata *metadata = batch->metadata;
+    if (metadata->query_op_capacity > metadata->operation_capacity ||
+        batch->query_op_count > metadata->query_op_capacity ||
+        (batch->query_op_count && !metadata->query_ops))
+        return;
     for (uint32_t i = 0; i < batch->query_op_count; ++i) {
         struct svga_batch_query_op *op = &metadata->query_ops[i];
         struct svga_context *context = &svga.contexts[op->context];

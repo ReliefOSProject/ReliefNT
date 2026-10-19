@@ -409,6 +409,9 @@ static int signal_deliver_pending_locked(struct task *task, struct trap_frame *f
             action->restorer = 0;
             task->ignored_signals &= ~bit;
         }
+        /* A caught signal may have been queued before the task parked.  Its
+         * successful frame installation must release that interruptible wait. */
+        sched_wake_interruptible(task);
         return 1;
     }
     return 0;

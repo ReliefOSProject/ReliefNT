@@ -422,8 +422,7 @@ static bool shader_batch_has_capacity(const struct svga_batch *batch)
 {
     return batch && batch->metadata && !batch->submitted &&
            batch->operation_count < batch->metadata->operation_capacity &&
-           batch->shader_op_count < batch->metadata->operation_capacity &&
-           batch->metadata->shader_ops;
+           batch->shader_op_count < batch->metadata->operation_capacity;
 }
 
 /** @brief Remove one staged host slot from the transaction reservation list.
@@ -504,6 +503,9 @@ int svga_batch_bind_shader(struct svga_batch *batch, svga_handle context,
     if (!context ||
         (type != SVGA3D_SHADERTYPE_VS && type != SVGA3D_SHADERTYPE_PS))
         return SVGA_EINVAL;
+    int reserve = svga_batch_operation_reserve(batch,
+        SVGA_BATCH_OPERATION_ARRAY_SHADER, batch->shader_op_count + 1u);
+    if (reserve) return reserve;
     uint64_t flags;
     if (!svga_try_lock_irqsave(&flags)) return SVGA_EBUSY;
     int ret = SVGA_EINVAL;
@@ -584,6 +586,9 @@ int svga_batch_shader_define(struct svga_batch *batch, svga_handle context,
         (type != SVGA3D_SHADERTYPE_VS && type != SVGA3D_SHADERTYPE_PS) ||
         !bytecode || bytes < 4 || (bytes & 3u))
         return SVGA_EINVAL;
+    int reserve = svga_batch_operation_reserve(batch,
+        SVGA_BATCH_OPERATION_ARRAY_SHADER, batch->shader_op_count + 1u);
+    if (reserve) return reserve;
     uint64_t flags;
     if (!svga_try_lock_irqsave(&flags)) return SVGA_EBUSY;
     int ret = SVGA_EINVAL;
@@ -716,6 +721,9 @@ int svga_batch_shader_destroy(struct svga_batch *batch, svga_handle context,
         local_id == UINT32_MAX || local_id >= 5000u ||
         (type != SVGA3D_SHADERTYPE_VS && type != SVGA3D_SHADERTYPE_PS))
         return SVGA_EINVAL;
+    int reserve = svga_batch_operation_reserve(batch,
+        SVGA_BATCH_OPERATION_ARRAY_SHADER, batch->shader_op_count + 1u);
+    if (reserve) return reserve;
     uint64_t flags;
     if (!svga_try_lock_irqsave(&flags)) return SVGA_EBUSY;
     int ret = SVGA_EINVAL;
@@ -790,6 +798,10 @@ void svga_shader_commit_batch_locked(struct svga_batch *batch,
 {
     if (!batch || !batch->metadata) return;
     struct svga_batch_metadata *metadata = batch->metadata;
+    if (metadata->shader_op_capacity > metadata->operation_capacity ||
+        batch->shader_op_count > metadata->shader_op_capacity ||
+        (batch->shader_op_count && !metadata->shader_ops))
+        return;
     for (uint32_t i = 0; i < batch->shader_op_count; ++i) {
         const struct svga_batch_shader_op *op = &metadata->shader_ops[i];
         if (op->kind == SVGA_BATCH_SHADER_BIND) continue;

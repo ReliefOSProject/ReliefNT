@@ -2222,6 +2222,18 @@ void sched_yield_current(void)
 }
 
 /**
+ * @brief Request a normal scheduling decision on the current CPU.
+ * @note The caller holds the IRQ-disabled syscall execution transaction and
+ *       will soon reach the normal user-return scheduling boundary. This
+ *       changes only the local reschedule flag; it does not yield the task or
+ *       alter scheduler accounting, task state, or remote CPU flags.
+ */
+void sched_request_reschedule_current(void)
+{
+    sched_request_reschedule_cpu(scheduler_cpu_index());
+}
+
+/**
  * @brief Write the accumulated busy and idle tick counters into the caller's outputs.
  */
 void sched_cpu_ticks(uint64_t *busy_ticks, uint64_t *idle_ticks)

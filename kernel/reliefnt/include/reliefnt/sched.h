@@ -895,6 +895,14 @@ void sched_on_cpu_tick(void);
 uint64_t sched_tick_count(void);
 void sched_yield_current(void);
 /**
+ * @brief Request a normal scheduling decision at the next current-CPU user-return boundary.
+ * @note Caller holds the IRQ-disabled syscall execution transaction and will
+ *       soon reach that boundary. This publishes only the current CPU's
+ *       reschedule flag; it does not change task state, queues, EEVDF
+ *       accounting or deadlines, or any remote CPU's flag.
+ */
+void sched_request_reschedule_current(void);
+/**
  * @brief Report the total busy and idle ticks accumulated so far.
  */
 void sched_cpu_ticks(uint64_t *busy_ticks, uint64_t *idle_ticks);

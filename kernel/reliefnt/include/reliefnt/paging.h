@@ -129,6 +129,15 @@ void *paging_kernel_direct_map(uint64_t phys);
  * registry or page-table preparation cannot represent the request.
  */
 bool paging_mmio_uncached(uint64_t phys, uint64_t len);
+/** @brief Permanently pin an exact page-aligned default-cache device range WB/NX.
+ * @param phys Page-aligned physical start.
+ * @param len Page-aligned nonzero length.
+ * @return True only when every page is a present writable supervisor identity
+ * mapping with default PWT/PCD/PAT attributes and no conflicting UC/WB
+ * interval exists. Task context after device quiescence; repeated identical
+ * WB claims are idempotent.
+ */
+bool paging_mmio_writeback_nx(uint64_t phys, uint64_t len);
 /** @brief Acquire one UC/NX reference per device page after BAR validation.
  * @param phys Page-aligned physical base.
  * @param len Page-aligned nonzero bytes.

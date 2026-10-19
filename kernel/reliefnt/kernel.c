@@ -261,8 +261,9 @@ static void kernel_start(uint32_t magic, uint32_t multiboot_info)
      * segments and triple fault on delivery after the GDT switch. */
     idt_init();
     console_info("[boot] GDT/TSS/IDT installed; probing VMware graphics acceleration\n");
-    /* The bootstrap page tables are complete now, so SVGA BARs can be marked
-     * UC before any 3D FIFO or guest-memory command is issued. */
+    /* Bootstrap page tables are complete. svga3d_init drains the legacy FIFO,
+     * keeps scan-out VRAM UC, and validates the FIFO BAR mapping policy before
+     * issuing 3D FIFO or guest-memory commands. */
     int svga_ret = svga3d_init();
     struct svga_info boot_svga_info;
     svga_get_info(&boot_svga_info);

@@ -139,8 +139,14 @@ struct svga_batch_query_key {
     uint16_t pending_head, pending_tail, staged_head, staged_tail;
     bool used;
 };
+enum svga_batch_operation_array {
+    SVGA_BATCH_OPERATION_ARRAY_QUERY = 1,
+    SVGA_BATCH_OPERATION_ARRAY_SHADER,
+    SVGA_BATCH_OPERATION_ARRAY_BINDING,
+};
 struct svga_batch_metadata {
     uint32_t operation_capacity, allocation_bytes;
+    uint32_t query_op_capacity, shader_op_capacity, binding_op_capacity;
     svga_handle contexts[SVGA_BATCH_MAX_CONTEXT_REFS];
     svga_handle surfaces[SVGA_BATCH_MAX_SURFACE_REFS];
     svga_handle gmrs[SVGA_BATCH_MAX_GMR_REFS];
@@ -199,6 +205,8 @@ struct svga_device {
     uint32_t shader_reserved_pages;
     uint32_t mode_leases;
     bool fifo_notify_deferred;
+    /** Whether this configured FIFO header advertises the optional BUSY word. */
+    bool fifo_busy_present;
     uint32_t cap_values[SVGA3D_DEVCAP_MAX];
     bool cap_valid[SVGA3D_DEVCAP_MAX];
     uint32_t context_limit, surface_limit, gmr_limit, page_limit, pages;
@@ -221,6 +229,12 @@ struct svga_device {
     uint32_t gpu_error_owner;
 };
 struct svga_span { const void *data; uint32_t bytes; };
+struct svga_cache_report {
+    const char *policy;
+    const char *reason;
+    int status;
+    bool legacy_restored;
+};
 extern struct svga_device svga;
 
 /** @brief Check allocation against live pages and shader staging reservations.
@@ -251,6 +265,18 @@ void svga_barrier(void);
 void svga_relax(void);
 void svga_bind(const struct svga_ops *ops, volatile uint32_t *fifo, uint32_t bytes);
 int svga_configure_locked(bool extended);
+/** @brief Preserve the legacy 2D FIFO after a cache-policy setup failure.
+ * @param cache_status Original negative cache setup status.
+ * @return The original status when reconfiguration succeeds, otherwise EIO.
+ * Caller holds svga_lock after a successful drain/quiesce.
+ */
+int svga_restore_legacy_after_cache_error_locked(int cache_status);
+/** @brief Emit cache-policy diagnostics after releasing svga_lock.
+ * @param report Selected policy or setup-failure details; NULL is ignored.
+ * @note Caller must not hold the shared SVGA lock because console presentation
+ *       can re-enter the framebuffer/SVGA path.
+ */
+void svga_report_cache_result_unlocked(const struct svga_cache_report *report);
 int svga_fifo_packet_locked(uint32_t id, bool three_d, const struct svga_span *spans, uint32_t count);
 /** @brief Queue a FIFO packet without waiting for space; full returns SVGA_EBUSY. */
 int svga_fifo_packet_try_locked(uint32_t id, bool three_d,
@@ -258,6 +284,21 @@ int svga_fifo_packet_try_locked(uint32_t id, bool three_d,
 int svga_fifo_batch_try_locked(const uint32_t *words, uint32_t bytes,
                                svga_handle *fence);
 int svga_batch_submit_locked(struct svga_batch *batch, svga_handle *fence);
+/** @brief Ensure a batch operation array can hold needed live records.
+ * The helper grows geometrically from four entries, capped by the batch's
+ * source-derived operation_capacity. It copies only live records and must be
+ * called without svga_lock held; allocation and replacement free occur before
+ * the staging caller acquires that lock. A failed allocation leaves the array,
+ * its capacity, and all batch counts unchanged.
+ * @param batch Open caller-owned batch whose metadata owns the array.
+ * @param array Query, shader, or binding operation array to reserve.
+ * @param needed Required record count, bounded by operation_capacity.
+ * @return Zero when capacity is available, SVGA_ENOMEM on capacity/allocation
+ *         exhaustion, or SVGA_EINVAL for inconsistent batch metadata.
+ */
+int svga_batch_operation_reserve(struct svga_batch *batch,
+                                 enum svga_batch_operation_array array,
+                                 uint32_t needed);
 int svga_batch_reserve_context_locked(struct svga_batch *batch, uint32_t cid);
 int svga_batch_state_validate_locked(struct svga_batch *batch);
 void svga_batch_state_commit_locked(const struct svga_batch *batch);

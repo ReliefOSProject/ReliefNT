@@ -7,9 +7,11 @@ static int batch_stage_binding(struct svga_batch *batch, svga_handle context,
 {
     if (!batch || !batch->metadata || batch->submitted || !context ||
         batch->operation_count >= batch->metadata->operation_capacity ||
-        batch->binding_op_count >= batch->metadata->operation_capacity ||
-        !batch->metadata->binding_ops)
+        batch->binding_op_count >= batch->metadata->operation_capacity)
         return SVGA_EINVAL;
+    int reserve = svga_batch_operation_reserve(batch,
+        SVGA_BATCH_OPERATION_ARRAY_BINDING, batch->binding_op_count + 1u);
+    if (reserve) return reserve;
     uint64_t flags;
     if (!svga_try_lock_irqsave(&flags)) return SVGA_EBUSY;
     int ret = SVGA_EINVAL;
@@ -83,21 +85,16 @@ int svga_batch_state_validate_locked(struct svga_batch *batch)
             SVGA_BATCH_SUBMIT_DETAIL_BINDING_METADATA, 0, 1);
         return SVGA_EINVAL;
     }
-    if (batch->binding_op_count > batch->metadata->operation_capacity) {
+    if (batch->metadata->binding_op_capacity >
+            batch->metadata->operation_capacity ||
+        batch->binding_op_count > batch->metadata->binding_op_capacity ||
+        (batch->binding_op_count && !batch->metadata->binding_ops)) {
         svga_batch_submit_failure_set(batch,
             SVGA_BATCH_SUBMIT_REASON_BINDING,
             SVGA_BATCH_SUBMIT_INDEX_NONE,
             SVGA_BATCH_SUBMIT_DETAIL_BINDING_METADATA,
             batch->binding_op_count,
-            batch->metadata->operation_capacity);
-        return SVGA_EINVAL;
-    }
-    if (batch->binding_op_count && !batch->metadata->binding_ops) {
-        svga_batch_submit_failure_set(batch,
-            SVGA_BATCH_SUBMIT_REASON_BINDING,
-            SVGA_BATCH_SUBMIT_INDEX_NONE,
-            SVGA_BATCH_SUBMIT_DETAIL_BINDING_METADATA,
-            batch->binding_op_count, 0);
+            batch->metadata->binding_op_capacity);
         return SVGA_EINVAL;
     }
     struct svga_batch_metadata *metadata = batch->metadata;
@@ -206,6 +203,10 @@ void svga_batch_state_commit_locked(const struct svga_batch *batch)
 {
     if (!batch || !batch->metadata) return;
     const struct svga_batch_metadata *metadata = batch->metadata;
+    if (metadata->binding_op_capacity > metadata->operation_capacity ||
+        batch->binding_op_count > metadata->binding_op_capacity ||
+        (batch->binding_op_count && !metadata->binding_ops))
+        return;
     for (uint32_t i = 0; i < batch->binding_op_count; ++i) {
         const struct svga_batch_binding_op *op = &metadata->binding_ops[i];
         int cid = svga_find_context(op->context);

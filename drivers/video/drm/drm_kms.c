@@ -852,10 +852,10 @@ static int drm_kms_dirtyfb(struct task *task, struct drm_file *file,
             !drm_kms_pending_job->submitted &&
             drm_kms_pending_job->fb == fb) {
             struct drm_kms_present_job *job = drm_kms_pending_job;
-            if (x1 < job->x1) x1 = job->x1;
-            if (y1 < job->y1) y1 = job->y1;
-            if (x2 > job->x2) x2 = job->x2;
-            if (y2 > job->y2) y2 = job->y2;
+            if (x1 > job->x1) x1 = job->x1;
+            if (y1 > job->y1) y1 = job->y1;
+            if (x2 < job->x2) x2 = job->x2;
+            if (y2 < job->y2) y2 = job->y2;
             drm_kms_job_set_rect(job, x1, y1, x2, y2);
             drm_kms_service_pending_damage();
             return 0;

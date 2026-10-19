@@ -404,6 +404,116 @@ static bool pci_bar_contains(uint64_t phys, uint64_t bytes)
     }
     return false;
 }
+
+/** @brief Validate a page range against one exact function BAR only.
+ * @param device Exact PCI identity selected by the driver.
+ * @param bar Zero-based memory BAR index.
+ * @param phys Page-aligned physical start of the requested aperture.
+ * @param bytes Nonzero page-aligned byte length.
+ * @return True when that implemented memory BAR contains the complete range.
+ * Task context after the selected device is drained. The command decode and BAR are restored while
+ * the serialized PCI configuration lock is still held, including on rejects.
+ */
+bool pci_device_bar_contains(const struct pci_device *device, uint8_t bar,
+                             uint64_t phys, uint64_t bytes)
+{
+    if (!device || !bytes || (phys & 4095u) || (bytes & 4095u) ||
+        phys > UINT64_MAX - bytes)
+        return false;
+
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&pci_config_lock, &flags);
+    uint32_t identity = pci_raw_read32(device->bus, device->slot, device->function, 0x00);
+    uint32_t header = pci_raw_read32(device->bus, device->slot, device->function, 0x0c);
+    uint32_t header_type = (header >> 16) & 0x7fu;
+    uint32_t bar_count = header_type == 0 ? 6u : header_type == 1 ? 2u : 0u;
+    bool valid = (uint16_t)identity == device->vendor_id &&
+                 (uint16_t)(identity >> 16) == device->device_id &&
+                 bar < bar_count;
+    uint32_t layout = 0;
+    while (valid && layout < bar) {
+        uint32_t previous = pci_raw_read32(device->bus, device->slot,
+            device->function, (uint8_t)(0x10u + layout * 4u));
+        if (previous == UINT32_MAX) {
+            valid = false;
+        } else if (previous && !(previous & 1u)) {
+            uint32_t previous_type = (previous >> 1) & 3u;
+            if (previous_type == 2u) {
+                if (layout + 1u >= bar_count) valid = false;
+                layout += 2u;
+            } else if (previous_type == 0u) {
+                ++layout;
+            } else {
+                valid = false;
+            }
+        } else {
+            ++layout;
+        }
+    }
+    if (layout != bar) valid = false; /* Selected index is a BAR's high dword. */
+    uint32_t bar_offset = 0x10u + (uint32_t)bar * 4u;
+    uint32_t low = valid ? pci_raw_read32(device->bus, device->slot,
+                                           device->function, (uint8_t)bar_offset)
+                         : 0;
+    valid = valid && low != 0 && low != UINT32_MAX &&
+                 !(low & 1u);
+    uint32_t type = (low >> 1) & 3u;
+    bool wide = type == 2u;
+    if (type != 0u && !wide) valid = false;
+    if (wide && bar + 1 >= bar_count) valid = false;
+    uint32_t high = wide && valid ? pci_raw_read32(device->bus, device->slot,
+                                          device->function, (uint8_t)(bar_offset+4)) : 0;
+    uint64_t base = ((uint64_t)high << 32) | (low & ~15u);
+    if (wide && high == UINT32_MAX) valid = false;
+
+    uint64_t size = 0;
+    if (valid && base) {
+        uint16_t command = (uint16_t)pci_raw_read32(
+            device->bus, device->slot, device->function, 0x04);
+        pci_raw_write16(device->bus, device->slot, device->function, 0x04,
+                        command & (uint16_t)~3u);
+        pci_raw_write32(device->bus, device->slot, device->function,
+                        (uint8_t)bar_offset,
+                        UINT32_MAX);
+        if (wide)
+            pci_raw_write32(device->bus, device->slot, device->function,
+                            (uint8_t)(bar_offset+4),
+                            UINT32_MAX);
+        uint32_t mask_low = pci_raw_read32(device->bus, device->slot,
+                                           device->function, (uint8_t)bar_offset);
+        uint32_t mask_high = wide ? pci_raw_read32(device->bus, device->slot,
+                                                   device->function,
+                                                   (uint8_t)(bar_offset+4))
+                                  : UINT32_MAX;
+        pci_raw_write32(device->bus, device->slot, device->function,
+                        (uint8_t)bar_offset, low);
+        if (wide)
+            pci_raw_write32(device->bus, device->slot, device->function,
+                            (uint8_t)(bar_offset+4),
+                            high);
+        pci_raw_write16(device->bus, device->slot, device->function, 0x04, command);
+
+        if (wide) {
+            uint64_t mask = ((uint64_t)mask_high << 32) | (mask_low & ~15u);
+            size = ~mask + 1;
+        } else {
+            uint32_t mask = mask_low & ~15u;
+            size = (uint32_t)(~mask + 1u);
+        }
+        if (!size || (size & (size - 1)) || (base & (size - 1)) ||
+            size > UINT64_MAX - base)
+            valid = false;
+    } else {
+        valid = false;
+    }
+    kernel_spin_unlock_irqrestore(&pci_config_lock, flags);
+
+    if (!valid) return false;
+    uint64_t bar_end = base + size;
+    if (phys < base || phys > bar_end || bytes > bar_end - phys) return false;
+    return true;
+}
+
 #define PCI_MMIO_MAX 64U
 struct pci_mmio_mapping { uint64_t phys, bytes, aligned, length; void *ptr; uint32_t refs; };
 static struct pci_mmio_mapping pci_mappings[PCI_MMIO_MAX];
