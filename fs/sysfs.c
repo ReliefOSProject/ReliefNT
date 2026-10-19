@@ -2,6 +2,7 @@
  * actual kernel objects; no writable control files or DRM ioctls are implied. */
 #include <reliefos/fs_abi.h>
 #include <reliefnt/framebuffer.h>
+#include <reliefnt/drm.h>
 #include <reliefnt/inventory.h>
 #include <reliefnt/pci.h>
 #include <reliefnt/platform.h>
@@ -46,7 +47,11 @@ enum attribute {
     A_PCI_UEVENT,
     A_BLOCK_NUMBER,
     A_BLOCK_TEXT,
-    A_BLOCK_FS_TEXT
+    A_BLOCK_FS_TEXT,
+    A_DRM_DEV,
+    A_DRM_UEVENT,
+    A_DRM_RENDER_DEV,
+    A_DRM_RENDER_UEVENT
 };
 struct sys_node {
     const char *path;
@@ -103,6 +108,14 @@ static void sys_pci_path(char out[RELIEFOS_FS_PATH_LEN], const char *prefix, uin
     text_hex(&s, p->function, 1);
     text_string(&s, suffix);
     out[s.written] = 0;
+}
+static void sys_hex_upper(struct text_stream *s, uint64_t value, uint32_t digits)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    while (digits) {
+        char c = hex[(value >> (--digits * 4)) & 15];
+        text_bytes(s, &c, 1);
+    }
 }
 /** @brief Visit one generated node, propagating an early match or visitor error. */
 static int sys_emit(sys_visit visit, void *ctx, const char *path, enum attribute attr, uint32_t index,
@@ -252,6 +265,7 @@ static int sys_walk(sys_visit visit, void *ctx)
 {
     static const char *dirs[] = {"/sys",
                                  "/sys/dev",
+                                 "/sys/dev/char",
                                  "/sys/dev/block",
                                  "/sys/block",
                                  "/sys/class/block",
@@ -332,10 +346,86 @@ static int sys_walk(sys_visit visit, void *ctx)
         sys_pci_path(target, "../../../devices/pci0000:00/", i, "");
         if ((ret = sys_emit(visit, ctx, path, A_LINK, i, target)))
             return ret;
+        /* Linux gives each PCI function a bus-class link. libdrm's PCI bus
+         * detection reads <device>/subsystem and recognizes its final
+         * component as "pci". */
+        sys_pci_path(path, "/sys/devices/pci0000:00/", i, "/subsystem");
+        if ((ret = sys_emit(visit, ctx, path, A_LINK, i, "../../../bus/pci")))
+            return ret;
         for (uint32_t j = 0; j < sizeof(kinds) / sizeof(kinds[0]); ++j) {
             sys_pci_path(path, "/sys/devices/pci0000:00/", i, attrs[j]);
             if ((ret = sys_emit(visit, ctx, path, kinds[j], i, 0)))
                 return ret;
+        }
+    }
+    struct pci_device drm_pci;
+    if (drm_device_pci_identity(&drm_pci) == 0) {
+        for (uint32_t i = 0; i < pci_count; ++i) {
+            if (pci_devices[i].bus != drm_pci.bus ||
+                pci_devices[i].slot != drm_pci.slot ||
+                pci_devices[i].function != drm_pci.function ||
+                pci_devices[i].vendor_id != drm_pci.vendor_id ||
+                pci_devices[i].device_id != drm_pci.device_id)
+                continue;
+            sys_pci_path(path, "/sys/devices/pci0000:00/", i, "/drm");
+            if ((ret = sys_emit(visit, ctx, path, A_DIR, i, 0))) return ret;
+            sys_pci_path(path, "/sys/devices/pci0000:00/", i, "/drm/card0");
+            if ((ret = sys_emit(visit, ctx, path, A_DIR, i, 0))) return ret;
+            sys_pci_path(path, "/sys/devices/pci0000:00/", i, "/drm/card0/dev");
+            if ((ret = sys_emit(visit, ctx, path, A_DRM_DEV, i, 0))) return ret;
+            sys_pci_path(path, "/sys/devices/pci0000:00/", i, "/drm/card0/uevent");
+            if ((ret = sys_emit(visit, ctx, path, A_DRM_UEVENT, i, 0))) return ret;
+            sys_pci_path(path, "/sys/devices/pci0000:00/", i, "/drm/card0/device");
+            if ((ret = sys_emit(visit, ctx, path, A_LINK, i, "../.."))) return ret;
+            sys_pci_path(target, "../../devices/pci0000:00/", i, "/drm/card0");
+            if ((ret = sys_emit(visit, ctx, "/sys/class/drm/card0", A_LINK, i, target)))
+                return ret;
+            sys_pci_path(path, "/sys/devices/pci0000:00/", i,
+                         "/drm/card0/card0-Virtual-1");
+            if ((ret = sys_emit(visit, ctx, path, A_DIR, i, 0))) return ret;
+            const char *connector_suffixes[] = {"/status", "/enabled", "/modes"};
+            const enum attribute connector_attrs[] = {
+                A_CONNECTED, A_ENABLED, A_FB_MODES,
+            };
+            for (uint32_t j = 0; j < sizeof(connector_attrs) / sizeof(connector_attrs[0]); ++j) {
+                sys_pci_path(path, "/sys/devices/pci0000:00/", i,
+                             "/drm/card0/card0-Virtual-1");
+                size_t path_length = __builtin_strlen(path);
+                size_t suffix_length = __builtin_strlen(connector_suffixes[j]);
+                if (path_length + suffix_length >= sizeof(path)) return -1;
+                __builtin_memcpy(path + path_length, connector_suffixes[j], suffix_length + 1u);
+                if ((ret = sys_emit(visit, ctx, path, connector_attrs[j], i, 0))) return ret;
+            }
+            if ((ret = sys_emit(visit, ctx, "/sys/dev/char/226:0", A_LINK, i, target)))
+                return ret;
+            sys_pci_path(target, "../../devices/pci0000:00/", i,
+                         "/drm/card0/card0-Virtual-1");
+            if ((ret = sys_emit(visit, ctx, "/sys/class/drm/card0-Virtual-1",
+                                A_LINK, i, target))) return ret;
+            if (drm_device_render_node_ready()) {
+                sys_pci_path(path, "/sys/devices/pci0000:00/", i,
+                             "/drm/renderD128");
+                if ((ret = sys_emit(visit, ctx, path, A_DIR, i, 0))) return ret;
+                sys_pci_path(path, "/sys/devices/pci0000:00/", i,
+                             "/drm/renderD128/dev");
+                if ((ret = sys_emit(visit, ctx, path, A_DRM_RENDER_DEV, i, 0)))
+                    return ret;
+                sys_pci_path(path, "/sys/devices/pci0000:00/", i,
+                             "/drm/renderD128/uevent");
+                if ((ret = sys_emit(visit, ctx, path,
+                                    A_DRM_RENDER_UEVENT, i, 0))) return ret;
+                sys_pci_path(path, "/sys/devices/pci0000:00/", i,
+                             "/drm/renderD128/device");
+                if ((ret = sys_emit(visit, ctx, path, A_LINK, i, "../..")))
+                    return ret;
+                sys_pci_path(target, "../../devices/pci0000:00/", i,
+                             "/drm/renderD128");
+                if ((ret = sys_emit(visit, ctx, "/sys/class/drm/renderD128",
+                                    A_LINK, i, target))) return ret;
+                if ((ret = sys_emit(visit, ctx, "/sys/dev/char/226:128",
+                                    A_LINK, i, target))) return ret;
+            }
+            break;
         }
     }
     const struct framebuffer *fb = framebuffer_get();
@@ -347,15 +437,9 @@ static int sys_walk(sys_visit visit, void *ctx)
                                "/sys/devices/virtual/graphics/fb0/name",
                                "/sys/devices/virtual/graphics/fb0/virtual_size",
                                "/sys/devices/virtual/graphics/fb0/bits_per_pixel",
-                               "/sys/devices/virtual/graphics/fb0/stride",
-                               "/sys/devices/virtual/drm",
-                               "/sys/devices/virtual/drm/card0",
-                               "/sys/devices/virtual/drm/card0/card0-Unknown-1",
-                               "/sys/devices/virtual/drm/card0/card0-Unknown-1/status",
-                               "/sys/devices/virtual/drm/card0/card0-Unknown-1/enabled",
-                               "/sys/devices/virtual/drm/card0/card0-Unknown-1/modes"};
-        const enum attribute kinds2[] = {A_DIR, A_DIR, A_FB_NAME, A_FB_SIZE,   A_FB_BPP,  A_FB_STRIDE,
-                                         A_DIR, A_DIR, A_DIR,     A_CONNECTED, A_ENABLED, A_FB_MODES};
+                               "/sys/devices/virtual/graphics/fb0/stride"};
+        const enum attribute kinds2[] = {A_DIR, A_DIR, A_FB_NAME, A_FB_SIZE,
+                                         A_FB_BPP, A_FB_STRIDE};
         for (uint32_t i = 0; i < sizeof(kinds2) / sizeof(kinds2[0]); ++i)
             if ((ret = sys_emit(visit, ctx, paths[i], kinds2[i], 0, 0)))
                 return ret;
@@ -387,12 +471,6 @@ static int sys_walk(sys_visit visit, void *ctx)
                 return ret;
             break;
         }
-        if ((ret = sys_emit(visit, ctx, "/sys/class/drm/card0", A_LINK, 0,
-                            "../../devices/virtual/drm/card0")))
-            return ret;
-        if ((ret = sys_emit(visit, ctx, "/sys/class/drm/card0-Unknown-1", A_LINK, 0,
-                            "../../devices/virtual/drm/card0/card0-Unknown-1")))
-            return ret;
     }
     return sys_blocks(visit, ctx);
 }
@@ -516,11 +594,36 @@ static void sys_value(const struct sys_node *n, struct text_stream *s)
         return;
     case A_PCI_UEVENT:
         text_string(s, "PCI_CLASS=");
-        text_hex(s, (pci->class_code << 16) | (pci->subclass << 8) | pci->prog_if, 6);
+        sys_hex_upper(s, (pci->class_code << 16) | (pci->subclass << 8) | pci->prog_if, 6);
         text_string(s, "\nPCI_ID=");
-        text_hex(s, pci->vendor_id, 4);
+        sys_hex_upper(s, pci->vendor_id, 4);
         text_string(s, ":");
-        text_hex(s, pci->device_id, 4);
+        sys_hex_upper(s, pci->device_id, 4);
+        {
+            uint32_t sub = sys_pci_subsystem(n);
+            char slot[RELIEFOS_FS_PATH_LEN];
+            text_string(s, "\nPCI_SUBSYS_ID=");
+            sys_hex_upper(s, sub & 65535u, 4);
+            text_string(s, ":");
+            sys_hex_upper(s, sub >> 16, 4);
+            text_string(s, "\nPCI_SLOT_NAME=");
+            sys_pci_path(slot, "", n->index, "");
+            text_string(s, slot);
+            text_string(s, "\nMODALIAS=pci:v");
+            sys_hex_upper(s, pci->vendor_id, 8);
+            text_string(s, "d");
+            sys_hex_upper(s, pci->device_id, 8);
+            text_string(s, "sv");
+            sys_hex_upper(s, sub & 65535u, 8);
+            text_string(s, "sd");
+            sys_hex_upper(s, sub >> 16, 8);
+            text_string(s, "bc");
+            sys_hex_upper(s, pci->class_code, 2);
+            text_string(s, "sc");
+            sys_hex_upper(s, pci->subclass, 2);
+            text_string(s, "i");
+            sys_hex_upper(s, pci->prog_if, 2);
+        }
         break;
     case A_FB_NAME:
         text_string(s, fb->backend == FRAMEBUFFER_BACKEND_VMWARE_SVGA ? "vmware-svga"
@@ -547,7 +650,7 @@ static void sys_value(const struct sys_node *n, struct text_stream *s)
         text_string(s, "connected");
         break;
     case A_ENABLED:
-        text_string(s, "enabled");
+        text_string(s, drm_device_kms_scanout_active() ? "enabled" : "disabled");
         break;
     case A_BLOCK_NUMBER:
         text_unsigned(s, n->value);
@@ -557,6 +660,20 @@ static void sys_value(const struct sys_node *n, struct text_stream *s)
         break;
     case A_BLOCK_FS_TEXT:
         text_string(s, n->target);
+        break;
+    case A_DRM_DEV:
+        text_string(s, "226:0");
+        break;
+    case A_DRM_UEVENT:
+        text_string(s, "MAJOR=226\nMINOR=0\nDEVNAME=dri/card0\nDEVTYPE=drm_minor");
+        break;
+    case A_DRM_RENDER_DEV:
+        text_string(s, "226:128");
+        break;
+    case A_DRM_RENDER_UEVENT:
+        text_string(s,
+                    "MAJOR=226\nMINOR=128\nDEVNAME=dri/renderD128\n"
+                    "DEVTYPE=drm_minor");
         break;
     default:
         return;

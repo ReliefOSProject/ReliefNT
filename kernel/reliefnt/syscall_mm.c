@@ -5,6 +5,7 @@
 #include <reliefnt/console.h>
 #include <reliefnt/audio.h>
 #include <reliefnt/framebuffer.h>
+#include <reliefnt/drm.h>
 #include <reliefnt/mm.h>
 #include <reliefnt/smp.h>
 #include <reliefnt/paging.h>
@@ -176,9 +177,65 @@ static void task_vma_clear(struct task_vma *vma)
     if (vma) {
         sysv_shm_vma_release(sched_current_task(), vma);
         if (vma->audio_pcm) audio_pcm_mmap_release(vma->audio_pcm, (enum audio_pcm_mmap_region)vma->audio_mmap_region);
+        if (vma->drm_bo) drm_bo_put(vma->drm_bo);
+        if (vma->drm_mapping_file) task_file_put(vma->drm_mapping_file);
         (void)storage_inode_put(vma->inode);
         *vma = (struct task_vma){0};
     }
+}
+
+/**
+ * @brief Drop the temporary BO and original-OFD pins used to install a DRM mmap.
+ * @param bo Optional pointer to the owned BO reference; when non-null, this
+ *        helper drops the reference and clears the caller's pointer.
+ * @param mapping_file Optional pointer to the owned task_file/OFD reference;
+ *        when non-null, this helper drops the reference and clears the pointer.
+ * @return No value; releases the owned pins through the supplied pointers.
+ *
+ * The caller owns these temporary pins until this call and may safely call the
+ * helper again after the pointers have been cleared. This helper neither
+ * acquires a VMA-store lock nor changes mapping bounds; the caller handles
+ * address-space mapping changes.
+ */
+static void task_drm_mapping_release(struct drm_bo **bo,
+                                    struct task_file **mapping_file)
+{
+    if (bo && *bo) {
+        drm_bo_put(*bo);
+        *bo = NULL;
+    }
+    if (mapping_file && *mapping_file) {
+        task_file_put(*mapping_file);
+        *mapping_file = NULL;
+    }
+}
+
+/**
+ * @brief Give a copied DRM VMA segment independent backing and OFD pins.
+ * @param dst Output pointer to the copied destination VMA whose DRM references
+ *        do not yet own pins; may be null, in which case no fields are changed.
+ * @param src Borrowed input pointer to a stable source VMA; its optional BO and
+ *        task_file references are retained for dst. It may be null, in which
+ *        case no fields are changed.
+ * @return No value; installs independent backing and OFD pins in dst in place.
+ *
+ * No VMA-store lock is acquired and no VMA address bounds are changed here; the
+ * caller keeps the source metadata stable and sets the destination segment's
+ * range. This helper only replaces copied DRM pointers with independently
+ * retained pins.
+ */
+static void task_vma_retain_drm(struct task_vma *dst,
+                                const struct task_vma *src)
+{
+    if (!dst || !src) return;
+    dst->drm_bo = NULL;
+    dst->drm_mapping_file = NULL;
+    if (src->drm_bo) {
+        drm_bo_get(src->drm_bo);
+        dst->drm_bo = src->drm_bo;
+    }
+    if (src->drm_mapping_file)
+        dst->drm_mapping_file = task_file_get(src->drm_mapping_file);
 }
 
 /**
@@ -981,6 +1038,10 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     int device_mapping = 0;
     int audio_file_mapping = 0;
     int audio_mapping_acquired = 0;
+    int drm_file_mapping = 0;
+    struct drm_bo *drm_mapping_bo = NULL;
+    struct task_file *drm_mapping_file = NULL;
+    uint64_t drm_bo_offset = 0;
     uint64_t device_phys = 0;
     struct audio_pcm_mmap audio_mapping = {0};
     int ret;
@@ -1023,14 +1084,33 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
         if (!file) {
             return -RELIEFOS_EBADF;
         }
-        if (!file_can_read(file)) return -RELIEFOS_EACCES;
-        int refresh = storage_inode_refresh(&file->node);
-        if (refresh < 0) return refresh;
-        if ((flags & LINUX_MAP_SHARED) && !file_can_write(file)) {
-            max_prot &= ~LINUX_PROT_WRITE;
-            if (prot & LINUX_PROT_WRITE) return -RELIEFOS_EACCES;
+        if (file->drm_prime_file)
+            return drm_prime_file_mmap(file, flags, prot);
+        if (file->drm_file) {
+            uint64_t sharing = flags & (LINUX_MAP_SHARED | LINUX_MAP_PRIVATE);
+            if (sharing != LINUX_MAP_SHARED || (prot & LINUX_PROT_EXEC))
+                return (prot & LINUX_PROT_EXEC) ? -RELIEFOS_EACCES : -RELIEFOS_EINVAL;
+            /* Linux do_mmap() requires FMODE_READ for both shared and
+             * private file mappings, even when PROT_NONE was requested. */
+            if (!file_can_read(file)) return -RELIEFOS_EACCES;
+            max_prot = LINUX_PROT_READ;
+            if (file_can_write(file)) max_prot |= LINUX_PROT_WRITE;
+            if (prot & ~max_prot) return -RELIEFOS_EACCES;
+            drm_file_mapping = 1;
+            device_mapping = 1;
+            vma_flags = TASK_VMA_FLAG_DEVICE | TASK_VMA_FLAG_SHARED |
+                        TASK_VMA_FLAG_MMAP;
+        } else {
+            if (!file_can_read(file)) return -RELIEFOS_EACCES;
+            int refresh = storage_inode_refresh(&file->node);
+            if (refresh < 0) return refresh;
+            if ((flags & LINUX_MAP_SHARED) && !file_can_write(file)) {
+                max_prot &= ~LINUX_PROT_WRITE;
+                if (prot & LINUX_PROT_WRITE) return -RELIEFOS_EACCES;
+            }
         }
-        if (file->node.flags & (STORAGE_NODE_FLAG_EXT2 | STORAGE_NODE_FLAG_TMPFS)) {
+        if (!drm_file_mapping &&
+            (file->node.flags & (STORAGE_NODE_FLAG_EXT2 | STORAGE_NODE_FLAG_TMPFS))) {
             uint64_t mount_flags;
             int ret = storage_node_mount_flags(&file->node, &mount_flags);
             if (ret < 0) return ret;
@@ -1043,7 +1123,8 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                 max_prot &= ~LINUX_PROT_EXEC;
             }
         }
-        if (file->flags & (TASK_FILE_FLAG_DEV_NODE | TASK_FILE_FLAG_DEV_SHM)) {
+        if (!drm_file_mapping &&
+            (file->flags & (TASK_FILE_FLAG_DEV_NODE | TASK_FILE_FLAG_DEV_SHM))) {
             uint64_t bytes;
             if ((file->flags & TASK_FILE_FLAG_DEV_NODE) &&
                 file->node.first_cluster == STORAGE_DEV_KIND_AUDIO) {
@@ -1083,7 +1164,7 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                 return -RELIEFOS_EINVAL;
             }
             if (device_mapping && !audio_file_mapping) vma_flags = TASK_VMA_FLAG_DEVICE;
-        } else if (file->node.type != RELIEFOS_FS_TYPE_FILE) {
+        } else if (!drm_file_mapping && file->node.type != RELIEFOS_FS_TYPE_FILE) {
             return -RELIEFOS_EINVAL;
         }
     }
@@ -1116,25 +1197,50 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     if (end > task_mmap_top(task)) {
         return (flags & LINUX_MAP_FIXED) ? -RELIEFOS_EINVAL : -RELIEFOS_ENOMEM;
     }
+    if (drm_file_mapping) {
+        ret = drm_file_mmap_bo(file, offset, mapped_len, &drm_mapping_bo,
+                               &drm_bo_offset);
+        if (ret < 0) return ret;
+        drm_mapping_file = task_file_get(file);
+        if (!drm_mapping_file) {
+            task_drm_mapping_release(&drm_mapping_bo, &drm_mapping_file);
+            return -RELIEFOS_ENOMEM;
+        }
+        device_phys = drm_bo_page_physical(drm_mapping_bo, drm_bo_offset);
+        if (!device_phys || (device_phys & (PAGE_SIZE - 1ULL))) {
+            task_drm_mapping_release(&drm_mapping_bo, &drm_mapping_file);
+            return -RELIEFOS_EINVAL;
+        }
+    }
     if (flags & LINUX_MAP_FIXED) {
         if ((flags & LINUX_MAP_FIXED_NOREPLACE) && !task_user_pages_free(task, start, end)) {
+            task_drm_mapping_release(&drm_mapping_bo, &drm_mapping_file);
             return -RELIEFOS_EEXIST;
         }
-        if (!task_address_space_can_map(task, start, end)) return -RELIEFOS_ENOMEM;
+        if (!task_address_space_can_map(task, start, end)) {
+            task_drm_mapping_release(&drm_mapping_bo, &drm_mapping_file);
+            return -RELIEFOS_ENOMEM;
+        }
         int unmap_ret = syscall_mm_munmap(start, mapped_len);
         if (!(flags & LINUX_MAP_FIXED_NOREPLACE) && unmap_ret < 0 && unmap_ret != -RELIEFOS_EINVAL) {
+            task_drm_mapping_release(&drm_mapping_bo, &drm_mapping_file);
             return unmap_ret;
         }
     } else if (!task_user_pages_free(task, start, end)) {
+        task_drm_mapping_release(&drm_mapping_bo, &drm_mapping_file);
         return -RELIEFOS_ENOMEM;
     }
-    if (!(flags & LINUX_MAP_FIXED) && !task_address_space_can_map(task, start, end)) return -RELIEFOS_ENOMEM;
+    if (!(flags & LINUX_MAP_FIXED) && !task_address_space_can_map(task, start, end)) {
+        task_drm_mapping_release(&drm_mapping_bo, &drm_mapping_file);
+        return -RELIEFOS_ENOMEM;
+    }
     if (!task_vma_can_record_mapping(task, start, end, prot, vma_flags,
                                      file ? &file->node : NULL, offset, max_prot)) {
         console_warn("[reliefnt] mmap VMA slots exhausted pid=%u bytes=%llu vmas=%u\n",
                        task->pid,
                        (unsigned long long)mapped_len,
                        task_vma_count(task));
+        task_drm_mapping_release(&drm_mapping_bo, &drm_mapping_file);
         return -RELIEFOS_ENOMEM;
     }
 
@@ -1178,6 +1284,7 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                 task_unmap_pages(task, start, page);
                 if (audio_mapping_acquired)
                     audio_pcm_mmap_release(audio_mapping.pcm, audio_mapping.region);
+                task_drm_mapping_release(&drm_mapping_bo, &drm_mapping_file);
                 return -RELIEFOS_ENOMEM;
             }
         }
@@ -1194,19 +1301,34 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     if (ret < 0) {
         if (audio_mapping_acquired)
             audio_pcm_mmap_release(audio_mapping.pcm, audio_mapping.region);
+        task_drm_mapping_release(&drm_mapping_bo, &drm_mapping_file);
         return ret;
     }
 
     if (task_vma_record_mapping(task, start, end, prot, vma_flags,
-                                file ? &file->node : NULL, offset, max_prot) < 0) {
+                                drm_file_mapping ? NULL :
+                                    (file ? &file->node : NULL),
+                                offset, max_prot) < 0) {
         task_unmap_pages(task, start, end);
         if (audio_mapping_acquired)
             audio_pcm_mmap_release(audio_mapping.pcm, audio_mapping.region);
+        task_drm_mapping_release(&drm_mapping_bo, &drm_mapping_file);
         return -RELIEFOS_ENOMEM;
     }
     if (device_mapping) {
         struct task_vma *device_vma = task_vma_containing(task, start, end);
-        if (device_vma) device_vma->device_physical = device_phys;
+        if (!device_vma) {
+            task_unmap_pages(task, start, end);
+            task_drm_mapping_release(&drm_mapping_bo, &drm_mapping_file);
+            return -RELIEFOS_ENOMEM;
+        }
+        device_vma->device_physical = device_phys;
+        if (drm_file_mapping) {
+            device_vma->drm_bo = drm_mapping_bo;
+            device_vma->drm_mapping_file = drm_mapping_file;
+            drm_mapping_bo = NULL;
+            drm_mapping_file = NULL;
+        }
     }
     if (audio_mapping_acquired) {
         struct task_vma *audio_vma = task_vma_containing(task, start, end);
@@ -1299,6 +1421,105 @@ int64_t syscall_mm_mremap(uint64_t old_addr, uint64_t old_len, uint64_t new_len,
     old_end = old_addr + old_mapped;
     vma = task_vma_containing(task, old_addr, old_end);
     if (!vma) return -RELIEFOS_EFAULT;
+    if (vma->drm_bo) {
+        if (new_mapped == old_mapped && !(flags & LINUX_MREMAP_FIXED))
+            return (int64_t)old_addr;
+        if (new_mapped > old_mapped)
+            return -RELIEFOS_EFAULT;
+        if (!(flags & LINUX_MREMAP_FIXED)) {
+            return syscall_mm_munmap(old_addr + new_mapped,
+                                     old_mapped - new_mapped) < 0
+                       ? -RELIEFOS_ENOMEM : (int64_t)old_addr;
+        }
+
+        /* Linux TTM marks these VM_PFNMAP | VM_DONTEXPAND. It permits a
+         * shrink and a fixed move, but rejects growth with EFAULT. Keep the
+         * initial implementation's move atomic at the VMA level: a fixed
+         * move must name the complete DRM VMA so no segment loses its object
+         * offset or independent OFD reference. */
+        uint64_t source_start = vma->start;
+        uint64_t source_end = vma->end;
+        uint64_t source_bytes = source_end - source_start;
+        uint64_t destination_end;
+        uint32_t source_index = UINT32_MAX;
+        uint32_t destination_index;
+        if (old_addr != source_start || old_mapped != source_bytes ||
+            !vma->drm_mapping_file || !vma->drm_mapping_file->used)
+            return -RELIEFOS_EFAULT;
+        if (!new_addr || (new_addr & (PAGE_SIZE - 1ULL)) ||
+            new_addr < RELIEFNT_USER_BASE || new_addr >= task_mmap_top(task) ||
+            new_mapped > task_mmap_top(task) - new_addr)
+            return -RELIEFOS_EINVAL;
+        destination_end = new_addr + new_mapped;
+        if (new_addr < source_end && source_start < destination_end)
+            return -RELIEFOS_EINVAL;
+        for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
+            struct task_vma *entry = sched_task_vma_at(task, i);
+            if (entry == vma) {
+                source_index = i;
+                break;
+            }
+        }
+        if (source_index == UINT32_MAX) return -RELIEFOS_EFAULT;
+
+        /* MREMAP_FIXED replaces its destination. Do that before checking the
+         * final address-space accounting, while keeping the source pinned. */
+        int unmap_ret = syscall_mm_munmap(new_addr, new_mapped);
+        if (unmap_ret < 0) return unmap_ret;
+        if (!task_user_pages_free(task, new_addr, destination_end))
+            return -RELIEFOS_ENOMEM;
+        uint64_t used = task_vma_total_bytes(task);
+        uint64_t limit = sched_task_limits(task)->as.rlim_cur &
+                         ~(PAGE_SIZE - 1ULL);
+        if (sched_task_limits(task)->as.rlim_cur != LINUX_RLIM_INFINITY &&
+            (used < source_bytes ||
+             used - source_bytes > limit ||
+             new_mapped > limit - (used - source_bytes)))
+            return -RELIEFOS_ENOMEM;
+        if (task_vma_free_slot_index(task, &destination_index) < 0)
+            return -RELIEFOS_ENOMEM;
+
+        vma = sched_task_vma_at(task, source_index);
+        if (!vma || !vma->drm_bo || !vma->drm_mapping_file)
+            return -RELIEFOS_EFAULT;
+        struct task_vma moved_vma = *vma;
+        uint64_t physical = vma->device_physical;
+        uint64_t page_flags = RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_SHARED;
+        if (vma->prot & LINUX_PROT_WRITE) page_flags |= RELIEFNT_PAGE_WRITABLE;
+        if (!(vma->prot & LINUX_PROT_EXEC)) page_flags |= RELIEFNT_PAGE_NOEXEC;
+        if (vma->prot == LINUX_PROT_NONE) page_flags |= RELIEFNT_PAGE_PROTNONE;
+        for (uint64_t page = 0; page < new_mapped; page += PAGE_SIZE) {
+            if (!address_space_map_user_page(sched_task_as(task), new_addr + page,
+                                             physical + page, page_flags)) {
+                task_unmap_pages(task, new_addr, new_addr + page);
+                return -RELIEFOS_ENOMEM;
+            }
+        }
+
+        task_vma_retain_drm(&moved_vma, vma);
+        if (!moved_vma.drm_mapping_file) {
+            task_unmap_pages(task, new_addr, destination_end);
+            task_drm_mapping_release(&moved_vma.drm_bo,
+                                     &moved_vma.drm_mapping_file);
+            return -RELIEFOS_ENOMEM;
+        }
+        moved_vma.used = 1;
+        moved_vma.start = new_addr;
+        moved_vma.end = destination_end;
+        moved_vma.device_physical = physical;
+        struct task_vma *destination = sched_task_vma_at(task, destination_index);
+        if (!destination || destination->used) {
+            task_unmap_pages(task, new_addr, destination_end);
+            task_drm_mapping_release(&moved_vma.drm_bo,
+                                     &moved_vma.drm_mapping_file);
+            return -RELIEFOS_ENOMEM;
+        }
+        *destination = moved_vma;
+        task_unmap_pages(task, source_start, source_end);
+        vma = sched_task_vma_at(task, source_index);
+        if (vma) task_vma_clear(vma);
+        return (int64_t)new_addr;
+    }
     /* File/device mappings still need Linux backing-file readahead/writeback. */
     if (!(vma->flags & TASK_VMA_FLAG_ANON)) return -RELIEFOS_ENOMEM;
     if (new_mapped == old_mapped) return (int64_t)old_addr;
@@ -1428,13 +1649,16 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
      * VMAs with different attributes, but rejects a range containing a hole. */
     uint64_t cursor = addr;
     uint32_t split_count = 0;
+    bool drm_mapping = false;
     while (cursor < end) {
         struct task_vma *vma = task_vma_containing(task, cursor, cursor + PAGE_SIZE);
         if (!vma) return -RELIEFOS_ENOMEM;
+        if (vma->drm_bo) drm_mapping = true;
         if (prot & ~vma->max_prot) return -RELIEFOS_EACCES;
         uint64_t piece_end = vma->end < end ? vma->end : end;
         /* Non-audio device mappings accept only a whole-VMA no-op change. */
         if ((vma->flags & TASK_VMA_FLAG_DEVICE) && !vma->audio_pcm &&
+            !vma->drm_bo &&
             (cursor != vma->start || piece_end != vma->end || prot != vma->prot)) {
             return -RELIEFOS_EOPNOTSUPP;
         }
@@ -1461,11 +1685,13 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
 
     /* Apply the PTE change with each mapping's own device/cache attributes. */
     cursor = addr;
+    bool pte_changed = false;
     while (cursor < end) {
         struct task_vma *vma = task_vma_containing(task, cursor, cursor + PAGE_SIZE);
         if (!vma) return -RELIEFOS_ENOMEM;
         uint64_t piece_end = vma->end < end ? vma->end : end;
-        if ((vma->flags & TASK_VMA_FLAG_DEVICE) && !vma->audio_pcm) {
+        if ((vma->flags & TASK_VMA_FLAG_DEVICE) && !vma->audio_pcm &&
+            !vma->drm_bo) {
             /* Validated as a whole-VMA no-op: leave device PTEs untouched. */
             cursor = piece_end;
             continue;
@@ -1476,13 +1702,22 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
         if (prot == LINUX_PROT_NONE) page_flags |= RELIEFNT_PAGE_PROTNONE;
         if (vma->flags & TASK_VMA_FLAG_DEVICE) page_flags |= RELIEFNT_PAGE_DEVICE;
         for (uint64_t page = cursor; page < piece_end; page += PAGE_SIZE) {
-            if (address_space_user_page_phys(sched_task_as(task), page) &&
-                !address_space_protect_user_page(sched_task_as(task), page, page_flags)) {
+            if (!address_space_user_page_phys(sched_task_as(task), page)) continue;
+            if (!address_space_protect_user_page(sched_task_as(task), page,
+                                                 page_flags)) {
+                /* Earlier pages may already have changed. Revoke stale remote
+                 * DRM translations even though the range operation fails. */
+                if (drm_mapping && pte_changed) smp_flush_user_tlb();
                 return -RELIEFOS_EACCES;
             }
+            pte_changed = true;
         }
         cursor = piece_end;
     }
+    /* The page-table helper invalidates only the current CPU. DRM protection
+     * changes must not return while a CLONE_VM peer can still write through a
+     * stale translation, so synchronously flush remote user TLBs first. */
+    if (drm_mapping && pte_changed) smp_flush_user_tlb();
 
     /**
  * @brief A partial protection change needs independent VMA metadata. In particular, PT_GNU_RELRO protects only the GOT page while BSS in the same original load segment must remain writable and lazily mappable.
@@ -1497,22 +1732,29 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
             struct task_vma *left = task_vma_free_slot(task);
             if (!left) return -RELIEFOS_ENOMEM;
             *left = original;
+            task_vma_retain_drm(left, &original);
             sysv_shm_vma_split(left);
             storage_inode_retain(left->inode);
             if (left->audio_pcm) (void)audio_pcm_mmap_retain(left->audio_pcm,
                                  (enum audio_pcm_mmap_region)left->audio_mmap_region);
             left->end = cursor;
+            if (left->drm_bo)
+                left->device_physical = original.device_physical;
             if (left->audio_pcm) left->audio_mmap_length = left->end - left->start;
         }
         if (piece_end < original.end) {
             struct task_vma *right = task_vma_free_slot(task);
             if (!right) return -RELIEFOS_ENOMEM;
             *right = original;
+            task_vma_retain_drm(right, &original);
             sysv_shm_vma_split(right);
             storage_inode_retain(right->inode);
             if (right->audio_pcm) (void)audio_pcm_mmap_retain(right->audio_pcm,
                                   (enum audio_pcm_mmap_region)right->audio_mmap_region);
             right->start = piece_end;
+            if (right->drm_bo)
+                right->device_physical = original.device_physical +
+                                         (piece_end - original.start);
             if (right->audio_pcm) right->audio_mmap_length = right->end - right->start;
             if (right->flags & TASK_VMA_FLAG_FILE) {
                 right->file_offset += piece_end - original.start;
@@ -1521,6 +1763,9 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
         *vma = original;
         vma->start = cursor;
         vma->end = piece_end;
+        if (vma->drm_bo)
+            vma->device_physical = original.device_physical +
+                                   (cursor - original.start);
         if (vma->flags & TASK_VMA_FLAG_FILE) {
             vma->file_offset += cursor - original.start;
         }
@@ -1561,7 +1806,8 @@ int64_t syscall_mm_munmap(uint64_t addr, uint64_t len)
      * interiors that need a right-hand metadata split. */
     for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
         struct task_vma *vma = sched_task_vma_at(task, i);
-        if (vma && vma->used && (vma->flags & TASK_VMA_FLAG_DEVICE) && !vma->audio_pcm &&
+        if (vma && vma->used && (vma->flags & TASK_VMA_FLAG_DEVICE) &&
+            !vma->audio_pcm && !vma->drm_bo &&
             start < vma->end && end > vma->start &&
             (start > vma->start || end < vma->end))
             return -RELIEFOS_EOPNOTSUPP;
@@ -1600,6 +1846,9 @@ int64_t syscall_mm_munmap(uint64_t addr, uint64_t len)
             task_vma_clear(vma);
         } else if (remove_start == original.start) {
             vma->start = remove_end;
+            if (vma->drm_bo)
+                vma->device_physical = original.device_physical +
+                                       (remove_end - original.start);
             if (vma->flags & TASK_VMA_FLAG_FILE) {
                 vma->file_offset += remove_end - original.start;
             }
@@ -1611,11 +1860,15 @@ int64_t syscall_mm_munmap(uint64_t addr, uint64_t len)
                 return -RELIEFOS_ENOMEM;
             }
             *right = original;
+            task_vma_retain_drm(right, &original);
             sysv_shm_vma_split(right);
             storage_inode_retain(right->inode);
             if (right->audio_pcm) (void)audio_pcm_mmap_retain(right->audio_pcm,
                                 (enum audio_pcm_mmap_region)right->audio_mmap_region);
             right->start = remove_end;
+            if (right->drm_bo)
+                right->device_physical = original.device_physical +
+                                         (remove_end - original.start);
             if (right->audio_pcm) right->audio_mmap_length = right->end - right->start;
             if (right->flags & TASK_VMA_FLAG_FILE) {
                 right->file_offset += remove_end - original.start;

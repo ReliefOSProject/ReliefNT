@@ -101,6 +101,17 @@ _Static_assert(sizeof(struct fb_cmap) == 40,
 #define FB_BLANK_HSYNC_SUSPEND 3
 #define FB_BLANK_POWERDOWN 4
 
+/* Linux v6.12 fb_var_screeninfo activation flags. */
+#define FB_ACTIVATE_NOW 0U
+#define FB_ACTIVATE_NXTOPEN 1U
+#define FB_ACTIVATE_TEST 2U
+#define FB_ACTIVATE_MASK 15U
+#define FB_ACTIVATE_VBL 16U
+#define FB_ACTIVATE_ALL 64U
+#define FB_ACTIVATE_FORCE 128U
+#define FB_ACTIVATE_INV_MODE 256U
+#define FB_ACTIVATE_KD_TEXT 512U
+
 #define FB_TYPE_PACKED_PIXELS 0U
 #define FB_VISUAL_TRUECOLOR 2U
 #define FB_VISUAL_PSEUDOCOLOR 3U

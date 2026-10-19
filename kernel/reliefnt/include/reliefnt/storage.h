@@ -258,6 +258,9 @@ static inline uint64_t storage_block_rdev(uint32_t value)
 #define STORAGE_DEV_KIND_AUDIO_CONTROL 30u
 #define STORAGE_DEV_KIND_AUDIO_MIXER 31u
 #define STORAGE_DEV_KIND_AUDIO_TIMER 32u
+#define STORAGE_DEV_KIND_DRI_DIR      33u
+#define STORAGE_DEV_KIND_DRM_CARD0    34u
+#define STORAGE_DEV_KIND_DRM_RENDERD128 35u
 
 struct boot_info;
 

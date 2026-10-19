@@ -5,6 +5,7 @@
 #include <reliefnt/console.h>
 #include <reliefnt/driver_manager.h>
 #include <reliefnt/driver_manager_phase.h>
+#include <reliefnt/drm.h>
 #include <reliefnt/framebuffer.h>
 #include <reliefnt/lock.h>
 #include <reliefnt/audio.h>
@@ -35,6 +36,9 @@
 static int64_t syscall_dispatch_regs(struct task *task, uint64_t number, uint64_t a0, uint64_t a1,
                                      uint64_t a2, uint64_t a3, uint64_t a4,
                                      uint64_t a5);
+#ifndef RELIEFOS_SYSCALL_FRAME_DISPATCH
+#define RELIEFOS_SYSCALL_FRAME_DISPATCH syscall_dispatch_regs
+#endif
 static int copy_user_string_fixed(char *dst, uint32_t cap, uint64_t user_ptr,
                                   uint32_t *out_len);
 
@@ -86,6 +90,7 @@ static int copy_user_string_fixed(char *dst, uint32_t cap, uint64_t user_ptr,
 #define STARTUP_DENIAL_MAX 64U
 #define STARTUP_REQUEST_MAX 16U
 #define TASK_EPOLL_MAX_ENTRIES 128u
+#define LINUX_RWF_HIPRI 0x00000001u
 
 struct task_timerfd {
     int32_t clockid;
@@ -255,6 +260,9 @@ static int linux_stat_from_legacy(struct linux_stat_abi *out,
                     type == RELIEFOS_FS_TYPE_SYMLINK ? 0120777u :
                     type == RELIEFOS_FS_TYPE_DEVICE ?
                         ((node && (node->flags & STORAGE_NODE_FLAG_DEV_BLOCK)) ? 0060660u : 0020660u) : 0100644u;
+    if (node && (node->first_cluster == STORAGE_DEV_KIND_DRM_CARD0 ||
+                 node->first_cluster == STORAGE_DEV_KIND_DRM_RENDERD128))
+        mode = LINUX_S_IFCHR | 0660u;
     *out = (struct linux_stat_abi){0};
     out->st_dev = node && (node->flags & STORAGE_NODE_FLAG_SYSFS) ? STORAGE_SYSFS_DEVICE :
         node && (node->flags & STORAGE_NODE_FLAG_PROC) ? STORAGE_PROCFS_DEVICE :
@@ -295,6 +303,10 @@ static int linux_stat_from_legacy(struct linux_stat_abi *out,
         (node && (node->flags & STORAGE_NODE_FLAG_DEV_NODE) &&
          node->first_cluster == STORAGE_DEV_KIND_AUDIO))
         out->st_rdev = linux_audio_rdev(node);
+    if (node && node->first_cluster == STORAGE_DEV_KIND_DRM_CARD0)
+        out->st_rdev = (226u << 8);
+    if (node && node->first_cluster == STORAGE_DEV_KIND_DRM_RENDERD128)
+        out->st_rdev = (226u << 8) | 128u;
     out->st_size = st ? (int64_t)st->size : 0;
     out->st_blksize = 4096;
     out->st_blocks = (out->st_size + 511) / 512;
@@ -303,6 +315,20 @@ static int linux_stat_from_legacy(struct linux_stat_abi *out,
 
 static void linux_stat_fd_type(struct linux_stat_abi *out, const struct task_file *file)
 {
+    if (file && file->drm_prime_file) {
+        /* TTM's anonymous dma-buf inode deliberately has no S_IFMT type. */
+        out->st_dev = 0;
+        out->st_ino = file->drm_prime_ino;
+        out->st_mode = 0600u;
+        out->st_nlink = 1;
+        out->st_uid = file->drm_prime_uid;
+        out->st_gid = file->drm_prime_gid;
+        out->st_rdev = 0;
+        out->st_size = (int64_t)file->drm_prime_size;
+        out->st_blksize = 4096;
+        out->st_blocks = (out->st_size + 511) / 512;
+        return;
+    }
     /* The legacy SDK labels anonymous pipes as devices. Linux get_pipe_inode()
      * creates S_IFIFO | 0600; it must not look like a terminal to libc/sudo. */
     if (file && (file->flags & TASK_FILE_FLAG_PIPE) && !file->inode) {
@@ -709,7 +735,9 @@ static int clear_task_file_result(struct task_file *file)
         return result;
     }
     syscall_flock_release_owner(file);
+    if (file->drm_prime_file) drm_prime_file_close(file);
     if (file->flags & TASK_FILE_FLAG_DEV_NODE) {
+        if (file->drm_file) drm_file_close(file);
         if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_PCM)
             (void)audio_device_close(file);
         if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_CONTROL)
@@ -758,6 +786,12 @@ static int clear_task_file_result(struct task_file *file)
     file->audio_control_file = NULL;
     file->audio_oss_file = NULL;
     file->audio_timer_file = NULL;
+    file->drm_file = NULL;
+    file->drm_prime_file = NULL;
+    file->drm_prime_ino = 0;
+    file->drm_prime_size = 0;
+    file->drm_prime_uid = 0;
+    file->drm_prime_gid = 0;
     file->read_cursor = (struct storage_read_cursor){0};
     file->flags = 0;
     file->fd_flags = 0;
@@ -1028,6 +1062,9 @@ void task_fifo_cancel(struct task *task)
 void task_release_syscall_file(struct task *task)
 {
     if (!task) return;
+    /* Signal handoff and syscall mismatch invalidate DRM ioctl snapshots here;
+     * the vmwgfx hook only queues bounded task-context cleanup. */
+    drm_vmwgfx_cancel_task_continuation(task);
     task_sysv_msg_cancel(task);
     task_sysv_sem_cancel(task);
     task_fifo_cancel(task);
@@ -1985,6 +2022,110 @@ int file_can_write(const struct task_file *file)
 {
     uint32_t acc = file ? (file->flags & RELIEFOS_O_ACCMODE) : RELIEFOS_O_RDONLY;
     return acc == RELIEFOS_O_WRONLY || acc == RELIEFOS_O_RDWR;
+}
+
+/**
+ * @brief Read one bounded slice of DRM event data into user memory.
+ * @param task Current task used for the DRM event copyout; not retained.
+ * @param file Borrowed DRM file description; it must be open for reading.
+ * @param buffer User address of the writable destination range.
+ * @param length Requested writable byte range; one DRM read is capped at
+ *        RELIEFOS_FS_IO_SLICE_BYTES.
+ * @return Bytes read, or negative EBADF/EFAULT or the DRM read's errno.
+ */
+static int64_t syscall_drm_read(struct task *task, struct task_file *file,
+                                uint64_t buffer, uint64_t length)
+{
+    uint32_t request_len;
+    if (!file || !file->drm_file || !file_can_read(file))
+        return -RELIEFOS_EBADF;
+    if (!user_range_writable(buffer, length)) return -RELIEFOS_EFAULT;
+    request_len = length > RELIEFOS_FS_IO_SLICE_BYTES
+        ? RELIEFOS_FS_IO_SLICE_BYTES : (uint32_t)length;
+    return drm_file_read(task, file, (void *)(uintptr_t)buffer, request_len);
+}
+
+/**
+ * @brief Read DRM event data with a positional syscall's offset validation.
+ * @param task Current task used for the DRM event copyout; not retained.
+ * @param file Borrowed DRM file description; it must be open for reading.
+ * @param buffer User address of the writable destination range.
+ * @param length Requested byte count, subject to the shared read slice limit.
+ * @param position Signed file offset encoded in the syscall register; DRM event
+ *        reads ignore its value after rejecting negative offsets.
+ * @return Bytes read, negative EINVAL for a negative offset, or the DRM read's
+ *         negative errno.
+ */
+static int64_t syscall_drm_pread(struct task *task, struct task_file *file,
+                                 uint64_t buffer, uint64_t length,
+                                 uint64_t position)
+{
+    if ((int64_t)position < 0) return -RELIEFOS_EINVAL;
+    return syscall_drm_read(task, file, buffer, length);
+}
+
+/**
+ * @brief Apply DRM's no-op seek behavior after validating the seek request.
+ * @param file Borrowed task file; it must refer to a DRM file description.
+ * @param whence Linux seek selector, checked by the existing 32-bit <= 4 rule.
+ * @return The unchanged file offset, or negative EBADF/EINVAL on invalid input.
+ */
+static int64_t syscall_drm_llseek(struct task_file *file, uint64_t whence)
+{
+    /* Linux ksys_lseek() rejects values beyond SEEK_MAX before calling the
+     * driver's noop_llseek(), which otherwise returns the unchanged f_pos. */
+    if (!file || !file->drm_file) return -RELIEFOS_EBADF;
+    if ((uint32_t)whence > 4u) return -RELIEFOS_EINVAL; /* SEEK_HOLE */
+    return (int64_t)file->offset;
+}
+
+/**
+ * @brief Read DRM event data across an already imported iovec array.
+ * @param task Current task used for DRM event copyout; not retained.
+ * @param file Borrowed DRM file description; it must be open for reading.
+ * @param iov Kernel-side iovec copy imported by the vector syscall dispatcher;
+ *        each writable user range is checked before any read is issued.
+ * @param iovcnt Number of entries in iov; values above UIO_MAXIOV are rejected.
+ * @param positional Whether position is a preadv offset that needs validation.
+ * @param position Signed file offset encoded in the syscall register; DRM event
+ *        reads ignore it after rejecting a negative positional offset.
+ * @param flags Vector-read flags; zero and LINUX_RWF_HIPRI are supported.
+ * @return Total bytes read, a partial count after a later read error, or
+ *         negative EBADF/EINVAL/EFAULT/EOPNOTSUPP or the DRM read's errno.
+ */
+static int64_t syscall_drm_readv(struct task *task, struct task_file *file,
+                                 const struct iovec *iov, uint64_t iovcnt,
+                                 bool positional, uint64_t position,
+                                 uint64_t flags)
+{
+    uint64_t requested = 0;
+    int64_t total = 0;
+    if (!file || !file->drm_file || !file_can_read(file))
+        return -RELIEFOS_EBADF;
+    if (positional && (int64_t)position < 0) return -RELIEFOS_EINVAL;
+    if (flags && flags != LINUX_RWF_HIPRI) return -RELIEFOS_EOPNOTSUPP;
+    if (iovcnt > UIO_MAXIOV) return -RELIEFOS_EINVAL;
+    for (uint64_t i = 0; i < iovcnt; ++i) {
+        uint64_t length = iov[i].iov_len;
+        if ((int64_t)length < 0) return -RELIEFOS_EINVAL;
+        if (length > 0x7ffff000u - requested)
+            length = 0x7ffff000u - requested;
+        if (length && !user_range_writable((uintptr_t)iov[i].iov_base, length))
+            return -RELIEFOS_EFAULT;
+        requested += length;
+    }
+    for (uint64_t i = 0; i < iovcnt && requested; ++i) {
+        uint64_t length = iov[i].iov_len;
+        if (length > 0x7ffff000u - (uint64_t)total)
+            length = 0x7ffff000u - (uint64_t)total;
+        if (!length) continue;
+        int64_t part = syscall_drm_read(task, file,
+                                       (uintptr_t)iov[i].iov_base, length);
+        if (part < 0) return total ? total : part;
+        total += part;
+        if ((uint64_t)part < length) break;
+    }
+    return total;
 }
 
 static int task_device_is(const struct task_file *file, uint32_t kind)
@@ -3631,6 +3772,10 @@ static int64_t syscall_poll_impl(struct task *task, struct pollfd *fds,
             task_timerfd_update(timer);
             if ((events & (POLLIN | POLLRDNORM)) && timer && timer->expirations)
                 revents |= POLLIN | POLLRDNORM;
+        } else if (file && file->drm_file) {
+            revents = drm_file_poll(file, events);
+        } else if (file && file->drm_prime_file) {
+            revents = drm_prime_file_poll(file, events);
         } else if (file && (file->flags & TASK_FILE_FLAG_DEV_NODE)) {
             if (task_device_is(file, STORAGE_DEV_KIND_KEYBOARD) ||
                 task_device_is(file, STORAGE_DEV_KIND_MOUSE)) {
@@ -4529,6 +4674,23 @@ static int64_t syscall_update_path_times(struct task *task, int32_t dirfd, uint6
     return storage_inode_utimensat(&node, atime, mtime, set_atime, set_mtime);
 }
 
+/**
+ * @brief Copy, validate, and copy back one fbdev variable-screen request.
+ * @param user_info Readable user address of a complete fb_var_screeninfo.
+ * @return Zero on success, or a negative Linux errno from validation/copyout.
+ */
+static int64_t syscall_fbdev_put_var(uint64_t user_info)
+{
+    struct fb_var_screeninfo info;
+    if (!user_range_ok(user_info, sizeof(info))) return -RELIEFOS_EFAULT;
+    __builtin_memcpy(&info, (const void *)(uintptr_t)user_info, sizeof(info));
+    int ret = framebuffer_fbdev_put_var(&info);
+    if (ret < 0) return ret;
+    if (!user_range_writable(user_info, sizeof(info))) return -RELIEFOS_EFAULT;
+    __builtin_memcpy((void *)(uintptr_t)user_info, &info, sizeof(info));
+    return 0;
+}
+
 int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
                                      uint64_t a3, uint64_t a4, uint64_t a5)
 {
@@ -4952,6 +5114,11 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
         if (!file) {
             return -RELIEFOS_EBADF;
         }
+        if (file->drm_file) {
+            if (!file_can_write(file)) return -RELIEFOS_EBADF;
+            return -LINUX_EINVAL;
+        }
+        if (file->drm_prime_file) return drm_prime_file_rw(file, true);
         if (file->flags & TASK_FILE_FLAG_EVENTFD) {
             uint64_t value;
             if (a2 != sizeof(uint64_t)) return -RELIEFOS_EINVAL;
@@ -5011,6 +5178,11 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
         if (!user_range_writable(a1, a2)) {
             return -RELIEFOS_EFAULT;
         }
+        if (file && file->drm_file) {
+            return syscall_drm_read(task, file, a1, a2);
+        }
+        if (file && file->drm_prime_file)
+            return drm_prime_file_rw(file, false);
         {
             struct task_pty_fd *endpoint = task_pty_for_io(task, (int)a0);
             if (endpoint) {
@@ -5444,12 +5616,25 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
             if ((value.mode & LINUX_S_IFMT) == LINUX_S_IFSOCK) return -LINUX_ENXIO;
         }
         if (node.flags & STORAGE_NODE_FLAG_DEV_NODE) {
+            if (node.first_cluster == STORAGE_DEV_KIND_DRM_CARD0 &&
+                (flags & LINUX_O_EXCL)) return -LINUX_EBUSY;
             uint32_t device_flags = TASK_FILE_FLAG_DEV_NODE;
             if (node.flags & STORAGE_NODE_FLAG_DEV_BLOCK) {
                 device_flags |= TASK_FILE_FLAG_DEV_BLOCK;
             }
             int fd = alloc_task_fd(task, &node,
                                    flags | device_flags, path);
+            if (fd >= 0 &&
+                (node.first_cluster == STORAGE_DEV_KIND_DRM_CARD0 ||
+                 node.first_cluster == STORAGE_DEV_KIND_DRM_RENDERD128) &&
+                !(flags & TASK_FILE_FLAG_PATH)) {
+                struct task_file *file = task_file_for_fd(task, fd);
+                int drm_ret = drm_file_open(task, file);
+                if (drm_ret < 0) {
+                    if (file) clear_task_file(file);
+                    return drm_ret;
+                }
+            }
             if (fd >= 0 && (node.flags & STORAGE_NODE_FLAG_AUDIO_PCM)) {
                 struct task_file *file = task_file_for_fd(task, fd);
                 int audio_ret = audio_device_open(task, file);
@@ -6091,6 +6276,8 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
             if (writing ? !user_range_ok(a1, a2) : !user_range_writable(a1, a2)) return -RELIEFOS_EFAULT;
             return syscall_regular_io(task, file, a1, a2, a3, writing, true);
         }
+        if (number == LINUX_SYS_PREAD64 && file->drm_file)
+            return syscall_drm_pread(task, file, a1, a2, a3);
         saved = file->offset;
         file->offset = a3;
         result = syscall_dispatch_regs_legacy(number == LINUX_SYS_PREAD64 ? LINUX_SYS_READ : LINUX_SYS_WRITE,
@@ -6180,17 +6367,25 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
                           number == LINUX_SYS_PREADV2 || number == LINUX_SYS_PWRITEV2;
         uint64_t position = (uint64_t)(uint32_t)a3 |
                             ((uint64_t)(uint32_t)a4 << 32);
+        bool current_position = (number == LINUX_SYS_PREADV2 ||
+                                number == LINUX_SYS_PWRITEV2) &&
+                               position == UINT64_MAX;
+        bool drm_read = file && file->drm_file && !writing;
         uint64_t positional_flags = (number == LINUX_SYS_PREADV2 ||
                                      number == LINUX_SYS_PWRITEV2) ? a5 : 0;
         uint64_t saved_offset = 0;
+        bool restore_position = false;
         int64_t total;
         if (file && file->kind == TASK_FILE_KIND_SIGNALFD) {
-            bool at_current = (number == LINUX_SYS_PREADV2 || number == LINUX_SYS_PWRITEV2) && a3 == UINT64_MAX;
-            if (positional && !at_current) return (int64_t)a3 < 0 ? -LINUX_EINVAL : -LINUX_ESPIPE;
+            if (positional && !current_position) return (int64_t)position < 0 ? -LINUX_EINVAL : -LINUX_ESPIPE;
             if (writing) return -LINUX_EINVAL;
             return task_signalfd_readv(task, file, a1, a2, (uint32_t)positional_flags);
         }
-        if (positional && positional_flags) return -RELIEFOS_EOPNOTSUPP;
+        if (positional && !current_position && (int64_t)position < 0)
+            return -RELIEFOS_EINVAL;
+        if (positional_flags &&
+            !(drm_read && positional_flags == LINUX_RWF_HIPRI))
+            return -RELIEFOS_EOPNOTSUPP;
         if (file ? !(writing ? file_can_write(file) : file_can_read(file)) :
             (!task_pty_for_io(task, (int)a0) &&
              ((uint32_t)a0 >= SCHED_TASK_STDIO_MAX ||
@@ -6210,14 +6405,22 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
             requested += iov[i].iov_len;
         }
         if (!requested) return 0;
-        if (positional) {
-            if (!file || (int64_t)position < 0) return -RELIEFOS_EINVAL;
-            if (file->node.type != RELIEFOS_FS_TYPE_FILE) return -RELIEFOS_ESPIPE;
-            saved_offset = file->offset;
-            file->offset = position;
+        if (positional && !current_position) {
+            if (!file) return -RELIEFOS_EINVAL;
+            if (!drm_read) {
+                if (file->node.type != RELIEFOS_FS_TYPE_FILE) return -RELIEFOS_ESPIPE;
+                saved_offset = file->offset;
+                file->offset = position;
+                restore_position = true;
+            }
+        }
+        if (drm_read) {
+            return syscall_drm_readv(task, file, iov, a2,
+                                     positional && !current_position,
+                                     position, positional_flags);
         }
         if (file && (file->flags & TASK_FILE_FLAG_SOCKET_UNIX)) {
-            if (positional) file->offset = saved_offset;
+            if (restore_position) file->offset = saved_offset;
             return task_socket_vector(file, iov, (uint32_t)a2, requested, writing);
         }
         total = 0;
@@ -6226,13 +6429,13 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
             int64_t part = syscall_dispatch_regs_legacy(writing ? LINUX_SYS_WRITE : LINUX_SYS_READ,
                                                         a0, (uintptr_t)iov[i].iov_base, iov[i].iov_len, 0, 0, 0);
             if (part < 0) {
-                if (positional) file->offset = saved_offset;
+                if (restore_position) file->offset = saved_offset;
                 return total ? total : part;
             }
             total += part;
             if ((uint64_t)part < iov[i].iov_len) break;
         }
-        if (positional) file->offset = saved_offset;
+        if (restore_position) file->offset = saved_offset;
         return total;
     }
 
@@ -6301,6 +6504,9 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
         if (!file) {
             return -RELIEFOS_EBADF;
         }
+        if (file->drm_file) return syscall_drm_llseek(file, a2);
+        if (file->drm_prime_file)
+            return drm_prime_file_llseek(file, offset, (uint32_t)a2);
         if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_CONTROL)
             return -LINUX_ESPIPE;
         if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_MIXER)
@@ -7071,23 +7277,7 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
             *(struct fb_fix_screeninfo *)(uintptr_t)a2 = info;
             return 0;
         }
-        if (!user_range_ok(a2, sizeof(struct fb_var_screeninfo))) {
-            return -RELIEFOS_EFAULT;
-        }
-        {
-            const struct fb_var_screeninfo *info =
-                (const struct fb_var_screeninfo *)(uintptr_t)a2;
-            /* The dynamic backend owns a 32bpp surface whatever format the
-             * boot firmware advertised; accept the native 32bpp request and
-             * let framebuffer_set_mode decide what is really settable. */
-            if (!info->xres || !info->yres || info->xres > fb->max_width ||
-                info->yres > fb->max_height ||
-                (info->bits_per_pixel != fb->bpp && info->bits_per_pixel != 32u)) {
-                return -RELIEFOS_EINVAL;
-            }
-            return framebuffer_set_mode(info->xres, info->yres) == 0
-                       ? 0 : -RELIEFOS_EINVAL;
-        }
+        return syscall_fbdev_put_var(a2);
     }
 
     /* Linux virtual-console and keyboard-display ioctls operate on a VT
@@ -7340,6 +7530,12 @@ static int64_t syscall_dispatch_regs(struct task *task, uint64_t number, uint64_
     if (number == LINUX_SYS_IOCTL && a1 == FIONBIO) {
         return syscall_ioctl_nonblock(sched_current_task(), (int)a0, a2);
     }
+    if (number == LINUX_SYS_IOCTL) {
+        struct task *task = sched_current_task();
+        struct task_file *file = task_file_for_io(task, (int)a0);
+        if (file && (file->drm_file || file->drm_prime_file))
+            return drm_fd_ioctl(task, file, (uint32_t)a1, a2);
+    }
 
     if (syscall_fs_owns(number)) {
         return syscall_fs_dispatch(number, a0, a1, a2, a3, a4, a5);
@@ -7385,6 +7581,7 @@ static int syscall_eagain_is_nonblocking_device(struct task *task,
         return file && (file->flags & RELIEFOS_O_NONBLOCK) ? 1 : 0;
     }
     if (number != LINUX_SYS_READ && number != LINUX_SYS_WRITE &&
+        number != LINUX_SYS_PREAD64 &&
         number != LINUX_SYS_READV && number != LINUX_SYS_WRITEV &&
         number != LINUX_SYS_PREADV && number != LINUX_SYS_PWRITEV &&
         number != LINUX_SYS_PREADV2 && number != LINUX_SYS_PWRITEV2) {
@@ -7395,6 +7592,17 @@ static int syscall_eagain_is_nonblocking_device(struct task *task,
         return (task_pty_status(endpoint) & RELIEFOS_O_NONBLOCK) != 0;
     }
     file = task_file_for_io(task, (int)fd);
+    /* DRM event reads use EAGAIN as the userspace-visible empty-queue result
+     * for O_NONBLOCK. Positional scalar/vector reads enter the same read
+     * operation, so they must escape the storage retry loop as well. Keep
+     * this scoped to reads; DRM ioctl EAGAIN may have other meanings. */
+    if (file && (number == LINUX_SYS_READ || number == LINUX_SYS_READV ||
+                 number == LINUX_SYS_PREAD64 || number == LINUX_SYS_PREADV ||
+                 number == LINUX_SYS_PREADV2) &&
+        file->drm_file &&
+        (file->flags & RELIEFOS_O_NONBLOCK)) {
+        return 1;
+    }
     if (file && (file->flags & RELIEFOS_O_NONBLOCK)) {
         if (file->flags & (TASK_FILE_FLAG_PIPE |
                            TASK_FILE_FLAG_SOCKET_UNIX |
@@ -7498,6 +7706,9 @@ void syscall_dispatch_frame(struct trap_frame *frame)
     }
     /* Several storage and GUI services still own global scratch buffers. */
     kernel_execution_lock_irqsave(&lock_flags);
+    /* Drain a small fair batch after taking kernel execution ownership. A
+     * final DRM close only queues work, including closes from signal return. */
+    drm_vmwgfx_process_retirements(2);
     driver_manager_process_audio_faults();
     input_process_pending();
     number = frame->rax;
@@ -7539,7 +7750,7 @@ void syscall_dispatch_frame(struct trap_frame *frame)
     } else if (number == LINUX_SYS_FORK) {
         result = sched_fork_current(frame);
     } else {
-        result = syscall_dispatch_regs(calling_task, number,
+        result = RELIEFOS_SYSCALL_FRAME_DISPATCH(calling_task, number,
                                        frame->rdi,
                                        frame->rsi,
                                        frame->rdx,

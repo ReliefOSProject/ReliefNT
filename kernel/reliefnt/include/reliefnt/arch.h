@@ -45,6 +45,8 @@ void arch_fpu_save(void *state);
  * @brief Reload x87/SSE state from a task's save area when switching back to it.
  */
 void arch_fpu_restore(const void *state);
+/** Run a bounded kernel callback on a scheduler-owned alternate ring-0 stack. */
+void arch_call_on_stack(void *stack_top, void (*callback)(void *), void *argument);
 /**
  * @brief Remap the PIC and start the PIT timer so IRQ0/1/12 can fire.
  */

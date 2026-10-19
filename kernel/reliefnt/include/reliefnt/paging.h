@@ -124,21 +124,26 @@ void *paging_kernel_direct_map(uint64_t phys);
  * @param len Byte length of the range.
  * @return True when addressable and UC/NX page attributes are installed.
  * Task context under execution transaction/pre-SMP. Compatibility mappings
- * retain permanent attributes; no mapping reference is transferred.
+ * retain permanent attributes; repeated permanent claims are idempotent and
+ * no mapping reference is transferred. Returns false if the bounded range
+ * registry or page-table preparation cannot represent the request.
  */
 bool paging_mmio_uncached(uint64_t phys, uint64_t len);
 /** @brief Acquire one UC/NX reference per device page after BAR validation.
  * @param phys Page-aligned physical base.
  * @param len Page-aligned nonzero bytes.
- * @return True on success; caller releases after quiescence. Task context under
- * execution transaction/pre-SMP; flushes every CPU, preserves neighbor flags.
+ * @return True on success; each call owns one exact-range lease that must be
+ * released after quiescence. False on invalid input, NX absence, allocation,
+ * or bounded registry exhaustion. Task context under execution transaction/
+ * pre-SMP; flushes every CPU and preserves original flags for every page.
  */
 bool paging_acquire_mmio(uint64_t phys, uint64_t len);
 /** @brief Release owned device pages and restore last-reference attributes.
- * @param phys Original aligned physical base.
- * @param len Original aligned byte length.
- * @return None. Task context under execution transaction/pre-SMP; TLB sync;
- * page-table split storage remains kernel owned, device RAM is never freed.
+ * @param phys Exact aligned physical base passed to one successful acquire.
+ * @param len Exact aligned byte length passed to that acquire.
+ * @return None; unmatched ranges have no effect. Task context under execution
+ * transaction/pre-SMP; TLB sync; page-table split storage remains kernel owned,
+ * device RAM is never freed.
  */
 void paging_release_mmio(uint64_t phys, uint64_t len);
 

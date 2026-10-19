@@ -35,6 +35,13 @@
 #define SVGA_3D_CMD_DEFINE_GB_CONTEXT 1107u
 #define SVGA_3D_CMD_DESTROY_GB_CONTEXT 1108u
 #define SVGA_3D_CMD_BIND_GB_CONTEXT 1109u
+#define SVGA_3D_CMD_DEFINE_GB_SHADER 1112u
+#define SVGA_3D_CMD_DESTROY_GB_SHADER 1113u
+#define SVGA_3D_CMD_BIND_GB_SHADER 1114u
+#define SVGA_3D_CMD_BEGIN_GB_QUERY 1116u
+#define SVGA_3D_CMD_END_GB_QUERY 1117u
+#define SVGA_3D_CMD_WAIT_FOR_GB_QUERY 1118u
+#define SVGA_3D_CMD_SET_GB_SHADERCONSTS_INLINE 1130u
 #define SVGA_OTABLE_MOB 0u
 #define SVGA_OTABLE_SURFACE 1u
 #define SVGA_OTABLE_CONTEXT 2u
@@ -55,6 +62,13 @@
 #define SVGA_GB_CONTEXT_ENTRY_BYTES 8u
 #define SVGA_GB_SHADER_ENTRY_BYTES 16u
 #define SVGA_GB_SCREENTARGET_ENTRY_BYTES 64u
+#define SVGA_GB_QUERY_RESULT_BYTES 12u
+#define SVGA_GB_QUERY_TYPE_OCCLUSION 0u
+#define SVGA_GB_SHADER_TYPE_VS 1u
+#define SVGA_GB_SHADER_TYPE_PS 2u
+#define SVGA_GB_CONST_FLOAT 0u
+#define SVGA_GB_CONST_INT 1u
+#define SVGA_GB_CONST_BOOL 2u
 
 typedef struct {
     uint32_t type, baseAddress, sizeInBytes, validSizeInBytes, ptDepth;
@@ -68,10 +82,23 @@ typedef struct {
 } SVGA3dCmdDefineGBSurface;
 typedef struct { uint32_t sid, mobid; } SVGA3dCmdBindGBSurface;
 typedef struct { uint32_t cid, mobid, validContents; } SVGA3dCmdBindGBContext;
+typedef struct { uint32_t shid, type, sizeInBytes; } SVGA3dCmdDefineGBShader;
+typedef struct { uint32_t shid, mobid, offsetInBytes; } SVGA3dCmdBindGBShader;
+typedef struct { uint32_t shid; } SVGA3dCmdDestroyGBShader;
+typedef struct { uint32_t cid, type; } SVGA3dCmdBeginGBQuery;
+typedef struct { uint32_t cid, type, mobid, offset; } SVGA3dCmdEndGBQuery;
+typedef struct { uint32_t cid, type, mobid, offset; } SVGA3dCmdWaitForGBQuery;
 
 _Static_assert(sizeof(SVGA3dCmdSetOTableBase) == 20, "OTable wire size");
 _Static_assert(sizeof(SVGA3dCmdDefineGBMob) == 16, "MOB wire size");
 _Static_assert(sizeof(SVGA3dCmdDefineGBSurface) == 36, "GB surface wire size");
 _Static_assert(sizeof(SVGA3dCmdBindGBSurface) == 8, "GB surface binding wire size");
 _Static_assert(sizeof(SVGA3dCmdBindGBContext) == 12, "GB context binding wire size");
+_Static_assert(sizeof(SVGA3dCmdDefineGBShader) == 12, "GB shader definition wire size");
+_Static_assert(sizeof(SVGA3dCmdBindGBShader) == 12, "GB shader binding wire size");
+_Static_assert(sizeof(SVGA3dCmdDestroyGBShader) == 4, "GB shader destroy wire size");
+_Static_assert(sizeof(SVGA3dCmdBeginGBQuery) == 8, "GB query begin wire size");
+_Static_assert(sizeof(SVGA3dCmdEndGBQuery) == 16, "GB query end wire size");
+_Static_assert(sizeof(SVGA3dCmdWaitForGBQuery) == 16, "GB query wait wire size");
+_Static_assert(sizeof(SVGA3dQueryResult) == SVGA_GB_QUERY_RESULT_BYTES, "GB query result size");
 #endif

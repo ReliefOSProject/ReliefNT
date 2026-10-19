@@ -1,4 +1,5 @@
 #include "../block/storage_internal.h"
+#include <reliefnt/drm.h>
 bool storage_ready(void)
 {
     return g_volumes[0].ready;
@@ -297,6 +298,37 @@ static int storage_lookup_path_unlocked(const char *path, struct storage_node *o
             .type = RELIEFOS_FS_TYPE_DIR,
             .flags = STORAGE_NODE_FLAG_DEV_DIR,
             .first_cluster = STORAGE_DEV_KIND_SND_DIR,
+            .volume_id = STORAGE_VOLUME_ROOT,
+        };
+        return 0;
+    }
+    if (g_devfs_enabled && storage_text_eq_ci(resolved, "/dev/dri")) {
+        if (!drm_device_is_registered()) return -2;
+        if (out) *out = (struct storage_node){
+            .type = RELIEFOS_FS_TYPE_DIR,
+            .flags = STORAGE_NODE_FLAG_DEV_DIR,
+            .first_cluster = STORAGE_DEV_KIND_DRI_DIR,
+            .volume_id = STORAGE_VOLUME_ROOT,
+        };
+        return 0;
+    }
+    if (g_devfs_enabled && storage_text_eq_ci(resolved, "/dev/dri/card0")) {
+        if (!drm_device_is_registered()) return -2;
+        if (out) *out = (struct storage_node){
+            .type = RELIEFOS_FS_TYPE_DEVICE,
+            .flags = STORAGE_NODE_FLAG_DEV_NODE,
+            .first_cluster = STORAGE_DEV_KIND_DRM_CARD0,
+            .volume_id = STORAGE_VOLUME_ROOT,
+        };
+        return 0;
+    }
+    if (g_devfs_enabled && storage_text_eq_ci(resolved,
+                                               "/dev/dri/renderD128")) {
+        if (!drm_device_render_node_ready()) return -2;
+        if (out) *out = (struct storage_node){
+            .type = RELIEFOS_FS_TYPE_DEVICE,
+            .flags = STORAGE_NODE_FLAG_DEV_NODE,
+            .first_cluster = STORAGE_DEV_KIND_DRM_RENDERD128,
             .volume_id = STORAGE_VOLUME_ROOT,
         };
         return 0;
@@ -772,6 +804,23 @@ static int storage_readdir_node_unlocked(const struct storage_node *node, uint64
         if (node->first_cluster == STORAGE_DEV_KIND_SND_DIR) {
             return storage_audio_snd_readdir(cursor, entry);
         }
+        if (node->first_cluster == STORAGE_DEV_KIND_DRI_DIR) {
+            if (!drm_device_is_registered()) return 0;
+            if (*cursor == 0) {
+                ++*cursor;
+                entry->type = RELIEFOS_FS_TYPE_DEVICE;
+                storage_copy_text(entry->name, sizeof(entry->name), "card0");
+                return 1;
+            }
+            if (*cursor == 1 && drm_device_render_node_ready()) {
+                ++*cursor;
+                entry->type = RELIEFOS_FS_TYPE_DEVICE;
+                storage_copy_text(entry->name, sizeof(entry->name),
+                                  "renderD128");
+                return 1;
+            }
+            return 0;
+        }
         while (*cursor < count) {
             const struct storage_dev_entry *dev = &entries[*cursor];
             ++(*cursor);
@@ -783,6 +832,15 @@ static int storage_readdir_node_unlocked(const struct storage_node *node, uint64
             /* Expose the Linux block namespace generated from discovered
              * transport identities. */
             uint64_t dynamic = *cursor - count;
+            if (drm_device_is_registered()) {
+                if (!dynamic) {
+                    ++*cursor;
+                    entry->type = RELIEFOS_FS_TYPE_DIR;
+                    storage_copy_text(entry->name, sizeof(entry->name), "dri");
+                    return 1;
+                }
+                --dynamic;
+            }
             for (uint32_t disk_id = 0; disk_id < g_install_disk_count;
                  ++disk_id) {
                 char device_name[RELIEFOS_FS_PATH_LEN];

@@ -21,12 +21,35 @@
 #include <reliefnt/svga.h>
 #include <reliefos/layout.h>
 #include <reliefnt/permissions.h>
+#include <reliefnt/drm.h>
 #include <linux/capability.h>
 #include <linux/securebits.h>
 #include <linux/mount.h>
 
 #define USER_STACK_TOP (RELIEFNT_USER_TOP - 0x1000ULL)
 #define EXEC_STACK_ALIGN 16ULL
+#define SCHED_IDLE_SERVICE_STACK_BYTES (16u * 1024u)
+
+static uint8_t sched_idle_service_stacks[SMP_MAX_CPUS]
+    [SCHED_IDLE_SERVICE_STACK_BYTES] __attribute__((aligned(16)));
+
+struct sched_idle_service_state {
+    uint64_t execution_flags;
+};
+
+/* The no-runnable path suspends the trap-return stack and runs this one
+ * bounded progress step on a scheduler-owned ring-0 stack. IRQs only wake the
+ * wait; all resource finalizers run after execution ownership is reacquired. */
+static void sched_idle_service_wait(void *opaque)
+{
+    struct sched_idle_service_state *state = opaque;
+    kernel_execution_unlock_irqrestore(state->execution_flags);
+    __asm__ volatile("sti; hlt; cli" ::: "memory");
+    kernel_execution_lock_irqsave(&state->execution_flags);
+    uint32_t retired = drm_vmwgfx_process_retirements(2);
+    if (retired)
+        console_debug("[reliefnt] drm idle retirement resources=%u\n", retired);
+}
 
 struct exec_launch {
     uint32_t argc;
@@ -672,11 +695,17 @@ static struct task *wait_for_runnable_task(uint64_t *execution_flags)
     for (;;) {
         input_process_pending();
         if ((next = sched_select_next_user())) break;
-        /* Selection retired the previous CR3 and task reservation. Never
-         * sleep holding the transaction needed by CPUs producing work. */
-        kernel_execution_unlock_irqrestore(*execution_flags);
-        __asm__ volatile("sti; hlt; cli");
-        kernel_execution_lock_irqsave(execution_flags);
+        /* Selection retired the previous CR3 and task reservation. Run the
+         * timer-paced DRM service away from the active trap-return stack. */
+        uint32_t cpu = smp_current_cpu();
+        if (cpu >= SMP_MAX_CPUS) cpu = 0;
+        struct sched_idle_service_state state = {
+            .execution_flags = *execution_flags,
+        };
+        void *stack_top = &sched_idle_service_stacks[cpu]
+            [SCHED_IDLE_SERVICE_STACK_BYTES];
+        arch_call_on_stack(stack_top, sched_idle_service_wait, &state);
+        *execution_flags = state.execution_flags;
     }
     return next;
 }

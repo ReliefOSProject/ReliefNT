@@ -91,6 +91,8 @@ void svga_platform_bind(uint16_t port, volatile uint32_t *fifo, uint32_t bytes)
 
 void svga_bind(const struct svga_ops *ops, volatile uint32_t *fifo, uint32_t bytes)
 {
+    /* A rebind has no inherited FIFO completion evidence. */
+    svga_fence_quiescence_reset();
     svga.ops = *ops;
     svga.fifo = fifo;
     svga.fifo_bytes = bytes;
@@ -239,10 +241,10 @@ int svga_negotiate_locked(void)
         return probe_result("devcap-3d", SVGA_ENOTSUP);
     svga.context_limit = SVGA_CONTEXTS;
     svga.surface_limit = SVGA_SURFACES;
-    if (!svga.probe.gb_objects && svga.cap_valid[SVGA3D_DEVCAP_MAX_CONTEXT_IDS] &&
+    if (svga.cap_valid[SVGA3D_DEVCAP_MAX_CONTEXT_IDS] &&
         svga.cap_values[SVGA3D_DEVCAP_MAX_CONTEXT_IDS] < svga.context_limit)
         svga.context_limit = svga.cap_values[SVGA3D_DEVCAP_MAX_CONTEXT_IDS];
-    if (!svga.probe.gb_objects && svga.cap_valid[SVGA3D_DEVCAP_MAX_SURFACE_IDS] &&
+    if (svga.cap_valid[SVGA3D_DEVCAP_MAX_SURFACE_IDS] &&
         svga.cap_values[SVGA3D_DEVCAP_MAX_SURFACE_IDS] < svga.surface_limit)
         svga.surface_limit = svga.cap_values[SVGA3D_DEVCAP_MAX_SURFACE_IDS];
     svga.gmr_limit = svga.ops.read(SVGA_REG_GMR_MAX_IDS);
@@ -269,8 +271,15 @@ int svga_negotiate_locked(void)
         memory -= vram;
         if (memory < svga.surface_limit_bytes) svga.surface_limit_bytes = memory;
     }
+    svga.compat_surface_limit_bytes = svga.surface_limit_bytes;
+    if (svga.probe.gb_objects) {
+        uint64_t non_gb_profile_bytes = (uint64_t)svga.page_limit * 4096u / 2u;
+        if (non_gb_profile_bytes < svga.compat_surface_limit_bytes)
+            svga.compat_surface_limit_bytes = non_gb_profile_bytes;
+    }
     if (!svga.context_limit || !svga.surface_limit || !svga.gmr_limit ||
-        !svga.page_limit || !svga.surface_limit_bytes)
+        !svga.page_limit || !svga.surface_limit_bytes ||
+        !svga.compat_surface_limit_bytes)
         return probe_result("resource-limits", SVGA_ENOTSUP);
     if (svga.probe.gb_objects) {
         int ret = svga_gb_init_locked();
@@ -308,7 +317,8 @@ bool svga_context_usable(uint32_t id)
 }
 bool svga_surface_usable(uint32_t id)
 {
-    return id < SVGA_SURFACES && svga.surfaces[id].handle && !svga.surfaces[id].gb.retiring;
+    return id < SVGA_SURFACES && svga.surfaces[id].handle &&
+           !svga.surfaces[id].retiring && !svga.surfaces[id].gb.retiring;
 }
 
 uint32_t svga_resource_id(svga_handle h)
@@ -328,7 +338,10 @@ void svga_get_info(struct svga_info *out)
     *out = (struct svga_info){ .device_caps = svga.caps, .fifo_caps = svga.fifo_caps,
         .host_version = svga.host_version, .guest_version = SVGA3D_HWVERSION_WS8_B1,
         .generation = svga.generation, .guest_pages = svga.pages,
-        .surface_bytes = svga.surface_bytes, .fifo_ready = svga.fifo_ready,
+        .surface_bytes = svga.surface_bytes,
+        .surface_limit_bytes = svga.surface_limit_bytes,
+        .compat_surface_limit_bytes = svga.compat_surface_limit_bytes,
+        .fifo_ready = svga.fifo_ready,
         .available = svga.available, .probe = svga.probe };
     for (uint32_t i = 0; i < SVGA_CONTEXTS; ++i) out->contexts += !!svga.contexts[i].handle;
     for (uint32_t i = 0; i < SVGA_SURFACES; ++i) out->surfaces += !!svga.surfaces[i].handle;
@@ -341,7 +354,42 @@ int svga3d_capability(uint32_t index, uint32_t *out)
     uint64_t flags = svga_lock();
     int ret = SVGA_ENOTSUP;
     if (out && index < SVGA3D_DEVCAP_MAX && svga.cap_valid[index]) {
-        *out = svga.cap_values[index]; ret = 0;
+        uint32_t value = svga.cap_values[index];
+        switch (index) {
+        case SVGA3D_DEVCAP_MAX_CONTEXT_IDS: {
+            uint32_t local = svga.context_limit ? svga.context_limit - 1u : 0u;
+            if (value > local) value = local;
+            break;
+        }
+        case SVGA3D_DEVCAP_MAX_SURFACE_IDS: {
+            uint32_t local = svga.surface_limit ? svga.surface_limit - 1u : 0u;
+            if (value > local) value = local;
+            break;
+        }
+        case SVGA3D_DEVCAP_MAX_TEXTURE_WIDTH:
+        case SVGA3D_DEVCAP_MAX_TEXTURE_HEIGHT:
+        case SVGA3D_DEVCAP_MAX_VOLUME_EXTENT: {
+            uint64_t max_dimension = svga.surface_limit_bytes / 2u;
+            if (index == SVGA3D_DEVCAP_MAX_VOLUME_EXTENT && max_dimension > 256u)
+                max_dimension = 256u;
+            if (value > max_dimension) value = (uint32_t)max_dimension;
+            break;
+        }
+        case SVGA3D_DEVCAP_MAX_TEXTURES:
+        case SVGA3D_DEVCAP_MAX_SHADER_TEXTURES:
+        case SVGA3D_DEVCAP_MAX_VERTEX_SHADER_TEXTURES:
+            if (value > 32u) value = 32u;
+            break;
+        case SVGA3D_DEVCAP_MAX_RENDER_TARGETS:
+        case SVGA3D_DEVCAP_MAX_SIMULTANEOUS_RENDER_TARGETS:
+            if (value > SVGA3D_MAX_SIMULTANEOUS_RENDER_TARGETS)
+                value = SVGA3D_MAX_SIMULTANEOUS_RENDER_TARGETS;
+            break;
+        default:
+            break;
+        }
+        *out = value;
+        ret = 0;
     }
     svga_unlock(flags);
     return ret;
@@ -391,6 +439,11 @@ int svga3d_init(void)
 
 int svga_shutdown_locked(void)
 {
+    /* Shutdown runs under svga_lock and cannot dispatch borrowed BO ownership
+     * callbacks. Refuse before changing any host state; the caller must retire
+     * these attachments through the task-context detach path first. */
+    for (uint32_t i = 0; i < SVGA_GMRS; ++i)
+        if (svga.gmrs[i].handle && svga.gmrs[i].borrowed) return SVGA_EBUSY;
     if (!svga.fifo_ready) return svga.gb_active ? SVGA_EBUSY : 0;
     int ret = svga_sync_locked();
     if (ret) return ret;
@@ -446,7 +499,12 @@ int svga_update(uint32_t x, uint32_t y, uint32_t width, uint32_t height)
 }
 int svga_mode_begin(uint64_t *flags)
 {
+    if (!flags) return SVGA_EINVAL;
     *flags = svga_lock();
+    if (svga.mode_leases) {
+        svga_unlock(*flags);
+        return SVGA_EBUSY;
+    }
     int ret = svga_shutdown_locked();
     if (!ret && svga.bound) {
         svga.ops.write(SVGA_REG_CONFIG_DONE, 0);
@@ -455,6 +513,36 @@ int svga_mode_begin(uint64_t *flags)
         svga.available = false;
     }
     if (ret) svga_unlock(*flags);
+    return ret;
+}
+
+int svga_mode_lease_acquire(void)
+{
+    uint64_t flags = svga_lock();
+    int ret = svga_mode_lease_acquire_locked();
+    svga_unlock(flags);
+    return ret;
+}
+
+int svga_mode_lease_acquire_locked(void)
+{
+    if (svga.mode_leases == UINT32_MAX) return SVGA_ENOMEM;
+    ++svga.mode_leases;
+    return 0;
+}
+
+int svga_mode_lease_release_locked(void)
+{
+    if (!svga.mode_leases) return SVGA_EINVAL;
+    --svga.mode_leases;
+    return 0;
+}
+
+int svga_mode_lease_release(void)
+{
+    uint64_t flags = svga_lock();
+    int ret = svga_mode_lease_release_locked();
+    svga_unlock(flags);
     return ret;
 }
 void svga_mode_end(uint64_t flags)

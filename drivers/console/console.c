@@ -25,6 +25,7 @@ struct console_vt_text {
 static struct console_vt_text vt_text[CONSOLE_VT_COUNT];
 static uint32_t console_active_vt;
 static bool console_vt_graphical;
+static const struct framebuffer *fb_console_render_target;
 
 static char log_buffer[CONSOLE_LOG_CAP];
 static size_t log_len;
@@ -74,6 +75,92 @@ static uint8_t fb_console_tty_cursor_saved[FB_CONSOLE_CURSOR_BYTES];
 static uint8_t *console_graphic_saved;
 static size_t console_graphic_saved_bytes;
 static uint32_t console_graphic_saved_vt;
+
+/**
+ * @brief Return the framebuffer currently used by the text renderer.
+ * @return The temporary replay surface, or the active framebuffer.
+ */
+static const struct framebuffer *fb_console_framebuffer(void)
+{
+    return fb_console_render_target ? fb_console_render_target : framebuffer_get();
+}
+
+/**
+ * @brief Fill a rectangle on the current text-rendering surface.
+ * @param x Left pixel coordinate.
+ * @param y Top pixel coordinate.
+ * @param width Rectangle width in pixels.
+ * @param height Rectangle height in pixels.
+ * @param color Logical RGB color to fill.
+ */
+static void fb_console_rect(uint32_t x, uint32_t y, uint32_t width,
+                            uint32_t height, uint32_t color)
+{
+    if (fb_console_render_target) {
+        framebuffer_rect_to(fb_console_render_target, x, y, width, height, color);
+    } else {
+        framebuffer_rect(x, y, width, height, color);
+    }
+}
+
+/**
+ * @brief Draw a scalar on the current text-rendering surface.
+ * @param x Left pixel coordinate.
+ * @param y Top pixel coordinate.
+ * @param cp Unicode scalar to draw.
+ * @param fg Logical RGB foreground color.
+ * @param bg Logical RGB background color.
+ */
+static void fb_console_codepoint(uint32_t x, uint32_t y, uint32_t cp,
+                                 uint32_t fg, uint32_t bg)
+{
+    if (fb_console_render_target) {
+        framebuffer_codepoint_to(fb_console_render_target, x, y, cp, fg, bg);
+    } else {
+        framebuffer_codepoint(x, y, cp, fg, bg);
+    }
+}
+
+/**
+ * @brief Allocate a same-layout RAM surface for one fullscreen text replay.
+ * @param target Receives a copy of the active framebuffer descriptor.
+ * @param pixels Receives the allocated backing storage on success.
+ * @return True when a valid surface was allocated.
+ */
+static bool fb_console_allocate_replay_target(struct framebuffer *target,
+                                              uint8_t **pixels)
+{
+    const struct framebuffer *active = framebuffer_get();
+    uint64_t visible_row_bytes;
+    uint64_t allocation_bytes;
+    uint8_t *storage;
+
+    if (!target || !pixels) {
+        return false;
+    }
+    *pixels = NULL;
+    if (!active->available || !active->pixels ||
+        !active->width || !active->height ||
+        (active->bytes_per_pixel != 3u && active->bytes_per_pixel != 4u)) {
+        return false;
+    }
+    visible_row_bytes = (uint64_t)active->width * active->bytes_per_pixel;
+    if (active->pitch < visible_row_bytes) {
+        return false;
+    }
+    allocation_bytes = (uint64_t)active->pitch * active->height;
+    if (!allocation_bytes || allocation_bytes > (uint64_t)(size_t)-1) {
+        return false;
+    }
+    storage = kernel_malloc((size_t)allocation_bytes);
+    if (!storage) {
+        return false;
+    }
+    *target = *active;
+    target->pixels = (uint32_t *)(void *)storage;
+    *pixels = storage;
+    return true;
+}
 
 /**
  * @brief Save the graphical framebuffer before a text VT paints over it.
@@ -196,29 +283,35 @@ static size_t console_log_replay_start(void)
     return first;
 }
 
+/**
+ * @brief Clear one text row on the current rendering surface.
+ * @param row Text row to clear.
+ */
 static void fb_console_clear_log_line(uint32_t row)
 {
-    const struct framebuffer *fb = framebuffer_get();
+    const struct framebuffer *fb = fb_console_framebuffer();
     if (!fb->available || !fb_cols || row >= fb_rows) {
         return;
     }
-    framebuffer_rect(fb_x, fb_y + row * RELIEFOS_FONT_H,
-                     fb_cols * RELIEFOS_FONT_W, RELIEFOS_FONT_H, fb_console_bg_color);
+    fb_console_rect(fb_x, fb_y + row * RELIEFOS_FONT_H,
+                    fb_cols * RELIEFOS_FONT_W, RELIEFOS_FONT_H, fb_console_bg_color);
 }
 
+/** @brief Clear the text grid on the current rendering surface. */
 static void fb_console_clear_log(void)
 {
-    const struct framebuffer *fb = framebuffer_get();
+    const struct framebuffer *fb = fb_console_framebuffer();
     if (!fb->available || !fb_cols || !fb_rows) {
         return;
     }
-    framebuffer_rect(fb_x, fb_y, fb_cols * RELIEFOS_FONT_W,
-                     fb_rows * RELIEFOS_FONT_H, fb_console_bg_color);
+    fb_console_rect(fb_x, fb_y, fb_cols * RELIEFOS_FONT_W,
+                    fb_rows * RELIEFOS_FONT_H, fb_console_bg_color);
 }
 
+/** @brief Restore the saved pixels beneath the visible text cursor. */
 static void fb_console_hide_tty_cursor(void)
 {
-    const struct framebuffer *fb = framebuffer_get();
+    const struct framebuffer *fb = fb_console_framebuffer();
     uint32_t row;
     uint32_t row_bytes;
 
@@ -244,9 +337,10 @@ static void fb_console_hide_tty_cursor(void)
     }
 }
 
+/** @brief Save the underlying pixels and draw the text cursor. */
 static void fb_console_show_tty_cursor(void)
 {
-    const struct framebuffer *fb = framebuffer_get();
+    const struct framebuffer *fb = fb_console_framebuffer();
     uint32_t row;
     uint32_t row_bytes;
 
@@ -273,15 +367,16 @@ static void fb_console_show_tty_cursor(void)
             dst[byte] = src[byte];
         }
     }
-    framebuffer_rect(fb_console_tty_cursor_x,
-                     fb_console_tty_cursor_y + RELIEFOS_FONT_H - 2u,
-                     RELIEFOS_FONT_W, 2u, fb_console_fg_color);
+    fb_console_rect(fb_console_tty_cursor_x,
+                    fb_console_tty_cursor_y + RELIEFOS_FONT_H - 2u,
+                    RELIEFOS_FONT_W, 2u, fb_console_fg_color);
     fb_console_tty_cursor_visible = true;
 }
 
+/** @brief Scroll the active text region on the current rendering surface. */
 static void fb_console_scroll(void)
 {
-    const struct framebuffer *fb = framebuffer_get();
+    const struct framebuffer *fb = fb_console_framebuffer();
     uint32_t top = fb_scroll_top < fb_rows ? fb_scroll_top : 0u;
     uint32_t bottom = fb_scroll_bottom < fb_rows ? fb_scroll_bottom : fb_rows - 1u;
     if (bottom <= top) {
@@ -337,9 +432,14 @@ static void fb_console_newline(void)
     }
 }
 
+/**
+ * @brief Render one Unicode scalar on the current text-rendering surface.
+ * @param ch Unicode scalar to render or terminal control to process.
+ */
 static void fb_console_scalar(uint32_t ch)
 {
-    if (!fb_console_enabled || !framebuffer_get()->available || !fb_cols || !fb_rows) {
+    const struct framebuffer *fb = fb_console_framebuffer();
+    if (!fb_console_enabled || !fb->available || !fb_cols || !fb_rows) {
         return;
     }
     if (ch == '\r') {
@@ -353,9 +453,9 @@ static void fb_console_scalar(uint32_t ch)
     if (ch == '\b') {
         if (fb_col) {
             --fb_col;
-            framebuffer_rect(fb_x + fb_col * RELIEFOS_FONT_W,
-                             fb_y + fb_row * RELIEFOS_FONT_H,
-                             RELIEFOS_FONT_W, RELIEFOS_FONT_H, fb_console_bg_color);
+            fb_console_rect(fb_x + fb_col * RELIEFOS_FONT_W,
+                            fb_y + fb_row * RELIEFOS_FONT_H,
+                            RELIEFOS_FONT_W, RELIEFOS_FONT_H, fb_console_bg_color);
         }
         return;
     }
@@ -381,14 +481,14 @@ static void fb_console_scalar(uint32_t ch)
         uint32_t bg = fb_console_reverse ? fb_console_fg_color : fb_console_bg_color;
         uint32_t x = fb_x + fb_col * RELIEFOS_FONT_W;
         uint32_t y = fb_y + fb_row * RELIEFOS_FONT_H;
-        framebuffer_rect(x, y, RELIEFOS_FONT_W, RELIEFOS_FONT_H, bg);
-        framebuffer_codepoint(x, y, ch, fg, bg);
-        if (fb_console_bold && x + 1u < framebuffer_get()->width) {
-            framebuffer_codepoint(x + 1u, y, ch, fg, bg);
+        fb_console_rect(x, y, RELIEFOS_FONT_W, RELIEFOS_FONT_H, bg);
+        fb_console_codepoint(x, y, ch, fg, bg);
+        if (fb_console_bold && x + 1u < fb->width) {
+            fb_console_codepoint(x + 1u, y, ch, fg, bg);
         }
         if (fb_console_underline) {
-            framebuffer_rect(x, y + RELIEFOS_FONT_H - 2u, RELIEFOS_FONT_W, 1u,
-                             fb_console_underline_color_set ? fb_console_underline_color : fg);
+            fb_console_rect(x, y + RELIEFOS_FONT_H - 2u, RELIEFOS_FONT_W, 1u,
+                            fb_console_underline_color_set ? fb_console_underline_color : fg);
         }
     }
     fb_col += cells;
@@ -412,9 +512,15 @@ static uint32_t fb_ansi_param(uint32_t index, uint32_t fallback)
     return fb_ansi_params[index];
 }
 
+/**
+ * @brief Clear a half-open cell range in one text row.
+ * @param row Text row to clear.
+ * @param first First cell in the range.
+ * @param last End cell, not included.
+ */
 static void fb_console_clear_row_range(uint32_t row, uint32_t first, uint32_t last)
 {
-    const struct framebuffer *fb = framebuffer_get();
+    const struct framebuffer *fb = fb_console_framebuffer();
     if (!fb->available || row >= fb_rows || first >= fb_cols) {
         return;
     }
@@ -424,10 +530,10 @@ static void fb_console_clear_row_range(uint32_t row, uint32_t first, uint32_t la
     if (last <= first) {
         return;
     }
-    framebuffer_rect(fb_x + first * RELIEFOS_FONT_W,
-                     fb_y + row * RELIEFOS_FONT_H,
-                     (last - first) * RELIEFOS_FONT_W, RELIEFOS_FONT_H,
-                     fb_console_bg_color);
+    fb_console_rect(fb_x + first * RELIEFOS_FONT_W,
+                    fb_y + row * RELIEFOS_FONT_H,
+                    (last - first) * RELIEFOS_FONT_W, RELIEFOS_FONT_H,
+                    fb_console_bg_color);
 }
 
 static uint32_t fb_ansi_color(uint32_t code)
@@ -813,9 +919,10 @@ static void fb_console_ansi_feed(char ch)
     fb_console_reset_ansi();
 }
 
+/** @brief Reset text state and clear the full active rendering surface. */
 static void fb_console_initialize_fullscreen(void)
 {
-    const struct framebuffer *fb = framebuffer_get();
+    const struct framebuffer *fb = fb_console_framebuffer();
     if (!fb->available) {
         return;
     }
@@ -837,13 +944,15 @@ static void fb_console_initialize_fullscreen(void)
     fb_scroll_bottom = fb_rows ? fb_rows - 1u : 0u;
     fb_console_reset_attributes();
     fb_console_reset_ansi();
-    framebuffer_rect(0, 0, fb->width, fb->height, console_panel());
+    fb_console_rect(0, 0, fb->width, fb->height, console_panel());
     /* The repaint covers the whole screen, so it must be published as a
      * whole: the scanout only refreshes regions an update command names, and
      * the grid (`fb_rows * RELIEFOS_FONT_H`) cannot reach the remainder strip
      * below the last font row. Publishing only the grid left that strip
      * showing the previous graphical picture after a switch to text. */
-    framebuffer_present();
+    if (!fb_console_render_target) {
+        framebuffer_present();
+    }
 }
 
 static void vga_console_ansi_feed(char character)
@@ -874,15 +983,17 @@ static void console_emit_raw(char ch)
     console_line_start = ch == '\n';
 }
 
+/** @brief Draw the cursor and publish an active text grid when not staging. */
 static void console_present(void)
 {
+    const struct framebuffer *fb = fb_console_framebuffer();
     if (console_presenting || console_vt_graphical || !fb_console_enabled ||
-        !framebuffer_get()->available) {
+        !fb->available) {
         return;
     }
     console_presenting = true;
     fb_console_show_tty_cursor();
-    if (fb_cols && fb_rows) {
+    if (fb_cols && fb_rows && !fb_console_render_target) {
         framebuffer_present_region(fb_x, fb_y,
                                    fb_cols * RELIEFOS_FONT_W,
                                    fb_rows * RELIEFOS_FONT_H);
@@ -1072,10 +1183,32 @@ void console_vt_activate(uint32_t number, bool graphical)
         console_present();
         return;
     }
+    struct framebuffer replay_target;
+    uint8_t *replay_pixels = NULL;
+    bool replay_staged = fb_console_allocate_replay_target(&replay_target,
+                                                            &replay_pixels);
+    if (replay_staged) {
+        fb_console_render_target = &replay_target;
+    }
     fb_console_initialize_fullscreen();
     struct console_vt_text *screen = &vt_text[number - 1u];
     for (size_t i = 0; i < screen->length; ++i) fb_console_ansi_feed(screen->bytes[i]);
     console_present();
+    if (replay_staged) {
+        const struct framebuffer *active = framebuffer_get();
+        size_t visible_row_bytes =
+            (size_t)active->width * active->bytes_per_pixel;
+        for (uint32_t row = 0; row < active->height; ++row) {
+            uint8_t *destination = (uint8_t *)active->pixels +
+                                   (uint64_t)row * active->pitch;
+            const uint8_t *source = replay_pixels +
+                                    (uint64_t)row * replay_target.pitch;
+            __builtin_memcpy(destination, source, visible_row_bytes);
+        }
+        fb_console_render_target = NULL;
+        framebuffer_present();
+        kernel_free(replay_pixels);
+    }
 }
 
 static void console_log_control(const char *sequence)

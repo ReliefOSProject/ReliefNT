@@ -292,7 +292,7 @@ ISR_NOERR isr9_stub 9
 ISR_ERR isr10_stub 10
 ISR_ERR isr11_stub 11
 ISR_ERR isr12_stub 12
-ISR_ERR isr13_stub 13
+ISR_ERR isr13_kernel_stub 13
 ISR_NOERR isr15_stub 15
 ISR_NOERR isr16_stub 16
 ISR_ERR isr17_stub 17
@@ -372,6 +372,66 @@ isr14_stub:
     pushq %r14
     pushq %r15
 .endm
+
+/**
+ * @brief Handle a CPU-delivered vector-13 fault without normal return.
+ * @details The processor supplies the #GP error code and interrupt-return
+ *          frame, including the old RSP and SS on a privilege transition.
+ *          This hardware entry receives no caller-supplied C arguments. For
+ *          CPL3 it saves all GPRs and passes the completed trap-frame pointer
+ *          as the sole argument to general_protection_dispatch(); CPL0 uses
+ *          the existing fatal entry. The path restores the selected task's
+ *          saved frame with iretq or enters fatal arch_schedule_failure() if
+ *          no valid frame is available.
+ * @return No ordinary return; control leaves by restoring a selected frame
+ *         or by the noreturn scheduler-failure path.
+ */
+.global isr13_stub
+.type isr13_stub, @function
+isr13_stub:
+    testb $3, 16(%rsp) /* CS follows the hardware error code and RIP. */
+    jz isr13_kernel_stub
+    pushq $13
+    pushq %rax
+    pushq %rbx
+    pushq %rcx
+    pushq %rdx
+    pushq %rsi
+    pushq %rdi
+    pushq %rbp
+    pushq %r8
+    pushq %r9
+    pushq %r10
+    pushq %r11
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    mov %rsp, %rdi
+    call general_protection_dispatch
+    test %rax, %rax
+    jz 1f
+    mov %rax, %r12
+    mov %rax, %rdi
+    call sched_task_cr3
+    mov %rax, %r13
+    mov %r12, %rdi
+    call sched_task_frame
+    mov %rax, %rdi
+    mov %r13, %rsi
+    test %rdi, %rdi
+    jz 1f
+    mov %rdi, %r14
+    mov %rsi, %rdi
+    call paging_load_cr3_if_changed
+    mov %r14, %rsp
+    jmp trap_restore_frame
+1:
+    /* Never iret to the original #GP frame if scheduling did not select a
+     * replacement or recoverable return frame. */
+    mov %rsp, %rdi
+    call arch_schedule_failure
+.size isr13_stub, .-isr13_stub
 
 .macro IRQ_STUB name vector
 .global \name

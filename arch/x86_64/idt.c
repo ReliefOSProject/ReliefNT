@@ -12,6 +12,8 @@
 #include <reliefnt/time.h>
 #include <reliefnt/userland.h>
 
+#include "idt.h"
+
 struct __attribute__((packed)) idt_entry {
     uint16_t offset_low;
     uint16_t selector;
@@ -294,6 +296,39 @@ void exception_dispatch(uint64_t vector, uint64_t error, uint64_t rip, uint64_t 
                        (unsigned)((error >> 4) & 1u));
     }
     bugcheck_exception(vector, error, rip, cs, rflags, rsp, ss, cr2);
+}
+
+/**
+ * @brief Deliver a user #GP as forced SIGSEGV, leaving kernel #GP fatal.
+ * @param frame Complete trap frame built by the dedicated vector-13 entry stub.
+ * @return The task selected by the normal scheduler, or NULL on an invalid scheduler return.
+ */
+struct task *general_protection_dispatch(struct trap_frame *frame)
+{
+    if (!frame) {
+        bugcheck_exception(13, 0, 0, 0, 0, 0, 0, x86_64_read_cr2());
+    }
+    if (frame->vector != 13) {
+        exception_dispatch(frame->vector, frame->error, frame->rip, frame->cs,
+                           frame->rflags, 0, 0);
+    }
+    if ((frame->cs & 3ULL) != 3ULL) {
+        /* Kernel-mode faults retain the existing fatal policy.  The generic
+         * entry supplied zero for RSP/SS when CPL did not change. */
+        exception_dispatch(frame->vector, frame->error, frame->rip, frame->cs,
+                           frame->rflags, 0, 0);
+    }
+
+    struct task *task = sched_current_task();
+    if (!task || task->kind != TASK_KIND_USER) {
+        bugcheck_trap("User General Protection Fault without user task", frame,
+                      x86_64_read_cr2());
+    }
+
+    /* #GP has no fault address.  CR2 belongs to the last page fault and must
+     * not be exposed as si_addr for this synchronous SIGSEGV. */
+    kernel_signal_force_fault(task, LINUX_SIGSEGV, LINUX_SI_KERNEL, 0);
+    return userland_schedule_from_frame(frame);
 }
 
 /**

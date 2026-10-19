@@ -1,11 +1,14 @@
 #include <reliefos/psf_font.h>
 #include <reliefnt/console.h>
+#include <reliefnt/drm.h>
 #include <reliefnt/framebuffer.h>
 #include <reliefnt/pci.h>
 #include <reliefnt/port.h>
 #include "framebuffer_fifo.h"
 #include "../svga/device.h"
 #include <generated/cjk_font.h>
+
+static struct framebuffer fb;
 
 /**
  * @brief Find the immutable Unicode glyph, falling back to U+FFFD.
@@ -41,16 +44,31 @@ uint32_t framebuffer_codepoint_width(uint32_t cp)
  */
 void framebuffer_codepoint(uint32_t x, uint32_t y, uint32_t cp, uint32_t fg, uint32_t bg)
 {
+    framebuffer_codepoint_to(&fb, x, y, cp, fg, bg);
+}
+
+/**
+ * @brief Draw a Unicode scalar into an explicit framebuffer target.
+ * @param target Framebuffer whose pixel storage receives the glyph.
+ * @param x Left pixel coordinate.
+ * @param y Top pixel coordinate.
+ * @param cp Unicode scalar to look up.
+ * @param fg Foreground color.
+ * @param bg Background color.
+ */
+void framebuffer_codepoint_to(const struct framebuffer *target,
+                              uint32_t x, uint32_t y, uint32_t cp,
+                              uint32_t fg, uint32_t bg)
+{
     unsigned index = framebuffer_glyph_index(cp);
     unsigned width = framebuffer_codepoint_width(cp);
     const uint8_t *bits = cp < 128U ? reliefos_psf_glyph((char)cp) : cjk_glyphs[index].bits;
     for (unsigned row = 0; row < 16U; row++)
         for (unsigned col = 0; col < width * 8U; col++)
-            framebuffer_rect(x + col, y + row, 1, 1,
+            framebuffer_rect_to(target, x + col, y + row, 1, 1,
                 bits[row * width + col / 8] & (0x80U >> (col % 8)) ? fg : bg);
 }
 
-static struct framebuffer fb;
 static void framebuffer_set_default_format(void);
 static int framebuffer_range_valid(uint64_t start, uint64_t bytes);
 
@@ -131,6 +149,17 @@ struct bochs_vbe_state {
 
 static struct vmware_svga_state vmware_svga;
 static struct bochs_vbe_state bochs_vbe;
+static bool framebuffer_drm_scanout_owned;
+static bool framebuffer_drm_damage_pending;
+static uint32_t framebuffer_drm_pending_x1;
+static uint32_t framebuffer_drm_pending_y1;
+static uint32_t framebuffer_drm_pending_x2;
+static uint32_t framebuffer_drm_pending_y2;
+
+static bool framebuffer_drm_owned(void)
+{
+    return __atomic_load_n(&framebuffer_drm_scanout_owned, __ATOMIC_ACQUIRE);
+}
 
 #define CURSOR_W 16
 #define CURSOR_H 16
@@ -340,7 +369,14 @@ static uint8_t framebuffer_component_from_native(uint32_t pixel,
     return (uint8_t)((raw * 255ULL + max_value / 2ULL) / max_value);
 }
 
-static uint32_t framebuffer_native_color(uint32_t color)
+/**
+ * @brief Convert logical RGB to the native channel layout of a framebuffer.
+ * @param target Framebuffer format that determines the native channel layout.
+ * @param color Logical RGB color to convert.
+ * @return Native-format pixel value.
+ */
+static uint32_t framebuffer_native_color_for(const struct framebuffer *target,
+                                             uint32_t color)
 {
     uint8_t red_position = 16u;
     uint8_t red_size = 8u;
@@ -349,13 +385,13 @@ static uint32_t framebuffer_native_color(uint32_t color)
     uint8_t blue_position = 0u;
     uint8_t blue_size = 8u;
 
-    if (framebuffer_color_format_valid(&fb)) {
-        red_position = fb.red_field_position;
-        red_size = fb.red_mask_size;
-        green_position = fb.green_field_position;
-        green_size = fb.green_mask_size;
-        blue_position = fb.blue_field_position;
-        blue_size = fb.blue_mask_size;
+    if (framebuffer_color_format_valid(target)) {
+        red_position = target->red_field_position;
+        red_size = target->red_mask_size;
+        green_position = target->green_field_position;
+        green_size = target->green_mask_size;
+        blue_position = target->blue_field_position;
+        blue_size = target->blue_mask_size;
     }
 
     return framebuffer_component_to_native((uint8_t)(color >> 16),
@@ -364,6 +400,11 @@ static uint32_t framebuffer_native_color(uint32_t color)
                                            green_position, green_size) |
            framebuffer_component_to_native((uint8_t)color,
                                            blue_position, blue_size);
+}
+
+static uint32_t framebuffer_native_color(uint32_t color)
+{
+    return framebuffer_native_color_for(&fb, color);
 }
 
 static uint32_t framebuffer_logical_color(uint32_t pixel)
@@ -815,6 +856,11 @@ static int framebuffer_vmware_probe(void)
         vmware_svga.max_height = FRAMEBUFFER_MODE_MAX_HEIGHT;
     }
     vmware_svga.present = true;
+    int drm_ret = drm_device_register(&device);
+    if (drm_ret < 0) {
+        console_warn("[reliefnt] VMware DRM primary node unavailable ret=%d\n",
+                     drm_ret);
+    }
     framebuffer_vmware_fifo_init(true, false);
 
     fb.max_width = vmware_svga.max_width;
@@ -1041,6 +1087,23 @@ static void framebuffer_write_native(uint32_t x, uint32_t y, uint32_t color)
     }
 }
 
+/**
+ * @brief Store one native-format pixel in an explicit framebuffer target.
+ * @param target Framebuffer whose pixel storage receives the pixel.
+ * @param x Pixel column.
+ * @param y Pixel row.
+ * @param color Native-format pixel value.
+ */
+static void framebuffer_write_native_to(const struct framebuffer *target,
+                                        uint32_t x, uint32_t y, uint32_t color)
+{
+    uint8_t *pixel = (uint8_t *)target->pixels + (uint64_t)y * target->pitch +
+                     (uint64_t)x * target->bytes_per_pixel;
+    for (uint8_t byte = 0; byte < target->bytes_per_pixel; ++byte) {
+        pixel[byte] = (uint8_t)(color >> (byte * 8u));
+    }
+}
+
 static uint32_t framebuffer_read_native(uint32_t x, uint32_t y)
 {
     const uint8_t *pixel = framebuffer_pixel_ptr(x, y);
@@ -1213,6 +1276,8 @@ int framebuffer_set_mode(uint32_t width, uint32_t height)
     uint64_t required_bytes;
     int changed;
 
+    if (framebuffer_drm_owned())
+        return fb.available && fb.width == width && fb.height == height ? 0 : -1;
     if (!fb.available || !(fb.capabilities & FRAMEBUFFER_CAP_MODE_SET) ||
         width == 0 || height == 0 || width > fb.max_width || height > fb.max_height) {
         return -1;
@@ -1267,20 +1332,43 @@ void framebuffer_clear(uint32_t color)
 
 void framebuffer_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color)
 {
+    framebuffer_rect_to(&fb, x, y, w, h, color);
+}
+
+/**
+ * @brief Fill an axis-aligned rectangle in an explicit framebuffer target.
+ * @param target Framebuffer whose pixel storage receives the fill.
+ * @param x Left pixel coordinate.
+ * @param y Top pixel coordinate.
+ * @param w Rectangle width in pixels.
+ * @param h Rectangle height in pixels.
+ * @param color Logical RGB color to fill.
+ */
+void framebuffer_rect_to(const struct framebuffer *target,
+                         uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                         uint32_t color)
+{
+    uint64_t minimum_pitch;
     uint32_t native_color;
-    if (!fb.available || x >= fb.width || y >= fb.height) {
+    if (!target || !target->available || !target->pixels || !target->width ||
+        !target->height || !target->bytes_per_pixel ||
+        target->bytes_per_pixel > 4u || x >= target->width || y >= target->height) {
         return;
     }
-    if (x + w > fb.width) {
-        w = fb.width - x;
+    minimum_pitch = (uint64_t)target->width * target->bytes_per_pixel;
+    if (target->pitch < minimum_pitch) {
+        return;
     }
-    if (y + h > fb.height) {
-        h = fb.height - y;
+    if (w > target->width - x) {
+        w = target->width - x;
     }
-    native_color = framebuffer_native_color(color);
+    if (h > target->height - y) {
+        h = target->height - y;
+    }
+    native_color = framebuffer_native_color_for(target, color);
     for (uint32_t yy = y; yy < y + h; ++yy) {
         for (uint32_t xx = x; xx < x + w; ++xx) {
-            framebuffer_write_native(xx, yy, native_color);
+            framebuffer_write_native_to(target, xx, yy, native_color);
         }
     }
 }
@@ -1361,6 +1449,25 @@ static void framebuffer_present_region_internal(uint32_t x, uint32_t y,
         svga_unlock(flags);
         return;
     }
+    if (framebuffer_drm_owned()) {
+        if (timer_refresh && framebuffer_drm_damage_pending) {
+            uint32_t x1 = framebuffer_drm_pending_x1;
+            uint32_t y1 = framebuffer_drm_pending_y1;
+            uint32_t x2 = framebuffer_drm_pending_x2;
+            uint32_t y2 = framebuffer_drm_pending_y2;
+            int published;
+            if (svga.available) {
+                published = svga_update_try_locked(x1, y1, x2 - x1, y2 - y1) == 0;
+            } else {
+                published = framebuffer_vmware_fifo_update(x1, y1,
+                                                            x2 - x1, y2 - y1);
+                if (published) framebuffer_vmware_kick();
+            }
+            if (published) framebuffer_drm_damage_pending = false;
+        }
+        svga_unlock(flags);
+        return;
+    }
     if (width == UINT32_MAX && height == UINT32_MAX) {
         width = fb.width;
         height = fb.height;
@@ -1435,6 +1542,98 @@ void framebuffer_present(void)
 void framebuffer_display_tick(void)
 {
     framebuffer_present_region_internal(0, 0, UINT32_MAX, UINT32_MAX, true);
+}
+
+int framebuffer_drm_scanout_begin(void)
+{
+    if (!fb.available || fb.backend != FRAMEBUFFER_BACKEND_VMWARE_SVGA ||
+        !vmware_svga.present || fb.bpp != 32u || fb.bytes_per_pixel != 4u ||
+        !fb.width || !fb.height || fb.pitch < (uint64_t)fb.width * 4u)
+        return -1;
+    uint64_t flags = svga_lock();
+    if (framebuffer_drm_owned()) {
+        svga_unlock(flags);
+        return 0;
+    }
+    __atomic_store_n(&framebuffer_drm_scanout_owned, true, __ATOMIC_RELEASE);
+    framebuffer_drm_damage_pending = false;
+    if (svga.bound && svga.traces_enabled) {
+        svga.ops.write(SVGA_REG_TRACES, 0);
+        svga.traces_enabled = false;
+    }
+    svga_unlock(flags);
+    return 0;
+}
+
+void framebuffer_drm_scanout_release(void)
+{
+    uint64_t flags = svga_lock();
+    __atomic_store_n(&framebuffer_drm_scanout_owned, false, __ATOMIC_RELEASE);
+    framebuffer_drm_damage_pending = false;
+    framebuffer_drm_pending_x1 = framebuffer_drm_pending_y1 = 0;
+    framebuffer_drm_pending_x2 = framebuffer_drm_pending_y2 = 0;
+    if (vmware_svga.fifo_present && svga.bound)
+        (void)svga_restore_traces_locked();
+    svga_unlock(flags);
+}
+
+static int framebuffer_drm_publish_locked(uint32_t x1, uint32_t y1,
+                                          uint32_t x2, uint32_t y2)
+{
+    if (x1 >= x2 || y1 >= y2) return 1;
+    if (svga.available)
+        return svga_update_try_locked(x1, y1, x2 - x1, y2 - y1) == 0;
+    if (!framebuffer_vmware_fifo_update(x1, y1, x2 - x1, y2 - y1)) return 0;
+    framebuffer_vmware_kick();
+    return 1;
+}
+
+int framebuffer_drm_present_region(const void *pixels, uint32_t pitch,
+                                   uint32_t format, uint32_t x1, uint32_t y1,
+                                   uint32_t x2, uint32_t y2)
+{
+    const uint32_t drm_format_xrgb8888 = 0x34325258u;
+    if (!pixels || !framebuffer_drm_owned() ||
+        fb.backend != FRAMEBUFFER_BACKEND_VMWARE_SVGA || !fb.available ||
+        format != drm_format_xrgb8888 || fb.bpp != 32u ||
+        fb.bytes_per_pixel != 4u || pitch < (uint64_t)fb.width * 4u ||
+        x1 >= x2 || y1 >= y2 || x2 > fb.width || y2 > fb.height)
+        return -1;
+    uint64_t last_source = (uint64_t)(y2 - 1u) * pitch + (uint64_t)x2 * 4u;
+    if (y2 > 1u && (last_source - (uint64_t)x2 * 4u) / (y2 - 1u) != pitch)
+        return -1;
+    const uint8_t *source = pixels;
+    for (uint32_t y = y1; y < y2; ++y) {
+        uint8_t *destination = framebuffer_pixel_ptr(x1, y);
+        const uint8_t *row = source + (uint64_t)y * pitch + (uint64_t)x1 * 4u;
+        __builtin_memcpy(destination, row, (uint64_t)(x2 - x1) * 4u);
+    }
+
+    uint64_t flags = svga_lock();
+    if (!framebuffer_drm_owned()) {
+        svga_unlock(flags);
+        return -1;
+    }
+    uint32_t send_x1 = x1, send_y1 = y1, send_x2 = x2, send_y2 = y2;
+    if (framebuffer_drm_damage_pending) {
+        if (framebuffer_drm_pending_x1 < send_x1) send_x1 = framebuffer_drm_pending_x1;
+        if (framebuffer_drm_pending_y1 < send_y1) send_y1 = framebuffer_drm_pending_y1;
+        if (framebuffer_drm_pending_x2 > send_x2) send_x2 = framebuffer_drm_pending_x2;
+        if (framebuffer_drm_pending_y2 > send_y2) send_y2 = framebuffer_drm_pending_y2;
+    }
+    if (framebuffer_drm_publish_locked(send_x1, send_y1, send_x2, send_y2)) {
+        framebuffer_drm_damage_pending = false;
+    } else {
+        framebuffer_drm_damage_pending = true;
+        framebuffer_drm_pending_x1 = send_x1;
+        framebuffer_drm_pending_y1 = send_y1;
+        framebuffer_drm_pending_x2 = send_x2;
+        framebuffer_drm_pending_y2 = send_y2;
+    }
+    svga_unlock(flags);
+    /* FIFO-full damage has already been copied into GFB and is kernel-owned
+     * until a nonblocking display tick publishes its coalesced rectangle. */
+    return 0;
 }
 
 static void framebuffer_char_transparent(uint32_t x, uint32_t y, char ch, uint32_t fg)

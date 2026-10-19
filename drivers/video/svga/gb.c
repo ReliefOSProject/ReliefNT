@@ -3,8 +3,8 @@
 static void backing_free(struct svga_mob *m)
 {
     if (m->pt_phys) svga.ops.free(m->pt_phys, m->pt_pages);
-    if (m->phys) svga.ops.free(m->phys, m->pages);
-    svga.pages -= m->pages + m->pt_pages;
+    if (m->phys && !m->borrowed) svga.ops.free(m->phys, m->pages);
+    svga.pages -= m->pt_pages + (m->borrowed ? 0u : m->pages);
     *m = (struct svga_mob){0};
 }
 
@@ -27,7 +27,7 @@ static int backing_alloc(struct svga_mob *m, uint32_t bytes)
         return SVGA_ENOMEM;
     uint32_t pages = (bytes + 4095u) / 4096u;
     uint32_t tables = pages <= 1 ? 0 : pages <= 1024 ? 1 : 1 + (pages + 1023u) / 1024u;
-    if (svga.pages > svga.page_limit || pages + tables > svga.page_limit - svga.pages)
+    if (!svga_page_budget_allows(pages + tables))
         return SVGA_ENOMEM;
     uint64_t phys = alloc_zero(pages);
     if (!phys) return SVGA_ENOMEM;
@@ -51,13 +51,59 @@ static int backing_alloc(struct svga_mob *m, uint32_t bytes)
     return 0;
 }
 
+int svga_gb_backing_alloc_locked(struct svga_mob *m, uint32_t bytes)
+{
+    return !m ? SVGA_EINVAL : backing_alloc(m, bytes);
+}
+
+int svga_gb_backing_borrow_locked(struct svga_mob *m, uint64_t phys,
+                                  uint32_t pages, uint32_t bytes)
+{
+    if (!m || !phys || (phys & 4095u) || !pages || !bytes ||
+        bytes > (uint64_t)pages * 4096u || pages > SVGA_MAX_GUEST_PAGES ||
+        (phys >> 12) > UINT32_MAX - pages)
+        return SVGA_EINVAL;
+    uint32_t tables = pages <= 1 ? 0 : pages <= 1024 ? 1 : 1 + (pages + 1023u) / 1024u;
+    if (!svga_page_budget_allows(tables))
+        return SVGA_ENOMEM;
+    uint64_t pt_phys = tables ? alloc_zero(tables) : 0;
+    if (tables && !pt_phys) return SVGA_ENOMEM;
+    *m = (struct svga_mob){.phys = phys, .pt_phys = pt_phys, .pages = pages,
+        .pt_pages = tables, .bytes = bytes,
+        .depth = tables > 1 ? SVGA3D_MOBFMT_PT_2 : tables ? SVGA3D_MOBFMT_PT_1 : SVGA3D_MOBFMT_PT_0,
+        .borrowed = true};
+    if (tables) {
+        uint32_t *pt = svga.ops.pointer(pt_phys);
+        uint32_t *leaves = tables > 1 ? pt + 1024 : pt;
+        if (tables > 1)
+            for (uint32_t i = 0; i < tables - 1; ++i)
+                pt[i] = (uint32_t)(pt_phys >> 12) + i + 1;
+        for (uint32_t i = 0; i < pages; ++i)
+            leaves[i] = (uint32_t)(phys >> 12) + i;
+    }
+    svga.pages += tables;
+    svga_barrier();
+    return 0;
+}
+
+void svga_gb_backing_free_locked(struct svga_mob *m)
+{
+    if (m) backing_free(m);
+}
+
 static uint32_t backing_root(const struct svga_mob *m)
 {
     return (uint32_t)((m->pt_phys ? m->pt_phys : m->phys) >> 12);
 }
 
+uint32_t svga_gb_backing_root(const struct svga_mob *m)
+{
+    return m ? backing_root(m) : 0;
+}
+
 static int mob_create(struct svga_mob *m, uint32_t id, uint32_t bytes)
 {
+    if (id >= SVGA_MOBS) return SVGA_EINVAL;
     int ret = backing_alloc(m, bytes);
     if (ret) return ret;
     SVGA3dCmdDefineGBMob cmd = {id, m->depth, backing_root(m), m->bytes};
@@ -73,7 +119,7 @@ int svga_gb_init_locked(void)
         SVGA_MOBS * SVGA_GB_MOB_ENTRY_BYTES,
         SVGA_SURFACES * SVGA_GB_SURFACE_ENTRY_BYTES,
         SVGA_CONTEXTS * SVGA_GB_CONTEXT_ENTRY_BYTES,
-        4096, 0
+        SVGA_GB_SHADER_SLOTS * SVGA_GB_SHADER_ENTRY_BYTES, 0
     };
     _Static_assert(SVGA_MOBS * SVGA_GB_MOB_ENTRY_BYTES <= 4194304u &&
                    SVGA_SURFACES * SVGA_GB_SURFACE_ENTRY_BYTES <= 4194304u &&

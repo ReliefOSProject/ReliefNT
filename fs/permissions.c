@@ -90,7 +90,16 @@ static int device_metadata(const struct storage_node *node,
     if (!write) {
         uint32_t mode = node->type == RELIEFOS_FS_TYPE_DIR ? 0755 : 0666;
         if (node->flags & STORAGE_NODE_FLAG_DEV_BLOCK) mode = 0600;
-        *value = (struct reliefos_permissions){mode, 0, 0};
+        uint32_t gid = 0;
+        if (node->first_cluster == STORAGE_DEV_KIND_DRM_CARD0) {
+            mode = 0660;
+            gid = 44; /* Linux video group. */
+        } else if (node->first_cluster ==
+                   STORAGE_DEV_KIND_DRM_RENDERD128) {
+            mode = 0660;
+            gid = 44; /* Linux video group. */
+        }
+        *value = (struct reliefos_permissions){mode, 0, gid};
         return 0;
     }
     if (free_slot == 128) return -RELIEFOS_ENOSPC;

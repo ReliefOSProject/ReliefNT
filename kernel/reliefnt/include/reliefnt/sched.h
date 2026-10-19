@@ -25,6 +25,9 @@ struct audio_control_file;
 struct audio_oss_file;
 struct audio_mixer_file;
 struct audio_pcm;
+struct drm_file;
+struct drm_bo;
+struct drm_prime_file;
 
 #define SCHED_TASK_NAME_LEN 32u
 /* Initial task-table capacity; the scheduler grows beyond this value. */
@@ -69,12 +72,16 @@ struct task_vma {
     uint64_t end;
     uint64_t file_offset;
     uint64_t file_limit;
-    /* Physical base of device-backed mappings (shmem, framebuffer); zero for
-     * ordinary file and anonymous mappings. */
+    /* Physical base of device-backed mappings (shmem, framebuffer, DRM BO);
+     * zero for ordinary file and anonymous mappings. */
     uint64_t device_physical;
     struct storage_node file_node;
     struct storage_inode_ref *inode;
     struct audio_pcm *audio_pcm;
+    /* A DRM VMA retains its BO and the source DRM open-file description.
+     * The latter preserves master/auth state after numeric fd close. */
+    struct drm_bo *drm_bo;
+    struct task_file *drm_mapping_file;
     struct sysv_shm_attachment *sysv_shm_attachment;
     uint32_t audio_mmap_region;
     uint32_t audio_mmap_generation;
@@ -111,6 +118,14 @@ struct task_file {
     struct audio_mixer_file *audio_mixer_file;
     /* ALSA /dev/snd/timer state owned by the open file description. */
     struct audio_timer_file *audio_timer_file;
+    /* DRM primary-node state owned by the open file description. */
+    struct drm_file *drm_file;
+    /* Opaque same-device vmwgfx surface PRIME file; also OFD-owned. */
+    struct drm_prime_file *drm_prime_file;
+    uint64_t drm_prime_ino;
+    uint64_t drm_prime_size;
+    uint32_t drm_prime_uid;
+    uint32_t drm_prime_gid;
     uint32_t input_vt; /* evdev graphical-VT filter, zero for the raw stream. */
     uint8_t input_vt_manual; /* EVIOCSVT explicitly selected the filter mode. */
     struct storage_read_cursor read_cursor;
@@ -118,6 +133,7 @@ struct task_file {
 };
 
 #define TASK_FILE_KIND_SIGNALFD 1u
+#define TASK_FILE_KIND_DRM_PRIME 4u
 
 static inline struct task_file *task_file_description(struct task_file *file)
 {
@@ -479,6 +495,8 @@ struct task {
     uint64_t socket_receive_name;
     unsigned char socket_receive_path[111];
     struct task_file *syscall_file;
+    /* Task-owned vmwgfx ioctl continuation; opaque to the scheduler. */
+    void *drm_vmwgfx_continuation;
     struct task_file *fifo_open_file; /* Unpublished endpoint held during FIFO rendezvous. */
     uint32_t tty_old_pgrp;
     struct task_pty_fd syscall_pty;

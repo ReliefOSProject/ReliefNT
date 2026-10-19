@@ -19,6 +19,7 @@
 #include <linux/errno.h>
 #include <reliefnt/time.h>
 #include <reliefnt/power.h>
+#include <reliefnt/drm.h>
 
 static struct kernel_signal_action *signal_action(struct task *task, int sig)
 {
@@ -277,6 +278,8 @@ static int signal_setup_frame(struct task *task, int sig,
             nr != __NR_poll && nr != __NR_ppoll && nr != __NR_epoll_wait && nr != __NR_epoll_pwait &&
             nr != __NR_epoll_pwait2 && nr != __NR_select && nr != __NR_pselect6 && nr != __NR_rt_sigtimedwait && !sleeping &&
             !(nr == __NR_futex && frame->r10) && !task->socket_io_timed;
+        bool synccpu_busy = drm_vmwgfx_task_signal_busy(task);
+        if (synccpu_busy) restart = false;
         uint64_t received = task->socket_receive_done;
         bool batch = task->mmsg.active;
         int64_t batch_result = batch ? task_socket_mmsg_interrupt(task, received) : 0;
@@ -288,7 +291,8 @@ static int signal_setup_frame(struct task *task, int sig,
         task_release_syscall_file(task);
         if (received || (batch && batch_result != -LINUX_EINTR) || (interruptible && !restart)) {
             frame->rip += 2;
-            frame->rax = batch ? (uint64_t)batch_result : received ? received : (uint64_t)-4LL;
+            frame->rax = synccpu_busy ? (uint64_t)-LINUX_EBUSY :
+                batch ? (uint64_t)batch_result : received ? received : (uint64_t)-4LL;
             task->poll_deadline_ticks = 0;
         }
         if (sleeping) {
@@ -377,6 +381,7 @@ static int signal_deliver_pending_locked(struct task *task, struct trap_frame *f
     /* A direct delivery or RMID result precedes signal_pending in ipc/msg.c. */
     if (task->restart_syscall && task->sysv_msg.completed) return 0;
     if (task->restart_syscall && task_sysv_sem_ready(task)) return 0;
+    if (drm_vmwgfx_task_uninterruptible(task)) return 0;
     int sig;
     while ((sig = kernel_signal_dequeue(task, ~(task->blocked_signals | task->sigwait_mask), &info))) {
         uint64_t bit = 1ULL << (uint32_t)(sig - 1);

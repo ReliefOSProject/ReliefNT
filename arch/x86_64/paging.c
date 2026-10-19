@@ -28,9 +28,16 @@ extern void x86_64_invlpg(uint64_t addr);
 /* All first-GiB kernel leaves are split before any user CR3 copies its PDEs.
  * Later BAR attribute changes remain visible through every copied low PDE. */
 static uint64_t kernel_low_pt[512][512] __attribute__((aligned(4096)));
-#define MMIO_PAGE_MAX 4096U
-struct mmio_page { uint64_t phys, original; uint32_t refs, permanent; };
-static struct mmio_page mmio_pages[MMIO_PAGE_MAX];
+#define MMIO_RUN_MAX 256U
+#define MMIO_LEASE_MAX 128U
+struct mmio_run {
+    uint64_t start, end, original_flags;
+    uint32_t refs, permanent;
+};
+struct mmio_lease { uint64_t start, end; uint32_t refs; };
+static struct mmio_run mmio_runs[MMIO_RUN_MAX], mmio_work[MMIO_RUN_MAX];
+static struct mmio_lease mmio_leases[MMIO_LEASE_MAX], mmio_lease_work[MMIO_LEASE_MAX];
+static uint32_t mmio_run_count, mmio_lease_count;
 static struct kernel_spinlock mmio_lock = KERNEL_SPINLOCK_INIT;
 static bool nx_enabled;
 
@@ -227,16 +234,6 @@ void *paging_kernel_direct_map(uint64_t phys)
     return (void *)(uintptr_t)(RELIEFNT_KERNEL_DIRECT_MAP_BASE + phys);
 }
 
-/** @brief Find attribute ownership for a physical device page under mmio_lock.
- * @param phys Page-aligned device address.
- * @return Borrowed record or NULL. Task context, no callback or sleep.
- */
-static struct mmio_page *mmio_find_page(uint64_t phys)
-{
-    for (uint32_t i = 0; i < MMIO_PAGE_MAX; ++i)
-        if ((mmio_pages[i].refs || mmio_pages[i].permanent) && mmio_pages[i].phys == phys) return &mmio_pages[i];
-    return NULL;
-}
 /** @brief Obtain a shared 4 KiB kernel leaf, splitting only its original PDE.
  * @param phys Physical address in the kernel map.
  * @return Borrowed PTE pointer, or NULL on allocation failure. mmio_lock held.
@@ -259,44 +256,323 @@ static uint64_t *mmio_leaf(uint64_t phys)
     if (!(*pde & RELIEFNT_PAGE_PRESENT)) return NULL;
     return &((uint64_t *)(uintptr_t)(*pde & RELIEFNT_PHYS_ADDR_MASK))[(phys >> 12) & 511];
 }
+/** @brief Return a leaf only when its PDE has already been split.
+ * @param phys Physical address in the kernel direct map.
+ * @return Borrowed leaf PTE or NULL. mmio_lock held; does not allocate.
+ */
+static uint64_t *mmio_existing_leaf(uint64_t phys)
+{
+    uint64_t *pde = &kernel_pd[phys >> 30][(phys >> 21) & 511];
+    if (!(*pde & RELIEFNT_PAGE_PRESENT) || (*pde & PAGE_SIZE_FLAG)) return NULL;
+    return &((uint64_t *)(uintptr_t)(*pde & RELIEFNT_PHYS_ADDR_MASK))[(phys >> 12) & 511];
+}
+
+/** @brief Append a sorted run, coalescing only identical adjacent states.
+ * @param run Sorted candidate record.
+ * @return True if the bounded workspace had room.
+ */
+static bool mmio_run_append(const struct mmio_run *run, uint32_t *count)
+{
+    if (*count && mmio_work[*count - 1].end == run->start) {
+        struct mmio_run *previous = &mmio_work[*count - 1];
+        if (previous->original_flags == run->original_flags &&
+            previous->refs == run->refs && previous->permanent == run->permanent) {
+            previous->end = run->end;
+            return true;
+        }
+    }
+    if (*count >= MMIO_RUN_MAX) return false;
+    mmio_work[(*count)++] = *run;
+    return true;
+}
+
+/** @brief Add an unowned page-table gap as runs of equal original PTE flags.
+ * @param start Aligned inclusive physical address.
+ * @param end Aligned exclusive physical address.
+ * @param permanent Bootstrap claim state.
+ * @param count Candidate run count, updated on success.
+ * @return True if every run fit. Page-table leaves were preflighted already.
+ */
+static bool mmio_append_new_range(uint64_t start, uint64_t end, bool permanent,
+                                  uint32_t *count)
+{
+    uint64_t run_start = start, original_flags = 0;
+    bool have_run = false;
+    for (uint64_t p = start; p < end; p += PAGE_SIZE) {
+        uint64_t *pte = mmio_existing_leaf(p);
+        if (!pte) return false;
+        uint64_t flags = *pte & ~RELIEFNT_PHYS_ADDR_MASK;
+        if (have_run && flags != original_flags) {
+            struct mmio_run run = {run_start, p, original_flags,
+                                   permanent ? 0u : 1u, permanent ? 1u : 0u};
+            if (!mmio_run_append(&run, count)) return false;
+            run_start = p;
+            original_flags = flags;
+        } else if (!have_run) {
+            run_start = p;
+            original_flags = flags;
+            have_run = true;
+        }
+    }
+    if (have_run) {
+        struct mmio_run run = {run_start, end, original_flags,
+                               permanent ? 0u : 1u, permanent ? 1u : 0u};
+        if (!mmio_run_append(&run, count)) return false;
+    }
+    return true;
+}
+
+/** @brief Build an acquisition result without changing the live registry.
+ * @param start Inclusive aligned range start.
+ * @param end Exclusive aligned range end.
+ * @param permanent Whether this is an idempotent permanent bootstrap claim.
+ * @param count Output candidate run count.
+ * @return False on reference or interval-capacity exhaustion.
+ */
+static bool mmio_plan_acquire(uint64_t start, uint64_t end, bool permanent,
+                              uint32_t *count)
+{
+    uint32_t out = 0;
+    uint64_t cursor = start;
+    for (uint32_t i = 0; i < mmio_run_count; ++i) {
+        const struct mmio_run *old = &mmio_runs[i];
+        if (old->end <= start || old->start >= end) {
+            if (old->start >= end && cursor < end) {
+                if (!mmio_append_new_range(cursor, end, permanent, &out)) return false;
+                cursor = end;
+            }
+            if (!mmio_run_append(old, &out)) return false;
+            continue;
+        }
+
+        uint64_t first = old->start < start ? start : old->start;
+        uint64_t last = old->end > end ? end : old->end;
+        if (cursor < first) {
+            if (!mmio_append_new_range(cursor, first, permanent, &out)) return false;
+        }
+        if (old->start < first) {
+            struct mmio_run prefix = *old;
+            prefix.end = first;
+            if (!mmio_run_append(&prefix, &out)) return false;
+        }
+
+        struct mmio_run overlap = *old;
+        overlap.start = first;
+        overlap.end = last;
+        if (permanent) {
+            overlap.permanent = 1;
+        } else {
+            if (overlap.refs == UINT32_MAX) return false;
+            ++overlap.refs;
+        }
+        if (!mmio_run_append(&overlap, &out)) return false;
+
+        if (last < old->end) {
+            struct mmio_run suffix = *old;
+            suffix.start = last;
+            if (!mmio_run_append(&suffix, &out)) return false;
+        }
+        cursor = last;
+    }
+    if (cursor < end && !mmio_append_new_range(cursor, end, permanent, &out)) return false;
+    *count = out;
+    return true;
+}
+
+/** @brief Build a release result without changing the live registry.
+ * @param start Inclusive aligned range start.
+ * @param end Exclusive aligned range end.
+ * @param count Output candidate run count.
+ * @return False only when the bounded workspace cannot represent the result.
+ */
+static bool mmio_plan_release(uint64_t start, uint64_t end, uint32_t *count)
+{
+    uint32_t out = 0;
+    for (uint32_t i = 0; i < mmio_run_count; ++i) {
+        const struct mmio_run *old = &mmio_runs[i];
+        if (old->end <= start || old->start >= end) {
+            if (!mmio_run_append(old, &out)) return false;
+            continue;
+        }
+
+        uint64_t first = old->start < start ? start : old->start;
+        uint64_t last = old->end > end ? end : old->end;
+        if (old->start < first) {
+            struct mmio_run prefix = *old;
+            prefix.end = first;
+            if (!mmio_run_append(&prefix, &out)) return false;
+        }
+        struct mmio_run overlap = *old;
+        overlap.start = first;
+        overlap.end = last;
+        if (overlap.refs) --overlap.refs;
+        if (overlap.refs || overlap.permanent) {
+            if (!mmio_run_append(&overlap, &out)) return false;
+        }
+        if (last < old->end) {
+            struct mmio_run suffix = *old;
+            suffix.start = last;
+            if (!mmio_run_append(&suffix, &out)) return false;
+        }
+    }
+    *count = out;
+    return true;
+}
+
+/** @brief Prepare a private lease-table update before PTE attributes change.
+ * @param start Inclusive aligned range start.
+ * @param end Exclusive aligned range end.
+ * @param acquire True to add a lease; false to release its exact matching range.
+ * @param count Output candidate lease count.
+ * @return False on capacity/refcount exhaustion or unmatched release.
+ */
+static bool mmio_plan_lease(uint64_t start, uint64_t end, bool acquire,
+                            uint32_t *count)
+{
+    for (uint32_t i = 0; i < mmio_lease_count; ++i) mmio_lease_work[i] = mmio_leases[i];
+    uint32_t found = UINT32_MAX;
+    for (uint32_t i = 0; i < mmio_lease_count; ++i)
+        if (mmio_lease_work[i].start == start && mmio_lease_work[i].end == end) {
+            found = i;
+            break;
+        }
+    uint32_t out = mmio_lease_count;
+    if (acquire) {
+        if (found != UINT32_MAX) {
+            if (mmio_lease_work[found].refs == UINT32_MAX) return false;
+            ++mmio_lease_work[found].refs;
+        } else {
+            if (out >= MMIO_LEASE_MAX) return false;
+            mmio_lease_work[out++] = (struct mmio_lease){start, end, 1};
+        }
+    } else {
+        if (found == UINT32_MAX) return false;
+        if (--mmio_lease_work[found].refs == 0) {
+            for (uint32_t i = found + 1; i < out; ++i)
+                mmio_lease_work[i - 1] = mmio_lease_work[i];
+            --out;
+        }
+    }
+    *count = out;
+    return true;
+}
+
+/** @brief Count unique live lease endpoints that would split an existing run.
+ * @param runs Candidate sorted run table.
+ * @param run_count Candidate run count.
+ * @param leases Candidate live lease table.
+ * @param lease_count Candidate live lease count.
+ * @return Number of additional run slots needed to represent all endpoints.
+ */
+static uint32_t mmio_missing_boundaries(const struct mmio_run *runs, uint32_t run_count,
+                                        const struct mmio_lease *leases, uint32_t lease_count)
+{
+    uint32_t missing = 0;
+    for (uint32_t i = 0; i < lease_count; ++i) {
+        uint64_t endpoints[2] = {leases[i].start, leases[i].end};
+        for (uint32_t side = 0; side < 2; ++side) {
+            uint64_t point = endpoints[side];
+            bool inside = false, seen = false;
+            for (uint32_t r = 0; r < run_count; ++r) {
+                if (point == runs[r].start || point == runs[r].end) break;
+                if (point > runs[r].start && point < runs[r].end) { inside = true; break; }
+                if (runs[r].start > point) break;
+            }
+            if (!inside) continue;
+            for (uint32_t j = 0; j <= i && !seen; ++j) {
+                uint32_t limit = j == i ? side : 2;
+                for (uint32_t previous = 0; previous < limit; ++previous) {
+                    uint64_t value = previous == 0 ? leases[j].start : leases[j].end;
+                    if (value == point) { seen = true; break; }
+                }
+            }
+            if (!seen) ++missing;
+        }
+    }
+    return missing;
+}
+
+/** @brief Check whether candidate runs plus reserved lease split points fit.
+ * @return True if every currently live lease can still be released safely.
+ */
+static bool mmio_registry_fits(uint32_t run_count, uint32_t lease_count)
+{
+    if (run_count > MMIO_RUN_MAX) return false;
+    uint32_t missing = mmio_missing_boundaries(mmio_work, run_count,
+                                                mmio_lease_work, lease_count);
+    return missing <= MMIO_RUN_MAX - run_count;
+}
+
+/** @brief Validate a page-aligned range without allowing end-address wrap.
+ */
+static bool mmio_valid_aligned_range(uint64_t phys, uint64_t len)
+{
+    return len && !(phys & (PAGE_SIZE - 1)) && !(len & (PAGE_SIZE - 1)) &&
+           len <= UINT64_MAX - phys && paging_kernel_direct_map_range(phys, len);
+}
+
+/** @brief Verify that every leaf in a range is already allocated.
+ * @param start Inclusive aligned range start.
+ * @param end Exclusive aligned range end.
+ * @return True when no later PTE update can allocate or fail.
+ */
+static bool mmio_verify_leaves(uint64_t start, uint64_t end)
+{
+    for (uint64_t p = start; p < end; p += PAGE_SIZE)
+        if (!mmio_existing_leaf(p)) return false;
+    return true;
+}
+
 /** @brief Set precise device-page UC/NX attributes and claim mapping references.
  * @param phys Page-aligned physical base; BAR validation belongs to PCI service.
  * @param len Page-aligned nonzero length, bounded to the shared direct map.
  * @param permanent Nonzero for bootstrap compatibility mappings.
  * @return True on success, false on malformed range/capacity/ENOMEM/NX absence.
- * Task context, execution transaction or pre-SMP boot; never from IRQ. All
- * copied kernel aliases share PTEs. Unrelated neighbor attributes are preserved.
+ * Task context, execution transaction or pre-SMP boot; never from IRQ. The
+ * sorted interval registry preserves original flags and coalesces identical
+ * runs; page-table splits may remain after a failed preflight.
  */
 static bool mmio_acquire(uint64_t phys, uint64_t len, bool permanent)
 {
-    if (!nx_enabled || !len || (phys & 4095) || (len & 4095) ||
-        len / PAGE_SIZE > MMIO_PAGE_MAX || !paging_kernel_direct_map_range(phys, len)) return false;
+    if (!nx_enabled || !mmio_valid_aligned_range(phys, len)) return false;
+    uint64_t end = phys + len;
     kernel_spin_lock(&mmio_lock);
-    uint32_t needed = 0, available = 0;
-    for (uint32_t i = 0; i < MMIO_PAGE_MAX; ++i) if (!mmio_pages[i].refs && !mmio_pages[i].permanent) ++available;
-    for (uint64_t p = phys; p < phys + len; p += PAGE_SIZE) {
-        struct mmio_page *e = mmio_find_page(p);
-        if (!e) ++needed;
-        else if (!permanent && e->refs == UINT32_MAX) { kernel_spin_unlock(&mmio_lock); return false; }
+    uint32_t lease_count = mmio_lease_count;
+    if (permanent) {
+        for (uint32_t i = 0; i < mmio_lease_count; ++i) mmio_lease_work[i] = mmio_leases[i];
+    } else if (!mmio_plan_lease(phys, end, true, &lease_count)) {
+        kernel_spin_unlock(&mmio_lock);
+        return false;
     }
-    if (needed > available) { kernel_spin_unlock(&mmio_lock); return false; }
-    /* Prepare every shared page table before modifying any leaf attributes. */
-    for (uint64_t p = phys; p < phys + len; p += PAGE_SIZE) if (!mmio_leaf(p)) {
-        smp_flush_user_tlb(); kernel_spin_unlock(&mmio_lock); return false;
+
+    /* Split all required PDEs before recording ownership or changing flags. */
+    for (uint64_t p = phys; p < end; p += PAGE_SIZE) if (!mmio_leaf(p)) {
+        smp_flush_user_tlb();
+        kernel_spin_unlock(&mmio_lock);
+        return false;
     }
-    for (uint64_t p = phys; p < phys + len; p += PAGE_SIZE) {
-        uint64_t *pte = mmio_leaf(p);
-        struct mmio_page *e = mmio_find_page(p);
-        if (!e) {
-            for (uint32_t i = 0; i < MMIO_PAGE_MAX; ++i) if (!mmio_pages[i].refs && !mmio_pages[i].permanent) {
-                e = &mmio_pages[i]; *e = (struct mmio_page){.phys = p, .original = *pte}; break;
-            }
-        }
-        if (permanent) e->permanent = 1; else ++e->refs;
-        *pte = (*pte & ~RELIEFNT_PAGE_PAT) | RELIEFNT_PAGE_PWT | RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_NOEXEC;
+    uint32_t run_count = 0;
+    if (!mmio_plan_acquire(phys, end, permanent, &run_count) ||
+        !mmio_registry_fits(run_count, lease_count) || !mmio_verify_leaves(phys, end)) {
+        smp_flush_user_tlb();
+        kernel_spin_unlock(&mmio_lock);
+        return false;
+    }
+
+    for (uint64_t p = phys; p < end; p += PAGE_SIZE) {
+        uint64_t *pte = mmio_existing_leaf(p);
+        *pte = (*pte & ~RELIEFNT_PAGE_PAT) | RELIEFNT_PAGE_PWT |
+               RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_NOEXEC;
+    }
+    for (uint32_t i = 0; i < run_count; ++i) mmio_runs[i] = mmio_work[i];
+    mmio_run_count = run_count;
+    if (!permanent) {
+        for (uint32_t i = 0; i < lease_count; ++i) mmio_leases[i] = mmio_lease_work[i];
+        mmio_lease_count = lease_count;
     }
     smp_flush_user_tlb();
-    kernel_spin_unlock(&mmio_lock); return true;
+    kernel_spin_unlock(&mmio_lock);
+    return true;
 }
 /** @brief Claim a precise shared UC/NX device mapping.
  * @param phys Aligned physical device base, validated against PCI BAR by caller.
@@ -316,14 +592,47 @@ bool paging_acquire_mmio(uint64_t phys, uint64_t len)
  */
 void paging_release_mmio(uint64_t phys, uint64_t len)
 {
-    if (!len || (phys & 4095) || (len & 4095) || !paging_kernel_direct_map_range(phys,len)) return;
+    if (!mmio_valid_aligned_range(phys, len)) return;
+    uint64_t end = phys + len;
     kernel_spin_lock(&mmio_lock);
-    for (uint64_t p = phys; p < phys + len; p += PAGE_SIZE) {
-        struct mmio_page *e = mmio_find_page(p);
-        if (!e || !e->refs) continue;
-        if (!--e->refs && !e->permanent) *mmio_leaf(p) = e->original;
+    uint32_t lease_count;
+    if (!mmio_plan_lease(phys, end, false, &lease_count)) {
+        kernel_spin_unlock(&mmio_lock);
+        return;
     }
-    smp_flush_user_tlb(); kernel_spin_unlock(&mmio_lock);
+    uint32_t run_count = 0;
+    if (!mmio_plan_release(phys, end, &run_count) ||
+        !mmio_registry_fits(run_count, lease_count)) {
+        kernel_spin_unlock(&mmio_lock);
+        return;
+    }
+
+    for (uint32_t i = 0; i < mmio_run_count; ++i) {
+        const struct mmio_run *run = &mmio_runs[i];
+        if (run->refs != 1 || run->permanent || run->end <= phys || run->start >= end) continue;
+        uint64_t first = run->start < phys ? phys : run->start;
+        uint64_t last = run->end > end ? end : run->end;
+        if (!mmio_verify_leaves(first, last)) {
+            kernel_spin_unlock(&mmio_lock);
+            return;
+        }
+    }
+    for (uint32_t i = 0; i < mmio_run_count; ++i) {
+        const struct mmio_run *run = &mmio_runs[i];
+        if (run->refs != 1 || run->permanent || run->end <= phys || run->start >= end) continue;
+        uint64_t first = run->start < phys ? phys : run->start;
+        uint64_t last = run->end > end ? end : run->end;
+        for (uint64_t p = first; p < last; p += PAGE_SIZE) {
+            uint64_t *pte = mmio_existing_leaf(p);
+            *pte = (p & RELIEFNT_PHYS_ADDR_MASK) | run->original_flags;
+        }
+    }
+    for (uint32_t i = 0; i < run_count; ++i) mmio_runs[i] = mmio_work[i];
+    mmio_run_count = run_count;
+    for (uint32_t i = 0; i < lease_count; ++i) mmio_leases[i] = mmio_lease_work[i];
+    mmio_lease_count = lease_count;
+    smp_flush_user_tlb();
+    kernel_spin_unlock(&mmio_lock);
 }
 /** @brief Preserve bootstrap MMIO validation API with precise permanent UC/NX.
  * @param phys Physical device start; covering pages are rounded outward.
@@ -333,9 +642,11 @@ void paging_release_mmio(uint64_t phys, uint64_t len)
  */
 bool paging_mmio_uncached(uint64_t phys, uint64_t len)
 {
-    if (!len || !paging_kernel_direct_map_range(phys,len)) return false;
-    uint64_t start = phys & ~4095ULL;
-    uint64_t end = (phys + len + 4095) & ~4095ULL;
+    if (!len || len > UINT64_MAX - phys || !paging_kernel_direct_map_range(phys, len)) return false;
+    uint64_t byte_end = phys + len;
+    if (byte_end > UINT64_MAX - (PAGE_SIZE - 1)) return false;
+    uint64_t start = phys & ~(PAGE_SIZE - 1);
+    uint64_t end = (byte_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     return end > start && mmio_acquire(start, end - start, true);
 }
 

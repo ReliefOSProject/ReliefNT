@@ -5,6 +5,9 @@
 #ifndef RELIEFNT_X86_64_IDT_H
 #define RELIEFNT_X86_64_IDT_H
 
+struct task;
+struct trap_frame;
+
 /**
  * Idt init.
  */
@@ -18,5 +21,12 @@ void idt_init(void);
  * expose partially written gate descriptors to another CPU.
  */
 void idt_load(void);
+
+/**
+ * @brief Dispatch a general-protection fault using its complete saved frame.
+ * @param frame Interrupted register state, including the CPU error code and user iret frame.
+ * @return The task selected by the existing user-return scheduler, or NULL if it cannot select one.
+ */
+struct task *general_protection_dispatch(struct trap_frame *frame);
 
 #endif

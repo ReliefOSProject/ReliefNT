@@ -10,10 +10,12 @@
 #include <reliefnt/paging.h>
 #include <reliefnt/pty.h>
 #include <reliefnt/sched.h>
+#include <reliefnt/drm.h>
 #include <reliefnt/loadavg.h>
 #include <reliefnt/permissions.h>
 #include <reliefnt/storage.h>
 #include <reliefnt/syscall.h>
+#include <reliefnt/syscall_internal.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/mm.h>
 #include <reliefnt/lock.h>
@@ -242,9 +244,13 @@ void sched_task_vma_release(struct task *task)
         if (vma) {
             sysv_shm_vma_release(task, vma);
             if (vma->audio_pcm) audio_pcm_mmap_release(vma->audio_pcm, (enum audio_pcm_mmap_region)vma->audio_mmap_region);
+            if (vma->drm_bo) drm_bo_put(vma->drm_bo);
+            if (vma->drm_mapping_file) task_file_put(vma->drm_mapping_file);
             (void)storage_inode_put(vma->inode);
             vma->inode = NULL;
             vma->audio_pcm = NULL;
+            vma->drm_bo = NULL;
+            vma->drm_mapping_file = NULL;
         }
     }
     (void)storage_inode_put(sched_task_mm(task)->executable_inode);
@@ -275,6 +281,22 @@ static int sched_task_vma_retain_audio(struct task_vma *dst,
     dst->audio_mmap_prot = src->audio_mmap_prot;
     dst->audio_mmap_offset = src->audio_mmap_offset;
     dst->audio_mmap_length = src->audio_mmap_length;
+    return 0;
+}
+
+/** @brief Retain the BO and OFD references represented by a copied DRM VMA. */
+static int sched_task_vma_retain_drm(struct task_vma *dst,
+                                     const struct task_vma *src)
+{
+    struct task_file *mapping_file = NULL;
+    if (!dst || !src) return -LINUX_EINVAL;
+    if (src->drm_mapping_file) {
+        mapping_file = task_file_get(src->drm_mapping_file);
+        if (!mapping_file) return -LINUX_ENOMEM;
+    }
+    if (src->drm_bo) drm_bo_get(src->drm_bo);
+    dst->drm_mapping_file = mapping_file;
+    dst->drm_bo = src->drm_bo;
     return 0;
 }
 
@@ -1152,9 +1174,12 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
             *dst = *src;
             dst->inode = NULL;
             dst->audio_pcm = NULL;
+            dst->drm_bo = NULL;
+            dst->drm_mapping_file = NULL;
             dst->sysv_shm_attachment = NULL;
             if (src->inode) storage_inode_retain(dst->inode = src->inode);
             if (sched_task_vma_retain_audio(dst, src) < 0) goto fail;
+            if (sched_task_vma_retain_drm(dst, src) < 0) goto fail;
             if (sysv_shm_vma_clone(child, dst, src) < 0) goto fail;
         }
         for (uint32_t i = 0; i < sched_task_mm(parent)->vma_extra_count; ++i) {
@@ -1164,9 +1189,12 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
             *dst = *src;
             dst->inode = NULL;
             dst->audio_pcm = NULL;
+            dst->drm_bo = NULL;
+            dst->drm_mapping_file = NULL;
             dst->sysv_shm_attachment = NULL;
             if (src->inode) storage_inode_retain(dst->inode = src->inode);
             if (sched_task_vma_retain_audio(dst, src) < 0) goto fail;
+            if (sched_task_vma_retain_drm(dst, src) < 0) goto fail;
             if (sysv_shm_vma_clone(child, dst, src) < 0) goto fail;
         }
     }
@@ -1736,6 +1764,9 @@ int sched_prepare_exec_current(struct task *task)
 
 void sched_exec_replace_mm(struct task *task, const struct address_space *replacement)
 {
+    /* A committed exec has replaced the user's address-space contract. Drop
+     * any saved ioctl user pointers before releasing the previous mm. */
+    drm_vmwgfx_cancel_task_continuation(task);
     struct task_address_space_state *old = task->shared_mm;
     /* exec_mmap() calls exec_mm_release() before the new mm is activated.
      * At this point userland_exec_current_node() cannot fail any more, so a

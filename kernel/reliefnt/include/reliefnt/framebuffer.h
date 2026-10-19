@@ -92,6 +92,13 @@ struct framebuffer_blit_cmd {
  */
 void framebuffer_init(const struct boot_info *boot);
 const struct framebuffer *framebuffer_get(void);
+struct fb_var_screeninfo;
+/**
+ * @brief Validate and apply one supported Linux fbdev variable-screen request.
+ * @param var Input request; on success replaced with the normalized layout.
+ * @return Zero on success, or a negative Linux errno without changing var.
+ */
+int framebuffer_fbdev_put_var(struct fb_var_screeninfo *var);
 /**
  * @brief Switch the display to width x height; returns 0 on success.
  */
@@ -105,6 +112,19 @@ void framebuffer_clear(uint32_t color);
  */
 void framebuffer_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color);
 /**
+ * @brief Fill a rectangle in an explicit framebuffer without changing the
+ *        active framebuffer descriptor.
+ * @param target Framebuffer whose pixel storage receives the drawing.
+ * @param x Left pixel coordinate.
+ * @param y Top pixel coordinate.
+ * @param w Rectangle width in pixels.
+ * @param h Rectangle height in pixels.
+ * @param color Logical RGB color to fill.
+ */
+void framebuffer_rect_to(const struct framebuffer *target,
+                         uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                         uint32_t color);
+/**
  * @brief Draw text at (x,y) using fg as the foreground and bg as the background color.
  */
 void framebuffer_text(uint32_t x, uint32_t y, const char *text, uint32_t fg, uint32_t bg);
@@ -112,6 +132,19 @@ void framebuffer_text(uint32_t x, uint32_t y, const char *text, uint32_t fg, uin
 uint32_t framebuffer_codepoint_width(uint32_t cp);
 /** @brief Draw scalar cp at x/y with foreground fg and background bg. */
 void framebuffer_codepoint(uint32_t x, uint32_t y, uint32_t cp, uint32_t fg, uint32_t bg);
+/**
+ * @brief Draw a scalar into an explicit framebuffer without changing the
+ *        active framebuffer descriptor.
+ * @param target Framebuffer whose pixel storage receives the glyph.
+ * @param x Left pixel coordinate.
+ * @param y Top pixel coordinate.
+ * @param cp Unicode scalar to draw.
+ * @param fg Logical RGB foreground color.
+ * @param bg Logical RGB background color.
+ */
+void framebuffer_codepoint_to(const struct framebuffer *target,
+                              uint32_t x, uint32_t y, uint32_t cp,
+                              uint32_t fg, uint32_t bg);
 /**
  * @brief Copy a w x h pixel buffer (stride words per row) to (x,y).
  */
@@ -131,6 +164,13 @@ void framebuffer_present_region(uint32_t x, uint32_t y, uint32_t width, uint32_t
  * generate an UPDATE command themselves.
  */
 void framebuffer_display_tick(void);
+/** @brief Claim or release legacy GFB presentation for DRM scanout. */
+int framebuffer_drm_scanout_begin(void);
+void framebuffer_drm_scanout_release(void);
+/** @brief Copy XRGB8888 damage to the SVGA GFB and retain FIFO-full damage. */
+int framebuffer_drm_present_region(const void *pixels, uint32_t pitch,
+                                   uint32_t format, uint32_t x1, uint32_t y1,
+                                   uint32_t x2, uint32_t y2);
 /**
  * @brief Read the color of the pixel at (x,y).
  */

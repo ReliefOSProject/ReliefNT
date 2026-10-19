@@ -23,7 +23,7 @@ int svga_gmr_create_locked(uint32_t bytes, svga_handle *out)
     if (!svga.available || !svga.memory_ready) goto done;
     for (id = 0; id < svga.gmr_limit && svga.gmrs[id].handle; ++id) {}
     ret = SVGA_ENOMEM;
-    if (id == svga.gmr_limit || pages > svga.page_limit - svga.pages) goto done;
+    if (id == svga.gmr_limit || !svga_page_budget_allows(pages)) goto done;
     svga_handle handle = svga_new_handle(SVGA_KIND_GMR, id);
     if (!handle) goto done;
     uint64_t phys = svga.ops.alloc(pages);
@@ -120,6 +120,10 @@ int svga_gmr_destroy(svga_handle handle)
 {
     uint64_t flags = svga_lock();
     int id = svga_find_gmr(handle);
+    if (id >= 0 && svga.gmrs[id].borrowed) {
+        svga_unlock(flags);
+        return svga_gmr_borrowed_detach(handle);
+    }
     int ret = id < 0 ? SVGA_EINVAL : svga_gmr_destroy_locked((uint32_t)id);
     svga_unlock(flags);
     return ret;
@@ -134,6 +138,7 @@ int svga_gmr_transfer(svga_handle handle, uint32_t offset, void *data,
     if (id < 0) goto done;
     struct svga_gmr *g = &svga.gmrs[id];
     if (g->retiring || offset > g->bytes || bytes > g->bytes - offset) goto done;
+    if (g->borrowed) { ret = SVGA_ENOTSUP; goto done; }
     ret = svga_sync_locked();
     if (ret) goto done;
     uint8_t *p = (uint8_t *)svga.ops.pointer(g->phys) + offset;

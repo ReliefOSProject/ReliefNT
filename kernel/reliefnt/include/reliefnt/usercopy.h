@@ -17,6 +17,10 @@ struct task;
  */
 int user_copy_to_task(struct task *task, uint64_t address, const void *source, uint64_t size);
 
+/** @brief Copy bytes from a pinned task's address space into the kernel. */
+int user_copy_from_task(struct task *task, void *destination, uint64_t address,
+                        uint64_t size);
+
 /**
  * @brief Return true when the user range [ptr, ptr+len) is mapped and accessible.
  */

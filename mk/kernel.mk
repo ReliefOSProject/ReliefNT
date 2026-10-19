@@ -9,7 +9,7 @@ KERNEL_LD_SCRIPT := $(RELIEFOS_SRC)/arch/x86_64/linker.ld
 KERNEL_SOURCE_DIRS := kernel/reliefnt drivers/console \
 	drivers/input/mouse drivers/tty/serial drivers/net/e1000 \
 	drivers/sound/ac97 drivers/sound/es1371 drivers/sound/hda \
-	drivers/video/vga drivers/video/framebuffer drivers/video/svga \
+	drivers/video/vga drivers/video/framebuffer drivers/video/svga drivers/video/drm \
 	drivers/usb/uhci drivers/storage/ide drivers/storage/ahci \
 	drivers/storage/nvme firmware block \
 	arch mm fs net kernel/exec
