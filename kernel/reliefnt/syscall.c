@@ -288,6 +288,13 @@ static int linux_stat_from_legacy(struct linux_stat_abi *out,
         out->st_ino = (uint64_t)node->volume_id * 16 + node->first_cluster;
         out->st_rdev = (device_major << 8) | node->first_cluster;
     }
+    if (node && (node->flags & STORAGE_NODE_FLAG_DEV_NODE) &&
+        !(node->flags & STORAGE_NODE_FLAG_PTY)) {
+        if (node->first_cluster == STORAGE_DEV_KIND_CONSOLE)
+            out->st_rdev = (5u << 8) | 1u;
+        else if (node->first_cluster == STORAGE_DEV_KIND_KMSG)
+            out->st_rdev = (1u << 8) | 11u;
+    }
     if ((node && (node->flags & (STORAGE_NODE_FLAG_AUDIO_PCM |
                                  STORAGE_NODE_FLAG_AUDIO_CONTROL |
                                  STORAGE_NODE_FLAG_AUDIO_MIXER |
@@ -710,6 +717,9 @@ static int clear_task_file_result(struct task_file *file)
     }
     syscall_flock_release_owner(file);
     if (file->flags & TASK_FILE_FLAG_DEV_NODE) {
+        if (file->node.first_cluster == STORAGE_DEV_KIND_CONSOLE && file->aux &&
+            !(file->flags & TASK_FILE_FLAG_PATH))
+            pty_transfer_put((uint32_t)file->aux, TASK_PTY_ENDPOINT_SLAVE);
         if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_PCM)
             (void)audio_device_close(file);
         if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_CONTROL)
@@ -1563,22 +1573,48 @@ static int task_pty_ensure_fd(struct task *task, int fd, struct task_pty_fd **ou
     return -RELIEFOS_EMFILE;
 }
 
-static void task_console_materialize_stdio(struct task *task)
+/**
+ * @brief Give implicit boot streams one shared, read/write /dev/console description.
+ * @param task Descriptor owner; null and existing PTY streams are left alone.
+ * @return Zero on success, negative ENODEV before VT setup, ENOMEM on allocation
+ * failure, or the terminal reference error without publishing any descriptors.
+ * Existing redirections and explicitly closed descriptors are preserved. Opening
+ * /dev/console does not acquire a controlling terminal, matching Linux tty_open.
+ */
+static int task_console_materialize_stdio(struct task *task)
 {
-    if (!task || task->pty_id) return;
+    if (!task || task->pty_id) return 0;
+    uint32_t missing = 0;
     for (int fd = 0; fd < 3; ++fd) {
         if (task_file_for_fd(task, fd) || task_pty_fd_for_fd(task, fd) ||
             (sched_task_fds(task)->closed_stdio_mask & (1u << fd))) continue;
-        /* Boot tasks inherit console output and no input. Give these existing
-         * streams real descriptions before fcntl, dup or fork can observe them. */
+        missing |= 1u << fd;
+    }
+    if (!missing) return 0;
+    uint32_t terminal = pty_vt_id(pty_vt_active());
+    if (!terminal) return -RELIEFOS_ENODEV;
+    struct task_file *description = kernel_malloc(sizeof(*description));
+    if (!description) return -RELIEFOS_ENOMEM;
+    int ret = pty_transfer_get(terminal, TASK_PTY_ENDPOINT_SLAVE);
+    if (ret < 0) {
+        kernel_free(description);
+        return ret;
+    }
+    *description = (struct task_file){.used = 1,
+        .flags = TASK_FILE_FLAG_DEV_NODE | RELIEFOS_O_RDWR,
+        .node = {.type = RELIEFOS_FS_TYPE_DEVICE, .flags = STORAGE_NODE_FLAG_DEV_NODE,
+                 .first_cluster = STORAGE_DEV_KIND_CONSOLE},
+        .aux = terminal};
+    copy_text(description->path, sizeof(description->path), "/dev/console");
+    for (int fd = 0; fd < 3; ++fd) {
+        if (!(missing & (1u << fd))) continue;
         struct task_file *file = &sched_task_fds(task)->stdio_files[fd];
         *file = (struct task_file){.used = 1,
-            .flags = TASK_FILE_FLAG_DEV_NODE | (fd ? RELIEFOS_O_WRONLY : RELIEFOS_O_RDONLY),
-            .fd_flags = (sched_task_fds(task)->cloexec_stdio_mask & (1u << fd)) ? RELIEFOS_FD_CLOEXEC : 0,
-            .node = {.type = RELIEFOS_FS_TYPE_DEVICE, .flags = STORAGE_NODE_FLAG_DEV_NODE,
-                     .first_cluster = fd ? STORAGE_DEV_KIND_KMSG : STORAGE_DEV_KIND_NULL}};
-        copy_text(file->path, sizeof(file->path), fd ? "/dev/kmsg" : "/dev/null");
+            .description = description,
+            .fd_flags = (sched_task_fds(task)->cloexec_stdio_mask & (1u << fd)) ? RELIEFOS_FD_CLOEXEC : 0};
+        ++description->references;
     }
+    return 0;
 }
 
 static int64_t syscall_ioctl_nonblock(struct task *task, int fd, uint64_t argument)
@@ -1602,9 +1638,15 @@ static int64_t syscall_ioctl_nonblock(struct task *task, int fd, uint64_t argume
     return 0;
 }
 
+/**
+ * @brief Materialize inherited console or PTY streams before descriptor sharing.
+ * @param task Descriptor owner; null is accepted.
+ * @return Zero on success or a negative allocation/terminal-reference errno.
+ */
 static int task_pty_materialize_stdio(struct task *task)
 {
-    task_console_materialize_stdio(task);
+    int console_status = task_console_materialize_stdio(task);
+    if (console_status < 0) return console_status;
     if (!task || !task->pty_id) return 0;
     for (int fd = 0; fd < 3; ++fd) {
         if (task_file_for_fd(task, fd) || task_pty_stream_for_fd(task, fd) < 0) continue;
@@ -1840,12 +1882,13 @@ static int task_pty_dup2_fd(struct task *task, int old_fd, int new_fd)
 }
 
 /**
- * Alloc task fd.
- * @param task Value supplied by the caller.
- * @param node Value supplied by the caller.
- * @param flags Identifier or flags controlling the operation.
- * @param path NUL-terminated text supplied by the caller.
- * @return The value or status produced by the operation.
+ * @brief Allocate an opened descriptor and retain its inode or console terminal.
+ * @param task Descriptor-table owner under the execution transaction.
+ * @param node Validated backing node, borrowed during initialization.
+ * @param flags Validated status and internal device flags.
+ * @param path Optional NUL-terminated device or file pathname.
+ * @return Descriptor number or negative errno; failed console setup releases
+ * the allocated slot and inode reference. O_PATH does not open a terminal.
  */
 static int alloc_task_fd(struct task *task, const struct storage_node *node, uint32_t flags, const char *path)
 {
@@ -1862,6 +1905,21 @@ static int alloc_task_fd(struct task *task, const struct storage_node *node, uin
     file->flags = flags;
     file->fd_flags = (flags & RELIEFOS_O_CLOEXEC) ? RELIEFOS_FD_CLOEXEC : 0;
     copy_text(file->path, sizeof(file->path), path);
+    if (task_device_is(file, STORAGE_DEV_KIND_CONSOLE) &&
+        !(flags & TASK_FILE_FLAG_PATH)) {
+        /* Resolve /dev/console at open time, not again after a VT switch. */
+        uint32_t terminal = pty_vt_id(pty_vt_active());
+        if (!terminal) {
+            task_discard_file_fd(task, fd);
+            return -RELIEFOS_ENODEV;
+        }
+        ret = pty_transfer_get(terminal, TASK_PTY_ENDPOINT_SLAVE);
+        if (ret < 0) {
+            task_discard_file_fd(task, fd);
+            return ret;
+        }
+        file->aux = terminal;
+    }
     return fd;
 }
 
@@ -2064,7 +2122,8 @@ static int task_block_device(const struct task_file *file, uint32_t *disk_id,
  * @param file Opened readable device descriptor.
  * @param buffer Validated writable destination of length bytes.
  * @param length Maximum byte count to read.
- * @return Bytes read or negative errno, including a pending storage retry.
+ * @return Bytes read, negative errno, or KERNEL_SYSCALL_BLOCKED for terminal
+ * job control; an empty nonblocking console returns negative EAGAIN.
  */
 static int task_device_read(struct task *task, struct task_file *file,
                             void *buffer, uint32_t length)
@@ -2082,8 +2141,16 @@ static int task_device_read(struct task *task, struct task_file *file,
     }
     if (task_device_is(file, STORAGE_DEV_KIND_NULL) ||
         task_device_is(file, STORAGE_DEV_KIND_FULL) ||
-        task_device_is(file, STORAGE_DEV_KIND_CONSOLE) ||
         task_device_is(file, STORAGE_DEV_KIND_SERIAL)) return 0;
+    if (task_device_is(file, STORAGE_DEV_KIND_CONSOLE)) {
+        uint32_t terminal = (uint32_t)file->aux;
+        if (!terminal || !pty_is_active(terminal)) return -RELIEFOS_ENODEV;
+        int64_t change = pty_check_change(terminal, task->pid, 21);
+        if (change) return (int)change;
+        if ((file->flags & RELIEFOS_O_NONBLOCK) && !pty_input_available(terminal) &&
+            !pty_is_hungup(terminal)) return -RELIEFOS_EAGAIN;
+        return (int)pty_read_input(terminal, (char *)buffer, length);
+    }
     if (task_device_is(file, STORAGE_DEV_KIND_RANDOM) ||
         task_device_is(file, STORAGE_DEV_KIND_URANDOM)) {
         int ret = kernel_random_fill(buffer, length);
@@ -2140,6 +2207,15 @@ static uint32_t task_device_write_length(const struct task_file *file, uint64_t 
     return count > limit ? limit : (uint32_t)count;
 }
 
+/**
+ * @brief Write a device, applying terminal processing to system-console output.
+ * @param task Calling task, used for permissions and terminal job control.
+ * @param file Writable opened device description; console aux retains its VT.
+ * @param buffer Validated source of length bytes.
+ * @param length Bounded device transfer size in bytes.
+ * @return Accepted bytes, negative errno, or KERNEL_SYSCALL_BLOCKED for job
+ * control. Accepted console bytes are also mirrored to diagnostic serial.
+ */
 static int task_device_write(struct task *task, struct task_file *file,
                              const void *buffer, uint32_t length)
 {
@@ -2170,9 +2246,15 @@ static int task_device_write(struct task *task, struct task_file *file,
         return input_evdev_write(file->node.first_cluster, buffer, length);
     }
     if (task_device_is(file, STORAGE_DEV_KIND_CONSOLE)) {
+        if (!length) return 0;
         if (!buffer) return -RELIEFOS_EFAULT;
-        console_write_len((const char *)buffer, length);
-        return (int)length;
+        uint32_t terminal = (uint32_t)file->aux;
+        if (!terminal || !pty_is_active(terminal)) return -RELIEFOS_ENODEV;
+        int64_t change = pty_check_change(terminal, task->pid, 0);
+        if (change) return (int)change;
+        int64_t result = pty_write_output(terminal, (const char *)buffer, length);
+        if (result > 0) console_serial_write_len(buffer, (size_t)result);
+        return (int)result;
     }
     if (task_device_is(file, STORAGE_DEV_KIND_KMSG)) {
         if (!buffer) return -RELIEFOS_EFAULT;
@@ -3562,6 +3644,15 @@ static int64_t syscall_poll_park(struct task *task, int64_t timeout_ms,
     return -RELIEFOS_EAGAIN;
 }
 
+/**
+ * @brief Poll descriptors using their bound terminal or device readiness.
+ * @param task Calling task under the execution transaction.
+ * @param fds Validated in/out poll array; nullable when nfds is zero.
+ * @param nfds Number of entries.
+ * @param timeout_ms Linux poll timeout, narrowed to signed 32 bits.
+ * @param generation Readiness generation captured before scanning descriptors.
+ * @return Ready count, zero on timeout, negative errno or a blocked retry token.
+ */
 static int64_t syscall_poll_impl(struct task *task, struct pollfd *fds,
                                  uint32_t nfds, int64_t timeout_ms,
                                  uint64_t generation)
@@ -3652,9 +3743,12 @@ static int64_t syscall_poll_impl(struct task *task, struct pollfd *fds,
                 revents |= audio_control_poll_file(file->audio_control_file, events);
             } else if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_TIMER) {
                 revents |= audio_timer_poll(file, events);
-            } else if (task_device_is(file, STORAGE_DEV_KIND_TTY)) {
-                if (pty_input_available(task->pty_id)) revents |= POLLIN;
-                if (pty_is_hungup(task->pty_id)) {
+            } else if (task_device_is(file, STORAGE_DEV_KIND_TTY) ||
+                       task_device_is(file, STORAGE_DEV_KIND_CONSOLE)) {
+                uint32_t terminal = task_device_is(file, STORAGE_DEV_KIND_CONSOLE)
+                    ? (uint32_t)file->aux : task->pty_id;
+                if ((events & POLLIN) && pty_input_available(terminal)) revents |= POLLIN;
+                if (pty_is_hungup(terminal)) {
                     revents |= POLLHUP;
                 }
             } else if (events & POLLIN) {
@@ -6310,6 +6404,7 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
         if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_TIMER)
             return audio_timer_seek(file, offset, (int)a2, NULL);
         if (file->flags & TASK_FILE_FLAG_PIPE) return -LINUX_ESPIPE;
+        if (task_device_is(file, STORAGE_DEV_KIND_CONSOLE)) return -LINUX_ESPIPE;
         if (file->io_owner && file->io_owner != task->pid) return -RELIEFOS_EAGAIN;
         int refresh = storage_inode_refresh(&file->node);
         if (refresh < 0) return refresh;
@@ -7100,8 +7195,10 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
          a1 == KDGKBMODE || a1 == KDSKBMODE)) {
         struct task *task = sched_current_task();
         struct task_pty_fd *endpoint = task_pty_endpoint_for_fd(task, (int)a0);
+        struct task_file *file = task_file_for_fd(task, (int)a0);
         uint32_t id = endpoint && endpoint->endpoint == TASK_PTY_ENDPOINT_SLAVE
-                          ? endpoint->pty_id : 0u;
+                          ? endpoint->pty_id : task_device_is(file, STORAGE_DEV_KIND_CONSOLE)
+                          ? (uint32_t)file->aux : 0u;
         if (!pty_vt_number(id)) return -RELIEFOS_ENOTTY;
         if (a1 == VT_OPENQRY) {
             return task_vt_query_ioctl(a1, a2);
@@ -7170,8 +7267,11 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
          a1 == TIOCGPGRP || a1 == TIOCSPGRP || a1 == TIOCGSID || a1 == TIOCNOTTY)) {
         struct task *task = sched_current_task();
         struct task_pty_fd *endpoint = task_pty_endpoint_for_fd(task, (int)a0);
+        struct task_file *file = task_file_for_fd(task, (int)a0);
         int stream = task_pty_stream_for_fd(task, (int)a0);
-        uint32_t pty_id = endpoint ? endpoint->pty_id : (stream >= 0 && task ? task->pty_id : 0);
+        uint32_t pty_id = endpoint ? endpoint->pty_id :
+            task_device_is(file, STORAGE_DEV_KIND_CONSOLE) ? (uint32_t)file->aux :
+            (stream >= 0 && task ? task->pty_id : 0);
         if (!pty_id || !pty_is_active(pty_id)) return -RELIEFOS_ENOTTY;
         int master = endpoint && endpoint->endpoint == TASK_PTY_ENDPOINT_MASTER;
         if (!master && pty_is_hungup(pty_id))
@@ -7181,7 +7281,8 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
             return pty_detach_controlling(pty_id, task->pid);
         }
         if (a1 == TIOCSCTTY) {
-            uint32_t access = endpoint ? task_pty_status(endpoint) & RELIEFOS_O_ACCMODE : RELIEFOS_O_RDWR;
+            uint32_t access = endpoint ? task_pty_status(endpoint) & RELIEFOS_O_ACCMODE :
+                file ? file->flags & RELIEFOS_O_ACCMODE : RELIEFOS_O_RDWR;
             return pty_acquire_controlling(pty_id, task->pid, (int32_t)a2,
                                            access != RELIEFOS_O_WRONLY);
         }
@@ -7296,7 +7397,10 @@ static int64_t syscall_dispatch_regs(struct task *task, uint64_t number, uint64_
         if (task && task->syscall_file && task->syscall_fd == (int32_t)a0 &&
             task->syscall_file_number == number)
             return syscall_dispatch_regs_legacy(number, a0, a1, a2, a3, a4, a5);
-        task_console_materialize_stdio(task);
+        {
+            int ret = task_console_materialize_stdio(task);
+            if (ret < 0) return ret;
+        }
         break;
     case LINUX_SYS_GETPID:
     case LINUX_SYS_GETPPID:
@@ -7310,7 +7414,10 @@ static int64_t syscall_dispatch_regs(struct task *task, uint64_t number, uint64_
     case LINUX_SYS_GETTIMEOFDAY:
         return syscall_dispatch_regs_legacy(number, a0, a1, a2, a3, a4, a5);
     default:
-        task_console_materialize_stdio(task);
+        {
+            int ret = task_console_materialize_stdio(task);
+            if (ret < 0) return ret;
+        }
         break;
     }
     /* Linux ioctl's fd and cmd are unsigned int on native x86-64. */
@@ -7406,6 +7513,7 @@ static int syscall_eagain_is_nonblocking_device(struct task *task,
         if ((file->flags & TASK_FILE_FLAG_DEV_NODE) &&
             (task_device_is(file, STORAGE_DEV_KIND_KEYBOARD) ||
              task_device_is(file, STORAGE_DEV_KIND_MOUSE) ||
+             task_device_is(file, STORAGE_DEV_KIND_CONSOLE) ||
              task_device_is(file, STORAGE_DEV_KIND_AUDIO) ||
              (file->node.flags & (STORAGE_NODE_FLAG_AUDIO_CONTROL |
                                   STORAGE_NODE_FLAG_AUDIO_TIMER)))) {

@@ -21,9 +21,17 @@ void console_putc(char ch);
  */
 void console_write(const char *s);
 /**
- * @brief Write exactly len bytes of s to the console; s need not be NUL-terminated.
+ * @brief Append raw diagnostics to the kernel log and serial sink.
+ * @param s Bytes to write; need not be NUL-terminated.
+ * @param len Number of bytes to write.
  */
 void console_write_len(const char *s, size_t len);
+/**
+ * @brief Mirror system-console output to serial without adding kernel log records.
+ * @param s Bytes already accepted by the console terminal; need not be NUL-terminated.
+ * @param len Number of bytes to mirror.
+ */
+void console_serial_write_len(const char *s, size_t len);
 /** @brief Record text emitted by a VT and paint it only while that VT is visible. */
 void console_vt_write(uint32_t number, const char *s, size_t len);
 /** @brief Present the active text VT or yield the framebuffer to graphics. */
