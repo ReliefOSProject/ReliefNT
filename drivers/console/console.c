@@ -1110,10 +1110,28 @@ void console_write(const char *s)
     }
 }
 
+/**
+ * @brief Append raw diagnostic output to the kernel log and serial sink.
+ * @param s Bytes to write; need not be NUL-terminated.
+ * @param len Number of bytes to write.
+ */
 void console_write_len(const char *s, size_t len)
 {
     for (size_t i = 0; i < len; ++i) {
         console_putc(s[i]);
+    }
+}
+
+/**
+ * @brief Mirror system-console bytes to serial without creating kernel log records.
+ * @param s Bytes already accepted by the console terminal.
+ * @param len Number of bytes to mirror; s need not be NUL-terminated.
+ */
+void console_serial_write_len(const char *s, size_t len)
+{
+    for (size_t i = 0; i < len; ++i) {
+        char byte[2] = {s[i], 0};
+        serial_write(byte);
     }
 }
 

@@ -60,11 +60,14 @@ make O=$PWD/out/x86_64/release ARCH=x86_64 PROFILE=release all
 `O=` 为输出目录（需绝对路径；默认 `out/<arch>/<profile>`），`ARCH=x86_64`，
 `PROFILE=release|debug`。其余目标：
 
-基础内核版本在 `configs/build-version` 中，当前为 `5.0.0`。可以像 Linux 一样
+基础内核版本在 `configs/build-version` 中，当前为 `5.1.0`。可以像 Linux 一样
 修改 Makefile 的 `EXTRAVERSION`，或使用 `make EXTRAVERSION=-perf all` 构建
-`5.0.0-perf`；`LOCALVERSION=-test` 会继续追加为 `5.0.0-perf-test`。
+`5.1.0-perf`；`LOCALVERSION=-test` 会继续追加为 `5.1.0-perf-test`。
 默认后缀为空。后缀变化自动触发版本头和内核重建；系统信息、uname 和 procfs
 都报告完整内核版本。完整版本最多 31 字节，后缀接受字母、数字、`._+-`。
+
+版本提交之间的更新范围、Release 说明格式和发布顺序见
+[发布规范](docs/RELEASE_PROCESS.md)，本版说明见 [5.1.0](docs/releases/5.1.0.md)。
 
 | 目标 | 作用 |
 | --- | --- |
@@ -106,6 +109,11 @@ VGA 文本回退过滤 ANSI 控制序列，不显示转义乱码。该选项不�
 光标位置，PID 1/OpenRC 输出直接接在后面，不再清屏。启动日志也纳入 tty1
 文本历史，切换到其他 VT 或离开图形模式后可以恢复。重复激活当前文本 VT
 不会重置画面；真正切换 VT、图形程序接管，以及程序主动清屏仍正常生效。
+PID 1 的标准输入、输出和错误共享一个以读写模式打开的 `/dev/console`
+描述；它在打开时绑定当前 VT，提供终端读写、termios、窗口尺寸和 VT ioctl，
+不会自动成为控制终端。OpenRC 通过正常终端检测选择 ANSI 输出。系统控制台
+写入额外镜像到诊断串口，不作为内核日志记录；`/dev/kmsg` 独立写入内核日志
+缓冲区和串口，不注入任意 tty。终端绘制仍只发生在对应 VT 的可见文本模式。
 
 启动日志记录构建身份、固件及模块、CPU 型号和特征、物理内存及页缓存容量、
 PCI 清单、显示后端与 3D 探测结果、根文件系统选择、驱动加载摘要、虚拟终端、

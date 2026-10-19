@@ -3,4 +3,4 @@
 # duplicated inside a C constant (plan section 7).
 kernel_name=ReliefNT
 system_name=ReliefOS
-release_version=5.0.0
+release_version=5.1.0
