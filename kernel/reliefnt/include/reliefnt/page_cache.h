@@ -10,7 +10,8 @@
 
 typedef int (*page_cache_loader)(uint64_t phys, void *context);
 
-/* All cache slots are pinned; the caller may use a private backing page. */
+/* Pinned-cache metadata allocation failed; private callers may use their own
+ * backing page. Shared mappings must retain a single cached page identity. */
 #define PAGE_CACHE_FULL (-2)
 
 void page_cache_init(void);

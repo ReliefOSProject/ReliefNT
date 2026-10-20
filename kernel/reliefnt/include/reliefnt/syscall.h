@@ -337,8 +337,11 @@ int64_t syscall_process_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
 int64_t syscall_dispatch(const struct syscall_frame *frame);
 /**
  * @brief Run the syscall encoded in the trap frame and update its return registers.
+ * Caller has interrupts disabled and holds no execution transaction. Returns
+ * the CPU-reserved task with its frame/TLS prepared, or NULL when the caller
+ * must run userland_schedule_from_frame() for signals or full scheduling.
  */
-void syscall_dispatch_frame(struct trap_frame *frame);
+struct task *syscall_dispatch_frame(struct trap_frame *frame);
 /**
  * @brief Validate an extensible Linux clone3 request and create its child.
  * @param frame Live parent trap frame, copied into the child with rax zero.

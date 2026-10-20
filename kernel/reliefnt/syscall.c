@@ -3,6 +3,7 @@
  * Implements process, file, memory, IPC, GUI, device, and timing operations.
  */
 #include <reliefnt/console.h>
+#include <reliefnt/arch.h>
 #include <reliefnt/driver_manager.h>
 #include <reliefnt/driver_manager_phase.h>
 #include <reliefnt/drm.h>
@@ -4205,9 +4206,8 @@ static bool syscall_select_bit(const uint64_t *set, uint32_t fd)
 
 static void syscall_rusage_cpu_time(uint64_t ticks, struct linux_timeval *out)
 {
-    uint64_t usec = (ticks * 1000000ULL) / RELIEFNT_TICK_HZ;
-    out->tv_sec = (int64_t)(usec / 1000000ULL);
-    out->tv_usec = (int64_t)(usec % 1000000ULL);
+    out->tv_sec = (int64_t)(ticks / RELIEFNT_TICK_HZ);
+    out->tv_usec = (int64_t)((ticks % RELIEFNT_TICK_HZ) * (1000000ULL / RELIEFNT_TICK_HZ));
 }
 
 static int64_t syscall_getrusage(uint64_t who_arg, uint64_t usage_ptr)
@@ -4220,7 +4220,7 @@ static int64_t syscall_getrusage(uint64_t who_arg, uint64_t usage_ptr)
     }
     if (who != 0 && who != -1 && who != -2) return -RELIEFOS_EINVAL;
     if (who == 0 || who == -2) {
-        syscall_rusage_cpu_time(task->cpu_ticks, &usage.ru_utime);
+        syscall_rusage_cpu_time(sched_task_cpu_ticks(task, false), &usage.ru_utime);
         usage.ru_maxrss = address_space_user_resident_kib(sched_task_as(task));
     }
     *(struct linux_rusage *)(uintptr_t)usage_ptr = usage;
@@ -4252,7 +4252,7 @@ static int64_t syscall_times(uint64_t tms_ptr)
     }
     if (tms_ptr) {
         struct linux_tms value = {
-            .tms_utime = (int64_t)task->cpu_ticks,
+            .tms_utime = (int64_t)sched_task_cpu_ticks(task, false),
             .tms_stime = 0,
             .tms_cutime = 0,
             .tms_cstime = 0,
@@ -4981,7 +4981,8 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
                                     ~((1ULL << 8) | (1ULL << 18));
         }
         int64_t result = syscall_select_common(a0, a1, a2, a3, a4, true);
-        if (result != -RELIEFOS_EAGAIN && task->sigsuspend_active) {
+        if (result != -RELIEFOS_EAGAIN && result != KERNEL_SYSCALL_BLOCKED &&
+            task->sigsuspend_active) {
             task->blocked_signals = task->sigsuspend_saved_mask;
             task->sigsuspend_active = 0;
         }
@@ -7802,7 +7803,7 @@ static int task_begin_syscall_io(struct task *task, uint64_t number, int32_t fd)
     return 0;
 }
 
-void syscall_dispatch_frame(struct trap_frame *frame)
+struct task *syscall_dispatch_frame(struct trap_frame *frame)
 {
     uint64_t number;
     uint64_t lock_flags;
@@ -7810,7 +7811,7 @@ void syscall_dispatch_frame(struct trap_frame *frame)
     int restored_signal_frame = 0;
     int eagain_from_nonblocking = 0;
     if (!frame) {
-        return;
+        return NULL;
     }
     /* Several storage and GUI services still own global scratch buffers. */
     kernel_execution_lock_irqsave(&lock_flags);
@@ -7936,11 +7937,23 @@ void syscall_dispatch_frame(struct trap_frame *frame)
         if (result != KERNEL_SYSCALL_BLOCKED)
             sched_sleep_current_until(time_ticks() + 1u);
         kernel_execution_unlock_irqrestore(lock_flags);
-        return;
+        return NULL;
     }
     if (!restored_signal_frame) {
         frame->rax = (uint64_t)result;
     }
     task_release_syscall_file(calling_task);
+    /* Complete an unchanged task's return inside the transaction that already
+     * pins its lifetime. The scheduler still checks signals, preemption, CPU
+     * ownership, affinity and the frame under scheduler_lock. Drain input
+     * arriving during the syscall before that check. Rejected returns keep
+     * the full signal/retirement/selection path in the architecture entry. */
+    input_process_pending();
+    struct task *resume = NULL;
+    if (sched_try_resume_current_user_frame(frame)) {
+        resume = sched_current_task();
+        arch_set_user_fs(resume->fs_base);
+    }
     kernel_execution_unlock_irqrestore(lock_flags);
+    return resume;
 }

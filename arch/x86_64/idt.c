@@ -594,8 +594,8 @@ struct task *page_fault_dispatch(struct trap_frame *frame)
  */
 struct task *int80_dispatch(struct trap_frame *frame)
 {
-    syscall_dispatch_frame(frame);
-    return userland_schedule_from_frame(frame);
+    struct task *resume = syscall_dispatch_frame(frame);
+    return resume ? resume : userland_schedule_from_frame(frame);
 }
 
 /* Called only when the assembly syscall return path could not obtain a
