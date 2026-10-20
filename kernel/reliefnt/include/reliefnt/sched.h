@@ -887,7 +887,7 @@ void sched_release_task_resources(struct task *task);
  * @brief Advance scheduler time and preempt or wake tasks as needed.
  */
 void sched_on_tick(void);
-/** Account a local APIC tick without advancing the BSP's global clock. */
+/** Request local preemption without advancing wall time or CPU usage. */
 void sched_on_cpu_tick(void);
 /**
  * @brief Return the number of scheduler ticks since boot.
@@ -903,10 +903,10 @@ void sched_yield_current(void);
  */
 void sched_request_reschedule_current(void);
 /**
- * @brief Report the total busy and idle ticks accumulated so far.
+ * @brief Report elapsed busy and idle CPU time in Linux USER_HZ (100) units.
  */
 void sched_cpu_ticks(uint64_t *busy_ticks, uint64_t *idle_ticks);
-/** Copy the accumulated busy and idle tick counters for each CPU. */
+/** Copy elapsed busy and idle time for each CPU, in the same 100 Hz units. */
 void sched_cpu_ticks_per_cpu(uint64_t *busy_ticks, uint64_t *idle_ticks,
                              uint32_t capacity);
 /** Copy a coherent per-CPU runtime snapshot, including current pid and
@@ -914,6 +914,10 @@ void sched_cpu_ticks_per_cpu(uint64_t *busy_ticks, uint64_t *idle_ticks,
 void sched_cpu_runtime_snapshot(uint64_t *busy_ticks, uint64_t *idle_ticks,
                                 uint32_t *current_pids, uint32_t *ready_counts,
                                 uint32_t capacity);
+/** Return a coherent task CPU-time snapshot in USER_HZ units. With process
+ * true, sum the existing thread-group members. Caller pins
+ * task lifetime with the execution transaction. Reaped children are separate. */
+uint64_t sched_task_cpu_ticks(const struct task *task, bool process);
 /**
  * @brief Read Linux sysinfo-compatible 1/5/15-minute load averages.
  * @param loads Output array of three Q16 values; must not be NULL.

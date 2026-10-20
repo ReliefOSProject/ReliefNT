@@ -7,7 +7,10 @@
  */
 #include <reliefnt/apic.h>
 #include <reliefnt/console.h>
+#include <reliefnt/lock.h>
 #include <reliefnt/power.h>
+#include <reliefnt/smp.h>
+#include <reliefnt/time.h>
 
 #define CPUID_FEATURE_APIC (1u << 9)
 #define IA32_APIC_BASE 0x1bu
@@ -20,6 +23,19 @@
 #define APIC_REG_ICR_HIGH 0x310u
 #define APIC_REG_LVT_LINT0 0x350u
 #define APIC_REG_LVT_LINT1 0x360u
+#define APIC_REG_LVT_TIMER 0x320u
+#define APIC_REG_TIMER_INITIAL 0x380u
+#define APIC_REG_TIMER_CURRENT 0x390u
+#define APIC_REG_TIMER_DIVIDE 0x3e0u
+#define APIC_TIMER_PERIODIC (1u << 17)
+#define APIC_TIMER_DIVIDE_16 0x3u
+#define APIC_TIMER_REFERENCE_COUNTS (ACPI_PM_TIMER_HZ / 20u)
+#define APIC_TIMER_REFERENCE_MAX_COUNTS (APIC_TIMER_REFERENCE_COUNTS + APIC_TIMER_REFERENCE_COUNTS / 5u)
+#define APIC_TIMER_SNAPSHOT_MAX_COUNTS (ACPI_PM_TIMER_HZ / 10000u)
+#define APIC_TIMER_MIN_COUNT 16u
+#ifndef APIC_TIMER_CALIBRATION_POLL_LIMIT
+#define APIC_TIMER_CALIBRATION_POLL_LIMIT 1000000u
+#endif
 #define APIC_REG_ICR_DELIVERY_STATUS (1u << 12)
 #define APIC_DM_INIT (5u << 8)
 #define APIC_DM_STARTUP (6u << 8)
@@ -90,15 +106,25 @@ static void write_msr(uint32_t msr, uint64_t value)
 
 static uint32_t lapic_read(uint32_t reg)
 {
+#ifdef RELIEFNT_APIC_TEST
+    extern uint32_t apic_test_read(uint32_t reg);
+    return apic_test_read(reg);
+#else
     return local_apic_base ? *(volatile uint32_t *)(local_apic_base + reg) : 0;
+#endif
 }
 
 static void lapic_write(uint32_t reg, uint32_t value)
 {
+#ifdef RELIEFNT_APIC_TEST
+    extern void apic_test_write(uint32_t reg, uint32_t value);
+    apic_test_write(reg, value);
+#else
     if (local_apic_base) {
         *(volatile uint32_t *)(local_apic_base + reg) = value;
         (void)lapic_read(APIC_REG_ID);
     }
+#endif
 }
 
 static bool cpu_id_seen(uint32_t id)
@@ -233,14 +259,129 @@ void apic_enable_legacy_pic(void)
     lapic_write(APIC_REG_LVT_LINT1, APIC_LVT_DELIVERY_NMI);
 }
 
-void apic_timer_init(uint8_t vector, uint32_t initial_count)
+struct apic_timer_sample {
+    uint32_t reference;
+    uint32_t count;
+};
+
+static bool apic_timer_calibration_poll(uint32_t *budget)
+{
+    if (!*budget) return false;
+    --*budget;
+    /* APs are online with IF=0. Respond without depending on IPI delivery or
+     * holding a lock needed by the BSP or another calibrating AP. */
+    smp_membarrier_poll();
+    __asm__ volatile("pause" : : : "memory");
+    return true;
+}
+
+static bool apic_timer_sample(struct apic_timer_sample *sample, uint32_t mask,
+                              uint32_t *budget)
+{
+    while (apic_timer_calibration_poll(budget)) {
+        uint32_t before, after, first_mask, last_mask;
+        if (!power_acpi_pm_timer_read(&before, &first_mask)) return false;
+        uint32_t count = lapic_read(APIC_REG_TIMER_CURRENT);
+        if (!power_acpi_pm_timer_read(&after, &last_mask) ||
+            first_mask != mask || last_mask != mask) return false;
+        uint32_t span = (after - before) & mask;
+        if (span <= APIC_TIMER_SNAPSHOT_MAX_COUNTS) {
+            *sample = (struct apic_timer_sample){
+                .reference = (before + span / 2u) & mask, .count = count};
+            return true;
+        }
+        /* A slow/glitching snapshot is not a trustworthy timestamp for the
+         * LAPIC read in its middle. Retry within the same bounded budget. */
+    }
+    return false;
+}
+
+void apic_timer_init(uint8_t vector, uint32_t fallback_count)
 {
     if (!local_apic_enabled) return;
-    /* Divide by 16; one-shot periodic operation is selected by the caller's
-     * vector policy, and the AP keeps a low-rate heartbeat while idle. */
-    lapic_write(0x3e0u, 0x3u);
-    lapic_write(0x320u, vector | (1u << 17));
-    lapic_write(0x380u, initial_count);
+    struct apic_timer_sample samples[3] = {{0}};
+    uint32_t budget = APIC_TIMER_CALIBRATION_POLL_LIMIT;
+    uint32_t initial_count = fallback_count ? fallback_count : 1000000u;
+    uint32_t reference = 0, mask = 0, elapsed = 0;
+    const char *failure = "reference-unavailable";
+    lapic_write(APIC_REG_LVT_TIMER, vector | APIC_LVT_MASKED);
+    lapic_write(APIC_REG_TIMER_INITIAL, 0);
+    if (!power_acpi_pm_timer_read(&reference, &mask) ||
+        (mask != 0x00ffffffu && mask != UINT32_MAX)) goto program_periodic;
+    /* Initial PIT IRQs can be delivered in a catch-up burst after boot ran
+     * with IF=0. ACPI's 3.579545 MHz free-running counter measures the physical
+     * interval independently of IRQ delivery and CPU/TSC frequency/offset. */
+    lapic_write(APIC_REG_TIMER_DIVIDE, APIC_TIMER_DIVIDE_16);
+    lapic_write(APIC_REG_TIMER_INITIAL, UINT32_MAX);
+    failure = "sample-timeout";
+    if (!apic_timer_sample(&samples[0], mask, &budget)) goto program_periodic;
+    if (!samples[0].count) { failure = "counter-expired"; goto program_periodic; }
+    uint64_t periods[2];
+    for (unsigned window = 0; window < 2u; ++window) {
+        const struct apic_timer_sample *start = &samples[window];
+        struct apic_timer_sample *end = &samples[window + 1u];
+        bool complete = false;
+        while (apic_timer_calibration_poll(&budget)) {
+            uint32_t current_mask;
+            if (!power_acpi_pm_timer_read(&reference, &current_mask) || current_mask != mask) {
+                failure = "reference-unavailable"; break;
+            }
+            elapsed = (reference - start->reference) & mask;
+            if (elapsed < APIC_TIMER_REFERENCE_COUNTS) continue;
+            if (!apic_timer_sample(end, mask, &budget)) break;
+            elapsed = (end->reference - start->reference) & mask;
+            if (elapsed < APIC_TIMER_REFERENCE_COUNTS || elapsed > APIC_TIMER_REFERENCE_MAX_COUNTS) {
+                failure = "sample-overshoot"; break;
+            }
+            if (!end->count || end->count >= start->count) {
+                failure = "counter-invalid"; break;
+            }
+            uint64_t delta = (uint64_t)start->count - end->count;
+            uint64_t denominator = (uint64_t)elapsed * RELIEFNT_TICK_HZ;
+            uint64_t measured = (delta * ACPI_PM_TIMER_HZ + denominator / 2u) / denominator;
+            if (measured < APIC_TIMER_MIN_COUNT || measured > UINT32_MAX) {
+                failure = "count-out-of-range"; break;
+            }
+            periods[window] = measured;
+            complete = true;
+            break;
+        }
+        if (!complete) goto program_periodic;
+    }
+    /* A single long vCPU pause may alias a full 24-bit PM counter turn into
+     * a short interval. Two independent windows must agree within 5% plus
+     * rounding, so such a pause cannot silently establish a wrong rate. */
+    uint64_t higher = periods[0] > periods[1] ? periods[0] : periods[1];
+    uint64_t lower = periods[0] < periods[1] ? periods[0] : periods[1];
+    if (higher - lower > higher / 20u + 1u) {
+        failure = "inconsistent-windows"; goto program_periodic;
+    }
+    elapsed = (samples[2].reference - samples[0].reference) & mask;
+    uint64_t delta = (uint64_t)samples[0].count - samples[2].count;
+    uint64_t denominator = (uint64_t)elapsed * RELIEFNT_TICK_HZ;
+    initial_count = (uint32_t)((delta * ACPI_PM_TIMER_HZ + denominator / 2u) / denominator);
+    failure = NULL;
+program_periodic:
+    /* The independent poll cap also covers a stopped reference. It bounds
+     * iterations, not host wall time if a virtual CPU is descheduled. */
+    lapic_write(APIC_REG_LVT_TIMER, vector | APIC_LVT_MASKED);
+    lapic_write(APIC_REG_TIMER_INITIAL, 0);
+    lapic_write(APIC_REG_TIMER_DIVIDE, APIC_TIMER_DIVIDE_16);
+    lapic_write(APIC_REG_LVT_TIMER, vector | APIC_TIMER_PERIODIC);
+    lapic_write(APIC_REG_TIMER_INITIAL, initial_count);
+    /* Serialize only the completed result with user-console transactions.
+     * Calibration itself holds no execution/scheduler lock. Lock admission
+     * also polls membarriers while this AP still has interrupts masked. */
+    uint64_t log_flags;
+    kernel_execution_lock_irqsave(&log_flags);
+    console_log(failure ? CONSOLE_LOG_WARN : CONSOLE_LOG_INFO,
+        "[reliefnt] LAPIC timer APIC=%u target_hz=%u count=%u %s clock=acpi-pm window_us=%llu start=%u end=%u polls=%u\n",
+        (unsigned)apic_id(), (unsigned)RELIEFNT_TICK_HZ, (unsigned)initial_count,
+        failure ? failure : "calibrated",
+        (unsigned long long)((uint64_t)elapsed * 1000000u / ACPI_PM_TIMER_HZ),
+        (unsigned)samples[0].count, (unsigned)samples[2].count,
+        (unsigned)(APIC_TIMER_CALIBRATION_POLL_LIMIT - budget));
+    kernel_execution_unlock_irqrestore(log_flags);
 }
 
 void apic_eoi(void)

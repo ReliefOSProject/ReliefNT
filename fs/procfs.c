@@ -237,8 +237,11 @@ static int proc_fill_content(const char *path, char *buffer, uint32_t capacity)
         uint64_t per_cpu_idle[SMP_MAX_CPUS] = {0};
         uint32_t cpu_count = smp_cpu_count();
         if (cpu_count > SMP_MAX_CPUS) cpu_count = SMP_MAX_CPUS;
-        sched_cpu_ticks(&busy, &idle);
-        sched_cpu_ticks_per_cpu(per_cpu_busy, per_cpu_idle, cpu_count);
+        sched_cpu_runtime_snapshot(per_cpu_busy, per_cpu_idle, NULL, NULL, cpu_count);
+        for (uint32_t cpu = 0; cpu < cpu_count; ++cpu) {
+            busy += per_cpu_busy[cpu];
+            idle += per_cpu_idle[cpu];
+        }
         proc_append_text(buffer, &pos, capacity, "cpu ");
         proc_append_u64(buffer, &pos, capacity, busy);
         proc_append_text(buffer, &pos, capacity, " 0 0 ");
@@ -432,12 +435,10 @@ static void proc_task_stat(struct task *task, struct text_stream *s)
     struct task_address_space_state *mm = sched_task_mm(task);
     struct task_snapshot_info snapshots[SCHED_TASK_MAX];
     uint32_t count = sched_snapshot(snapshots, SCHED_TASK_MAX, 0), threads = 0;
-    uint64_t ticks = 0;
     for (uint32_t i = 0; i < count; ++i) {
         struct task *other = sched_find(snapshots[i].pid);
         if (other && sched_task_tgid(other) == sched_task_tgid(task)) {
             ++threads;
-            ticks += other->cpu_ticks;
         }
     }
     uint32_t foreground = 0;
@@ -447,7 +448,7 @@ static void proc_task_stat(struct task *task, struct text_stream *s)
     values[5] = task->process_group;
     values[6] = task->process_session;
     values[8] = values[7] ? foreground : (uint64_t)-1;
-    values[14] = ticks * 100 / RELIEFNT_TICK_HZ;
+    values[14] = sched_task_cpu_ticks(task, true);
     values[18] = 20 + task->priority;
     values[19] = task->priority;
     values[20] = threads;

@@ -48,12 +48,21 @@ static struct task *current_task[SMP_MAX_CPUS];
 static uint32_t next_session_id = 1;
 static uint64_t scheduler_ticks;
 static uint64_t scheduler_loads[3];
-static uint64_t scheduler_busy_ticks;
-static uint64_t scheduler_idle_ticks;
-static uint64_t scheduler_cpu_busy_ticks[SMP_MAX_CPUS];
-static uint64_t scheduler_cpu_idle_ticks[SMP_MAX_CPUS];
+/* CPU time uses the BSP's USER_HZ reference on every CPU. LAPIC IRQs are
+ * preemption requests, not a clock: their rate may differ during calibration
+ * or fallback. The BSP samples CPU ownership at the existing 10 ms precision;
+ * no unverified cross-CPU TSC interpolation enters CPU usage statistics. */
+static struct cpu_runtime_accounting {
+    uint64_t last_tick;
+    uint64_t busy_ticks;
+    uint64_t idle_ticks;
+    bool started;
+} cpu_accounting[SMP_MAX_CPUS];
+_Static_assert(RELIEFNT_TICK_HZ == 100, "CPU ticks use Linux USER_HZ=100");
 static struct kernel_spinlock scheduler_lock = KERNEL_SPINLOCK_INIT;
 static void sched_notify_parent_exit(struct task *task);
+static void cpu_accounting_settle(uint32_t cpu);
+static void cpu_accounting_sync(void);
 
 void sched_truncate_file_mappings(const struct storage_node *node, uint64_t size)
 {
@@ -552,14 +561,12 @@ void sched_init(void)
     next_session_id = 1;
     scheduler_ticks = 0;
     for (unsigned i = 0; i < 3; ++i) scheduler_loads[i] = 0;
-    scheduler_busy_ticks = 0;
-    scheduler_idle_ticks = 0;
     for (uint32_t i = 0; i < SMP_MAX_CPUS; ++i) {
         fair_queues[i] = (struct eevdf_queue){0};
         fair_running[i] = NULL;
         fair_started[i] = 0;
-        scheduler_cpu_busy_ticks[i] = 0;
-        scheduler_cpu_idle_ticks[i] = 0;
+        cpu_accounting[i] = (struct cpu_runtime_accounting){
+            .started = smp_cpu_online(i)};
     }
     fair_clock = 0;
     console_info("[reliefnt] EEVDF scheduler initialized\n");
@@ -597,6 +604,45 @@ static void task_zero(struct task *task)
         ((uint8_t *)task)[i] = 0;
     }
     task_fair_bind(task);
+}
+
+static uint64_t cpu_accounting_add(uint64_t value, uint64_t delta)
+{
+    return delta > UINT64_MAX - value ? UINT64_MAX : value + delta;
+}
+
+/* All helpers run under scheduler_lock. Reading statistics must not advance
+ * EEVDF runtime or renew its deadlines. scheduler_ticks needs no clock lock. */
+static void cpu_accounting_settle(uint32_t cpu)
+{
+    if (!smp_cpu_online(cpu)) {
+        cpu_accounting[cpu].started = false;
+        return;
+    }
+    if (!cpu_accounting[cpu].started) {
+        cpu_accounting[cpu].last_tick = scheduler_ticks;
+        cpu_accounting[cpu].started = true;
+        return;
+    }
+    uint64_t delta = scheduler_ticks - cpu_accounting[cpu].last_tick;
+    cpu_accounting[cpu].last_tick = scheduler_ticks;
+    struct task *owner = current_task[cpu];
+    /* BLOCKED/READY/EXITED can still own the live CPU until its syscall or
+     * interrupt handoff retires the reservation. Bill that interval to the
+     * owner, not idle time, and settle it before publishing another owner. */
+    if (owner && owner->pid && owner->pid == current_pid[cpu] && owner->running_cpu == cpu) {
+        cpu_accounting[cpu].busy_ticks = cpu_accounting_add(cpu_accounting[cpu].busy_ticks, delta);
+        owner->cpu_ticks = cpu_accounting_add(owner->cpu_ticks, delta);
+    } else {
+        cpu_accounting[cpu].idle_ticks = cpu_accounting_add(cpu_accounting[cpu].idle_ticks, delta);
+    }
+}
+
+static void cpu_accounting_sync(void)
+{
+    uint32_t count = smp_cpu_count();
+    if (count > SMP_MAX_CPUS) count = SMP_MAX_CPUS;
+    for (uint32_t cpu = 0; cpu < count; ++cpu) cpu_accounting_settle(cpu);
 }
 
 /** @brief Drop the resource-limit reference only when a task is reaped/recycled. */
@@ -1448,6 +1494,7 @@ void sched_set_running(uint32_t pid)
         return;
     }
     fair_stop_cpu(cpu);
+    cpu_accounting_settle(cpu);
     current_pid[cpu] = pid;
     current_task[cpu] = selected;
     for (uint32_t i = 0; i < task_count; ++i) {
@@ -2119,7 +2166,6 @@ static void sched_posix_timer_expire(void)
 /** @brief Account a tick and queue expirations; signal actions run on return to user mode. */
 void sched_on_tick(void)
 {
-    struct task *current;
     bool woke = false;
     uint64_t flags;
     kernel_spin_lock_irqsave(&scheduler_lock, &flags);
@@ -2135,16 +2181,7 @@ void sched_on_tick(void)
             if (tasks[i]->pid && (tasks[i]->state == TASK_RUNNING || tasks[i]->state == TASK_READY)) ++active;
         sched_load_update(scheduler_loads, active);
     }
-    current = sched_find(scheduler_current_pid());
-    uint32_t cpu = scheduler_cpu_index();
-    if (current && current->state == TASK_RUNNING) {
-        ++scheduler_busy_ticks;
-        ++scheduler_cpu_busy_ticks[cpu];
-        ++current->cpu_ticks;
-    } else {
-        ++scheduler_idle_ticks;
-        ++scheduler_cpu_idle_ticks[cpu];
-    }
+    cpu_accounting_sync();
     for (uint32_t i = 0; i < task_count; ++i) {
         if (tasks[i]->state == TASK_BLOCKED && !tasks[i]->vfork_child && tasks[i]->wake_tick &&
             tasks[i]->wake_tick <= scheduler_ticks) {
@@ -2165,26 +2202,16 @@ void sched_on_tick(void)
 }
 
 /**
- * Account a local-APIC preemption tick. The BSP PIT alone advances wall time
- * and sleepers; AP ticks only account and preempt the task owned by that CPU.
+ * Request local-APIC preemption. The BSP PIT alone advances wall time,
+ * sleepers and CPU usage; an AP tick must never manufacture CPU time.
  */
 void sched_on_cpu_tick(void)
 {
-    struct task *current;
     uint32_t cpu = scheduler_cpu_index();
     uint64_t flags;
 
     kernel_spin_lock_irqsave(&scheduler_lock, &flags);
     sched_request_reschedule_cpu(cpu);
-    current = sched_find(current_pid[cpu]);
-    if (current && current->state == TASK_RUNNING && current->running_cpu == cpu) {
-        ++scheduler_busy_ticks;
-        ++scheduler_cpu_busy_ticks[cpu];
-        ++current->cpu_ticks;
-    } else {
-        ++scheduler_idle_ticks;
-        ++scheduler_cpu_idle_ticks[cpu];
-    }
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
 }
 
@@ -2240,11 +2267,17 @@ void sched_cpu_ticks(uint64_t *busy_ticks, uint64_t *idle_ticks)
 {
     uint64_t flags;
     kernel_spin_lock_irqsave(&scheduler_lock, &flags);
+    cpu_accounting_sync();
+    uint64_t busy = 0, idle = 0;
+    for (uint32_t cpu = 0; cpu < SMP_MAX_CPUS; ++cpu) {
+        busy = cpu_accounting_add(busy, cpu_accounting[cpu].busy_ticks);
+        idle = cpu_accounting_add(idle, cpu_accounting[cpu].idle_ticks);
+    }
     if (busy_ticks) {
-        *busy_ticks = scheduler_busy_ticks;
+        *busy_ticks = busy;
     }
     if (idle_ticks) {
-        *idle_ticks = scheduler_idle_ticks;
+        *idle_ticks = idle;
     }
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
 }
@@ -2255,12 +2288,13 @@ void sched_cpu_ticks_per_cpu(uint64_t *busy_ticks, uint64_t *idle_ticks,
     uint64_t flags;
     uint32_t count = capacity < SMP_MAX_CPUS ? capacity : SMP_MAX_CPUS;
     kernel_spin_lock_irqsave(&scheduler_lock, &flags);
+    cpu_accounting_sync();
     for (uint32_t i = 0; i < count; ++i) {
         if (busy_ticks) {
-            busy_ticks[i] = scheduler_cpu_busy_ticks[i];
+            busy_ticks[i] = cpu_accounting[i].busy_ticks;
         }
         if (idle_ticks) {
-            idle_ticks[i] = scheduler_cpu_idle_ticks[i];
+            idle_ticks[i] = cpu_accounting[i].idle_ticks;
         }
     }
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
@@ -2273,12 +2307,13 @@ void sched_cpu_runtime_snapshot(uint64_t *busy_ticks, uint64_t *idle_ticks,
     uint64_t flags;
     uint32_t count = capacity < SMP_MAX_CPUS ? capacity : SMP_MAX_CPUS;
     kernel_spin_lock_irqsave(&scheduler_lock, &flags);
+    cpu_accounting_sync();
     for (uint32_t cpu = 0; cpu < count; ++cpu) {
         if (busy_ticks) {
-            busy_ticks[cpu] = scheduler_cpu_busy_ticks[cpu];
+            busy_ticks[cpu] = cpu_accounting[cpu].busy_ticks;
         }
         if (idle_ticks) {
-            idle_ticks[cpu] = scheduler_cpu_idle_ticks[cpu];
+            idle_ticks[cpu] = cpu_accounting[cpu].idle_ticks;
         }
         if (current_pids) {
             current_pids[cpu] = current_pid[cpu];
@@ -2294,6 +2329,22 @@ void sched_cpu_runtime_snapshot(uint64_t *busy_ticks, uint64_t *idle_ticks,
         }
     }
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
+}
+
+uint64_t sched_task_cpu_ticks(const struct task *task, bool process)
+{
+    uint64_t flags, result = 0;
+    kernel_spin_lock_irqsave(&scheduler_lock, &flags);
+    cpu_accounting_sync();
+    if (task && !process) result = task->cpu_ticks;
+    else if (task) {
+        uint32_t group = sched_task_tgid(task);
+        for (uint32_t i = 0; i < task_count; ++i)
+            if (sched_task_tgid(tasks[i]) == group)
+                result = cpu_accounting_add(result, tasks[i]->cpu_ticks);
+    }
+    kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
+    return result;
 }
 
 /**
@@ -2607,6 +2658,7 @@ void sched_quiesce_exited_current(void)
 
     kernel_spin_lock_irqsave(&scheduler_lock, &flags);
     fair_stop_cpu(cpu);
+    cpu_accounting_settle(cpu);
     pid = current_pid[cpu];
     for (uint32_t i = 0; i < task_count; ++i) {
         if (tasks[i]->pid == pid && tasks[i]->state == TASK_EXITED) {
@@ -2639,6 +2691,7 @@ struct task *sched_select_next_user(void)
     struct task *old = sched_find(current_pid[cpu]);
     fair_stop_cpu(cpu);
     best = fair_select(cpu);
+    cpu_accounting_settle(cpu);
     if (!best || best != old) {
         /* The execution transaction pins task metadata around this handoff.
          * Switch CR3 before publishing the old task to remote CPUs/reapers,
@@ -3523,6 +3576,7 @@ uint32_t sched_snapshot(struct task_snapshot_info *out, uint32_t capacity, uint6
     uint64_t flags;
     uint32_t result;
     kernel_spin_lock_irqsave(&scheduler_lock, &flags);
+    cpu_accounting_sync();
     if (tick) {
         *tick = scheduler_ticks;
     }

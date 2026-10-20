@@ -55,6 +55,8 @@ struct acpi_power_state {
 
 static struct acpi_power_state acpi_power;
 static const struct acpi_rsdp *acpi_root_rsdp;
+static uint16_t acpi_pm_timer_port;
+static uint32_t acpi_pm_timer_mask;
 
 /**
  * Acpi read32.
@@ -90,6 +92,36 @@ static uint64_t acpi_read64(const uint8_t *base, uint32_t offset)
         value |= (uint64_t)base[offset + i] << (i * 8U);
     }
     return value;
+}
+
+static void acpi_pm_timer_init(const uint8_t *fadt, uint32_t length)
+{
+    acpi_pm_timer_port = 0;
+    acpi_pm_timer_mask = 0;
+    if (!fadt || length < 116u || fadt[91] != 4u) return;
+    uint32_t flags = acpi_read32(fadt, 112);
+    if (flags & (1u << 20)) return; /* HW_REDUCED_ACPI has no fixed registers. */
+    uint64_t address = acpi_read32(fadt, 76);
+    uint32_t mask = flags & (1u << 8) ? UINT32_MAX : 0x00ffffffu;
+    if (length >= 220u && acpi_read64(fadt, 212)) {
+        /* A nonzero X_PM_TMR_BLK supersedes PM_TMR_BLK. Do not silently use
+         * the legacy address when the preferred GAS is unsupported/invalid. */
+        /* PM_TMR is read as one 32-bit register even on 24-bit counters. */
+        if (fadt[208] != 1u || fadt[209] != 32u ||
+            fadt[210] || (fadt[211] && fadt[211] != 3u)) return;
+        address = acpi_read64(fadt, 212);
+    }
+    if (!address || address > 0xfffcu) return;
+    acpi_pm_timer_port = (uint16_t)address;
+    acpi_pm_timer_mask = mask;
+}
+
+bool power_acpi_pm_timer_read(uint32_t *count, uint32_t *mask)
+{
+    if (!count || !mask || !acpi_pm_timer_port) return false;
+    *mask = acpi_pm_timer_mask;
+    *count = x86_64_inl(acpi_pm_timer_port) & acpi_pm_timer_mask;
+    return true;
 }
 
 /**
@@ -525,6 +557,8 @@ void power_init(const struct boot_info *boot)
         ((uint8_t *)&acpi_power)[i] = 0;
     }
     acpi_root_rsdp = 0;
+    acpi_pm_timer_port = 0;
+    acpi_pm_timer_mask = 0;
     if (boot && boot->rsdp_addr <= 0xffffffffULL) {
         rsdp = (const struct acpi_rsdp *)(uintptr_t)boot->rsdp_addr;
         if (!acpi_rsdp_valid(rsdp)) {
@@ -548,6 +582,8 @@ void power_init(const struct boot_info *boot)
         return;
     }
     fadt_bytes = (const uint8_t *)fadt;
+    /* The independent clock is usable even without a DSDT _S5 object. */
+    acpi_pm_timer_init(fadt_bytes, fadt->length);
     acpi_power.smi_command = acpi_read32(fadt_bytes, 48);
     acpi_power.acpi_enable = fadt_bytes[52];
     acpi_power.pm1_control_length = fadt_bytes[89];

@@ -24,7 +24,7 @@
 /* Conservative periodic preemption rate for a virtual LAPIC. The BSP PIT
  * remains the authoritative 100 Hz wall clock; this only prevents an AP's
  * compute-bound user task from monopolising that CPU. */
-#define AP_LAPIC_TIMER_INITIAL_COUNT 1000000u
+#define AP_LAPIC_TIMER_FALLBACK_COUNT 1000000u
 
 extern uint8_t smp_trampoline_start[];
 extern uint8_t smp_trampoline_end[];
@@ -332,7 +332,7 @@ void smp_ap_entry(uint32_t cpu_index)
     }
     /* No device IRQ is routed to an AP. Its local timer is sufficient for
      * preemption and sends vector 0x40 through the shared, immutable IDT. */
-    apic_timer_init(0x40u, AP_LAPIC_TIMER_INITIAL_COUNT);
+    apic_timer_init(0x40u, AP_LAPIC_TIMER_FALLBACK_COUNT);
     for (;;) {
         struct task *next;
         struct trap_frame *frame;
