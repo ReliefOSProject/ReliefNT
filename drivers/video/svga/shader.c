@@ -5,6 +5,26 @@
  * slot so a ready low slot cannot starve older high slots. */
 static uint32_t shader_reap_cursor;
 
+_Static_assert(SVGA_GB_SHADER_SLOTS <= 64u, "shader retirement mask capacity");
+
+/* The mask is an empty fast path only. Publication, fence checks, record
+ * removal and backing ownership remain serialized by svga_lock. */
+void svga_shader_retire_locked(struct svga_shader *shader, svga_handle fence)
+{
+    uint32_t slot = (uint32_t)(shader - svga.shaders);
+    shader->retiring = true;
+    shader->retire_fence = fence;
+    __atomic_fetch_or(&svga.retiring_shader_mask, 1ULL << slot, __ATOMIC_RELEASE);
+}
+
+static void shader_clear_locked(struct svga_shader *shader)
+{
+    uint32_t slot = (uint32_t)(shader - svga.shaders);
+    __atomic_fetch_and(&svga.retiring_shader_mask, ~(1ULL << slot),
+                       __ATOMIC_RELEASE);
+    *shader = (struct svga_shader){0};
+}
+
 #define SVGA_GB_SHADER_MAX_CODE_BYTES (8u * 1024u * 1024u)
 
 /** @brief Find a live or retiring VGPU9 shader key while svga_lock is held.
@@ -253,7 +273,7 @@ int svga3d_shader_destroy(svga_handle context, uint32_t local_id, uint32_t type)
         uint32_t pages = code.pages + code.pt_pages;
         if (svga.pages >= pages) svga.pages -= pages;
         else svga.pages = 0;
-        *shader = (struct svga_shader){0};
+        shader_clear_locked(shader);
         ret = 0;
         svga_unlock(flags);
         svga_shader_backing_free(&allocator, &code);
@@ -283,8 +303,7 @@ int svga3d_shader_destroy(svga_handle context, uint32_t local_id, uint32_t type)
     svga_handle fence = 0;
     ret = svga_fifo_batch_try_locked(words, used * 4u, &fence);
     if (ret) goto done;
-    shader->retiring = true;
-    shader->retire_fence = fence;
+    svga_shader_retire_locked(shader, fence);
     if (bound) svga.contexts[cid].shaders[type - SVGA3D_SHADERTYPE_VS] = UINT32_MAX;
     ret = SVGA_EBUSY;
 done:
@@ -458,7 +477,7 @@ static void shader_release_reservation_locked(struct svga_batch *batch,
     if (metadata->reserved_pages >= shader->reserved_pages)
         metadata->reserved_pages -= shader->reserved_pages;
     else metadata->reserved_pages = 0;
-    *shader = (struct svga_shader){0};
+    shader_clear_locked(shader);
     shader_remove_reserved_slot(metadata, slot);
 }
 
@@ -827,8 +846,7 @@ void svga_shader_commit_batch_locked(struct svga_batch *batch,
             if (!serial) serial = ++svga.handle_serial;
             shader->serial = serial;
         } else if (op->kind == SVGA_BATCH_SHADER_DESTROY) {
-            shader->retiring = true;
-            shader->retire_fence = fence;
+            svga_shader_retire_locked(shader, fence);
         }
     }
 
@@ -863,7 +881,7 @@ void svga_shader_abort_batch_locked(struct svga_batch *batch)
         if (!shader->reserved || shader->reserved_by != metadata->transaction_id)
             continue;
         metadata->abort_backings[slot] = shader->code;
-        *shader = (struct svga_shader){0};
+        shader_clear_locked(shader);
     }
     for (uint32_t i = 0; i < metadata->state_context_count; ++i) {
         uint32_t cid = metadata->state_context_ids[i];
@@ -884,6 +902,7 @@ int svga_backend_reap_retired(uint32_t budget, uint32_t *reaped)
 {
     if (!reaped) return SVGA_EINVAL;
     *reaped = 0;
+    if (!__atomic_load_n(&svga.retiring_shader_mask, __ATOMIC_ACQUIRE)) return 0;
     if (budget > SVGA_GB_SHADER_SLOTS) budget = SVGA_GB_SHADER_SLOTS;
     for (uint32_t attempt = 0; attempt < budget; ++attempt) {
         uint64_t flags;
@@ -904,7 +923,7 @@ int svga_backend_reap_retired(uint32_t budget, uint32_t *reaped)
             uint32_t pages = code.pages + code.pt_pages;
             if (svga.pages >= pages) svga.pages -= pages;
             else svga.pages = 0;
-            *shader = (struct svga_shader){0};
+            shader_clear_locked(shader);
             reclaimed_slot = slot;
             found = true;
             break;

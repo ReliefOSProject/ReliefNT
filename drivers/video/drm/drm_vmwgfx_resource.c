@@ -66,6 +66,9 @@ static struct kernel_spinlock drm_vmwgfx_resource_lock = KERNEL_SPINLOCK_INIT;
 static struct drm_vmwgfx_resource *drm_vmwgfx_all_resources;
 static struct drm_vmwgfx_resource *drm_vmwgfx_retire_head;
 static struct drm_vmwgfx_resource *drm_vmwgfx_retire_tail;
+/* Published under resource_lock. Only the empty observation is lock-free;
+ * popping, requeuing and all resource lifetimes still use that lock. */
+static bool drm_vmwgfx_retire_pending;
 static uint32_t drm_vmwgfx_next_handle = DRM_VMW_RESOURCE_HANDLE_MIN;
 
 static struct drm_vmwgfx_file_ref *drm_vmwgfx_file_ref_find_locked(
@@ -151,6 +154,7 @@ static void drm_vmwgfx_queue_locked(struct drm_vmwgfx_resource *resource)
     else
         drm_vmwgfx_retire_head = resource;
     drm_vmwgfx_retire_tail = resource;
+    __atomic_store_n(&drm_vmwgfx_retire_pending, true, __ATOMIC_RELEASE);
 }
 
 static void drm_vmwgfx_queue_resource(struct drm_vmwgfx_resource *resource)
@@ -696,6 +700,8 @@ static struct drm_vmwgfx_resource *drm_vmwgfx_retire_pop_locked(void)
     if (!resource) return NULL;
     drm_vmwgfx_retire_head = resource->retire_next;
     if (!drm_vmwgfx_retire_head) drm_vmwgfx_retire_tail = NULL;
+    __atomic_store_n(&drm_vmwgfx_retire_pending,
+                     drm_vmwgfx_retire_head != NULL, __ATOMIC_RELEASE);
     resource->retire_next = NULL;
     resource->queued = false;
     return resource;
@@ -713,6 +719,8 @@ uint32_t drm_vmwgfx_process_retirements(uint32_t budget)
     uint32_t shader_reaped = 0;
     (void)svga_backend_reap_retired(budget, &shader_reaped);
     drm_vmwgfx_execbuf_process_retirements(budget);
+    if (!__atomic_load_n(&drm_vmwgfx_retire_pending, __ATOMIC_ACQUIRE))
+        return 0;
     for (uint32_t attempt = 0; attempt < budget; ++attempt) {
         uint64_t flags;
         kernel_spin_lock_irqsave(&drm_vmwgfx_resource_lock, &flags);

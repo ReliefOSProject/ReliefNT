@@ -136,6 +136,18 @@ static uint32_t drm_vmwgfx_exec_work_bytes;
 static uint32_t drm_vmwgfx_attachment_count;
 static uint64_t drm_vmwgfx_attachment_bytes;
 static uint32_t drm_vmwgfx_attachment_progress_cursor;
+static bool drm_vmwgfx_exec_maintenance_pending;
+
+/* Called under exec_lock after changing these owners. Count allocated work
+ * as well as queued work, conservatively covering unpublished allocations
+ * and every submitted job, cleanup record and cached attachment. */
+static void drm_vmwgfx_exec_publish_maintenance_locked(void)
+{
+    bool pending = drm_vmwgfx_exec_work_count || drm_vmwgfx_attachment_count ||
+                   drm_vmwgfx_continuation_cleanup;
+    __atomic_store_n(&drm_vmwgfx_exec_maintenance_pending, pending,
+                     __ATOMIC_RELEASE);
+}
 
 static void drm_vmwgfx_execdiag(
     struct drm_faildiag_context *diagnostics, int error, const char *stage,
@@ -1168,6 +1180,7 @@ static void drm_vmwgfx_exec_attachment_owner_put(void *opaque)
     if (*link == attachment) {
         *link = attachment->next;
         if (drm_vmwgfx_attachment_count) --drm_vmwgfx_attachment_count;
+        drm_vmwgfx_exec_publish_maintenance_locked();
         if (drm_vmwgfx_attachment_bytes >= attachment->bytes)
             drm_vmwgfx_attachment_bytes -= attachment->bytes;
         else
@@ -1299,6 +1312,7 @@ static int drm_vmwgfx_exec_attachment_get(
     candidate->next = drm_vmwgfx_attachments;
     drm_vmwgfx_attachments = candidate;
     ++drm_vmwgfx_attachment_count;
+    drm_vmwgfx_exec_publish_maintenance_locked();
     drm_vmwgfx_attachment_bytes += bytes;
     *out = candidate;
     kernel_spin_unlock_irqrestore(&drm_vmwgfx_exec_lock, flags);
@@ -1333,6 +1347,7 @@ static void drm_vmwgfx_exec_work_release(struct drm_vmwgfx_exec_work *work)
     uint64_t flags;
     kernel_spin_lock_irqsave(&drm_vmwgfx_exec_lock, &flags);
     if (drm_vmwgfx_exec_work_count) --drm_vmwgfx_exec_work_count;
+    drm_vmwgfx_exec_publish_maintenance_locked();
     if (drm_vmwgfx_exec_work_bytes >= work->allocation_bytes)
         drm_vmwgfx_exec_work_bytes -= work->allocation_bytes;
     else
@@ -1449,6 +1464,7 @@ static struct drm_vmwgfx_exec_work *drm_vmwgfx_exec_work_alloc(
         return NULL;
     }
     ++drm_vmwgfx_exec_work_count;
+    drm_vmwgfx_exec_publish_maintenance_locked();
     drm_vmwgfx_exec_work_bytes += (uint32_t)allocation;
     kernel_spin_unlock_irqrestore(&drm_vmwgfx_exec_lock, flags);
 
@@ -1475,6 +1491,7 @@ static struct drm_vmwgfx_exec_work *drm_vmwgfx_exec_work_alloc(
 no_memory:
     kernel_spin_lock_irqsave(&drm_vmwgfx_exec_lock, &flags);
     if (drm_vmwgfx_exec_work_count) --drm_vmwgfx_exec_work_count;
+    drm_vmwgfx_exec_publish_maintenance_locked();
     if (drm_vmwgfx_exec_work_bytes >= allocation)
         drm_vmwgfx_exec_work_bytes -= (uint32_t)allocation;
     kernel_spin_unlock_irqrestore(&drm_vmwgfx_exec_lock, flags);
@@ -1486,6 +1503,10 @@ no_memory:
 
 void drm_vmwgfx_execbuf_process_retirements(uint32_t budget)
 {
+    /* Work published after this empty observation is handled on the next
+     * syscall or idle-service pass. No queue entry is consumed by this hint. */
+    if (!__atomic_load_n(&drm_vmwgfx_exec_maintenance_pending, __ATOMIC_ACQUIRE))
+        return;
     uint64_t now = time_ticks();
     if (budget > 8u) budget = 8u;
     for (uint32_t i = 0; i < budget; ++i) {
@@ -1496,6 +1517,7 @@ void drm_vmwgfx_execbuf_process_retirements(uint32_t budget)
         if (continuation) {
             drm_vmwgfx_continuation_cleanup = continuation->next;
             continuation->next = NULL;
+            drm_vmwgfx_exec_publish_maintenance_locked();
         }
         struct drm_vmwgfx_exec_work *work = drm_vmwgfx_exec_cleanup;
         if (work) {
@@ -1614,6 +1636,7 @@ static void drm_vmwgfx_continuation_queue_release(
     kernel_spin_lock_irqsave(&drm_vmwgfx_exec_lock, &flags);
     continuation->next = drm_vmwgfx_continuation_cleanup;
     drm_vmwgfx_continuation_cleanup = continuation;
+    drm_vmwgfx_exec_publish_maintenance_locked();
     kernel_spin_unlock_irqrestore(&drm_vmwgfx_exec_lock, flags);
 }
 

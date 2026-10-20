@@ -222,6 +222,7 @@ struct svga_device {
     struct svga_gmr gmrs[SVGA_GMRS];
     struct svga_mob external_mobs[SVGA_GMRS];
     struct svga_shader shaders[SVGA_GB_SHADER_SLOTS];
+    uint64_t retiring_shader_mask;
     struct svga_query_pending queries[SVGA_QUERY_PENDING_MAX];
     struct svga_gpu_context gpu_contexts[SVGA_GPU_CONTEXTS];
     struct svga_gpu_stats gpu_stats;
@@ -346,6 +347,7 @@ bool svga_fence_reached_locked(svga_handle fence);
 void svga_shader_commit_batch_locked(struct svga_batch *batch,
                                      svga_handle fence);
 void svga_shader_abort_batch_locked(struct svga_batch *batch);
+void svga_shader_retire_locked(struct svga_shader *shader, svga_handle fence);
 void svga_shader_backing_free(const struct svga_ops *ops, struct svga_mob *mob);
 int svga_query_validate_batch_locked(struct svga_batch *batch);
 void svga_query_commit_batch_locked(const struct svga_batch *batch,

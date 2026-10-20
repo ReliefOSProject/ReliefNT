@@ -391,8 +391,7 @@ int svga_context_destroy_locked(uint32_t id)
             svga_handle fence = 0;
             ret = svga_fifo_batch_try_locked(words, used * 4u, &fence);
             if (ret) return ret;
-            shader->retiring = true;
-            shader->retire_fence = fence;
+            svga_shader_retire_locked(shader, fence);
             if (type_index < 2)
                 svga.contexts[id].shaders[type_index] = UINT32_MAX;
             return SVGA_EBUSY;
@@ -590,8 +589,7 @@ int svga3d_context_try_destroy(svga_handle handle)
     for (uint32_t i = 0; i < SVGA_GB_SHADER_SLOTS; ++i) {
         struct svga_shader *shader = &svga.shaders[i];
         if (shader->defined && shader->context == handle) {
-            shader->retiring = true;
-            shader->retire_fence = fence;
+            svga_shader_retire_locked(shader, fence);
         }
     }
     ret = SVGA_EBUSY;
