@@ -1,82 +1,81 @@
 # ReliefNT
 
 **ReliefNT** 是 ReliefOS 项目的独立内核仓库：Ring-0 内核（`kernel/reliefnt`）、
-内核调试器模块（`debug/`，ET_REL 的 kerneldebug.sys）、UAPI 头
-（`include/uapi`、`include/reliefos`）以及引导期驱动（`drivers/`，console/TTY
-显示后端在 `drivers/console`）。`kernel.sys` 自带 Multiboot2 头，由 GRUB 直接引导。
-构建产物恰为内核侧三个制品：`kernel.sys`、`kernel.debug` 与
-`kerneldebug.sys`；设备驱动（mouse/serial/e1000/ac97/es1371/hda）直接链接进
-`kernel.sys`。本仓库不含用户态、镜像或打包目标。
+内核调试器模块（`debug/`，ET_REL 的 `kerneldebug.sys`）、UAPI 头和引导期驱动。
+`kernel.sys` 自带 Multiboot2 头，由 GRUB 直接引导。独立构建产物为
+`kernel.sys`、`kernel.debug` 和 `kerneldebug.sys`；驱动直接链接进内核。
+本仓不包含用户态、系统镜像或打包目标。
 
-在父仓库 [ReliefOS](https://github.com/ReliefOSProject/ReliefOS) 中，本仓库挂载于
-`kernel/reliefnt/`。
+在父仓库 [ReliefOS](https://github.com/ReliefOSProject/ReliefOS) 中，本仓挂载于
+`kernel/reliefnt/`。构建迁移的源列表、旧参数与产物基线见
+[迁移审计记录](docs/KBUILD_MIGRATION_AUDIT.md)。
 
-许可证：Apache License 2.0（见 [LICENSE](LICENSE)），第三方组件的归属与许可见
-[NOTICE](NOTICE)。
+许可证：Apache License 2.0（见 [LICENSE](LICENSE)）；第三方组件归属与许可见
+[NOTICE](NOTICE)。Linux 6.12 的原生 Kbuild/Kconfig 源文件按
+[`scripts/kbuild-source.json`](scripts/kbuild-source.json) 的清单和校验值导入。
 
 ## 获取
 
 ```sh
-git clone --recurse-submodules https://github.com/ReliefOSProject/ReliefNT.git
+git clone https://github.com/ReliefOSProject/ReliefNT.git
 cd ReliefNT
-# 若克隆时未带 --recurse-submodules：
-git submodule update --init --recursive
 ```
-
-`third_party/kconfig-frontends` 是真实子模块（Kconfig 前端，仅构建期使用）；
-缺失时构建会拒绝继续。`third_party/zlib/contrib/puff/puff.c` 为随库跟踪的源文件。
 
 ## 依赖
 
-构建环境为 Linux/WSL，入口为 GNU Make 4.3+（生产链只编译 C 与汇编；Python 仅
-`make test` 使用）。典型依赖：
+构建环境为 Linux/WSL，入口为 GNU Make 4.3+。目标 C/汇编由 Clang/LLVM 生成；
+原生 Kconfig 的 `menuconfig` 需要 ncurses，测试使用 Python 3。典型依赖：
 
 ```sh
 sudo apt install build-essential clang lld llvm libclang-rt-dev \
-  autoconf automake libtool libtool-bin pkg-config bison flex gperf gettext \
-  libncurses-dev gzip curl python3 git
+  bison flex pkg-config libncurses-dev gzip curl python3 git
 ```
 
-工具链由 `configs/toolchains/llvm-x86_64.mk` 描述（默认 `TOOLCHAIN=`）。
+工具链由 `configs/toolchains/llvm-x86_64.mk` 描述。GNU Make 以 `-rR` 运行原生
+Linux 6.12 `Makefile.build`、`Makefile.host` 和 Kconfig；构建参数适配位于
+`scripts/Makefile.reliefnt`，导入源与许可证清单位于 `scripts/kbuild-source.json`。
 
 ## 构建
 
-先取回锁定的构建输入（下载缓存 `cache/` 不入库；构建本身从不联网，只校验缓存）：
+先取回锁定的构建输入（下载缓存 `cache/downloads/` 不入库；编译前只校验缓存）：
 
 ```sh
 make O=$PWD/out/x86_64/release fetch
 ```
 
-`configs/dependencies.lock.json` 以 sha256 钉住每个输入（当前为 GNU Unifont
-16.0.04），`tools/build/fetch.sh` 负责下载与校验。离线构建：预先按同一文件名把
-输入放入 `cache/downloads/` 即可（校验不通过会拒绝使用）。
+`configs/dependencies.lock.json` 以 SHA-256 钉住 GNU Unifont 16.0.04。离线构建时，
+把锁定输入放入 `cache/downloads/` 即可；校验不通过或输入缺失时构建会停止。
 
-然后构建：
+然后构建并安装：
 
 ```sh
 make O=$PWD/out/x86_64/release ARCH=x86_64 PROFILE=release all
+make O=$PWD/out/x86_64/release install
 ```
 
-`O=` 为输出目录（需绝对路径；默认 `out/<arch>/<profile>`），`ARCH=x86_64`，
-`PROFILE=release|debug`。其余目标：
+`O=` 是独立输出目录（默认 `out/<arch>/<profile>`，相对路径会规范化为绝对路径），
+`ARCH=x86_64`，`PROFILE=release|debug`。release 使用 `-O3`，debug 使用 `-O0 -g`。
+基础版本来自 `configs/build-version`；`EXTRAVERSION=-perf` 与
+`LOCALVERSION=-test` 会生成 `5.1.1-perf-test`。`TOOLCHAIN=` 可选其他工具链描述，
+`CC=`, `LD=`, `AR=`, `OBJCOPY=`, `STRIP=`, `NM=`, `HOSTCC=` 可在命令行覆盖相应工具。
 
-基础内核版本在 `configs/build-version` 中，当前为 `5.1.1`。可以像 Linux 一样
-修改 Makefile 的 `EXTRAVERSION`，或使用 `make EXTRAVERSION=-perf all` 构建
-`5.1.1-perf`；`LOCALVERSION=-test` 会继续追加为 `5.1.1-perf-test`。
-默认后缀为空。后缀变化自动触发版本头和内核重建；系统信息、uname 和 procfs
-都报告完整内核版本。完整版本最多 31 字节，后缀接受字母、数字、`._+-`。
-
-版本提交之间的更新范围、Release 说明格式和发布顺序见
-[发布规范](docs/RELEASE_PROCESS.md)，本版说明见 [5.1.1](docs/releases/5.1.1.md)。
+内核使用原生 `conf` / `mconf`、`syncconfig`、`.config`、`include/config/auto.conf`
+和 `include/generated/autoconf.h`。当前内核没有可配置的构建功能项；镜像、产品和
+用户态选项属于父仓库，不会生成未被内核消费的伪配置。`PROFILE`、版本后缀与工具链
+仍由独立内核 Makefile 提供。
 
 | 目标 | 作用 |
 | --- | --- |
-| `make O=... all` | 三个内核制品（kernel.sys、kernel.debug、kerneldebug.sys） |
+| `make O=... all` | 构建 `kernel.sys`、`kernel.debug`、`kerneldebug.sys` |
+| `make O=... vdso` | 构建 vDSO ELF 和嵌入对象 |
+| `make O=... defconfig` / `olddefconfig` / `menuconfig` | 使用原生 Linux Kconfig 工具 |
 | `make O=... headers_install` | 按白名单导出 UAPI 头到 `$(O)/kernel-export/include` |
-| `make O=... install` | 制品与 `manifest.txt` 复制到 `$(DESTDIR)`（默认 `$(O)/kernel-install`） |
-| `make O=... test` | 宿主工具单测 + `tools/test_abi_layout.py` + `tools/test_header_export.py` |
-| `make O=... clean` | 清理输出目录（`distclean` 连同配置一起清理；`cache/` 永远保留） |
-| `make help` | 全部目标与变量 |
+| `make O=... install DESTDIR=...` | 安装三个产品和带校验和的 `manifest.txt` |
+| `make O=... test-vdso` | 检查 vDSO ELF、嵌入字节及运行时 ABI |
+| `make O=... test` | 宿主工具测试、ABI 布局、头文件导出和 vDSO 检查 |
+| `make O=... clean` | 清理构建输出并保留 `.config` 与下载缓存 |
+| `make O=... distclean` | 清理构建输出和 `.config`；下载缓存保留 |
+| `make help` | 显示目标和变量 |
 
 ## 内核日志
 
@@ -122,5 +121,6 @@ PID 1 以及在线 CPU 数量。设备不可用、回退和初始化失败保留
 ## 许可证
 
 本仓库自有源码以 Apache License 2.0 发布（[LICENSE](LICENSE)）；GNU Unifont、
-zlib puff、kconfig-frontends 等第三方组件维持各自许可，详见
-[NOTICE](NOTICE) 与 [resources/licenses/](resources/licenses/)。
+zlib puff 与导入的 Linux 6.12 Kbuild/Kconfig 文件维持各自许可，详见
+[NOTICE](NOTICE)、[resources/licenses/](resources/licenses/) 和
+[`LICENSES/kbuild/COPYING`](LICENSES/kbuild/COPYING)。

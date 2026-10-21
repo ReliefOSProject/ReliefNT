@@ -26,14 +26,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          # third_party/kconfig-frontends is built from source to derive .config;
-          # a missing submodule fails the build by design.
-          submodules: recursive
           persist-credentials: false
 
-      # Toolchain for the kernel products (clang/lld/llvm), HOSTCC plus the
-      # autotools chain kconfig-frontends' bootstrap needs. Subset of the
-      # known-good ReliefOS ubuntu-24.04 package set.
+      # Toolchain for the kernel products and native Linux Kconfig front end.
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -47,21 +42,13 @@ jobs:
             make \
             bison \
             flex \
-            gperf \
-            gettext \
-            perl \
-            libncurses-dev \
-            bc \
             pkg-config \
-            autoconf \
-            automake \
-            libtool \
-            libtool-bin \
-            gawk \
-            ncurses-bin
+            libncurses-dev \
+            gzip \
+            curl \
+            python3
 
-      # The build itself never downloads: it verifies cache/downloads against
-      # configs/dependencies.lock.json and stops when bytes are missing.
+      # Fetches the pinned Unifont build input; compilation verifies its hash.
       - name: Fetch locked dependencies
         run: make fetch
 

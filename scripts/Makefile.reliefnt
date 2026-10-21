@@ -1,0 +1,96 @@
+# ReliefNT's project-specific parameters for the vendored Linux 6.12 Kbuild.
+# Source compilation, fixdep, hostprogs, archives and .cmd decisions stay in the
+# upstream scripts/Makefile.build and scripts/Makefile.host.
+
+RELIEFNT_INCLUDE_FLAGS := \
+    -I$(O)/include \
+    -I$(RELIEFNT_SRC)/kernel/reliefnt/include \
+    -I$(RELIEFNT_SRC)/include/uapi \
+    -I$(RELIEFNT_SRC)/include
+
+ifeq ($(PROFILE),debug)
+RELIEFNT_OPTIMIZATION_FLAGS := -O0 -g
+else
+RELIEFNT_OPTIMIZATION_FLAGS := -O3
+endif
+
+RELIEFNT_KERNEL_CFLAGS := $(RELIEFNT_OPTIMIZATION_FLAGS) -std=c11 \
+    -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
+    -mno-red-zone -mgeneral-regs-only -mcmodel=kernel \
+    -Wall -Wextra $(RELIEFNT_INCLUDE_FLAGS) \
+    -include $(O)/include/generated/autoconf.h
+
+RELIEFNT_KERNEL_AFLAGS := $(RELIEFNT_OPTIMIZATION_FLAGS) -ffreestanding \
+    -mno-red-zone -mgeneral-regs-only $(RELIEFNT_INCLUDE_FLAGS)
+
+RELIEFNT_VDSO_CFLAGS := $(RELIEFNT_OPTIMIZATION_FLAGS) -std=c11 \
+    -ffreestanding -fPIC -fvisibility=hidden -fno-builtin \
+    -fno-stack-protector -fno-plt -fno-unwind-tables \
+    -fno-asynchronous-unwind-tables -mno-red-zone -mgeneral-regs-only \
+    -Wall -Wextra -Werror -I$(RELIEFNT_SRC)/kernel/reliefnt/include
+
+RELIEFNT_VDSO_LDFLAGS := -m elf_x86_64 -shared -nostdlib \
+    -z max-page-size=0x1000 --hash-style=both --no-undefined \
+    --build-id=none -soname linux-vdso.so.1 \
+    --version-script=$(RELIEFNT_SRC)/vdso/vdso.map
+
+RELIEFNT_HOST_WARNINGS := -std=c11 -Wall -Wextra -Wpedantic -Werror \
+    -Wformat=2 -Wshadow -Wstrict-prototypes -Wmissing-prototypes
+RELIEFNT_HOST_CFLAGS ?= $(HOST_CFLAGS)
+RELIEFNT_HOST_CPPFLAGS := -I$(RELIEFNT_SRC) \
+    -I$(RELIEFNT_SRC)/scripts/include
+
+RELIEFNT_HOST_PROGRAMS := \
+    tools/host/assets/reliefos-cjk-font \
+    tools/host/version/reliefos-version \
+    tools/host/manifest/reliefos-deps
+
+RELIEFNT_BUILD_MARKER := $(O)/.reliefos-out
+RELIEFNT_HOST_CC_ID := $(O)/include/generated/host-toolchain-id.h
+RELIEFNT_TARGET_CC_ID := $(O)/.reliefnt-target-cc.id
+RELIEFNT_TARGET_AR_ID := $(O)/.reliefnt-target-ar.id
+RELIEFNT_TARGET_LD_ID := $(O)/.reliefnt-target-ld.id
+RELIEFNT_TARGET_OBJCOPY_ID := $(O)/.reliefnt-target-objcopy.id
+RELIEFNT_SOURCE_ID := $(shell git -C $(RELIEFNT_SRC) rev-parse --short HEAD 2>/dev/null || echo unknown)
+RELIEFNT_CACHE := $(RELIEFNT_SRC)/cache/downloads
+
+# The identity header is a real included dependency for upstream host rules.
+# Target compiler/linker identities use explicit Kbuild prerequisites so the
+# project's historical compiler flags remain unchanged.
+RELIEFNT_KBUILD_BASE = --no-print-directory -rR -C '$(O)' \
+    -f '$(RELIEFNT_SRC)/scripts/Makefile.port' \
+    -f '$(RELIEFNT_SRC)/scripts/Makefile.build' \
+    srctree='$(RELIEFNT_SRC)' objtree='$(O)' VPATH='$(RELIEFNT_SRC)' \
+    ARCH='$(ARCH)' SRCARCH='$(ARCH)' KBUILD_BUILTIN=1 need-builtin=1 \
+    SHELL=/bin/sh CONFIG_SHELL=/bin/sh AWK=awk \
+    YACC=bison LEX=flex HOSTPKG_CONFIG=pkg-config \
+    HOSTCC='$(HOSTCC)' \
+    KBUILD_HOSTCFLAGS='$(RELIEFNT_HOST_CFLAGS) $(RELIEFNT_HOST_CPPFLAGS)' \
+    KBUILD_HOSTLDFLAGS='$(HOST_LDFLAGS)' \
+    RELIEFNT_HOST_WARNINGS='$(RELIEFNT_HOST_WARNINGS)' \
+    HOST_EXTRACFLAGS='-include $(RELIEFNT_HOST_CC_ID)' \
+    CC='$(TARGET_CC) --target=$(TRIPLE_KERNEL)' \
+    AR='env RELIEFNT_AR_ID=$(strip $(file <$(RELIEFNT_TARGET_AR_ID))) $(TARGET_AR)' LD='$(TARGET_LD)' NM='$(TARGET_NM)' \
+    OBJCOPY='$(TARGET_OBJCOPY)' STRIP='$(TARGET_STRIP)' \
+    KBUILD_CFLAGS='$(RELIEFNT_KERNEL_CFLAGS)' \
+    KBUILD_AFLAGS='$(RELIEFNT_KERNEL_AFLAGS)' \
+    CFLAGS_KERNEL='$(KERNEL_CFLAGS)' AFLAGS_KERNEL='$(KERNEL_AFLAGS)' \
+    KERNEL_LDFLAGS='$(KERNEL_LDFLAGS)' \
+    RELIEFNT_TARGET_LD='$(TARGET_LD)' \
+    RELIEFNT_TARGET_OBJCOPY='$(TARGET_OBJCOPY)' \
+    KERNELDEBUG_SYS='$(O)/generated/system/kerneldebug.sys' \
+    RELIEFNT_CACHE='$(RELIEFNT_CACHE)' \
+    RELIEFNT_SOURCE_ID='$(RELIEFNT_SOURCE_ID)' \
+    SOURCE_DATE_EPOCH='$(SOURCE_DATE_EPOCH)' \
+    EXTRAVERSION='$(EXTRAVERSION)' LOCALVERSION='$(LOCALVERSION)' \
+    VDSO_LDFLAGS='$(RELIEFNT_VDSO_LDFLAGS)' \
+    HEADER_EXPORT_LIST='$(HEADER_EXPORT_LIST)' \
+    KBUILD_VERBOSE='$(V)' quiet='$(if $(filter 1,$(V)),,quiet_)'
+
+define RELIEFNT_KBUILD
+$(MAKE) $(RELIEFNT_KBUILD_BASE) $(1)
+endef
+
+define RELIEFNT_KCONFIG
+$(call RELIEFNT_KBUILD,obj=scripts/kconfig KBUILD_KCONFIG=$(RELIEFNT_SRC)/Kconfig KBUILD_DEFCONFIG=reliefnt_defconfig KCONFIG_CONFIG=$(O)/.config SRCARCH=$(ARCH) $(1))
+endef

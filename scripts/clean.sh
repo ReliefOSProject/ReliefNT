@@ -50,14 +50,16 @@ if [ -n "$src" ] && [ -n "$marker_root" ] && [ "$marker_root" != "$src" ]; then
 fi
 
 # Explicit list rather than a glob: an unknown entry in the tree is not ours to
-# delete, and this is what makes `clean` auditable.
-# third-party holds upstream build directories this configuration owns (see mk/third-party.mk).
-# kernel-export (headers_install) and kernel-install (install/DESTDIR) are
-# this repository's own outputs and were added when the kernel build was
-# split out; the parent list is kept so a mixed-era tree still cleans.
-products="userland userland-installer userland-installer-policy upstream rootfs resources rpr-apps rpr-pages obj generated host include auth pam system musl installer sdk sysroot stage packages images logs meta third-party kernel-export kernel-install"
+# delete, and this is what makes `clean` auditable. These are the source-relative
+# object directories produced by native Kbuild plus ReliefNT's generated files.
+products="arch block debug drivers firmware fs generated host include kernel kernel-export kernel-install mm net scripts tools vdso"
 if [ "$keep" = 0 ]; then
-    products="$products config"
+	for config_file in .config .config.old .config.old.1 .tmp.config; do
+		if [ -e "$resolved/$config_file" ] || [ -L "$resolved/$config_file" ]; then
+			printf '  remove %s\n' "$config_file"
+			rm -f -- "$resolved/$config_file" || exit 1
+		fi
+	done
 fi
 
 printf 'clean: %s (keep config=%s)\n' "$resolved" "$keep"
@@ -66,6 +68,13 @@ for entry in $products; do
         printf '  remove %s\n' "$entry"
         rm -rf -- "$resolved/$entry" || exit 1
     fi
+done
+for generated_file in built-in.a .built-in.a.cmd \
+	.reliefnt-target-cc.id .reliefnt-target-ar.id .reliefnt-target-ld.id .reliefnt-target-objcopy.id; do
+	if [ -e "$resolved/$generated_file" ] || [ -L "$resolved/$generated_file" ]; then
+		printf '  remove %s\n' "$generated_file"
+		rm -f -- "$resolved/$generated_file" || exit 1
+	fi
 done
 if [ "$keep" = 0 ]; then
     for marker_entry in .reliefos-out; do

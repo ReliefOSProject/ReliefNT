@@ -7,6 +7,14 @@
 
 - 根 Makefile 是生产入口；产物为 `kernel.sys`、`kernel.debug` 和 `kerneldebug.sys`。
   本仓不包含 ReliefOS 用户态、系统镜像或 APK 打包。
+- C/汇编、宿主工具、依赖追踪和配置由 `scripts/kbuild-source.json` 中校验过的
+  Linux 6.12 Kbuild/Kconfig 文件提供；适配只放在 `Kbuild`、`scripts/Makefile.reliefnt`
+  和 `scripts/Makefile.port`。不得改写导入的 `scripts/Makefile.*`、`basic/`、
+  `kconfig/`、`include/` 或许可证文件来绕过上游规则。
+- `Kbuild` 保持 C 对象 C-locale 排序、ASM 对象 C-locale 排序及最后的嵌入 vDSO
+  对象。改动源清单时先核对 [迁移审计记录](docs/KBUILD_MIGRATION_AUDIT.md)。
+- `.config` 只承载内核实际消费的 Kconfig 符号；镜像/产品配置留在 ReliefOS 父仓。
+  `PROFILE`、`EXTRAVERSION`、`LOCALVERSION` 和工具链覆盖仍由独立入口提供。
 - `configs/build-version` 是版本输入，生成文件只写输出目录。更改版本时同步
   当前文档示例，保留数字 ABI 语义与最长 31 字节的完整内核版本限制。
 - 按改动范围执行内核编译、宿主工具测试、UAPI 布局和头文件导出检查。

@@ -1,8 +1,8 @@
 # ReliefOS x86_64 target toolchain description.
 #
-# Reviewed data, not logic: mk/toolchain.mk interprets it and `make doctor`
-# verifies it. Switching toolchains means pointing TOOLCHAIN= at another file in
-# this directory, never at an undeclared environment variable.
+# Reviewed data, not logic: the standalone Makefile interprets it. Switching
+# toolchains means pointing TOOLCHAIN= at another file in this directory, not
+# relying on an undeclared environment variable.
 
 TOOLCHAIN_NAME := llvm-x86_64
 

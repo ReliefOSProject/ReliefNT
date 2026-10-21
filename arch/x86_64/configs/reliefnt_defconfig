@@ -1,0 +1,2 @@
+# ReliefNT x86-64 kernel default configuration.
+# PROFILE, version suffixes, epoch and toolchain remain explicit Make variables.

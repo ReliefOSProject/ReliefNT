@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+# The vDSO is a standalone ELF, then its exact bytes are embedded in the kernel.
+always-y += clock.o vdso.so vdso_blob.S
+targets += clock.o vdso.so vdso_blob.S
+
+$(obj)/clock.o: $(objtree)/.reliefnt-target-cc.id
+
+quiet_cmd_reliefnt_vdso_link = VDSOLD  $@
+cmd_reliefnt_vdso_link = $(RELIEFNT_TARGET_LD) $(VDSO_LDFLAGS) \
+    -T $(src)/vdso.lds -o $@ $(obj)/clock.o
+
+$(obj)/vdso.so: $(obj)/clock.o $(src)/vdso.lds $(src)/vdso.map \
+    $(objtree)/.reliefnt-target-ld.id FORCE
+	$(call if_changed,reliefnt_vdso_link)
+
+quiet_cmd_reliefnt_vdso_embed = GEN     $@
+cmd_reliefnt_vdso_embed = { \
+    printf '%s\n' '.section .rodata.reliefnt_vdso,"a",@progbits' \
+        '.balign 16' '.global reliefnt_vdso_image_start' \
+        '.type reliefnt_vdso_image_start,@object' 'reliefnt_vdso_image_start:'; \
+    printf '.incbin "%s"\n' '$(abspath $(obj)/vdso.so)'; \
+    printf '%s\n' '.global reliefnt_vdso_image_end' \
+        '.type reliefnt_vdso_image_end,@object' 'reliefnt_vdso_image_end:' \
+        '.size reliefnt_vdso_image_start,reliefnt_vdso_image_end-reliefnt_vdso_image_start'; \
+} > $@.tmp && mv -f $@.tmp $@
+
+$(obj)/vdso_blob.S: $(obj)/vdso.so FORCE
+	$(call if_changed,reliefnt_vdso_embed)

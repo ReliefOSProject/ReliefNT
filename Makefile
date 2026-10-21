@@ -1,31 +1,15 @@
-# ReliefNT standalone kernel build entry point (phase 2 of the kernel/userland
-# separation).
-#
-# GNU Make owns the dependency graph, the parallel schedule and the incremental
-# decisions. C helpers under tools/host/ perform data transforms only; short
-# scripts under tools/build/ drive third-party builds. Nothing here shells out to
-# a second scheduler, and no production path runs Python, Meson or Ninja (the
-# Python regression tools under tools/test_*.py run only from `make test`).
-#
-# Derived from the parent ReliefOS build entry point. The product surface here
-# is exactly the kernel side: kernel.sys, kernel.debug and kerneldebug.sys; the
-# device drivers are linked into kernel.sys itself. Nothing in this tree reads
-# parent or product configuration.
+# ReliefNT's standalone entry point. All C and assembly compilation, hostprogs,
+# archives, command tracking and dependencies are handled by vendored Linux
+# 6.12 Kbuild (scripts/Makefile.build and scripts/Makefile.host).
 
-# --- GNU Make version ------------------------------------------------------
-# Grouped targets ('&:') and the $(file) function both need 4.3.
-reliefos_make_min := $(shell printf '4.3\n$(MAKE_VERSION)\n' | LC_ALL=C sort -V | head -n1)
-ifeq ($(reliefos_make_min),4.3)
+reliefnt_make_version := $(shell printf '4.3\n$(MAKE_VERSION)\n' | LC_ALL=C sort -V | head -n1)
+ifeq ($(reliefnt_make_version),4.3)
 else
 $(error GNU Make >= 4.3 is required, this is $(MAKE_VERSION))
 endif
 
-RELIEFOS_SRC := $(patsubst %/,%,$(dir $(realpath $(firstword $(MAKEFILE_LIST)))))
+RELIEFNT_SRC := $(patsubst %/,%,$(dir $(realpath $(firstword $(MAKEFILE_LIST)))))
 
-# --- user-facing variables --------------------------------------------------
-# ARCH, PROFILE and O may come from the command line or from these defaults
-# only. An inherited environment value is ignored on purpose: an unrelated shell
-# setting must not silently change what gets built (plan section 6.2).
 ifeq ($(origin ARCH),undefined)
 ARCH := x86_64
 endif
@@ -33,321 +17,319 @@ ifeq ($(origin PROFILE),undefined)
 PROFILE := release
 endif
 ifeq ($(origin O),undefined)
-O := $(RELIEFOS_SRC)/out/$(ARCH)/$(PROFILE)
+O := $(RELIEFNT_SRC)/out/$(ARCH)/$(PROFILE)
 endif
 
-V ?= 0
-# Appended verbatim to configs/build-version's numeric release, as in Linux.
-# Set EXTRAVERSION = -perf here or pass make EXTRAVERSION=-perf.
-EXTRAVERSION =
-LOCALVERSION ?=
-SOURCE_DATE_EPOCH ?= $(shell git -C $(RELIEFOS_SRC) show -s --format=%ct HEAD 2>/dev/null)
-TOOLCHAIN ?= $(RELIEFOS_SRC)/configs/toolchains/llvm-x86_64.mk
-
-O := $(patsubst %/,%,$(O))
-
-# --- input validation -------------------------------------------------------
-# The supported character set is enumerated rather than promising arbitrary
-# paths: Make word splitting, shell quoting and the generated manifests all break
-# on the rejected set, so failing here is far cheaper than failing mid-build.
-RELIEFOS_ALLOWED_CHARS := a b c d e f g h i j k l m n o p q r s t u v w x y z \
-	A B C D E F G H I J K L M N O P Q R S T U V W X Y Z \
-	0 1 2 3 4 5 6 7 8 9 . _ / -
-
-# $(call strip_allowed,text,chars): keep only characters outside the allow-list.
-strip_allowed = $(if $(2),$(call strip_allowed,$(subst $(firstword $(2)),,$(1)),$(wordlist 2,9999,$(2))),$(1))
-
-reliefos_suffix_residual := $(call strip_allowed,$(EXTRAVERSION)$(LOCALVERSION),$(filter-out /,$(RELIEFOS_ALLOWED_CHARS)) +)
-ifneq ($(reliefos_suffix_residual),)
-$(error EXTRAVERSION and LOCALVERSION accept only A-Z a-z 0-9 . _ + -)
-endif
-
-ifeq ($(O),)
-$(error O= must not be empty; it names this build's output directory)
-endif
-ifneq ($(words $(O)),1)
-$(error O='$(O)' is unsupported: whitespace and newlines are not accepted in an output path)
-endif
-reliefos_O_residual := $(call strip_allowed,$(O),$(RELIEFOS_ALLOWED_CHARS))
-ifneq ($(reliefos_O_residual),)
-$(error O='$(O)' is unsupported: offending characters are [$(reliefos_O_residual)]; accepted are A-Z a-z 0-9 . _ / -)
-endif
-# Compare absolute paths: `O=.` and `O=<src>` are the same refusal. O has already
-# been restricted to a safe character set above, so quoting here cannot be escaped.
-reliefos_O_absolute := $(shell realpath -m -- '$(O)' 2>/dev/null || printf '%s' '$(O)')
-ifeq ($(reliefos_O_absolute),/)
-$(error refusing / as the output directory)
-endif
-ifeq ($(reliefos_O_absolute),$(RELIEFOS_SRC))
-$(error refusing the source root as the output directory (O='$(O)'))
-endif
-ifneq ($(filter $(ARCH),x86_64),)
-else
+ifeq ($(filter $(ARCH),x86_64),)
 $(error unsupported ARCH '$(ARCH)'; this build supports ARCH=x86_64)
 endif
-ifneq ($(filter $(PROFILE),debug release),)
-else
+ifeq ($(filter $(PROFILE),debug release),)
 $(error unsupported PROFILE '$(PROFILE)'; use PROFILE=debug or PROFILE=release)
 endif
 
-# --- output layout ----------------------------------------------------------
-O_HOST      := $(O)/host
-O_OBJ       := $(O)/obj
-O_GENERATED := $(O)/generated
-O_INCLUDE   := $(O)/include
-O_CONFIG    := $(O)/config
-O_LOGS      := $(O)/logs
-O_META      := $(O)/meta
-
-# Shared download cache: deliberately outside O because it is profile
-# independent and `distclean` must not throw it away. It is a real directory in
-# this repository (never a symlink to another checkout).
-RELIEFOS_CACHE := $(RELIEFOS_SRC)/cache/downloads
-
-# Written when an output tree is created and re-checked before anything is
-# deleted, so `clean` can never operate on a directory it does not own.
-RELIEFOS_O_MARKER := $(O)/.reliefos-out
-
-# --- same-output-directory mutual exclusion ---------------------------------
-# Two top-level makes sharing one O would race on objects, generated headers and
-# signature files, so one of them has to be refused outright (plan section 6.3).
-# Different O directories are independent and may build concurrently.
-#
-# The owner is the make process that acquired the lock, and the token names the
-# output directory it owns: RELIEFOS_BUILD_OWNER is "<pid>.<start ticks>:<absolute O>".
-# A nested make for that same directory inherits it, so recursive build
-# invocations do not refuse their own outer build. A nested make for a different
-# directory acquires its own lock, so a test suite that spawns builds still gets
-# real exclusion for the trees it creates.
-#
-# Three cases skip acquisition: dry runs and `make -q` (they promise no output,
-# and refusing them would make `make -n` depend on unrelated builds), and goals
-# that write nothing at all -- a bare `make` and `make help` must keep working
-# while a build is running elsewhere, and must not create the output tree.
-reliefos_read_only_goals := help
-reliefos_lock_not_needed :=
-ifeq ($(MAKECMDGOALS),)
-reliefos_lock_not_needed := 1
-else ifeq ($(words $(filter $(reliefos_read_only_goals),$(MAKECMDGOALS))),$(words $(MAKECMDGOALS)))
-reliefos_lock_not_needed := 1
+override O := $(shell realpath -m -- '$(O)' 2>/dev/null)
+ifeq ($(strip $(O)),)
+$(error O= must name an output directory)
 endif
-reliefos_lock_dir := $(O)/.build-lock
-reliefos_lock_skip := \
-	$(if $(findstring n,$(firstword -$(MAKEFLAGS))),1)\
-	$(if $(findstring q,$(firstword -$(MAKEFLAGS))),1)\
-	$(reliefos_lock_not_needed)
-ifeq ($(strip $(reliefos_lock_skip)),)
-RELIEFOS_BUILD_OWNER := $(shell sh $(RELIEFOS_SRC)/scripts/build-lock.sh acquire \
-	$(reliefos_lock_dir) $(reliefos_O_absolute))
-ifeq ($(RELIEFOS_BUILD_OWNER),)
+ifeq ($(O),/)
+$(error refusing / as the output directory)
+endif
+ifeq ($(O),$(RELIEFNT_SRC))
+$(error refusing the source root as the output directory)
+endif
+ifneq ($(words $(O)),1)
+$(error O='$(O)' is unsupported: spaces and newlines are not accepted in an output path)
+endif
+
+V ?= 0
+ifeq ($(V),1)
+Q :=
+else
+Q := @
+endif
+
+EXTRAVERSION =
+LOCALVERSION ?=
+SOURCE_DATE_EPOCH ?= $(shell git -C $(RELIEFNT_SRC) show -s --format=%ct HEAD 2>/dev/null || echo 0)
+ifeq ($(origin TOOLCHAIN),command line)
+# Honor an explicit caller override, but do not inherit the parent product's
+# environment-selected toolchain when this child is built through integration.
+else
+TOOLCHAIN := $(RELIEFNT_SRC)/configs/toolchains/llvm-x86_64.mk
+endif
+ifeq ($(wildcard $(TOOLCHAIN)),)
+$(error toolchain description '$(TOOLCHAIN)' not found)
+endif
+include $(TOOLCHAIN)
+
+# GNU Make's built-in CC is not a target toolchain choice. As before, only
+# explicit command-line CC/CXX/LD/AR/OBJCOPY/STRIP/NM values override the file.
+reliefnt_override = $(if $(filter command line,$(origin $(2))),$($(2)),$($(1)))
+TARGET_CC := $(call reliefnt_override,TOOLCHAIN_CC,CC)
+TARGET_CXX := $(call reliefnt_override,TOOLCHAIN_CXX,CXX)
+TARGET_AR := $(call reliefnt_override,TOOLCHAIN_AR,AR)
+TARGET_RANLIB := $(call reliefnt_override,TOOLCHAIN_RANLIB,RANLIB)
+TARGET_LD := $(call reliefnt_override,TOOLCHAIN_LD,LD)
+TARGET_OBJCOPY := $(call reliefnt_override,TOOLCHAIN_OBJCOPY,OBJCOPY)
+TARGET_STRIP := $(call reliefnt_override,TOOLCHAIN_STRIP,STRIP)
+ifeq ($(origin NM),command line)
+TARGET_NM := $(NM)
+else
+TARGET_NM := llvm-nm
+endif
+
+KERNEL_CFLAGS ?=
+KERNEL_AFLAGS ?=
+KERNEL_LDFLAGS ?=
+HOSTCC ?= cc
+HOST_CFLAGS ?= -O2 -g
+HOST_LDFLAGS ?=
+HEADER_EXPORT_LIST ?= $(RELIEFNT_SRC)/configs/header-export.list
+RELIEFNT_TEST_PYTHON ?= python3
+DESTDIR ?= $(O)/kernel-install
+
+include $(RELIEFNT_SRC)/scripts/Makefile.reliefnt
+
+# The output marker and persistent lock protect independent builds and make
+# clean/distclean refuse directories that this checkout does not own.
+RELIEFNT_O_MARKER := $(O)/.reliefos-out
+RELIEFNT_O_LOCK := $(O)/.build-lock
+RELIEFNT_O_ABSOLUTE := $(O)
+RELIEFNT_READ_ONLY_GOALS := help
+RELIEFNT_LOCK_SKIP := \
+	$(if $(findstring n,$(firstword -$(MAKEFLAGS))),1) \
+	$(if $(findstring q,$(firstword -$(MAKEFLAGS))),1)
+ifeq ($(MAKECMDGOALS),)
+RELIEFNT_LOCK_SKIP += 1
+else ifeq ($(words $(filter-out $(RELIEFNT_READ_ONLY_GOALS),$(MAKECMDGOALS))),0)
+RELIEFNT_LOCK_SKIP += 1
+endif
+ifeq ($(strip $(RELIEFNT_LOCK_SKIP)),)
+RELIEFNT_BUILD_OWNER := $(shell sh $(RELIEFNT_SRC)/scripts/build-lock.sh acquire \
+	'$(RELIEFNT_O_LOCK)' '$(RELIEFNT_O_ABSOLUTE)')
+ifeq ($(strip $(RELIEFNT_BUILD_OWNER)),)
 $(error refusing to build: '$(O)' is already being built by another make)
 endif
-export RELIEFOS_BUILD_OWNER
+export RELIEFOS_BUILD_OWNER := $(RELIEFNT_BUILD_OWNER)
 endif
 
-# --- fragment includes ------------------------------------------------------
-# Kernel-side machinery only. The parent's userland/sdk/images fragments (and
-# the parse-time components.mk coupling in mk/userland.mk) are deliberately
-# absent from this tree.
-include $(RELIEFOS_SRC)/mk/logging.mk
-include $(RELIEFOS_SRC)/mk/host.mk
-include $(RELIEFOS_SRC)/mk/toolchain.mk
-include $(RELIEFOS_SRC)/mk/config.mk
-include $(RELIEFOS_SRC)/mk/kernel.mk
-include $(RELIEFOS_SRC)/mk/headers.mk
-include $(RELIEFOS_SRC)/mk/boot.mk
-include $(RELIEFOS_SRC)/mk/resources.mk
-
-# --- public goals -----------------------------------------------------------
 .DEFAULT_GOAL := help
-# Source inventories are inputs, never implicit host executable targets.
 .SUFFIXES:
+.DELETE_ON_ERROR:
 
-.PHONY: help all kernel kerneldebug vdso boot tools fetch fetch-check defconfig olddefconfig \
-	menuconfig headers_install install config-sync build-info \
-	test test-tools test-abi test-header-export test-vdso clean distclean
+.PHONY: help all kernel kerneldebug boot vdso tools fetch fetch-check \
+	defconfig olddefconfig menuconfig config-sync build-info headers_install \
+	install test test-tools test-abi test-header-export test-vdso \
+	kbuild-fixdep kconfig-tools clean distclean FORCE
 
 help:
 	@printf '%s\n' \
-	  'ReliefNT kernel build (standalone kernel checkout)' \
+	  'ReliefNT standalone kernel build (Linux 6.12 Kbuild)' \
 	  '' \
 	  '  all               kernel.sys, kernel.debug, kerneldebug.sys' \
-	  '  kernel            kernel.sys + kernel.debug' \
-	  '  kerneldebug       kerneldebug.sys (standalone kernel debug module)' \
-	  '  vdso              build the versioned x86-64 vDSO and embedded object' \
-	  '  test-vdso         inspect and run the generated vDSO ELF' \
-	  '  headers_install   export the UAPI whitelist to $(O)/kernel-export/include' \
-	  '  install           copy products + manifest.txt to $(DESTDIR)' \
-	  '  test              host-tool tests + ABI layout + header export' \
-	  '  tools             the host C helpers' \
-	  '  fetch             download the locked dependencies into cache/downloads' \
-	  '  fetch-check       probe the locked URLs for HTTP errors (no downloads)' \
-	  '  defconfig / olddefconfig / menuconfig' \
-	  '  clean / distclean (distclean also removes the configuration)' \
+	  '  kernel            kernel.sys and kernel.debug' \
+	  '  kerneldebug       kerneldebug.sys' \
+	  '  vdso              build vDSO ELF and embedded object' \
+	  '  test-vdso         inspect and exercise the generated vDSO' \
+	  '  headers_install   export the UAPI whitelist to $(O)/kernel-export' \
+	  '  install           install products and manifest.txt to DESTDIR' \
+	  '  defconfig / olddefconfig / menuconfig / config-sync' \
+	  '  tools / fetch / fetch-check' \
+	  '  test              host tests, ABI, header export and vDSO' \
+	  '  clean / distclean (download cache is preserved)' \
 	  '' \
-	  '  variables: O= ARCH= PROFILE=release|debug TOOLCHAIN= SOURCE_DATE_EPOCH= V=1 HOSTCC='
+	  '  variables: O= ARCH=x86_64 PROFILE=release|debug TOOLCHAIN= V=1' \
+	  '             CC= CXX= LD= AR= OBJCOPY= STRIP= NM= HOSTCC=' \
+	  '             EXTRAVERSION= LOCALVERSION= SOURCE_DATE_EPOCH='
 
-tools: $(RELIEFOS_HOST_TOOLS)
+$(RELIEFNT_O_MARKER): | $(O)
+	$(Q)printf 'reliefos-build-out version=1 root=%s\n' '$(RELIEFNT_SRC)' > $@.tmp
+	$(Q)mv -f $@.tmp $@
 
-kernel: $(RELIEFOS_KERNEL_SYS) $(RELIEFOS_KERNEL_DEBUG)
+$(O):
+	$(Q)mkdir -p $@
 
-vdso: $(VDSO_ELF) $(VDSO_BLOB_OBJECT)
+FORCE:
 
-test-vdso:
-	$(call RELIEFOS_LOG,RUN,tools/test_vdso.py)
-	$(Q)$(RELIEFOS_TEST_PYTHON) $(RELIEFOS_SRC)/tools/test_vdso.py --output $(O)/test-vdso
+define RELIEFNT_WRITE_TOOL_ID
+set -eu; \
+tool_name=$$(printf '%s\n' '$(1)' | awk '{ print $$1 }'); \
+tool_path=$$(command -v "$$tool_name"); \
+tool_version=$$($(1) --version 2>&1 | head -n1); \
+tool_hash=$$(sha256sum "$$tool_path" | cut -d' ' -f1); \
+identity=$$(printf '%s\n%s\n%s\n' '$(1)' "$$tool_version" "$$tool_hash" | sha256sum | cut -d' ' -f1); \
+printf '%s\n' "$$identity" > '$@.tmp'; \
+if cmp -s '$@.tmp' '$@' 2>/dev/null; then rm -f '$@.tmp'; \
+else mv -f '$@.tmp' '$@'; fi
+endef
 
-# `all` is exactly the three kernel products. There is no userland, no image and
-# no package goal in this repository.
-all: kernel kerneldebug
+$(RELIEFNT_HOST_CC_ID): FORCE $(RELIEFNT_O_MARKER)
+	$(Q)set -eu; \
+	mkdir -p '$(dir $(RELIEFNT_HOST_CC_ID))'; \
+	tool_name=$$(printf '%s\n' '$(HOSTCC)' | awk '{ print $$1 }'); \
+	tool_path=$$(command -v "$$tool_name"); \
+	tool_version=$$($(HOSTCC) --version 2>&1 | head -n1); \
+	tool_hash=$$(sha256sum "$$tool_path" | cut -d' ' -f1); \
+	identity=$$(printf '%s\n%s\n%s\n' '$(HOSTCC)' "$$tool_version" "$$tool_hash" | sha256sum | cut -d' ' -f1); \
+	printf '/* host compiler identity */\n#define RELIEFNT_HOST_COMPILER_ID "%s"\n' "$$identity" > $@.tmp; \
+	if cmp -s $@.tmp $@ 2>/dev/null; then rm -f $@.tmp; else mv -f $@.tmp $@; fi
 
-# Populate the shared download cache from the locked URLs. A normal build never
-# downloads: it verifies the cache and stops with this command when bytes are
-# missing.
-fetch: $(RELIEFOS_DEPS_TOOL)
-	$(Q)sh $(RELIEFOS_SRC)/tools/build/fetch.sh --deps $(RELIEFOS_DEPS_TOOL) \
-		--lock $(RELIEFOS_SRC)/configs/dependencies.lock.json --cache $(RELIEFOS_CACHE) \
+$(RELIEFNT_TARGET_CC_ID): FORCE $(RELIEFNT_O_MARKER)
+	$(Q)$(call RELIEFNT_WRITE_TOOL_ID,$(TARGET_CC))
+
+$(RELIEFNT_TARGET_AR_ID): FORCE $(RELIEFNT_O_MARKER)
+	$(Q)$(call RELIEFNT_WRITE_TOOL_ID,$(TARGET_AR))
+
+$(RELIEFNT_TARGET_LD_ID): FORCE $(RELIEFNT_O_MARKER)
+	$(Q)$(call RELIEFNT_WRITE_TOOL_ID,$(TARGET_LD))
+
+$(RELIEFNT_TARGET_OBJCOPY_ID): FORCE $(RELIEFNT_O_MARKER)
+	$(Q)$(call RELIEFNT_WRITE_TOOL_ID,$(TARGET_OBJCOPY))
+
+kbuild-fixdep: $(RELIEFNT_O_MARKER) $(RELIEFNT_HOST_CC_ID)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=scripts/basic scripts/basic/fixdep)
+
+kconfig-tools: kbuild-fixdep $(RELIEFNT_HOST_CC_ID)
+	+$(Q)$(call RELIEFNT_KCONFIG,build_config build_menuconfig)
+
+defconfig: kconfig-tools $(RELIEFNT_O_MARKER)
+	+$(Q)$(call RELIEFNT_KCONFIG,defconfig)
+	+$(Q)$(call RELIEFNT_KCONFIG,syncconfig)
+
+olddefconfig: kconfig-tools $(RELIEFNT_O_MARKER)
+	+$(Q)if [ ! -f '$(O)/.config' ]; then $(call RELIEFNT_KCONFIG,defconfig); fi
+	+$(Q)$(call RELIEFNT_KCONFIG,olddefconfig)
+	+$(Q)$(call RELIEFNT_KCONFIG,syncconfig)
+
+menuconfig: kconfig-tools $(RELIEFNT_O_MARKER)
+	+$(Q)if [ ! -f '$(O)/.config' ]; then $(call RELIEFNT_KCONFIG,defconfig); fi
+	+$(Q)$(call RELIEFNT_KCONFIG,menuconfig)
+	+$(Q)$(call RELIEFNT_KCONFIG,syncconfig)
+
+config-sync: kconfig-tools $(RELIEFNT_O_MARKER)
+	+$(Q)if [ ! -f '$(O)/.config' ]; then $(call RELIEFNT_KCONFIG,defconfig); fi
+	+$(Q)$(call RELIEFNT_KCONFIG,syncconfig)
+
+kernel: config-sync vdso kbuild-fixdep \
+	$(RELIEFNT_TARGET_CC_ID) $(RELIEFNT_TARGET_AR_ID) $(RELIEFNT_TARGET_LD_ID) $(RELIEFNT_TARGET_OBJCOPY_ID)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=.)
+
+all: kernel
+
+kerneldebug: config-sync kbuild-fixdep \
+	$(RELIEFNT_TARGET_CC_ID) $(RELIEFNT_TARGET_OBJCOPY_ID)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=. ./generated/system/kerneldebug.sys)
+
+boot: kernel
+
+vdso: config-sync kbuild-fixdep $(RELIEFNT_TARGET_CC_ID) $(RELIEFNT_TARGET_AR_ID) $(RELIEFNT_TARGET_LD_ID)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=vdso KBUILD_CFLAGS='$(RELIEFNT_VDSO_CFLAGS)' KBUILD_AFLAGS=)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=. ./vdso/vdso_blob.o)
+
+tools: kbuild-fixdep $(RELIEFNT_HOST_CC_ID) $(RELIEFNT_O_MARKER)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=. $(RELIEFNT_HOST_PROGRAMS))
+
+fetch: tools
+	$(Q)$(RELIEFNT_SRC)/tools/build/fetch.sh \
+		--deps $(O)/tools/host/manifest/reliefos-deps \
+		--lock $(RELIEFNT_SRC)/configs/dependencies.lock.json \
+		--cache $(RELIEFNT_CACHE) --only unifont
+
+fetch-check: tools
+	$(Q)$(RELIEFNT_SRC)/tools/build/fetch-check.sh \
+		--deps $(O)/tools/host/manifest/reliefos-deps \
+		--lock $(RELIEFNT_SRC)/configs/dependencies.lock.json \
 		--only unifont
 
-# URL liveness for exactly the list fetch downloads.  Probes only: nothing is
-# downloaded and the cache is not touched.
-fetch-check: $(RELIEFOS_DEPS_TOOL)
-	$(Q)sh $(RELIEFOS_SRC)/tools/build/fetch-check.sh --deps $(RELIEFOS_DEPS_TOOL) \
-		--lock $(RELIEFOS_SRC)/configs/dependencies.lock.json \
-		--only unifont
+build-info: kbuild-fixdep $(RELIEFNT_HOST_CC_ID) $(RELIEFNT_O_MARKER)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=. ./include/generated/build_info.h)
 
-defconfig olddefconfig menuconfig: $(RELIEFOS_O_MARKER) $(KCONFIG_CONF) $(KCONFIG_MCONF) | $(O_CONFIG)
-	$(Q)sh $(RELIEFOS_SRC)/tools/build/kconfig-frontends.sh run \
-		--conf $(abspath $(KCONFIG_CONF)) --mconf $(abspath $(KCONFIG_MCONF)) \
-		--kconfig $(KCONFIG_ROOT) --config $(abspath $(RELIEFOS_CONFIG_FILE)) \
-		--seed $(KCONFIG_SEED) --mode $@
+headers_install: kbuild-fixdep $(RELIEFNT_O_MARKER)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=. ./kernel-export/manifest.txt)
+	$(Q)set -eu; export_root='$(O)/kernel-export'; \
+	while IFS= read -r relative; do \
+	  case "$$relative" in \
+	    \#*) continue ;; \
+	  esac; \
+	  source="$$export_root/.kbuild/include/$$relative"; \
+	  output="$$export_root/include/$$relative"; \
+	  mkdir -p "$$(dirname "$$output")"; \
+	  if ! cmp -s "$$source" "$$output"; then \
+	    cp "$$source" "$$output.tmp"; mv -f "$$output.tmp" "$$output"; \
+	  fi; \
+	done < "$$export_root/manifest.txt"
 
-config-sync: $(AUTOCONF_H) $(RELIEFOS_AUTOCONF_MK)
+test-vdso: vdso vdso-runtime-test
+	$(Q)$(RELIEFNT_TEST_PYTHON) $(RELIEFNT_SRC)/tools/test_vdso.py --output $(O) --no-build
 
-build-info: $(BUILD_INFO_HEADER)
+# Tracked host suites use the same native hostprogs engine as build tools.
+# Separate output contexts prevent sanitiser flags from sharing any objects.
+RELIEFNT_TEST_HOST_BINS := $(O)/host/tests/test_common $(O)/host/tests/test_json
+RELIEFNT_TEST_HOST_SANITISED := $(O)/host/tests-sanitised/test_common $(O)/host/tests-sanitised/test_json
+RELIEFNT_TEST_SANITISE := -fsanitize=address,undefined -fno-omit-frame-pointer
 
-# --- install ---------------------------------------------------------------
-# Products plus manifest.txt. The manifest records what was installed and how
-# it was built so an installed kernel can be traced back to its inputs: format
-# version, arch, kernel git identity (or "no-git"), dirty flag, toolchain
-# identity, config and UAPI export digests and a sha256 per artifact.
-# sha256sum only; no interpreter in the production chain.
-DESTDIR ?= $(O)/kernel-install
-INSTALL_PRODUCTS := $(RELIEFOS_KERNEL_SYS) $(RELIEFOS_KERNEL_DEBUG) $(KERNELDEBUG_SYS)
+define RELIEFNT_NATIVE_HOST_TESTS
+.PHONY: native-host-tests-$(1)
+native-host-tests-$(1): kbuild-fixdep $(RELIEFNT_HOST_CC_ID)
+	$$(Q)mkdir -p $(2)
+	+$$(Q)$$(MAKE) $$(RELIEFNT_KBUILD_BASE) obj=scripts/basic -C '$(2)' objtree='$(2)'
+	+$$(Q)$$(MAKE) $$(RELIEFNT_KBUILD_BASE) obj=. -C '$(2)' objtree='$(2)' kbuild-file='$$(RELIEFNT_SRC)/tests/host/Kbuild' KBUILD_HOSTCFLAGS='$$(RELIEFNT_HOST_WARNINGS) $$(RELIEFNT_HOST_CPPFLAGS) -I$$(RELIEFNT_SRC)/tests/host $(3)' KBUILD_HOSTLDFLAGS='$$(HOST_LDFLAGS) $(4)'
+$(addprefix $(2)/,test_common test_json): native-host-tests-$(1) ;
+endef
+$(eval $(call RELIEFNT_NATIVE_HOST_TESTS,plain,$(O)/host/tests,$(HOST_CFLAGS),))
+$(eval $(call RELIEFNT_NATIVE_HOST_TESTS,sanitised,$(O)/host/tests-sanitised,$(RELIEFNT_TEST_SANITISE) -g -O1,$(RELIEFNT_TEST_SANITISE) -g -O1))
 
-.PHONY: install
-install: $(INSTALL_PRODUCTS) $(HEADER_EXPORT_MANIFEST)
-	$(call RELIEFOS_LOG,INSTALL,$(DESTDIR))
+test-tools: $(RELIEFNT_TEST_HOST_BINS) $(RELIEFNT_TEST_HOST_SANITISED)
+	$(Q)set -eu; for test_binary in $(RELIEFNT_TEST_HOST_BINS); do "$$test_binary"; done
+	$(Q)set -eu; for test_binary in $(RELIEFNT_TEST_HOST_SANITISED); do \
+		ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+		"$$test_binary"; done
+
+.PHONY: vdso-runtime-test
+vdso-runtime-test: kbuild-fixdep $(RELIEFNT_HOST_CC_ID)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=. host/tests/vdso_runtime_test)
+
+test-abi:
+	$(Q)$(RELIEFNT_TEST_PYTHON) $(RELIEFNT_SRC)/tools/test_abi_layout.py
+
+test-header-export: headers_install
+	$(Q)$(RELIEFNT_TEST_PYTHON) $(RELIEFNT_SRC)/tools/test_header_export.py --out $(O)
+
+test: test-tools test-abi test-header-export test-vdso
+
+install: all headers_install
 	$(Q)set -eu; \
 	dest='$(DESTDIR)'; \
 	mkdir -p "$$dest"; \
-	cp $(INSTALL_PRODUCTS) "$$dest"/; \
+	cp $(O)/generated/system/kernel.sys \
+	   $(O)/generated/system/kernel.debug \
+	   $(O)/generated/system/kerneldebug.sys "$$dest"/; \
 	{ \
 	  printf 'format_version: 1\n'; \
 	  printf 'arch: %s\n' '$(ARCH)'; \
 	  printf 'profile: %s\n' '$(PROFILE)'; \
-	  if git -C '$(RELIEFOS_SRC)' rev-parse --short HEAD >/dev/null 2>&1; then \
-	    printf 'kernel_git: %s\n' "$$(git -C '$(RELIEFOS_SRC)' rev-parse --short HEAD)"; \
-	    if [ -n "$$(git -C '$(RELIEFOS_SRC)' status --porcelain 2>/dev/null)" ]; then \
+	  if git -C '$(RELIEFNT_SRC)' rev-parse --short HEAD >/dev/null 2>&1; then \
+	    printf 'kernel_git: %s\n' "$$(git -C '$(RELIEFNT_SRC)' rev-parse --short HEAD)"; \
+	    if [ -n "$$(git -C '$(RELIEFNT_SRC)' status --porcelain 2>/dev/null)" ]; then \
 	      printf 'kernel_git_dirty: yes\n'; \
-	    else \
-	      printf 'kernel_git_dirty: no\n'; \
-	    fi; \
-	  else \
-	    printf 'kernel_git: no-git\n'; \
-	    printf 'kernel_git_dirty: unknown\n'; \
-	  fi; \
+	    else printf 'kernel_git_dirty: no\n'; fi; \
+	  else printf 'kernel_git: no-git\nkernel_git_dirty: unknown\n'; fi; \
 	  printf 'toolchain: %s\n' "$$($(TARGET_CC) --version 2>/dev/null | head -n1)"; \
-	  printf 'config_sha256: %s\n' "$$(sha256sum '$(RELIEFOS_CONFIG_FILE)' | cut -d' ' -f1)"; \
-	  printf 'uapi_sha256: %s\n' "$$(sha256sum '$(HEADER_EXPORT_MANIFEST)' | cut -d' ' -f1)"; \
+	  printf 'config_sha256: %s\n' "$$(sha256sum '$(O)/.config' | cut -d' ' -f1)"; \
+	  printf 'uapi_sha256: %s\n' "$$(sha256sum '$(O)/kernel-export/manifest.txt' | cut -d' ' -f1)"; \
 	  printf 'artifacts:\n'; \
-	  (cd "$$dest" && sha256sum $(notdir $(INSTALL_PRODUCTS)) | sed 's/^/  /'); \
+	  (cd "$$dest" && sha256sum kernel.sys kernel.debug kerneldebug.sys | sed 's/^/  /'); \
 	} > "$$dest/manifest.txt.tmp"; \
-	mv "$$dest/manifest.txt.tmp" "$$dest/manifest.txt"
+	mv -f "$$dest/manifest.txt.tmp" "$$dest/manifest.txt"
 
-# --- tests -----------------------------------------------------------------
-# The two Python regression tools are boundary tests, not production chain.
-# The C host tests cover the shared host primitives and the lock-file reader.
-RELIEFOS_TEST_PYTHON ?= python3
-RELIEFOS_HOST_TEST_BINS := $(O_HOST)/tests/test_common $(O_HOST)/tests/test_json
-RELIEFOS_HOST_TEST_SANITISED := $(O_HOST)/tests-sanitised/test_common \
-	$(O_HOST)/tests-sanitised/test_json
-
-$(O_HOST)/obj/tests/host/%.c.o: $(RELIEFOS_SRC)/tests/host/%.c $(O_META)/host-cc.sig
-	$(Q)mkdir -p $(dir $@)
-	$(call RELIEFOS_LOG,HOSTCC,$<)
-	$(Q)$(HOSTCC) $(RELIEFOS_STRICT_WARNINGS) -I$(RELIEFOS_SRC)/tests/host \
-	    $(RELIEFOS_HOST_INCLUDES) $(HOST_CFLAGS) -MMD -MF $@.d -c $< -o $@
-
-$(O_HOST)/obj/tests-sanitised/host/%.c.o: $(RELIEFOS_SRC)/tests/host/%.c $(O_META)/host-cc-sanitised.sig
-	$(Q)mkdir -p $(dir $@)
-	$(call RELIEFOS_LOG,HOSTCC,$<)
-	$(Q)$(HOSTCC) $(RELIEFOS_STRICT_WARNINGS) $(RELIEFOS_SANITISE) \
-	    -I$(RELIEFOS_SRC)/tests/host $(RELIEFOS_HOST_INCLUDES) -g -O1 \
-	    -MMD -MF $@.d -c $< -o $@
-
-$(O_HOST)/obj/tests-sanitised/tools/host/%.c.o: $(RELIEFOS_SRC)/tools/host/%.c \
-	$(O_META)/host-cc-sanitised.sig
-	$(Q)mkdir -p $(dir $@)
-	$(call RELIEFOS_LOG,HOSTCC,$<)
-	$(Q)$(HOSTCC) $(RELIEFOS_STRICT_WARNINGS) $(RELIEFOS_SANITISE) -g -O1 \
-	    $(RELIEFOS_HOST_INCLUDES) -MMD -MF $@.d -c $< -o $@
-
-$(O_HOST)/tests/test_common: $(O_HOST)/obj/tests/host/test_common.c.o $(RELIEFOS_HOST_COMMON_OBJS)
-	$(Q)mkdir -p $(dir $@)
-	$(Q)$(HOSTCC) $(HOST_CFLAGS) $(HOST_LDFLAGS) $^ -o $@
-
-$(O_HOST)/tests/test_json: $(O_HOST)/obj/tests/host/test_json.c.o $(RELIEFOS_JSON_OBJ) \
-	$(RELIEFOS_HOST_COMMON_OBJS)
-	$(Q)mkdir -p $(dir $@)
-	$(Q)$(HOSTCC) $(HOST_CFLAGS) $(HOST_LDFLAGS) $^ -o $@
-
-RELIEFOS_HOST_SANITISED_OBJS := $(patsubst $(O_HOST)/obj/tools/host/%.c.o, \
-	$(O_HOST)/obj/tests-sanitised/tools/host/%.c.o,$(RELIEFOS_HOST_COMMON_OBJS))
-
-$(O_HOST)/tests-sanitised/test_common: $(O_HOST)/obj/tests-sanitised/host/test_common.c.o \
-	$(RELIEFOS_HOST_SANITISED_OBJS)
-	$(Q)mkdir -p $(dir $@)
-	$(Q)$(HOSTCC) $(RELIEFOS_SANITISE) -g -O1 $^ -o $@
-
-$(O_HOST)/tests-sanitised/test_json: $(O_HOST)/obj/tests-sanitised/host/test_json.c.o \
-	$(O_HOST)/obj/tests-sanitised/tools/host/manifest/json.c.o $(RELIEFOS_HOST_SANITISED_OBJS)
-	$(Q)mkdir -p $(dir $@)
-	$(Q)$(HOSTCC) $(RELIEFOS_SANITISE) -g -O1 $^ -o $@
-
-RELIEFOS_SIG_host-cc-sanitised := argv=$(HOSTCC) $(RELIEFOS_STRICT_WARNINGS) $(RELIEFOS_SANITISE) -g -O1|path=$(reliefos_host_tool_path)|identity=$(reliefos_host_tool_identity)
-$(if $(RELIEFOS_PASSIVE),,$(eval $(call RELIEFOS_SIGNATURE_RULE,host-cc-sanitised)))
-
--include $(shell find $(O_HOST)/obj/tests $(O_HOST)/obj/tests-sanitised -name '*.o.d' 2>/dev/null)
-
-test-tools: $(RELIEFOS_HOST_TEST_BINS) $(RELIEFOS_HOST_TEST_SANITISED)
-	@set -eu; for test_binary in $(RELIEFOS_HOST_TEST_BINS); do \
-	    $(call RELIEFOS_LOG_SHELL,RUN,$$test_binary); \
-	    $$test_binary; \
-	done
-	@set -eu; for test_binary in $(RELIEFOS_HOST_TEST_SANITISED); do \
-	    $(call RELIEFOS_LOG_SHELL,RUN,$$test_binary); \
-	    ASAN_OPTIONS=detect_leaks=1 \
-	    UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 $$test_binary; \
-	done
-
-# UAPI wire-layout freeze against tools/tests/abi_layout_golden.json.
-test-abi:
-	$(call RELIEFOS_LOG,RUN,tools/test_abi_layout.py)
-	$(Q)$(RELIEFOS_TEST_PYTHON) $(RELIEFOS_SRC)/tools/test_abi_layout.py
-
-# headers_install boundary: exact whitelist, self-contained C/C++, no residue.
-test-header-export:
-	$(call RELIEFOS_LOG,RUN,tools/test_header_export.py)
-	$(Q)$(RELIEFOS_TEST_PYTHON) $(RELIEFOS_SRC)/tools/test_header_export.py
-
-test: test-tools test-abi test-header-export
-
-# --- cleaning ---------------------------------------------------------------
-# scripts/clean.sh enforces the ownership-marker safety rules: it never removes
-# a tree it did not create, and the shared download cache survives every mode.
 clean:
-	@O='$(O)' SRC='$(RELIEFOS_SRC)' KEEP_CONFIG=1 sh $(RELIEFOS_SRC)/scripts/clean.sh
+	$(Q)if [ -f '$(RELIEFNT_O_MARKER)' ]; then \
+		O='$(O)' SRC='$(RELIEFNT_SRC)' KEEP_CONFIG=1 \
+		sh $(RELIEFNT_SRC)/scripts/clean.sh; \
+	else printf 'clean: no owned output at %s\n' '$(O)'; fi
 
 distclean:
-	@O='$(O)' SRC='$(RELIEFOS_SRC)' KEEP_CONFIG=0 sh $(RELIEFOS_SRC)/scripts/clean.sh
+	$(Q)if [ -f '$(RELIEFNT_O_MARKER)' ]; then \
+		O='$(O)' SRC='$(RELIEFNT_SRC)' KEEP_CONFIG=0 \
+		sh $(RELIEFNT_SRC)/scripts/clean.sh; \
+	else printf 'distclean: no owned output at %s\n' '$(O)'; fi

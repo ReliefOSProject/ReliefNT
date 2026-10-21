@@ -1,0 +1,4 @@
+# Test-only native hostprogs; each mode has a separate output cwd.
+hostprogs-always-y := test_common test_json
+test_common-objs := tests/host/test_common.o tools/host/common/buffer.o tools/host/common/io.o tools/host/common/process.o
+test_json-objs := tests/host/test_json.o tools/host/manifest/json.o tools/host/common/buffer.o tools/host/common/io.o tools/host/common/process.o

@@ -12,7 +12,6 @@ import tempfile
 
 
 KERNEL_ROOT = Path(__file__).resolve().parents[1]
-RUNTIME_TEST = KERNEL_ROOT / "tools" / "tests" / "vdso_runtime_test.c"
 
 
 def run(command: list[str], **kwargs) -> subprocess.CompletedProcess:
@@ -122,15 +121,8 @@ def check_elf(vdso: Path, vdso_blob: Path) -> None:
 
 
 def check_runtime(out: Path, vdso: Path) -> None:
-    compiler = tool("cc", "clang")
     binary = out / "host" / "tests" / "vdso_runtime_test"
-    binary.parent.mkdir(parents=True, exist_ok=True)
-    command = [compiler, "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-O2",
-               "-I", str(KERNEL_ROOT / "kernel" / "reliefnt" / "include"),
-               str(RUNTIME_TEST), "-ldl", "-o", str(binary)]
-    result = run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    require(result.returncode == 0,
-            f"runtime test compile failed:\n{result.stdout}")
+    require(binary.is_file(), f"Kbuild did not produce runtime test {binary}")
     try:
         result = run([str(binary), str(vdso)], stdout=subprocess.PIPE,
                      stderr=subprocess.STDOUT, timeout=10)
@@ -146,19 +138,20 @@ def main() -> int:
     parser.add_argument("--output", type=Path,
                         default=KERNEL_ROOT / "out" / "vdso-task1-test",
                         help="isolated kernel build output directory")
+    parser.add_argument("--no-build", action="store_true", help="inspect prerequisites already built by Make")
     args = parser.parse_args()
     out = args.output.resolve()
-    vdso = out / "generated" / "vdso" / "vdso.so"
-    vdso_blob = out / "obj" / "kernel" / "vdso" / "vdso_blob.S.o"
+    vdso = out / "vdso" / "vdso.so"
+    vdso_blob = out / "vdso" / "vdso_blob.o"
 
     env = os.environ.copy()
     tmpdir = env.get("TMPDIR") or str(KERNEL_ROOT / "out" / "tmp")
     Path(tmpdir).mkdir(parents=True, exist_ok=True)
     env["TMPDIR"] = tmpdir
 
-    command = ["make", "-C", str(KERNEL_ROOT), f"O={out}", "vdso"]
-    print("+", " ".join(command), flush=True)
-    result = subprocess.run(command, env=env, check=False)
+    command = ["make", "-C", str(KERNEL_ROOT), f"O={out}", "vdso", "vdso-runtime-test"]
+    print("+", " ".join(command), flush=True) if not args.no_build else None
+    result = subprocess.run(command, env=env, check=False) if not args.no_build else subprocess.CompletedProcess(command, 0)
     try:
         require(result.returncode == 0,
                 f"`make vdso` exited {result.returncode}")

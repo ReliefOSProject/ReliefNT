@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0
+# Compiler-policy adapter for ReliefOS/ReliefNT, which are not Linux kernels.
+# The upstream compilation/dependency engine stays unmodified. Linux's forced
+# compiler_types.h is not an input to either project's freestanding/POSIX ABI.
+# Recursive Kbuild calls retain this adapter before loading the upstream rules.
+override build := -f $(srctree)/scripts/Makefile.port -f $(srctree)/scripts/Makefile.build obj
+
+override c_flags = -Wp,-MMD,$(depfile) $(NOSTDINC_FLAGS) $(LINUXINCLUDE) \
+                  $(_c_flags) $(modkern_cflags) $(basename_flags) $(modname_flags)
+
+# Fail product/custom actions at the first failing command.
+.SHELLFLAGS := -ec
+
+# Do not create missing object directories when inspecting an output tree.
+ifneq ($(or $(findstring n,$(firstword -$(MAKEFLAGS))),$(findstring q,$(firstword -$(MAKEFLAGS)))),)
+override obj-dirs :=
+endif
