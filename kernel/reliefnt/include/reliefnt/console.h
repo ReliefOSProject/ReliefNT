@@ -61,6 +61,11 @@ void console_enable_framebuffer(void);
  */
 void console_disable_framebuffer(void);
 /**
+ * @brief Hide boot logos and restore the full text area before userland starts.
+ * Called once by the BSP after kernel initialization, with interrupts disabled.
+ */
+void console_boot_complete(void);
+/**
  * @brief Route console output to the legacy VGA text buffer.
  */
 void console_enable_vga_fallback(void);

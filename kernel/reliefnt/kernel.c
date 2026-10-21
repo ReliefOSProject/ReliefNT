@@ -349,6 +349,7 @@ static void kernel_start(uint32_t magic, uint32_t multiboot_info)
                  online_cpus, smp_cpu_count(),
                  (unsigned long long)mm_free_memory_kib());
 
+    console_boot_complete();
     console_vt_activate(1, false);
     userland_enter_first();
     kernel_idle_loop();

@@ -4,6 +4,7 @@
 static struct reliefos_utf8_stream console_utf8;
 #include <reliefnt/console.h>
 #include <reliefnt/framebuffer.h>
+#include <reliefnt/boot_logo.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/lock.h>
 #include <reliefnt/smp.h>
@@ -31,6 +32,7 @@ static char log_buffer[CONSOLE_LOG_CAP];
 static size_t log_len;
 static size_t log_start;
 static bool fb_console_enabled;
+static bool console_boot_logo_active = true;
 static bool vga_console_enabled;
 static uint32_t fb_x;
 static uint32_t fb_y;
@@ -927,9 +929,11 @@ static void fb_console_initialize_fullscreen(void)
         return;
     }
     fb_x = 0;
-    fb_y = 0;
+    fb_console_rect(0, 0, fb->width, fb->height, console_panel());
+    fb_y = console_boot_logo_active && !console_active_vt ?
+           boot_logo_draw(fb, smp_cpu_count()) : 0u;
     fb_cols = fb->width / RELIEFOS_FONT_W;
-    fb_rows = fb->height / RELIEFOS_FONT_H;
+    fb_rows = (fb->height - fb_y) / RELIEFOS_FONT_H;
     if (fb_cols > CONSOLE_MAX_COLS) {
         fb_cols = CONSOLE_MAX_COLS;
     }
@@ -944,7 +948,6 @@ static void fb_console_initialize_fullscreen(void)
     fb_scroll_bottom = fb_rows ? fb_rows - 1u : 0u;
     fb_console_reset_attributes();
     fb_console_reset_ansi();
-    fb_console_rect(0, 0, fb->width, fb->height, console_panel());
     /* The repaint covers the whole screen, so it must be published as a
      * whole: the scanout only refreshes regions an update command names, and
      * the grid (`fb_rows * RELIEFOS_FONT_H`) cannot reach the remainder strip
@@ -1443,6 +1446,21 @@ void console_disable_framebuffer(void)
     fb_console_hide_tty_cursor();
     fb_console_tty_cursor_active = false;
     fb_console_enabled = false;
+}
+
+/**
+ * @brief Remove boot logos and replay diagnostics using the full text screen.
+ * Called by the BSP after initialization and before the first user task runs.
+ * Subsequent console re-enables and VT switches cannot reintroduce the logos.
+ */
+void console_boot_complete(void)
+{
+    if (!console_boot_logo_active) return;
+    console_boot_logo_active = false;
+    if (fb_console_enabled && !console_vt_graphical) {
+        fb_console_hide_tty_cursor();
+        console_enable_framebuffer();
+    }
 }
 
 void console_enable_vga_fallback(void)

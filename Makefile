@@ -289,13 +289,20 @@ test-tools: $(RELIEFNT_TEST_HOST_BINS) $(RELIEFNT_TEST_HOST_SANITISED)
 vdso-runtime-test: kbuild-fixdep $(RELIEFNT_HOST_CC_ID)
 	+$(Q)$(call RELIEFNT_KBUILD,obj=. host/tests/vdso_runtime_test)
 
+.PHONY: boot-logo-runtime-test test-boot-logo
+boot-logo-runtime-test: kbuild-fixdep $(RELIEFNT_HOST_CC_ID)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=. host/tests/boot_logo_runtime_test)
+
+test-boot-logo: boot-logo-runtime-test
+	$(Q)$(O)/host/tests/boot_logo_runtime_test
+
 test-abi:
 	$(Q)$(RELIEFNT_TEST_PYTHON) $(RELIEFNT_SRC)/tools/test_abi_layout.py
 
 test-header-export: headers_install
 	$(Q)$(RELIEFNT_TEST_PYTHON) $(RELIEFNT_SRC)/tools/test_header_export.py --out $(O)
 
-test: test-tools test-abi test-header-export test-vdso
+test: test-tools test-abi test-header-export test-vdso test-boot-logo
 
 install: all headers_install
 	$(Q)set -eu; \

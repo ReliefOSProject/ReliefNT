@@ -3,7 +3,7 @@
 # C objects remain in the old globally sorted order, followed by sorted assembly
 # objects and the embedded vDSO blob, matching the previous linker input order.
 
-# 157 C translation units (LC_ALL=C sorted):
+# 158 C translation units (LC_ALL=C sorted):
 obj-y := \
     arch/x86_64/apic.o \
     arch/x86_64/arch.o \
@@ -53,6 +53,7 @@ obj-y := \
     drivers/video/drm/drm_vmwgfx_execbuf.o \
     drivers/video/drm/drm_vmwgfx_execbuf_parser.o \
     drivers/video/drm/drm_vmwgfx_resource.o \
+    drivers/video/framebuffer/boot_logo.o \
     drivers/video/framebuffer/fbdev.o \
     drivers/video/framebuffer/framebuffer.o \
     drivers/video/svga/batch_state.o \
@@ -208,6 +209,13 @@ hostprogs += host/tests/vdso_runtime_test
 host/tests/vdso_runtime_test-objs := tools/tests/vdso_runtime_test.o
 HOSTCFLAGS_tools/tests/vdso_runtime_test.o := -std=gnu11 -Wall -Wextra -Werror -O2 -I$(srctree)/kernel/reliefnt/include
 HOSTLDLIBS_host/tests/vdso_runtime_test := -ldl
+
+# The RAM-backed fixture compiles the real painters into distinct host objects.
+hostprogs += host/tests/boot_logo_runtime_test
+host/tests/boot_logo_runtime_test-objs := tools/tests/boot_logo_runtime_test.o tools/tests/boot_logo_draw.o tools/tests/boot_logo_framebuffer.o
+$(foreach item,boot_logo_runtime_test boot_logo_draw boot_logo_framebuffer,$(eval HOSTCFLAGS_tools/tests/$(item).o := -std=gnu11 -O2 -g -Wall -Wextra -ffunction-sections -fdata-sections -I$(srctree)/kernel/reliefnt/include -I$(srctree)/include/uapi -I$(srctree)/include -I$(objtree)/include))
+HOSTLDLIBS_host/tests/boot_logo_runtime_test := -Wl,--gc-sections
+$(obj)/tools/tests/boot_logo_framebuffer.o: $(obj)/include/generated/cjk_font.h
 
 # Rebuild target objects if the compiler binary changes in place. The command
 # line remains exactly the project's compiler flags; this file is a dependency,
