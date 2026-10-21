@@ -441,6 +441,25 @@ void apic_send_ipi(uint32_t destination, uint8_t vector)
     apic_wait_delivery();
 }
 
+/**
+ * @brief Submit a physical NMI with a bounded wait for the local ICR.
+ * @param destination Online physical xAPIC ID.
+ * @return True on submission; false if unavailable or the ICR stays busy.
+ */
+bool apic_send_nmi(uint32_t destination)
+{
+    if (!local_apic_enabled || destination > 0xffu) return false;
+    for (uint32_t attempt = 0; attempt < 1000000u; ++attempt) {
+        if (!(lapic_read(APIC_REG_ICR_LOW) & APIC_REG_ICR_DELIVERY_STATUS)) {
+            lapic_write(APIC_REG_ICR_HIGH, destination << 24);
+            lapic_write(APIC_REG_ICR_LOW, APIC_DEST_PHYSICAL | APIC_LVT_DELIVERY_NMI);
+            return true;
+        }
+        __asm__ volatile("pause");
+    }
+    return false;
+}
+
 static void ioapic_write(const struct ioapic_info *io, uint8_t reg, uint32_t value)
 {
     if (!io || !io->base) return;

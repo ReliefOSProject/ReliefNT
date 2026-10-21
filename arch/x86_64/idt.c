@@ -6,6 +6,7 @@
 #include <reliefnt/arch.h>
 #include <reliefnt/console.h>
 #include <reliefnt/lock.h>
+#include <reliefnt/paging.h>
 #include <reliefnt/pty.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/syscall.h>
@@ -267,34 +268,7 @@ void exception_dispatch(uint64_t vector, uint64_t error, uint64_t rip, uint64_t 
                         uint64_t rflags, uint64_t rsp, uint64_t ss)
 {
     uint64_t cr2 = x86_64_read_cr2();
-    const char *mode = (cs & 3u) == 3u ? "user" : "kernel";
-    /* #DF/#MC/#NMI can be delivered after the interrupted stack or scheduler
-     * state is already corrupt.  Go straight to the emergency bugcheck path
-     * so diagnostic logging cannot turn a recoverable second fault into a
-     * triple fault and hardware reset. */
-    if (vector == 2 || vector == 8 || vector == 18) {
-        bugcheck_exception(vector, error, rip, cs, rflags, rsp, ss, cr2);
-    }
-    console_fatal("[reliefnt] exception vector=%llu error=0x%llx rip=0x%llx cs=0x%llx rflags=0x%llx rsp=0x%llx ss=0x%llx\n",
-                   (unsigned long long)vector,
-                   (unsigned long long)error,
-                   (unsigned long long)rip,
-                   (unsigned long long)cs,
-                   (unsigned long long)rflags,
-                   (unsigned long long)rsp,
-                   (unsigned long long)ss);
-    console_fatal("[reliefnt] exception mode=%s cr2=0x%llx ticks=%llu\n",
-                   mode,
-                   (unsigned long long)cr2,
-                   (unsigned long long)time_ticks());
-    if (vector == 14) {
-        console_fatal("[reliefnt] page fault flags present=%u write=%u user=%u reserved=%u fetch=%u\n",
-                       (unsigned)(error & 1u),
-                       (unsigned)((error >> 1) & 1u),
-                       (unsigned)((error >> 2) & 1u),
-                       (unsigned)((error >> 3) & 1u),
-                       (unsigned)((error >> 4) & 1u));
-    }
+    /* Fatal output must bypass the ordinary console lock, even for #DF/NMI. */
     bugcheck_exception(vector, error, rip, cs, rflags, rsp, ss, cr2);
 }
 
@@ -524,6 +498,12 @@ struct task *page_fault_dispatch(struct trap_frame *frame)
     uint64_t cr2 = x86_64_read_cr2();
     uint64_t execution_flags;
 
+    /* Kernel faults outside the supported user range cannot be demand paging
+     * or COW usercopy. Report them before taking locks the fault may interrupt. */
+    if (frame && (frame->cs & 3u) != 3u &&
+        (cr2 < RELIEFNT_USER_BASE || cr2 >= RELIEFNT_USER_TOP))
+        bugcheck_trap("Unhandled Page Fault", frame, cr2);
+
     /* Independent demand-zero faults do not touch VFS/device scratch state.
      * Only user-mode faults may take the non-nesting read gate; kernel-mode
      * usercopy faults can already own the recursive exclusive transaction.
@@ -565,18 +545,18 @@ struct task *page_fault_dispatch(struct trap_frame *frame)
         kernel_execution_unlock_irqrestore(execution_flags);
         bugcheck_exception(14, 0, 0, 0, 0, 0, 0, cr2);
     }
-    console_fatal("[reliefnt] page fault unhandled cr2=0x%llx error=0x%llx rip=0x%llx cs=0x%llx\n",
-                   (unsigned long long)cr2,
-                   (unsigned long long)frame->error,
-                   (unsigned long long)frame->rip,
-                   (unsigned long long)frame->cs);
-    console_fatal("[reliefnt] page fault flags present=%u write=%u user=%u reserved=%u fetch=%u\n",
-                   (unsigned)(frame->error & 1u),
-                   (unsigned)((frame->error >> 1) & 1u),
-                   (unsigned)((frame->error >> 2) & 1u),
-                   (unsigned)((frame->error >> 3) & 1u),
-                   (unsigned)((frame->error >> 4) & 1u));
     if ((frame->cs & 3ULL) == 3ULL) {
+        console_fatal("[reliefnt] page fault unhandled cr2=0x%llx error=0x%llx rip=0x%llx cs=0x%llx\n",
+                       (unsigned long long)cr2,
+                       (unsigned long long)frame->error,
+                       (unsigned long long)frame->rip,
+                       (unsigned long long)frame->cs);
+        console_fatal("[reliefnt] page fault flags present=%u write=%u user=%u reserved=%u fetch=%u\n",
+                       (unsigned)(frame->error & 1u),
+                       (unsigned)((frame->error >> 1) & 1u),
+                       (unsigned)((frame->error >> 2) & 1u),
+                       (unsigned)((frame->error >> 3) & 1u),
+                       (unsigned)((frame->error >> 4) & 1u));
         kernel_spin_unlock(&user_page_fault_lock);
         signal_user_page_fault(frame, cr2);
         kernel_execution_unlock_irqrestore(execution_flags);

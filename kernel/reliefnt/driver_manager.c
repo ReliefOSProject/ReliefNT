@@ -51,6 +51,20 @@ static void early_serial_write(const char *text)
     }
 }
 
+/**
+ * @brief Bypass driver registration and locks when reporting a fatal failure.
+ * @param text Bytes to send through the already initialized COM1 UART.
+ * @param length Number of bytes, independent of NUL termination.
+ */
+void serial_write_emergency(const char *text, size_t length)
+{
+    if (!text) return;
+    for (size_t index = 0; index < length; ++index) {
+        if (text[index] == '\n') early_serial_putc('\r');
+        early_serial_putc(text[index]);
+    }
+}
+
 /* Descriptors of the drivers linked into kernel.sys, in load order: serial
  * first so console output moves off the early COM1 path, then alphabetical. */
 extern const struct reliefos_driver_module serial_driver_module;

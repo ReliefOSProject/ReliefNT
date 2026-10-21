@@ -28,6 +28,12 @@ void apic_send_init(uint32_t destination);
 void apic_send_startup(uint32_t destination, uint8_t vector);
 /** @brief Send a fixed-delivery interrupt to one physical local APIC. */
 void apic_send_ipi(uint32_t destination, uint8_t vector);
+/**
+ * @brief Send an NMI to one online physical xAPIC without taking locks.
+ * @param destination Physical xAPIC ID; the caller has interrupts masked.
+ * @return True if submitted, false for unavailable APIC or delivery timeout.
+ */
+bool apic_send_nmi(uint32_t destination);
 bool ioapic_route_irq(uint32_t irq, uint8_t vector, uint32_t destination);
 
 #endif

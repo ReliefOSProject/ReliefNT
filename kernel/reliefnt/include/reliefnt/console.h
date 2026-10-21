@@ -38,6 +38,41 @@ void console_vt_write(uint32_t number, const char *s, size_t len);
 void console_vt_activate(uint32_t number, bool graphical);
 /** @brief Refresh the active graphical VT's framebuffer scanout. */
 void console_display_tick(void);
+
+/** Original display owner captured before a fatal console takeover. */
+struct console_panic_context {
+    uint32_t vt;
+    bool graphical;
+};
+/**
+ * @brief Take over the current display without allocation or ordinary locks.
+ * The panic owner must mask interrupts and stop other CPUs before calling.
+ * @return Original VT number (zero during boot) and graphical ownership.
+ */
+struct console_panic_context console_panic_begin(void);
+/**
+ * @brief Write literal panic text on black, recording it on the current VT.
+ * @param text Bytes with no terminal control sequences.
+ * @param length Number of bytes to consume.
+ * @param foreground Logical RGB foreground; red/yellow/white select ANSI colors.
+ */
+void console_panic_write(const char *text, size_t length, uint32_t foreground);
+/** @brief Publish panic pixels with bounded hardware polling and no locks. */
+void console_panic_flush(void);
+/**
+ * @brief Write directly to COM1 without registered drivers or console locks.
+ * @param text Bytes to send; newline is expanded to CR/LF.
+ * @param length Number of bytes; polling per character is bounded.
+ */
+void serial_write_emergency(const char *text, size_t length);
+/** @brief Select black VGA text attributes, preserving a valid text cursor. */
+void vga_panic_begin(void);
+/**
+ * @brief Write one literal VGA panic byte with a black background.
+ * @param ch ASCII byte to render.
+ * @param foreground VGA foreground index, low four bits only.
+ */
+void vga_panic_putc(char ch, uint8_t foreground);
 /**
  * @brief Format INFO-level kernel diagnostics; raw output uses console_write.
  */

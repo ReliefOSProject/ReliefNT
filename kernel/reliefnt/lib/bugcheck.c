@@ -1,129 +1,112 @@
-/*
- * ReliefOS kernel bugcheck implementation: renders fatal diagnostics.
- * Captures task, trap, memory, and display state before halting safely.
- */
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Fatal diagnostics use the current TTY or a black framebuffer text console.
+ * No allocator, scheduler lock, console lock or GPU lock is used after claim. */
 #include <reliefnt/bugcheck.h>
 #include <reliefnt/console.h>
-#include <reliefnt/framebuffer.h>
+#include <reliefnt/apic.h>
 #include <reliefnt/sched.h>
+#include <reliefnt/smp.h>
 #include <reliefnt/time.h>
-#include <reliefos/psf_font.h>
-
+#include <generated/build_info.h>
 #include "../../arch/x86_64/port.h"
 
-/* Set before any diagnostic work.  A second CPU fault must not recurse into
- * the formatter/console while the first fault is already being rendered. */
 static volatile int g_bugcheck_active;
-static volatile int g_bugcheck_emergency;
+static volatile uint32_t g_bugcheck_parked[SMP_MAX_CPUS];
 
-/**
- * @brief Pick the Win95 or Metro palette color depending on the active GUI theme.
- */
-static uint32_t bugcheck_color(uint32_t win95, uint32_t metro)
-{
-    if (g_bugcheck_emergency) {
-        /* The GUI/theme state may be the object that faulted.  Keep the fatal
-         * screen on a fixed palette for double fault/NMI/machine-check paths. */
-        return win95;
-    }
-    return metro;
-}
-
-#define BUGCHECK_BG bugcheck_color(0x000000aaU, 0x000078d4U)
-#define BUGCHECK_FG bugcheck_color(0x00ffffffU, 0x00202020U)
-#define BUGCHECK_SUB bugcheck_color(0x00d8d8ffU, 0x006b6b6bU)
-#define BUGCHECK_PANEL bugcheck_color(0x001c1cb8U, 0x00f3f3f3U)
+#define PANIC_RED 0x00ff5555u
+#define PANIC_YELLOW 0x00ffff55u
+#define PANIC_WHITE 0x00ffffffu
 
 struct bugcheck_info {
     const char *reason;
     const char *detail;
-    uint64_t vector;
-    uint64_t error;
-    uint64_t rip;
-    uint64_t cs;
-    uint64_t rflags;
-    uint64_t rsp;
-    uint64_t ss;
-    uint64_t cr2;
-    uint64_t ticks;
-    uint64_t uptime_ms;
-    uint32_t pid;
-    const char *task_name;
+    bool has_exception;
+    bool have_registers;
+    bool have_runtime;
+    bool header_printed;
+    uint32_t cpu, apic, pid;
+    uint32_t stopped, others;
+    uint64_t cr0, cr2, cr3, cr4;
+    uint64_t ticks, uptime_ms;
+    char task_name[64];
+    struct console_panic_context display;
+    struct trap_frame frame;
+};
+
+struct panic_line {
+    char bytes[192];
+    size_t used;
 };
 
 /**
- * @brief Copy src into dst, keeping room for a NUL terminator; a NULL src or empty dst is a no-op.
+ * @brief Append bounded, literal diagnostic text, neutralizing terminal controls.
+ * @param line Destination line, always leaving space for newline.
+ * @param text NUL-terminated text; NULL is treated as unavailable.
  */
-static void copy_text(char *dst, uint32_t cap, const char *src)
+static void line_text(struct panic_line *line, const char *text)
 {
-    uint32_t i = 0;
-    if (!dst || cap == 0) {
-        return;
-    }
-    while (src && src[i] && i + 1 < cap) {
-        dst[i] = src[i];
-        ++i;
-    }
-    dst[i] = 0;
-}
-
-/**
- * @brief Write ch at *pos, advance *pos, and re-terminate the buffer; drops the char if full.
- */
-static void append_char(char *buf, uint32_t *pos, uint32_t cap, char ch)
-{
-    if (!buf || !pos || *pos + 1 >= cap) {
-        return;
-    }
-    buf[*pos] = ch;
-    ++(*pos);
-    buf[*pos] = 0;
-}
-
-/**
- * @brief Append every character of text one at a time via append_char.
- */
-static void append_text(char *buf, uint32_t *pos, uint32_t cap, const char *text)
-{
-    while (text && *text) {
-        append_char(buf, pos, cap, *text++);
+    if (!text) text = "(unavailable)";
+    while (*text && line->used + 2u < sizeof(line->bytes)) {
+        unsigned char ch = (unsigned char)*text++;
+        line->bytes[line->used++] = ch < 32u || ch == 127u ? '?' : (char)ch;
     }
 }
 
 /**
- * @brief Append value in decimal, building the digits least-significant first into a scratch buffer.
+ * @brief Append a fixed-width, zero-padded 64-bit hexadecimal value.
+ * @param line Destination line.
+ * @param value Unsigned value to format.
  */
-static void append_u64_dec(char *buf, uint32_t *pos, uint32_t cap, uint64_t value)
+static void line_hex(struct panic_line *line, uint64_t value)
 {
-    char tmp[24];
-    uint32_t n = 0;
-    if (value == 0) {
-        append_char(buf, pos, cap, '0');
-        return;
-    }
-    while (value && n < sizeof(tmp)) {
-        tmp[n++] = (char)('0' + (value % 10ULL));
-        value /= 10ULL;
-    }
-    while (n) {
-        append_char(buf, pos, cap, tmp[--n]);
-    }
+    static const char digits[] = "0123456789ABCDEF";
+    line_text(line, "0x");
+    for (int shift = 60; shift >= 0 && line->used + 2u < sizeof(line->bytes); shift -= 4)
+        line->bytes[line->used++] = digits[(value >> shift) & 15u];
 }
 
 /**
- * @brief Append value as a fixed-width "0x" + 16 uppercase hex digits (zero-padded).
+ * @brief Append a decimal value without an allocator or libc formatter.
+ * @param line Destination line.
+ * @param value Unsigned value to format.
  */
-static void append_u64_hex(char *buf, uint32_t *pos, uint32_t cap, uint64_t value)
+static void line_dec(struct panic_line *line, uint64_t value)
 {
-    const char *digits = "0123456789ABCDEF";
-    append_text(buf, pos, cap, "0x");
-    for (int shift = 60; shift >= 0; shift -= 4) {
-        append_char(buf, pos, cap, digits[(value >> shift) & 0xfU]);
-    }
+    char digits[21];
+    unsigned count = 0;
+    do { digits[count++] = '0' + value % 10u; value /= 10u; } while (value);
+    while (count && line->used + 2u < sizeof(line->bytes))
+        line->bytes[line->used++] = digits[--count];
 }
 
 /**
- * @brief Map an x86 exception vector to its human-readable name, defaulting to "CPU Exception".
+ * @brief Print one line, then reset the reusable formatting buffer.
+ * @param line Complete line to print.
+ * @param color Logical RGB foreground color; background is always black.
+ */
+static void line_emit(struct panic_line *line, uint32_t color)
+{
+    line->bytes[line->used++] = '\n';
+    console_panic_write(line->bytes, line->used, color);
+    line->used = 0;
+}
+
+/**
+ * @brief Format a short constant or bounded string as its own diagnostic line.
+ * @param text Text to print.
+ * @param color Logical RGB foreground color.
+ */
+static void panic_text(const char *text, uint32_t color)
+{
+    struct panic_line line = {0};
+    line_text(&line, text);
+    line_emit(&line, color);
+}
+
+/**
+ * @brief Name an x86 architectural exception vector.
+ * @param vector CPU exception number.
+ * @return Resident descriptive string, including a generic fallback.
  */
 static const char *exception_name(uint64_t vector)
 {
@@ -156,365 +139,222 @@ static const char *exception_name(uint64_t vector)
 }
 
 /**
- * @brief Report "user" when the faulting code segment runs in ring 3, otherwise "kernel".
+ * @brief Format two or three named registers on one terminal-width line.
+ * @param a First register name.
+ * @param av First register value.
+ * @param b Second register name.
+ * @param bv Second register value.
+ * @param c Optional third name; NULL omits the third register.
+ * @param cv Third register value.
  */
-static const char *fault_mode(const struct bugcheck_info *info)
+static void register_line(const char *a, uint64_t av, const char *b, uint64_t bv,
+                          const char *c, uint64_t cv)
 {
-    return info && (info->cs & 3u) == 3u ? "user" : "kernel";
+    struct panic_line line = {0};
+    line_text(&line, a); line_text(&line, "="); line_hex(&line, av);
+    line_text(&line, "  "); line_text(&line, b); line_text(&line, "="); line_hex(&line, bv);
+    if (c) { line_text(&line, "  "); line_text(&line, c); line_text(&line, "="); line_hex(&line, cv); }
+    line_emit(&line, PANIC_WHITE);
 }
 
 /**
- * @brief Encode the page-fault error code's P/W/U/RSVD/IF bits as "P=1 W=0 ..." fields.
+ * @brief Decode architectural page-fault error bits without assuming feature support.
+ * @param error CPU-supplied page-fault error code.
  */
-static void append_page_fault_flags(char *line, uint32_t *pos, uint32_t cap,
-                                    uint64_t error)
+static void page_fault_flags(uint64_t error)
 {
-    append_text(line, pos, cap, "P=");
-    append_char(line, pos, cap, (error & 1u) ? '1' : '0');
-    append_text(line, pos, cap, " W=");
-    append_char(line, pos, cap, (error & 2u) ? '1' : '0');
-    append_text(line, pos, cap, " U=");
-    append_char(line, pos, cap, (error & 4u) ? '1' : '0');
-    append_text(line, pos, cap, " RSVD=");
-    append_char(line, pos, cap, (error & 8u) ? '1' : '0');
-    append_text(line, pos, cap, " IF=");
-    append_char(line, pos, cap, (error & 16u) ? '1' : '0');
+    static const char *const names[] = {"P=", " W=", " U=", " RSVD=", " IF=", " PK=", " SS="};
+    struct panic_line line = {0};
+    line_text(&line, "PF: ");
+    for (unsigned bit = 0; bit < 7; ++bit) {
+        line_text(&line, names[bit]); line_dec(&line, (error >> bit) & 1u);
+    }
+    line_text(&line, " SGX="); line_dec(&line, (error >> 15) & 1u);
+    line_emit(&line, PANIC_YELLOW);
+    line_text(&line, error & 1u ? "Protection violation during " : "Non-present page during ");
+    line_text(&line, error & 16u ? "instruction fetch" : error & 2u ? "write" : "read");
+    line_text(&line, error & 4u ? " in user mode." : " in supervisor mode.");
+    line_emit(&line, PANIC_YELLOW);
 }
 
 /**
- * @brief Capture the runtime snapshot: tick count, uptime, and the current task's pid and name.
+ * @brief Render detailed diagnostics as terminal text rather than a GUI panel.
+ * @param info Immutable trap/runtime snapshot; unavailable fields are explicit.
+ */
+static void render_bugcheck_text(const struct bugcheck_info *info)
+{
+    const struct trap_frame *f = &info->frame;
+    struct panic_line line = {0};
+    if (!info->header_printed) panic_text("!!! KERNEL PANIC - SYSTEM HALTED !!!", PANIC_RED);
+    line_text(&line, "Reason: "); line_text(&line, info->reason); line_emit(&line, PANIC_RED);
+    if (info->detail) { line_text(&line, "Detail: "); line_text(&line, info->detail); line_emit(&line, PANIC_YELLOW); }
+    panic_text("ReliefNT " RELIEFOS_KERNEL_VERSION "  source=" RELIEFOS_SOURCE_ID, PANIC_WHITE);
+    panic_text("Build: " RELIEFOS_BUILD_TIME "  x86_64", PANIC_WHITE);
+    line_text(&line, "CPU "); line_dec(&line, info->cpu); line_text(&line, "  APIC "); line_dec(&line, info->apic);
+    line_text(&line, "  other CPUs stopped="); line_dec(&line, info->stopped);
+    line_text(&line, "/"); line_dec(&line, info->others); line_emit(&line, PANIC_WHITE);
+    line_text(&line, "Display: ");
+    if (info->display.vt) { line_text(&line, "tty"); line_dec(&line, info->display.vt); }
+    else line_text(&line, "boot console");
+    line_text(&line, info->display.graphical ? " (GUI -> panic text overlay)" : " (current text console)");
+    line_emit(&line, PANIC_WHITE);
+    if (info->have_runtime) {
+        line_text(&line, "PID "); line_dec(&line, info->pid); line_text(&line, "  TASK "); line_text(&line, info->task_name);
+        line_emit(&line, PANIC_WHITE);
+        line_text(&line, "UPTIME_MS="); line_dec(&line, info->uptime_ms); line_text(&line, "  TICKS="); line_dec(&line, info->ticks);
+        line_emit(&line, PANIC_WHITE);
+    } else panic_text("Task/time: unavailable on emergency exception path", PANIC_YELLOW);
+    line_text(&line, "Mode: "); line_text(&line, (f->cs & 3u) == 3u ? "user" : "kernel");
+    if (info->has_exception) {
+        line_text(&line, "  VECTOR="); line_dec(&line, f->vector);
+        line_text(&line, "  ERROR="); line_hex(&line, f->error);
+    } else line_text(&line, "  explicit panic (RIP = caller)");
+    line_emit(&line, PANIC_YELLOW);
+    register_line("RIP", f->rip, "RFLAGS", f->rflags, NULL, 0);
+    if (f->rsp) register_line("RSP", f->rsp, "SS", f->ss, "CS", f->cs);
+    else { register_line("CS", f->cs, "SS", f->ss, NULL, 0); panic_text("RSP: not saved by this exception entry", PANIC_YELLOW); }
+    register_line("CR2", info->cr2, "CR3", info->cr3, NULL, 0);
+    register_line("CR0", info->cr0, "CR4", info->cr4, NULL, 0);
+    if (info->has_exception && f->vector == 14) page_fault_flags(f->error);
+    if (info->have_registers) {
+        register_line("RAX", f->rax, "RBX", f->rbx, "RCX", f->rcx);
+        register_line("RDX", f->rdx, "RSI", f->rsi, "RDI", f->rdi);
+        register_line("RBP", f->rbp, "R8 ", f->r8, "R9 ", f->r9);
+        register_line("R10", f->r10, "R11", f->r11, "R12", f->r12);
+        register_line("R13", f->r13, "R14", f->r14, "R15", f->r15);
+    } else panic_text("General registers: not saved by this entry", PANIC_YELLOW);
+    panic_text("Save this screen and serial log before restarting.", PANIC_WHITE);
+    panic_text("Resolve RIP with the matching kernel.unstripped: addr2line -e <ELF> <RIP>", PANIC_WHITE);
+    panic_text("!!! KERNEL PANIC - SYSTEM HALTED; RESTART REQUIRED !!!", PANIC_RED);
+}
+
+/** @brief Halt without touching console state, including on secondary CPUs. */
+static __attribute__((noreturn)) void bugcheck_halt_forever(void)
+{
+    for (;;) __asm__ volatile("cli; hlt" : : : "memory");
+}
+
+/**
+ * @brief Stop online peer CPUs via NMI, then wait a bounded time for their entry.
+ * @param info Owner CPU identity; receives stopped/expected peer counts.
+ */
+static void stop_other_cpus(struct bugcheck_info *info)
+{
+    uint32_t count = smp_cpu_count();
+    if (count > SMP_MAX_CPUS) count = SMP_MAX_CPUS;
+    for (uint32_t cpu = 0; cpu < count; ++cpu) {
+        if (cpu == info->cpu || !smp_cpu_online(cpu)) continue;
+        ++info->others;
+        const struct smp_cpu_info *other = smp_cpu_info(cpu);
+        if (other) (void)apic_send_nmi(other->apic_id);
+    }
+    for (uint32_t attempt = 0; attempt < 1000000u; ++attempt) {
+        info->stopped = 0;
+        for (uint32_t cpu = 0; cpu < count; ++cpu)
+            if (cpu != info->cpu && __atomic_load_n(&g_bugcheck_parked[cpu], __ATOMIC_ACQUIRE)) ++info->stopped;
+        if (info->stopped >= info->others) break;
+        __asm__ volatile("pause");
+    }
+}
+
+/**
+ * @brief Capture lock-free runtime fields; emergency faults omit scheduler data.
+ * @param info Crash record whose frame and control registers are already saved.
  */
 static void collect_bugcheck_info(struct bugcheck_info *info)
 {
-    struct task *task;
-    if (!info) {
-        return;
-    }
-    info->ticks = 0;
-    info->uptime_ms = 0;
-    info->pid = 0;
-    info->task_name = "(unavailable)";
-    /* Do not dereference scheduler/time state from the emergency stack.  The
-     * raw CPU frame is still rendered below and remains the authoritative
-     * diagnostic when the fault happened during scheduler teardown. */
-    if (g_bugcheck_emergency) {
-        return;
-    }
+    if (info->has_exception && (info->frame.vector == 2 || info->frame.vector == 8 || info->frame.vector == 18)) return;
     info->ticks = time_ticks();
     info->uptime_ms = time_uptime_ms();
     info->pid = sched_current_pid();
-    task = sched_current_task();
-    info->task_name = (task && task->name) ? task->name : "(none)";
+    const struct task *task = sched_current_task();
+    const char *name = task && task->name ? task->name : "(none)";
+    size_t index = 0;
+    while (index + 1u < sizeof(info->task_name) && name[index]) {
+        info->task_name[index] = name[index]; ++index;
+    }
+    info->task_name[index] = 0;
+    info->have_runtime = true;
 }
 
 /**
- * @brief Draw the fatal-error STOP screen in text mode, including registers and fault detail.
- */
-static void draw_bugcheck_vga(const struct bugcheck_info *info)
-{
-    char line[96];
-    uint32_t pos;
-
-    vga_init();
-    copy_text(line, sizeof(line), "ReliefOS has encountered a fatal system error.");
-    vga_write_at(0, 0, line);
-    copy_text(line, sizeof(line), "The system has been halted to prevent further damage.");
-    vga_write_at(0, 1, line);
-
-    copy_text(line, sizeof(line), " ");
-    for (uint8_t row = 2; row < 25; ++row) {
-        vga_write_at(0, row, "                                                                                ");
-    }
-
-    copy_text(line, sizeof(line), "STOP: ");
-    vga_write_at(0, 3, line);
-    vga_write_at(6, 3, info->reason ? info->reason : "KERNEL PANIC");
-
-    if (info->detail) {
-        vga_write_at(0, 5, info->detail);
-    }
-
-    pos = 0;
-    line[0] = 0;
-    append_text(line, &pos, sizeof(line), "PID ");
-    append_u64_dec(line, &pos, sizeof(line), info->pid);
-    append_text(line, &pos, sizeof(line), " TASK ");
-    append_text(line, &pos, sizeof(line), info->task_name);
-    append_text(line, &pos, sizeof(line), " MODE ");
-    append_text(line, &pos, sizeof(line), fault_mode(info));
-    vga_write_at(0, 7, line);
-
-    pos = 0;
-    line[0] = 0;
-    append_text(line, &pos, sizeof(line), "RIP ");
-    append_u64_hex(line, &pos, sizeof(line), info->rip);
-    append_text(line, &pos, sizeof(line), "  CS ");
-    append_u64_hex(line, &pos, sizeof(line), info->cs);
-    vga_write_at(0, 8, line);
-
-    pos = 0;
-    line[0] = 0;
-    append_text(line, &pos, sizeof(line), "RFLAGS ");
-    append_u64_hex(line, &pos, sizeof(line), info->rflags);
-    append_text(line, &pos, sizeof(line), "  ERR ");
-    append_u64_hex(line, &pos, sizeof(line), info->error);
-    append_text(line, &pos, sizeof(line), "  VEC ");
-    append_u64_dec(line, &pos, sizeof(line), info->vector);
-    vga_write_at(0, 9, line);
-
-    pos = 0;
-    line[0] = 0;
-    append_text(line, &pos, sizeof(line), "RSP ");
-    append_u64_hex(line, &pos, sizeof(line), info->rsp);
-    append_text(line, &pos, sizeof(line), "  SS ");
-    append_u64_hex(line, &pos, sizeof(line), info->ss);
-    vga_write_at(0, 10, line);
-
-    pos = 0;
-    line[0] = 0;
-    append_text(line, &pos, sizeof(line), "CR2 ");
-    append_u64_hex(line, &pos, sizeof(line), info->cr2);
-    vga_write_at(0, 11, line);
-
-    if (info->vector == 14) {
-        pos = 0;
-        line[0] = 0;
-        append_text(line, &pos, sizeof(line), "PF ");
-        append_page_fault_flags(line, &pos, sizeof(line), info->error);
-        vga_write_at(0, 12, line);
-    }
-}
-
-/**
- * @brief Render the fatal-error panel into the framebuffer, falling back to VGA if none is available.
- */
-static void draw_bugcheck_fb(const struct bugcheck_info *info)
-{
-    const struct framebuffer *fb = framebuffer_get();
-    char line[128];
-    uint32_t x = 32;
-    uint32_t y = 28;
-    uint32_t lh = RELIEFOS_FONT_H + 6;
-    uint32_t panel_w;
-    uint32_t panel_h;
-
-    if (!fb->available) {
-        draw_bugcheck_vga(info);
-        return;
-    }
-
-    panel_w = fb->width > 64 ? fb->width - 64 : fb->width;
-    panel_h = fb->height > 56 ? fb->height - 56 : fb->height;
-
-    framebuffer_clear(BUGCHECK_BG);
-    framebuffer_rect(x, y, panel_w, panel_h, BUGCHECK_PANEL);
-    framebuffer_rect(x, y, panel_w, 2, BUGCHECK_FG);
-    framebuffer_rect(x, y, 2, panel_h, BUGCHECK_FG);
-    framebuffer_rect(x + panel_w - 2, y, 2, panel_h, BUGCHECK_SUB);
-    framebuffer_rect(x, y + panel_h - 2, panel_w, 2, BUGCHECK_SUB);
-
-    framebuffer_text(x + 18, y + 18, "ReliefOS", BUGCHECK_FG, BUGCHECK_PANEL);
-    framebuffer_text(x + 18, y + 18 + lh, "A fatal system error has occurred.", BUGCHECK_FG, BUGCHECK_PANEL);
-    framebuffer_text(x + 18, y + 18 + lh * 2,
-                     "The system has been halted to prevent further corruption.",
-                     BUGCHECK_SUB, BUGCHECK_PANEL);
-
-    copy_text(line, sizeof(line), "STOP:");
-    framebuffer_text(x + 18, y + 18 + lh * 4, line, BUGCHECK_FG, BUGCHECK_PANEL);
-    framebuffer_text(x + 72, y + 18 + lh * 4,
-                     info->reason ? info->reason : "KERNEL PANIC",
-                     BUGCHECK_FG, BUGCHECK_PANEL);
-
-    if (info->detail && info->detail[0]) {
-        framebuffer_text(x + 18, y + 18 + lh * 5, info->detail, BUGCHECK_SUB, BUGCHECK_PANEL);
-    }
-
-    {
-        uint32_t row = 7;
-        uint32_t pos = 0;
-        line[0] = 0;
-        append_text(line, &pos, sizeof(line), "PID ");
-        append_u64_dec(line, &pos, sizeof(line), info->pid);
-        append_text(line, &pos, sizeof(line), "  TASK ");
-        append_text(line, &pos, sizeof(line), info->task_name);
-        append_text(line, &pos, sizeof(line), "  MODE ");
-        append_text(line, &pos, sizeof(line), fault_mode(info));
-        framebuffer_text(x + 18, y + 18 + lh * row++, line, BUGCHECK_FG, BUGCHECK_PANEL);
-
-        pos = 0; line[0] = 0;
-        append_text(line, &pos, sizeof(line), "VECTOR ");
-        append_u64_dec(line, &pos, sizeof(line), info->vector);
-        append_text(line, &pos, sizeof(line), "  ERROR ");
-        append_u64_hex(line, &pos, sizeof(line), info->error);
-        framebuffer_text(x + 18, y + 18 + lh * row++, line, BUGCHECK_FG, BUGCHECK_PANEL);
-
-        pos = 0; line[0] = 0;
-        append_text(line, &pos, sizeof(line), "RIP ");
-        append_u64_hex(line, &pos, sizeof(line), info->rip);
-        append_text(line, &pos, sizeof(line), "  CS ");
-        append_u64_hex(line, &pos, sizeof(line), info->cs);
-        framebuffer_text(x + 18, y + 18 + lh * row++, line, BUGCHECK_FG, BUGCHECK_PANEL);
-
-        pos = 0; line[0] = 0;
-        append_text(line, &pos, sizeof(line), "RFLAGS ");
-        append_u64_hex(line, &pos, sizeof(line), info->rflags);
-        framebuffer_text(x + 18, y + 18 + lh * row++, line, BUGCHECK_FG, BUGCHECK_PANEL);
-
-        pos = 0; line[0] = 0;
-        append_text(line, &pos, sizeof(line), "RSP ");
-        append_u64_hex(line, &pos, sizeof(line), info->rsp);
-        append_text(line, &pos, sizeof(line), "  SS ");
-        append_u64_hex(line, &pos, sizeof(line), info->ss);
-        framebuffer_text(x + 18, y + 18 + lh * row++, line, BUGCHECK_FG, BUGCHECK_PANEL);
-
-        pos = 0; line[0] = 0;
-        append_text(line, &pos, sizeof(line), "CR2 ");
-        append_u64_hex(line, &pos, sizeof(line), info->cr2);
-        framebuffer_text(x + 18, y + 18 + lh * row++, line, BUGCHECK_FG, BUGCHECK_PANEL);
-
-        if (info->vector == 14) {
-            pos = 0; line[0] = 0;
-            append_text(line, &pos, sizeof(line), "PF FLAGS ");
-            append_page_fault_flags(line, &pos, sizeof(line), info->error);
-            framebuffer_text(x + 18, y + 18 + lh * row++, line, BUGCHECK_FG, BUGCHECK_PANEL);
-        }
-
-        pos = 0; line[0] = 0;
-        append_text(line, &pos, sizeof(line), "TICKS ");
-        append_u64_dec(line, &pos, sizeof(line), info->ticks);
-        append_text(line, &pos, sizeof(line), "  UPTIME_MS ");
-        append_u64_dec(line, &pos, sizeof(line), info->uptime_ms);
-        framebuffer_text(x + 18, y + 18 + lh * row++, line, BUGCHECK_FG, BUGCHECK_PANEL);
-    }
-
-    framebuffer_text(x + 18, y + panel_h - 32,
-                     "Restart the machine after collecting the information above.",
-                     BUGCHECK_SUB, BUGCHECK_PANEL);
-}
-
-/**
- * @brief Disable the framebuffer and spin with interrupts off on hlt; never returns.
- */
-static __attribute__((noreturn)) void bugcheck_halt_forever(void)
-{
-    console_disable_framebuffer();
-    for (;;) {
-        __asm__ volatile("cli; hlt");
-    }
-}
-
-/**
- * @brief Print diagnostics, draw the error screen, and halt; a nested call halts immediately to avoid recursion.
+ * @brief Claim fatal output, stop peers, report through the emergency console, halt.
+ * @param info Saved exception context, never allocated dynamically.
  */
 static __attribute__((noreturn)) void bugcheck_commit(struct bugcheck_info *info)
 {
-    if (!info) {
-        x86_64_halt();
-    }
     __asm__ volatile("cli" : : : "memory");
+    uint32_t cpu = smp_current_cpu();
     if (__sync_lock_test_and_set(&g_bugcheck_active, 1)) {
+        if (cpu < SMP_MAX_CPUS) __atomic_store_n(&g_bugcheck_parked[cpu], 1, __ATOMIC_RELEASE);
         bugcheck_halt_forever();
     }
-    g_bugcheck_emergency = info->vector == 2 || info->vector == 8 || info->vector == 18;
+    info->cpu = cpu;
+    info->apic = apic_id();
+    __asm__ volatile("mov %%cr0, %0" : "=r"(info->cr0));
+    __asm__ volatile("mov %%cr3, %0" : "=r"(info->cr3));
+    __asm__ volatile("mov %%cr4, %0" : "=r"(info->cr4));
+    stop_other_cpus(info);
+    info->display = console_panic_begin();
+    panic_text("!!! KERNEL PANIC - SYSTEM HALTED !!!", PANIC_RED);
+    console_panic_flush();
+    info->header_printed = true;
     collect_bugcheck_info(info);
-    if (g_bugcheck_emergency) {
-        /* Keep this path allocation-free and independent of console/theme
-         * bookkeeping.  The framebuffer/VGA renderer contains the complete
-         * vector/error/RIP/stack record. */
-        draw_bugcheck_fb(info);
-        bugcheck_halt_forever();
-    }
-    console_fatal("\n[bugcheck] %s\n", info->reason ? info->reason : "KERNEL PANIC");
-    if (info->detail) {
-        console_fatal("[bugcheck] detail=%s\n", info->detail);
-    }
-    console_fatal("[bugcheck] pid=%u task=%s mode=%s vec=%llu err=0x%llx rip=0x%llx cr2=0x%llx rsp=0x%llx ss=0x%llx cs=0x%llx rflags=0x%llx ticks=%llu uptime_ms=%llu\n",
-                   info->pid,
-                   info->task_name,
-                   fault_mode(info),
-                   (unsigned long long)info->vector,
-                   (unsigned long long)info->error,
-                   (unsigned long long)info->rip,
-                   (unsigned long long)info->cr2,
-                   (unsigned long long)info->rsp,
-                   (unsigned long long)info->ss,
-                   (unsigned long long)info->cs,
-                   (unsigned long long)info->rflags,
-                   (unsigned long long)info->ticks,
-                   (unsigned long long)info->uptime_ms);
-    if (info->vector == 14) {
-        char pf_line[96];
-        uint32_t pos = 0;
-        pf_line[0] = 0;
-        append_page_fault_flags(pf_line, &pos, sizeof(pf_line), info->error);
-        console_fatal("[bugcheck] page_fault cr2=0x%llx %s\n",
-                       (unsigned long long)info->cr2,
-                       pf_line);
-    }
-    draw_bugcheck_fb(info);
+    render_bugcheck_text(info);
+    console_panic_flush();
     bugcheck_halt_forever();
 }
 
 /**
- * @brief Turn a panic message into a zeroed fault record and commit it; never returns.
+ * @brief Report an explicit kernel panic, capturing caller RIP and current stack.
+ * @param message Resident kernel diagnostic text; NULL is allowed.
  */
 __attribute__((noreturn)) void bugcheck_panic(const char *message)
 {
-    struct bugcheck_info info = {
-        .reason = "KERNEL PANIC",
-        .detail = message ? message : "(null)",
-        .vector = 0,
-        .error = 0,
-        .rip = 0,
-        .cs = 0,
-        .rflags = 0,
-        .rsp = 0,
-        .ss = 0,
-        .cr2 = 0,
-    };
+    struct bugcheck_info info = {.reason = "Explicit kernel panic", .detail = message};
+    info.frame.rip = (uint64_t)__builtin_return_address(0);
+    __asm__ volatile("mov %%rsp, %0" : "=r"(info.frame.rsp));
+    __asm__ volatile("mov %%cs, %0" : "=r"(info.frame.cs));
+    __asm__ volatile("mov %%ss, %0" : "=r"(info.frame.ss));
+    __asm__ volatile("pushfq; popq %0" : "=r"(info.frame.rflags));
+    __asm__ volatile("mov %%cr2, %0" : "=r"(info.cr2));
     bugcheck_commit(&info);
 }
 
 /**
- * @brief Build and commit a fault record for an unhandled CPU exception, naming it from the vector.
+ * @brief Report an unhandled scalar exception frame; do not invent GPR values.
+ * @param vector CPU exception number.
+ * @param error CPU exception error code.
+ * @param rip Faulting instruction pointer.
+ * @param cs Saved code selector.
+ * @param rflags Saved CPU flags.
+ * @param rsp Saved stack pointer, zero if absent from this entry.
+ * @param ss Saved stack selector, zero if absent.
+ * @param cr2 Fault address register captured by the dispatcher.
  */
 __attribute__((noreturn)) void bugcheck_exception(uint64_t vector, uint64_t error,
-                                                  uint64_t rip, uint64_t cs,
-                                                  uint64_t rflags, uint64_t rsp,
-                                                  uint64_t ss, uint64_t cr2)
+    uint64_t rip, uint64_t cs, uint64_t rflags, uint64_t rsp, uint64_t ss, uint64_t cr2)
 {
     struct bugcheck_info info = {
-        .reason = exception_name(vector),
-        .detail = "Unhandled CPU exception",
-        .vector = vector,
-        .error = error,
-        .rip = rip,
-        .cs = cs,
-        .rflags = rflags,
-        .rsp = rsp,
-        .ss = ss,
-        .cr2 = cr2,
+        .reason = exception_name(vector), .detail = "Unhandled CPU exception",
+        .has_exception = true, .cr2 = cr2,
+        .frame = {.vector = vector, .error = error, .rip = rip, .cs = cs,
+                  .rflags = rflags, .rsp = rsp, .ss = ss},
     };
     bugcheck_commit(&info);
 }
 
 /**
- * @brief Commit a fault record copied from an architecture trap frame, zeroing fields when absent.
+ * @brief Preserve all registers from an unhandled architecture trap frame.
+ * @param reason Resident diagnostic description, or NULL for a generic reason.
+ * @param frame Saved CPU and general registers; NULL is explicitly unavailable.
+ * @param cr2 Fault address captured at exception entry.
  */
-__attribute__((noreturn)) void bugcheck_trap(const char *reason, const struct trap_frame *frame,
-                                             uint64_t cr2)
+__attribute__((noreturn)) void bugcheck_trap(const char *reason, const struct trap_frame *frame, uint64_t cr2)
 {
-    struct bugcheck_info info = {
-        .reason = reason ? reason : "TRAP",
-        .detail = "Trap frame captured",
-        .vector = frame ? frame->vector : 0,
-        .error = frame ? frame->error : 0,
-        .rip = frame ? frame->rip : 0,
-        .cs = frame ? frame->cs : 0,
-        .rflags = frame ? frame->rflags : 0,
-        .rsp = frame ? frame->rsp : 0,
-        .ss = frame ? frame->ss : 0,
-        .cr2 = cr2,
-    };
+    struct bugcheck_info info = {.reason = reason ? reason : "Kernel trap",
+        .detail = frame ? "Trap frame captured" : "Trap frame unavailable",
+        .has_exception = frame != NULL, .have_registers = frame != NULL, .cr2 = cr2};
+    if (frame) info.frame = *frame;
     bugcheck_commit(&info);
 }

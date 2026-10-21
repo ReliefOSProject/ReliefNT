@@ -73,3 +73,22 @@ void vga_write_at(uint8_t x, uint8_t y, const char *s)
         vga[pos + i] = entry(s[i]);
     }
 }
+
+/** @brief Keep the text cursor where possible and select bright text on black. */
+void vga_panic_begin(void)
+{
+    color = 0x0f;
+    if (!initialized || row >= VGA_HEIGHT || col >= VGA_WIDTH) vga_init();
+}
+
+/**
+ * @brief Output a literal ASCII character with no background attribute bits.
+ * @param ch Character to render.
+ * @param foreground VGA foreground color index.
+ */
+void vga_panic_putc(char ch, uint8_t foreground)
+{
+    color = foreground & 0x0f;
+    if (ch == '\r') { col = 0; return; }
+    vga_putc(ch);
+}

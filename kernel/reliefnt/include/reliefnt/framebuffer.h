@@ -154,6 +154,13 @@ void framebuffer_blit(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t s
  */
 void framebuffer_present(void);
 /**
+ * @brief Reclaim fatal scanout without locks after other CPUs have stopped.
+ * Restores legacy GFB tracing where supported; never resets the video mode.
+ */
+void framebuffer_panic_prepare(void);
+/** @brief Publish fatal pixels without locks, with a finite FIFO retry bound. */
+void framebuffer_panic_present(void);
+/**
  * @brief Flush only the (x,y,width,height) sub-region of the back buffer.
  */
 void framebuffer_present_region(uint32_t x, uint32_t y, uint32_t width, uint32_t height);

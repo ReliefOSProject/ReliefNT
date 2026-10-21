@@ -217,6 +217,12 @@ $(foreach item,boot_logo_runtime_test boot_logo_draw boot_logo_framebuffer,$(eva
 HOSTLDLIBS_host/tests/boot_logo_runtime_test := -Wl,--gc-sections
 $(obj)/tools/tests/boot_logo_framebuffer.o: $(obj)/include/generated/cjk_font.h
 
+hostprogs += host/tests/panic_console_runtime_test
+host/tests/panic_console_runtime_test-objs := tools/tests/panic_console_runtime_test.o tools/tests/boot_logo_draw.o
+HOSTCFLAGS_tools/tests/panic_console_runtime_test.o := -std=gnu11 -O2 -g -Wall -Wextra -ffunction-sections -fdata-sections -I$(srctree)/kernel/reliefnt/include -I$(srctree)/include/uapi -I$(srctree)/include -I$(objtree)/include
+HOSTLDLIBS_host/tests/panic_console_runtime_test := -Wl,--gc-sections
+$(obj)/tools/tests/panic_console_runtime_test.o: $(obj)/include/generated/cjk_font.h $(obj)/include/generated/build_info.h
+
 # Rebuild target objects if the compiler binary changes in place. The command
 # line remains exactly the project's compiler flags; this file is a dependency,
 # not an extra compiler option.
@@ -244,6 +250,7 @@ targets += \
     generated/system/kerneldebug.sys
 
 $(obj)/kernel/reliefnt/version.o: $(obj)/include/generated/build_info.h
+$(obj)/kernel/reliefnt/lib/bugcheck.o: $(obj)/include/generated/build_info.h
 $(obj)/drivers/video/framebuffer/framebuffer.o: $(obj)/include/generated/cjk_font.h
 
 quiet_cmd_reliefnt_build_info = GEN     $@

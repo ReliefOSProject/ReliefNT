@@ -296,13 +296,20 @@ boot-logo-runtime-test: kbuild-fixdep $(RELIEFNT_HOST_CC_ID)
 test-boot-logo: boot-logo-runtime-test
 	$(Q)$(O)/host/tests/boot_logo_runtime_test
 
+.PHONY: panic-console-runtime-test test-panic-console
+panic-console-runtime-test: kbuild-fixdep $(RELIEFNT_HOST_CC_ID)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=. host/tests/panic_console_runtime_test)
+
+test-panic-console: panic-console-runtime-test
+	$(Q)$(O)/host/tests/panic_console_runtime_test
+
 test-abi:
 	$(Q)$(RELIEFNT_TEST_PYTHON) $(RELIEFNT_SRC)/tools/test_abi_layout.py
 
 test-header-export: headers_install
 	$(Q)$(RELIEFNT_TEST_PYTHON) $(RELIEFNT_SRC)/tools/test_header_export.py --out $(O)
 
-test: test-tools test-abi test-header-export test-vdso test-boot-logo
+test: test-tools test-abi test-header-export test-vdso test-boot-logo test-panic-console
 
 install: all headers_install
 	$(Q)set -eu; \
