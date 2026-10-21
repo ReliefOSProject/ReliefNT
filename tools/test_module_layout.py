@@ -4,6 +4,7 @@ from pathlib import Path
 import hashlib
 import json
 import re
+import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 PRODUCTION = ('arch', 'block', 'drivers', 'firmware', 'fs', 'kernel', 'lib', 'mm', 'net', 'sound', 'debug', 'vdso')
@@ -11,6 +12,7 @@ PRODUCTION = ('arch', 'block', 'drivers', 'firmware', 'fs', 'kernel', 'lib', 'mm
 
 def main():
     errors, objects, visited = [], [], set()
+    inputs = set()
 
     def visit(directory):
         if directory in visited:
@@ -21,6 +23,7 @@ def main():
         if not path.is_file():
             errors.append(f'missing Kbuild: {directory}')
             return
+        inputs.add(path.relative_to(ROOT).as_posix())
         content = path.read_text().replace('\\\n', ' ')
         entries = []
         for line in content.splitlines():
@@ -59,13 +62,26 @@ def main():
             if source.suffix not in ('.c', '.S', '.h'):
                 continue
             relative = source.relative_to(ROOT).as_posix()
+            inputs.add(relative)
             if source.suffix in ('.c', '.S') and relative not in built_sources:
                 errors.append(f'unbuilt production source: {relative}')
             if re.search(r'^\s*#\s*include\s*["<][^">]+\.(?:c|inc)[">]', source.read_text(), re.M):
                 errors.append(f'implementation include: {relative}')
     for header in (ROOT / 'include/reliefnt').rglob('*.h'):
+        inputs.add(header.relative_to(ROOT).as_posix())
         if re.search(r'^\s*#\s*include\s*["<][^">]+\.(?:c|inc)[">]', header.read_text(), re.M):
             errors.append(f'implementation include: {header.relative_to(ROOT)}')
+    # Audit the real ignore rules, including tracked files, so a local build
+    # cannot hide production sources that would be omitted from a new commit.
+    # Source archives have no Git metadata and retain the structural audit.
+    if (ROOT / '.git').exists():
+        ignored = subprocess.run(
+            ['git', '-C', str(ROOT), 'check-ignore', '--no-index', '-z', '--stdin'],
+            input='\0'.join(sorted(inputs)) + '\0', text=True, capture_output=True,
+        )
+        if ignored.returncode not in (0, 1):
+            errors.append(f'cannot audit production ignore rules: {ignored.stderr.strip()}')
+        errors.extend(f'ignored production input: {name}' for name in ignored.stdout.split('\0') if name)
     manifest = json.loads((ROOT / 'scripts/kbuild-source.json').read_text())
     for name, digest in manifest['files'].items():
         if hashlib.sha256((ROOT / name).read_bytes()).hexdigest() != digest:

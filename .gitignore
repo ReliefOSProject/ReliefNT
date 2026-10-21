@@ -1,7 +1,7 @@
 # Download cache populated by `make fetch`. Never tracked: its contents are
 # fetched build inputs, pinned by digest in configs/dependencies.lock.json and
 # verified against that lock by tools/build/fetch.sh and by the build itself.
-cache/
+/cache/
 
 # Default output directory (O= defaults to out/<arch>/<profile>).
 out/
