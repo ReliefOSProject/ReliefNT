@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Objects are owned by this directory; child modules own their own lists.
+obj-y := bugcheck.o panic.o string.o text_utf16.o
+
+include $(srctree)/scripts/Makefile.module
+
+$(obj)/bugcheck.o: $(objtree)/include/generated/build_info.h

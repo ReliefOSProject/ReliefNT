@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Objects are owned by this directory; child modules own their own lists.
+obj-y := exfat_cache.o exfat_dir.o exfat_file.o exfat_mount.o exfat_name.o exfat_namespace.o
+
+include $(srctree)/scripts/Makefile.module

@@ -11,6 +11,11 @@
  */
 
 #include "storage_nvme.h"
+#include "../../../block/core/storage_core_api.h"
+#include "../../../fs/fs_mount_api.h"
+#include <reliefnt/mm.h>
+#include <reliefnt/pci.h>
+#include <reliefnt/paging.h>
 
 #define NVME_MAX_CONTROLLERS 8u
 #define NVME_QUEUE_DEPTH 32u

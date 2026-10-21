@@ -121,7 +121,7 @@ def check_elf(vdso: Path, vdso_blob: Path) -> None:
 
 
 def check_runtime(out: Path, vdso: Path) -> None:
-    binary = out / "host" / "tests" / "vdso_runtime_test"
+    binary = out / "tools" / "tests" / "vdso_runtime_test"
     require(binary.is_file(), f"Kbuild did not produce runtime test {binary}")
     try:
         result = run([str(binary), str(vdso)], stdout=subprocess.PIPE,

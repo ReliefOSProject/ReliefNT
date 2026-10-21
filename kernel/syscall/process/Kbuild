@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := clone.o exec.o legacy_process.o process.o process_vm.o resources.o security.o session.o
+
+include $(srctree)/scripts/Makefile.module

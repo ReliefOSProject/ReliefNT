@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := dhcp.o dns.o http.o ntp.o
+
+include $(srctree)/scripts/Makefile.module

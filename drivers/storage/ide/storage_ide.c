@@ -1,4 +1,6 @@
 #include "storage_ide.h"
+#include "../../../block/core/storage_core_api.h"
+#include <reliefnt/port.h>
 
 static void ide_io_delay(uint16_t control)
 {

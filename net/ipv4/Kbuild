@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := core.o icmp.o udp.o
+
+include $(srctree)/scripts/Makefile.module

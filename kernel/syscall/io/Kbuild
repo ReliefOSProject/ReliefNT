@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := drm_io.o file_io.o io.o legacy_io.o transfer.o
+
+include $(srctree)/scripts/Makefile.module

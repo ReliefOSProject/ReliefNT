@@ -6,7 +6,7 @@
 
 #include <stdint.h>
 #include <reliefnt/lock.h>
-#include "../../block/storage_internal.h"
+#include "../../../block/core/storage_driver.h"
 
 struct nvme_command;
 struct nvme_completion;

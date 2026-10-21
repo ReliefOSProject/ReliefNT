@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+# Project host utilities use upstream Makefile.host and its .cmd/fixdep rules.
+hostprogs-always-y += \
+    assets/reliefos-cjk-font \
+    version/reliefos-version \
+    manifest/reliefos-deps
+
+RELIEFNT_HOST_COMMON_OBJS := \
+    common/buffer.o \
+    common/io.o \
+    common/process.o
+
+version/reliefos-version-objs := \
+    version/reliefos-version.o \
+    $(RELIEFNT_HOST_COMMON_OBJS)
+
+manifest/reliefos-deps-objs := \
+    manifest/reliefos-deps.o \
+    manifest/json.o \
+    $(RELIEFNT_HOST_COMMON_OBJS)
+
+RELIEFNT_HOST_PROGRAMS := $(hostprogs-always-y)
+RELIEFNT_HOST_OBJECTS := \
+    $(RELIEFNT_HOST_COMMON_OBJS) \
+    version/reliefos-version.o \
+    manifest/reliefos-deps.o \
+    manifest/json.o
+
+$(addprefix $(obj)/,$(RELIEFNT_HOST_PROGRAMS) $(RELIEFNT_HOST_OBJECTS)): \
+    $(objtree)/include/generated/host-toolchain-id.h
+
+# Project utilities retain strict diagnostics; upstream Kconfig has its own flags.
+$(foreach item,$(RELIEFNT_HOST_OBJECTS) $(addsuffix .o,$(RELIEFNT_HOST_PROGRAMS)),$(eval HOSTCFLAGS_$(item) += $(RELIEFNT_HOST_WARNINGS)))

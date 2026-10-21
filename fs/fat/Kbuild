@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Objects are owned by this directory; child modules own their own lists.
+obj-y := fat32_alloc.o fat32_dir.o fat32_io.o fat32_mount.o fat32_name.o
+
+include $(srctree)/scripts/Makefile.module

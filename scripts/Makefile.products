@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: Apache-2.0
+# Final products, generated assets and UAPI installation (no source lists).
+# Kbuild owns these generated files and records their commands and prerequisites
+# in the same .cmd/fixdep format as every compiled object.
+always-y += \
+    include/generated/build_info.h \
+    include/generated/cjk_font.h \
+    generated/system/kernel.unstripped \
+    generated/system/kernel.sys \
+    generated/system/kernel.debug \
+    generated/system/kerneldebug.sys
+
+targets += \
+    include/generated/build_info.h \
+    include/generated/cjk_font.h \
+    generated/system/kernel.unstripped \
+    generated/system/kernel.sys \
+    generated/system/kernel.debug \
+    generated/system/kerneldebug.sys
+
+
+quiet_cmd_reliefnt_build_info = GEN     $@
+cmd_reliefnt_build_info = $(objtree)/tools/host/version/reliefos-version \
+    --version-file $(srctree)/configs/build-version \
+    --extra-version '$(EXTRAVERSION)' --local-version '$(LOCALVERSION)' \
+    --source-id '$(RELIEFNT_SOURCE_ID)' --epoch '$(SOURCE_DATE_EPOCH)' \
+    --output $@
+
+$(obj)/include/generated/build_info.h: \
+    $(srctree)/configs/build-version \
+    $(obj)/tools/host/version/reliefos-version FORCE
+	$(call if_changed,reliefnt_build_info)
+
+quiet_cmd_reliefnt_cjk_font = GEN     $@
+cmd_reliefnt_cjk_font = set -eu; \
+    $(CONFIG_SHELL) $(srctree)/tools/build/fetch.sh \
+        --deps $(objtree)/tools/host/manifest/reliefos-deps \
+        --lock $(srctree)/configs/dependencies.lock.json \
+        --cache '$(RELIEFNT_CACHE)' --only unifont --verify-only; \
+    font=$$($(objtree)/tools/host/manifest/reliefos-deps \
+        --lock $(srctree)/configs/dependencies.lock.json \
+        --id unifont --print directory); \
+    gzip -dc '$(RELIEFNT_CACHE)'/$$font | \
+        $(objtree)/tools/host/assets/reliefos-cjk-font > $@.tmp; \
+    mv -f $@.tmp $@
+
+$(obj)/include/generated/cjk_font.h: \
+    $(obj)/tools/host/assets/reliefos-cjk-font \
+    $(obj)/tools/host/manifest/reliefos-deps \
+    $(srctree)/configs/dependencies.lock.json \
+    $(srctree)/tools/build/fetch.sh FORCE
+	$(call if_changed,reliefnt_cjk_font)
+
+quiet_cmd_reliefnt_kernel_link = LD      $@
+cmd_reliefnt_kernel_link = $(RELIEFNT_TARGET_LD) -nostdlib \
+    -z max-page-size=0x1000 $(KERNEL_LDFLAGS) \
+    -T $(srctree)/arch/x86_64/linker.ld -o $@ \
+    --whole-archive $(obj)/built-in.a --no-whole-archive
+
+$(obj)/generated/system/kernel.unstripped: \
+    $(obj)/built-in.a \
+    $(srctree)/arch/x86_64/linker.ld \
+    $(objtree)/.reliefnt-target-ld.id FORCE
+	$(call if_changed,reliefnt_kernel_link)
+
+quiet_cmd_reliefnt_kernel_strip = OBJCOPY $@
+cmd_reliefnt_kernel_strip = $(RELIEFNT_TARGET_OBJCOPY) --strip-debug $< $@.tmp && mv -f $@.tmp $@
+
+$(obj)/generated/system/kernel.sys: \
+    $(obj)/generated/system/kernel.unstripped \
+    $(objtree)/.reliefnt-target-objcopy.id FORCE
+	$(call if_changed,reliefnt_kernel_strip)
+
+quiet_cmd_reliefnt_kernel_debug = OBJCOPY $@
+cmd_reliefnt_kernel_debug = $(RELIEFNT_TARGET_OBJCOPY) --only-keep-debug $< $@.tmp && mv -f $@.tmp $@
+
+$(obj)/generated/system/kernel.debug: \
+    $(obj)/generated/system/kernel.unstripped \
+    $(objtree)/.reliefnt-target-objcopy.id FORCE
+	$(call if_changed,reliefnt_kernel_debug)
+
+quiet_cmd_reliefnt_kerneldebug = OBJCOPY $@
+cmd_reliefnt_kerneldebug = $(RELIEFNT_TARGET_OBJCOPY) \
+    --remove-section .llvm_addrsig --remove-section .comment \
+    --remove-section .note.GNU-stack \
+    --rename-section .note.reliefos.kerneldebug=.note.reliefos.kerneldebug,alloc,load,readonly,data,contents \
+    $< $@.tmp && mv -f $@.tmp $@
+
+$(obj)/generated/system/kerneldebug.sys: \
+    $(objtree)/debug/kerneldebug.o \
+    $(objtree)/.reliefnt-target-objcopy.id FORCE
+	$(call if_changed,reliefnt_kerneldebug)
+
+# Exact UAPI whitelist. Each copied header and the manifest are independent
+# Kbuild targets, so a removed output is repaired even when all sources are old.
+RELIEFNT_HEADER_LIST := $(or $(HEADER_EXPORT_LIST),$(srctree)/configs/header-export.list)
+RELIEFNT_HEADER_ENTRIES := $(shell sed -e 's/\#.*//' -e '/^[[:space:]]*$$/d' $(RELIEFNT_HEADER_LIST))
+RELIEFNT_HEADER_OUTPUTS := $(patsubst include/uapi/%,kernel-export/.kbuild/include/%,$(RELIEFNT_HEADER_ENTRIES))
+RELIEFNT_HEADER_RELATIVE := $(patsubst include/uapi/%,%,$(RELIEFNT_HEADER_ENTRIES))
+targets += $(RELIEFNT_HEADER_OUTPUTS) kernel-export/manifest.txt
+
+quiet_cmd_reliefnt_header_copy = HDRINST  $@
+cmd_reliefnt_header_copy = mkdir -p $(@D); cp -p $< $@.tmp; \
+    if cmp -s $@.tmp $@ 2>/dev/null; then rm -f $@.tmp; \
+    else mv -f $@.tmp $@; fi
+
+define reliefnt_header_rule
+$(obj)/$(patsubst include/uapi/%,kernel-export/.kbuild/include/%,$(1)): \
+    $(srctree)/$(1) $(RELIEFNT_HEADER_LIST) FORCE
+	$$(call if_changed,reliefnt_header_copy)
+endef
+$(foreach entry,$(RELIEFNT_HEADER_ENTRIES),$(eval $(call reliefnt_header_rule,$(entry))))
+
+quiet_cmd_reliefnt_header_manifest = MANIFEST $@
+cmd_reliefnt_header_manifest = set -eu; \
+    { printf '%s\n' '\# generated by headers_install; source: configs/header-export.list'; \
+      for entry in $(RELIEFNT_HEADER_RELATIVE); do printf '%s\n' "$$entry"; done; \
+    } | LC_ALL=C sort > $@.tmp; \
+    if cmp -s $@.tmp $@ 2>/dev/null; then rm -f $@.tmp; \
+    else mv -f $@.tmp $@; fi; \
+    for entry in $(RELIEFNT_HEADER_RELATIVE); do \
+      source=$(objtree)/kernel-export/.kbuild/include/"$$entry"; \
+      output=$(objtree)/kernel-export/include/"$$entry"; \
+      mkdir -p "$$(dirname "$$output")"; \
+      cp -p "$$source" "$$output.tmp"; \
+      if cmp -s "$$output.tmp" "$$output" 2>/dev/null; then rm -f "$$output.tmp"; \
+      else mv -f "$$output.tmp" "$$output"; fi; \
+    done; \
+    find $(objtree)/kernel-export/include -type f -printf '%P\n' | LC_ALL=C sort > $(objtree)/kernel-export/present.tmp; \
+    { for entry in $(RELIEFNT_HEADER_RELATIVE); do printf '%s\n' "$$entry"; done; } | LC_ALL=C sort > $(objtree)/kernel-export/want.tmp; \
+    comm -23 $(objtree)/kernel-export/present.tmp $(objtree)/kernel-export/want.tmp | \
+      while IFS= read -r stale; do rm -f $(objtree)/kernel-export/include/"$$stale"; done; \
+    rm -f $(objtree)/kernel-export/present.tmp $(objtree)/kernel-export/want.tmp; \
+    find $(objtree)/kernel-export/include -mindepth 1 -type d -empty -delete; \
+    touch $@
+
+$(obj)/kernel-export/manifest.txt: \
+    $(addprefix $(obj)/,$(RELIEFNT_HEADER_OUTPUTS)) \
+    $(RELIEFNT_HEADER_LIST) FORCE
+	$(call if_changed,reliefnt_header_manifest)

@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := codec.o codec_control.o codec_probe.o codec_route.o controller.o controller_io.o controller_recovery.o controller_rings.o controller_verb.o controls.o hda.o stream.o
+
+include $(srctree)/scripts/Makefile.module

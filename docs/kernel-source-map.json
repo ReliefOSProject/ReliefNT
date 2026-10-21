@@ -1,0 +1,708 @@
+{
+  "baseline": "dd0d60f776cec88e84ec62f323963e080fba4483",
+  "purpose": "Historical source ownership audit only; not consumed by Kbuild",
+  "old_to_new": {
+    "kernel/reliefnt/driver_manager.c": [
+      "kernel/device/early_serial.c",
+      "kernel/device/registry.c",
+      "kernel/device/services.c",
+      "kernel/device/api.c"
+    ],
+    "kernel/reliefnt/driver_manager_phase.c": [
+      "kernel/device/driver_manager_phase.c"
+    ],
+    "kernel/reliefnt/driver_resources.c": [
+      "kernel/device/driver_resources.c"
+    ],
+    "kernel/reliefnt/futex.c": [
+      "kernel/ipc/futex.c"
+    ],
+    "kernel/reliefnt/gpu.c": [
+      "drivers/video/core/gpu.c"
+    ],
+    "kernel/reliefnt/input.c": [
+      "drivers/tty/input/input.c"
+    ],
+    "kernel/reliefnt/kernel.c": [
+      "kernel/init/kernel.c"
+    ],
+    "kernel/reliefnt/kernel_debug.c": [
+      "kernel/init/kernel_debug.c"
+    ],
+    "kernel/reliefnt/lock.c": [
+      "kernel/sync/lock.c"
+    ],
+    "kernel/reliefnt/pty.c": [
+      "drivers/tty/pty/core.c",
+      "drivers/tty/pty/ring.c",
+      "drivers/tty/pty/line_discipline.c",
+      "drivers/tty/pty/vt.c",
+      "drivers/tty/pty/keyboard.c",
+      "drivers/tty/pty/session.c"
+    ],
+    "kernel/reliefnt/random.c": [
+      "kernel/random/random.c"
+    ],
+    "kernel/reliefnt/shm.c": [
+      "kernel/ipc/shm.c"
+    ],
+    "kernel/reliefnt/signal.c": [
+      "kernel/signal/signal.c"
+    ],
+    "kernel/reliefnt/signal_queue.c": [
+      "kernel/signal/signal_queue.c"
+    ],
+    "kernel/reliefnt/signalfd.c": [
+      "kernel/signal/signalfd.c"
+    ],
+    "kernel/reliefnt/syscall.c": [
+      "kernel/syscall/event/epoll.c",
+      "kernel/syscall/fs/stat.c",
+      "kernel/syscall/system/user_string.c",
+      "kernel/syscall/system/startup.c",
+      "kernel/syscall/fd/flock.c",
+      "kernel/syscall/fd/descriptor.c",
+      "kernel/syscall/fd/pty_descriptor.c",
+      "kernel/syscall/dispatch.c",
+      "kernel/syscall/event/timerfd.c",
+      "kernel/syscall/io/drm_io.c",
+      "kernel/syscall/device/device_io.c",
+      "kernel/syscall/device/input_ioctl.c",
+      "kernel/syscall/fs/path.c",
+      "kernel/syscall/io/transfer.c",
+      "kernel/syscall/process/session.c",
+      "kernel/syscall/process/exec.c",
+      "kernel/syscall/event/poll.c",
+      "kernel/syscall/process/resources.c",
+      "kernel/syscall/fs/filesystem.c",
+      "kernel/syscall/device/fbdev_ioctl.c",
+      "kernel/syscall/io/io.c",
+      "kernel/syscall/entry.c",
+      "kernel/syscall/fs/legacy_filesystem.c",
+      "kernel/syscall/ipc/legacy_ipc.c",
+      "kernel/syscall/process/legacy_process.c",
+      "kernel/syscall/system/legacy_system.c",
+      "kernel/syscall/event/legacy_events.c",
+      "kernel/syscall/memory/legacy_memory.c",
+      "kernel/syscall/io/legacy_io.c",
+      "kernel/syscall/fd/legacy_descriptors.c",
+      "kernel/syscall/device/legacy_ioctl.c"
+    ],
+    "kernel/reliefnt/syscall_clone.c": [
+      "kernel/syscall/process/clone.c"
+    ],
+    "kernel/reliefnt/syscall_device.c": [
+      "kernel/syscall/device/device.c"
+    ],
+    "kernel/reliefnt/syscall_file_io.c": [
+      "kernel/syscall/io/file_io.c"
+    ],
+    "kernel/reliefnt/syscall_fs.c": [
+      "kernel/syscall/fs/fs.c"
+    ],
+    "kernel/reliefnt/syscall_gui.c": [
+      "kernel/syscall/device/gui.c"
+    ],
+    "kernel/reliefnt/syscall_ipc.c": [
+      "kernel/syscall/ipc/ipc.c"
+    ],
+    "kernel/reliefnt/syscall_locks.c": [
+      "kernel/syscall/fs/locks.c"
+    ],
+    "kernel/reliefnt/syscall_mm.c": [
+      "mm/user/mapping.c",
+      "mm/user/vma.c",
+      "mm/user/protect.c",
+      "mm/user/cache.c",
+      "mm/user/fault.c"
+    ],
+    "kernel/reliefnt/syscall_process.c": [
+      "kernel/syscall/process/process.c"
+    ],
+    "kernel/reliefnt/syscall_process_vm.c": [
+      "kernel/syscall/process/process_vm.c"
+    ],
+    "kernel/reliefnt/syscall_security.c": [
+      "kernel/syscall/process/security.c"
+    ],
+    "kernel/reliefnt/syscall_socket.c": [
+      "kernel/syscall/ipc/socket.c"
+    ],
+    "kernel/reliefnt/syscall_socket_batch.c": [
+      "kernel/syscall/ipc/socket_batch.c"
+    ],
+    "kernel/reliefnt/syscall_sysv_msg.c": [
+      "kernel/syscall/ipc/sysv_msg.c"
+    ],
+    "kernel/reliefnt/syscall_sysv_sem.c": [
+      "kernel/syscall/ipc/sysv_sem.c"
+    ],
+    "kernel/reliefnt/syscall_sysv_shm.c": [
+      "kernel/syscall/ipc/sysv_shm.c"
+    ],
+    "kernel/reliefnt/syscall_time.c": [
+      "kernel/syscall/time/time.c"
+    ],
+    "kernel/reliefnt/time.c": [
+      "kernel/time/time.c"
+    ],
+    "kernel/reliefnt/time_discipline.c": [
+      "kernel/time/time_discipline.c"
+    ],
+    "kernel/reliefnt/uts.c": [
+      "kernel/init/uts.c"
+    ],
+    "kernel/reliefnt/version.c": [
+      "kernel/init/version.c"
+    ],
+    "kernel/reliefnt/wait.c": [
+      "kernel/sync/wait.c"
+    ],
+    "kernel/reliefnt/sched/eevdf.inc": [
+      "kernel/sched/fair.c"
+    ],
+    "kernel/reliefnt/sched/sched.c": [
+      "kernel/sched/exec.c",
+      "kernel/sched/task.c",
+      "kernel/sched/core.c",
+      "kernel/sched/fair.c",
+      "kernel/sched/tables.c",
+      "kernel/sched/lookup.c",
+      "kernel/sched/session.c",
+      "kernel/sched/accounting.c",
+      "kernel/sched/clone.c",
+      "kernel/sched/signal.c",
+      "kernel/sched/timers.c",
+      "kernel/sched/wait.c"
+    ],
+    "kernel/reliefnt/lib/bugcheck.c": [
+      "lib/bugcheck.c"
+    ],
+    "kernel/reliefnt/lib/panic.c": [
+      "lib/panic.c"
+    ],
+    "kernel/reliefnt/lib/string.c": [
+      "lib/string.c"
+    ],
+    "kernel/reliefnt/lib/text_utf16.c": [
+      "lib/text_utf16.c"
+    ],
+    "kernel/reliefnt/audio/alsa_control.c": [
+      "sound/core/alsa_control.c"
+    ],
+    "kernel/reliefnt/audio/alsa_pcm.c": [
+      "sound/core/alsa_pcm.c"
+    ],
+    "kernel/reliefnt/audio/core.c": [
+      "sound/core/core.c"
+    ],
+    "kernel/reliefnt/audio/device.c": [
+      "sound/core/device.c"
+    ],
+    "kernel/reliefnt/audio/mixer.c": [
+      "sound/core/mixer.c"
+    ],
+    "kernel/reliefnt/audio/oss.c": [
+      "sound/core/oss.c"
+    ],
+    "kernel/reliefnt/audio/pcm.c": [
+      "sound/core/pcm_buffer.c",
+      "sound/core/pcm_mapping.c",
+      "sound/core/pcm_transfer.c",
+      "sound/core/pcm_format.c",
+      "sound/core/pcm.c"
+    ],
+    "kernel/reliefnt/audio/storage_audio.c": [
+      "sound/core/storage_audio.c"
+    ],
+    "kernel/reliefnt/audio/timer.c": [
+      "sound/core/timer.c"
+    ],
+    "kernel/reliefnt/include/reliefnt/apic.h": [
+      "include/reliefnt/apic.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/arch.h": [
+      "include/reliefnt/arch.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/audio.h": [
+      "include/reliefnt/audio.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/boot_logo.h": [
+      "include/reliefnt/boot_logo.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/bugcheck.h": [
+      "include/reliefnt/bugcheck.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/console.h": [
+      "include/reliefnt/console.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/driver_manager.h": [
+      "include/reliefnt/driver_manager.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/driver_manager_phase.h": [
+      "include/reliefnt/driver_manager_phase.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/driver_resources.h": [
+      "include/reliefnt/driver_resources.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/drm.h": [
+      "include/reliefnt/drm.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/e1000.h": [
+      "include/reliefnt/e1000.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/eevdf.h": [
+      "include/reliefnt/eevdf.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/eevdf_tree.h": [
+      "include/reliefnt/eevdf_tree.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/efi_fs.h": [
+      "include/reliefnt/efi_fs.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/elf.h": [
+      "include/reliefnt/elf.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/framebuffer.h": [
+      "include/reliefnt/framebuffer.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/futex.h": [
+      "include/reliefnt/futex.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/gpu.h": [
+      "include/reliefnt/gpu.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/heap.h": [
+      "include/reliefnt/heap.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/input.h": [
+      "include/reliefnt/input.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/inventory.h": [
+      "include/reliefnt/inventory.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/kernel.h": [
+      "include/reliefnt/kernel.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/kernel_debug.h": [
+      "include/reliefnt/kernel_debug.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/loadavg.h": [
+      "include/reliefnt/loadavg.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/lock.h": [
+      "include/reliefnt/lock.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/mm.h": [
+      "include/reliefnt/mm.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/mouse.h": [
+      "include/reliefnt/mouse.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/multiboot2.h": [
+      "include/reliefnt/multiboot2.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/net.h": [
+      "include/reliefnt/net.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/net_packet.h": [
+      "include/reliefnt/net_packet.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/net_udp.h": [
+      "include/reliefnt/net_udp.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/object.h": [
+      "include/reliefnt/object.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/ostui.h": [
+      "include/reliefnt/ostui.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/page_cache.h": [
+      "include/reliefnt/page_cache.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/paging.h": [
+      "include/reliefnt/paging.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/panic.h": [
+      "include/reliefnt/panic.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/pci.h": [
+      "include/reliefnt/pci.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/pci_irq.h": [
+      "include/reliefnt/pci_irq.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/permissions.h": [
+      "include/reliefnt/permissions.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/platform.h": [
+      "include/reliefnt/platform.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/port.h": [
+      "include/reliefnt/port.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/power.h": [
+      "include/reliefnt/power.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/pty.h": [
+      "include/reliefnt/pty.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/random.h": [
+      "include/reliefnt/random.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/sched.h": [
+      "include/reliefnt/sched.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/signal.h": [
+      "include/reliefnt/signal.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/smp.h": [
+      "include/reliefnt/smp.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/storage.h": [
+      "include/reliefnt/storage.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/svga.h": [
+      "include/reliefnt/svga.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/syscall.h": [
+      "include/reliefnt/syscall.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/syscall_internal.h": [
+      "include/reliefnt/syscall_internal.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/sysv_shm.h": [
+      "include/reliefnt/sysv_shm.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/text_stream.h": [
+      "include/reliefnt/text_stream.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/text_utf16.h": [
+      "include/reliefnt/text_utf16.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/time.h": [
+      "include/reliefnt/time.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/time_discipline.h": [
+      "include/reliefnt/time_discipline.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/tmpfs.h": [
+      "include/reliefnt/tmpfs.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/trap.h": [
+      "include/reliefnt/trap.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/types.h": [
+      "include/reliefnt/types.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/usb.h": [
+      "include/reliefnt/usb.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/usercopy.h": [
+      "include/reliefnt/usercopy.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/userland.h": [
+      "include/reliefnt/userland.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/uts.h": [
+      "include/reliefnt/uts.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/vdso.h": [
+      "include/reliefnt/vdso.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/vdso_data.h": [
+      "include/reliefnt/vdso_data.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/version.h": [
+      "include/reliefnt/version.h"
+    ],
+    "kernel/reliefnt/include/reliefnt/wait.h": [
+      "include/reliefnt/wait.h"
+    ],
+    "fs/object.c": [
+      "fs/vfs/object.c"
+    ],
+    "fs/permissions.c": [
+      "fs/security/access.c"
+    ],
+    "fs/procfs.c": [
+      "fs/proc/procfs.c"
+    ],
+    "fs/storage_exfat.c": [
+      "fs/exfat/exfat_cache.c",
+      "fs/exfat/exfat_dir.c",
+      "fs/exfat/exfat_file.c",
+      "fs/exfat/exfat_mount.c",
+      "fs/exfat/exfat_name.c",
+      "fs/exfat/exfat_namespace.c"
+    ],
+    "fs/storage_exfat_upcase.inc": [
+      "fs/exfat/exfat_upcase_data.h"
+    ],
+    "fs/storage_ext2.c": [
+      "fs/ext2/ext2.c"
+    ],
+    "fs/storage_ext2_cache.c": [
+      "fs/ext2/ext2_cache.c"
+    ],
+    "fs/storage_ext2_write.c": [
+      "fs/ext2/ext2_write.c"
+    ],
+    "fs/storage_ext4_alloc.c": [
+      "fs/ext4/alloc.c"
+    ],
+    "fs/storage_ext4_cache.c": [
+      "fs/ext4/cache.c"
+    ],
+    "fs/storage_ext4_checksum.c": [
+      "fs/ext4/checksum.c"
+    ],
+    "fs/storage_ext4_dir.c": [
+      "fs/ext4/dir.c"
+    ],
+    "fs/storage_ext4_extent.c": [
+      "fs/ext4/extent.c"
+    ],
+    "fs/storage_ext4_format.c": [
+      "fs/ext4/format.c"
+    ],
+    "fs/storage_ext4_journal.c": [
+      "fs/ext4/journal.c"
+    ],
+    "fs/storage_ext4_mount.c": [
+      "fs/ext4/mount.c"
+    ],
+    "fs/storage_ext4_ops.c": [
+      "fs/ext4/ops.c"
+    ],
+    "fs/storage_ext4_vfs.c": [
+      "fs/ext4/vfs.c"
+    ],
+    "fs/storage_ext4_xattr.c": [
+      "fs/ext4/xattr.c"
+    ],
+    "fs/storage_fat32.c": [
+      "fs/fat/fat32_alloc.c",
+      "fs/fat/fat32_dir.c",
+      "fs/fat/fat32_io.c",
+      "fs/fat/fat32_mount.c",
+      "fs/fat/fat32_name.c",
+      "block/install/storage_identify.c"
+    ],
+    "fs/storage_inode.c": [
+      "fs/vfs/inode.c"
+    ],
+    "fs/storage_iso.c": [
+      "fs/iso9660/iso.c"
+    ],
+    "fs/storage_mount.c": [
+      "fs/vfs/mount.c"
+    ],
+    "fs/storage_mounts.c": [
+      "fs/vfs/mounts.c"
+    ],
+    "fs/storage_permissions.c": [
+      "fs/security/permissions.c"
+    ],
+    "fs/storage_sidecar.c": [
+      "fs/security/sidecar.c"
+    ],
+    "fs/storage_statfs.c": [
+      "fs/vfs/statfs.c"
+    ],
+    "fs/storage_tmpfs.c": [
+      "fs/tmpfs/tmpfs.c"
+    ],
+    "fs/storage_vfs.c": [
+      "fs/vfs/vfs_dir.c",
+      "fs/vfs/vfs_namespace.c",
+      "fs/vfs/vfs_path.c",
+      "fs/vfs/vfs_read.c",
+      "fs/vfs/vfs_special.c",
+      "fs/vfs/vfs_stat.c",
+      "fs/vfs/vfs_write.c"
+    ],
+    "fs/sysfs.c": [
+      "fs/sysfs/sysfs.c"
+    ],
+    "fs/tmpfs.c": [
+      "fs/tmpfs/core.c"
+    ],
+    "block/storage_block.c": [
+      "block/core/storage_block.c"
+    ],
+    "block/storage_devlinks.c": [
+      "block/device/storage_devlinks.c"
+    ],
+    "block/storage_disk.c": [
+      "block/partition/disk_io.c",
+      "block/partition/partition_gpt.c",
+      "block/partition/partition_install.c",
+      "block/partition/partition_mount.c"
+    ],
+    "block/storage_identity.c": [
+      "block/partition/storage_identity.c"
+    ],
+    "block/storage_installer.c": [
+      "block/install/storage_installer.c"
+    ],
+    "block/storage_internal.h": [
+      "block/core/storage_hardware.h",
+      "block/core/storage_types.h",
+      "block/core/storage_core_api.h",
+      "block/core/storage_driver.h",
+      "block/core/storage_internal.h",
+      "block/partition/storage_partition.h",
+      "fs/fs_internal.h",
+      "fs/fs_mount_api.h",
+      "fs/ext4/storage_ext4_types.h",
+      "fs/ext4/internal.h"
+    ],
+    "block/storage_state.c": [
+      "block/core/storage_state.c"
+    ],
+    "block/storage_state_data.c": [
+      "block/core/storage_state_data.c"
+    ],
+    "block/storage_sync.c": [
+      "block/core/storage_sync.c"
+    ],
+    "drivers/video/drm/drm_vmwgfx_caps.c": [
+      "drivers/video/drm/vmwgfx/caps.c"
+    ],
+    "drivers/video/drm/drm_vmwgfx_execbuf.c": [
+      "drivers/video/drm/vmwgfx/retire.c",
+      "drivers/video/drm/vmwgfx/execbuf.c",
+      "drivers/video/drm/vmwgfx/fence.c",
+      "drivers/video/drm/vmwgfx/validate.c",
+      "drivers/video/drm/vmwgfx/translate.c",
+      "drivers/video/drm/vmwgfx/continuation.c"
+    ],
+    "drivers/video/drm/drm_vmwgfx_execbuf_parser.c": [
+      "drivers/video/drm/vmwgfx/execbuf_parser.c"
+    ],
+    "drivers/video/drm/drm_vmwgfx_execbuf_parser.h": [
+      "drivers/video/drm/vmwgfx/execbuf_parser.h"
+    ],
+    "drivers/video/drm/drm_vmwgfx_resource.c": [
+      "drivers/video/drm/vmwgfx/resource.c"
+    ],
+    "arch/x86_64/apic.c": [
+      "arch/x86_64/interrupt/apic.c"
+    ],
+    "arch/x86_64/arch.c": [
+      "arch/x86_64/boot/arch.c"
+    ],
+    "arch/x86_64/boot.S": [
+      "arch/x86_64/boot/boot.S"
+    ],
+    "arch/x86_64/cpuinfo.c": [
+      "arch/x86_64/cpu/cpuinfo.c"
+    ],
+    "arch/x86_64/gdt.c": [
+      "arch/x86_64/cpu/gdt.c"
+    ],
+    "arch/x86_64/idt.c": [
+      "arch/x86_64/interrupt/idt.c"
+    ],
+    "arch/x86_64/irq.c": [
+      "arch/x86_64/interrupt/irq.c"
+    ],
+    "arch/x86_64/multiboot2.c": [
+      "arch/x86_64/boot/multiboot2.c"
+    ],
+    "arch/x86_64/paging.c": [
+      "arch/x86_64/mm/paging.c"
+    ],
+    "arch/x86_64/pci.c": [
+      "arch/x86_64/platform/pci.c"
+    ],
+    "arch/x86_64/pci_irq.c": [
+      "arch/x86_64/platform/pci_irq.c"
+    ],
+    "arch/x86_64/platform.c": [
+      "arch/x86_64/platform/platform.c"
+    ],
+    "arch/x86_64/power.c": [
+      "arch/x86_64/platform/power.c"
+    ],
+    "arch/x86_64/scheduler_stack.S": [
+      "arch/x86_64/cpu/scheduler_stack.S"
+    ],
+    "arch/x86_64/smp.c": [
+      "arch/x86_64/cpu/smp.c"
+    ],
+    "arch/x86_64/smp_trampoline.S": [
+      "arch/x86_64/cpu/smp_trampoline.S"
+    ],
+    "mm/heap.c": [
+      "mm/heap/heap.c"
+    ],
+    "mm/mm.c": [
+      "mm/physical/mm.c"
+    ],
+    "mm/page_cache.c": [
+      "mm/cache/page_cache.c"
+    ],
+    "net/net.c": [
+      "net/core.c",
+      "net/input.c",
+      "net/interface/config.c",
+      "net/ipv4/core.c",
+      "net/ipv4/icmp.c",
+      "net/ipv4/udp.c",
+      "net/link/arp.c",
+      "net/link/ethernet.c",
+      "net/services/dhcp.c",
+      "net/services/dns.c",
+      "net/services/http.c",
+      "net/services/ntp.c",
+      "net/tcp/input.c",
+      "net/tcp/output.c",
+      "net/tcp/socket.c",
+      "net/utility.c"
+    ],
+    "net/net_control.c": [
+      "net/socket/control.c"
+    ],
+    "net/net_packet.c": [
+      "net/socket/packet.c"
+    ],
+    "net/net_udp.c": [
+      "net/socket/udp.c"
+    ],
+    "drivers/video/framebuffer/framebuffer.c": [
+      "drivers/video/framebuffer/glyph.c",
+      "drivers/video/framebuffer/present.c",
+      "drivers/video/framebuffer/color.c",
+      "drivers/video/framebuffer/core.c",
+      "drivers/video/framebuffer/vbe.c",
+      "drivers/video/framebuffer/vmware.c",
+      "drivers/video/framebuffer/panic.c",
+      "drivers/video/framebuffer/draw.c",
+      "drivers/video/framebuffer/desktop_input.c",
+      "drivers/video/framebuffer/desktop.c"
+    ],
+    "drivers/console/console.c": [
+      "drivers/console/render.c",
+      "drivers/console/vt.c",
+      "drivers/console/log.c",
+      "drivers/console/ansi.c",
+      "drivers/console/core.c",
+      "drivers/console/panic.c"
+    ],
+    "drivers/sound/hda/codec.c": [
+      "drivers/sound/hda/codec_probe.c",
+      "drivers/sound/hda/codec.c",
+      "drivers/sound/hda/codec_route.c",
+      "drivers/sound/hda/codec_control.c"
+    ],
+    "drivers/sound/hda/controller.c": [
+      "drivers/sound/hda/controller.c",
+      "drivers/sound/hda/controller_io.c",
+      "drivers/sound/hda/controller_rings.c",
+      "drivers/sound/hda/controller_recovery.c",
+      "drivers/sound/hda/controller_verb.c"
+    ]
+  }
+}

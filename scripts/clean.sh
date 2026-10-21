@@ -52,7 +52,7 @@ fi
 # Explicit list rather than a glob: an unknown entry in the tree is not ours to
 # delete, and this is what makes `clean` auditable. These are the source-relative
 # object directories produced by native Kbuild plus ReliefNT's generated files.
-products="arch block debug drivers firmware fs generated host include kernel kernel-export kernel-install mm net scripts tools vdso"
+products="arch block debug drivers firmware fs generated host include kernel kernel-export kernel-install lib mm net scripts sound tools vdso"
 if [ "$keep" = 0 ]; then
 	for config_file in .config .config.old .config.old.1 .tmp.config; do
 		if [ -e "$resolved/$config_file" ] || [ -L "$resolved/$config_file" ]; then

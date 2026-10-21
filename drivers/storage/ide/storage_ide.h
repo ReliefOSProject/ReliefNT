@@ -4,7 +4,7 @@
 #define RELIEFOS_STORAGE_IDE_H
 
 #include <stdint.h>
-#include "../../block/storage_internal.h"
+#include "../../../block/core/storage_driver.h"
 
 struct ide_device_info {
     uint8_t present;

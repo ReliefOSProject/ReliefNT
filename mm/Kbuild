@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := cache/ heap/ physical/ user/
+
+include $(srctree)/scripts/Makefile.module

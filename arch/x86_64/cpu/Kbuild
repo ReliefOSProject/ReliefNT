@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Objects are owned by this directory; child modules own their own lists.
+obj-y := cpuinfo.o gdt.o scheduler_stack.o smp.o smp_trampoline.o
+
+include $(srctree)/scripts/Makefile.module

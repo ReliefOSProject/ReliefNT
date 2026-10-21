@@ -210,24 +210,23 @@ config-sync: kconfig-tools $(RELIEFNT_O_MARKER)
 	+$(Q)if [ ! -f '$(O)/.config' ]; then $(call RELIEFNT_KCONFIG,defconfig); fi
 	+$(Q)$(call RELIEFNT_KCONFIG,syncconfig)
 
-kernel: config-sync vdso kbuild-fixdep \
+kernel: config-sync vdso prepare-assets prepare-debug kbuild-fixdep \
 	$(RELIEFNT_TARGET_CC_ID) $(RELIEFNT_TARGET_AR_ID) $(RELIEFNT_TARGET_LD_ID) $(RELIEFNT_TARGET_OBJCOPY_ID)
 	+$(Q)$(call RELIEFNT_KBUILD,obj=.)
 
 all: kernel
 
-kerneldebug: config-sync kbuild-fixdep \
+kerneldebug: config-sync prepare-debug kbuild-fixdep \
 	$(RELIEFNT_TARGET_CC_ID) $(RELIEFNT_TARGET_OBJCOPY_ID)
 	+$(Q)$(call RELIEFNT_KBUILD,obj=. ./generated/system/kerneldebug.sys)
 
 boot: kernel
 
 vdso: config-sync kbuild-fixdep $(RELIEFNT_TARGET_CC_ID) $(RELIEFNT_TARGET_AR_ID) $(RELIEFNT_TARGET_LD_ID)
-	+$(Q)$(call RELIEFNT_KBUILD,obj=vdso KBUILD_CFLAGS='$(RELIEFNT_VDSO_CFLAGS)' KBUILD_AFLAGS=)
-	+$(Q)$(call RELIEFNT_KBUILD,obj=. ./vdso/vdso_blob.o)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=vdso)
 
 tools: kbuild-fixdep $(RELIEFNT_HOST_CC_ID) $(RELIEFNT_O_MARKER)
-	+$(Q)$(call RELIEFNT_KBUILD,obj=. $(RELIEFNT_HOST_PROGRAMS))
+	+$(Q)$(call RELIEFNT_KBUILD,obj=tools/host $(RELIEFNT_HOST_PROGRAMS))
 
 fetch: tools
 	$(Q)$(RELIEFNT_SRC)/tools/build/fetch.sh \
@@ -241,7 +240,7 @@ fetch-check: tools
 		--lock $(RELIEFNT_SRC)/configs/dependencies.lock.json \
 		--only unifont
 
-build-info: kbuild-fixdep $(RELIEFNT_HOST_CC_ID) $(RELIEFNT_O_MARKER)
+build-info: tools kbuild-fixdep $(RELIEFNT_HOST_CC_ID) $(RELIEFNT_O_MARKER)
 	+$(Q)$(call RELIEFNT_KBUILD,obj=. ./include/generated/build_info.h)
 
 headers_install: kbuild-fixdep $(RELIEFNT_O_MARKER)
@@ -285,23 +284,18 @@ test-tools: $(RELIEFNT_TEST_HOST_BINS) $(RELIEFNT_TEST_HOST_SANITISED)
 		ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
 		"$$test_binary"; done
 
-.PHONY: vdso-runtime-test
-vdso-runtime-test: kbuild-fixdep $(RELIEFNT_HOST_CC_ID)
-	+$(Q)$(call RELIEFNT_KBUILD,obj=. host/tests/vdso_runtime_test)
+.PHONY: native-runtime-tests vdso-runtime-test boot-logo-runtime-test panic-console-runtime-test test-boot-logo test-panic-console
+# Build shared fixture objects once, including under parallel aggregate goals.
+native-runtime-tests: prepare-assets kbuild-fixdep $(RELIEFNT_HOST_CC_ID)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=tools/tests tools/tests/vdso_runtime_test tools/tests/boot_logo_runtime_test tools/tests/panic_console_runtime_test)
 
-.PHONY: boot-logo-runtime-test test-boot-logo
-boot-logo-runtime-test: kbuild-fixdep $(RELIEFNT_HOST_CC_ID)
-	+$(Q)$(call RELIEFNT_KBUILD,obj=. host/tests/boot_logo_runtime_test)
+vdso-runtime-test boot-logo-runtime-test panic-console-runtime-test: native-runtime-tests
 
 test-boot-logo: boot-logo-runtime-test
-	$(Q)$(O)/host/tests/boot_logo_runtime_test
-
-.PHONY: panic-console-runtime-test test-panic-console
-panic-console-runtime-test: kbuild-fixdep $(RELIEFNT_HOST_CC_ID)
-	+$(Q)$(call RELIEFNT_KBUILD,obj=. host/tests/panic_console_runtime_test)
+	$(Q)$(O)/tools/tests/boot_logo_runtime_test
 
 test-panic-console: panic-console-runtime-test
-	$(Q)$(O)/host/tests/panic_console_runtime_test
+	$(Q)$(O)/tools/tests/panic_console_runtime_test
 
 test-abi:
 	$(Q)$(RELIEFNT_TEST_PYTHON) $(RELIEFNT_SRC)/tools/test_abi_layout.py
@@ -309,7 +303,7 @@ test-abi:
 test-header-export: headers_install
 	$(Q)$(RELIEFNT_TEST_PYTHON) $(RELIEFNT_SRC)/tools/test_header_export.py --out $(O)
 
-test: test-tools test-abi test-header-export test-vdso test-boot-logo test-panic-console
+test: test-tools test-abi test-header-export test-vdso test-boot-logo test-panic-console test-module-layout
 
 install: all headers_install
 	$(Q)set -eu; \
@@ -347,3 +341,13 @@ distclean:
 		O='$(O)' SRC='$(RELIEFNT_SRC)' KEEP_CONFIG=0 \
 		sh $(RELIEFNT_SRC)/scripts/clean.sh; \
 	else printf 'distclean: no owned output at %s\n' '$(O)'; fi
+
+.PHONY: prepare-assets prepare-debug test-module-layout
+prepare-assets: tools
+	+$(Q)$(call RELIEFNT_KBUILD,obj=. ./include/generated/build_info.h ./include/generated/cjk_font.h)
+
+prepare-debug: config-sync kbuild-fixdep $(RELIEFNT_TARGET_CC_ID)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=debug)
+
+test-module-layout:
+	$(Q)$(RELIEFNT_TEST_PYTHON) $(RELIEFNT_SRC)/tools/test_module_layout.py

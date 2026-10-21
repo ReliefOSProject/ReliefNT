@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# This host fixture is opt-in, so production kernel builds do not compile it.
+hostprogs += vdso_runtime_test
+vdso_runtime_test-objs := vdso_runtime_test.o
+HOSTCFLAGS_vdso_runtime_test.o := -std=gnu11 -Wall -Wextra -Werror -O2 -I$(srctree)/include
+HOSTLDLIBS_vdso_runtime_test := -ldl
+
+# The RAM-backed fixture compiles the real painters into distinct host objects.
+hostprogs += boot_logo_runtime_test
+boot_logo_runtime_test-objs := boot_logo_runtime_test.o boot_logo_draw.o boot_logo_framebuffer.o
+$(foreach item,boot_logo_runtime_test boot_logo_draw boot_logo_framebuffer,$(eval HOSTCFLAGS_$(item).o := -std=gnu11 -O2 -g -Wall -Wextra -ffunction-sections -fdata-sections -I$(srctree)/include -I$(srctree)/include/uapi -I$(srctree)/include -I$(objtree)/include))
+HOSTLDLIBS_boot_logo_runtime_test := -Wl,--gc-sections
+$(obj)/boot_logo_framebuffer.o: $(objtree)/include/generated/cjk_font.h
+
+hostprogs += panic_console_runtime_test
+panic_console_runtime_test-objs := panic_console_runtime_test.o boot_logo_draw.o
+HOSTCFLAGS_panic_console_runtime_test.o := -std=gnu11 -O2 -g -Wall -Wextra -ffunction-sections -fdata-sections -I$(srctree)/include -I$(srctree)/include/uapi -I$(srctree)/include -I$(objtree)/include
+HOSTLDLIBS_panic_console_runtime_test := -Wl,--gc-sections
+$(obj)/panic_console_runtime_test.o: $(objtree)/include/generated/cjk_font.h $(objtree)/include/generated/build_info.h

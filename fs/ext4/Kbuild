@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Objects are owned by this directory; child modules own their own lists.
+obj-y := alloc.o cache.o checksum.o dir.o extent.o format.o journal.o mount.o ops.o vfs.o xattr.o
+
+include $(srctree)/scripts/Makefile.module

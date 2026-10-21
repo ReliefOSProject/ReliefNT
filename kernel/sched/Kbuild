@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := accounting.o clone.o core.o exec.o fair.o lookup.o session.o signal.o tables.o task.o timers.o wait.o
+
+include $(srctree)/scripts/Makefile.module

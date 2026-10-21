@@ -1,0 +1,587 @@
+/*
+ * ReliefOS x86_64 interrupt handling: configures the IDT and trap dispatch.
+ * Handles faults, system calls, hardware IRQs, and user page faults.
+ */
+#include <reliefnt/bugcheck.h>
+#include <reliefnt/arch.h>
+#include <reliefnt/console.h>
+#include <reliefnt/lock.h>
+#include <reliefnt/paging.h>
+#include <reliefnt/pty.h>
+#include <reliefnt/sched.h>
+#include <reliefnt/syscall.h>
+#include <reliefnt/time.h>
+#include <reliefnt/userland.h>
+
+#include "../idt.h"
+
+struct __attribute__((packed)) idt_entry {
+    uint16_t offset_low;
+    uint16_t selector;
+    uint8_t ist;
+    uint8_t type_attr;
+    uint16_t offset_mid;
+    uint32_t offset_high;
+    uint32_t zero;
+};
+
+struct __attribute__((packed)) idt_ptr {
+    uint16_t limit;
+    uint64_t base;
+};
+
+static struct idt_entry idt[256];
+/* Lazy executable pages and user-copy faults share storage/page-cache
+ * scratch state. Serialize that transaction without disabling local timer
+ * interrupts, so another CPU can continue scheduling while one CPU reads a
+ * backing page. */
+static struct kernel_spinlock user_page_fault_lock = KERNEL_SPINLOCK_INIT;
+
+extern void x86_64_lidt(const struct idt_ptr *ptr);
+extern void isr0_stub(void);
+extern void isr1_stub(void);
+extern void isr2_stub(void);
+extern void isr3_stub(void);
+extern void isr4_stub(void);
+extern void isr5_stub(void);
+extern void isr6_stub(void);
+extern void isr7_stub(void);
+extern void isr8_stub(void);
+extern void isr9_stub(void);
+extern void isr10_stub(void);
+extern void isr11_stub(void);
+extern void isr12_stub(void);
+extern void isr13_stub(void);
+extern void isr14_stub(void);
+extern void isr15_stub(void);
+extern void isr16_stub(void);
+extern void isr17_stub(void);
+extern void isr18_stub(void);
+extern void isr19_stub(void);
+extern void isr20_stub(void);
+extern void isr21_stub(void);
+extern void isr22_stub(void);
+extern void isr23_stub(void);
+extern void isr24_stub(void);
+extern void isr25_stub(void);
+extern void isr26_stub(void);
+extern void isr27_stub(void);
+extern void isr28_stub(void);
+extern void isr29_stub(void);
+extern void isr30_stub(void);
+extern void isr31_stub(void);
+extern void isr80_stub(void);
+extern void irq0_stub(void);
+extern void irq1_stub(void);
+extern void irq2_stub(void);
+extern void irq3_stub(void);
+extern void irq4_stub(void);
+extern void irq5_stub(void);
+extern void irq6_stub(void);
+extern void irq7_stub(void);
+extern void irq8_stub(void);
+extern void irq9_stub(void);
+extern void irq10_stub(void);
+extern void irq11_stub(void);
+extern void irq12_stub(void);
+extern void irq13_stub(void);
+extern void irq14_stub(void);
+extern void irq15_stub(void);
+extern void irq32_stub(void);
+extern void irq_membarrier_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_50_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_51_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_52_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_53_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_54_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_55_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_56_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_57_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_58_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_59_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_5a_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_5b_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_5c_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_5d_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_5e_stub(void);
+/** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
+extern void irq_msi_5f_stub(void);
+extern void irqff_stub(void);
+extern uint64_t x86_64_read_cr2(void);
+
+/**
+ * Idt set.
+ * @param vector Identifier or flags controlling the operation.
+ * @param handler Value supplied by the caller.
+ * @param dpl Identifier or flags controlling the operation.
+ */
+static void idt_set(uint8_t vector, void *handler, uint8_t dpl)
+{
+    uint64_t addr = (uint64_t)(uintptr_t)handler;
+    idt[vector].offset_low = addr & 0xffff;
+    idt[vector].selector = RELIEFNT_KERNEL_CS;
+    idt[vector].ist = 0;
+    idt[vector].type_attr = (uint8_t)(0x8e | ((dpl & 3) << 5));
+    idt[vector].offset_mid = (addr >> 16) & 0xffff;
+    idt[vector].offset_high = (uint32_t)(addr >> 32);
+    idt[vector].zero = 0;
+}
+
+/* Select a TSS interrupt-stack-table slot after installing a gate.  The IDT
+ * stores IST as a three-bit value where zero means "use the current stack". */
+static void idt_set_ist(uint8_t vector, uint8_t ist)
+{
+    idt[vector].ist = ist & 7u;
+}
+
+/**
+ * Load the shared IDT descriptor on the current CPU.
+ */
+void idt_load(void)
+{
+    struct idt_ptr ptr = {
+        .limit = sizeof(idt) - 1,
+        .base = (uint64_t)(uintptr_t)idt,
+    };
+    x86_64_lidt(&ptr);
+}
+
+/**
+ * Idt init.
+ */
+void idt_init(void)
+{
+    kernel_spin_init(&user_page_fault_lock);
+    idt_set(0, isr0_stub, 0);
+    idt_set(1, isr1_stub, 0);
+    idt_set(2, isr2_stub, 0);
+    idt_set(3, isr3_stub, 0);
+    idt_set(4, isr4_stub, 0);
+    idt_set(5, isr5_stub, 0);
+    idt_set(6, isr6_stub, 0);
+    idt_set(7, isr7_stub, 0);
+    idt_set(8, isr8_stub, 0);
+    idt_set(9, isr9_stub, 0);
+    idt_set(10, isr10_stub, 0);
+    idt_set(11, isr11_stub, 0);
+    idt_set(12, isr12_stub, 0);
+    idt_set(13, isr13_stub, 0);
+    idt_set(14, isr14_stub, 0);
+    idt_set(15, isr15_stub, 0);
+    idt_set(16, isr16_stub, 0);
+    idt_set(17, isr17_stub, 0);
+    idt_set(18, isr18_stub, 0);
+    idt_set(19, isr19_stub, 0);
+    idt_set(20, isr20_stub, 0);
+    idt_set(21, isr21_stub, 0);
+    idt_set(22, isr22_stub, 0);
+    idt_set(23, isr23_stub, 0);
+    idt_set(24, isr24_stub, 0);
+    idt_set(25, isr25_stub, 0);
+    idt_set(26, isr26_stub, 0);
+    idt_set(27, isr27_stub, 0);
+    idt_set(28, isr28_stub, 0);
+    idt_set(29, isr29_stub, 0);
+    idt_set(30, isr30_stub, 0);
+    idt_set(31, isr31_stub, 0);
+    /* These faults are the ones most likely to arrive after the current
+     * kernel stack or return frame has already become unusable.  Keep their
+     * entry path independent so the normal bugcheck screen can still run. */
+    idt_set_ist(2, 2);
+    idt_set_ist(8, 1);
+    idt_set_ist(18, 3);
+    idt_set(0x20, irq0_stub, 0);
+    idt_set(0x21, irq1_stub, 0);
+    idt_set(0x22, irq2_stub, 0);
+    idt_set(0x23, irq3_stub, 0);
+    idt_set(0x24, irq4_stub, 0);
+    idt_set(0x25, irq5_stub, 0);
+    idt_set(0x26, irq6_stub, 0);
+    idt_set(0x27, irq7_stub, 0);
+    idt_set(0x28, irq8_stub, 0);
+    idt_set(0x29, irq9_stub, 0);
+    idt_set(0x2a, irq10_stub, 0);
+    idt_set(0x2b, irq11_stub, 0);
+    idt_set(0x2c, irq12_stub, 0);
+    idt_set(0x2d, irq13_stub, 0);
+    idt_set(0x2e, irq14_stub, 0);
+    idt_set(0x2f, irq15_stub, 0);
+    for (uint8_t vector = 0x30; vector < 0x50; ++vector) {
+        idt_set(vector, irq32_stub, 0);
+    }
+    /* Local APIC uses 0xff as the architectural spurious-interrupt vector.
+     * A valid gate is required even though the handler only acknowledges and
+     * discards the interrupt; otherwise the CPU raises #GP with an IDT error
+     * code of (0xff << 3) | 2. */
+    idt_set(0x41, irq_membarrier_stub, 0);
+    idt_set(0x50, irq_msi_50_stub, 0);
+    idt_set(0x51, irq_msi_51_stub, 0);
+    idt_set(0x52, irq_msi_52_stub, 0);
+    idt_set(0x53, irq_msi_53_stub, 0);
+    idt_set(0x54, irq_msi_54_stub, 0);
+    idt_set(0x55, irq_msi_55_stub, 0);
+    idt_set(0x56, irq_msi_56_stub, 0);
+    idt_set(0x57, irq_msi_57_stub, 0);
+    idt_set(0x58, irq_msi_58_stub, 0);
+    idt_set(0x59, irq_msi_59_stub, 0);
+    idt_set(0x5a, irq_msi_5a_stub, 0);
+    idt_set(0x5b, irq_msi_5b_stub, 0);
+    idt_set(0x5c, irq_msi_5c_stub, 0);
+    idt_set(0x5d, irq_msi_5d_stub, 0);
+    idt_set(0x5e, irq_msi_5e_stub, 0);
+    idt_set(0x5f, irq_msi_5f_stub, 0);
+    idt_set(0xff, irqff_stub, 0);
+    /* Syscalls may select a different address space before returning. Use an
+     * interrupt gate so a local timer cannot nest inside that decision and
+     * overwrite current_pid/running_cpu between frame selection and iretq.
+     * DPL=3 still permits Ring-3 int $0x80 entry. */
+    idt_set(0x80, isr80_stub, 3);
+    idt_load();
+}
+
+/**
+ * Exception dispatch.
+ * @param vector Identifier or flags controlling the operation.
+ * @param error Value supplied by the caller.
+ * @param rip Value supplied by the caller.
+ * @param cs Value supplied by the caller.
+ * @param rflags Value supplied by the caller.
+ * @param rsp Value supplied by the caller.
+ * @param ss Value supplied by the caller.
+ */
+void exception_dispatch(uint64_t vector, uint64_t error, uint64_t rip, uint64_t cs,
+                        uint64_t rflags, uint64_t rsp, uint64_t ss)
+{
+    uint64_t cr2 = x86_64_read_cr2();
+    /* Fatal output must bypass the ordinary console lock, even for #DF/NMI. */
+    bugcheck_exception(vector, error, rip, cs, rflags, rsp, ss, cr2);
+}
+
+/**
+ * @brief Deliver a user #GP as forced SIGSEGV, leaving kernel #GP fatal.
+ * @param frame Complete trap frame built by the dedicated vector-13 entry stub.
+ * @return The task selected by the normal scheduler, or NULL on an invalid scheduler return.
+ */
+struct task *general_protection_dispatch(struct trap_frame *frame)
+{
+    if (!frame) {
+        bugcheck_exception(13, 0, 0, 0, 0, 0, 0, x86_64_read_cr2());
+    }
+    if (frame->vector != 13) {
+        exception_dispatch(frame->vector, frame->error, frame->rip, frame->cs,
+                           frame->rflags, 0, 0);
+    }
+    if ((frame->cs & 3ULL) != 3ULL) {
+        /* Kernel-mode faults retain the existing fatal policy.  The generic
+         * entry supplied zero for RSP/SS when CPL did not change. */
+        exception_dispatch(frame->vector, frame->error, frame->rip, frame->cs,
+                           frame->rflags, 0, 0);
+    }
+
+    struct task *task = sched_current_task();
+    if (!task || task->kind != TASK_KIND_USER) {
+        bugcheck_trap("User General Protection Fault without user task", frame,
+                      x86_64_read_cr2());
+    }
+
+    /* #GP has no fault address.  CR2 belongs to the last page fault and must
+     * not be exposed as si_addr for this synchronous SIGSEGV. */
+    kernel_signal_force_fault(task, LINUX_SIGSEGV, LINUX_SI_KERNEL, 0);
+    return userland_schedule_from_frame(frame);
+}
+
+/**
+ * Pf append char.
+ * @param buf Value supplied by the caller.
+ * @param pos Output storage updated by the function.
+ * @param cap Maximum number of elements available in the related buffer.
+ * @param ch Value supplied by the caller.
+ */
+static void pf_append_char(char *buf, uint32_t *pos, uint32_t cap, char ch)
+{
+    if (!buf || !pos || cap == 0 || *pos + 1 >= cap) {
+        return;
+    }
+    buf[*pos] = ch;
+    ++(*pos);
+    buf[*pos] = 0;
+}
+
+/**
+ * Pf append text.
+ * @param buf Value supplied by the caller.
+ * @param pos Output storage updated by the function.
+ * @param cap Maximum number of elements available in the related buffer.
+ * @param text NUL-terminated text supplied by the caller.
+ */
+static void pf_append_text(char *buf, uint32_t *pos, uint32_t cap, const char *text)
+{
+    if (!text) {
+        return;
+    }
+    while (*text) {
+        pf_append_char(buf, pos, cap, *text++);
+    }
+}
+
+/**
+ * Pf append u64 dec.
+ * @param buf Value supplied by the caller.
+ * @param pos Output storage updated by the function.
+ * @param cap Maximum number of elements available in the related buffer.
+ * @param value Value supplied by the caller.
+ */
+static void pf_append_u64_dec(char *buf, uint32_t *pos, uint32_t cap, uint64_t value)
+{
+    char tmp[21];
+    uint32_t n = 0;
+    if (value == 0) {
+        pf_append_char(buf, pos, cap, '0');
+        return;
+    }
+    while (value && n < sizeof(tmp)) {
+        tmp[n++] = (char)('0' + (value % 10ULL));
+        value /= 10ULL;
+    }
+    while (n) {
+        pf_append_char(buf, pos, cap, tmp[--n]);
+    }
+}
+
+/**
+ * Pf append u64 hex.
+ * @param buf Value supplied by the caller.
+ * @param pos Output storage updated by the function.
+ * @param cap Maximum number of elements available in the related buffer.
+ * @param value Value supplied by the caller.
+ */
+static void pf_append_u64_hex(char *buf, uint32_t *pos, uint32_t cap, uint64_t value)
+{
+    static const char hex[] = "0123456789abcdef";
+    int started = 0;
+    pf_append_text(buf, pos, cap, "0x");
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        uint8_t nibble = (uint8_t)((value >> shift) & 0xfu);
+        if (nibble || started || shift == 0) {
+            pf_append_char(buf, pos, cap, hex[nibble]);
+            started = 1;
+        }
+    }
+}
+
+/**
+ * Format user page fault report.
+ * @param buf Value supplied by the caller.
+ * @param cap Maximum number of elements available in the related buffer.
+ * @param task Value supplied by the caller.
+ * @param frame Value supplied by the caller.
+ * @param cr2 Value supplied by the caller.
+ */
+static void format_user_page_fault_report(char *buf, uint32_t cap,
+                                          const struct task *task,
+                                          const struct trap_frame *frame,
+                                          uint64_t cr2)
+{
+    uint32_t pos = 0;
+    if (!buf || cap == 0 || !frame) {
+        return;
+    }
+    buf[0] = 0;
+    pf_append_text(buf, &pos, cap, "A user application caused an unrecoverable Page Fault.\n");
+    pf_append_text(buf, &pos, cap, "PID: ");
+    pf_append_u64_dec(buf, &pos, cap, task ? task->pid : 0);
+    pf_append_text(buf, &pos, cap, "  Name: ");
+    pf_append_text(buf, &pos, cap, task && task->name ? task->name : "(unknown)");
+    pf_append_char(buf, &pos, cap, '\n');
+    pf_append_text(buf, &pos, cap, "Path: ");
+    pf_append_text(buf, &pos, cap, task && task->path[0] ? task->path : "(unknown)");
+    pf_append_char(buf, &pos, cap, '\n');
+    pf_append_text(buf, &pos, cap, "User: ");
+    pf_append_text(buf, &pos, cap, task && task->username[0] ? task->username : "(none)");
+    pf_append_text(buf, &pos, cap, "  UID: ");
+    pf_append_u64_dec(buf, &pos, cap, task ? task->uid : 0);
+    pf_append_text(buf, &pos, cap, "  Role: ");
+    pf_append_text(buf, &pos, cap,
+                   task && task->role == RELIEFOS_AUTH_ROLE_ADMIN ? "Administrator" : "User");
+    pf_append_char(buf, &pos, cap, '\n');
+    pf_append_text(buf, &pos, cap, "Fault address: ");
+    pf_append_u64_hex(buf, &pos, cap, cr2);
+    pf_append_text(buf, &pos, cap, "  Error: ");
+    pf_append_u64_hex(buf, &pos, cap, frame->error);
+    pf_append_char(buf, &pos, cap, '\n');
+    pf_append_text(buf, &pos, cap, "Flags: present=");
+    pf_append_u64_dec(buf, &pos, cap, frame->error & 1ULL);
+    pf_append_text(buf, &pos, cap, " write=");
+    pf_append_u64_dec(buf, &pos, cap, (frame->error >> 1) & 1ULL);
+    pf_append_text(buf, &pos, cap, " user=");
+    pf_append_u64_dec(buf, &pos, cap, (frame->error >> 2) & 1ULL);
+    pf_append_text(buf, &pos, cap, " reserved=");
+    pf_append_u64_dec(buf, &pos, cap, (frame->error >> 3) & 1ULL);
+    pf_append_text(buf, &pos, cap, " fetch=");
+    pf_append_u64_dec(buf, &pos, cap, (frame->error >> 4) & 1ULL);
+    pf_append_char(buf, &pos, cap, '\n');
+    pf_append_text(buf, &pos, cap, "RIP: ");
+    pf_append_u64_hex(buf, &pos, cap, frame->rip);
+    pf_append_text(buf, &pos, cap, "  RSP: ");
+    pf_append_u64_hex(buf, &pos, cap, frame->rsp);
+    pf_append_text(buf, &pos, cap, "  RBP: ");
+    pf_append_u64_hex(buf, &pos, cap, frame->rbp);
+    pf_append_char(buf, &pos, cap, '\n');
+    pf_append_text(buf, &pos, cap, "RAX: ");
+    pf_append_u64_hex(buf, &pos, cap, frame->rax);
+    pf_append_text(buf, &pos, cap, "  RBX: ");
+    pf_append_u64_hex(buf, &pos, cap, frame->rbx);
+    pf_append_text(buf, &pos, cap, "  RCX: ");
+    pf_append_u64_hex(buf, &pos, cap, frame->rcx);
+    pf_append_char(buf, &pos, cap, '\n');
+    pf_append_text(buf, &pos, cap, "RDX: ");
+    pf_append_u64_hex(buf, &pos, cap, frame->rdx);
+    pf_append_text(buf, &pos, cap, "  RSI: ");
+    pf_append_u64_hex(buf, &pos, cap, frame->rsi);
+    pf_append_text(buf, &pos, cap, "  RDI: ");
+    pf_append_u64_hex(buf, &pos, cap, frame->rdi);
+    pf_append_char(buf, &pos, cap, '\n');
+    pf_append_text(buf, &pos, cap, "CS: ");
+    pf_append_u64_hex(buf, &pos, cap, frame->cs);
+    pf_append_text(buf, &pos, cap, "  RFLAGS: ");
+    pf_append_u64_hex(buf, &pos, cap, frame->rflags);
+    pf_append_text(buf, &pos, cap, "  Ticks: ");
+    pf_append_u64_dec(buf, &pos, cap, time_ticks());
+}
+
+/**
+ * Queue a synchronous Linux fault while the task and address space are pinned.
+ * @param frame Value supplied by the caller.
+ * @param cr2 Value supplied by the caller.
+ */
+static void signal_user_page_fault(struct trap_frame *frame, uint64_t cr2)
+{
+    struct task *task = sched_current_task();
+    char report[RELIEFOS_FS_PATH_LEN];
+    if (!task || task->kind != TASK_KIND_USER) {
+        bugcheck_trap("Unhandled Page Fault", frame, cr2);
+    }
+    format_user_page_fault_report(report, sizeof(report), task, frame, cr2);
+    uint32_t signal = task->page_fault_signal == 7 ? 7 : 11;
+    console_warn("[reliefnt] user page fault signal=%u pid=%u name=%s cr2=0x%llx rip=0x%llx error=0x%llx\n",
+                   signal,
+                   task->pid,
+                   task->name,
+                   (unsigned long long)cr2,
+                   (unsigned long long)frame->rip,
+                   (unsigned long long)frame->error);
+    kernel_signal_force_fault(task, signal, syscall_page_fault_signal_code(task, cr2), cr2);
+}
+
+/**
+ * Page fault dispatch.
+ * @param frame Value supplied by the caller.
+ * @return The value or status produced by the operation.
+ */
+struct task *page_fault_dispatch(struct trap_frame *frame)
+{
+    uint64_t cr2 = x86_64_read_cr2();
+    uint64_t execution_flags;
+
+    /* Kernel faults outside the supported user range cannot be demand paging
+     * or COW usercopy. Report them before taking locks the fault may interrupt. */
+    if (frame && (frame->cs & 3u) != 3u &&
+        (cr2 < RELIEFNT_USER_BASE || cr2 >= RELIEFNT_USER_TOP))
+        bugcheck_trap("Unhandled Page Fault", frame, cr2);
+
+    /* Independent demand-zero faults do not touch VFS/device scratch state.
+     * Only user-mode faults may take the non-nesting read gate; kernel-mode
+     * usercopy faults can already own the recursive exclusive transaction.
+     * Returning NULL resumes the faulting instruction without an artificial
+     * context switch on every anonymous page. Timer preemption still applies. */
+    if (frame && (frame->cs & 3ULL) == 3ULL &&
+        kernel_execution_try_read_lock_irqsave(&execution_flags)) {
+        int handled = syscall_handle_private_anon_fault(sched_current_task(), cr2, frame->error);
+        kernel_execution_read_unlock_irqrestore(execution_flags);
+        if (handled) return NULL;
+    }
+
+    /* A lazy page-in touches the same VFS and device state as a filesystem
+     * syscall.  Share the transaction boundary with syscalls so page faults
+     * cannot reprogram AHCI or mutate filesystem caches midway through an
+     * ordinary operation.  The execution lock is reentrant for a fault that
+     * occurs while the same CPU copies user memory inside a syscall. */
+    kernel_execution_lock_irqsave(&execution_flags);
+    kernel_spin_lock(&user_page_fault_lock);
+
+    if (frame && syscall_handle_user_page_fault(cr2, frame->error)) {
+        /**
+ * @brief Kernel helpers may write a current user's COW buffer while serving a syscall. Its page is now private, so resume the interrupted kernel instruction instead of trying to iret through a kernel-mode trap frame.
+ */
+        if ((frame->cs & 3ULL) != 3ULL) {
+            kernel_spin_unlock(&user_page_fault_lock);
+            kernel_execution_unlock_irqrestore(execution_flags);
+            return NULL;
+        }
+        /**
+ * @brief A lazy file-backed page may require a synchronous FAT read. Switch away after each resolved fault so a newly-starting app cannot hold the desktop in a long run of consecutive page-ins.
+ */
+        kernel_spin_unlock(&user_page_fault_lock);
+        kernel_execution_unlock_irqrestore(execution_flags);
+        return userland_schedule_from_frame(frame);
+    }
+    if (!frame) {
+        kernel_spin_unlock(&user_page_fault_lock);
+        kernel_execution_unlock_irqrestore(execution_flags);
+        bugcheck_exception(14, 0, 0, 0, 0, 0, 0, cr2);
+    }
+    if ((frame->cs & 3ULL) == 3ULL) {
+        console_fatal("[reliefnt] page fault unhandled cr2=0x%llx error=0x%llx rip=0x%llx cs=0x%llx\n",
+                       (unsigned long long)cr2,
+                       (unsigned long long)frame->error,
+                       (unsigned long long)frame->rip,
+                       (unsigned long long)frame->cs);
+        console_fatal("[reliefnt] page fault flags present=%u write=%u user=%u reserved=%u fetch=%u\n",
+                       (unsigned)(frame->error & 1u),
+                       (unsigned)((frame->error >> 1) & 1u),
+                       (unsigned)((frame->error >> 2) & 1u),
+                       (unsigned)((frame->error >> 3) & 1u),
+                       (unsigned)((frame->error >> 4) & 1u));
+        kernel_spin_unlock(&user_page_fault_lock);
+        signal_user_page_fault(frame, cr2);
+        kernel_execution_unlock_irqrestore(execution_flags);
+        return userland_schedule_from_frame(frame);
+    }
+    kernel_spin_unlock(&user_page_fault_lock);
+    kernel_execution_unlock_irqrestore(execution_flags);
+    bugcheck_trap("Unhandled Page Fault", frame, cr2);
+}
+
+/**
+ * Int80 dispatch.
+ * @param frame Value supplied by the caller.
+ * @return The value or status produced by the operation.
+ */
+struct task *int80_dispatch(struct trap_frame *frame)
+{
+    struct task *resume = syscall_dispatch_frame(frame);
+    return resume ? resume : userland_schedule_from_frame(frame);
+}
+
+/* Called only when the assembly syscall return path could not obtain a
+ * validated user frame.  Returning through the stale frame would turn a
+ * scheduler consistency bug into an unreportable triple fault. */
+__attribute__((noreturn)) void arch_schedule_failure(struct trap_frame *frame)
+{
+    bugcheck_trap("Scheduler Return Failure", frame, x86_64_read_cr2());
+}

@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := ansi.o core.o log.o ostui.o panic.o render.o vt.o
+
+include $(srctree)/scripts/Makefile.module

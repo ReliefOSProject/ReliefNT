@@ -12,7 +12,7 @@ ReliefOS-specific extensions. Neither i386 nor x32 is included.
   Public libc structures may differ: TCGETS transfers 36 bytes although musl's
   public termios is larger; musl performs the kernel conversion.
 - Kernel-only objects, scheduler state, pointers and helper declarations stay
-  under `kernel/reliefnt/include`. Public ReliefOS convenience functions stay in
+  under `include/reliefnt`. Public ReliefOS convenience functions stay in
   `include/reliefos` or `userland/libc/include/reliefos` and import these definitions.
 - musl sources and headers remain upstream. Verify their actual installed
   headers against UAPI with `python3 build.py test musl-abi`. Never patch a
@@ -35,7 +35,7 @@ Permission wire records use independent 32-bit UID/GID values and Linux mode
 bits. `linux/stat.h`, `linux/statfs.h`, `linux/fcntl.h` and `linux/errno.h` are
 shared declarations, not duplicate libc policy. The kernel's internal
 mode/UID/GID triple is not a published ABI and lives in
-`kernel/reliefnt/include/reliefnt/storage.h`; userland observes and changes POSIX
+`include/reliefnt/storage.h`; userland observes and changes POSIX
 permissions only through stat/chmod/chown.
 On FAT/exFAT, version-1 ACL records remain readable and gain explicit POSIX
 metadata on their next write. ext2 uses its native inode fields. Legacy calls

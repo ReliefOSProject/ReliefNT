@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := descriptor.o flock.o legacy_descriptors.o pty_descriptor.o
+
+include $(srctree)/scripts/Makefile.module

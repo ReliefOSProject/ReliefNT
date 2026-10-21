@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := input.o output.o socket.o
+
+include $(srctree)/scripts/Makefile.module

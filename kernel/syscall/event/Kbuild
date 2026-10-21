@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := epoll.o legacy_events.o poll.o timerfd.o
+
+include $(srctree)/scripts/Makefile.module

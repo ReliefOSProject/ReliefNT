@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := ipc.o legacy_ipc.o socket.o socket_batch.o sysv_msg.o sysv_sem.o sysv_shm.o
+
+include $(srctree)/scripts/Makefile.module

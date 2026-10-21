@@ -11,8 +11,10 @@
   Linux 6.12 Kbuild/Kconfig 文件提供；适配只放在 `Kbuild`、`scripts/Makefile.reliefnt`
   和 `scripts/Makefile.port`。不得改写导入的 `scripts/Makefile.*`、`basic/`、
   `kconfig/`、`include/` 或许可证文件来绕过上游规则。
-- `Kbuild` 保持 C 对象 C-locale 排序、ASM 对象 C-locale 排序及最后的嵌入 vDSO
-  对象。改动源清单时先核对 [迁移审计记录](docs/KBUILD_MIGRATION_AUDIT.md)。
+- 每个自研代码目录用自己的 `Kbuild` 显式列出本目录对象和直接子目录；根
+  `Kbuild` 只遍历子系统并集成顶层产物。不得恢复全局源码清单、通配扫描或
+  通过包含实现 `.c`/`.inc` 文件代替独立编译。目录与迁移对应见
+  [模块说明](docs/KERNEL_MODULES.md) 和历史源码映射；审计清单不参与构建。
 - `.config` 只承载内核实际消费的 Kconfig 符号；镜像/产品配置留在 ReliefOS 父仓。
   `PROFILE`、`EXTRAVERSION`、`LOCALVERSION` 和工具链覆盖仍由独立入口提供。
 - `configs/build-version` 是版本输入，生成文件只写输出目录。更改版本时同步

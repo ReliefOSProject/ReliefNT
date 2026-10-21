@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := alsa_control.o alsa_pcm.o core.o device.o mixer.o oss.o pcm.o pcm_buffer.o pcm_format.o pcm_mapping.o pcm_transfer.o storage_audio.o timer.o
+
+include $(srctree)/scripts/Makefile.module

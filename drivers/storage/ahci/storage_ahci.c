@@ -1,4 +1,8 @@
-#include "../../../block/storage_internal.h"
+#include "../../../block/core/storage_driver.h"
+#include "../../../block/core/storage_core_api.h"
+#include <reliefnt/sched.h>
+#include <reliefnt/syscall.h>
+#include <reliefnt/time.h>
 
 /* Driver-private in-flight command slot: shared with the host test fixture
  * that textually includes this driver, but with no other translation unit. */

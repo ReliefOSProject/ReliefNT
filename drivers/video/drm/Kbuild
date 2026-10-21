@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Objects are owned by this directory; child modules own their own lists.
+obj-y := drm_bo.o drm_device.o drm_faildiag.o drm_file.o drm_ioctl.o drm_kms.o drm_prime.o vmwgfx/
+
+include $(srctree)/scripts/Makefile.module

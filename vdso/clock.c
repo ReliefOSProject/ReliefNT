@@ -1,6 +1,6 @@
 #include <stdint.h>
 
-#include "reliefnt/vdso_data.h"
+#include "../include/reliefnt/vdso_data.h"
 
 #define VDSO_CLOCK_REALTIME 0
 #define VDSO_CLOCK_MONOTONIC 1

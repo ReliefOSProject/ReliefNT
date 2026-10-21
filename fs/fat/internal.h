@@ -1,0 +1,89 @@
+#ifndef RELIEFNT_FS_FAT_FAT32_C_INTERNAL_H
+#define RELIEFNT_FS_FAT_FAT32_C_INTERNAL_H
+
+#include "../../block/core/storage_internal.h"
+
+
+
+
+int fat32_mount(void);
+
+int fat32_read_fat_entry(uint32_t cluster, uint32_t *out_next);
+
+int storage_read_cache_lookup(uint32_t cluster, uint32_t *out_offset,
+                                     uint32_t *out_clusters);
+
+int storage_read_contiguous_clusters(uint32_t first_cluster,
+                                            uint32_t max_clusters,
+                                            uint32_t *out_clusters,
+                                            uint32_t *out_next);
+
+int storage_read_cache_fill(uint32_t first_cluster, uint32_t clusters);
+
+int fat32_read_lookup_cluster(uint32_t cluster, void *buffer);
+
+int fat32_write_fat_entry(uint32_t cluster, uint32_t value);
+
+int fat32_note_allocated(void);
+
+int fat32_note_freed(void);
+
+int fat32_read_cluster(uint32_t cluster, void *buffer);
+
+int fat32_write_cluster(uint32_t cluster, const void *buffer);
+
+int fat32_make_short_name(const char *name, uint8_t out[11]);
+
+int fat32_find_free_cluster(uint32_t *out_cluster);
+
+int fat32_collect_chain(uint32_t first_cluster, uint32_t chain[FAT32_MAX_FILE_CLUSTERS], uint32_t *out_count);
+
+int fat32_free_chain(uint32_t first_cluster);
+
+int fat32_name_match_short(const struct fat32_dirent *de, const char *name);
+
+void fat32_lfn_extract_utf16(const struct fat32_lfn *lfn, uint16_t *dst,
+                                    uint32_t *len, uint32_t cap);
+
+void fat32_build_lfn_name(const uint16_t lfn_parts[20][13], uint32_t lfn_count,
+                                 char *dst, uint32_t cap);
+
+int fat32_validate_name(const char *name);
+
+int fat32_make_short_alias(uint32_t dir_cluster, const char *name, uint8_t out[11]);
+
+uint8_t fat32_short_name_checksum(const uint8_t short_name[11]);
+
+uint32_t fat32_utf16_name(const char *name, uint16_t *utf16, uint32_t cap);
+
+uint32_t fat32_lfn_entry_count(const char *name);
+
+void fat32_fill_lfn_entry(struct fat32_lfn *lfn,
+                                 const uint16_t *name, uint32_t name_len,
+                                 uint32_t part_index, uint32_t part_count,
+                                 uint8_t checksum);
+
+int fat32_find_in_dir(uint32_t dir_cluster, const char *name, struct storage_node *out);
+
+int fat32_find_dirent_ref_in_dir(uint32_t dir_cluster, const char *name, struct fat32_dir_ref *out);
+
+int fat32_update_dirent(const struct fat32_dir_ref *ref);
+
+int fat32_name_needs_lfn(const char *name, uint8_t short_name[11], uint8_t *need_lfn);
+
+int fat32_find_free_dirent_span(uint32_t dir_cluster, uint32_t slots,
+                                       struct fat32_dir_span *out);
+
+int fat32_create_dirent(uint32_t parent_cluster, const char *name, uint8_t attr,
+                               uint32_t first_cluster, uint32_t size);
+
+int fat32_delete_dirent(uint32_t dir_cluster, const char *name,
+                               struct fat32_dirent *deleted);
+
+int fat32_delete_acl_metadata_file(uint32_t dir_cluster);
+
+int fat32_dir_is_empty(uint32_t dir_cluster);
+
+int fat32_iter_dir_entry(uint32_t dir_cluster, uint64_t index, struct reliefos_dir_entry *entry);
+
+#endif

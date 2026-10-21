@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # The vDSO is a standalone ELF, then its exact bytes are embedded in the kernel.
+obj-y := vdso_blob.o
 always-y += clock.o vdso.so vdso_blob.S
+ccflags-remove-y := $(KBUILD_CFLAGS)
+CFLAGS_clock.o := $(RELIEFNT_VDSO_CFLAGS)
 targets += clock.o vdso.so vdso_blob.S
 
 $(obj)/clock.o: $(objtree)/.reliefnt-target-cc.id

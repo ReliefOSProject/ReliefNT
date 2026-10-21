@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := arp.o ethernet.o
+
+include $(srctree)/scripts/Makefile.module

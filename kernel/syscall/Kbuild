@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := device/ event/ fd/ fs/ io/ ipc/ memory/ process/ system/ time/ dispatch.o entry.o
+
+include $(srctree)/scripts/Makefile.module

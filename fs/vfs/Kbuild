@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Objects are owned by this directory; child modules own their own lists.
+obj-y := inode.o mount.o mounts.o object.o statfs.o vfs_dir.o vfs_namespace.o vfs_path.o vfs_read.o vfs_special.o vfs_stat.o vfs_write.o
+
+include $(srctree)/scripts/Makefile.module

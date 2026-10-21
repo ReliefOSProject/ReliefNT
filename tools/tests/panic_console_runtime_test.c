@@ -3,9 +3,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "../../drivers/video/framebuffer/framebuffer.c"
-#include "../../drivers/console/console.c"
-#include "../../kernel/reliefnt/lib/bugcheck.c"
+#include "modules/framebuffer.h"
+#include "modules/console.h"
+#include "../../lib/bugcheck.c"
 
 #define WIDTH 640u
 #define HEIGHT 640u

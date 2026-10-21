@@ -4,7 +4,7 @@
 
 RELIEFNT_INCLUDE_FLAGS := \
     -I$(O)/include \
-    -I$(RELIEFNT_SRC)/kernel/reliefnt/include \
+    -I$(RELIEFNT_SRC)/include \
     -I$(RELIEFNT_SRC)/include/uapi \
     -I$(RELIEFNT_SRC)/include
 
@@ -27,7 +27,7 @@ RELIEFNT_VDSO_CFLAGS := $(RELIEFNT_OPTIMIZATION_FLAGS) -std=c11 \
     -ffreestanding -fPIC -fvisibility=hidden -fno-builtin \
     -fno-stack-protector -fno-plt -fno-unwind-tables \
     -fno-asynchronous-unwind-tables -mno-red-zone -mgeneral-regs-only \
-    -Wall -Wextra -Werror -I$(RELIEFNT_SRC)/kernel/reliefnt/include
+    -Wall -Wextra -Werror -I$(RELIEFNT_SRC)/include
 
 RELIEFNT_VDSO_LDFLAGS := -m elf_x86_64 -shared -nostdlib \
     -z max-page-size=0x1000 --hash-style=both --no-undefined \
@@ -84,6 +84,7 @@ RELIEFNT_KBUILD_BASE = --no-print-directory -rR -C '$(O)' \
     SOURCE_DATE_EPOCH='$(SOURCE_DATE_EPOCH)' \
     EXTRAVERSION='$(EXTRAVERSION)' LOCALVERSION='$(LOCALVERSION)' \
     VDSO_LDFLAGS='$(RELIEFNT_VDSO_LDFLAGS)' \
+    RELIEFNT_VDSO_CFLAGS='$(RELIEFNT_VDSO_CFLAGS)' \
     HEADER_EXPORT_LIST='$(HEADER_EXPORT_LIST)' \
     KBUILD_VERBOSE='$(V)' quiet='$(if $(filter 1,$(V)),,quiet_)'
 
