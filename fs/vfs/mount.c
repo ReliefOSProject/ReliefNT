@@ -383,7 +383,8 @@ void storage_init(void)
 {
     uint32_t optical_slot = STORAGE_VOLUME_DYNAMIC_FIRST;
     uint32_t optical_index = 0;
-    uint8_t root_ready = 0;
+    bool explicit_root = storage_boot_root_requested();
+    uint8_t root_ready = explicit_root ? 1 : 0;
 
     storage_memzero(g_volumes, sizeof(g_volumes));
     storage_memzero(g_install_disks, sizeof(g_install_disks));
@@ -519,6 +520,18 @@ void storage_init(void)
         }
     }
     storage_sort_install_disks();
+    if (explicit_root) {
+        root_ready = 0;
+        int selected = storage_boot_root_select();
+        if (selected >= 0) {
+            storage_boot_root_filter_enable(true);
+            root_ready = storage_try_mount_root_disk(&g_install_disks[selected]) == 0;
+            storage_boot_root_filter_enable(false);
+        }
+        if (selected < 0 || !root_ready)
+            console_error("[reliefnt] explicit root selection failed status=%d; refusing automatic fallback\n",
+                          selected < 0 ? selected : -2);
+    }
     g_active_volume = &g_volumes[0];
     if (!root_ready) {
         console_error("[reliefnt] storage init failed: no AHCI/IDE/NVMe GPT ESP/root filesystem found\n");
@@ -569,6 +582,7 @@ void storage_mount_boot_root(const struct boot_info *boot, bool ramdisk_root)
 {
     uint64_t start = 0;
     uint64_t length = 0;
+    storage_boot_root_configure(!ramdisk_root && boot ? boot->cmdline : NULL);
     storage_init();
     if (!ramdisk_root) {
         const char *root_fs = g_volumes[STORAGE_VOLUME_ROOT].filesystem == STORAGE_FILESYSTEM_EXT4

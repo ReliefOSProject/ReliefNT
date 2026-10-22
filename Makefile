@@ -303,7 +303,23 @@ test-abi:
 test-header-export: headers_install
 	$(Q)$(RELIEFNT_TEST_PYTHON) $(RELIEFNT_SRC)/tools/test_header_export.py --out $(O)
 
-test: test-tools test-abi test-header-export test-vdso test-boot-logo test-panic-console test-module-layout
+test: test-tools test-abi test-header-export test-vdso test-boot-logo test-panic-console test-module-layout test-boot
+
+.PHONY: test-boot multiboot2-runtime-test boot-root-runtime-test file-flags-runtime-test sidecar-directory-runtime-test
+sidecar-directory-runtime-test: kbuild-fixdep $(RELIEFNT_HOST_CC_ID)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=tools/tests tools/tests/sidecar_directory_runtime_test)
+file-flags-runtime-test: kbuild-fixdep $(RELIEFNT_HOST_CC_ID)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=tools/tests tools/tests/file_flags_runtime_test)
+boot-root-runtime-test: kbuild-fixdep $(RELIEFNT_HOST_CC_ID)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=tools/tests tools/tests/boot_root_runtime_test)
+multiboot2-runtime-test: kbuild-fixdep $(RELIEFNT_HOST_CC_ID)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=tools/tests tools/tests/multiboot2_runtime_test)
+test-boot: kernel multiboot2-runtime-test boot-root-runtime-test file-flags-runtime-test sidecar-directory-runtime-test
+	$(Q)$(O)/tools/tests/multiboot2_runtime_test
+	$(Q)$(O)/tools/tests/boot_root_runtime_test
+	$(Q)$(O)/tools/tests/file_flags_runtime_test
+	$(Q)$(O)/tools/tests/sidecar_directory_runtime_test
+	$(Q)$(RELIEFNT_TEST_PYTHON) $(RELIEFNT_SRC)/tools/test_boot_entry.py --output $(O)
 
 install: all headers_install
 	$(Q)set -eu; \

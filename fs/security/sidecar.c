@@ -36,10 +36,10 @@
 #define SIDECAR_MAGIC 0x4c43414cU
 #define SIDECAR_FORMAT_V1 1U
 #define SIDECAR_DISK_VERSION 2U
-#define SIDECAR_MAX_BYTES 8192U
+/* Bound metadata memory by bytes, without an artificial 64-file directory
+ * limit. Rewrites allocate only the existing image plus one maximum record. */
+#define SIDECAR_MAX_BYTES (16U * 1024U * 1024U)
 #define SIDECAR_PAGE_BYTES 4096u
-#define SIDECAR_MAX_PAGES (SIDECAR_MAX_BYTES / SIDECAR_PAGE_BYTES)
-#define SIDECAR_MAX_RECORDS 64U
 #define SIDECAR_HEADER_BYTES 16U
 #define SIDECAR_TLV_BYTES 4U
 #define SIDECAR_RECORD_PREFIX_BYTES 12U
@@ -450,8 +450,8 @@ static int sidecar_next_record(const uint8_t *data, uint32_t length, uint32_t *c
  * @param count Records written so far, incremented only on success.
  * @param record Record to serialize; ACE flags and the legacy deny bit are
  *               normalized away, exactly as an older write normalized them.
- * @return Zero, -EINVAL for an unsavable record, -ENOSPC at the record limit,
- *         or -E2BIG when the image would exceed capacity.
+ * @return Zero, -EINVAL for an unsavable record, or -E2BIG when the
+ *         bounded metadata image would exceed capacity.
  */
 static int sidecar_emit_record(uint8_t *out, uint32_t capacity, uint32_t *pos,
                                uint32_t *count, const struct sidecar_record *record)
@@ -464,9 +464,6 @@ static int sidecar_emit_record(uint8_t *out, uint32_t capacity, uint32_t *pos,
     if (!name_length || name_length >= RELIEFOS_FS_NAME_LEN ||
         record->ace_count > RELIEFOS_FS_ACL_MAX_ACE) {
         return -RELIEFOS_EINVAL;
-    }
-    if (*count >= SIDECAR_MAX_RECORDS) {
-        return -RELIEFOS_ENOSPC;
     }
     if (*pos + SIDECAR_TLV_BYTES + payload > capacity) {
         return -RELIEFOS_E2BIG;
@@ -692,13 +689,19 @@ static int sidecar_edit(const char *directory, const char *name, enum sidecar_ed
         candidate.mode = value->mode & 0177777u;
         candidate.has_mode = 1;
     }
-    phys = mm_alloc_pages(SIDECAR_MAX_PAGES);
+    uint32_t capacity = length > SIDECAR_HEADER_BYTES ? length : SIDECAR_HEADER_BYTES;
+    uint32_t extra = SIDECAR_TLV_BYTES + SIDECAR_POSIX_PREFIX_BYTES +
+        RELIEFOS_FS_NAME_LEN + RELIEFOS_FS_ACL_MAX_ACE * SIDECAR_ACE_BYTES;
+    capacity = capacity > SIDECAR_MAX_BYTES - extra ? SIDECAR_MAX_BYTES : capacity + extra;
+    uint32_t pages = sidecar_pages(capacity);
+    capacity = pages * SIDECAR_PAGE_BYTES;
+    phys = mm_alloc_pages(pages);
     if (!phys) {
         sidecar_unload(image, length);
         return -RELIEFOS_ENOMEM;
     }
     updated = (uint8_t *)(uintptr_t)phys;
-    storage_memzero(updated, SIDECAR_MAX_BYTES);
+    storage_memzero(updated, capacity);
     sidecar_put_u32(updated, SIDECAR_MAGIC);
     sidecar_put_u32(updated + 4u, SIDECAR_DISK_VERSION);
     cursor = SIDECAR_HEADER_BYTES;
@@ -734,25 +737,25 @@ static int sidecar_edit(const char *directory, const char *name, enum sidecar_ed
                 }
             }
         }
-        ret = sidecar_emit_record(updated, SIDECAR_MAX_BYTES, &position, &count, emit);
+        ret = sidecar_emit_record(updated, capacity, &position, &count, emit);
         if (ret < 0) {
             break;
         }
     }
     if (corrupt) {
-        mm_free_pages(phys, SIDECAR_MAX_PAGES);
+        mm_free_pages(phys, pages);
         sidecar_unload(image, length);
         return edit == SIDECAR_EDIT_SET ? -RELIEFOS_EIO : 0;
     }
     if (ret == 0 && edit == SIDECAR_EDIT_SET && !replaced) {
-        ret = sidecar_emit_record(updated, SIDECAR_MAX_BYTES, &position, &count,
+        ret = sidecar_emit_record(updated, capacity, &position, &count,
                                   &candidate);
         if (ret == 0) {
             changed = 1;
         }
     }
     if (ret == 0 && !changed) {
-        mm_free_pages(phys, SIDECAR_MAX_PAGES);
+        mm_free_pages(phys, pages);
         sidecar_unload(image, length);
         return 0;
     }
@@ -764,7 +767,7 @@ static int sidecar_edit(const char *directory, const char *name, enum sidecar_ed
             ret = storage_write_file(path, updated, position);
         }
     }
-    mm_free_pages(phys, SIDECAR_MAX_PAGES);
+    mm_free_pages(phys, pages);
     sidecar_unload(image, length);
     return ret;
 }

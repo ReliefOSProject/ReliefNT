@@ -422,13 +422,9 @@ int storage_disk_block_write(uint32_t disk_id, int32_t partition_index,
     uint64_t bytes = sectors * 512u;
     if (offset >= bytes) return -28;
     if (length > bytes - offset) length = bytes - offset;
-    /* The raw node is intentionally not a back door around mounted-volume
-     * protection. Installer advanced mode may write an unmounted target; a
-     * running system or mounted target must use filesystem operations. */
-    if ((disk->boot_root && !storage_installer_root_active()) ||
-        disk->target_mounted || storage_disk_has_data_mount(disk_id)) {
-        return -16;
-    }
+    /* Linux raw block I/O follows descriptor DAC/access-mode checks. Mount
+     * conflicts apply to exclusive opens, rather than every write to another
+     * range on the same disk (for example GRUB embedding beside an ESP). */
     if (partition_index < 0) {
         /* A whole-disk write may modify either GPT copy even when the caller
          * ultimately reports an I/O error.  Drop cached partition extents

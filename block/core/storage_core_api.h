@@ -24,6 +24,16 @@ bool storage_async_can_yield(void);
 bool storage_mount_path_matches(const char *path, const char *mount_path);
 const char *storage_transport_name(uint8_t transport);
 int gpt_find_esp(void);
+/** @brief Parse the borrowed Linux root argument before BSP disk discovery. */
+void storage_boot_root_configure(const char *cmdline);
+/** @brief Return whether automatic first-disk mounting must be deferred. */
+bool storage_boot_root_requested(void);
+/** @brief Resolve the requested UUID to a unique disk after discovery/sorting. */
+int storage_boot_root_select(void);
+/** @brief Enable/disable GUID filtering only around the explicit boot mount. */
+void storage_boot_root_filter_enable(bool enabled);
+/** @brief Accept a GPT root candidate under the current scoped boot filter. */
+bool storage_boot_root_accept_guid(const uint8_t guid[16]);
 int storage_devlink_next(uint64_t *cursor, char uuid[37], char target[48]);
 int storage_devlink_target(const char *path, char target[48]);
 int install_clear_sectors(struct install_disk_state *disk, uint64_t lba,

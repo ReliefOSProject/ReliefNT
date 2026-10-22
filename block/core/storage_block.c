@@ -612,6 +612,8 @@ int gpt_find_esp(void)
                        (unsigned long long)entry->last_lba,
                        (unsigned)entry->type_guid[0], (unsigned)entry->type_guid[1],
                        (unsigned)entry->type_guid[2], (unsigned)entry->type_guid[3]);
+        if (storage_memcmp(entry->type_guid, esp_guid, 16) &&
+            !storage_boot_root_accept_guid(entry->unique_guid)) continue;
         if (storage_memcmp(entry->type_guid, esp_guid, 16) == 0) {
             g_storage.esp_start_lba = entry->first_lba;
             g_storage.esp_sector_count = entry->last_lba - entry->first_lba + 1u;
@@ -671,6 +673,7 @@ int gpt_find_esp(void)
             struct gpt_entry *candidate =
                 (struct gpt_entry *)(void *)(table + (uint64_t)i * size);
             if (!candidate->first_lba || candidate->last_lba < candidate->first_lba ||
+                !storage_boot_root_accept_guid(candidate->unique_guid) ||
                 storage_memcmp(candidate->type_guid, esp_guid, 16) == 0) {
                 continue;
             }

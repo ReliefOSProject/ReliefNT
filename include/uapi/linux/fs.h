@@ -6,7 +6,7 @@
 
 /* Linux block-device ioctls supported by the ReliefOS block layer. */
 #define BLKROSET      _IO(0x12, 93)
-#define BLKROGET      _IOR(0x12, 94, int)
+#define BLKROGET      _IO(0x12, 94)
 #define BLKRRPART     _IO(0x12, 95)
 #define BLKGETSIZE    _IO(0x12, 96)
 #define BLKSSZGET     _IO(0x12, 104)

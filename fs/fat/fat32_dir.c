@@ -184,6 +184,11 @@ int fat32_update_dirent(const struct fat32_dir_ref *ref)
     return 0;
 }
 
+/**
+ * @brief Reserve consecutive directory slots, extending a chain when needed.
+ * Caller holds the storage transaction. Before linking a new empty cluster,
+ * convert old unused end markers to deleted entries so FAT readers reach it.
+ */
 int fat32_find_free_dirent_span(uint32_t dir_cluster, uint32_t slots,
                                        struct fat32_dir_span *out)
 {
@@ -227,10 +232,6 @@ int fat32_find_free_dirent_span(uint32_t dir_cluster, uint32_t slots,
                 if (ret < 0) {
                     return storage_read_failure(ret);
                 }
-                ret = fat32_write_fat_entry(cluster, new_cluster);
-                if (ret < 0) {
-                    return storage_read_failure(ret);
-                }
                 ret = fat32_write_fat_entry(new_cluster, FAT32_EOC);
                 if (ret < 0) {
                     return storage_read_failure(ret);
@@ -244,6 +245,25 @@ int fat32_find_free_dirent_span(uint32_t dir_cluster, uint32_t slots,
                 if (ret < 0) {
                     return storage_read_failure(ret);
                 }
+                /* A 0x00 entry ends the entire directory, including later
+                 * clusters. An LFN may not fit the old trailing free slots. */
+                ret = fat32_read_cluster(cluster, storage_cluster_buf);
+                if (ret < 0) return storage_read_failure(ret);
+                int changed = 0;
+                for (uint32_t off = 0; off < g_storage.cluster_bytes;
+                     off += sizeof(struct fat32_dirent)) {
+                    if (storage_cluster_buf[off] == 0) {
+                        storage_cluster_buf[off] = 0xe5;
+                        changed = 1;
+                    }
+                }
+                if (changed) {
+                    ret = fat32_write_cluster(cluster, storage_cluster_buf);
+                    if (ret < 0) return storage_read_failure(ret);
+                }
+                /* Publish only after the new cluster is initialized. */
+                ret = fat32_write_fat_entry(cluster, new_cluster);
+                if (ret < 0) return storage_read_failure(ret);
                 out->entry_cluster = new_cluster;
                 out->entry_offset = 0;
                 return 0;

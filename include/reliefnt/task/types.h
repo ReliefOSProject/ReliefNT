@@ -146,9 +146,11 @@ static inline struct task_file *task_file_description(struct task_file *file)
 #define TASK_FILE_FLAG_SOCKET_UNIX 0x04000000u
 #define TASK_FILE_FLAG_DEV_SHM    0x01000000u
 #define TASK_FILE_FLAG_SOCKET_INET 0x00800000u
-#define TASK_FILE_FLAG_EVENTFD     0x00400000u
+#define TASK_FILE_FLAG_EVENTFD     0x00000010u
 #define TASK_FILE_FLAG_EPOLL       0x00200000u
-#define TASK_FILE_FLAG_TIMERFD     0x00100000u
+/* Keep private kinds outside Linux O_SYNC (0x101000) and O_TMPFILE
+ * (0x410000). User status flags remain intact for F_GETFL and I/O policy. */
+#define TASK_FILE_FLAG_TIMERFD     0x00000008u
 /* Linux FMODE_PATH: the descriptor came from open(O_PATH) and therefore only
  * holds a path reference.  The raw LINUX_O_PATH bit cannot remain in
  * file->flags because it is numerically identical to TASK_FILE_FLAG_EPOLL, so

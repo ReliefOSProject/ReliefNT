@@ -13,16 +13,26 @@
 #define _IOC_NONE 0U
 #define _IOC_WRITE 1U
 #define _IOC_READ 2U
+#ifndef _IOC
 #define _IOC(dir, type, nr, size) \
     (((dir) << _IOC_DIRSHIFT) | ((type) << _IOC_TYPESHIFT) | \
      ((nr) << _IOC_NRSHIFT) | ((size) << _IOC_SIZESHIFT))
+#endif
 #define _IOC_DIR(nr) (((nr) >> _IOC_DIRSHIFT) & ((1U << _IOC_DIRBITS) - 1U))
 #define _IOC_TYPE(nr) (((nr) >> _IOC_TYPESHIFT) & ((1U << _IOC_TYPEBITS) - 1U))
 #define _IOC_NR(nr) (((nr) >> _IOC_NRSHIFT) & ((1U << _IOC_NRBITS) - 1U))
 #define _IOC_SIZE(nr) (((nr) >> _IOC_SIZESHIFT) & ((1U << _IOC_SIZEBITS) - 1U))
+#ifndef _IO
 #define _IO(type, nr) _IOC(_IOC_NONE, (type), (nr), 0)
+#endif
+#ifndef _IOR
 #define _IOR(type, nr, data) _IOC(_IOC_READ, (type), (nr), sizeof(data))
+#endif
+#ifndef _IOW
 #define _IOW(type, nr, data) _IOC(_IOC_WRITE, (type), (nr), sizeof(data))
+#endif
+#ifndef _IOWR
 #define _IOWR(type, nr, data) _IOC(_IOC_READ | _IOC_WRITE, (type), (nr), sizeof(data))
+#endif
 
 #endif

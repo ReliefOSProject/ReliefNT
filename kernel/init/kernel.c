@@ -16,6 +16,7 @@
 #include <reliefnt/mm.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/multiboot2.h>
+#include <reliefnt/panic.h>
 #include <reliefnt/net.h>
 #include <reliefnt/platform.h>
 #include <reliefnt/power.h>
@@ -108,7 +109,7 @@ static void boot_capture_efi_memory_map(struct boot_info *boot)
     uint64_t entry_size = 0;
     uint32_t entry_count = 0;
 
-    if (!boot || boot->mmap_entry_count || boot->efi_mmap_entry_count) {
+    if (!boot || !boot->efi_system_table || boot->mmap_entry_count || boot->efi_mmap_entry_count) {
         return;
     }
     if (efi_boot_memory_map(boot->efi_system_table, efi_mmap_buffer,
@@ -158,7 +159,7 @@ static uint32_t boot_load_ui_theme(void)
 /**
  * @brief Full boot sequence: parse Multiboot2/EFI info, then initialize every kernel subsystem in order and enter userland.
  */
-static void kernel_start(uint32_t magic, uint32_t multiboot_info)
+static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
 {
     bool boot_log_pause;
 
@@ -170,7 +171,9 @@ static void kernel_start(uint32_t magic, uint32_t multiboot_info)
     irq_mask_legacy_pic();
     console_init();
     struct boot_info boot;
-    multiboot2_parse(magic, (uintptr_t)multiboot_info, &boot);
+    if (multiboot2_parse(magic, multiboot_info, &boot) < 0) {
+        panic("Invalid Multiboot2 boot information");
+    }
     console_log_configure(boot.cmdline);
     const struct reliefos_system_info *system = reliefnt_system_info();
     console_info("ReliefOS %s %s booting\n",
@@ -358,7 +361,7 @@ static void kernel_start(uint32_t magic, uint32_t multiboot_info)
 /**
  * @brief Multiboot2 entry point called by the arch entry stub; starts the kernel.
  */
-void kernel_main(uint32_t magic, uint32_t multiboot_info)
+void kernel_main(uint32_t magic, uintptr_t multiboot_info)
 {
     kernel_start(magic, multiboot_info);
 }

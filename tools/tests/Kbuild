@@ -17,3 +17,21 @@ panic_console_runtime_test-objs := panic_console_runtime_test.o boot_logo_draw.o
 HOSTCFLAGS_panic_console_runtime_test.o := -std=gnu11 -O2 -g -Wall -Wextra -ffunction-sections -fdata-sections -I$(srctree)/include -I$(srctree)/include/uapi -I$(srctree)/include -I$(objtree)/include
 HOSTLDLIBS_panic_console_runtime_test := -Wl,--gc-sections
 $(obj)/panic_console_runtime_test.o: $(objtree)/include/generated/cjk_font.h $(objtree)/include/generated/build_info.h
+
+hostprogs += multiboot2_runtime_test
+multiboot2_runtime_test-objs := multiboot2_runtime_test.o multiboot2_parser.o
+HOSTCFLAGS_multiboot2_runtime_test.o := -std=gnu11 -O2 -g -Wall -Wextra -Werror -I$(srctree)/include -I$(srctree)/include/uapi
+HOSTCFLAGS_multiboot2_parser.o := -std=gnu11 -O2 -g -Wall -Wextra -Werror -I$(srctree)/include -I$(srctree)/include/uapi
+
+hostprogs += file_flags_runtime_test
+file_flags_runtime_test-objs := file_flags_runtime_test.o
+HOSTCFLAGS_file_flags_runtime_test.o := -std=gnu11 -O2 -g -Wall -Wextra -Werror -I$(srctree)/include -I$(srctree)/include/uapi
+
+hostprogs += sidecar_directory_runtime_test
+sidecar_directory_runtime_test-objs := sidecar_directory_runtime_test.o sidecar_directory_backend.o
+$(foreach item,sidecar_directory_runtime_test sidecar_directory_backend,$(eval HOSTCFLAGS_$(item).o := -std=gnu11 -O2 -g -Wall -Wextra -Werror -ffunction-sections -fdata-sections -I$(srctree)/include -I$(srctree)/include/uapi))
+HOSTLDLIBS_sidecar_directory_runtime_test := -Wl,--gc-sections
+
+hostprogs += boot_root_runtime_test
+boot_root_runtime_test-objs := boot_root_runtime_test.o boot_root_parser.o boot_root_devlinks.o
+$(foreach item,boot_root_runtime_test boot_root_parser boot_root_devlinks,$(eval HOSTCFLAGS_$(item).o := -std=gnu11 -O2 -g -Wall -Wextra -Werror -I$(srctree)/include -I$(srctree)/include/uapi))

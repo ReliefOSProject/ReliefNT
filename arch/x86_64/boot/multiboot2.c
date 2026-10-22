@@ -1,117 +1,152 @@
-/*
- * ReliefOS Multiboot2 support: decodes bootloader information structures.
- * Extracts memory maps, framebuffer data, modules, and command-line metadata.
- */
-#include <reliefnt/console.h>
+/* Decode the standard Multiboot2 handoff before allocation or interrupts. */
 #include <reliefnt/multiboot2.h>
+#include <linux/errno.h>
 
-/**
- * @brief Round value up to the next 8-byte boundary.
- */
-static uintptr_t align8(uintptr_t value)
+/** @brief Test for a NUL within a borrowed tag payload, without reading padding. */
+static bool tag_string_valid(const uint8_t *data, size_t length)
 {
-    return (value + 7u) & ~((uintptr_t)7u);
+    for (size_t i = 0; i < length; ++i) {
+        if (!data[i]) return true;
+    }
+    return false;
 }
 
 /**
- * @brief Decode the Multiboot2 tag list at info_addr into out (cmdline, modules, memory map, framebuffer, EFI, ACPI).
+ * @brief Decode a bounded handoff into caller-owned storage, publishing only on success.
+ * @param magic Multiboot2 bootloader magic in EAX.
+ * @param info_addr Borrowed, readable, eight-byte-aligned physical information block.
+ * @param out Writable output that must not alias the information block.
+ * @return 0 on success, -EINVAL on malformed or unrepresentable information.
+ * Called by the BSP with IRQs disabled, before heap/locks exist. Pointer fields
+ * borrow the bootloader block; its lifetime extends through memory reservation.
  */
-void multiboot2_parse(uint32_t magic, uintptr_t info_addr, struct boot_info *out)
+int multiboot2_parse(uint32_t magic, uintptr_t info_addr, struct boot_info *out)
 {
-    for (size_t i = 0; i < sizeof(*out); ++i) {
-        ((uint8_t *)out)[i] = 0;
-    }
-    out->magic = magic;
-    out->multiboot_info = (uint64_t)info_addr;
-
-    if (magic != MULTIBOOT2_BOOTLOADER_MAGIC || info_addr == 0) {
-        console_error("[reliefnt] invalid multiboot2 handoff magic=0x%x info=%p\n",
-                       magic, (void *)info_addr);
-        return;
-    }
-
-    const struct multiboot2_info *info = (const struct multiboot2_info *)info_addr;
+    if (!out) return -EINVAL;
+    *out = (struct boot_info){0};
+    if (magic != MULTIBOOT2_BOOTLOADER_MAGIC || !info_addr ||
+        (info_addr & 7u) || info_addr > UINTPTR_MAX - sizeof(struct multiboot2_info))
+        return -EINVAL;
+    const struct multiboot2_info *info = (const void *)info_addr;
+    if (info->total_size < 16 || (info->total_size & 7u) ||
+        info_addr > UINTPTR_MAX - info->total_size) return -EINVAL;
     uintptr_t cursor = info_addr + sizeof(*info);
     uintptr_t end = info_addr + info->total_size;
-
-    while (cursor < end) {
-        const struct multiboot2_tag *tag = (const struct multiboot2_tag *)cursor;
-        if (tag->type == MULTIBOOT2_TAG_TYPE_END || tag->size == 0) {
-            break;
-        }
-
+    struct boot_info parsed = {0};
+    parsed.magic = magic;
+    parsed.multiboot_info = info_addr;
+    while (end - cursor >= sizeof(struct multiboot2_tag)) {
+        const struct multiboot2_tag *tag = (const void *)cursor;
+        size_t remaining = end - cursor;
+        if (tag->size < sizeof(*tag) || tag->size > remaining) return -EINVAL;
+        size_t padded = ((size_t)tag->size + 7u) & ~(size_t)7u;
+        if (padded > remaining) return -EINVAL;
+        const uint8_t *payload = (const uint8_t *)tag + sizeof(*tag);
+        size_t payload_size = tag->size - sizeof(*tag);
         switch (tag->type) {
+        case MULTIBOOT2_TAG_TYPE_END:
+            if (tag->size != 8 || remaining != 8) return -EINVAL;
+            *out = parsed;
+            return 0;
         case MULTIBOOT2_TAG_TYPE_CMDLINE:
-            out->cmdline = ((const struct multiboot2_tag_string *)tag)->string;
-            break;
         case MULTIBOOT2_TAG_TYPE_BOOT_LOADER_NAME:
-            out->bootloader = ((const struct multiboot2_tag_string *)tag)->string;
+            if (!tag_string_valid(payload, payload_size)) return -EINVAL;
+            if (tag->type == MULTIBOOT2_TAG_TYPE_CMDLINE) parsed.cmdline = (const char *)payload;
+            else parsed.bootloader = (const char *)payload;
             break;
         case MULTIBOOT2_TAG_TYPE_MODULE: {
-            const struct multiboot2_tag_module *mod = (const struct multiboot2_tag_module *)tag;
-            if (out->module_count < 16) {
-                struct boot_module *dst = &out->modules[out->module_count++];
-                dst->start = mod->mod_start;
-                dst->end = mod->mod_end;
-                dst->name = mod->string;
-            }
+            const struct multiboot2_tag_module *mod = (const void *)tag;
+            if (tag->size <= sizeof(*mod) || mod->mod_end < mod->mod_start ||
+                !tag_string_valid((const uint8_t *)mod->string, tag->size - sizeof(*mod)) ||
+                parsed.module_count >= sizeof(parsed.modules) / sizeof(parsed.modules[0]))
+                return -EINVAL;
+            parsed.modules[parsed.module_count++] = (struct boot_module){
+                mod->mod_start, mod->mod_end, mod->string};
             break;
         }
         case MULTIBOOT2_TAG_TYPE_BASIC_MEMINFO: {
-            const uint32_t *mem = (const uint32_t *)((const uint8_t *)tag + 8);
-            out->memory_lower_kib = mem[0];
-            out->memory_upper_kib = mem[1];
+            if (payload_size < 8) return -EINVAL;
+            const uint32_t *mem = (const void *)payload;
+            parsed.memory_lower_kib = mem[0];
+            parsed.memory_upper_kib = mem[1];
             break;
         }
         case MULTIBOOT2_TAG_TYPE_MMAP: {
-            const struct multiboot2_tag_mmap *mmap = (const struct multiboot2_tag_mmap *)tag;
-            out->mmap_addr = (uint64_t)(uintptr_t)mmap->entries;
-            out->mmap_entry_size = mmap->entry_size;
-            out->mmap_entry_count = (tag->size - sizeof(*mmap)) / mmap->entry_size;
+            const struct multiboot2_tag_mmap *map = (const void *)tag;
+            if (tag->size < sizeof(*map) || map->entry_size < sizeof(struct multiboot2_mmap_entry) ||
+                (tag->size - sizeof(*map)) % map->entry_size) return -EINVAL;
+            uint32_t count = (tag->size - sizeof(*map)) / map->entry_size;
+            for (uint32_t i = 0; i < count; ++i) {
+                const struct multiboot2_mmap_entry *entry = (const void *)
+                    ((const uint8_t *)map->entries + (size_t)i * map->entry_size);
+                if (entry->len > UINT64_MAX - entry->addr) return -EINVAL;
+            }
+            parsed.mmap_addr = (uintptr_t)map->entries;
+            parsed.mmap_entry_size = map->entry_size;
+            parsed.mmap_entry_count = count;
             break;
         }
         case MULTIBOOT2_TAG_TYPE_FRAMEBUFFER: {
-            const struct multiboot2_tag_framebuffer *fb = (const struct multiboot2_tag_framebuffer *)tag;
-            out->framebuffer_addr = fb->framebuffer_addr;
-            out->framebuffer_width = fb->framebuffer_width;
-            out->framebuffer_height = fb->framebuffer_height;
-            out->framebuffer_pitch = fb->framebuffer_pitch;
-            out->framebuffer_bpp = fb->framebuffer_bpp;
-            out->framebuffer_type = fb->framebuffer_type;
-            if (fb->framebuffer_type == MULTIBOOT2_FRAMEBUFFER_TYPE_RGB &&
-                tag->size >= sizeof(*fb) + MULTIBOOT2_FRAMEBUFFER_RGB_INFO_SIZE) {
+            const struct multiboot2_tag_framebuffer *fb = (const void *)tag;
+            if (tag->size < sizeof(*fb)) return -EINVAL;
+            parsed.framebuffer_addr = fb->framebuffer_addr;
+            parsed.framebuffer_width = fb->framebuffer_width;
+            parsed.framebuffer_height = fb->framebuffer_height;
+            parsed.framebuffer_pitch = fb->framebuffer_pitch;
+            parsed.framebuffer_bpp = fb->framebuffer_bpp;
+            parsed.framebuffer_type = fb->framebuffer_type;
+            if (fb->framebuffer_type == MULTIBOOT2_FRAMEBUFFER_TYPE_RGB) {
+                if (tag->size < sizeof(*fb) + MULTIBOOT2_FRAMEBUFFER_RGB_INFO_SIZE) return -EINVAL;
                 const uint8_t *rgb = (const uint8_t *)fb + sizeof(*fb);
-                out->framebuffer_red_field_position = rgb[0];
-                out->framebuffer_red_mask_size = rgb[1];
-                out->framebuffer_green_field_position = rgb[2];
-                out->framebuffer_green_mask_size = rgb[3];
-                out->framebuffer_blue_field_position = rgb[4];
-                out->framebuffer_blue_mask_size = rgb[5];
+                if (!fb->framebuffer_bpp || fb->framebuffer_bpp > 32) return -EINVAL;
+                for (unsigned i = 0; i < 6; i += 2) {
+                    if (!rgb[i+1] || (unsigned)rgb[i] + rgb[i+1] > fb->framebuffer_bpp)
+                        return -EINVAL;
+                }
+                parsed.framebuffer_red_field_position = rgb[0];
+                parsed.framebuffer_red_mask_size = rgb[1];
+                parsed.framebuffer_green_field_position = rgb[2];
+                parsed.framebuffer_green_mask_size = rgb[3];
+                parsed.framebuffer_blue_field_position = rgb[4];
+                parsed.framebuffer_blue_mask_size = rgb[5];
             }
+            uint64_t span = (uint64_t)fb->framebuffer_pitch * fb->framebuffer_height;
+            if (span > UINT64_MAX - fb->framebuffer_addr) return -EINVAL;
             break;
         }
-        case MULTIBOOT2_TAG_TYPE_EFI64: {
-            const uint64_t *efi = (const uint64_t *)((const uint8_t *)tag + 8);
-            out->efi_system_table = *efi;
+        case MULTIBOOT2_TAG_TYPE_EFI64:
+            if (payload_size < 8) return -EINVAL;
+            parsed.efi_system_table = *(const uint64_t *)(const void *)payload;
             break;
-        }
         case MULTIBOOT2_TAG_TYPE_EFI_MMAP: {
-            const struct multiboot2_tag_efi_mmap *mmap =
-                (const struct multiboot2_tag_efi_mmap *)tag;
-            out->efi_mmap_addr = (uint64_t)(uintptr_t)mmap->efi_mmap;
-            out->efi_mmap_entry_size = mmap->descr_size;
-            out->efi_mmap_entry_count = mmap->descr_size ?
-                (tag->size - sizeof(*mmap)) / mmap->descr_size : 0;
+            const struct multiboot2_tag_efi_mmap *map = (const void *)tag;
+            if (tag->size < sizeof(*map) || map->descr_size < sizeof(struct efi_memory_descriptor) ||
+                (tag->size - sizeof(*map)) % map->descr_size) return -EINVAL;
+            uint32_t count = (tag->size - sizeof(*map)) / map->descr_size;
+            for (uint32_t i = 0; i < count; ++i) {
+                const struct efi_memory_descriptor *entry = (const void *)
+                    (map->efi_mmap + (size_t)i * map->descr_size);
+                if (entry->number_of_pages > (UINT64_MAX - entry->physical_start) / 4096u)
+                    return -EINVAL;
+            }
+            parsed.efi_mmap_addr = (uintptr_t)map->efi_mmap;
+            parsed.efi_mmap_entry_size = map->descr_size;
+            parsed.efi_mmap_entry_count = count;
             break;
         }
         case MULTIBOOT2_TAG_TYPE_ACPI_OLD:
+            if (payload_size < 20) return -EINVAL;
+            if (!parsed.rsdp_addr) parsed.rsdp_addr = (uintptr_t)payload;
+            break;
         case MULTIBOOT2_TAG_TYPE_ACPI_NEW:
-            out->rsdp_addr = (uint64_t)(uintptr_t)((const uint8_t *)tag + 8);
+            if (payload_size < 36) return -EINVAL;
+            parsed.rsdp_addr = (uintptr_t)payload;
             break;
         default:
+            /* Unknown standard extension tags are safe to skip by their size. */
             break;
         }
-
-        cursor = align8(cursor + tag->size);
+        cursor += padded;
     }
+    return -EINVAL;
 }

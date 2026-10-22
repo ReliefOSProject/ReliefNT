@@ -2,7 +2,8 @@
  * ReliefOS x86_64 kernel linker script: fixes the kernel image layout.
  * Places boot, text, read-only data, writable data, and relocation sections.
  */
-ENTRY(_start)
+/* The standard ELF route is IA32 protected mode; EFI64 uses header tag 9. */
+ENTRY(bios_start)
 
 SECTIONS
 {

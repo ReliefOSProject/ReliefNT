@@ -450,6 +450,8 @@ int storage_disk_block_info(uint32_t disk_id, int32_t partition_index,
 int storage_disk_device_name(uint32_t disk_id, int32_t partition_index,
                              char *out, uint32_t capacity);
 /** Reads/writes a block node at a byte offset; offsets and lengths are sector aligned. */
+/** @brief Check current mount conflicts for an exclusive whole-disk/partition open. */
+int storage_disk_block_busy(uint32_t disk_id, int32_t partition_index);
 int storage_disk_block_read(uint32_t disk_id, int32_t partition_index,
                             uint64_t offset, void *buffer, uint32_t length,
                             uint32_t *out_read);

@@ -9,8 +9,10 @@
 
 /**
  * @brief Top-level kernel entry point, called once by the Multiboot2 entry stub.
+ * @param multiboot_info Borrowed full-width bootloader block, retained until reserved.
+ * BSP with IRQs disabled; owns initial stack and acquires no outer transaction.
  */
-void kernel_main(uint32_t magic, uint32_t multiboot_info);
+void kernel_main(uint32_t magic, uintptr_t multiboot_info);
 void kernel_idle_loop(void) __attribute__((noreturn));
 
 #endif

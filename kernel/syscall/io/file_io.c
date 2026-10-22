@@ -121,5 +121,10 @@ int64_t syscall_regular_io(struct task *task, struct task_file *file, uint64_t b
         file->io_owner = 0;
     if (resumable)
         task->regular_io.active = false;
+    if (writing && done && (file->flags & LINUX_O_DSYNC)) {
+        int sync = block ? storage_sync_disk(STORAGE_BLOCK_DISK_ID(file->node.volume_id))
+                         : storage_sync_volume(file->node.volume_id);
+        if (sync < 0) return sync;
+    }
     return done ? (int64_t)done : error;
 }

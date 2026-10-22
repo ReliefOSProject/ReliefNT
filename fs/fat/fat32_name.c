@@ -111,14 +111,18 @@ int fat32_name_match_short(const struct fat32_dirent *de, const char *name)
     return storage_text_eq_ci(short_name, name);
 }
 
+/** @brief Decode packed little-endian UTF-16 without assuming aligned disk fields. */
 void fat32_lfn_extract_utf16(const struct fat32_lfn *lfn, uint16_t *dst,
                                     uint32_t *len, uint32_t cap)
 {
-    const uint16_t *parts[3] = {lfn->name1, lfn->name2, lfn->name3};
+    const uint8_t *parts[3] = {
+        (const uint8_t *)lfn + offsetof(struct fat32_lfn, name1),
+        (const uint8_t *)lfn + offsetof(struct fat32_lfn, name2),
+        (const uint8_t *)lfn + offsetof(struct fat32_lfn, name3)};
     const uint32_t counts[3] = {5, 6, 2};
     for (uint32_t p = 0; p < 3; ++p) {
         for (uint32_t i = 0; i < counts[p]; ++i) {
-            uint16_t ch = parts[p][i];
+            uint16_t ch = parts[p][2u * i] | (uint16_t)parts[p][2u * i + 1u] << 8;
             if (ch == 0x0000 || ch == 0xffff) {
                 return;
             }
@@ -364,12 +368,16 @@ uint32_t fat32_lfn_entry_count(const char *name)
     return (len + 12u) / 13u;
 }
 
+/** @brief Encode a FAT LFN wire entry using defined unaligned byte stores. */
 void fat32_fill_lfn_entry(struct fat32_lfn *lfn,
                                  const uint16_t *name, uint32_t name_len,
                                  uint32_t part_index, uint32_t part_count,
                                  uint8_t checksum)
 {
-    uint16_t *slots[3] = {lfn->name1, lfn->name2, lfn->name3};
+    uint8_t *slots[3] = {
+        (uint8_t *)lfn + offsetof(struct fat32_lfn, name1),
+        (uint8_t *)lfn + offsetof(struct fat32_lfn, name2),
+        (uint8_t *)lfn + offsetof(struct fat32_lfn, name3)};
     const uint32_t slot_counts[3] = {5, 6, 2};
     uint32_t cursor = part_index * 13u;
     int terminated = 0;
@@ -393,7 +401,8 @@ void fat32_fill_lfn_entry(struct fat32_lfn *lfn,
                 value = 0x0000u;
                 terminated = 1;
             }
-            slots[part][i] = value;
+            slots[part][2u * i] = (uint8_t)value;
+            slots[part][2u * i + 1u] = (uint8_t)(value >> 8);
         }
     }
 }

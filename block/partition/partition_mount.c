@@ -8,6 +8,31 @@ static int storage_filesystem_from_name(const char *filesystem, uint32_t *out_fi
 
 static uint32_t storage_mount_volume_for_target(const char *target);
 
+/**
+ * @brief Report mounted filesystems conflicting with an O_EXCL block open.
+ * Caller holds the execution lock. Whole disks conflict with every mounted
+ * partition; a partition conflicts only with its own mounted dev_t identity.
+ */
+int storage_disk_block_busy(uint32_t disk_id, int32_t partition_index)
+{
+    if (disk_id >= g_install_disk_count || !g_install_disks[disk_id].present ||
+        partition_index < -1 || (partition_index >= 0 &&
+        (uint32_t)partition_index >= RELIEFOS_DISK_MAX_PARTITIONS)) return -22;
+    uint64_t device = storage_block_rdev(STORAGE_BLOCK_VOLUME_ID(disk_id, partition_index));
+    for (uint32_t i = 0; i < STORAGE_MAX_VOLUMES; ++i) {
+        const struct storage_volume *volume = &g_volumes[i];
+        if (!volume->ready || volume->ram_base || volume->tmpfs ||
+            volume->source_disk_id != disk_id) continue;
+        /* storage_volume_device_number assigns anonymous major-zero IDs
+         * 1..STORAGE_MAX_VOLUMES to optical/pseudo mounts. These do not own
+         * an install disk, regardless of their default source_disk_id. */
+        uint64_t mounted_device = storage_volume_device_number(volume);
+        if (mounted_device <= STORAGE_MAX_VOLUMES) continue;
+        if (partition_index < 0 || mounted_device == device) return 1;
+    }
+    return 0;
+}
+
 
 /**
  * @brief Checks whether a runtime data mount belongs to a block disk.

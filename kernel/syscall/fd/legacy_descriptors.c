@@ -215,6 +215,11 @@ int64_t syscall_legacy_descriptors(uint64_t number, uint64_t a0, uint64_t a1, ui
                 (flags & LINUX_O_EXCL)) return -LINUX_EBUSY;
             uint32_t device_flags = TASK_FILE_FLAG_DEV_NODE;
             if (node.flags & STORAGE_NODE_FLAG_DEV_BLOCK) {
+                if (flags & LINUX_O_EXCL) {
+                    int busy = storage_disk_block_busy(STORAGE_BLOCK_DISK_ID(node.volume_id),
+                                                       STORAGE_BLOCK_PARTITION(node.volume_id));
+                    if (busy) return busy < 0 ? busy : -LINUX_EBUSY;
+                }
                 device_flags |= TASK_FILE_FLAG_DEV_BLOCK;
             }
             int fd = alloc_task_fd(task, &node,

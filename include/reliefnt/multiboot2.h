@@ -44,12 +44,13 @@ struct multiboot2_tag_module {
     char string[];
 };
 
+/** @brief Borrowed wire entry; extended strides need not preserve alignment. */
 struct multiboot2_mmap_entry {
     uint64_t addr;
     uint64_t len;
     uint32_t type;
     uint32_t zero;
-};
+} __attribute__((packed));
 
 struct multiboot2_tag_mmap {
     uint32_t type;
@@ -85,6 +86,7 @@ struct multiboot2_tag_efi_mmap {
     uint8_t efi_mmap[];
 };
 
+/** @brief Firmware wire descriptor, read at the bootloader's declared stride. */
 struct efi_memory_descriptor {
     uint32_t type;
     uint32_t pad;
@@ -92,7 +94,7 @@ struct efi_memory_descriptor {
     uint64_t virtual_start;
     uint64_t number_of_pages;
     uint64_t attribute;
-};
+} __attribute__((packed));
 
 struct boot_module {
     uint64_t start;
@@ -132,8 +134,11 @@ struct boot_info {
 };
 
 /**
- * @brief Parse the Multiboot2 info block at info_addr into out, checking magic first.
+ * @brief Validate a borrowed bootloader block and publish its decoded fields.
+ * @param info_addr Readable eight-byte-aligned information; retained through reservation.
+ * @param out Caller-owned output, zero on failure; must not alias the input.
+ * @return 0 or -EINVAL. BSP boot context, IRQs disabled; no allocation or locks.
  */
-void multiboot2_parse(uint32_t magic, uintptr_t info_addr, struct boot_info *out);
+int multiboot2_parse(uint32_t magic, uintptr_t info_addr, struct boot_info *out);
 
 #endif

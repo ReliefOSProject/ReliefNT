@@ -12,7 +12,7 @@ multiboot2_header:
 
     .align 8
     .short 1
-    .short 0
+    .short 1
     .long 20
     .long 4
     .long 6
@@ -31,12 +31,12 @@ multiboot2_header:
 
     .align 8
     .short 7
-    .short 0
+    .short 1
     .long 8
 
     .align 8
     .short 9
-    .short 0
+    .short 1
     .long 12
     .long _start
 
@@ -61,13 +61,14 @@ boot_stack_top:
 .type _start, @function
 _start:
     mov %eax, %r12d
-    mov %ebx, %r13d
+    mov %rbx, %r13
     cli
+    cld
     mov $boot_stack_top, %rsp
     and $-16, %rsp
     xor %rbp, %rbp
     mov %r12d, %edi
-    mov %r13d, %esi
+    mov %r13, %rsi
     call kernel_main
 
 .halt:
