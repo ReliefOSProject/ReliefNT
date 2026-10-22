@@ -14,7 +14,7 @@
 - 每个自研代码目录用自己的 `Kbuild` 显式列出本目录对象和直接子目录；根
   `Kbuild` 只遍历子系统并集成顶层产物。不得恢复全局源码清单、通配扫描或
   通过包含实现 `.c`/`.inc` 文件代替独立编译。目录与迁移对应见
-  [模块说明](docs/KERNEL_MODULES.md) 和历史源码映射；审计清单不参与构建。
+  [模块说明](Documentation/core-api/modules.rst) 和历史源码映射；审计清单不参与构建。
 - `.config` 只承载内核实际消费的 Kconfig 符号；镜像/产品配置留在 ReliefOS 父仓。
   `PROFILE`、`EXTRAVERSION`、`LOCALVERSION` 和工具链覆盖仍由独立入口提供。
 - `configs/build-version` 是版本输入，生成文件只写输出目录。更改版本时同步
@@ -28,14 +28,14 @@
 
 ## 版本发布的长期规则
 
-- 发布前必须阅读并遵循 [发布规范](docs/RELEASE_PROCESS.md)。Release 更新范围是
+- 发布前必须阅读并遵循 [发布规范](Documentation/process/releasing.rst)。Release 更新范围是
   `(上一版本号提交, 本次版本号提交]`，不是发布日期之间或任意最近 tag 之间。
   例如 5.1.0 从“改为 5.0.0”的提交之后统计到“改为 5.1.0”的提交。
 - ReliefNT 仅写内核仓自身的有效更新；ReliefOS 仅写主仓自身更新，不包含内核
   实现和纯 gitlink 更新。两份说明章节格式相同、内容独立，合并去重，不把已撤销
   功能或计划当交付，不列“更新版本号到 x.x.x”等机械条目。
 - 说明必须包括：更新内容、是否破坏性更新、更新与迁移注意事项、开发者提示；
-  归档到 `docs/releases/<版本>.md`。
+  归档到 `Documentation/releases/<版本>.rst`。
 - 只有用户明确授权才提交、推送、建立分支或发布；detached HEAD 是正常的
   子模块状态，不因此创建分支，不强推、不擅自重写标签或 Release。
 - 先推送内核版本提交，再让 ReliefOS 父仓更新 gitlink 并推送。两仓标签和

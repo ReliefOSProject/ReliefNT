@@ -119,7 +119,7 @@ endif
 
 .PHONY: help all kernel kerneldebug boot vdso tools fetch fetch-check \
 	defconfig olddefconfig menuconfig config-sync build-info headers_install \
-	install test test-tools test-abi test-header-export test-vdso \
+	install test test-tools test-abi test-header-export test-vdso htmldocs \
 	kbuild-fixdep kconfig-tools clean distclean FORCE
 
 help:
@@ -136,11 +136,18 @@ help:
 	  '  defconfig / olddefconfig / menuconfig / config-sync' \
 	  '  tools / fetch / fetch-check' \
 	  '  test              host tests, ABI, header export and vDSO' \
+	  '  htmldocs          strict Sphinx HTML manual in O/Documentation/html' \
 	  '  clean / distclean (download cache is preserved)' \
 	  '' \
 	  '  variables: O= ARCH=x86_64 PROFILE=release|debug TOOLCHAIN= V=1' \
 	  '             CC= CXX= LD= AR= OBJCOPY= STRIP= NM= HOSTCC=' \
 	  '             EXTRAVERSION= LOCALVERSION= SOURCE_DATE_EPOCH='
+
+SPHINXBUILD ?= sphinx-build
+SPHINXOPTS ?=
+htmldocs: $(RELIEFNT_O_MARKER)
+	$(Q)SPHINXBUILD='$(SPHINXBUILD)' SPHINXOPTS='$(SPHINXOPTS)' \
+	    sh $(RELIEFNT_SRC)/scripts/build-docs.sh $(RELIEFNT_SRC)/Documentation $(O)/Documentation/html
 
 $(RELIEFNT_O_MARKER): | $(O)
 	$(Q)printf 'reliefos-build-out version=1 root=%s\n' '$(RELIEFNT_SRC)' > $@.tmp
