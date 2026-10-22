@@ -119,7 +119,7 @@ endif
 
 .PHONY: help all kernel kerneldebug boot vdso tools fetch fetch-check \
 	defconfig olddefconfig menuconfig config-sync build-info headers_install \
-	install test test-tools test-abi test-header-export test-vdso htmldocs \
+	install test test-tools test-abi test-header-export test-vdso test-kconfig htmldocs \
 	kbuild-fixdep kconfig-tools clean distclean FORCE
 
 help:
@@ -136,6 +136,7 @@ help:
 	  '  defconfig / olddefconfig / menuconfig / config-sync' \
 	  '  tools / fetch / fetch-check' \
 	  '  test              host tests, ABI, header export and vDSO' \
+	  '  test-kconfig      standalone native configuration ownership checks' \
 	  '  htmldocs          strict Sphinx HTML manual in O/Documentation/html' \
 	  '  clean / distclean (download cache is preserved)' \
 	  '' \
@@ -310,7 +311,10 @@ test-abi:
 test-header-export: headers_install
 	$(Q)$(RELIEFNT_TEST_PYTHON) $(RELIEFNT_SRC)/tools/test_header_export.py --out $(O)
 
-test: test-tools test-abi test-header-export test-vdso test-boot-logo test-panic-console test-module-layout test-boot
+test: test-tools test-abi test-header-export test-vdso test-boot-logo test-panic-console test-module-layout test-boot test-kconfig
+
+test-kconfig:
+	$(Q)sh $(RELIEFNT_SRC)/tools/tests/test-kconfig.sh
 
 .PHONY: test-boot multiboot2-runtime-test boot-root-runtime-test file-flags-runtime-test sidecar-directory-runtime-test
 sidecar-directory-runtime-test: kbuild-fixdep $(RELIEFNT_HOST_CC_ID)

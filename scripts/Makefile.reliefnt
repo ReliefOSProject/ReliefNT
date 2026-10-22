@@ -92,6 +92,7 @@ define RELIEFNT_KBUILD
 $(MAKE) $(RELIEFNT_KBUILD_BASE) $(1)
 endef
 
+# Match the upstream Linux 6.12 host language mode, not the compiler default.
 define RELIEFNT_KCONFIG
-$(call RELIEFNT_KBUILD,obj=scripts/kconfig KBUILD_KCONFIG=$(RELIEFNT_SRC)/Kconfig KBUILD_DEFCONFIG=reliefnt_defconfig KCONFIG_CONFIG=$(O)/.config SRCARCH=$(ARCH) $(1))
+$(call RELIEFNT_KBUILD,obj=scripts/kconfig KBUILD_KCONFIG=$(RELIEFNT_SRC)/Kconfig KBUILD_DEFCONFIG=reliefnt_defconfig KCONFIG_CONFIG=$(O)/.config SRCARCH=$(ARCH) KBUILD_HOSTCFLAGS='$(RELIEFNT_HOST_CFLAGS) -std=gnu11 $(RELIEFNT_HOST_CPPFLAGS)' $(1))
 endef

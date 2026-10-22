@@ -16,6 +16,18 @@ fetch 获取锁定 Unifont，正常构建不隐式联网。配置在 O/.config�
 编辑，olddefconfig 保留并补充。工具链由 configs/toolchains 指定，显式命令行
 覆盖目标工具；HOSTCC 独立。原版引擎摘要见 scripts/kbuild-source.json。
 
+配置归属
+========
+
+当前已实现的内核部件全部内建，没有可选内核特性符号；Kconfig 不定义占位开关。
+menuconfig 显示构建策略的使用说明，实际编译策略由 PROFILE=debug|release 控制，
+工具链、版本后缀和 SOURCE_DATE_EPOCH 继续使用独立 Make 参数。
+
+应用、系统镜像、激活策略和 QEMU 参数只属于 ReliefOS 主仓，内核不 source
+主仓 Kconfig。从旧输出复制配置后运行 olddefconfig，会由原版 conf 移除外来符号。
+``make test-kconfig`` 使用隔离输出验证该边界与重复同步的稳定性，并属于默认 test。
+保留的 Linux Kconfig 引擎及其测试夹具是上游构建输入，不是本内核提供的配置项。
+
 产物与版本
 ==========
 

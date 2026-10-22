@@ -1,3 +1,9 @@
 mainmenu "ReliefNT x86-64 Kernel Configuration"
 
-comment "The current kernel has no user-selectable configuration symbols."
+comment "All implemented kernel subsystems are built in"
+comment "No optional kernel feature symbols are defined"
+comment "Build policy: PROFILE=debug|release"
+comment "Show build commands: V=1"
+comment "Toolchain and version suffixes use Make variables"
+comment "Configure applications and images in ReliefOS"
+comment "QEMU options also belong to ReliefOS"
