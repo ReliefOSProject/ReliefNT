@@ -15,6 +15,7 @@ int64_t syscall_io_write(uint64_t a0, uint64_t a1, uint64_t a2)
     uint32_t request_len;
     int pty_stream;
     struct task_file *signal_file = task_file_for_io(task, (int32_t)a0);
+    if (signal_file && (signal_file->flags & TASK_FILE_FLAG_PATH)) return -RELIEFOS_EBADF;
     if (signal_file && signal_file->kind == TASK_FILE_KIND_SIGNALFD) return -LINUX_EINVAL;
     if (!user_range_ok(a1, a2)) {
         return -RELIEFOS_EFAULT;
@@ -101,8 +102,7 @@ int64_t syscall_io_write(uint64_t a0, uint64_t a1, uint64_t a2)
     if (file->flags & TASK_FILE_FLAG_DEV_NODE) {
         if (!file_can_write(file)) return -RELIEFOS_EBADF;
         if (file->flags & TASK_FILE_FLAG_DEV_BLOCK) {
-            if (task_effective_role(task) != RELIEFOS_AUTH_ROLE_ADMIN &&
-                !(task->uid == 0 && storage_installer_root_active())) return -RELIEFOS_EACCES;
+            /* open(2) checked device DAC; the writable descriptor authorizes I/O. */
             return syscall_regular_io(task,file,a1,a2,0,true,false);
         }
         request_len = task_device_write_length(file, a2);

@@ -50,8 +50,7 @@ int64_t syscall_legacy_io(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2
             bool writing = number == LINUX_SYS_PWRITE64;
             if (writing ? !file_can_write(file) : !file_can_read(file)) return -RELIEFOS_EBADF;
             if (writing ? !user_range_ok(a1,a2) : !user_range_writable(a1,a2)) return -RELIEFOS_EFAULT;
-            if (writing && task_effective_role(task) != RELIEFOS_AUTH_ROLE_ADMIN &&
-                !(task->uid == 0 && storage_installer_root_active())) return -RELIEFOS_EACCES;
+            /* Match write(2): device DAC is checked when this descriptor is opened. */
             return syscall_regular_io(task,file,a1,a2,a3,writing,true);
         }
         if (file->node.type == RELIEFOS_FS_TYPE_FILE &&

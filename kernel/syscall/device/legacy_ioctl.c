@@ -90,8 +90,8 @@ int64_t syscall_legacy_ioctl(uint64_t number, uint64_t a0, uint64_t a1, uint64_t
                 return 0;
             }
             if (a1 == BLKRRPART) {
-                if (!task || (task_effective_role(task) != RELIEFOS_AUTH_ROLE_ADMIN &&
-                              !(task->uid == 0 && storage_installer_root_active()))) {
+                /* Linux requires CAP_SYS_ADMIN for partition-table rescans. */
+                if (!task || !(task->cap_effective & (1ULL << CAP_SYS_ADMIN))) {
                     return -RELIEFOS_EACCES;
                 }
                 if (partition_index >= 0) return -RELIEFOS_EINVAL;

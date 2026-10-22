@@ -134,10 +134,7 @@ int task_device_write(struct task *task, struct task_file *file,
     uint32_t wrote = 0;
     if (!task || !file) return -RELIEFOS_EBADF;
     if (task_block_device(file, &disk_id, &partition_index)) {
-        if (task_effective_role(task) != RELIEFOS_AUTH_ROLE_ADMIN &&
-            !(task->uid == 0 && storage_installer_root_active())) {
-            return -RELIEFOS_EACCES;
-        }
+        if (!file_can_write(file)) return -RELIEFOS_EBADF;
         int ret = storage_disk_block_write(disk_id, partition_index, file->offset,
                                            buffer, length, &wrote);
         return ret < 0 ? ret : (int)wrote;
