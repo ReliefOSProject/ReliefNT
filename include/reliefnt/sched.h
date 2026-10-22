@@ -47,12 +47,25 @@ void sched_set_task_image_node(uint32_t pid, const struct storage_node *node);
  */
 void sched_set_task_path(uint32_t pid, const char *path);
 /**
- * @brief Set argv/envp and the packed aux data for task pid's upcoming exec.
+ * @brief Replace exec metadata with an owned copy, preserving old data on failure.
+ * @param task Destination task. @param argc Number of arguments.
+ * @param argv Argument pointers into data. @param envc Number of environment entries.
+ * @param envp Environment pointers into data. @param data Packed string buffer.
+ * @param data_len Buffer length in bytes.
+ * @return Zero, -EINVAL for invalid pointers, -E2BIG, or -ENOMEM.
  */
-void sched_copy_task_exec_params(struct task *task, uint32_t argc, char *const argv[],
+int sched_copy_task_exec_params(struct task *task, uint32_t argc, char *const argv[],
                                 uint32_t envc, char *const envp[],
                                 const char *data, uint32_t data_len);
-void sched_set_task_exec_params(uint32_t pid,
+/**
+ * @brief Assign owned exec metadata to a task identified by pid.
+ * @param pid Task identifier. @param argc Number of arguments.
+ * @param argv Argument pointers into data. @param envc Number of environment entries.
+ * @param envp Environment pointers into data. @param data Packed string buffer.
+ * @param data_len Buffer length in bytes.
+ * @return Zero or the negative copy/allocation error.
+ */
+int sched_set_task_exec_params(uint32_t pid,
                                 uint32_t argc, char *const argv[],
                                 uint32_t envc, char *const envp[],
                                 const char *data, uint32_t data_len);

@@ -151,6 +151,9 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
     }
     task_zero(child);
     *child = *parent;
+    child->exec_argv = NULL;
+    child->exec_envp = NULL;
+    child->exec_data = NULL;
     task_fair_reset(child);
     child->limits = *sched_task_limits(parent);
     child->limits.references = 1;
@@ -345,6 +348,12 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
         if (syscall_clone_task_files(parent, child) < 0) goto fail;
         files_retained = true;
     }
+    /**
+ * @brief exec_argv and exec_envp are interior pointers, so rebuild them to reference the child-owned packed string storage after the structure copy.
+ */
+    if (sched_set_task_exec_params(child_pid, parent->exec_argc, parent->exec_argv,
+                                   parent->exec_envc, parent->exec_envp,
+                                   parent->exec_data, parent->exec_data_len) < 0) goto fail;
     if (task_sysv_sem_clone(parent, child, flags) < 0) goto fail;
     if (flags & CLONE_FS) {
         child->shared_fs = parent->shared_fs;
@@ -358,12 +367,6 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
         child->shared_limits = parent->shared_limits;
         ++child->shared_limits->references;
     }
-    /**
- * @brief exec_argv and exec_envp are interior pointers, so rebuild them to reference the child-owned packed string storage after the structure copy.
- */
-    sched_set_task_exec_params(child_pid, parent->exec_argc, parent->exec_argv,
-                               parent->exec_envc, parent->exec_envp,
-                               parent->exec_data, parent->exec_data_len);
     task_groups_retain(child->groups);
     if (flags & CLONE_PARENT_SETTID) *(uint32_t *)(uintptr_t)parent_tid = child_pid;
     if (flags & CLONE_CHILD_SETTID) {
@@ -399,6 +402,9 @@ fail:
         if (files_retained) syscall_release_task_files(child);
         sched_task_file_release(child);
     }
+    kernel_free(child->exec_argv);
+    kernel_free(child->exec_envp);
+    kernel_free(child->exec_data);
     task_zero(child);
     child->state = TASK_EXITED;
     child->running_cpu = SCHED_CPU_NONE;

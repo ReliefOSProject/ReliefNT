@@ -230,9 +230,13 @@ struct task_snapshot_user {
 struct exec_params_kernel {
     uint32_t argc;
     uint32_t envc;
-    char *argv[SCHED_EXEC_ARG_MAX + 1];
-    char *envp[SCHED_EXEC_ENV_MAX + 1];
-    char data[SCHED_EXEC_DATA_MAX];
+    char **argv;
+    char **envp;
+    char *data;
+    uint32_t data_cap;
+    uint32_t argv_cap;
+    uint32_t envp_cap;
+    uint32_t limit;
     uint32_t data_len;
 };
 
@@ -1112,6 +1116,8 @@ uint32_t kernel_string_len_cap(const char *text, uint32_t cap);
  * @return The value or status produced by the operation.
  */
 int copy_exec_params_from_user(uint64_t argv_ptr, uint64_t envp_ptr, struct exec_params_kernel *params);
+/** @brief Free owned exec staging buffers. @param params Initialized staging object. */
+void free_exec_params(struct exec_params_kernel *params);
 
 int exec_resolve_scripts(struct task *task, char *path, struct storage_node *node,
                                  const char *execfn, bool inaccessible,

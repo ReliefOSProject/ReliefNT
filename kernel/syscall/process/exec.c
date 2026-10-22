@@ -1,123 +1,189 @@
 #include "../internal.h"
 
-/**
- * Copy user vector.
- * @param user_ptr Value supplied by the caller.
- * @param max_count Value supplied by the caller.
- * @param out_ptrs Value supplied by the caller.
- * @param data Value supplied by the caller.
- * @param data_cap Value supplied by the caller.
- * @param out_count Value supplied by the caller.
- * @param data_len Value supplied by the caller.
- * @return The value or status produced by the operation.
+/** @brief Release all staging allocations, including partially built vectors.
+ * @param params Initialized staging object, reset to zero on return.
  */
-static int copy_user_vector(uint64_t user_ptr, uint32_t max_count,
-                            char *out_ptrs[], char *data,
-                            uint32_t data_cap, uint32_t *out_count, uint32_t *data_len);
-
-static bool script_space(char c);
-
-static int script_header(char header[256], char **name, char **argument);
-
-static int exec_append_string(struct exec_params_kernel *params, const char *text, bool environment);
-
-static int exec_script_arguments(struct exec_params_kernel *params, const char *interpreter,
-                                  const char *argument, const char *script);
-
-
-/**
- * Copy user vector.
- * @param user_ptr Value supplied by the caller.
- * @param max_count Value supplied by the caller.
- * @param out_ptrs Value supplied by the caller.
- * @param data Value supplied by the caller.
- * @param data_cap Value supplied by the caller.
- * @param out_count Value supplied by the caller.
- * @param data_len Value supplied by the caller.
- * @return The value or status produced by the operation.
- */
-static int copy_user_vector(uint64_t user_ptr, uint32_t max_count,
-                            char *out_ptrs[], char *data,
-                            uint32_t data_cap, uint32_t *out_count, uint32_t *data_len)
+void free_exec_params(struct exec_params_kernel *params)
 {
-    uint64_t *user_vec = (uint64_t *)(uintptr_t)user_ptr;
-    uint32_t count = 0;
-    if (!out_ptrs || !data || !out_count || !data_len) {
-        return -RELIEFOS_EINVAL;
+    if (!params) return;
+    kernel_free(params->argv);
+    kernel_free(params->envp);
+    kernel_free(params->data);
+    *params = (struct exec_params_kernel){0};
+}
+
+/** @brief Allocate bounded staging space after counting the user vectors.
+ * @param params Zeroed object receiving owned storage.
+ * @param argc Argument capacity, excluding its null terminator.
+ * @param envc Environment capacity, excluding its null terminator.
+ * @param limit Combined Linux argument budget, including pointer words.
+ * @param bytes Actual packed string capacity, not the entire remaining budget.
+ * @return Zero, -E2BIG for an exhausted budget, or -ENOMEM.
+ */
+static int allocate_exec_params(struct exec_params_kernel *params, uint32_t argc,
+                               uint32_t envc, uint32_t limit, uint32_t bytes)
+{
+    uint64_t pointers = ((uint64_t)(argc ? argc : 1) + envc) * sizeof(char *);
+    if (argc > SCHED_EXEC_ARG_MAX || envc > SCHED_EXEC_ENV_MAX || pointers >= limit ||
+        bytes > limit - pointers)
+        return -RELIEFOS_E2BIG;
+    params->limit = limit;
+    params->argv_cap = argc;
+    params->envp_cap = envc;
+    params->data_cap = bytes;
+    params->argv = kernel_malloc(((size_t)argc + 1) * sizeof(char *));
+    params->envp = kernel_malloc(((size_t)envc + 1) * sizeof(char *));
+    params->data = kernel_malloc(params->data_cap ? params->data_cap : 1);
+    if (!params->argv || !params->envp || !params->data) {
+        free_exec_params(params);
+        return -RELIEFOS_ENOMEM;
     }
-    if (!user_ptr) {
-        *out_count = 0;
-        return 0;
-    }
-    for (;;) {
-        uint64_t entry_ptr;
-        if (!user_range_ok((uint64_t)(uintptr_t)&user_vec[count], sizeof(uint64_t))) {
-            return -RELIEFOS_EFAULT;
-        }
-        entry_ptr = user_vec[count];
-        if (!entry_ptr) {
-            break;
-        }
-        if (count >= max_count) {
-            return -RELIEFOS_E2BIG;
-        }
-        uint32_t len = 0;
-        uint32_t start = *data_len;
-        int ret = copy_user_string_fixed(data + start, data_cap - start, entry_ptr, &len);
-        if (ret < 0) {
-            return ret;
-        }
-        out_ptrs[count] = data + start;
-        *data_len += len + 1;
-        ++count;
-    }
-    out_ptrs[count] = 0;
-    *out_count = count;
+    params->argv[0] = params->envp[0] = NULL;
     return 0;
 }
 
-/**
- * Copy exec params from user.
- * @param argv_ptr Value supplied by the caller.
- * @param envp_ptr Value supplied by the caller.
- * @param params Value supplied by the caller.
- * @return The value or status produced by the operation.
+/** @brief Read one pointer word without user-address arithmetic wrapping.
+ * @param vector User vector base, nonzero.
+ * @param index Word offset within the vector.
+ * @param value Output pointer word.
+ * @return Zero or -EFAULT for inaccessible/overflowing user memory.
+ */
+static int exec_user_pointer(uint64_t vector, uint32_t index, uint64_t *value)
+{
+    uint64_t offset = (uint64_t)index * sizeof(uint64_t);
+    if (vector > UINT64_MAX - offset || !user_range_ok(vector + offset, sizeof(*value)))
+        return -RELIEFOS_EFAULT;
+    __builtin_memcpy(value, (const void *)(uintptr_t)(vector + offset), sizeof(*value));
+    return 0;
+}
+
+/** @brief Measure or copy a user string within the Linux per-string bound.
+ * @param pointer User address. @param data Optional copy destination.
+ * @param cap String limit including NUL. @param length Output size including NUL.
+ * @return Zero, -EFAULT, or -E2BIG.
+ */
+static int copy_exec_string(uint64_t pointer, char *data, uint32_t cap, uint32_t *length);
+
+/** @brief Count user strings, bounded by the bytes available for pointer words.
+ * @param vector Nullable user vector base.
+ * @param limit Combined string/pointer budget.
+ * @param count Output number of non-null entries.
+ * @param bytes Accumulated packed string bytes from both vectors.
+ * @return Zero, -EFAULT, or -E2BIG.
+ */
+static int count_exec_vector(uint64_t vector, uint32_t limit, uint32_t *count, uint32_t *bytes)
+{
+    *count = 0;
+    if (!vector) return 0;
+    for (;;) {
+        uint64_t pointer;
+        int ret = exec_user_pointer(vector, *count, &pointer);
+        if (ret < 0) return ret;
+        if (!pointer) return 0;
+        if (*count >= SCHED_EXEC_ARG_MAX || *count >= limit / sizeof(char *))
+            return -RELIEFOS_E2BIG;
+        uint32_t cap = limit - *bytes, length;
+        if (cap > SCHED_EXEC_STR_MAX) cap = SCHED_EXEC_STR_MAX;
+        ret = copy_exec_string(pointer, NULL, cap, &length);
+        if (ret < 0) return ret;
+        *bytes += length;
+        ++*count;
+    }
+}
+
+/** @brief Copy a user string page by page with Linux MAX_ARG_STRLEN semantics.
+ * @param pointer Non-null user string address.
+ * @param data Optional kernel destination; NULL measures without copying.
+ * @param cap Capacity including the terminating NUL, at most MAX_ARG_STRLEN.
+ * @param length Output byte count including the terminating NUL.
+ * @return Zero, -EFAULT on unreadable memory, or -E2BIG on a missing NUL.
+ */
+static int copy_exec_string(uint64_t pointer, char *data, uint32_t cap, uint32_t *length)
+{
+    uint32_t done = 0;
+    while (done < cap) {
+        if (pointer > UINT64_MAX - done) return -RELIEFOS_EFAULT;
+        uint64_t address = pointer + done;
+        uint32_t chunk = 4096u - (uint32_t)(address & 4095u);
+        if (chunk > cap - done) chunk = cap - done;
+        if (!user_range_ok(address, chunk)) return -RELIEFOS_EFAULT;
+        for (uint32_t i = 0; i < chunk; ++i) {
+            char ch = ((const char *)(uintptr_t)address)[i];
+            if (data) data[done] = ch;
+            ++done;
+            if (!ch) { *length = done; return 0; }
+        }
+    }
+    return -RELIEFOS_E2BIG;
+}
+
+/** @brief Copy a counted user vector; a concurrent size change fails safely.
+ * @param vector Nullable user vector base.
+ * @param count Count observed before allocation.
+ * @param params Owned staging object.
+ * @param environment Select envp rather than argv.
+ * @return Zero or a negative copy/budget error.
+ */
+static int copy_exec_vector_user(uint64_t vector, uint32_t count,
+                                 struct exec_params_kernel *params, bool environment)
+{
+    char **dest = environment ? params->envp : params->argv;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint64_t pointer;
+        int ret = exec_user_pointer(vector, i, &pointer);
+        if (ret < 0) return ret;
+        if (!pointer) return -RELIEFOS_EFAULT;
+        uint32_t cap = params->data_cap - params->data_len, length = 0;
+        if (cap > SCHED_EXEC_STR_MAX) cap = SCHED_EXEC_STR_MAX;
+        dest[i] = params->data + params->data_len;
+        ret = copy_exec_string(pointer, dest[i], cap, &length);
+        if (ret < 0) return ret;
+        params->data_len += length;
+    }
+    if (vector) {
+        uint64_t end;
+        int ret = exec_user_pointer(vector, count, &end);
+        if (ret < 0) return ret;
+        if (end) return -RELIEFOS_E2BIG;
+    }
+    dest[count] = NULL;
+    if (environment) params->envc = count;
+    else params->argc = count;
+    return 0;
+}
+
+/** @brief Snapshot argv/envp in heap storage using the current Linux stack budget.
+ * @param argv_ptr Nullable user argument vector.
+ * @param envp_ptr Nullable user environment vector.
+ * @param params Output object; released on failure or with free_exec_params.
+ * @return Zero, -E2BIG, -EFAULT, or -ENOMEM; no process image is changed.
  */
 int copy_exec_params_from_user(uint64_t argv_ptr, uint64_t envp_ptr, struct exec_params_kernel *params)
 {
-    int ret;
-    uint32_t data_len = 0;
-    if (!params) {
-        return -RELIEFOS_EINVAL;
-    }
-    for (uint32_t i = 0; i < SCHED_EXEC_ARG_MAX + 1; ++i) {
-        params->argv[i] = 0;
-    }
-    for (uint32_t i = 0; i < SCHED_EXEC_ENV_MAX + 1; ++i) {
-        params->envp[i] = 0;
-    }
-    params->argc = 0;
-    params->envc = 0;
-    params->data_len = 0;
-
-    if (argv_ptr) {
-        ret = copy_user_vector(argv_ptr, SCHED_EXEC_ARG_MAX, params->argv, params->data,
-                               sizeof(params->data), &params->argc, &data_len);
-        if (ret < 0) {
-            return ret;
-        }
-    }
-    ret = copy_user_vector(envp_ptr, SCHED_EXEC_ENV_MAX, params->envp, params->data,
-                           sizeof(params->data), &params->envc, &data_len);
-    if (ret < 0) {
-        return ret;
-    }
-    params->data_len = data_len;
-    return 0;
+    if (!params) return -RELIEFOS_EINVAL;
+    *params = (struct exec_params_kernel){0};
+    struct task *task = sched_current_task();
+    uint32_t limit = sched_exec_argument_limit(task ? sched_task_limits(task)->stack.rlim_cur : 8u*1024u*1024u);
+    uint32_t argc, envc, bytes = 0;
+    int ret = count_exec_vector(argv_ptr, limit, &argc, &bytes);
+    if (!ret) ret = count_exec_vector(envp_ptr, limit, &envc, &bytes);
+    if (!ret) ret = allocate_exec_params(params, argc, envc, limit, bytes);
+    if (!ret) ret = copy_exec_vector_user(argv_ptr, argc, params, false);
+    if (!ret) ret = copy_exec_vector_user(envp_ptr, envc, params, true);
+    if (ret < 0) free_exec_params(params);
+    return ret;
 }
 
+/** @brief Identify the two separators accepted by Linux shebang parsing.
+ * @param c Header byte. @return True for a space or tab.
+ */
 static bool script_space(char c) { return c == ' ' || c == '\t'; }
 
+/** @brief Parse the bounded interpreter line without reading beyond 256 bytes.
+ * @param header Mutable file prefix. @param name Output interpreter pointer.
+ * @param argument Output optional argument pointer, or NULL.
+ * @return One for a script, zero for other files, or -ENOEXEC for truncation.
+ */
 static int script_header(char header[256], char **name, char **argument)
 {
     if (header[0] != '#' || header[1] != '!') return 0;
@@ -149,48 +215,67 @@ static int script_header(char header[256], char **name, char **argument)
     return 1;
 }
 
+/** @brief Append one kernel string without exceeding the reserved Linux budget.
+ * @param params Allocated staging object.
+ * @param text Kernel string, bounded by MAX_ARG_STRLEN.
+ * @param environment Select the environment vector.
+ * @return Zero or -E2BIG, without modifying state on error.
+ */
 static int exec_append_string(struct exec_params_kernel *params, const char *text, bool environment)
 {
-    uint32_t length = (uint32_t)__builtin_strlen(text) + 1;
+    size_t size = kernel_string_len_cap(text, SCHED_EXEC_STR_MAX);
     uint32_t *count = environment ? &params->envc : &params->argc;
-    uint32_t limit = environment ? SCHED_EXEC_ENV_MAX : SCHED_EXEC_ARG_MAX;
-    if (*count >= limit || length > sizeof(params->data) - params->data_len) return -RELIEFOS_E2BIG;
+    uint32_t cap = environment ? params->envp_cap : params->argv_cap;
+    if (size >= SCHED_EXEC_STR_MAX || *count >= cap ||
+        size + 1 > params->data_cap - params->data_len) return -RELIEFOS_E2BIG;
     char **vector = environment ? params->envp : params->argv;
     vector[(*count)++] = params->data + params->data_len;
-    __builtin_memcpy(params->data + params->data_len, text, length);
-    params->data_len += length;
+    __builtin_memcpy(params->data + params->data_len, text, size + 1);
+    params->data_len += (uint32_t)size + 1;
     vector[*count] = NULL;
     return 0;
 }
 
+/** @brief Rewrite shebang arguments transactionally, preserving the environment.
+ * @param params Owned staging object, replaced only on success.
+ * @param interpreter Interpreter pathname.
+ * @param argument Optional shebang argument.
+ * @param script Script filename.
+ * @return Zero or a negative budget/allocation error.
+ */
 static int exec_script_arguments(struct exec_params_kernel *params, const char *interpreter,
                                   const char *argument, const char *script)
 {
-    struct exec_params_kernel *next = kernel_malloc(sizeof(*next));
-    if (!next) return -RELIEFOS_ENOMEM;
-    __builtin_memset(next, 0, sizeof(*next));
-    int ret = exec_append_string(next, interpreter, false);
-    if (!ret && argument) ret = exec_append_string(next, argument, false);
-    if (!ret) ret = exec_append_string(next, script, false);
+    struct exec_params_kernel next = {0};
+    uint64_t argc = (params->argc ? params->argc - 1 : 0) + 2ULL + !!argument;
+    if (argc > SCHED_EXEC_ARG_MAX) return -RELIEFOS_E2BIG;
+    uint64_t bytes = params->data_len;
+    if (params->argc) bytes -= __builtin_strlen(params->argv[0]) + 1;
+    bytes += __builtin_strlen(interpreter) + 1 + __builtin_strlen(script) + 1;
+    if (argument) bytes += __builtin_strlen(argument) + 1;
+    if (bytes > params->limit) return -RELIEFOS_E2BIG;
+    int ret = allocate_exec_params(&next, (uint32_t)argc, params->envc, params->limit, (uint32_t)bytes);
+    if (!ret) ret = exec_append_string(&next, interpreter, false);
+    if (!ret && argument) ret = exec_append_string(&next, argument, false);
+    if (!ret) ret = exec_append_string(&next, script, false);
     for (uint32_t i = 1; !ret && i < params->argc; ++i)
-        ret = exec_append_string(next, params->argv[i], false);
+        ret = exec_append_string(&next, params->argv[i], false);
     for (uint32_t i = 0; !ret && i < params->envc; ++i)
-        ret = exec_append_string(next, params->envp[i], true);
+        ret = exec_append_string(&next, params->envp[i], true);
     if (!ret) {
-        __builtin_memcpy(params->data, next->data, next->data_len);
-        params->data_len = next->data_len;
-        params->argc = next->argc;
-        params->envc = next->envc;
-        for (uint32_t i = 0; i < next->argc; ++i)
-            params->argv[i] = params->data + (next->argv[i] - next->data);
-        for (uint32_t i = 0; i < next->envc; ++i)
-            params->envp[i] = params->data + (next->envp[i] - next->data);
-        params->argv[params->argc] = params->envp[params->envc] = NULL;
-    }
-    kernel_free(next);
+        free_exec_params(params);
+        *params = next;
+    } else free_exec_params(&next);
     return ret;
 }
 
+/** @brief Resolve interpreter scripts and rebuild argv before any exec commit.
+ * @param task Calling task under execution serialization.
+ * @param path Mutable resolved path. @param node Mutable held executable node.
+ * @param execfn Original execution name. @param inaccessible FD has CLOEXEC set.
+ * @param params Owned arguments/environment; preserves the stack-derived budget.
+ * @return Zero for a resolved executable or a negative lookup/format/copy error.
+ */
 int exec_resolve_scripts(struct task *task, char *path, struct storage_node *node,
                                  const char *execfn, bool inaccessible,
                                  struct exec_params_kernel *params)

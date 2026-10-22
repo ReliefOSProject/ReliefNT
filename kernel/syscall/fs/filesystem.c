@@ -57,15 +57,14 @@ int64_t syscall_openat2(uint64_t dirfd, uint64_t pathname,
 }
 
 /**
- * Syscall dispatch regs legacy.
- * @param number Value supplied by the caller.
- * @param a0 Value supplied by the caller.
- * @param a1 Value supplied by the caller.
- * @param a2 Value supplied by the caller.
- * @param a3 Value supplied by the caller.
- * @param a4 Value supplied by the caller.
- * @param a5 Value supplied by the caller.
- * @return The value or status produced by the operation.
+ * @brief Set inode timestamps by pathname, empty-path handle, or Linux futimens fd.
+ * @param task Caller whose identity controls timestamp permissions.
+ * @param dirfd Directory fd or the target fd when path_ptr is NULL.
+ * @param path_ptr User pathname, or NULL for an fd-only operation.
+ * @param times Validated access/modification times, with UTIME_NOW/UTIME_OMIT.
+ * @param flags Lookup flags; fd-only operations require zero.
+ * @param times_supplied Caller explicitly supplied the times vector.
+ * @return Zero or a negative lookup, descriptor, permission, or storage error.
  */
 int64_t syscall_update_path_times(struct task *task, int32_t dirfd, uint64_t path_ptr,
                                          const struct linux_timespec times[2], uint32_t flags,
@@ -75,11 +74,24 @@ int64_t syscall_update_path_times(struct task *task, int32_t dirfd, uint64_t pat
     char path[RELIEFOS_FS_PATH_LEN];
     if (flags & ~(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH))
         return -RELIEFOS_EINVAL;
-    int ret = resolve_user_path_at_flags(task, dirfd, path_ptr, flags & LINUX_AT_EMPTY_PATH,
-                                   path, NULL, false,
-                                   flags & LINUX_AT_SYMLINK_NOFOLLOW ? 0 : FS_LOOKUP_FOLLOW);
-    if (ret < 0) return ret;
-    ret = storage_lookup_path(path, &node);
+    int ret;
+    struct task_file *file = NULL;
+    if (!path_ptr && dirfd != LINUX_AT_FDCWD) {
+        /* Linux do_utimes_fd: futimens uses a NULL pathname, not AT_EMPTY_PATH. */
+        if (flags) return -RELIEFOS_EINVAL;
+        file = task_file_for_fd(task, dirfd);
+        if (!file || (file->flags & TASK_FILE_FLAG_PATH)) return -RELIEFOS_EBADF;
+        copy_text(path, sizeof(path), file->path);
+    } else {
+        ret = resolve_user_path_at_flags(task, dirfd, path_ptr, flags & LINUX_AT_EMPTY_PATH,
+                                        path, &file, false,
+                                        flags & LINUX_AT_SYMLINK_NOFOLLOW ? 0 : FS_LOOKUP_FOLLOW);
+        if (ret < 0) return ret;
+    }
+    if (file) {
+        node = file->node;
+        ret = storage_inode_refresh(&node);
+    } else ret = storage_lookup_path(path, &node);
     if (ret < 0) return ret;
     struct reliefos_permissions perms;
     ret = fs_permissions_get(path, &node, &perms);
@@ -91,7 +103,7 @@ int64_t syscall_update_path_times(struct task *task, int32_t dirfd, uint64_t pat
                             (times[1].tv_nsec != 1073741823 && times[1].tv_nsec != 1073741822);
         }
         if (explicit_time) return -RELIEFOS_EPERM;
-        ret = fs_permissions_check(task, path, FS_ACCESS_WRITE, false);
+        ret = fs_permissions_check_node(task, path, &node, FS_ACCESS_WRITE, false);
         if (ret < 0) return ret;
     }
     struct reliefos_time_info now;

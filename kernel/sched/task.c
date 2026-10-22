@@ -523,6 +523,10 @@ void sched_release_task_resources(struct task *task)
     if (task->shared_sighand && __atomic_sub_fetch(&task->shared_sighand->references, 1, __ATOMIC_SEQ_CST) == 0)
         kernel_free(task->shared_sighand);
     task->shared_sighand = NULL;
+    kernel_free(task->exec_argv); kernel_free(task->exec_envp); kernel_free(task->exec_data);
+    task->exec_argv = task->exec_envp = NULL;
+    task->exec_data = NULL;
+    task->exec_argc = task->exec_envc = task->exec_data_len = 0;
     svga_gpu_release_owner(task->pid);
     task->flags |= TASK_FLAG_RESOURCES_RELEASED;
     /* Signal/fault exits also retire private PTY owners. Publish cleanup first:

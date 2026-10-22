@@ -253,6 +253,33 @@ static bool task_stack_growth_allowed(const struct task *task, uint64_t page)
     return true;
 }
 
+/** @brief Grow a prepared exec stack using the same accounting as stack faults.
+ * @param task Prepared task owning the not-yet-committed user mappings.
+ * @param low Lowest required page, aligned to 4 KiB.
+ * @return Zero, -E2BIG for RLIMIT_STACK/window exhaustion, or -ENOMEM.
+ */
+int syscall_mm_prepare_exec_stack(struct task *task, uint64_t low)
+{
+    if (!task || (low & (PAGE_SIZE - 1)) || low >= task->stack_top ||
+        low < task->stack_top - (uint64_t)RELIEFNT_USER_STACK_MAX_PAGES * PAGE_SIZE)
+        return -RELIEFOS_E2BIG;
+    if (task->stack_top - low > sched_task_limits(task)->stack.rlim_cur)
+        return -RELIEFOS_E2BIG;
+    uint64_t as_limit = sched_task_limits(task)->as.rlim_cur;
+    if (as_limit != LINUX_RLIM_INFINITY &&
+        task_vma_total_bytes(task) > (as_limit & ~(PAGE_SIZE - 1ULL)))
+        return -RELIEFOS_ENOMEM;
+    if (low >= task->stack_low) return 0;
+    if (!task_stack_growth_allowed(task, low)) return -RELIEFOS_ENOMEM;
+    for (uint64_t page = low; page < task->stack_low; page += PAGE_SIZE)
+        if (!address_space_map_user_stack_page(sched_task_as(task), page))
+            return -RELIEFOS_ENOMEM;
+    task->stack_low = low;
+    sched_task_mm(task)->initial_stack_low = low;
+    return 0;
+}
+
+
 /** @brief Distinguish a missing mapping from denied access to an existing VMA. */
 int syscall_page_fault_signal_code(struct task *task, uint64_t address)
 {

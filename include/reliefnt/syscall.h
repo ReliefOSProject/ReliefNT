@@ -400,4 +400,11 @@ void syscall_close_cloexec_files(struct task *task);
 int syscall_inherit_task_fds(struct task *parent, struct task *child,
                              int stdin_fd, int stdout_fd, int stderr_fd);
 
+/** @brief Populate initial exec stack pages before replacing the old address space.
+ * @param task Prepared task with a private address space and inherited rlimits.
+ * @param low Page-aligned lowest address occupied by exec data.
+ * @return Zero, -E2BIG for the stack limit, or -ENOMEM for AS/allocation limits.
+ */
+int syscall_mm_prepare_exec_stack(struct task *task, uint64_t low);
+
 #endif

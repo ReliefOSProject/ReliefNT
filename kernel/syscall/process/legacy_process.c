@@ -88,10 +88,11 @@ int64_t syscall_legacy_process(uint64_t number, uint64_t a0, uint64_t a1, uint64
         bool inaccessible = at && raw[0] != '/' && dirfd != LINUX_AT_FDCWD &&
                             (task_fd_descriptor_flags(task, dirfd) & RELIEFOS_FD_CLOEXEC);
         ret = exec_resolve_scripts(task, path, &node, execfn, inaccessible, &params);
-        if (ret < 0) return ret;
-        return userland_exec_current_node(path, &node, execfn, params.argc, params.argv,
-                                          params.envc, params.envp,
-                                          params.data, params.data_len);
+        if (!ret) ret = userland_exec_current_node(path, &node, execfn, params.argc, params.argv,
+                                                   params.envc, params.envp,
+                                                   params.data, params.data_len);
+        free_exec_params(&params);
+        return ret;
     }
 
     if (number == LINUX_SYS_FORK) {

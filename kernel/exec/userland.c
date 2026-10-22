@@ -51,13 +51,18 @@ static void sched_idle_service_wait(void *opaque)
         console_debug("[reliefnt] drm idle retirement resources=%u\n", retired);
 }
 
+/* Internal boot/service launch requests remain small; execve uses heap-sized vectors. */
+#define KERNEL_LAUNCH_ARG_MAX 1024u
+#define KERNEL_LAUNCH_ENV_MAX 128u
+#define KERNEL_LAUNCH_DATA_MAX 32768u
+
 struct exec_launch {
     uint32_t argc;
     uint32_t envc;
     uint32_t data_len;
-    const char *argv[SCHED_EXEC_ARG_MAX + 1];
-    const char *envp[SCHED_EXEC_ENV_MAX + 1];
-    char data[SCHED_EXEC_DATA_MAX];
+    const char *argv[KERNEL_LAUNCH_ARG_MAX + 1];
+    const char *envp[KERNEL_LAUNCH_ENV_MAX + 1];
+    char data[KERNEL_LAUNCH_DATA_MAX];
 };
 
 /*
@@ -198,21 +203,21 @@ static int build_exec_launch(struct exec_launch *launch, const char *path,
     if (!launch || !path || !path[0]) {
         return -22;
     }
-    for (uint32_t i = 0; i < SCHED_EXEC_ARG_MAX + 1; ++i) {
+    for (uint32_t i = 0; i < KERNEL_LAUNCH_ARG_MAX + 1; ++i) {
         launch->argv[i] = 0;
     }
-    for (uint32_t i = 0; i < SCHED_EXEC_ENV_MAX + 1; ++i) {
+    for (uint32_t i = 0; i < KERNEL_LAUNCH_ENV_MAX + 1; ++i) {
         launch->envp[i] = 0;
     }
     if (!argv || !argv[0]) {
         argv = (const char *const[]){path, 0};
     }
-    argc = copy_exec_vector((char **)launch->argv, SCHED_EXEC_ARG_MAX + 1,
+    argc = copy_exec_vector((char **)launch->argv, KERNEL_LAUNCH_ARG_MAX + 1,
                             argv, launch->data, sizeof(launch->data), &data_len);
     if (argc == 0xffffffffu) {
         return -7;
     }
-    envc = copy_exec_vector((char **)launch->envp, SCHED_EXEC_ENV_MAX + 1,
+    envc = copy_exec_vector((char **)launch->envp, KERNEL_LAUNCH_ENV_MAX + 1,
                             envp, launch->data, sizeof(launch->data), &data_len);
     if (envc == 0xffffffffu) {
         return -7;
@@ -311,9 +316,12 @@ static int prepare_user_exec_stack(struct task *task, const char *execfn, uint64
     argv_base = argc_base + sizeof(uint64_t);
     envp_base = argv_base + argv_bytes;
     auxv_base = envp_base + envp_bytes;
-    if (argc_base < task->stack_top - (uint64_t)RELIEFNT_USER_STACK_PAGES * 4096ULL) {
-        return -12;
-    }
+    uint64_t vector_bytes = ((uint64_t)argc + task->exec_envc) * sizeof(uint64_t);
+    uint32_t argument_limit = sched_exec_argument_limit(sched_task_limits(task)->stack.rlim_cur);
+    if (vector_bytes + task->exec_data_len + path_len + 1 + !task->exec_argc > argument_limit)
+        return -7;
+    int stack_ret = syscall_mm_prepare_exec_stack(task, argc_base & ~4095ULL);
+    if (stack_ret < 0) return stack_ret;
 
     for (uint32_t i = 0; i < task->exec_data_len; ++i) {
         char *dst = (char *)user_ptr_for_phys(sched_task_as(task), strings_base + i);
@@ -612,9 +620,10 @@ static int64_t spawn_pending_image_ex(const char *path, const char *task_name,
     sched_set_task_path(pid, path);
     sched_set_task_image_node(pid, node);
     if (launch) {
-        sched_set_task_exec_params(pid, launch->argc, (char *const *)launch->argv,
-                                   launch->envc, (char *const *)launch->envp,
-                                   launch->data, launch->data_len);
+        int ret = sched_set_task_exec_params(pid, launch->argc, (char *const *)launch->argv,
+                                            launch->envc, (char *const *)launch->envp,
+                                            launch->data, launch->data_len);
+        if (ret < 0) { sched_exit(pid, 127); return ret; }
     }
     if (pty_id) {
         struct task *task = sched_find(pid);
@@ -1082,7 +1091,8 @@ int userland_exec_current_node(const char *path, const struct storage_node *held
     prepared->flags = TASK_FLAG_PENDING_LOAD;
     prepared->address_space.nondumpable = fs_permissions_check_node(task, path, &node, FS_ACCESS_READ, false) < 0;
     copy_text(prepared->path, sizeof(prepared->path), path);
-    sched_copy_task_exec_params(prepared, argc, argv, envc, envp, data, data_len);
+    ret = sched_copy_task_exec_params(prepared, argc, argv, envc, envp, data, data_len);
+    if (ret < 0) goto failed;
     ret = -12;
     if (!task_name[0] || !address_space_create(sched_task_as(prepared)) ||
         !address_space_map_user_stack(sched_task_as(prepared), USER_STACK_TOP)) goto failed;
@@ -1106,8 +1116,8 @@ int userland_exec_current_node(const char *path, const struct storage_node *held
     task->stack_low = prepared->stack_low;
     sched_task_mm(task)->program_break_base = sched_task_mm(prepared)->program_break_base;
     sched_task_mm(task)->program_break = sched_task_mm(prepared)->program_break;
+    kernel_free(task->exec_argv); kernel_free(task->exec_envp); kernel_free(task->exec_data);
     task->loader_state = prepared->loader_state;
-    sched_copy_task_exec_params(task, argc, argv, envc, envp, data, data_len);
     /* POSIX execve preserves ignored signals but resets caught dispositions. */
     kernel_signal_reset_handlers(task);
     task->frame = prepared->frame;
@@ -1143,6 +1153,7 @@ int userland_exec_current_node(const char *path, const struct storage_node *held
                    (unsigned long long)(*sched_task_as(task)).cr3);
     return 0;
 failed:
+    kernel_free(prepared->exec_argv); kernel_free(prepared->exec_envp); kernel_free(prepared->exec_data);
     address_space_destroy(sched_task_as(prepared));
     sched_task_vma_release(prepared);
     kernel_free(prepared);

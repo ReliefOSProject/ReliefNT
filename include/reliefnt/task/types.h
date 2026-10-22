@@ -34,10 +34,24 @@ struct drm_prime_file;
 #define SCHED_NR_OPEN 1048576u
 #define SCHED_TASK_PTY_FD_MAX 8u
 #define SCHED_TASK_STDIO_MAX 3u
-/* Bounded build-tool vectors; strings plus pointers fit the initial 64 KiB stack. */
-#define SCHED_EXEC_ARG_MAX 1024u
-#define SCHED_EXEC_ENV_MAX 128u
-#define SCHED_EXEC_DATA_MAX 32768u
+/* Linux MAX_ARG_STRINGS / MAX_ARG_STRLEN; the total budget follows RLIMIT_STACK. */
+#define SCHED_EXEC_ARG_MAX 0x7fffffffu
+#define SCHED_EXEC_ENV_MAX 0x7fffffffu
+#define SCHED_EXEC_STR_MAX (32u * 4096u)
+#define SCHED_EXEC_DATA_MAX (6u * 1024u * 1024u)
+
+/**
+ * @brief Compute Linux's max(128 KiB, min(6 MiB, soft stack limit / 4)).
+ * @param stack_limit Current soft RLIMIT_STACK, including RLIM_INFINITY.
+ * @return Combined string and pointer budget in bytes.
+ */
+static inline uint32_t sched_exec_argument_limit(uint64_t stack_limit)
+{
+    uint64_t limit = stack_limit / 4;
+    if (limit > SCHED_EXEC_DATA_MAX) limit = SCHED_EXEC_DATA_MAX;
+    if (limit < SCHED_EXEC_STR_MAX) limit = SCHED_EXEC_STR_MAX;
+    return (uint32_t)limit;
+}
 #define SCHED_TASK_VMA_MAX 128u
 #define SCHED_TASK_TIMER_MAX 32u
 
@@ -379,9 +393,9 @@ struct task_loader_state {
     uint16_t exec_phnum;
     bool secure_exec;
     uint16_t exec_reserved;
-    char *exec_argv[SCHED_EXEC_ARG_MAX + 1];
-    char *exec_envp[SCHED_EXEC_ENV_MAX + 1];
-    char exec_data[SCHED_EXEC_DATA_MAX];
+    char **exec_argv;
+    char **exec_envp;
+    char *exec_data;
     struct reliefos_dynamic_launch dynamic_launch;
 };
 
@@ -644,9 +658,9 @@ struct task {
             uint16_t exec_phnum;
             bool secure_exec;
             uint16_t exec_reserved;
-            char *exec_argv[SCHED_EXEC_ARG_MAX + 1];
-            char *exec_envp[SCHED_EXEC_ENV_MAX + 1];
-            char exec_data[SCHED_EXEC_DATA_MAX];
+            char **exec_argv;
+            char **exec_envp;
+            char *exec_data;
             struct reliefos_dynamic_launch dynamic_launch;
         };
     };

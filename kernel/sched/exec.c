@@ -48,72 +48,63 @@ void sched_set_task_path(uint32_t pid, const char *path)
     task_copy_path(sched_find(pid), path);
 }
 
-/**
- * @brief Store clamped argc/argv/envc/envp/data, rebinding interior pointers into the owned buffer.
+/** @brief Copy exec metadata into exactly sized task-owned allocations.
+ * @param task Destination task; existing metadata survives allocation failure.
+ * @param argc Argument count. @param argv Pointers into data.
+ * @param envc Environment count. @param envp Pointers into data.
+ * @param data Packed NUL-terminated strings. @param data_len Valid packed bytes.
+ * @return Zero, -EINVAL for invalid metadata, -E2BIG, or -ENOMEM.
  */
-void sched_copy_task_exec_params(struct task *task,
+int sched_copy_task_exec_params(struct task *task,
                                 uint32_t argc, char *const argv[],
                                 uint32_t envc, char *const envp[],
                                 const char *data, uint32_t data_len)
 {
-    uintptr_t src_base;
-    uintptr_t src_end;
-    if (!task) {
-        return;
+    if (!task || (data_len && !data)) return -22;
+    uint64_t pointers = ((uint64_t)(argc ? argc : 1) + envc) * sizeof(char *);
+    uint32_t limit = SCHED_EXEC_DATA_MAX;
+    if (argc > SCHED_EXEC_ARG_MAX || envc > SCHED_EXEC_ENV_MAX || pointers >= limit ||
+        data_len > limit - pointers) return -7;
+    char **new_argv = kernel_malloc(((size_t)argc + 1) * sizeof(char *));
+    char **new_envp = kernel_malloc(((size_t)envc + 1) * sizeof(char *));
+    char *new_data = kernel_malloc(data_len ? data_len : 1);
+    if (!new_argv || !new_envp || !new_data) {
+        kernel_free(new_argv); kernel_free(new_envp); kernel_free(new_data);
+        return -12;
     }
-    if (argc > SCHED_EXEC_ARG_MAX) {
-        argc = SCHED_EXEC_ARG_MAX;
-    }
-    if (envc > SCHED_EXEC_ENV_MAX) {
-        envc = SCHED_EXEC_ENV_MAX;
-    }
-    if (data_len > sizeof(task->exec_data)) {
-        data_len = sizeof(task->exec_data);
-    }
-    task->exec_argc = argc;
-    task->exec_envc = envc;
-    task->exec_data_len = data_len;
-    for (uint32_t i = 0; i < SCHED_EXEC_ARG_MAX + 1; ++i) {
-        task->exec_argv[i] = 0;
-    }
-    for (uint32_t i = 0; i < SCHED_EXEC_ENV_MAX + 1; ++i) {
-        task->exec_envp[i] = 0;
-    }
-    for (uint32_t i = 0; i < data_len; ++i) {
-        task->exec_data[i] = data ? data[i] : 0;
-    }
-    for (uint32_t i = data_len; i < sizeof(task->exec_data); ++i) {
-        task->exec_data[i] = 0;
-    }
-    src_base = (uintptr_t)data;
-    src_end = src_base + data_len;
-    for (uint32_t i = 0; i < argc; ++i) {
-        task->exec_argv[i] = 0;
-        if (!argv || !argv[i]) {
-            continue;
+    if (data_len) __builtin_memcpy(new_data, data, data_len);
+    for (unsigned v = 0; v < 2; ++v) {
+        uint32_t count = v ? envc : argc;
+        char *const *src = v ? envp : argv;
+        char **dst = v ? new_envp : new_argv;
+        for (uint32_t i = 0; i < count; ++i) {
+            uintptr_t offset = src && src[i] ? (uintptr_t)src[i] - (uintptr_t)data : UINTPTR_MAX;
+            if (offset >= data_len) {
+                kernel_free(new_argv); kernel_free(new_envp); kernel_free(new_data);
+                return -22;
+            }
+            dst[i] = new_data + offset;
         }
-        uintptr_t ptr = (uintptr_t)argv[i];
-        if (ptr >= src_base && ptr < src_end) {
-            task->exec_argv[i] = task->exec_data + (ptr - src_base);
-        }
+        dst[count] = NULL;
     }
-    for (uint32_t i = 0; i < envc; ++i) {
-        task->exec_envp[i] = 0;
-        if (!envp || !envp[i]) {
-            continue;
-        }
-        uintptr_t ptr = (uintptr_t)envp[i];
-        if (ptr >= src_base && ptr < src_end) {
-            task->exec_envp[i] = task->exec_data + (ptr - src_base);
-        }
-    }
+    kernel_free(task->exec_argv); kernel_free(task->exec_envp); kernel_free(task->exec_data);
+    task->exec_argv = new_argv; task->exec_envp = new_envp; task->exec_data = new_data;
+    task->exec_argc = argc; task->exec_envc = envc; task->exec_data_len = data_len;
+    return 0;
 }
 
-void sched_set_task_exec_params(uint32_t pid, uint32_t argc, char *const argv[],
+/** @brief Assign a task's next launch arguments using owned heap storage.
+ * @param pid Destination task ID.
+ * @param argc Argument count. @param argv Pointers into data.
+ * @param envc Environment count. @param envp Pointers into data.
+ * @param data Packed strings. @param data_len Number of valid bytes.
+ * @return Zero or a negative validation/allocation error.
+ */
+int sched_set_task_exec_params(uint32_t pid, uint32_t argc, char *const argv[],
                                 uint32_t envc, char *const envp[],
                                 const char *data, uint32_t data_len)
 {
-    sched_copy_task_exec_params(sched_find(pid), argc, argv, envc, envp, data, data_len);
+    return sched_copy_task_exec_params(sched_find(pid), argc, argv, envc, envp, data, data_len);
 }
 
 int sched_prepare_exec_current(struct task *task)
