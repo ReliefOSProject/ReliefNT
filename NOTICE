@@ -22,7 +22,7 @@ that file merely because it is distributed in the same repository or image.
 Third-party components in this repository
 -----------------------------------------
 
-* GNU Unifont 16.0.04 (unifont_all-16.0.04.hex.gz, the pinned build input
+* GNU Unifont 18.0.01 (unifont_all-18.0.01.hex.gz, the pinned build input
   fetched into cache/downloads by `make fetch` from the URL recorded in
   configs/dependencies.lock.json): the compiled fonts are covered by the SIL
   Open Font License 1.1 and by the GNU GPL version 2 or later with the GNU
