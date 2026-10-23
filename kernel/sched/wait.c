@@ -16,7 +16,6 @@ void sched_block_current(void)
         return;
     }
     task->wake_tick = 0;
-    task->wait_window_id = 0;
     task->state = TASK_BLOCKED;
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
 }
@@ -31,7 +30,6 @@ void sched_wake_interruptible(struct task *task)
     kernel_spin_lock_irqsave(&scheduler_lock, &flags);
     if (task && task->state == TASK_BLOCKED && !task->vfork_child) {
         task->wake_tick = 0;
-        task->wait_window_id = 0;
         task->state = TASK_READY;
         sched_request_reschedule_all_online();
     }
@@ -59,7 +57,6 @@ void sched_mark_ready(uint32_t pid)
     /* A wakeup may race the owner's syscall epilogue. Publish readiness,
      * but never release another CPU's still-live frame/CR3 reservation. */
     task->wake_tick = 0;
-    task->wait_window_id = 0;
     task->state = TASK_READY;
     /* A newly runnable task must be considered for scheduling on the next
      * return-to-user boundary; the syscall fast-path skips the scheduler round
@@ -80,7 +77,6 @@ void sched_sleep_current_until(uint64_t wake_tick)
         kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
         return;
     }
-    task->wait_window_id = 0;
     task->wake_tick = wake_tick;
     /* Keep the CPU reservation until the interrupt frame is captured by
      * userland_schedule_from_frame().  Clearing it here would make that

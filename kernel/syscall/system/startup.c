@@ -198,8 +198,7 @@ uint32_t task_effective_role(const struct task *task)
 static int require_background_service(void)
 {
     struct task *task = sched_current_task();
-    if (!task || !(task->flags & TASK_FLAG_SERVICE) ||
-        (task->flags & TASK_FLAG_WINDOW_SERVER)) {
+    if (!task || !(task->flags & TASK_FLAG_SERVICE)) {
         return -RELIEFOS_EPERM;
     }
     return 0;

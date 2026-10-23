@@ -206,7 +206,6 @@ uint32_t sched_create_kernel_task(const char *name, uint64_t entry)
     task->timer_pending_signals = 0;
     task_init_limits(task);
     (*sched_task_umask(task)) = 022;
-    task->wait_window_id = 0;
     task->exit_code = 0;
     task->image = NULL;
     task->image_len = 0;
@@ -275,7 +274,6 @@ uint32_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack
     task->timer_pending_signals = 0;
     task_init_limits(task);
     (*sched_task_umask(task)) = 022;
-    task->wait_window_id = 0;
     task->exit_code = 0;
     task->image = NULL;
     task->image_len = 0;

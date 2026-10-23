@@ -1,5 +1,5 @@
 /*
- * Kernel input fan-out: the desktop consumes normalized raw events while
+ * Kernel input fan-out: boot/debug consoles consume normalized events while
  * /dev/input/event* exposes independent Linux evdev streams.
  */
 #include <reliefnt/input.h>
@@ -302,7 +302,7 @@ static uint8_t evdev_publish_mouse_buttons(uint8_t buttons)
  * @brief Label graphical input and restore pointer state when a VT resumes.
  * @param number Graphical VT number, or zero for a text terminal.
  * The snapshot repairs releases filtered out while text owned input, including
- * when windowd did not run at all between the two switches.
+ * when no userspace input consumer ran between the two switches.
  */
 void input_set_graphical_vt(uint32_t number)
 {

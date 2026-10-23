@@ -213,10 +213,7 @@ struct task_snapshot_user {
 
 
 
-/**
- * Require window server.
- * @return The value or status produced by the operation.
- */
+
 
 
 

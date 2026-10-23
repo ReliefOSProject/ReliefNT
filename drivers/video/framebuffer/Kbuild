@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-obj-y := boot_logo.o color.o core.o desktop.o desktop_input.o draw.o fbdev.o glyph.o panic.o present.o vbe.o vmware.o
+obj-y := boot_logo.o color.o core.o draw.o fbdev.o glyph.o panic.o present.o vbe.o vmware.o
 
 include $(srctree)/scripts/Makefile.module
 

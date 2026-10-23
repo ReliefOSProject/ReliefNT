@@ -153,8 +153,25 @@ int64_t syscall_fs_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
 int syscall_ipc_owns(uint64_t number);
 int64_t syscall_ipc_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
                              uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5);
-int syscall_gui_owns(uint64_t number, uint64_t a1);
-int64_t syscall_gui_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
+/**
+ * @brief Identify the GPU device ioctl boundary.
+ * @param number Linux syscall number.
+ * @param a1 Ioctl request number.
+ * @return Nonzero if this boundary owns the request.
+ */
+int syscall_gpu_device_owns(uint64_t number, uint64_t a1);
+/**
+ * @brief Dispatch a GPU ioctl after checking the descriptor's device identity.
+ * @param number Linux syscall number.
+ * @param a0 GPU descriptor.
+ * @param a1 Ioctl request number.
+ * @param a2 User request address, validated by the GPU handler.
+ * @param a3 Unused syscall argument.
+ * @param a4 Unused syscall argument.
+ * @param a5 Unused syscall argument.
+ * @return Device result or negative errno.
+ */
+int64_t syscall_gpu_device_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
                              uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5);
 int syscall_device_owns(uint64_t number, uint64_t a1);
 int64_t syscall_device_dispatch(uint64_t number, uint64_t a0, uint64_t a1,

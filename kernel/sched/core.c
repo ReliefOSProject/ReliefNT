@@ -148,7 +148,6 @@ void sched_create_idle_task(void)
     task->stack_top = 0;
     task->stack_low = 0;
     task->wake_tick = 0;
-    task->wait_window_id = 0;
     task->exit_code = 0;
     task->image = NULL;
     task->image_len = 0;
@@ -237,7 +236,6 @@ void sched_on_tick(void)
         if (tasks[i]->state == TASK_BLOCKED && !tasks[i]->vfork_child && tasks[i]->wake_tick &&
             tasks[i]->wake_tick <= scheduler_ticks) {
             tasks[i]->wake_tick = 0;
-            tasks[i]->wait_window_id = 0;
             tasks[i]->state = TASK_READY;
             woke = true;
             /* A blocked task may still be reserved by the CPU that is

@@ -59,7 +59,7 @@ struct reliefos_gpu_draw {
 };
 
 /* All pointer fields are user virtual addresses encoded as uint64_t. Output is
- * top-down, tightly packed 00RRGGBB, suitable for reliefos_gui_present_window().
+ * top-down, tightly packed 00RRGGBB pixels.
  * Render returns a fenced readback. The kernel keeps two offscreen slots, so
  * from the third frame onward it waits for frame N-1 while frame N is already
  * queued on the GPU; the first two calls return the first rendered frame. */

@@ -65,23 +65,7 @@ struct exec_launch {
     char data[KERNEL_LAUNCH_DATA_MAX];
 };
 
-/*
- * Service image identity markers: the M1 authority decision. A root executor
- * running a root-owned, non-group/world-writable image whose gid is one of
- * these reserved, memberless groups receives TASK_FLAG_SERVICE (plus
- * TASK_FLAG_WINDOW_SERVER for the window-server role). The path name grants
- * nothing. Mirrored by the rootfs staging plan and guest /etc/group:
- *
- *     reliefos-window-server:x:60001:  desktop.elf          role window server
- *     reliefos-service:x:60002:        windowd.elf, imd.elf role service
- */
-#define RELIEFOS_GID_WINDOW_SERVER 60001u
-#define RELIEFOS_GID_SERVICE 60002u
-
 static uint32_t init_pid;
-static uint32_t desktop_pid;
-static uint32_t windowd_pid;
-static uint32_t tty_pid;
 /* Boot loader command line captured at init for the /proc/cmdline mechanism. */
 static const char *boot_cmdline;
 /* elf.c keeps a bounded header scratch buffer and ASLR state at file scope.
@@ -1014,7 +998,7 @@ void userland_init(const struct boot_info *boot)
 void userland_enter_first(void)
 {
     struct task *first;
-    if (!init_pid && !desktop_pid && !windowd_pid && !tty_pid) {
+    if (!init_pid) {
         console_fatal("[reliefnt] no Ring-3 userland loaded\n");
         kernel_idle_loop();
     }
@@ -1121,25 +1105,8 @@ int userland_exec_current_node(const char *path, const struct storage_node *held
     /* POSIX execve preserves ignored signals but resets caught dispositions. */
     kernel_signal_reset_handlers(task);
     task->frame = prepared->frame;
-    /**
- * @brief exec replaces the image and its authority. A child of the desktop is never allowed to retain window-server/service privileges across exec.
- */
+    /* exec cannot confer kernel service authority through an image gid. */
     preserved_flags = task->flags & (TASK_FLAG_ELEVATED_ADMIN | TASK_FLAG_WAITABLE_CHILD);
-    /* Authority is tied to a root-owned, non-writable image, root
-     * credentials and the image's reserved role gid, never to ancestry,
-     * argv, or a user-selected path (see RELIEFOS_GID_* above). */
-    struct reliefos_permissions permissions;
-    if (!task->uid && !task->euid &&
-        storage_inode_permissions(&node, &permissions, false) == 0 &&
-        permissions.uid == 0 && !(permissions.mode & 0022)) {
-        if (permissions.gid == RELIEFOS_GID_WINDOW_SERVER) {
-            preserved_flags |= TASK_FLAG_SERVICE | TASK_FLAG_WINDOW_SERVER;
-            desktop_pid = task->pid;
-        } else if (permissions.gid == RELIEFOS_GID_SERVICE) {
-            preserved_flags |= TASK_FLAG_SERVICE;
-            windowd_pid = task->pid;
-        }
-    }
     task->flags = preserved_flags | TASK_FLAG_STARTED;
     copy_text(task->name_storage, sizeof(task->name_storage), task_name);
     task->name = task->name_storage;

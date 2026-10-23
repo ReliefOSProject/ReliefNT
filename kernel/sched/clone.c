@@ -70,7 +70,6 @@ void vfork_child_done_locked(struct task *child)
     if (parent->vfork_child == child) parent->vfork_child = NULL;
     if (parent->state == TASK_BLOCKED) {
         parent->wake_tick = 0;
-        parent->wait_window_id = 0;
         parent->state = TASK_READY;
         sched_request_reschedule_all_online();
     }
@@ -265,10 +264,10 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
     child->image = NULL;
     child->image_len = 0;
     /**
- * @brief Service and window-server authority belongs to the launched image, not to an arbitrary child created by that process.
+ * @brief Kernel service authority is never inherited by an ordinary fork child.
  */
     child->flags &= ~(TASK_FLAG_RESOURCES_RELEASED | TASK_FLAG_PENDING_LOAD |
-                      TASK_FLAG_SERVICE | TASK_FLAG_WINDOW_SERVER);
+                      TASK_FLAG_SERVICE);
     child->flags |= TASK_FLAG_STARTED;
     if (flags & CLONE_THREAD) child->flags &= ~TASK_FLAG_WAITABLE_CHILD;
     else child->flags |= TASK_FLAG_WAITABLE_CHILD;
@@ -277,7 +276,6 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
     child->running_cpu = SCHED_CPU_NONE;
     child->wake_tick = 0;
     child->poll_deadline_ticks = 0;
-    child->wait_window_id = 0;
     child->exit_code = 0;
     child->cpu_ticks = 0;
     child->pending_signals = 0;
@@ -383,7 +381,6 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
         child->vfork_parent = parent;
         parent->vfork_child = child;
         parent->wake_tick = 0;
-        parent->wait_window_id = 0;
         parent->state = TASK_BLOCKED;
     }
     child->state = TASK_READY;

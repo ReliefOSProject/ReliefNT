@@ -109,8 +109,6 @@ struct bochs_vbe_state {
 
 
 
-#define CURSOR_W 16
-#define CURSOR_H 16
 
 
 
@@ -119,31 +117,7 @@ struct bochs_vbe_state {
 
 
 
-#define DESKTOP_MAX_WINDOWS 3
-#define DESKTOP_TASKBAR_H 34
-#define DESKTOP_TITLEBAR_H 26
-#define DESKTOP_MIN_W 180
-#define DESKTOP_MIN_H 96
 
-#define DESKTOP_DRAG_NONE 0
-#define DESKTOP_DRAG_MOVE 1
-#define DESKTOP_DRAG_RESIZE 2
-
-struct desktop_window {
-    int32_t x;
-    int32_t y;
-    uint32_t width;
-    uint32_t height;
-    int32_t restore_x;
-    int32_t restore_y;
-    uint32_t restore_width;
-    uint32_t restore_height;
-    const char *title;
-    uint32_t body_color;
-    bool visible;
-    bool minimized;
-    bool maximized;
-};
 
 
 
@@ -319,15 +293,6 @@ extern struct framebuffer fb;
 extern struct vmware_svga_state vmware_svga;
 extern bool framebuffer_drm_scanout_owned;
 extern bool framebuffer_drm_damage_pending;
-extern bool cursor_visible;
-extern struct desktop_window windows[DESKTOP_MAX_WINDOWS];
-extern uint8_t z_order[DESKTOP_MAX_WINDOWS];
-extern bool desktop_ready;
-extern bool start_menu_open;
-extern int32_t active_window;
-extern int32_t drag_window;
-extern uint8_t drag_mode;
-extern uint8_t previous_mouse_buttons;
 
 /** @brief Return the font's one- or two-column width for a Unicode scalar. */
 uint32_t framebuffer_codepoint_width(uint32_t cp);
@@ -481,15 +446,5 @@ int framebuffer_drm_present_region(const void *pixels, uint32_t pitch,
 void framebuffer_text(uint32_t x, uint32_t y, const char *text, uint32_t fg, uint32_t bg);
 
 void framebuffer_text_transparent(uint32_t x, uint32_t y, const char *text, uint32_t fg);
-
-uint32_t taskbar_y(void);
-
-void desktop_redraw(void);
-
-void desktop_boot_paint(void);
-
-void desktop_handle_mouse(uint32_t x, uint32_t y, uint8_t buttons);
-
-void desktop_draw_mouse(uint32_t x, uint32_t y);
 
 #endif

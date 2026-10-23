@@ -101,7 +101,7 @@
       "kernel/syscall/fs/fs.c"
     ],
     "kernel/reliefnt/syscall_gui.c": [
-      "kernel/syscall/device/gui.c"
+      "kernel/syscall/device/gpu.c"
     ],
     "kernel/reliefnt/syscall_ipc.c": [
       "kernel/syscall/ipc/ipc.c"
@@ -679,9 +679,7 @@
       "drivers/video/framebuffer/vbe.c",
       "drivers/video/framebuffer/vmware.c",
       "drivers/video/framebuffer/panic.c",
-      "drivers/video/framebuffer/draw.c",
-      "drivers/video/framebuffer/desktop_input.c",
-      "drivers/video/framebuffer/desktop.c"
+      "drivers/video/framebuffer/draw.c"
     ],
     "drivers/console/console.c": [
       "drivers/console/render.c",

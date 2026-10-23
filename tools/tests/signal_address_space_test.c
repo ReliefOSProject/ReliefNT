@@ -66,7 +66,6 @@ void sched_wake_interruptible(struct task *task)
 {
     if (task && task->state == TASK_BLOCKED && !task->vfork_child) {
         task->wake_tick = 0;
-        task->wait_window_id = 0;
         task->state = TASK_READY;
     }
 }

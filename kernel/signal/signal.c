@@ -201,7 +201,6 @@ int kernel_signal_queue_task_info(struct task *task, int signal_number,
         if (task->state == TASK_BLOCKED) {
             if (sched_vfork_waiting(task)) return 0;
             task->wake_tick = 0;
-            task->wait_window_id = 0;
             task->state = TASK_READY;
             sched_notify_runnable();
         }

@@ -215,7 +215,6 @@ enum task_kind {
 #define TASK_FLAG_SERVICE 0x00000001u
 #define TASK_FLAG_STARTED 0x00000002u
 #define TASK_FLAG_RESOURCES_RELEASED 0x00000004u
-#define TASK_FLAG_WINDOW_SERVER 0x00000008u
 #define TASK_FLAG_ELEVATED_ADMIN 0x00000010u
 #define TASK_FLAG_PENDING_LOAD 0x00000020u
 /* Real fork children remain zombies until their parent calls waitpid. */
@@ -376,7 +375,6 @@ struct task_credentials_state {
 };
 
 struct task_terminal_state {
-    uint32_t wait_window_id;
     uint32_t pty_id;
     uint32_t wait_pty_id;
     uint32_t controlling_pty_id;
@@ -639,7 +637,6 @@ struct task {
     union {
         struct task_terminal_state terminal_state;
         struct {
-            uint32_t wait_window_id;
             uint32_t pty_id;
             uint32_t wait_pty_id;
             uint32_t controlling_pty_id;

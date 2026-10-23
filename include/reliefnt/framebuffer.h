@@ -186,17 +186,4 @@ uint32_t framebuffer_get_pixel_public(uint32_t x, uint32_t y);
  * @brief Set the pixel at (x,y) to color.
  */
 void framebuffer_put_pixel_public(uint32_t x, uint32_t y, uint32_t color);
-/**
- * @brief Draw the initial desktop wallpaper/background at startup.
- */
-void desktop_boot_paint(void);
-/**
- * @brief Update desktop state for a mouse move to (x,y) with the given buttons.
- */
-void desktop_handle_mouse(uint32_t x, uint32_t y, uint8_t buttons);
-/**
- * @brief Repaint the mouse cursor at (x,y).
- */
-void desktop_draw_mouse(uint32_t x, uint32_t y);
-
 #endif

@@ -44,7 +44,6 @@ void sched_wake_process_signal(uint32_t tgid, uint64_t bit)
             (!task->vfork_child || kernel_signal_fatal_pending(task)) &&
             (((~task->blocked_signals | task->sigwait_mask) & bit) || task->signalfd_waiting)) {
             task->wake_tick = 0;
-            task->wait_window_id = 0;
             task->state = TASK_READY;
             woke = true;
         }
@@ -90,7 +89,6 @@ void sched_signal_wait_current(uint64_t deadline)
     struct task *task = sched_current_task();
     if (task && task->pid && task->state != TASK_EXITED) {
         task->wake_tick = deadline;
-        task->wait_window_id = 0;
         __atomic_store_n(&task->state, TASK_BLOCKED, __ATOMIC_SEQ_CST);
         uint64_t pending = __atomic_load_n(&task->pending_signals, __ATOMIC_SEQ_CST) |
             __atomic_load_n(sched_task_process_pending(task), __ATOMIC_SEQ_CST);
@@ -182,7 +180,6 @@ void sched_signal_job_control(uint32_t tgid, int signal_number)
             task->child_event = TASK_CHILD_EVENT_STOPPED;
         }
         task->wake_tick = 0;
-        task->wait_window_id = 0;
         kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
         if (signal_number != 18) task_sysv_sem_stop(task);
     }

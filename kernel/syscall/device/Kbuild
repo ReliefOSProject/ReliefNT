@@ -1,4 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-obj-y := device.o device_io.o fbdev_ioctl.o gui.o input_ioctl.o legacy_ioctl.o
+obj-y := device.o device_io.o fbdev_ioctl.o gpu.o input_ioctl.o legacy_ioctl.o
 
 include $(srctree)/scripts/Makefile.module

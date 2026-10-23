@@ -698,8 +698,7 @@ static int net_connection_visible(const struct net_socket *socket,
     if (viewer->role == RELIEFOS_AUTH_ROLE_ADMIN) {
         return 1;
     }
-    if ((viewer->flags & TASK_FLAG_SERVICE) &&
-        !(viewer->flags & TASK_FLAG_WINDOW_SERVER)) {
+    if (viewer->flags & TASK_FLAG_SERVICE) {
         return 1;
     }
     return viewer->uid != 0 && socket->owner_uid == viewer->uid;

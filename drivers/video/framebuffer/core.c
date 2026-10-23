@@ -14,24 +14,6 @@ bool framebuffer_drm_scanout_owned;
 
 bool framebuffer_drm_damage_pending;
 
-bool cursor_visible;
-
-struct desktop_window windows[DESKTOP_MAX_WINDOWS];
-
-uint8_t z_order[DESKTOP_MAX_WINDOWS];
-
-bool desktop_ready;
-
-bool start_menu_open;
-
-int32_t active_window;
-
-int32_t drag_window;
-
-uint8_t drag_mode;
-
-uint8_t previous_mouse_buttons;
-
 int framebuffer_range_valid(uint64_t start, uint64_t bytes)
 {
     return start != 0 && bytes != 0 && start < FRAMEBUFFER_PHYS_LIMIT &&

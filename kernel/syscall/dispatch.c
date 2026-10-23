@@ -750,8 +750,8 @@ int64_t syscall_dispatch_regs(struct task *task, uint64_t number, uint64_t a0, u
     if (syscall_security_owns(number, a1)) {
         return syscall_security_dispatch(number, a0, a1, a2, a3, a4, a5);
     }
-    if (syscall_gui_owns(number, a1)) {
-        return syscall_gui_dispatch(number, a0, a1, a2, a3, a4, a5);
+    if (syscall_gpu_device_owns(number, a1)) {
+        return syscall_gpu_device_dispatch(number, a0, a1, a2, a3, a4, a5);
     }
     if (syscall_device_owns(number, a1)) {
         return syscall_device_dispatch(number, a0, a1, a2, a3, a4, a5);

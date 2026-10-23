@@ -1,4 +1,4 @@
-/* Kernel half of the evdev/windowd integration fixture; no userspace sources. */
+/* Kernel half of the evdev integration fixture; no userspace sources. */
 #include <assert.h>
 #include <stdio.h>
 #include "../../drivers/tty/input/input.c"

@@ -39,7 +39,7 @@ ReliefNT 按职责组织静态链接的内核部件。目录模块只划分源�
 
 * 路径：``drivers/tty/{input,pty,serial}/``; 职责：输入路由、PTY/行规程/终端会话、串口。
 
-* 路径：``drivers/video/framebuffer/``; 职责：像素/字形、绘图、呈现、VBE/VMware、panic 与旧桌面绘制。
+* 路径：``drivers/video/framebuffer/``; 职责：像素/字形、绘图、呈现、VBE/VMware、启动图标与 panic 显示。
 
 * 路径：``drivers/video/drm/vmwgfx/``; 职责：SVGA 资源/能力及 execbuf 验证、翻译、fence、retire、continuation。
 

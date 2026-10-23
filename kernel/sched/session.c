@@ -326,8 +326,7 @@ void sched_set_session_identity(uint32_t parent_pid, const struct reliefos_user_
 {
     for (uint32_t i = 0; i < task_count; ++i) {
         struct task *task = tasks[i];
-        if (((task->flags & TASK_FLAG_SERVICE) == 0 ||
-             (task->flags & TASK_FLAG_WINDOW_SERVER)) &&
+        if ((task->flags & TASK_FLAG_SERVICE) == 0 &&
             (task->pid == parent_pid || task->parent_pid == parent_pid)) {
             sched_set_task_identity(task->pid, user, session_id);
         }
@@ -344,8 +343,7 @@ void sched_clear_session_identity(uint32_t session_id)
     }
     for (uint32_t i = 0; i < task_count; ++i) {
         if (tasks[i]->session_id == session_id &&
-            ((tasks[i]->flags & TASK_FLAG_SERVICE) == 0 ||
-             (tasks[i]->flags & TASK_FLAG_WINDOW_SERVER))) {
+            (tasks[i]->flags & TASK_FLAG_SERVICE) == 0) {
             task_clear_identity(tasks[i]);
             task_copy_cwd(tasks[i], "/");
         }

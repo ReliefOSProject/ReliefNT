@@ -9,6 +9,4 @@
 #include "../../../drivers/video/framebuffer/vmware.c"
 #include "../../../drivers/video/framebuffer/panic.c"
 #include "../../../drivers/video/framebuffer/draw.c"
-#include "../../../drivers/video/framebuffer/desktop_input.c"
-#include "../../../drivers/video/framebuffer/desktop.c"
 #endif
