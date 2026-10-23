@@ -5,9 +5,10 @@
 #include <reliefnt/framebuffer.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/paging.h>
+#include <reliefnt/svga.h>
 #include <reliefnt/usercopy.h>
 
-#include "../svga/device.h"
+#include "../svga/svga_protocol.h"
 
 #define DRM_KMS_CRTC_ID 1u
 #define DRM_KMS_CONNECTOR_ID 2u
@@ -17,8 +18,6 @@
 #define DRM_FORMAT_XRGB8888 0x34325258u
 #define DRM_FORMAT_ARGB8888 0x34325241u
 #define DRM_KMS_PRESENT_JOBS_MAX 16u
-#define DRM_KMS_PRESENT_OUTPUT_BYTES 64u
-#define DRM_KMS_PRESENT_SOURCE_BYTES 36u
 #define DRM_VMW_RESOURCE_HANDLE_MIN 0x01000000u
 
 struct drm_kms_fb {
@@ -38,11 +37,8 @@ struct drm_kms_fb {
 struct drm_kms_present_job {
     struct drm_kms_present_job *next;
     struct drm_kms_fb *fb;
-    struct svga_batch batch;
-    uint32_t output[DRM_KMS_PRESENT_OUTPUT_BYTES / sizeof(uint32_t)];
     svga_handle fence;
     uint32_t x1, y1, x2, y2;
-    bool batch_open;
     bool submitted;
     bool cancelled;
 };
@@ -185,46 +181,6 @@ static void drm_kms_job_set_rect(struct drm_kms_present_job *job,
     job->y1 = y1;
     job->x2 = x2;
     job->y2 = y2;
-    struct SVGA3dCopyRect rect = {
-        .x = x1, .y = y1, .w = x2 - x1, .h = y2 - y1,
-        .srcx = x1, .srcy = y1,
-    };
-    __builtin_memcpy(&job->output[3], &rect, sizeof(rect));
-}
-
-static int drm_kms_job_build(struct drm_kms_present_job *job)
-{
-    struct svga_info info;
-    svga_get_info(&info);
-    if (!info.available || !info.fifo_ready ||
-        !(info.fifo_caps & SVGA_FIFO_CAP_FENCE))
-        return -LINUX_ENODEV;
-    svga_handle surface = drm_vmwgfx_surface_backend_handle(job->fb->surface);
-    uint32_t sid = drm_vmwgfx_surface_backend_id(job->fb->surface);
-    if (!surface || sid == UINT32_MAX) return -LINUX_EINVAL;
-    int ret = drm_kms_map_svga_status(svga_batch_init_sized(
-        &job->batch, info.generation, job->output,
-        DRM_KMS_PRESENT_OUTPUT_BYTES, DRM_KMS_PRESENT_SOURCE_BYTES));
-    if (ret) return ret;
-    job->batch_open = true;
-    ret = drm_kms_map_svga_status(
-        svga_batch_retain_surface(&job->batch, surface));
-    struct {
-        SVGA3dCmdPresent command;
-        SVGA3dCopyRect rect;
-    } payload = {
-        .command = {.sid = sid},
-    };
-    payload.rect = (struct SVGA3dCopyRect){
-        .x = job->x1, .y = job->y1,
-        .w = job->x2 - job->x1, .h = job->y2 - job->y1,
-        .srcx = job->x1, .srcy = job->y1,
-    };
-    if (!ret)
-        ret = drm_kms_map_svga_status(svga_batch_append(
-            &job->batch, SVGA_3D_CMD_PRESENT, true, &payload,
-            sizeof(payload)));
-    return ret;
 }
 
 static void drm_kms_job_enqueue(struct drm_kms_present_job *job)
@@ -254,16 +210,20 @@ static void drm_kms_job_free(struct drm_kms_present_job *job)
     kernel_free(job);
 }
 
+/** @brief Submit the caller-pinned surface without render-batch allocations. */
 static int drm_kms_job_submit(struct drm_kms_present_job *job)
 {
-    if (!job || !job->batch_open || job->cancelled)
+    if (!job || job->submitted || job->cancelled)
         return -LINUX_EINVAL;
+    const struct svga_present_rect rect = {
+        .x = job->x1, .y = job->y1,
+        .w = job->x2 - job->x1, .h = job->y2 - job->y1,
+        .srcx = job->x1, .srcy = job->y1,
+    };
+    svga_handle surface = drm_vmwgfx_surface_backend_handle(job->fb->surface);
     int ret = drm_kms_map_svga_status(
-        svga_batch_submit(&job->batch, &job->fence));
-    if (!ret) {
-        job->batch_open = false;
-        job->submitted = true;
-    }
+        svga3d_present_try(surface, &rect, 1, &job->fence));
+    if (!ret) job->submitted = true;
     return ret;
 }
 
@@ -297,14 +257,6 @@ static void drm_kms_maybe_restore_framebuffer(void)
 static void drm_kms_job_discard(struct drm_kms_present_job *job)
 {
     if (!job) return;
-    if (job->batch_open) {
-        int ret = svga_batch_abort(&job->batch);
-        if (ret) {
-            job->cancelled = true;
-            return;
-        }
-        job->batch_open = false;
-    }
     drm_kms_job_free(job);
 }
 
@@ -385,19 +337,8 @@ static void drm_kms_service_pending_damage(void)
                          drm_kms_pending_damage.y1,
                          drm_kms_pending_damage.x2,
                          drm_kms_pending_damage.y2);
-    int ret = drm_kms_job_build(job);
-    if (ret) {
-        if (job->batch_open) {
-            drm_kms_job_enqueue(job);
-            job->cancelled = true;
-        } else {
-            drm_kms_fb_put(job->fb);
-            kernel_free(job);
-        }
-        return;
-    }
     drm_kms_job_enqueue(job);
-    ret = drm_kms_job_submit(job);
+    int ret = drm_kms_job_submit(job);
     if (!ret) {
         drm_kms_pending_damage_clear();
     } else if (ret == -LINUX_EBUSY) {
@@ -424,12 +365,7 @@ static int drm_kms_submit_surface_present(struct drm_kms_fb *fb,
     drm_kms_fb_get(fb);
     drm_kms_job_set_rect(job, x1, y1, x2, y2);
     drm_kms_job_enqueue(job);
-    int ret = drm_kms_job_build(job);
-    if (ret) {
-        drm_kms_job_discard(job);
-        return ret;
-    }
-    ret = drm_kms_job_submit(job);
+    int ret = drm_kms_job_submit(job);
     if (ret) {
         drm_kms_job_discard(job);
         return ret;

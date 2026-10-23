@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # Objects are owned by this directory; child modules own their own lists.
-obj-y := batch_state.o borrowed.o device.o fifo.o gb.o gmr.o query.o render.o shader.o svga3d.o triangle.o
+obj-y := batch_state.o borrowed.o device.o fifo.o gb.o gmr.o present.o query.o render.o shader.o svga3d.o triangle.o
 
 include $(srctree)/scripts/Makefile.module

@@ -71,18 +71,6 @@ static uint32_t shader_backing_table_pages(uint32_t pages)
            1 + (pages + 1023u) / 1024u;
 }
 
-/** @brief Zero a page-aligned allocation through its captured allocator.
- * @param ops Allocator snapshot that owns the physical range.
- * @param phys Page-aligned physical base returned by that allocator.
- * @param pages Number of pages to clear.
- */
-static void shader_zero_pages(const struct svga_ops *ops, uint64_t phys,
-                              uint32_t pages)
-{
-    uint32_t *words = ops->pointer(phys);
-    for (uint32_t i = 0; i < pages * 1024u; ++i) words[i] = 0;
-}
-
 /** @brief Allocate and initialize shader code and page-table backing unlocked.
  * @param ops Captured allocator callbacks owned by the staging transaction.
  * @param bytes Shader bytecode length in bytes.
@@ -103,7 +91,6 @@ static int shader_backing_alloc(const struct svga_ops *ops, uint32_t bytes,
         ops->free(phys, pages);
         return SVGA_ENOMEM;
     }
-    shader_zero_pages(ops, phys, pages);
     uint64_t pt_phys = tables ? ops->alloc(tables) : 0;
     if (tables && (!pt_phys || (pt_phys & 4095u) ||
                    (pt_phys >> 12) > UINT32_MAX - tables ||
@@ -112,7 +99,6 @@ static int shader_backing_alloc(const struct svga_ops *ops, uint32_t bytes,
         ops->free(phys, pages);
         return SVGA_ENOMEM;
     }
-    if (tables) shader_zero_pages(ops, pt_phys, tables);
     *mob = (struct svga_mob){.phys = phys, .pt_phys = pt_phys,
         .pages = pages, .pt_pages = tables, .bytes = bytes,
         .depth = tables > 1 ? SVGA3D_MOBFMT_PT_2 :

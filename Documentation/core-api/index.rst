@@ -11,3 +11,4 @@
    execution
    memory
    drivers
+   svga

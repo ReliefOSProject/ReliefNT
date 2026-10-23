@@ -8,7 +8,7 @@ static void backing_free(struct svga_mob *m)
     *m = (struct svga_mob){0};
 }
 
-static uint64_t alloc_zero(uint32_t pages)
+static uint64_t backing_alloc_pages(uint32_t pages)
 {
     uint64_t phys = svga.ops.alloc(pages);
     if (!phys) return 0;
@@ -17,7 +17,6 @@ static uint64_t alloc_zero(uint32_t pages)
         svga.ops.free(phys, pages);
         return 0;
     }
-    for (uint32_t i = 0; i < pages * 1024u; ++i) ptr[i] = 0;
     return phys;
 }
 
@@ -29,9 +28,9 @@ static int backing_alloc(struct svga_mob *m, uint32_t bytes)
     uint32_t tables = pages <= 1 ? 0 : pages <= 1024 ? 1 : 1 + (pages + 1023u) / 1024u;
     if (!svga_page_budget_allows(pages + tables))
         return SVGA_ENOMEM;
-    uint64_t phys = alloc_zero(pages);
+    uint64_t phys = backing_alloc_pages(pages);
     if (!phys) return SVGA_ENOMEM;
-    uint64_t pt_phys = tables ? alloc_zero(tables) : 0;
+    uint64_t pt_phys = tables ? backing_alloc_pages(tables) : 0;
     if (tables && !pt_phys) {
         svga.ops.free(phys, pages);
         return SVGA_ENOMEM;
@@ -66,7 +65,7 @@ int svga_gb_backing_borrow_locked(struct svga_mob *m, uint64_t phys,
     uint32_t tables = pages <= 1 ? 0 : pages <= 1024 ? 1 : 1 + (pages + 1023u) / 1024u;
     if (!svga_page_budget_allows(tables))
         return SVGA_ENOMEM;
-    uint64_t pt_phys = tables ? alloc_zero(tables) : 0;
+    uint64_t pt_phys = tables ? backing_alloc_pages(tables) : 0;
     if (tables && !pt_phys) return SVGA_ENOMEM;
     *m = (struct svga_mob){.phys = phys, .pt_phys = pt_phys, .pages = pages,
         .pt_pages = tables, .bytes = bytes,

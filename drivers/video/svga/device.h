@@ -63,6 +63,7 @@ static inline void svga_batch_submit_failure_set(
 struct svga_ops {
     uint32_t (*read)(uint32_t reg);
     void (*write)(uint32_t reg, uint32_t value);
+    /* Return exclusively owned, page-aligned, zeroed pages, or zero. */
     uint64_t (*alloc)(uint32_t pages);
     void (*free)(uint64_t phys, uint32_t pages);
     void *(*pointer)(uint64_t phys);

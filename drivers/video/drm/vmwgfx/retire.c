@@ -297,13 +297,22 @@ struct drm_vmwgfx_exec_work *drm_vmwgfx_exec_work_alloc(
     }
 
     uint64_t flags;
+    bool retried_retirement = false;
+retry_quota:
     kernel_spin_lock_irqsave(&drm_vmwgfx_exec_lock, &flags);
     if (drm_vmwgfx_exec_work_count >= DRM_VMW_EXEC_WORK_MAX ||
         allocation > DRM_VMW_EXEC_WORK_BYTES_MAX - drm_vmwgfx_exec_work_bytes) {
         kernel_spin_unlock_irqrestore(&drm_vmwgfx_exec_lock, flags);
-        if (error) *error = -LINUX_ENOMEM;
-        drm_vmwgfx_exec_work_alloc_diag(diagnostics, -LINUX_ENOMEM,
-            "exec.work.quota", source_bytes, output_capacity, allocation);
+        /* Completed jobs may still be awaiting a maintenance pass. Reap a
+         * bounded number outside exec_lock before charging new work. Pending
+         * fences keep their full charge; transient pressure is retryable,
+         * not an allocation failure that makes Mesa abort the X server. */
+        if (!retried_retirement) {
+            retried_retirement = true;
+            drm_vmwgfx_execbuf_process_retirements(8u);
+            goto retry_quota;
+        }
+        if (error) *error = -LINUX_EBUSY;
         return NULL;
     }
     ++drm_vmwgfx_exec_work_count;

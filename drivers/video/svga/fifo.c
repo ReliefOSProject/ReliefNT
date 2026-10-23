@@ -181,14 +181,17 @@ static void put_word(uint32_t *next, uint32_t word, bool reserve)
     }
 }
 
-/** @brief Notify the host after publishing FIFO work with an explicit SYNC.
+/** @brief Wake an idle host after publishing FIFO work.
  * @note The caller holds the SVGA lock. The barrier keeps published FIFO
- *       contents visible before the SYNC doorbell.
+ *       contents visible before checking BUSY. A busy host promises to notice
+ *       new commands before sleeping, so another monitor exit is unnecessary.
+ *       Legacy FIFOs without the shared BUSY register still require SYNC.
  */
 static void fifo_wake_locked(void)
 {
     svga_barrier();
-    if (svga.fifo_busy_present && !svga.fifo[SVGA_FIFO_BUSY]) {
+    if (svga.fifo_busy_present) {
+        if (svga.fifo[SVGA_FIFO_BUSY]) return;
         svga.fifo[SVGA_FIFO_BUSY] = 1;
         svga_barrier();
     }
@@ -1421,6 +1424,10 @@ int svga_wait_locked(svga_handle fence)
     if (!seq || (fence >> 32) != svga.generation ||
         (int32_t)(svga.issued_fence - seq) < 0) return SVGA_EINVAL;
     if (!(svga.fifo_caps & SVGA_FIFO_CAP_FENCE)) return SVGA_ENOTSUP;
+    if (svga_fence_reached_locked(fence)) {
+        svga_barrier();
+        return 0;
+    }
     fifo_wake_locked();
     /* Fast path: Fence completion is published through plain FIFO MMIO.
      * Poll it without SVGA_REG_BUSY reads, which synchronously process the

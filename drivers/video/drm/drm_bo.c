@@ -24,7 +24,6 @@ struct drm_bo {
     uint32_t page_count;
     /* Linux vmwgfx blocks command submission for non-ALLOW_CS CPU grabs. */
     uint32_t cpu_writer_grabs;
-    uint32_t cpu_allow_cs_grabs;
     uint32_t gpu_reservations;
     uint64_t size;
     uint64_t physical;
@@ -37,7 +36,6 @@ struct drm_bo_handle {
     uint32_t handle;
     /* Aggregate SYNCCPU pairing state; no allocation per successful grab. */
     uint32_t cpu_writer_grabs;
-    uint32_t cpu_allow_cs_grabs;
 };
 
 static struct kernel_spinlock drm_bo_lock = KERNEL_SPINLOCK_INIT;
@@ -334,10 +332,6 @@ int drm_bo_handle_delete(struct drm_file *file, uint32_t handle)
             entry->bo->cpu_writer_grabs -= entry->cpu_writer_grabs;
         else
             entry->bo->cpu_writer_grabs = 0;
-        if (entry->bo->cpu_allow_cs_grabs >= entry->cpu_allow_cs_grabs)
-            entry->bo->cpu_allow_cs_grabs -= entry->cpu_allow_cs_grabs;
-        else
-            entry->bo->cpu_allow_cs_grabs = 0;
     }
     kernel_spin_unlock_irqrestore(&drm_bo_lock, flags);
     if (!entry) return -LINUX_EINVAL;
@@ -358,10 +352,6 @@ void drm_bo_file_release(struct drm_file *file)
             entry->bo->cpu_writer_grabs -= entry->cpu_writer_grabs;
         else
             entry->bo->cpu_writer_grabs = 0;
-        if (entry->bo->cpu_allow_cs_grabs >= entry->cpu_allow_cs_grabs)
-            entry->bo->cpu_allow_cs_grabs -= entry->cpu_allow_cs_grabs;
-        else
-            entry->bo->cpu_allow_cs_grabs = 0;
     }
     kernel_spin_unlock_irqrestore(&drm_bo_lock, flags);
     while (handles) {
@@ -436,14 +426,18 @@ static int drm_bo_synccpu(struct drm_file *file,
         kernel_spin_unlock_irqrestore(&drm_bo_lock, flags);
         return -LINUX_EINVAL;
     }
-    bool allow_cs = (arg->flags & drm_vmw_synccpu_allow_cs) != 0;
-    uint32_t *handle_count = allow_cs ? &entry->cpu_allow_cs_grabs :
-                                        &entry->cpu_writer_grabs;
-    uint32_t *bo_count = allow_cs ? &entry->bo->cpu_allow_cs_grabs :
-                                   &entry->bo->cpu_writer_grabs;
+    /* Linux ALLOW_CS only waits for prior GPU work; it does not create a CPU
+     * writer reservation. Release validates the handle and otherwise has no
+     * effect, including on unrelated non-ALLOW_CS grabs of this BO. */
+    if (arg->flags & drm_vmw_synccpu_allow_cs) {
+        kernel_spin_unlock_irqrestore(&drm_bo_lock, flags);
+        return 0;
+    }
+    uint32_t *handle_count = &entry->cpu_writer_grabs;
+    uint32_t *bo_count = &entry->bo->cpu_writer_grabs;
     /* Linux's non-ALLOW_CS counter can underflow on an unmatched release.
      * Keep the valid pairing model without reproducing that kernel bug. */
-    if (!*bo_count || (allow_cs && !*handle_count)) {
+    if (!*bo_count) {
         kernel_spin_unlock_irqrestore(&drm_bo_lock, flags);
         return -LINUX_EINVAL;
     }

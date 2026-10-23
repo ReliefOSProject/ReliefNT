@@ -548,10 +548,12 @@ uint64_t mm_alloc_pages(uint32_t page_count)
         /* A multi-page search can skip smaller holes; retain those for later. */
         if (page_count == 1 || first == allocation_hint) allocation_hint = i + 1;
         result = (uint64_t)first * PAGE_SIZE;
-        zero_pages(result, page_count);
         break;
     }
     kernel_spin_unlock_irqrestore(&mm_lock, flags);
+    /* The claimed run cannot be reused while it is private to this call.
+     * Avoid holding the allocator lock during a potentially large clear. */
+    if (result) zero_pages(result, page_count);
     return result;
 }
 

@@ -521,6 +521,19 @@ int svga3d_context_try_create(svga_handle *out);
 int svga3d_context_try_destroy(svga_handle context);
 int svga3d_surface_try_create(const struct svga_surface_desc *desc, svga_handle *out);
 int svga3d_surface_try_destroy(svga_handle surface);
+/**
+ * @brief Publish a bounded PRESENT and real fence without allocating or waiting.
+ * @param surface Live surface retained by the caller until the fence completes.
+ * @param rects One to 64 scanout/source rectangles.
+ * @param count Number of rectangles; source and destination must fit the surface.
+ * @param fence Receives the issued token, or zero on failure.
+ * @return Zero after atomic FIFO publication, SVGA_EBUSY for contention or
+ *         backpressure, or a negative SVGA error without publishing commands.
+ * Successful submission updates the surface's last-use fence. Its existing
+ * resource lease preserves the mode; callers retain ownership until completion.
+ */
+int svga3d_present_try(svga_handle surface, const struct svga_present_rect *rects,
+                      uint32_t count, svga_handle *fence);
 /** @brief Keep fbdev mode changes from resetting live DRM render resources. */
 int svga_mode_lease_acquire(void);
 /** @brief Release a mode lease after all leased resources have retired. */

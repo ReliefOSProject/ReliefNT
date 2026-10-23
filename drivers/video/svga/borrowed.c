@@ -1,8 +1,12 @@
 #include "device.h"
 
+/* Bound each IRQ-disabled pass while allowing inline page-number packets to
+ * queue in FIFO order without a host round trip between adjacent chunks. */
+#define SVGA_GMR_MAPPING_CHUNKS_PER_PASS 4u
+
 static int submit_mapping_chunk_locked(uint32_t id, struct svga_gmr *g)
 {
-    uint32_t offset = g->mapped_pages;
+    uint32_t offset = g->mapped_pages + g->map_pending_pages;
     uint32_t count = g->pages - offset;
     if (count > 256u) count = 256u;
     uint32_t ppns[256];
@@ -37,10 +41,10 @@ static int submit_mapping_chunk_locked(uint32_t id, struct svga_gmr *g)
     g->defined = true;
     g->mob_defined = true;
     svga.external_mobs[id].defined = true;
-    g->map_pending_pages = count;
+    g->map_pending_pages += count;
     g->map_inflight = true;
     g->progress_fence = fence;
-    return SVGA_EBUSY;
+    return 0;
 }
 
 int svga_gmr_borrowed_attach(uint64_t phys, uint32_t bytes, void *owner,
@@ -99,13 +103,21 @@ int svga_gmr_borrowed_attach(uint64_t phys, uint32_t bytes, void *owner,
     }
     ret = SVGA_EBUSY;
     if (g->map_inflight) {
-        if (!svga_fence_reached_locked(g->progress_fence)) goto done;
-        g->mapped_pages += g->map_pending_pages;
-        g->map_pending_pages = 0;
-        g->map_inflight = false;
+        if (svga_fence_reached_locked(g->progress_fence)) {
+            g->mapped_pages += g->map_pending_pages;
+            g->map_pending_pages = 0;
+            g->map_inflight = false;
+        }
     }
     if (g->mapped_pages == g->pages) { ret = 0; goto done; }
-    ret = submit_mapping_chunk_locked(id, g);
+    for (uint32_t chunk = 0; chunk < SVGA_GMR_MAPPING_CHUNKS_PER_PASS &&
+         g->mapped_pages + g->map_pending_pages < g->pages; ++chunk) {
+        ret = submit_mapping_chunk_locked(id, g);
+        if (ret) goto done;
+    }
+    /* A later fence covers every earlier mapping in the same FIFO. Keep the
+     * backing owner pinned and the MOB unavailable until that fence passes. */
+    ret = SVGA_EBUSY;
 done:
     svga_unlock(flags);
     return ret;
