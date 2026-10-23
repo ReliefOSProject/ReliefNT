@@ -255,9 +255,10 @@ void *hda_phys_to_direct_map_page(uint64_t phys)
 #ifdef HDA_TESTING
     return hda_test_dma_map(phys);
 #else
-    if ((phys & (HDA_DMA_PAGE_BYTES - 1u)) ||
-        phys > RELIEFNT_KERNEL_DIRECT_MAP_SIZE - HDA_DMA_PAGE_BYTES) return NULL;
-    return (void *)(uintptr_t)(RELIEFNT_KERNEL_DIRECT_MAP_BASE + phys);
+    const struct reliefos_driver_kernel_api *api = hda_module_kernel_api();
+    if ((phys & (HDA_DMA_PAGE_BYTES - 1u)) || !api || !api->phys_to_virt)
+        return NULL;
+    return api->phys_to_virt(phys);
 #endif
 }
 

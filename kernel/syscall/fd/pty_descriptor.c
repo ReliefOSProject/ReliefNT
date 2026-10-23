@@ -3,18 +3,16 @@
 
 
 /**
- * Task pty fd for fd.
- * @param task Value supplied by the caller.
- * @param fd Value supplied by the caller.
- * @return The value or status produced by the operation.
+ * @brief Find the PTY alias that represents one Linux descriptor.
+ * @param task Descriptor-table owner; NULL is accepted.
+ * @param fd Linux descriptor number, including implicit standard streams.
+ * @return Borrowed alias entry or NULL when no PTY alias has that descriptor.
  */
 struct task_pty_fd *task_pty_fd_for_fd(struct task *task, int fd)
 {
-    if (!task || fd < 0) {
-        return NULL;
-    }
-    for (uint32_t i = 0; i < SCHED_TASK_PTY_FD_MAX; ++i) {
-        struct task_pty_fd *entry = &sched_task_fds(task)->pty_fds[i];
+    if (!task || fd < 0) return NULL;
+    for (uint32_t i = 0; i < sched_task_pty_capacity(task); ++i) {
+        struct task_pty_fd *entry = sched_task_pty_at(task, i);
         if (entry->used && entry->fd == fd) {
             return entry;
         }
@@ -56,6 +54,12 @@ int task_pty_promote(struct task_pty_fd *entry)
     return 0;
 }
 
+/**
+ * @brief Drop one PTY descriptor alias and release its terminal ownership.
+ * @param entry Alias entry to clear; null or already released aliases are ignored.
+ * @note The final total description reference removes weak epoll watches before
+ * dropping the PTY transfer reference or freeing the stable description.
+ */
 void task_pty_release_entry(struct task_pty_fd *entry)
 {
     uint32_t pty_id;
@@ -66,6 +70,7 @@ void task_pty_release_entry(struct task_pty_fd *entry)
     struct task_pty_description *description = entry->description;
     *entry = (struct task_pty_fd){0};
     if (description && --description->references == 0) {
+        task_epoll_remove_pty_description(description);
         if (description->pty_id) pty_transfer_put(description->pty_id, description->endpoint);
         kernel_free(description);
     }
@@ -74,10 +79,17 @@ void task_pty_release_entry(struct task_pty_fd *entry)
     }
 }
 
+/**
+ * @brief Install a PTY endpoint in the lowest available descriptor slot.
+ * @param task Descriptor-table owner; required.
+ * @param pty_id Live PTY session identifier.
+ * @param endpoint Master or slave endpoint kind.
+ * @param flags Linux open status flags, including optional O_CLOEXEC.
+ * @return Installed descriptor or negative errno without publishing a partial alias.
+ */
 int task_pty_endpoint_fd(struct task *task, uint32_t pty_id,
-                                uint32_t endpoint, uint32_t flags)
+                         uint32_t endpoint, uint32_t flags)
 {
-    int candidate;
     if (!task || !pty_id || !endpoint || !pty_is_active(pty_id) ||
         !task_can_allocate_fd(task)) {
         return -RELIEFOS_EMFILE;
@@ -85,38 +97,40 @@ int task_pty_endpoint_fd(struct task *task, uint32_t pty_id,
     if (endpoint == TASK_PTY_ENDPOINT_SLAVE && !pty_slave_open_allowed(pty_id)) {
         return -RELIEFOS_EIO;
     }
-    candidate = task_unused_fd(task, 0);
+    int candidate = task_unused_fd(task, 0);
     if (candidate < 0) return candidate;
-    for (uint32_t attempts = 0;
-         attempts < SCHED_TASK_PTY_FD_MAX + SCHED_TASK_FILE_MAX + 4u;
-         ++attempts, ++candidate) {
-        if (!task_pty_fd_available(task, candidate)) continue;
-        for (uint32_t i = 0; i < SCHED_TASK_PTY_FD_MAX; ++i) {
-            struct task_pty_fd *entry = &sched_task_fds(task)->pty_fds[i];
-            if (!entry->used) {
-                *entry = (struct task_pty_fd){
-                    .used = 1, .fd = candidate,
-                    .flags = (flags & RELIEFOS_O_CLOEXEC) ? RELIEFOS_FD_CLOEXEC : 0,
-                    .status_flags = flags & (RELIEFOS_O_ACCMODE |
-                                             RELIEFOS_O_APPEND |
-                                             RELIEFOS_O_NONBLOCK),
-                    .stream = endpoint == TASK_PTY_ENDPOINT_MASTER ? 1u : 0u,
-                    .pty_id = pty_id, .endpoint = endpoint,
-                };
-                int ret = task_pty_promote(entry);
-                if (ret < 0) { *entry = (struct task_pty_fd){0}; return ret; }
-                if (candidate < 3) {
-                    sched_task_fds(task)->closed_stdio_mask &= ~(1u << candidate);
-                    sched_task_fds(task)->cloexec_stdio_mask &= ~(1u << candidate);
-                }
-                return candidate;
-            }
-        }
-        return -RELIEFOS_EMFILE;
+    struct task_pty_fd *entry;
+    int ret = sched_task_pty_alloc(task, &entry);
+    if (ret < 0) return ret;
+    *entry = (struct task_pty_fd){
+        .used = 1, .fd = candidate,
+        .flags = (flags & RELIEFOS_O_CLOEXEC) ? RELIEFOS_FD_CLOEXEC : 0,
+        .status_flags = flags & (RELIEFOS_O_ACCMODE |
+                                 RELIEFOS_O_APPEND |
+                                 RELIEFOS_O_NONBLOCK),
+        .stream = endpoint == TASK_PTY_ENDPOINT_MASTER ? 1u : 0u,
+        .pty_id = pty_id, .endpoint = endpoint,
+    };
+    ret = task_pty_promote(entry);
+    if (ret < 0) {
+        *entry = (struct task_pty_fd){0};
+        return ret;
     }
-    return -RELIEFOS_EMFILE;
+    if (candidate < 3) {
+        sched_task_fds(task)->closed_stdio_mask &= ~(1u << candidate);
+        sched_task_fds(task)->cloexec_stdio_mask &= ~(1u << candidate);
+    }
+    return candidate;
 }
 
+/**
+ * @brief Parse a live numeric devpts path or resolve the active-VT alias.
+ * @param path NUL-terminated endpoint path; NULL is rejected.
+ * @param pty_id Writable result for the recognized active PTY identifier.
+ * @return One for a recognized live endpoint path, zero for malformed, inactive,
+ * or out-of-range paths.
+ * @note Numeric PTY names are bounded by the signed Linux PTY identifier range.
+ */
 int task_pty_endpoint_path(const char *path, uint32_t *pty_id)
 {
     const char *prefix = "/dev/pts/";
@@ -130,9 +144,10 @@ int task_pty_endpoint_path(const char *path, uint32_t *pty_id)
     while (*prefix && *path && *prefix == *path) { ++prefix; ++path; }
     if (*prefix || !*path) return 0;
     while (*path >= '0' && *path <= '9') {
-        value = value * 10u + (uint32_t)(*path - '0');
+        uint32_t digit = (uint32_t)(*path - '0');
+        if (value > (0x7fffffffu - digit) / 10u) return 0;
+        value = value * 10u + digit;
         ++path; ++digits;
-        if (value > 0xffffu) return 0;
     }
     if (!digits || *path || !value || !pty_is_active(value)) return 0;
     *pty_id = value;
@@ -174,8 +189,16 @@ int task_pty_stream_for_fd(struct task *task, int fd)
     return fd >= 0 && fd <= 2 ? fd : -1;
 }
 
+/**
+ * @brief Materialize and promote an implicit PTY stream descriptor if needed.
+ * @param task Descriptor-table owner; required.
+ * @param fd Existing implicit stream or PTY alias descriptor.
+ * @param out Receives a borrowed live alias entry; later PTY table growth can invalidate it.
+ * @return Zero on success or negative errno without losing descriptor state.
+ */
 int task_pty_ensure_fd(struct task *task, int fd, struct task_pty_fd **out)
 {
+    if (!task || !out) return -RELIEFOS_EINVAL;
     struct task_pty_fd *entry = task_pty_fd_for_fd(task, fd);
     if (entry) {
         int ret = task_pty_promote(entry);
@@ -185,20 +208,17 @@ int task_pty_ensure_fd(struct task *task, int fd, struct task_pty_fd **out)
     }
     int stream = task_pty_stream_for_fd(task, fd);
     if (stream < 0 || task_file_for_fd(task, fd)) return -RELIEFOS_EBADF;
-    for (uint32_t i = 0; i < SCHED_TASK_PTY_FD_MAX; ++i) {
-        entry = &sched_task_fds(task)->pty_fds[i];
-        if (entry->used) continue;
-        *entry = (struct task_pty_fd){.used = 1, .fd = fd, .stream = (uint32_t)stream,
-            .pty_id = task->pty_id, .endpoint = TASK_PTY_ENDPOINT_SLAVE,
-            .status_flags = stream == 0 ? RELIEFOS_O_RDONLY : RELIEFOS_O_WRONLY,
-            .flags = fd < 3 && (sched_task_fds(task)->cloexec_stdio_mask & (1u << fd))
-                ? RELIEFOS_FD_CLOEXEC : 0};
-        int ret = task_pty_promote(entry);
-        if (ret < 0) { *entry = (struct task_pty_fd){0}; return ret; }
-        *out = entry;
-        return 0;
-    }
-    return -RELIEFOS_EMFILE;
+    int ret = sched_task_pty_alloc(task, &entry);
+    if (ret < 0) return ret;
+    *entry = (struct task_pty_fd){.used = 1, .fd = fd, .stream = (uint32_t)stream,
+        .pty_id = task->pty_id, .endpoint = TASK_PTY_ENDPOINT_SLAVE,
+        .status_flags = stream == 0 ? RELIEFOS_O_RDONLY : RELIEFOS_O_WRONLY,
+        .flags = fd < 3 && (sched_task_fds(task)->cloexec_stdio_mask & (1u << fd))
+            ? RELIEFOS_FD_CLOEXEC : 0};
+    ret = task_pty_promote(entry);
+    if (ret < 0) { *entry = (struct task_pty_fd){0}; return ret; }
+    *out = entry;
+    return 0;
 }
 
 /**
@@ -301,16 +321,17 @@ int task_pty_fd_available(struct task *task, int fd)
 }
 
 /**
- * Task pty duplicate fd.
- * @param task Value supplied by the caller.
- * @param old_fd Value supplied by the caller.
- * @param minimum_fd Value supplied by the caller.
- * @param flags Identifier or flags controlling the operation.
- * @return The value or status produced by the operation.
+ * @brief Duplicate one PTY descriptor at or above a requested minimum.
+ * @param task Descriptor-table owner; required.
+ * @param old_fd Open PTY or implicit PTY-stream descriptor.
+ * @param minimum_fd Inclusive lowest descriptor number to allocate.
+ * @param flags Per-descriptor flags; only FD_CLOEXEC is retained.
+ * @return New descriptor or negative errno with source and target references intact.
  */
 int task_pty_duplicate_fd(struct task *task, int old_fd, int minimum_fd,
-                                 uint32_t flags)
+                          uint32_t flags)
 {
+    if (!task) return -RELIEFOS_EBADF;
     struct task_pty_fd *source = task_pty_fd_for_fd(task, old_fd);
     int stream = task_pty_stream_for_fd(task, old_fd);
     int candidate;
@@ -322,35 +343,34 @@ int task_pty_duplicate_fd(struct task *task, int old_fd, int minimum_fd,
     if (ret < 0) return ret;
     candidate = task_unused_fd(task, minimum_fd);
     if (candidate < 0) return candidate;
-    for (uint32_t attempts = 0; attempts < SCHED_TASK_PTY_FD_MAX + SCHED_TASK_FILE_MAX + 4u;
-         ++attempts, ++candidate) {
-        if (candidate < 0) {
-            return -RELIEFOS_EINVAL;
-        }
-        if (!task_pty_fd_available(task, candidate)) {
-            continue;
-        }
-        for (uint32_t i = 0; i < SCHED_TASK_PTY_FD_MAX; ++i) {
-            struct task_pty_fd *entry = &sched_task_fds(task)->pty_fds[i];
-            if (!entry->used) {
-                *entry = *source;
-                ++entry->description->references;
-                entry->fd = candidate;
-                entry->flags = flags;
-                /* A fresh descriptor never inherits FD_CLOEXEC, so a reused
-                 * stdio slot must also drop the implicit close-on-exec bit. */
-                if (candidate < 3) {
-                    sched_task_fds(task)->closed_stdio_mask &= ~(1u << candidate);
-                    sched_task_fds(task)->cloexec_stdio_mask &= ~(1u << candidate);
-                }
-                return candidate;
-            }
-        }
-        return -RELIEFOS_EMFILE;
+    /* Retain before growing because growth moves the task-owned alias vector. */
+    struct task_pty_fd retained = *source;
+    ++retained.description->references;
+    struct task_pty_fd *entry;
+    ret = sched_task_pty_alloc(task, &entry);
+    if (ret < 0) {
+        task_pty_release_entry(&retained);
+        return ret;
     }
-    return -RELIEFOS_EMFILE;
+    *entry = retained;
+    entry->fd = candidate;
+    entry->flags = flags;
+    /* A fresh descriptor never inherits FD_CLOEXEC, so a reused stdio slot
+     * also drops the implicit close-on-exec bit. */
+    if (candidate < 3) {
+        sched_task_fds(task)->closed_stdio_mask &= ~(1u << candidate);
+        sched_task_fds(task)->cloexec_stdio_mask &= ~(1u << candidate);
+    }
+    return candidate;
 }
 
+/**
+ * @brief Retain a PTY alias in a caller-owned SCM_RIGHTS transfer entry.
+ * @param task Descriptor-table owner; required.
+ * @param fd Open PTY or implicit PTY stream descriptor.
+ * @param out Caller-owned transfer entry receiving one retained reference.
+ * @return Zero on success or negative errno without changing output ownership.
+ */
 int task_pty_export_fd(struct task *task, int fd, struct task_pty_fd *out)
 {
     if (!task || !out || task_file_for_fd(task, fd)) return -RELIEFOS_EBADF;
@@ -363,36 +383,50 @@ int task_pty_export_fd(struct task *task, int fd, struct task_pty_fd *out)
     return 0;
 }
 
+/**
+ * @brief Import a retained PTY transfer entry into a task descriptor table.
+ * @param task Receiving descriptor-table owner; required.
+ * @param source Caller-owned live transfer entry; it remains owned by caller.
+ * @param flags Per-descriptor flags to install on the received alias.
+ * @return New descriptor or negative errno; source ownership is unchanged.
+ * @note The source is snapshotted before possible table growth. If it points into
+ * this same task's alias vector, growth may invalidate the caller's borrowed pointer.
+ */
 int task_pty_import_fd(struct task *task, const struct task_pty_fd *source, uint32_t flags)
 {
-    if (!source || !source->used || !source->description) return -RELIEFOS_EBADF;
+    if (!task || !source || !source->used || !source->description) return -RELIEFOS_EBADF;
     int fd = task_unused_fd(task, 0);
     if (fd < 0) return fd;
-    for (unsigned i = 0; i < SCHED_TASK_PTY_FD_MAX; ++i) {
-        struct task_pty_fd *entry = &sched_task_fds(task)->pty_fds[i];
-        if (entry->used) continue;
-        *entry = *source;
-        ++entry->description->references;
-        entry->fd = fd;
-        entry->flags = flags;
-        if (fd < 3) {
-            sched_task_fds(task)->closed_stdio_mask &= ~(1u << fd);
-            sched_task_fds(task)->cloexec_stdio_mask &= ~(1u << fd);
-        }
-        return fd;
+    /* SCM_RIGHTS sources can be aliases in this same vector. Snapshot and
+     * retain before allocating a slot, which may relocate that vector. */
+    struct task_pty_fd retained = *source;
+    ++retained.description->references;
+    struct task_pty_fd *entry;
+    int ret = sched_task_pty_alloc(task, &entry);
+    if (ret < 0) {
+        task_pty_release_entry(&retained);
+        return ret;
     }
-    return -RELIEFOS_EMFILE;
+    *entry = retained;
+    entry->fd = fd;
+    entry->flags = flags;
+    if (fd < 3) {
+        sched_task_fds(task)->closed_stdio_mask &= ~(1u << fd);
+        sched_task_fds(task)->cloexec_stdio_mask &= ~(1u << fd);
+    }
+    return fd;
 }
 
 /**
- * Task pty dup2 fd.
- * @param task Value supplied by the caller.
- * @param old_fd Value supplied by the caller.
- * @param new_fd Value supplied by the caller.
- * @return The value or status produced by the operation.
+ * @brief Replace a descriptor with a retained PTY endpoint or implicit stream.
+ * @param task Descriptor-table owner; required.
+ * @param old_fd Open PTY or implicit PTY-stream descriptor.
+ * @param new_fd Target descriptor, required to be below RLIMIT_NOFILE.
+ * @return Target descriptor on success or negative errno without losing source ownership.
  */
 int task_pty_dup2_fd(struct task *task, int old_fd, int new_fd)
 {
+    if (!task) return -RELIEFOS_EBADF;
     struct task_pty_fd *source = task_pty_fd_for_fd(task, old_fd);
     int stream = task_pty_stream_for_fd(task, old_fd);
     if (!task || (stream < 0 && !(source && source->endpoint)) || new_fd < 0)
@@ -402,19 +436,17 @@ int task_pty_dup2_fd(struct task *task, int old_fd, int new_fd)
     int ret = task_pty_ensure_fd(task, old_fd, &source);
     if (ret < 0) return ret;
     struct task_pty_fd retained = *source;
+    ++retained.description->references;
     retained.fd = new_fd;
     retained.flags = 0;
     struct task_pty_fd *entry = task_pty_fd_for_fd(task, new_fd);
     if (!entry) {
-        for (uint32_t i = 0; i < SCHED_TASK_PTY_FD_MAX; ++i) {
-            if (!sched_task_fds(task)->pty_fds[i].used) {
-                entry = &sched_task_fds(task)->pty_fds[i];
-                break;
-            }
+        ret = sched_task_pty_alloc(task, &entry);
+        if (ret < 0) {
+            task_pty_release_entry(&retained);
+            return ret;
         }
     }
-    if (!entry) return -RELIEFOS_EMFILE;
-    ++retained.description->references;
     /* Allocate/validate before replacing any existing target reference. */
     syscall_record_locks_close(task, task_descriptor_for_fd(task, new_fd));
     clear_task_file(task_descriptor_for_fd(task, new_fd));

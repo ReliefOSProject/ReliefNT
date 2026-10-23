@@ -338,7 +338,6 @@ int64_t syscall_legacy_descriptors(uint64_t number, uint64_t a0, uint64_t a1, ui
             struct task_file *stdio_file = task_descriptor_for_fd(task, (int)fd);
             struct task_pty_fd *pty_fd = task_pty_fd_for_fd(task, (int)fd);
             if (stdio_file) {
-                task_epoll_remove_fd(task, (int)fd);
                 syscall_record_locks_close(task, stdio_file);
                 result = clear_task_file_result(stdio_file);
             } else if (pty_fd) {
@@ -354,7 +353,6 @@ int64_t syscall_legacy_descriptors(uint64_t number, uint64_t a0, uint64_t a1, ui
         }
         struct task_file *descriptor = task_descriptor_for_fd(task, (int)fd);
         if (descriptor) {
-            task_epoll_remove_fd(task, (int)fd);
             syscall_record_locks_close(task, descriptor);
             return clear_task_file_result(descriptor);
         }
@@ -498,6 +496,8 @@ int64_t syscall_legacy_descriptors(uint64_t number, uint64_t a0, uint64_t a1, ui
                 }
                 return 0;
             }
+            if (a1 == LINUX_F_GETPIPE_SZ || a1 == LINUX_F_SETPIPE_SZ)
+                return task_pipe_capacity(file_fd, a1 == LINUX_F_SETPIPE_SZ, (uint32_t)a2);
             if (a1 == LINUX_F_GET_SEALS || a1 == LINUX_F_ADD_SEALS) {
                 /* Linux memfd_fcntl: sealing is a shmem-file interface; pty
                  * and stream descriptors are not sealable and report EINVAL. */
@@ -551,8 +551,8 @@ int64_t syscall_legacy_descriptors(uint64_t number, uint64_t a0, uint64_t a1, ui
                 }
             }
         }
-        for (uint32_t i = 0; i < SCHED_TASK_PTY_FD_MAX; ++i) {
-            struct task_pty_fd *pty_fd = &sched_task_fds(task)->pty_fds[i];
+        for (uint32_t i = 0; i < sched_task_pty_capacity(task); ++i) {
+            struct task_pty_fd *pty_fd = sched_task_pty_at(task, i);
             if (!pty_fd->used || pty_fd->fd < 0 || (uint32_t)pty_fd->fd < first ||
                 (uint32_t)pty_fd->fd > last) continue;
             if (flags & 4u) pty_fd->flags |= RELIEFOS_FD_CLOEXEC;

@@ -939,7 +939,12 @@ static int es1371_hardware_init(void)
         es1371.dma_phys = 0;
         return -12;
     }
-    es1371.dma_buffer = (uint8_t *)(uintptr_t)es1371.dma_phys;
+    es1371.dma_buffer = (uint8_t *)kernel_api->phys_to_virt(es1371.dma_phys);
+    if (!es1371.dma_buffer) {
+        kernel_api->free_pages(es1371.dma_phys, ES1371_DMA_PAGES);
+        es1371.dma_phys = 0;
+        return -12;
+    }
     es1371_zero(es1371.dma_buffer, ES1371_DMA_BYTES);
     es1371.active = 1;
     es1371.sample_rate = default_format.sample_rate;
@@ -958,7 +963,8 @@ static int es1371_driver_init(const struct reliefos_driver_kernel_api *api)
         .get_state = es1371_get_state,
     };
     if (!api || api->abi_version != RELIEFOS_DRIVER_ABI_VERSION ||
-        api->struct_size < RELIEFOS_DRIVER_LOG_API_SIZE || !api->console_log) {
+        api->struct_size < RELIEFOS_DRIVER_PHYS_MAP_API_SIZE || !api->console_log ||
+        !api->phys_to_virt) {
         return -22;
     }
     kernel_api = api;

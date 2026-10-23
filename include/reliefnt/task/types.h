@@ -25,14 +25,15 @@ struct audio_pcm;
 struct drm_file;
 struct drm_bo;
 struct drm_prime_file;
+struct task_epoll_watch;
 
 #define SCHED_TASK_NAME_LEN 32u
 /* Initial task-table capacity; the scheduler grows beyond this value. */
 #define SCHED_TASK_MAX 64u
 #define SCHED_TASK_FILE_MAX 64u
-#define SCHED_TASK_FILE_LIMIT 1024u
+/* Linux-compatible initial soft RLIMIT_NOFILE; never an enumeration ceiling. */
+#define SCHED_TASK_NOFILE_DEFAULT 1024u
 #define SCHED_NR_OPEN 1048576u
-#define SCHED_TASK_PTY_FD_MAX 8u
 #define SCHED_TASK_STDIO_MAX 3u
 /* Linux MAX_ARG_STRINGS / MAX_ARG_STRLEN; the total budget follows RLIMIT_STACK. */
 #define SCHED_EXEC_ARG_MAX 0x7fffffffu
@@ -113,6 +114,8 @@ struct task_file {
     uint32_t flock_type;
     uint32_t kind;
     uint32_t io_owner;
+    /* Epoll watches borrow this stable OFD identity and detach before final free. */
+    struct task_epoll_watch *epoll_watches;
     struct storage_node node;
     struct storage_inode_ref *inode;
     uint64_t offset;
@@ -176,6 +179,8 @@ struct task_pty_description {
     uint32_t status_flags;
     uint32_t pty_id;
     uint32_t endpoint;
+    /* Epoll watches borrow this stable PTY OFD identity until final release. */
+    struct task_epoll_watch *epoll_watches;
 };
 
 /* Aliases of the standard streams for a process attached to a PTY. */
@@ -291,7 +296,12 @@ struct task_fd_table_state {
     struct task_file *file_extra;
     uint32_t file_extra_count;
     uint32_t file_extra_capacity;
-    struct task_pty_fd pty_fds[SCHED_TASK_PTY_FD_MAX];
+    /* PTY aliases are descriptor-indexed but stored separately because they
+     * may have no task_file payload. The vector is owned by this fd table and
+     * can move on growth; count is the scan bound, including empty slots. */
+    struct task_pty_fd *pty_fds;
+    uint32_t pty_fd_count;
+    uint32_t pty_fd_capacity;
     uint32_t references;
     uint64_t lock_owner;
 };
@@ -493,7 +503,10 @@ struct task {
     uint32_t signalfd_vector_count, signalfd_read_flags;
     uint32_t sigwait_active;
     struct task_posix_timer timers[SCHED_TASK_TIMER_MAX];
-    struct kernel_wait_queue *waiting_queue;
+    struct kernel_wait_queue *waiting_queue; /* Owns the links below while linked. */
+    struct task *wait_next; /* Intrusive queue successor; protected by queue->lock. */
+    struct task *wait_prev; /* Intrusive queue predecessor; protected by queue->lock. */
+    uint32_t wait_minimum; /* Minimum resource threshold for satisfied wakes. */
     struct task_file *socket_receive_file;
     uint64_t socket_receive_done;
     int32_t socket_receive_pid;
@@ -582,7 +595,9 @@ struct task {
             struct task_file *file_extra;
             uint32_t file_extra_count;
             uint32_t file_extra_capacity;
-            struct task_pty_fd pty_fds[SCHED_TASK_PTY_FD_MAX];
+            struct task_pty_fd *pty_fds;
+            uint32_t pty_fd_count;
+            uint32_t pty_fd_capacity;
             uint32_t file_references;
             uint64_t lock_owner;
         };

@@ -13,21 +13,20 @@ extern char __kernel_start[];
 extern char __kernel_end[];
 
 static uint64_t total_kib;
+static uint64_t unsupported_ram_bytes;
+static uint32_t unsupported_ram_ranges;
 
 #define PAGE_SIZE 4096ULL
-/* A user CR3 replaces the low identity mapping for every 2 MiB chunk of
- * RELIEFNT_USER_TOP it covers, and kernel code dereferences frame addresses as
- * plain pointers without switching CR3, so the allocator may only hand out
- * frames at or above the top of the user window.  Widening the user window
- * therefore costs that much physical RAM: RELIEFNT_USER_TOP is 768 MiB, so a
- * guest must have well above 768 MiB before the kernel can manage pages. */
-#define PAGE_ALLOC_MIN RELIEFNT_USER_TOP
-#define PAGE_ALLOC_LIMIT 0x400000000ULL
+/* Keep the conventional first MiB out of the allocator. */
+#define MM_LOW_RESERVED_END 0x100000ULL
+/* Page references and the supervisor direct map currently cover [0, 16 GiB). */
+#define PAGE_ALLOC_LIMIT RELIEFNT_KERNEL_DIRECT_MAP_SIZE
 #define FALLBACK_ALLOC_START 0x0a000000ULL
 #define FALLBACK_MEMORY_KIB (512ULL * 1024ULL)
 #define MM_MAX_FREE_RANGES 256u
 #define MM_MAX_RESERVED_RANGES 64u
 #define MM_PAGE_COUNT (PAGE_ALLOC_LIMIT / PAGE_SIZE)
+#define MM_PAGE_REF_PINNED UINT32_MAX
 
 struct phys_range {
     uint64_t start;
@@ -39,10 +38,10 @@ static struct phys_range free_ranges[MM_MAX_FREE_RANGES];
 static uint32_t free_range_count;
 static struct phys_range reserved_ranges[MM_MAX_RESERVED_RANGES];
 static uint32_t reserved_range_count;
-/* The allocator tracks the first 16 GiB.  A compact 16-bit count uses 8 MiB
- * and is large enough for the supported physical address range while still
- * allowing COW and shared file pages to use the same ownership accounting. */
-static uint16_t page_refs[MM_PAGE_COUNT];
+/* The allocator tracks 4,194,304 pages below 16 GiB.  A 32-bit count costs
+ * 16 MiB and supports large shared mappings.  UINT32_MAX is a pinned state:
+ * if a page ever reaches that count, later frees cannot release it early. */
+static uint32_t page_refs[MM_PAGE_COUNT];
 /* Runtime free pages cannot be represented by a bounded list of fragments. */
 static uint64_t *free_pages;
 static uint32_t free_page_count;
@@ -82,11 +81,12 @@ static uint64_t align_up(uint64_t value, uint64_t align)
 }
 
 /**
- * @brief Zero the full 4 KiB page starting at phys (identity-mapped).
+ * @brief Zero the full 4 KiB page through the supervisor direct map.
  */
 static void zero_page(uint64_t phys)
 {
-    uint8_t *p = (uint8_t *)(uintptr_t)phys;
+    uint8_t *p = (uint8_t *)mm_phys_to_virt(phys);
+    if (!p) return;
     for (uint64_t i = 0; i < PAGE_SIZE; ++i) {
         p[i] = 0;
     }
@@ -103,20 +103,27 @@ static void zero_pages(uint64_t phys, uint32_t page_count)
 }
 
 /**
- * @brief Clamp and page-align [start,end) into the allocator window, then append it as a free range.
+ * @brief Clip a usable range to direct-map bounds and append its aligned pages.
  */
 static void add_free_range(uint64_t start, uint64_t end)
 {
+    if (end < start) {
+        console_warn("[reliefnt] rejecting wrapped usable RAM range start=0x%llx end=0x%llx\n",
+                     (unsigned long long)start, (unsigned long long)end);
+        return;
+    }
     if (end > PAGE_ALLOC_LIMIT) {
+        uint64_t unsupported_start = start > PAGE_ALLOC_LIMIT ? start : PAGE_ALLOC_LIMIT;
+        if (unsupported_start < end) {
+            unsupported_ram_bytes += end - unsupported_start;
+            ++unsupported_ram_ranges;
+        }
         end = PAGE_ALLOC_LIMIT;
     }
     start = align_up(start, PAGE_SIZE);
     end = align_down(end, PAGE_SIZE);
-    /**
- * @brief User address spaces replace the identity mapping above their lower boundary. Physical pages below that boundary cannot safely be touched while a user CR3 is active, so keep allocator pages outside the alias.
- */
-    if (start < PAGE_ALLOC_MIN) {
-        start = PAGE_ALLOC_MIN;
+    if (start < MM_LOW_RESERVED_END) {
+        start = MM_LOW_RESERVED_END;
     }
     if (start >= end || free_range_count >= MM_MAX_FREE_RANGES) {
         return;
@@ -280,7 +287,12 @@ static void seed_free_ranges_from_boot(const struct boot_info *boot)
 {
     if (boot->mmap_addr && boot->mmap_entry_count) {
         total_kib = 0;
-        const uint8_t *cursor = (const uint8_t *)(uintptr_t)boot->mmap_addr;
+        const uint8_t *cursor = (const uint8_t *)mm_phys_to_virt(boot->mmap_addr);
+        if (!cursor) {
+            console_warn("[reliefnt] multiboot memory map is outside the kernel direct map\n");
+            add_fallback_free_range();
+            return;
+        }
         for (uint32_t i = 0; i < boot->mmap_entry_count; ++i) {
             const struct multiboot2_mmap_entry *entry =
                 (const struct multiboot2_mmap_entry *)(cursor + (uint64_t)i * boot->mmap_entry_size);
@@ -292,7 +304,12 @@ static void seed_free_ranges_from_boot(const struct boot_info *boot)
     }
     if (boot->efi_mmap_addr && boot->efi_mmap_entry_count) {
         total_kib = 0;
-        const uint8_t *cursor = (const uint8_t *)(uintptr_t)boot->efi_mmap_addr;
+        const uint8_t *cursor = (const uint8_t *)mm_phys_to_virt(boot->efi_mmap_addr);
+        if (!cursor) {
+            console_warn("[reliefnt] EFI memory map is outside the kernel direct map\n");
+            add_fallback_free_range();
+            return;
+        }
         for (uint32_t i = 0; i < boot->efi_mmap_entry_count; ++i) {
             const struct efi_memory_descriptor *entry =
                 (const struct efi_memory_descriptor *)(cursor + (uint64_t)i * boot->efi_mmap_entry_size);
@@ -324,7 +341,7 @@ static void reserve_boot_ranges(const struct boot_info *boot)
 {
     uint64_t boot_framebuffer_start = 0;
     uint64_t boot_framebuffer_bytes = 0;
-    reserve_range(0, PAGE_ALLOC_MIN, "lowmem");
+    reserve_range(0, MM_LOW_RESERVED_END, "lowmem");
     if (boot->mmap_addr && boot->mmap_entry_count) {
         reserve_bytes(boot->mmap_addr,
                       (uint64_t)boot->mmap_entry_count * boot->mmap_entry_size,
@@ -336,8 +353,8 @@ static void reserve_boot_ranges(const struct boot_info *boot)
                       "efi-mmap");
     }
     if (boot->multiboot_info) {
-        const struct multiboot2_info *info =
-            (const struct multiboot2_info *)(uintptr_t)boot->multiboot_info;
+        const struct multiboot2_info *info = (const struct multiboot2_info *)
+            mm_phys_to_virt(boot->multiboot_info);
         uint64_t bytes = info && info->total_size ? info->total_size : 4096;
         reserve_bytes(boot->multiboot_info, bytes, "multiboot");
     }
@@ -355,7 +372,7 @@ static void reserve_boot_ranges(const struct boot_info *boot)
         uint64_t reservation_start = fb->reservation_start;
         uint64_t reservation_bytes = fb->reservation_bytes;
         if (!reservation_start && fb->available && fb->pixels && fb->pitch && fb->height) {
-            reservation_start = (uint64_t)(uintptr_t)fb->pixels;
+            reservation_start = mm_virt_to_phys(fb->pixels);
             reservation_bytes = (uint64_t)fb->pitch * fb->height;
         }
         if (reservation_start && reservation_bytes &&
@@ -403,6 +420,12 @@ static void print_memory_map(void)
                        (unsigned long long)free_ranges[i].end,
                        (unsigned long long)((free_ranges[i].end - free_ranges[i].start) / 1024));
     }
+    if (unsupported_ram_ranges) {
+        console_warn("[reliefnt] unsupported usable RAM ranges=%u bytes=%llu above direct-map limit=0x%llx\n",
+                     unsupported_ram_ranges,
+                     (unsigned long long)unsupported_ram_bytes,
+                     (unsigned long long)PAGE_ALLOC_LIMIT);
+    }
 }
 
 /**
@@ -412,6 +435,8 @@ void mm_init(const struct boot_info *boot)
 {
     kernel_spin_init(&mm_lock);
     total_kib = 0;
+    unsupported_ram_bytes = 0;
+    unsupported_ram_ranges = 0;
     free_range_count = 0;
     reserved_range_count = 0;
     for (uint32_t i = 0; i < MM_PAGE_COUNT; ++i) {
@@ -428,7 +453,11 @@ void mm_init(const struct boot_info *boot)
     free_pages = NULL;
     for (uint32_t i = 0; i < free_range_count; ++i) {
         if (free_ranges[i].end - free_ranges[i].start >= bitmap_bytes) {
-            free_pages = (uint64_t *)(uintptr_t)free_ranges[i].start;
+            free_pages = (uint64_t *)mm_phys_to_virt(free_ranges[i].start);
+            if (!free_pages) {
+                console_fatal("[reliefnt] page bitmap is outside the kernel direct map\n");
+                break;
+            }
             reserve_range(free_ranges[i].start, free_ranges[i].start + bitmap_bytes, "page-bitmap");
             break;
         }
@@ -456,6 +485,10 @@ void mm_init(const struct boot_info *boot)
                    boot->mmap_entry_count,
                    boot->efi_mmap_entry_count);
     print_memory_map();
+    /* Early framebuffer BAR setup may have used pinned page tables from the
+     * kernel image. After this successful initialization, future MMIO splits
+     * can safely consume allocator-owned pages. */
+    paging_mmio_allocator_ready();
 }
 
 /**
@@ -477,6 +510,37 @@ uint64_t mm_free_memory_kib(void)
     free_kib = (uint64_t)free_page_count * (PAGE_SIZE / 1024);
     kernel_spin_unlock_irqrestore(&mm_lock, flags);
     return free_kib;
+}
+
+/**
+ * @brief Translate a supported physical address through the supervisor direct map.
+ * @param phys Physical byte address in the mapped direct-map range.
+ * @return Kernel pointer including the page offset, or NULL outside that range.
+ */
+void *mm_phys_to_virt(uint64_t phys)
+{
+    return paging_kernel_direct_map(phys);
+}
+
+/**
+ * @brief Translate a supported supervisor kernel pointer to a physical address.
+ * @param address Pointer in the direct-map window or linked kernel identity hole.
+ * @return Physical byte address, or zero outside those two bounded mappings.
+ * The low identity interval is limited to the supervisor kernel hole; ordinary
+ * low user addresses and other low physical-range integers are not accepted.
+ */
+uint64_t mm_virt_to_phys(const void *address)
+{
+    uint64_t value = (uint64_t)(uintptr_t)address;
+    if (value >= RELIEFNT_KERNEL_HOLE_START &&
+        value < RELIEFNT_KERNEL_HOLE_END) {
+        return value;
+    }
+    if (value < RELIEFNT_KERNEL_DIRECT_MAP_BASE ||
+        value - RELIEFNT_KERNEL_DIRECT_MAP_BASE >= RELIEFNT_KERNEL_DIRECT_MAP_SIZE) {
+        return 0;
+    }
+    return value - RELIEFNT_KERNEL_DIRECT_MAP_BASE;
 }
 
 /**
@@ -581,8 +645,8 @@ void mm_free_pages(uint64_t phys, uint32_t page_count)
     kernel_spin_lock_irqsave(&mm_lock, &flags);
     for (uint32_t page = 0; page < page_count; ++page) {
         uint64_t current = phys + (uint64_t)page * PAGE_SIZE;
-        uint16_t *refs = &page_refs[page_index(current)];
-        if (!*refs) {
+        uint32_t *refs = &page_refs[page_index(current)];
+        if (!*refs || *refs == MM_PAGE_REF_PINNED) {
             continue;
         }
         --*refs;
@@ -606,7 +670,8 @@ void mm_free_page(uint64_t phys)
 }
 
 /**
- * @brief Increment a page's reference count, saturating at UINT16_MAX and ignoring free (zero) pages.
+ * @brief Retain a page, pinning it on reference-count overflow.
+ * @param phys Physical page address to retain.
  */
 void mm_retain_page(uint64_t phys)
 {
@@ -615,9 +680,13 @@ void mm_retain_page(uint64_t phys)
         return;
     }
     kernel_spin_lock_irqsave(&mm_lock, &flags);
-    uint16_t *refs = &page_refs[page_index(phys)];
-    if (*refs && *refs != UINT16_MAX) {
-        ++*refs;
+    uint32_t *refs = &page_refs[page_index(phys)];
+    if (*refs && *refs != MM_PAGE_REF_PINNED) {
+        if (*refs == MM_PAGE_REF_PINNED - 1) {
+            *refs = MM_PAGE_REF_PINNED;
+        } else {
+            ++*refs;
+        }
     }
     kernel_spin_unlock_irqrestore(&mm_lock, flags);
 }

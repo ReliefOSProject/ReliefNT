@@ -16,7 +16,7 @@ struct reliefos_net_config net_config;
 
 bool net_interface_up = true;
 
-struct net_socket net_sockets[RELIEFOS_NET_SOCKET_MAX];
+struct net_socket *net_sockets;
 
 /**
  * Net log config.
@@ -65,13 +65,16 @@ int net_is_ready(void)
 }
 
 /**
- * Net driver detached.
+ * @brief Close TCP sockets and reset cached link configuration after NIC removal.
+ * @note Every socket waiter is woken before the network stack stops using its state.
  */
 void net_driver_detached(void)
 {
-    for (unsigned i = 0; i < RELIEFOS_NET_SOCKET_MAX; ++i) {
-        struct net_socket *s = &net_sockets[i];
-        if (s->used) { s->error = LINUX_ENETDOWN; net_socket_mark_closed(s, RELIEFOS_NET_STATUS_NO_DEVICE); }
+    for (struct net_socket *s = net_sockets; s; s = s->registry_next) {
+        if (s->used) {
+            s->error = LINUX_ENETDOWN;
+            net_socket_mark_closed(s, RELIEFOS_NET_STATUS_NO_DEVICE);
+        }
     }
     net_arp_cache_clear();
     net_set_static_fallback();

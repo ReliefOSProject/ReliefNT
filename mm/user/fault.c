@@ -1,8 +1,8 @@
 #include "memory_internal.h"
 
 /**
- * Zero phys page.
- * @param phys Value supplied by the caller.
+ * @brief Clear one allocator page through the kernel direct map.
+ * @param phys Physical page address returned by the allocator.
  */
 static void zero_phys_page(uint64_t phys);
 
@@ -34,7 +34,8 @@ static bool task_stack_growth_allowed(const struct task *task, uint64_t page);
  */
 static void zero_phys_page(uint64_t phys)
 {
-    uint8_t *ptr = (uint8_t *)(uintptr_t)phys;
+    uint8_t *ptr = (uint8_t *)mm_phys_to_virt(phys);
+    if (!ptr) return;
     for (uint64_t i = 0; i < PAGE_SIZE; ++i) {
         ptr[i] = 0;
     }
@@ -101,6 +102,11 @@ static int task_map_anonymous_page(struct task *task, struct task_vma *vma,
     return 0;
 }
 
+/** @brief Fill a page-cache frame from the requested file range.
+ * @param phys Physical cache frame to fill.
+ * @param opaque File, offset, and segment-limit context.
+ * @return Zero on success or a negative ReliefOS errno.
+ */
 static int load_file_cache_page(uint64_t phys, void *opaque)
 {
     struct file_page_load_context *context = (struct file_page_load_context *)opaque;
@@ -122,13 +128,21 @@ static int load_file_cache_page(uint64_t phys, void *opaque)
      * fault cannot replay that syscall, and its cache page must stay alive
      * until DMA completes. Match the uncached fault path's synchronous I/O. */
     storage_set_io_async_context(false);
-    if (storage_read_node(context->node, offset, (void *)(uintptr_t)phys,
+    void *page = mm_phys_to_virt(phys);
+    if (!page) return -RELIEFOS_ENOMEM;
+    if (storage_read_node(context->node, offset, page,
                           want, &got) < 0 || got != want) {
         return -RELIEFOS_EIO;
     }
     return 0;
 }
 
+/** @brief Resolve and install one lazy file-backed VMA page.
+ * @param task Owning task and address space.
+ * @param vma File mapping metadata and protection policy.
+ * @param page Aligned virtual page address to materialize.
+ * @return Zero after mapping, otherwise a negative ReliefOS errno.
+ */
 static int task_map_file_vma_page(struct task *task, const struct task_vma *vma,
                                   uint64_t page)
 {
@@ -182,8 +196,14 @@ static int task_map_file_vma_page(struct task *task, const struct task_vma *vma,
  * @brief A user page fault is not a restartable filesystem syscall. Force this backing-page read through the synchronous AHCI path so an in-flight async storage operation cannot surface as EAGAIN and turn a valid lazy mapping into a process-killing fault.
  */
         storage_set_io_async_context(false);
+        void *frame = mm_phys_to_virt(phys);
+        if (!frame) {
+            if (cached) page_cache_release(phys);
+            else mm_free_page(phys);
+            return -RELIEFOS_ENOMEM;
+        }
         ret = storage_read_node(&vma->file_node, file_offset,
-                                (void *)(uintptr_t)phys, want, &got);
+                                frame, want, &got);
         storage_set_io_async_context(false);
         if (ret < 0 || got != want) {
             if (cached) page_cache_release(phys);

@@ -36,6 +36,7 @@ int storage_inode_get(const struct storage_node *node, struct storage_inode_ref 
         struct ext2_inode inode;
         int ret = storage_select_node_volume(node, &previous);
         bool memory = node->flags & STORAGE_NODE_FLAG_TMPFS;
+        struct tmpfs_super *memory_fs = !ret && memory ? g_storage.tmpfs : NULL;
         if (!ret && memory) ret = tmpfs_hold(g_storage.tmpfs, node->first_cluster);
         else if (!ret && storage_ext4_is_ext_family(&g_storage)) {
             struct ext4_inode_view ext4_inode;
@@ -49,7 +50,7 @@ int storage_inode_get(const struct storage_node *node, struct storage_inode_ref 
         }
         ref = kernel_malloc(sizeof(*ref));
         if (!ref) {
-            if (memory) tmpfs_drop(g_volumes[node->volume_id].tmpfs, node->first_cluster);
+            if (memory) tmpfs_drop(memory_fs, node->first_cluster);
             kernel_execution_unlock_irqrestore(flags);
             return -12;
         }

@@ -13,6 +13,7 @@
 
 #define CONCURRENT_TASKS 24u
 #define REMOVE_WAKE_ROUNDS 64u
+#define WAIT_QUEUE_SLEEPERS 65u
 
 static _Thread_local struct task *current_task;
 
@@ -26,6 +27,7 @@ static bool race_sleep_entered;
 static atomic_bool race_wait_for_notify;
 static bool race_block_before_wait;
 static atomic_uint sleep_call_count;
+static struct kernel_wait_queue *unlock_wake_queue;
 
 void kernel_spin_init(struct kernel_spinlock *lock)
 {
@@ -58,6 +60,12 @@ void kernel_spin_unlock_irqrestore(struct kernel_spinlock *lock, uint64_t flags)
 {
     (void)flags;
     __atomic_store_n(&lock->state, 0u, __ATOMIC_RELEASE);
+    /* Deliver a deterministic IRQ immediately when registration is published. */
+    if (unlock_wake_queue && lock == &unlock_wake_queue->lock) {
+        struct kernel_wait_queue *queue = unlock_wake_queue;
+        unlock_wake_queue = NULL;
+        (void)kernel_wait_queue_wake_one(queue);
+    }
 }
 
 struct task *sched_current_task(void)
@@ -126,8 +134,8 @@ static int task_is_registered(struct kernel_wait_queue *queue,
     uint64_t flags;
     int found = 0;
     kernel_spin_lock_irqsave(&queue->lock, &flags);
-    for (uint32_t i = 0; i < queue->count; ++i) {
-        if (queue->waiters[i] == task) {
+    for (struct task *waiter = queue->head; waiter; waiter = waiter->wait_next) {
+        if (waiter == task) {
             found = 1;
             break;
         }
@@ -155,6 +163,24 @@ static int test_poll_stale_generation_does_not_sleep(void)
     current_task = NULL;
     if (!passed) fprintf(stderr, "FAIL: stale poll generation slept or registered\n");
     return passed ? 0 : 1;
+}
+
+static int test_queue_wake_at_registration_unlock(void)
+{
+    struct kernel_wait_queue queue;
+    struct task task;
+    kernel_wait_queue_init(&queue);
+    task_init(&task, 19u, TASK_RUNNING);
+    current_task = &task;
+    unlock_wake_queue = &queue;
+    kernel_wait_queue_block_current_minimum(&queue, 4096);
+    current_task = NULL;
+    if (unlock_wake_queue || task.state != TASK_READY || queue.count || task.waiting_queue) {
+        fprintf(stderr, "FAIL: queue registration wake was lost state=%u count=%u\n",
+                (unsigned)task.state, queue.count);
+        return 1;
+    }
+    return 0;
 }
 
 enum poll_race_stage {
@@ -251,6 +277,34 @@ static int test_threshold_stop_and_unconditional_wake(void)
 
     if (!passed)
         fprintf(stderr, "FAIL: threshold boundary or stopped-task wake semantics\n");
+    return passed ? 0 : 1;
+}
+
+static int test_more_than_64_sleepers(void)
+{
+    struct kernel_wait_queue queue;
+    struct task tasks[WAIT_QUEUE_SLEEPERS];
+
+    kernel_wait_queue_init(&queue);
+    for (uint32_t i = 0; i < WAIT_QUEUE_SLEEPERS; ++i) {
+        task_init(&tasks[i], 60u + i, TASK_RUNNING);
+        current_task = &tasks[i];
+        kernel_wait_queue_block_current(&queue);
+    }
+    current_task = NULL;
+
+    int passed = queue.count == WAIT_QUEUE_SLEEPERS;
+    for (uint32_t i = 0; i < WAIT_QUEUE_SLEEPERS; ++i)
+        passed = passed && tasks[i].state == TASK_BLOCKED &&
+                 tasks[i].waiting_queue == &queue;
+    passed = passed && kernel_wait_queue_wake_all(&queue) == WAIT_QUEUE_SLEEPERS &&
+             queue.count == 0u;
+    for (uint32_t i = 0; i < WAIT_QUEUE_SLEEPERS; ++i)
+        passed = passed && tasks[i].state == TASK_READY &&
+                 tasks[i].waiting_queue == NULL;
+
+    if (!passed)
+        fprintf(stderr, "FAIL: wait queue did not wake all 65 registered sleepers\n");
     return passed ? 0 : 1;
 }
 
@@ -448,11 +502,13 @@ static int test_exit_unlink_races_wake(void)
 int main(void)
 {
     if (test_poll_stale_generation_does_not_sleep()) return EXIT_FAILURE;
+    if (test_queue_wake_at_registration_unlock()) return EXIT_FAILURE;
     if (test_poll_notify_race(POLL_NOTIFY_BEFORE_BLOCKED)) return EXIT_FAILURE;
     if (test_poll_notify_race(POLL_NOTIFY_AFTER_BLOCKED)) return EXIT_FAILURE;
     if (test_threshold_stop_and_unconditional_wake()) return EXIT_FAILURE;
+    if (test_more_than_64_sleepers()) return EXIT_FAILURE;
     if (test_concurrent_enqueue_threshold_and_close_wakes()) return EXIT_FAILURE;
     if (test_exit_unlink_races_wake()) return EXIT_FAILURE;
-    puts("PASS wait queue concurrency: poll generation races, threshold boundaries, concurrent close/wake, and exit unlink");
+    puts("PASS wait queue concurrency: 65 sleepers, poll generation races, threshold boundaries, concurrent close/wake, and exit unlink");
     return EXIT_SUCCESS;
 }

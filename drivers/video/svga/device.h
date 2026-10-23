@@ -69,6 +69,16 @@ struct svga_ops {
     void *(*pointer)(uint64_t phys);
     uint64_t (*clock)(void);
 };
+struct framebuffer;
+/** @brief Validate that an SVGA FIFO CPU alias matches its physical reservation.
+ * @param fb Framebuffer descriptor with the auxiliary physical range.
+ * @param fifo Kernel CPU alias bound to the SVGA protocol layer.
+ * @param bytes FIFO range size.
+ * @return True when both physical start and byte count match.
+ */
+bool svga_fifo_reservation_matches(const struct framebuffer *fb,
+                                   const volatile uint32_t *fifo,
+                                   uint32_t bytes);
 struct svga_mob {
     uint64_t phys, pt_phys;
     uint32_t pages, pt_pages, bytes, depth;

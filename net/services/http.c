@@ -283,7 +283,7 @@ static uint32_t net_http_exchange_ip(struct reliefos_net_http_get *request,
     local_seq += http_len;
     acked_remote_seq = wait.remote_seq;
     start = time_uptime_ms();
-    next_retransmit = start + NET_TCP_DATA_RETRANSMIT_MS;
+    next_retransmit = start + NET_TCP_INITIAL_RTO_MS;
     spins = 0;
     while (!net_timeout_expired(start, timeout_ms, spins++)) {
         uint32_t before = wait.changed;
@@ -319,7 +319,7 @@ static uint32_t net_http_exchange_ip(struct reliefos_net_http_get *request,
                 request->status = RELIEFOS_NET_STATUS_TX_FAILED;
                 break;
             }
-            next_retransmit = now + NET_TCP_DATA_RETRANSMIT_MS;
+            next_retransmit = now + NET_TCP_INITIAL_RTO_MS;
         }
         net_cpu_relax();
     }

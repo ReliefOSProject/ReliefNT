@@ -925,6 +925,11 @@ int64_t sched_create_process_session(uint32_t pid);
  */
 uint32_t sched_pty_reference_count(uint32_t pty_id);
 
+/**
+ * @brief Count master-endpoint references that prevent PTY session teardown.
+ * @param pty_id Stable PTY session identifier; zero has no references.
+ * @return Number of transfer references and open master aliases.
+ */
 uint32_t sched_pty_master_reference_count(uint32_t pty_id);
 
 /**

@@ -1,4 +1,5 @@
 #include "pcm_internal.h"
+#include <reliefnt/mm.h>
 
 
 
@@ -53,7 +54,16 @@ int audio_pcm_import_control_locked(struct audio_pcm *pcm)
     return 0;
 }
 
-/** @brief Validate and retain one PCM data/status/control mapping. */
+/** @brief Validate and retain one PCM data/status/control mapping.
+ * @param pcm Live core object whose backing remains pinned by the reference.
+ * @param offset Linux data, status, or control mapping selector.
+ * @param length Page-aligned mapping size in bytes.
+ * @param prot Allowed audio PCM read/write protection bits.
+ * @param mapping Receives physical backing address and retained generation.
+ * @return Zero or -EINVAL/-EPERM/-EBADFD/-ENODEV/-EFAULT. IRQ-safe lock
+ * protects references; @p mapping.backing is a physical address suitable for
+ * user page-table insertion, never a kernel CPU alias or DMA bus address.
+ */
 int audio_pcm_mmap_acquire(struct audio_pcm *pcm, uint64_t offset,
                            uint64_t length, uint32_t prot,
                            struct audio_pcm_mmap *mapping)
@@ -90,22 +100,31 @@ int audio_pcm_mmap_acquire(struct audio_pcm *pcm, uint64_t offset,
         return -EBADFD;
     }
     int ret = 0;
+    void *backing = NULL;
     if (region == AUDIO_PCM_MMAP_DATA) {
         if (length > pcm->dma.bytes ||
             ((uint64_t)(uintptr_t)audio_pcm_buffer(pcm) & (AUDIO_PCM_MMAP_PAGE_BYTES - 1u)) ||
             (pcm->direction == AUDIO_CAPTURE && !(prot & AUDIO_PCM_PROT_READ)) ||
             (pcm->direction == AUDIO_PLAYBACK && !(prot & AUDIO_PCM_PROT_WRITE))) {
             ret = -EINVAL;
+        } else {
+            backing = audio_pcm_buffer(pcm);
         }
     } else if (region == AUDIO_PCM_MMAP_STATUS) {
         if (length > AUDIO_PCM_MMAP_PAGE_BYTES || !(prot & AUDIO_PCM_PROT_READ) ||
             (prot & AUDIO_PCM_PROT_WRITE)) {
             ret = (prot & AUDIO_PCM_PROT_WRITE) ? -EPERM : -EINVAL;
+        } else {
+            backing = pcm->status_page;
         }
     } else if (length > AUDIO_PCM_MMAP_PAGE_BYTES ||
                !(prot & AUDIO_PCM_PROT_READ)) {
         ret = -EINVAL;
+    } else {
+        backing = pcm->control_page;
     }
+    uint64_t backing_phys = !ret ? mm_virt_to_phys(backing) : 0;
+    if (!ret && !backing_phys) ret = -EFAULT;
     if (!ret) {
         ++pcm->mapping_refs;
         if (region == AUDIO_PCM_MMAP_DATA) ++pcm->data_refs;
@@ -117,10 +136,7 @@ int audio_pcm_mmap_acquire(struct audio_pcm *pcm, uint64_t offset,
             .prot = prot,
             .offset = offset,
             .length = length,
-            .backing = region == AUDIO_PCM_MMAP_DATA
-                ? (uint64_t)(uintptr_t)audio_pcm_buffer(pcm)
-                : (uint64_t)(uintptr_t)(region == AUDIO_PCM_MMAP_STATUS
-                    ? pcm->status_page : pcm->control_page),
+            .backing = backing_phys,
         };
     }
     audio_pcm_publish_locked(pcm);

@@ -1,4 +1,5 @@
 #include "pcm_internal.h"
+#include <reliefnt/mm.h>
 
 static uint32_t audio_pcm_container_bytes(uint32_t sample_bits);
 
@@ -12,8 +13,11 @@ static int audio_pcm_validate(const struct audio_pcm *pcm, const struct audio_pa
 /** @brief Select a core-owned DMA ring in OPEN/SETUP/PREPARED.
  * @param pcm Live OFD-owned stream; serialized in task context.
  * @param selection Borrowed validated hardware and memory-format configuration.
- * @return Zero, -EBADFD for state/data mappings, or validation/device errno.
+ * @return Zero, -EBADFD for state/data mappings, validation/device errno, or
+ *         -EFAULT when the selected CPU alias has no kernel physical mapping.
  * The caller retains ownership; IRQ-safe locks protect published counters.
+ * The DMA descriptor keeps the CPU alias separately from its physical bus
+ * address and retains an existing device bus mapping for an unchanged ring.
  */
 static int audio_pcm_hw_params_selected(struct audio_pcm *pcm,
                                          const struct audio_params_ext *selection);
@@ -114,8 +118,18 @@ static int audio_pcm_hw_params_selected(struct audio_pcm *pcm,
     uint8_t *buffer = NULL;
     ret = audio_pcm_prepare_buffer(pcm, bytes, &new_storage, &buffer);
     if (ret) return ret;
+    uint64_t dma_bus = mm_virt_to_phys(buffer);
     uint64_t flags;
     kernel_spin_lock_irqsave(&pcm->lock, &flags);
+    /* A device may have installed an IOMMU/bus address for this same backing.
+     * Keep it across format renegotiation; mmap still translates the CPU alias
+     * independently to the physical pages that user page tables must map. */
+    if (pcm->dma.kernel == buffer && pcm->dma.bus) dma_bus = pcm->dma.bus;
+    if (!dma_bus) {
+        kernel_spin_unlock_irqrestore(&pcm->lock, flags);
+        if (new_storage && kernel_free) kernel_free(new_storage);
+        return -EFAULT;
+    }
     if (!audio_pcm_connected_locked(pcm)) {
         kernel_spin_unlock_irqrestore(&pcm->lock, flags);
         if (new_storage && kernel_free) kernel_free(new_storage);
@@ -128,7 +142,7 @@ static int audio_pcm_hw_params_selected(struct audio_pcm *pcm,
     pcm->params = *params;
     pcm->selected = *selection;
     pcm->dma = (struct audio_dma){.kernel = buffer,
-                                  .bus = (uint64_t)(uintptr_t)buffer,
+                                  .bus = dma_bus,
                                   .bytes = bytes};
     pcm->boundary = AUDIO_PCM_BOUNDARY_BASE - (AUDIO_PCM_BOUNDARY_BASE % params->buffer_frames);
     pcm->avail_min = params->period_frames;

@@ -9,6 +9,8 @@
 #include <reliefnt/console.h>
 #include <reliefnt/input.h>
 #include <reliefnt/sched.h>
+#include <reliefnt/smp.h>
+#include <reliefnt/net.h>
 #include <reliefnt/signal.h>
 #include <reliefnt/userland.h>
 #include <reliefnt/syscall.h>
@@ -27,6 +29,15 @@
 #include "../../kernel/sync/lock.c"
 static _Thread_local uint32_t cpu;
 static _Thread_local uint64_t irq_state;
+static bool network_due;
+static bool network_stack_active;
+static unsigned network_maintenance_calls;
+static unsigned network_stack_maintenance_calls;
+static unsigned network_stack_calls;
+#define SCHED_IDLE_SERVICE_STACK_BYTES (16u * 1024u)
+static uint8_t sched_idle_service_stacks[SMP_MAX_CPUS]
+    [SCHED_IDLE_SERVICE_STACK_BYTES] __attribute__((aligned(16)));
+static bool exclusive(void) { return execution_owner==cpu && execution_depth[cpu]==1; }
 static struct task current, replacement;
 static struct task *selected;
 static atomic_bool key_pending;
@@ -34,10 +45,28 @@ static unsigned drained, delivered, released, fpu_saved, fpu_restored;
 static uint64_t installed_fs;
 
 uint32_t smp_current_cpu(void) { return cpu; }
+bool net_tcp_maintenance_due(void)
+{ assert(exclusive()); return network_due; }
+void net_tcp_maintenance(void)
+{
+    assert(exclusive());
+    ++network_maintenance_calls;
+    if (network_stack_active) ++network_stack_maintenance_calls;
+    network_due = false;
+}
+void arch_call_on_stack(void *stack_top, void (*callback)(void *), void *argument)
+{
+    assert(exclusive());
+    assert(cpu < SMP_MAX_CPUS &&
+           stack_top == &sched_idle_service_stacks[cpu][SCHED_IDLE_SERVICE_STACK_BYTES]);
+    ++network_stack_calls;
+    network_stack_active = true;
+    callback(argument);
+    network_stack_active = false;
+}
 void smp_membarrier_poll(void) { }
 uint64_t kernel_irq_save(void) { uint64_t saved=irq_state; irq_state=0; return saved; }
 void kernel_irq_restore(uint64_t saved) { irq_state=saved; }
-static bool exclusive(void) { return execution_owner==cpu && execution_depth[cpu]==1; }
 void input_process_pending(void)
 { assert(exclusive()); if (atomic_exchange(&key_pending, false)) ++drained; }
 struct task *sched_current_task(void) { return &current; }
@@ -85,6 +114,8 @@ static struct task *wait_for_runnable_task(uint64_t *flags)
 
 /* The runner inserts the complete, unmodified production dispatch function.
  * The real scheduler's eligibility rules have separate sched_resume coverage. */
+#include "network_maintenance_body.inc"
+#include "network_maintenance_runner_body.inc"
 #include "user_return_body.inc"
 
 static void reset(void)
@@ -98,6 +129,8 @@ static void reset(void)
     replacement.pid=42;replacement.kind=TASK_KIND_USER;replacement.state=TASK_RUNNING;
     replacement.fs_base=0x5678000;replacement.frame=current.frame;
     selected=&current;drained=delivered=released=fpu_saved=fpu_restored=0;
+    network_due=false;network_stack_active=false;
+    network_maintenance_calls=network_stack_maintenance_calls=network_stack_calls=0;
     installed_fs=0;
     atomic_store(&key_pending,false);
 }
@@ -157,10 +190,22 @@ static void test_one_transaction_for_completed_syscall(void)
     assert(int80_dispatch(&frame)==&current);
     assert(frame.rax==123 && current.frame.rax==123);
     assert(installed_fs==current.fs_base && io_releases==1 && !async_io);
+    assert(network_maintenance_calls==1 && network_stack_maintenance_calls==0 &&
+           network_stack_calls==0);
+    assert(!network_stack_active);
     assert(!fpu_saved && !fpu_restored && !irq_state);
     if (execution_next_ticket-before!=1)
         fputs("FAIL: completed syscall reacquired the execution transaction on user return\n",stderr);
     assert(execution_next_ticket-before==1);
+}
+static void test_timer_user_return_network_maintenance_stack(void)
+{
+    struct trap_frame frame=prepare(LINUX_SYS_GETPID);
+    network_due=true;
+    assert(userland_schedule_from_frame(&frame)==&current);
+    assert(network_maintenance_calls==1 && network_stack_maintenance_calls==1);
+    assert(network_stack_calls==1 && !network_stack_active);
+    assert(!irq_state);
 }
 static void test_signal_input_and_retry(void)
 {
@@ -195,6 +240,7 @@ static void test_restored_context_and_fallback(void)
 int main(void)
 {
     test_one_transaction_for_completed_syscall();
+    test_timer_user_return_network_maintenance_stack();
     test_signal_input_and_retry();
     test_restored_context_and_fallback();
     puts("PASS syscall user return: one transaction, result/TLS, signal, deferred input, retry, exec/sigreturn and retirement");

@@ -1,5 +1,6 @@
 # category<TAB>kernel-relative path<TAB>reason
 compatibility	block/core/storage_block.c	识别已有磁盘 GPT 名 LEONOS4_ROOT
+compatibility	drivers/video/framebuffer/fbdev.c	从 ioctl 分派迁移的 leonos-fb 设备 ID，保持既有 fbdev ABI 值
 compatibility	fs/vfs/mount.c	旧 leonos-installer-root 引导 module tag 双接受
 compatibility	fs/proc/procfs.c	冻结 LeonOSRole/LeonOSFlags 与 /proc/leonos-drivers 接口值
 compatibility	fs/sysfs/sysfs.c	冻结 /sys/devices/platform/leonos-block 运行时设备路径
@@ -11,6 +12,7 @@ compatibility	kernel/init/kernel_debug.c	旧 kerneldebug ELF note section 与函
 compatibility	kernel/syscall/device/input_ioctl.c	冻结设备 ioctl 对外 identity：PS/2 名称与 leonos-fb
 compatibility	kernel/syscall/device/legacy_ioctl.c	冻结设备 ioctl 对外 identity：PS/2 名称与 leonos-fb
 compatibility	tools/tests/fixtures/legacy-abi-layout.json	旧 UAPI sizeof/offsetof/常量布局 golden，值级对比基线不得随意改写
+compatibility	tools/tests/installer_ramdisk_test.c	验证旧 leonos-installer-root module tag 的挂载兼容路径
 compatibility	tools/tests/linux_inventory_test.c	sysfs 冻结 leonos-block 接口值的 Linux 清单探针
 compatibility	include/uapi/README.rst	公开旧 libleonos.so.2 独立兼容 SONAME 的使用限制
 history	configs/kernel-source-map.json	源码拆分映射保留基线名称，仅作审计不进入生产编译

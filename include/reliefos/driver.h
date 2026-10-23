@@ -14,7 +14,7 @@
 #include <reliefos/driver_abi.h>
 #include <reliefos/kernel_log.h>
 
-#define RELIEFOS_DRIVER_ABI_VERSION 1U
+#define RELIEFOS_DRIVER_ABI_VERSION 2U
 #define RELIEFOS_DRIVER_MODULE_MAGIC 0x4c445256U
 #define RELIEFOS_DRIVER_MAX 16U
 
@@ -226,6 +226,13 @@ struct reliefos_driver_kernel_api {
      */
     int (*audio_request_disconnect)(uint32_t card);
     void (*console_log)(enum console_log_level level, const char *fmt, ...);
+    /** @brief Translate a supported physical byte address through the supervisor direct map.
+     * @param phys Physical byte address, including an optional page offset.
+     * @return Stable CPU alias, or NULL outside the kernel's direct-map extent.
+     * The caller must retain the owning page/device lease; this does not map
+     * device memory or transfer ownership.
+     */
+    void *(*phys_to_virt)(uint64_t phys);
 };
 
 #define RELIEFOS_DRIVER_AUDIO_API_SIZE \
@@ -241,6 +248,10 @@ struct reliefos_driver_kernel_api {
 #define RELIEFOS_DRIVER_LOG_API_SIZE \
     (offsetof(struct reliefos_driver_kernel_api, console_log) + \
      sizeof(((struct reliefos_driver_kernel_api *)0)->console_log))
+/* Modules dereferencing allocator pages require this full v2 API prefix. */
+#define RELIEFOS_DRIVER_PHYS_MAP_API_SIZE \
+    (offsetof(struct reliefos_driver_kernel_api, phys_to_virt) + \
+     sizeof(((struct reliefos_driver_kernel_api *)0)->phys_to_virt))
 
 struct reliefos_driver_module {
     uint32_t magic;

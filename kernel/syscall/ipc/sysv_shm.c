@@ -138,9 +138,16 @@ static int64_t sysv_shm_get(struct task *task, int32_t key, uint64_t size, uint3
     if (!s->pages) { kernel_free(s); return -LINUX_ENOMEM; }
     uint32_t made = 0;
     for (; made < count; ++made) {
+        void *page_map;
         s->pages[made] = mm_alloc_page();
         if (!s->pages[made]) break;
-        __builtin_memset((void *)(uintptr_t)s->pages[made], 0, SYSV_SHM_PAGE);
+        page_map = mm_phys_to_virt(s->pages[made]);
+        if (!page_map) {
+            mm_free_page(s->pages[made]);
+            s->pages[made] = 0;
+            break;
+        }
+        __builtin_memset(page_map, 0, SYSV_SHM_PAGE);
     }
     if (made != count) {
         while (made) mm_free_page(s->pages[--made]);

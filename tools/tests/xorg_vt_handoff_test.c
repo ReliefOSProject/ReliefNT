@@ -13,6 +13,7 @@
 #include <reliefnt/console.h>
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "modules/pty.h"
 
@@ -21,6 +22,13 @@
 
 static struct task owners[3];
 static struct task *current;
+void *kernel_malloc(size_t size) { return malloc(size); }
+void kernel_free(void *memory) { free(memory); }
+void kernel_spin_init(struct kernel_spinlock *lock) { lock->state = 0; }
+void kernel_spin_lock_irqsave(struct kernel_spinlock *lock, uint64_t *flags)
+{ assert(!lock->state); lock->state = 1; *flags = 0; }
+void kernel_spin_unlock_irqrestore(struct kernel_spinlock *lock, uint64_t flags)
+{ (void)flags; assert(lock->state); lock->state = 0; }
 struct task *sched_current_task(void) { return current; }
 void kernel_wait_queue_init(struct kernel_wait_queue *q) { memset(q, 0, sizeof(*q)); }
 void kernel_wait_queue_remove(struct kernel_wait_queue *q, struct task *t) { (void)q; (void)t; }
@@ -232,7 +240,7 @@ static void regression(const char *name)
         pty_console_key_event(10, 1); /* raw byte 0x0a is a line delimiter */
         assert(drain_bytes(1, bytes, sizeof(bytes)) == 2);
         assert(bytes[0] == 30 && bytes[1] == 10);
-        sessions[0].foreground_pgid = 50;
+        pty_session_slot_at(0)->foreground_pgid = 50;
         pty_console_key_event(3, 1); /* raw byte 0x03 is still VINTR */
         assert(signal_count == 1 && signal_log[0].group == 50 && signal_log[0].signal == 2);
     } else if (!strcmp(name, "keyboard")) {

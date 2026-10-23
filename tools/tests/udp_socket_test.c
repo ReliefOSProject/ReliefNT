@@ -7,12 +7,13 @@
 static struct task current;
 static struct task_file files[80];
 static unsigned allocations;
+static unsigned sleeps;
 static uint64_t ticks = 100;
 struct task *sched_current_task(void) { return &current; }
 void *kernel_malloc(size_t bytes) { ++allocations; return calloc(1, bytes); }
 void kernel_free(void *p) { if (p) { assert(allocations); --allocations; free(p); } }
 uint64_t time_ticks(void) { return ticks; }
-void sched_sleep_current_until(uint64_t tick) { assert(tick == ticks + 1); }
+void sched_sleep_current_until(uint64_t tick) { assert(tick == ticks + 1); ++sleeps; }
 bool user_range_ok(uint64_t address, uint64_t size) { (void)size; return address > 4096; }
 bool user_range_writable(uint64_t address, uint64_t size) { return user_range_ok(address, size); }
 int task_allocate_fd(struct task *task, int minimum, struct task_file **out)
@@ -72,6 +73,18 @@ int main(void)
     assert(task_udp_recv(&files[b], text, sizeof(text), 0, 0, 0) == KERNEL_SYSCALL_BLOCKED);
     ++ticks;
     assert(task_udp_recv(&files[b], text, sizeof(text), 0, 0, 0) == -LINUX_EAGAIN);
+    current.socket_io_deadline = 0;
+    current.socket_io_timed = false;
+    int64_t negative_timeout[2] = {-1, 500000};
+    assert(call(__NR_setsockopt, b, SOL_SOCKET, SO_RCVTIMEO,
+                (uintptr_t)negative_timeout, sizeof(negative_timeout)) == 0);
+    size = sizeof(negative_timeout);
+    assert(call(__NR_getsockopt, b, SOL_SOCKET, SO_RCVTIMEO,
+                (uintptr_t)negative_timeout, (uintptr_t)&size) == 0);
+    assert(negative_timeout[0] == 0 && negative_timeout[1] == 0);
+    unsigned sleeps_before = sleeps;
+    assert(task_udp_recv(&files[b], text, sizeof(text), 0, 0, 0) == -LINUX_EAGAIN);
+    assert(current.socket_io_timed && sleeps == sleeps_before);
     files[b].flags |= RELIEFOS_O_NONBLOCK;
     assert(call(__NR_setsockopt, b, SOL_SOCKET, SO_SNDTIMEO, (uintptr_t)timeout, sizeof(timeout)) == -LINUX_ENOPROTOOPT);
     assert(call(__NR_getsockopt, b, SOL_SOCKET, SO_SNDTIMEO, (uintptr_t)timeout, (uintptr_t)&size) == -LINUX_ENOPROTOOPT);
@@ -84,7 +97,14 @@ int main(void)
     assert(task_udp_send(&files[a], text, 1473, 0, 0, 0) == -LINUX_EMSGSIZE);
     for (unsigned i = 0; i < 100; ++i) assert(task_udp_send(&files[a], "x", 1, 0, 0, 0) == 1);
     assert(udp_from_file(&files[b])->queued == UDP_QUEUE_LENGTH);
+    int extra[70];
+    for (unsigned i = 0; i < 70; ++i) {
+        extra[i] = open_socket();
+        assert(extra[i] >= 0);
+    }
+    for (unsigned i = 0; i < 70; ++i) task_udp_release(&files[extra[i]]);
     task_udp_release(&files[a]); task_udp_release(&files[b]);
+    assert(!sockets);
     assert(!allocations);
     puts("PASS UDP bind, connect, datagram boundaries, source address, truncation/peek, zero length, options and cleanup");
 }

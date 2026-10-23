@@ -27,8 +27,10 @@ int pty_vt_init(void)
     for (uint32_t number = 1; number <= VT_COUNT; ++number) {
         int32_t id = pty_create(0);
         if (id != (int32_t)number) return -12;
-        sessions[number - 1u].console = 1;
-        sessions[number - 1u].locked = 0;
+        struct pty_session *session = pty_session_slot_at(number - 1u);
+        if (!session) return -12;
+        session->console = 1;
+        session->locked = 0;
         vt_modes[number - 1u] = (struct vt_mode){ .mode = VT_AUTO };
         vt_keyboard_modes[number - 1u] = K_XLATE;
         vt_release_pending[number - 1u] = 0;

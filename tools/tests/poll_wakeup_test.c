@@ -130,6 +130,17 @@ void net_socket_release_fd(int32_t handle) { (void)handle; }
 int storage_inode_put(struct storage_inode_ref *reference) { (void)reference; return 0; }
 void task_pipe_release(struct task_file *file) { (void)file; }
 void task_shm_release(struct task_file *file) { (void)file; }
+/* This fixture exercises poll readiness, not PTY aliases. */
+uint32_t sched_task_pty_capacity(const struct task *task)
+{ (void)task; return 0; }
+struct task_pty_fd *sched_task_pty_at(struct task *task, uint32_t index)
+{ (void)task; (void)index; return NULL; }
+void drm_prime_file_close(struct task_file *file) { (void)file; }
+void drm_file_close(struct task_file *file) { (void)file; }
+uint32_t drm_file_poll(struct task_file *file, uint32_t events)
+{ (void)file; (void)events; return 0; }
+uint32_t drm_prime_file_poll(const struct task_file *file, uint32_t events)
+{ (void)file; (void)events; return 0; }
 int audio_device_close(struct task_file *file) { (void)file; return 0; }
 int audio_control_close(struct task_file *file) { (void)file; return 0; }
 int audio_mixer_close(struct task_file *file) { (void)file; return 0; }

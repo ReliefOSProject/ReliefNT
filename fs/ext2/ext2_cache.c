@@ -66,7 +66,11 @@ void ext2_cache_store(uint64_t lba, uint32_t sectors, const void *buffer)
         size_t bytes = sizeof(*ext2_cache) * EXT2_CACHE_ENTRIES;
         uint64_t phys = mm_alloc_pages((uint32_t)((bytes + 4095u) / 4096u));
         if (!phys) return;
-        ext2_cache = (struct ext2_cache_entry *)(uintptr_t)phys;
+        ext2_cache = (struct ext2_cache_entry *)mm_phys_to_virt(phys);
+        if (!ext2_cache) {
+            mm_free_pages(phys, (uint32_t)((bytes + 4095u) / 4096u));
+            return;
+        }
         storage_memzero(ext2_cache, bytes);
     }
     for (unsigned i = 0; i < EXT2_CACHE_ENTRIES; ++i) {

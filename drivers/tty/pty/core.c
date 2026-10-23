@@ -1,7 +1,17 @@
 #include "internal.h"
 
 
-struct pty_session sessions[PTY_MAX];
+struct pty_session_page {
+    struct pty_session_page *next;
+    struct pty_session entries[PTY_SESSION_PAGE_SIZE];
+};
+
+/* Session objects never move or disappear while the kernel runs. New pages
+ * extend the stable ID space without invalidating borrowers from find_session. */
+static struct pty_session_page initial_session_page;
+static struct pty_session_page *session_page_tail = &initial_session_page;
+static uint32_t session_page_count = 1;
+static struct kernel_spinlock session_page_lock;
 
 static uint32_t next_generation;
 uint8_t vt_ready;
@@ -39,17 +49,44 @@ struct kernel_wait_queue vt_waiters;
 uint64_t vt_display_generation;
 
 /**
- * @brief Return the PTY session for pty_id (1-based), or NULL if invalid/unused.
+ * @brief Resolve a stable PTY slot through the linked session-page directory.
+ * @param index Zero-based PTY ID index; zero is PTY ID 1.
+ * @return Stable slot pointer when its page exists, otherwise NULL.
+ */
+struct pty_session *pty_session_slot_at(uint32_t index)
+{
+    uint32_t page_index = index / PTY_SESSION_PAGE_SIZE;
+    if (page_index >= __atomic_load_n(&session_page_count, __ATOMIC_ACQUIRE))
+        return NULL;
+    struct pty_session_page *page = &initial_session_page;
+    while (page_index--) {
+        page = __atomic_load_n(&page->next, __ATOMIC_ACQUIRE);
+        if (!page) return NULL;
+    }
+    return &page->entries[index % PTY_SESSION_PAGE_SIZE];
+}
+
+/**
+ * @brief Return the number of numeric PTY IDs backed by stable session pages.
+ * @return Addressable PTY slot count.
+ */
+uint32_t pty_session_slot_capacity(void)
+{
+    return __atomic_load_n(&session_page_count, __ATOMIC_ACQUIRE) *
+           PTY_SESSION_PAGE_SIZE;
+}
+
+/**
+ * @brief Return a live PTY session by its stable 1-based identifier.
+ * @param pty_id 1-based PTY ID; zero is invalid.
+ * @return Stable session pointer when allocated, otherwise NULL.
  */
 struct pty_session *find_session(uint32_t pty_id)
 {
-    if (pty_id == 0 || pty_id > PTY_MAX) {
-        return 0;
-    }
-    if (!sessions[pty_id - 1].used) {
-        return 0;
-    }
-    return &sessions[pty_id - 1];
+    if (!pty_id) return NULL;
+    struct pty_session *session = pty_session_slot_at(pty_id - 1u);
+    return session && __atomic_load_n(&session->used, __ATOMIC_ACQUIRE)
+        ? session : NULL;
 }
 
 int pty_get_node(uint32_t pty_id, struct storage_node *node)
@@ -72,8 +109,10 @@ int pty_lookup_path(const char *path, struct storage_node *node)
     if (*prefix || *path < '1' || *path > '9') return -2;
     uint32_t id = 0;
     do {
-        id = id * 10 + (uint32_t)(*path++ - '0');
-        if (id > PTY_MAX) return -2;
+        uint32_t digit = (uint32_t)(*path++ - '0');
+        if (id > (UINT32_MAX - digit) / 10u) return -2;
+        id = id * 10u + digit;
+        if (id > pty_session_slot_capacity()) return -2;
     } while (*path >= '0' && *path <= '9');
     struct pty_session *session = find_session(id);
     if (*path || !session || session->hungup || session->console) return -2;
@@ -111,10 +150,11 @@ int pty_inode_permissions(const struct storage_node *node,
 }
 
 /**
- * @brief Zero all PTY sessions.
+ * @brief Reset allocated PTY sessions while preserving stable backing pages.
  */
 void pty_init(void)
 {
+    kernel_spin_init(&session_page_lock);
     kernel_wait_queue_init(&vt_waiters);
     vt_display_generation = 0;
     vt_ready = 0;
@@ -134,88 +174,140 @@ void pty_init(void)
     console_shift_down = 0;
     console_ctrl_down = 0;
     console_alt_down = 0;
-    for (uint32_t i = 0; i < PTY_MAX; ++i) {
-        for (uint32_t j = 0; j < sizeof(sessions[i]); ++j) {
-            ((uint8_t *)&sessions[i])[j] = 0;
-        }
+    for (uint32_t i = 0; i < pty_session_slot_capacity(); ++i) {
+        struct pty_session *session = pty_session_slot_at(i);
+        if (session) __builtin_memset(session, 0, sizeof(*session));
     }
 }
 
 /**
- * @brief Allocate and initialize a PTY for owner_pid with default termios/winsize; returns its id, or -12 when exhausted.
+ * @brief Initialize a reserved session slot with default Unix98 terminal state.
+ * @param session Stable, unused slot protected by session_page_lock.
+ * @param owner_pid Task that opened ptmx; zero for fixed virtual consoles.
+ * @param permissions Mode and filesystem credentials captured before taking the page lock.
+ * @param winsize Initial terminal dimensions captured before taking the page lock.
+ */
+static void pty_initialize_session(struct pty_session *session, uint32_t owner_pid,
+                                   const struct reliefos_permissions *permissions,
+                                   const struct linux_winsize *winsize)
+{
+    __builtin_memset(session, 0, sizeof(*session));
+    session->locked = 1;
+    session->owner_pid = owner_pid;
+    session->permissions = *permissions;
+    if (!++next_generation) ++next_generation;
+    session->generation = next_generation;
+    session->termios.c_iflag = RELIEFOS_PTY_IFLAG_ICRNL;
+    session->termios.c_oflag = LINUX_OPOST | LINUX_ONLCR;
+    session->termios.c_cflag = LINUX_CLOCAL | LINUX_CREAD | LINUX_CS8 | LINUX_B115200;
+    session->termios.c_lflag = RELIEFOS_PTY_LFLAG_ECHO |
+                               RELIEFOS_PTY_LFLAG_ECHONL |
+                               RELIEFOS_PTY_LFLAG_ICANON |
+                               RELIEFOS_PTY_LFLAG_IEXTEN |
+                               RELIEFOS_PTY_LFLAG_ISIG;
+    session->termios.c_cc[RELIEFOS_PTY_CC_VEOF] = 4;
+    session->termios.c_cc[RELIEFOS_PTY_CC_VEOL] = 0;
+    session->termios.c_cc[RELIEFOS_PTY_CC_VERASE] = 127;
+    session->termios.c_cc[RELIEFOS_PTY_CC_VINTR] = 3;
+    session->termios.c_cc[RELIEFOS_PTY_CC_VKILL] = 21;
+    session->termios.c_cc[RELIEFOS_PTY_CC_VMIN] = 1;
+    session->termios.c_cc[RELIEFOS_PTY_CC_VQUIT] = 28;
+    session->termios.c_cc[RELIEFOS_PTY_CC_VSTART] = 17;
+    session->termios.c_cc[RELIEFOS_PTY_CC_VSTOP] = 19;
+    session->termios.c_cc[RELIEFOS_PTY_CC_VSUSP] = 26;
+    session->termios.c_cc[RELIEFOS_PTY_CC_VTIME] = 0;
+    session->termios.c_ispeed = 115200U;
+    session->termios.c_ospeed = 115200U;
+    session->winsize = *winsize;
+    /* Publish the fully initialized session to lock-free readers. */
+    __atomic_store_n(&session->used, 1, __ATOMIC_RELEASE);
+}
+
+/**
+ * @brief Allocate a PTY at a stable numeric ID, growing page storage as needed.
+ * @param owner_pid Task that opened ptmx; zero is reserved for kernel consoles.
+ * @return Stable 1-based PTY ID or negative ENOMEM when ID/storage growth fails.
  */
 int32_t pty_create(uint32_t owner_pid)
 {
-    for (uint32_t i = 0; i < PTY_MAX; ++i) {
-        if (sessions[i].used && sessions[i].hungup &&
-            !sessions[i].console &&
-            sched_pty_reference_count(i + 1U) == 0) {
-            for (uint32_t j = 0; j < sizeof(sessions[i]); ++j) {
-                ((uint8_t *)&sessions[i])[j] = 0;
-            }
-        }
+    uint64_t flags;
+    const struct task *owner = sched_find(owner_pid);
+    struct reliefos_permissions permissions = {0600,
+        owner ? owner->fsuid : 0, owner ? owner->fsgid : 0};
+    const struct framebuffer *fb = framebuffer_get();
+    uint32_t cols = fb && fb->available ? fb->width / RELIEFOS_FONT_W : 80u;
+    uint32_t rows = fb && fb->available ? fb->height / RELIEFOS_FONT_H : 24u;
+    struct linux_winsize winsize = {
+        .ws_row = (uint16_t)(rows > 0xffffu ? 0xffffu : rows),
+        .ws_col = (uint16_t)(cols > 0xffffu ? 0xffffu : cols),
+    };
+    if (!winsize.ws_row) winsize.ws_row = 24;
+    if (!winsize.ws_col) winsize.ws_col = 80;
+    for (uint32_t i = 0; i < pty_session_slot_capacity(); ++i) {
+        struct pty_session *session = pty_session_slot_at(i);
+        if (session && __atomic_load_n(&session->used, __ATOMIC_ACQUIRE) &&
+            session->hungup && !session->console &&
+            sched_pty_reference_count(i + 1u) == 0)
+            pty_reap_hungup(i + 1u);
     }
-    for (uint32_t i = 0; i < PTY_MAX; ++i) {
-        if (!sessions[i].used) {
-            sessions[i].used = 1;
-            /* Linux devpts keeps the slave inaccessible until unlockpt(). */
-            sessions[i].locked = 1;
-            sessions[i].owner_pid = owner_pid;
-            const struct task *owner = sched_find(owner_pid);
-            sessions[i].permissions = (struct reliefos_permissions){0600,
-                owner ? owner->fsuid : 0, owner ? owner->fsgid : 0};
-            if (!++next_generation) ++next_generation;
-            sessions[i].generation = next_generation;
-            /* Opening ptmx does not acquire a controlling terminal. */
-            sessions[i].process_session = 0;
-            sessions[i].foreground_pgid = 0;
-            sessions[i].input_head = 0;
-            sessions[i].input_tail = 0;
-            sessions[i].output_head = 0;
-            sessions[i].output_tail = 0;
-            sessions[i].termios.c_iflag = RELIEFOS_PTY_IFLAG_ICRNL;
-            sessions[i].termios.c_oflag = LINUX_OPOST | LINUX_ONLCR;
-            sessions[i].termios.c_cflag = LINUX_CLOCAL | LINUX_CREAD |
-                                         LINUX_CS8 | LINUX_B115200;
-            sessions[i].termios.c_lflag = RELIEFOS_PTY_LFLAG_ECHO |
-                                          RELIEFOS_PTY_LFLAG_ECHONL |
-                                          RELIEFOS_PTY_LFLAG_ICANON |
-                                          RELIEFOS_PTY_LFLAG_IEXTEN |
-                                          RELIEFOS_PTY_LFLAG_ISIG;
-            sessions[i].termios.c_cc[RELIEFOS_PTY_CC_VEOF] = 4;     /* Ctrl-D */
-            sessions[i].termios.c_cc[RELIEFOS_PTY_CC_VEOL] = 0;
-            sessions[i].termios.c_cc[RELIEFOS_PTY_CC_VERASE] = 127; /* DEL */
-            sessions[i].termios.c_cc[RELIEFOS_PTY_CC_VINTR] = 3;    /* Ctrl-C */
-            sessions[i].termios.c_cc[RELIEFOS_PTY_CC_VKILL] = 21;   /* Ctrl-U */
-            sessions[i].termios.c_cc[RELIEFOS_PTY_CC_VMIN] = 1;
-            sessions[i].termios.c_cc[RELIEFOS_PTY_CC_VQUIT] = 28;
-            sessions[i].termios.c_cc[RELIEFOS_PTY_CC_VSTART] = 17;
-            sessions[i].termios.c_cc[RELIEFOS_PTY_CC_VSTOP] = 19;
-            sessions[i].termios.c_cc[RELIEFOS_PTY_CC_VSUSP] = 26;
-            sessions[i].termios.c_cc[RELIEFOS_PTY_CC_VTIME] = 0;
-            sessions[i].termios.c_ispeed = 115200U;
-            sessions[i].termios.c_ospeed = 115200U;
-            {
-                const struct framebuffer *fb = framebuffer_get();
-                uint32_t cols = fb && fb->available ? fb->width / RELIEFOS_FONT_W : 80u;
-                uint32_t rows = fb && fb->available ? fb->height / RELIEFOS_FONT_H : 24u;
-                sessions[i].winsize.ws_row = (uint16_t)(rows > 0xffffu ? 0xffffu : rows);
-                sessions[i].winsize.ws_col = (uint16_t)(cols > 0xffffu ? 0xffffu : cols);
-                if (!sessions[i].winsize.ws_row) sessions[i].winsize.ws_row = 24;
-                if (!sessions[i].winsize.ws_col) sessions[i].winsize.ws_col = 80;
-            }
+    for (;;) {
+        kernel_spin_lock_irqsave(&session_page_lock, &flags);
+        uint32_t capacity = pty_session_slot_capacity();
+        for (uint32_t i = 0; i < capacity; ++i) {
+            struct pty_session *session = pty_session_slot_at(i);
+            if (!session || __atomic_load_n(&session->used, __ATOMIC_ACQUIRE)) continue;
+            pty_initialize_session(session, owner_pid, &permissions, &winsize);
+            uint32_t process_session = session->process_session;
+            uint32_t foreground_pgid = session->foreground_pgid;
+            kernel_spin_unlock_irqrestore(&session_page_lock, flags);
             console_debug("[reliefnt] pty create owner=%u id=%u session=%u pgrp=%u\n",
-                           owner_pid, (uint32_t)(i + 1),
-                           sessions[i].process_session,
-                           sessions[i].foreground_pgid);
-            return (int32_t)(i + 1);
+                          owner_pid, i + 1u, process_session, foreground_pgid);
+            return (int32_t)(i + 1u);
         }
+        uint32_t page_count = __atomic_load_n(&session_page_count, __ATOMIC_RELAXED);
+        /* pty_create returns a signed ID, so never publish IDs above INT32_MAX. */
+        if (page_count >= (uint32_t)INT32_MAX / PTY_SESSION_PAGE_SIZE) {
+            kernel_spin_unlock_irqrestore(&session_page_lock, flags);
+            return -12;
+        }
+        kernel_spin_unlock_irqrestore(&session_page_lock, flags);
+
+        /* Allocation is outside the spinlock. Another creator may append a
+         * page first; in that case this zeroed candidate is simply discarded. */
+        struct pty_session_page *page = kernel_malloc(sizeof(*page));
+        if (!page) return -12;
+        __builtin_memset(page, 0, sizeof(*page));
+        kernel_spin_lock_irqsave(&session_page_lock, &flags);
+        capacity = pty_session_slot_capacity();
+        bool have_free = false;
+        for (uint32_t i = 0; i < capacity; ++i) {
+            struct pty_session *session = pty_session_slot_at(i);
+            if (session && !__atomic_load_n(&session->used, __ATOMIC_ACQUIRE)) {
+                have_free = true;
+                break;
+            }
+        }
+        page_count = __atomic_load_n(&session_page_count, __ATOMIC_RELAXED);
+        if (have_free) {
+            kernel_spin_unlock_irqrestore(&session_page_lock, flags);
+            kernel_free(page);
+            continue;
+        }
+        if (page_count >= (uint32_t)INT32_MAX / PTY_SESSION_PAGE_SIZE) {
+            kernel_spin_unlock_irqrestore(&session_page_lock, flags);
+            kernel_free(page);
+            return -12;
+        }
+        __atomic_store_n(&session_page_tail->next, page, __ATOMIC_RELEASE);
+        session_page_tail = page;
+        __atomic_store_n(&session_page_count, page_count + 1u, __ATOMIC_RELEASE);
+        kernel_spin_unlock_irqrestore(&session_page_lock, flags);
     }
-    return -12;
 }
 
 /**
- * @brief Reclaim a hung-up PTY once no endpoint or controlling-TTY reference remains.
+ * @brief Reclaim a hung-up PTY slot after the final endpoint and task reference closes.
+ * @param pty_id Stable 1-based PTY ID to check.
  */
 void pty_reap_hungup(uint32_t pty_id)
 {
@@ -223,11 +315,14 @@ void pty_reap_hungup(uint32_t pty_id)
     if (!session || !session->hungup || session->console) {
         return;
     }
-    if (sched_pty_reference_count(pty_id) == 0) {
-        for (uint32_t j = 0; j < sizeof(*session); ++j) {
-            ((uint8_t *)session)[j] = 0;
-        }
+    if (sched_pty_reference_count(pty_id) != 0) return;
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&session_page_lock, &flags);
+    if (__atomic_load_n(&session->used, __ATOMIC_ACQUIRE) &&
+        session->hungup && !session->console && !session->transfer_refs) {
+        __builtin_memset(session, 0, sizeof(*session));
     }
+    kernel_spin_unlock_irqrestore(&session_page_lock, flags);
 }
 
 int pty_transfer_get(uint32_t pty_id, uint32_t endpoint)

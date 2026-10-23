@@ -1,5 +1,8 @@
 #include "internal.h"
 
+#include <reliefnt/mm.h>
+#include <reliefnt/paging.h>
+
 
 
 uint32_t vmware_svga_read(uint32_t reg)
@@ -69,7 +72,15 @@ void framebuffer_vmware_fifo_init(bool report, bool device_lock_held)
         return;
     }
 
-    vmware_svga.fifo = (volatile uint32_t *)(uintptr_t)mem_start;
+    if (!paging_mmio_uncached(mem_start, mem_size)) {
+        if (report) {
+            console_warn("[reliefnt] VMware SVGA FIFO cannot be mapped uncached mem=%p size=%u\n",
+                         (void *)(uintptr_t)mem_start, mem_size);
+        }
+        return;
+    }
+    vmware_svga.fifo = (volatile uint32_t *)mm_phys_to_virt(mem_start);
+    if (!vmware_svga.fifo) return;
     vmware_svga.fifo_min = VMWARE_SVGA_FIFO_MIN_BYTES;
     vmware_svga.fifo_max = mem_size;
     vmware_svga.fifo[VMWARE_SVGA_FIFO_MIN] = vmware_svga.fifo_min;
@@ -262,7 +273,7 @@ int framebuffer_vmware_probe(void)
     boot_mode_valid = fb.available && fb.width && fb.height &&
         (uint64_t)fb.pitch >= (uint64_t)fb.width * 4u &&
         (uint64_t)fb.pitch * fb.height <= usable_bytes &&
-        framebuffer_range_valid((uint64_t)(uintptr_t)fb.pixels,
+        framebuffer_range_valid(mm_virt_to_phys(fb.pixels),
                                 (uint64_t)fb.pitch * fb.height);
     /* The geometry registers describe the live scan-out only once the device
      * has been enabled.  While REG_ENABLE is clear they still hold the
@@ -301,7 +312,9 @@ int framebuffer_vmware_probe(void)
         }
     }
     if (device_mode_valid && (enabled & 1u) != 0u) {
-        fb.pixels = (uint32_t *)(uintptr_t)((uint64_t)fb_start + fb_offset);
+        if (!paging_mmio_uncached(fb_start, fb_max_size)) return 0;
+        fb.pixels = (uint32_t *)mm_phys_to_virt((uint64_t)fb_start + fb_offset);
+        if (!fb.pixels) return 0;
         fb.width = width;
         fb.height = height;
         fb.pitch = pitch;
@@ -421,7 +434,17 @@ int framebuffer_vmware_set_mode(uint32_t width, uint32_t height)
         else svga_unlock(legacy_flags);
         return 0;
     }
-    fb.pixels = (uint32_t *)(uintptr_t)((uint64_t)fb_start + fb_offset);
+    if (!paging_mmio_uncached(fb_start, fb_max_size)) {
+        if (restart_3d) svga_mode_end(svga_flags);
+        else svga_unlock(legacy_flags);
+        return 0;
+    }
+    fb.pixels = (uint32_t *)mm_phys_to_virt((uint64_t)fb_start + fb_offset);
+    if (!fb.pixels) {
+        if (restart_3d) svga_mode_end(svga_flags);
+        else svga_unlock(legacy_flags);
+        return 0;
+    }
     fb.width = width;
     fb.height = height;
     fb.pitch = pitch;

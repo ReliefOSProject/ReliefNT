@@ -3,6 +3,11 @@
 static const uint8_t *audio_pcm_const_buffer(const struct audio_pcm *pcm);
 
 
+/** @brief Return the CPU alias for the active PCM ring.
+ * @param pcm Live PCM object; caller serializes against reconfiguration.
+ * @return Borrowed CPU pointer to the inline or allocator-backed ring, never a
+ *         DMA bus address or a physical address.
+ */
 uint8_t *audio_pcm_buffer(struct audio_pcm *pcm)
 {
     return pcm->extended_buffer ? pcm->extended_buffer : pcm->buffer;
@@ -13,6 +18,11 @@ static const uint8_t *audio_pcm_const_buffer(const struct audio_pcm *pcm)
     return pcm->extended_buffer ? pcm->extended_buffer : pcm->buffer;
 }
 
+/** @brief Release the allocator owner for an extended PCM ring.
+ * @param pcm Retired PCM object with no file or mmap references.
+ * @return None. Clears both aliases before releasing backing pages.
+ * Task context; no PCM lock may be held while the kernel heap is called.
+ */
 void audio_pcm_free_buffer(struct audio_pcm *pcm)
 {
     void *storage = pcm->extended_storage;
@@ -21,8 +31,18 @@ void audio_pcm_free_buffer(struct audio_pcm *pcm)
     if (storage && kernel_free) kernel_free(storage);
 }
 
+/** @brief Select or allocate an aligned CPU alias for the requested PCM ring.
+ * @param pcm Live PCM object; caller serializes against reconfiguration.
+ * @param bytes Validated ring length, no larger than AUDIO_PCM_BUFFER_BYTES.
+ * @param new_storage Receives a new allocation owner, or NULL when reusing an
+ *                    existing inline or extended ring.
+ * @param new_buffer Receives the writable CPU alias; it is not a DMA address.
+ * @return Zero on success, -ENOMEM when extended storage cannot be allocated.
+ * Task context. On success with non-NULL new_storage, caller must either
+ * publish both outputs together or free the new owner on a later failure.
+ */
 int audio_pcm_prepare_buffer(struct audio_pcm *pcm, uint32_t bytes,
-                                    void **new_storage, uint8_t **new_buffer)
+                             void **new_storage, uint8_t **new_buffer)
 {
     *new_storage = NULL;
     *new_buffer = audio_pcm_buffer(pcm);

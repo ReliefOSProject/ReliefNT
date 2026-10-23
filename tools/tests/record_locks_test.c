@@ -5,6 +5,9 @@
 #include "../../kernel/syscall/fs/locks.c"
 
 static struct task first, second, *current = &first;
+#define RECORD_LOCK_WAITERS_TEST 65u
+static struct task wait_owner;
+static struct task lock_waiters[RECORD_LOCK_WAITERS_TEST];
 static struct task_file file = {.used = 1, .flags = LINUX_O_RDWR,
     .node = {.type = RELIEFOS_FS_TYPE_FILE, .volume_id = 1, .first_cluster = 50}};
 static int allocation_fails;
@@ -27,6 +30,48 @@ static int request(unsigned command, short type, long start, long size)
     struct native_flock lock = {.type = type, .start = start, .length = size};
     return syscall_record_lock(5, command, (uintptr_t)&lock);
 }
+
+static int test_more_than_64_record_lock_waiters(void)
+{
+    wait_owner.pid = wait_owner.tgid = 100;
+    current = &wait_owner;
+    assert(request(LINUX_F_SETLK, LINUX_F_WRLCK, 1000, 1) == 0);
+
+    for (unsigned i = 0; i < RECORD_LOCK_WAITERS_TEST; ++i) {
+        lock_waiters[i].pid = lock_waiters[i].tgid = 200u + i;
+        current = &lock_waiters[i];
+        if (pending_count == pending_capacity) {
+            allocation_fails = 1;
+            int failed_growth = request(LINUX_F_SETLKW, LINUX_F_WRLCK, 1000, 1);
+            allocation_fails = 0;
+            assert(failed_growth == -LINUX_ENOLCK &&
+                   pending_count == pending_capacity &&
+                   !lock_waiters[i].waiting_queue);
+        }
+        int ret = request(LINUX_F_SETLKW, LINUX_F_WRLCK, 1000, 1);
+        if (ret != KERNEL_SYSCALL_BLOCKED) {
+            fprintf(stderr,
+                    "FAIL: record-lock wait registration %u returned %d instead of blocking\n",
+                    i, ret);
+            for (unsigned j = 0; j < i; ++j) {
+                syscall_record_lock_cancel(&lock_waiters[j]);
+                lock_waiters[j].waiting_queue = NULL;
+            }
+            current = &wait_owner;
+            (void)request(LINUX_F_SETLK, LINUX_F_UNLCK, 1000, 1);
+            return 1;
+        }
+    }
+
+    for (unsigned i = 0; i < RECORD_LOCK_WAITERS_TEST; ++i) {
+        syscall_record_lock_cancel(&lock_waiters[i]);
+        lock_waiters[i].waiting_queue = NULL;
+    }
+    current = &wait_owner;
+    assert(request(LINUX_F_SETLK, LINUX_F_UNLCK, 1000, 1) == 0);
+    return 0;
+}
+
 int main(void)
 {
     first.pid = first.tgid = 41;
@@ -58,10 +103,11 @@ int main(void)
     char unaligned[sizeof(result) + 1];
     memcpy(unaligned + 1, &result, sizeof(result));
     assert(syscall_record_lock(5, LINUX_F_GETLK, (uintptr_t)(unaligned + 1)) == 0);
+    if (test_more_than_64_record_lock_waiters()) return 1;
     file.flags = LINUX_O_RDONLY;
     assert(request(LINUX_F_SETLK, LINUX_F_WRLCK, 100, 0) == -LINUX_EBADF);
     file.flags = TASK_FILE_FLAG_PATH;
     assert(request(LINUX_F_GETLK, LINUX_F_RDLCK, 100, 0) == -LINUX_EBADF);
     syscall_record_locks_close(&first, &file);
-    puts("PASS production record locks: conflict, split/merge, stable owner, deadlock, close, ENOLCK rollback and unaligned ABI");
+    puts("PASS production record locks: 65 pending requests, conflict, split/merge, stable owner, deadlock, close, ENOLCK rollback and unaligned ABI");
 }

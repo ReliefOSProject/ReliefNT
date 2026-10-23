@@ -10,5 +10,6 @@
    modules
    execution
    memory
+   resource-limits
    drivers
    svga

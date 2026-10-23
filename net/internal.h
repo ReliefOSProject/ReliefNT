@@ -19,6 +19,7 @@
 #include <linux/poll.h>
 #include <reliefnt/storage.h>
 #include <reliefnt/time.h>
+#include <reliefnt/wait.h>
 #include <reliefos/layout.h>
 
 #include <reliefos/device_abi.h>
@@ -60,12 +61,15 @@
 #define NET_BOOT_DHCP_TIMEOUT_MS 4000u
 #define NET_TCP_MSS 1460u
 #define NET_TCP_SYN_RETRANSMIT_MS 500u
-#define NET_TCP_DATA_RETRANSMIT_MS 750u
+#define NET_TCP_INITIAL_RTO_MS 1000u
+#define NET_TCP_MAX_RTO_MS 60000u
+#define NET_TCP_MAX_RETRANSMITS 15u
 #define NET_ARP_CACHE_SIZE 8u
 #define NET_HTTP_DEFAULT_TIMEOUT_MS 8000u
 #define NET_HTTP_MAX_TIMEOUT_MS 10000u
 /* The full unscaled TCP window; scaling is not negotiated yet. */
 #define NET_SOCKET_RX_CAP 65535u
+#define NET_SOCKET_TX_CAP 65535u
 #ifndef NET_TCP_TRACE
 #define NET_TCP_TRACE 0
 #endif
@@ -130,6 +134,13 @@ struct net_arp_cache_entry {
     uint8_t mac[6];
 };
 
+/**
+ * @brief Stable TCP object registered until its owner and waiters are gone.
+ *
+ * The receive and transmit storage is allocated with this object. The network
+ * registry never relocates sockets; collection detaches both embedded wait
+ * queues and the optional active-work queue before releasing the object.
+ */
 struct net_socket {
     uint32_t used;
     bool fd_owned;
@@ -150,6 +161,16 @@ struct net_socket {
     uint32_t local_seq;
     uint32_t remote_seq;
     uint32_t acked_seq;
+    uint32_t peer_window;
+    uint32_t peer_window_seq;
+    uint32_t peer_window_ack;
+    uint32_t tx_cwnd;
+    uint32_t tx_ssthresh;
+    uint32_t tx_rto_ms;
+    uint32_t tx_retries;
+    uint64_t tx_persist_deadline;
+    bool peer_window_valid;
+    bool tx_persist_probe;
     uint32_t rx_len;
     uint32_t rx_head;
     uint32_t rx_window_ack;
@@ -159,9 +180,26 @@ struct net_socket {
     uint32_t rx_bytes;
     uint32_t created_ms;
     uint32_t changed_ms;
+    /* These flags disambiguate legacy TIME_WAIT for read/write half-close. */
     uint32_t fin_received;
+    bool fin_pending;
+    bool fin_sent;
+    bool fin_acked;
     uint8_t dst_mac[6];
     uint8_t *rx;
+    uint8_t *tx;
+    uint32_t tx_head;
+    uint32_t tx_len;
+    uint32_t tx_sent;
+    uint64_t tx_retransmit_deadline;
+    uint64_t receive_timeout;
+    uint64_t send_timeout;
+    struct kernel_wait_queue wait_read;
+    struct kernel_wait_queue wait_write;
+    struct net_socket *registry_next;
+    struct net_socket *maintenance_next;
+    struct net_socket *maintenance_prev;
+    bool maintenance_queued;
 };
 
 
@@ -392,7 +430,7 @@ extern uint32_t net_sequence;
 extern uint16_t net_ipv4_id;
 extern struct reliefos_net_config net_config;
 extern bool net_interface_up;
-extern struct net_socket net_sockets[RELIEFOS_NET_SOCKET_MAX];
+extern struct net_socket *net_sockets;
 
 /**
  * Net cpu relax.
@@ -623,10 +661,34 @@ int net_send_udp_to_mac(const uint8_t *dst_mac, uint32_t src_ip,
                                uint16_t dst_port, const uint8_t *payload,
                                uint32_t payload_len);
 
+/**
+ * @brief Compute the still-unconsumed portion of the local advertised TCP window.
+ * @param socket Stable receiving socket.
+ * @return Remaining advertised bytes, clamped to zero.
+ */
 uint32_t net_socket_receive_window(const struct net_socket *socket);
 
+/**
+ * @brief Select an advertised receive window without retracting the offered right edge.
+ * @param socket Stable receiving socket.
+ * @return Window bytes bounded by local receive-ring capacity.
+ */
 uint32_t net_socket_select_window(const struct net_socket *socket);
 
+/**
+ * @brief Build and send one TCP segment with the socket's selected receive window.
+ * @param dst_mac Ethernet destination address.
+ * @param src_ip Host-order local IPv4 source address.
+ * @param dst_ip Host-order peer IPv4 destination address.
+ * @param src_port Local TCP port.
+ * @param dst_port Peer TCP port.
+ * @param seq TCP sequence number.
+ * @param ack TCP acknowledgment number.
+ * @param flags TCP control flags.
+ * @param payload Segment payload, or null for an empty segment.
+ * @param payload_len Payload byte count.
+ * @return Driver result, or a negative transmit error.
+ */
 int net_send_tcp_to_mac(const uint8_t *dst_mac, uint32_t src_ip,
                                uint32_t dst_ip, uint16_t src_port,
                                uint16_t dst_port, uint32_t seq,
@@ -681,11 +743,13 @@ void net_handle_ipv4(const uint8_t *frame, uint32_t len,
                             struct net_tcp_wait *tcp_wait);
 
 /**
- * Net poll once.
- * @param arp_wait Value supplied by the caller.
- * @param ping_wait Value supplied by the caller.
- * @param udp_wait Value supplied by the caller.
- * @param tcp_wait Value supplied by the caller.
+ * @brief Receive one NIC frame and service a bounded batch of queued TCP work.
+ * @param arp_wait Optional synchronous ARP waiter.
+ * @param ping_wait Optional synchronous ping waiter.
+ * @param udp_wait Optional synchronous UDP waiter.
+ * @param tcp_wait Optional synchronous TCP waiter.
+ * @note Up to four active sockets progress even when the poll pass receives no
+ *       frame; inactive registry entries are not scanned.
  */
 void net_poll_once(struct net_arp_wait *arp_wait,
                           struct net_ping_wait *ping_wait,
@@ -702,17 +766,38 @@ void net_poll_once(struct net_arp_wait *arp_wait,
 int net_resolve_mac(uint32_t ip, uint32_t timeout_ms, uint8_t *out_mac);
 
 /**
- * Net socket touch.
- * @param socket Value supplied by the caller.
+ * @brief Refresh the last-change timestamp used by diagnostics and collection.
+ * @param socket Registered socket whose timestamp should be refreshed.
  */
 void net_socket_touch(struct net_socket *socket);
 
 /**
- * Net socket mark closed.
- * @param socket Value supplied by the caller.
- * @param status Output storage updated by the function.
+ * @brief Close a registered socket and wake readers, writers, and poll waiters.
+ * @param socket Stable registered socket object.
+ * @param status Final network status retained for diagnostics.
+ * @note Call while socket lifetime is pinned; the object is not freed here.
  */
 void net_socket_mark_closed(struct net_socket *socket, uint32_t status);
+
+/**
+ * @brief Apply a validated cumulative ACK to queued TCP data or a FIN.
+ * @param socket Socket whose sequence space is acknowledged.
+ * @param ack Next byte expected by the peer.
+ * @note A FIN ACK advances sequence state without consuming transmit-ring bytes.
+ */
+void net_socket_acknowledge(struct net_socket *socket, uint32_t ack);
+
+/**
+ * @brief Retry active TCP handshakes, queued data, RTOs, persist probes, and FINs.
+ * @note Called from each network poll pass; services at most four queued sockets.
+ */
+void net_tcp_service_sockets(void);
+
+/**
+ * @brief Check the active TCP work queue without scanning the socket registry.
+ * @return True when queued data, a handshake, retransmission, persist probe, or FIN needs service.
+ */
+bool net_tcp_maintenance_pending(void);
 
 /**
  * Net socket trace tls.
@@ -826,67 +911,99 @@ int net_http_resolve_hosts(const char *host, uint32_t host_len,
                                   uint32_t *out_status);
 
 /**
- * Net socket open.
- * @param request Value supplied by the caller.
- * @param owner_pid Value supplied by the caller.
- * @param owner_uid Value supplied by the caller.
- * @return The value or status produced by the operation.
+ * @brief Allocate and register one dynamically backed TCP socket.
+ * @param request Requested domain/type/protocol and output handle/status.
+ * @param owner_pid Owning process identifier.
+ * @param owner_uid Owning user identifier.
+ * @return Zero when processed; request->status reports unsupported type or allocation failure.
  */
 int net_socket_open(struct reliefos_net_socket_open *request, uint32_t owner_pid,
                     uint32_t owner_uid);
 
 /**
- * Net socket connect.
- * @param request Value supplied by the caller.
- * @param owner_pid Value supplied by the caller.
- * @return The value or status produced by the operation.
+ * @brief Resolve and connect a TCP socket, publishing selected endpoints.
+ * @param request Socket handle, hostname/port, timeout, and output fields.
+ * @param owner_pid Required owner process identifier.
+ * @return Zero when processed; request->status carries connection outcome.
  */
 int net_socket_connect(struct reliefos_net_socket_connect *request,
                        uint32_t owner_pid);
 
 /**
- * Net socket send.
- * @param request Value supplied by the caller.
- * @param owner_pid Value supplied by the caller.
- * @return The value or status produced by the operation.
+ * @brief Queue bytes in the bounded TCP transmit ring without waiting for ACKs.
+ * @param request Socket handle, borrowed payload, requested length, and result fields.
+ * @param owner_pid Optional owner process filter.
+ * @return Zero when processed; request reports bytes accepted and socket status.
+ * @note Accepted bytes remain owned by the stable socket until ACKed.
  */
 int net_socket_send(struct reliefos_net_socket_io *request, uint32_t owner_pid);
 
 /**
- * Net socket recv.
- * @param request Value supplied by the caller.
- * @param owner_pid Value supplied by the caller.
- * @return The value or status produced by the operation.
+ * @brief Read available TCP stream bytes or report EOF/status.
+ * @param request Socket handle, writable buffer, requested length, and result fields.
+ * @param owner_pid Optional owner process filter.
+ * @return Zero when processed; request reports bytes returned and socket status.
  */
 int net_socket_recv(struct reliefos_net_socket_io *request, uint32_t owner_pid);
 
 /**
- * Net socket close.
- * @param request Value supplied by the caller.
- * @param owner_pid Value supplied by the caller.
- * @return The value or status produced by the operation.
+ * @brief Queue close work and a deferred FIN for an established TCP socket.
+ * @param request Socket handle and output status.
+ * @param owner_pid Optional owner process filter.
+ * @return Zero when processed; request->status reports invalid handles.
+ * @note The network pump drains accepted data before transmitting the FIN.
  */
 int net_socket_close(struct reliefos_net_socket_close *request,
                      uint32_t owner_pid);
 
 /**
- * Net connections.
- * @param request Value supplied by the caller.
- * @param viewer Value supplied by the caller.
- * @return The value or status produced by the operation.
+ * @brief Count visible live TCP sockets and fill a bounded legacy snapshot.
+ * @param request Snapshot capacity, optional entries, and live-count output.
+ * @param viewer Task identity used to apply visibility rules.
+ * @return Zero or a negative error for an invalid request.
+ * @note request->count may exceed the fixed UAPI entry-array capacity.
  */
 int net_connections(struct reliefos_net_connection_list *request,
                     const struct task *viewer);
 
 /**
- * Net close owner sockets.
- * @param owner_pid Value supplied by the caller.
+ * @brief Report readiness for an AF_INET socket to poll/select/epoll.
+ * @param handle Internal socket handle.
+ * @param owner_pid Optional process owner filter; zero accepts any owner.
+ * @param events Requested poll bits.
+ * @return Ready event bits or POLLNVAL for an unknown handle.
  */
 short net_socket_poll_fd(int32_t handle, uint32_t owner_pid, short events);
 
+/**
+ * @brief Retain a socket for one installed AF_INET file description.
+ * @param handle Internal socket handle.
+ */
 void net_socket_pin_fd(int32_t handle);
 
+/**
+ * @brief Release a socket's AF_INET file-description reference.
+ * @param handle Internal socket handle.
+ */
 void net_socket_release_fd(int32_t handle);
+
+/**
+ * @brief Park a blocking writer until the socket gains transmit queue space.
+ * @param handle Internal socket handle.
+ * @return One while parked, zero when it should retry, or a negative errno.
+ * @note The caller retains the syscall file pin across retries; SO_SNDTIMEO is
+ * applied in scheduler ticks, with UINT64_MAX representing an infinite wait.
+ */
+int net_socket_wait_writable(int32_t handle);
+
+/**
+ * @brief Park a blocking reader until its socket has data, EOF, or an error.
+ * @param handle Internal socket handle.
+ * @return One while parked, zero when it should retry, or a negative errno.
+ * @note The caller retains the syscall file pin across retries; SO_RCVTIMEO is
+ * applied in scheduler ticks, with UINT64_MAX representing an infinite wait.
+ */
+int net_socket_wait_readable(int32_t handle);
 
 int net_socket_error(int32_t handle, bool clear);
 
@@ -900,6 +1017,12 @@ int net_socket_address(int32_t handle, uint32_t owner_pid,
                        uint32_t *local_ip, uint16_t *local_port,
                        uint32_t *remote_ip, uint16_t *remote_port);
 
+/**
+ * @brief Retire TCP sockets owned by a process that no longer has descriptors.
+ * @param owner_pid Process identifier whose unowned network state is retired.
+ * @note Pending accepted data and initiated FINs remain registered for pump
+ *       progress; idle unconnected sockets are closed immediately.
+ */
 void net_close_owner_sockets(uint32_t owner_pid);
 
 /**

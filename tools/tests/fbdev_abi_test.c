@@ -6,6 +6,7 @@
 #include <linux/errno.h>
 #include <linux/fb.h>
 #include <reliefnt/framebuffer.h>
+#include <reliefnt/mm.h>
 #include "modules/syscall_dispatch.h"
 
 _Static_assert(FB_ACTIVATE_NOW == 0 && FB_ACTIVATE_NXTOPEN == 1 &&
@@ -23,6 +24,16 @@ static bool drm_lease_active;
 static unsigned user_read_range_checks;
 static unsigned user_write_range_checks;
 static bool user_output_writable;
+static const uintptr_t framebuffer_alias = 0xffffff8000100000ULL;
+static const uint64_t framebuffer_physical = 0x12345000ULL;
+
+bool framebuffer_fbdev_get_fix_info(const struct framebuffer *fb,
+                                    struct fb_fix_screeninfo *info);
+
+uint64_t mm_virt_to_phys(const void *address)
+{
+    return (uintptr_t)address == framebuffer_alias ? framebuffer_physical : 0;
+}
 
 bool user_range_ok(uint64_t address, uint64_t length)
 {
@@ -93,7 +104,7 @@ static struct fb_var_screeninfo make_var(uint32_t width, uint32_t height,
 static void setup_fb(uint32_t bpp, uint32_t backend)
 {
     memset(&device, 0, sizeof(device));
-    device.pixels = (uint32_t *)(uintptr_t)0x100000;
+    device.pixels = (uint32_t *)framebuffer_alias;
     device.width = 800;
     device.height = 600;
     device.pitch = bpp == 24 ? 2400 : 3200;
@@ -439,6 +450,19 @@ static void test_invalid_formats_ranges_and_activation_are_rejected(void)
     assert_rejected_without_side_effects(&var);
 }
 
+static void test_fixed_screeninfo_exports_physical_memory(void)
+{
+    struct fb_fix_screeninfo info;
+    setup_fb(32, FRAMEBUFFER_BACKEND_VMWARE_SVGA);
+    assert(framebuffer_fbdev_get_fix_info(&device, &info));
+    assert(info.smem_start == framebuffer_physical);
+    assert(info.smem_start != (uint64_t)framebuffer_alias);
+    assert(info.smem_len == device.max_bytes);
+    assert(info.line_length == device.pitch);
+    assert(info.type == FB_TYPE_PACKED_PIXELS);
+    assert(info.visual == FB_VISUAL_TRUECOLOR);
+}
+
 int main(void)
 {
     test_test_activation_validates_without_applying();
@@ -449,6 +473,7 @@ int main(void)
     test_lease_rejects_different_size_without_scanout_side_effects();
     test_ioctl_validates_before_requesting_copyout();
     test_invalid_formats_ranges_and_activation_are_rejected();
+    test_fixed_screeninfo_exports_physical_memory();
     puts("fbdev-abi: PASS");
     return 0;
 }

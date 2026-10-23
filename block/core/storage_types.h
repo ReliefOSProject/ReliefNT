@@ -205,6 +205,7 @@ struct install_disk_state {
 
 /* State definitions are owned by block/core/storage_state_data.c. */
 extern struct storage_volume g_volumes[STORAGE_MAX_VOLUMES];
+extern struct storage_volume g_shmem_volume;
 extern struct storage_volume *g_active_volume;
 #define g_storage (*g_active_volume)
 

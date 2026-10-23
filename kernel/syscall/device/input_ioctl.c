@@ -20,7 +20,7 @@ uint32_t task_evdev_vt_hint(const struct task *task)
     if (pty_vt_number(task->controlling_pty_id))
         return task->controlling_pty_id;
     fds = sched_task_fds(task);
-    for (uint32_t i = 0; i < SCHED_TASK_PTY_FD_MAX; ++i) {
+    for (uint32_t i = 0; i < fds->pty_fd_count; ++i) {
         const struct task_pty_fd *entry = &fds->pty_fds[i];
         if (entry->used && entry->endpoint == TASK_PTY_ENDPOINT_SLAVE &&
             pty_vt_number(entry->pty_id))

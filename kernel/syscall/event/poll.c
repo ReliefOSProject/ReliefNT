@@ -72,9 +72,9 @@ int64_t syscall_poll_impl(struct task *task, struct pollfd *fds,
         if (fd < 0) {
             continue;
         }
-        file = task_file_for_fd(task, fd);
+        file = task_file_for_io(task, fd);
         {
-            struct task_pty_fd *endpoint = task_pty_endpoint_for_fd(task, fd);
+            struct task_pty_fd *endpoint = task_pty_for_io(task, fd);
             if (endpoint) {
                 if (pty_is_hungup(endpoint->pty_id)) {
                     if (events & POLLIN) revents |= POLLIN;
@@ -98,6 +98,10 @@ int64_t syscall_poll_impl(struct task *task, struct pollfd *fds,
         }
         if (file && file->kind == TASK_FILE_KIND_SIGNALFD) {
             revents = events & task_signalfd_poll(task, file);
+        } else if (file && (file->flags & TASK_FILE_FLAG_EPOLL)) {
+            if ((events & (POLLIN | POLLRDNORM)) &&
+                task_epoll_poll_ready(task, file))
+                revents |= events & (POLLIN | POLLRDNORM);
         } else if (file && (file->flags & TASK_FILE_FLAG_PIPE)) {
             revents = task_pipe_poll(file, events);
         } else if (file && (file->flags & TASK_FILE_FLAG_SOCKET_UNIX)) {
@@ -211,30 +215,53 @@ int64_t syscall_poll(uint64_t fds_ptr, uint64_t count, int64_t timeout_ms)
                              timeout_ms, generation);
 }
 
+/**
+ * @brief Test one descriptor bit in a copied select set.
+ * @param set Kernel copy of a user fd_set, or null for an absent set.
+ * @param fd Descriptor number represented by the bit.
+ * @return True when the requested bit is set.
+ */
 static bool syscall_select_bit(const uint64_t *set, uint32_t fd)
 {
     return set && (set[fd >> 6] & (1ULL << (fd & 63u))) != 0;
 }
 
+/**
+ * @brief Implement select/pselect with dynamic fd bitmaps and poll readiness.
+ * @param nfds_arg Highest descriptor plus one, in the Linux signed-int ABI.
+ * @param read_ptr Optional readable/writable read set pointer.
+ * @param write_ptr Optional readable/writable write set pointer.
+ * @param except_ptr Optional readable/writable exception set pointer.
+ * @param timeout_ptr Optional timeval or pselect timespec pointer.
+ * @param pselect_timeout True selects timespec input without timeout copyback.
+ * @return Ready descriptor count, zero on timeout, or a negative errno/block token.
+ * @note User fd_sets are copied before polling and changed only after all error
+ *       checks pass, so EFAULT, ENOMEM and EBADF preserve their input masks.
+ */
 int64_t syscall_select_common(uint64_t nfds_arg, uint64_t read_ptr,
                                      uint64_t write_ptr, uint64_t except_ptr,
                                      uint64_t timeout_ptr, bool pselect_timeout)
 {
     struct task *task = sched_current_task();
-    uint64_t read_set[LINUX_SELECT_MAX_FDS / 64] = {0};
-    uint64_t write_set[LINUX_SELECT_MAX_FDS / 64] = {0};
-    uint64_t except_set[LINUX_SELECT_MAX_FDS / 64] = {0};
+    uint64_t *read_set = NULL;
+    uint64_t *write_set = NULL;
+    uint64_t *except_set = NULL;
+    uint64_t *bitmap_storage = NULL;
     struct pollfd *pollfds = NULL;
     int *fd_map = NULL;
     uint64_t nfds = nfds_arg;
-    uint64_t bytes;
+    size_t words = 0;
+    size_t bytes = 0;
     uint32_t selected = 0;
     int64_t timeout_ms = -1;
-    int64_t result;
+    int64_t result = -RELIEFOS_EINVAL;
 
     kernel_poll_wait_remove(task);
-    if (!task || nfds > LINUX_SELECT_MAX_FDS) return -RELIEFOS_EINVAL;
-    bytes = ((nfds + 63) / 64) * sizeof(uint64_t);
+    if (!task || nfds_arg > INT32_MAX) return -RELIEFOS_EINVAL;
+    if (nfds > sched_task_limits(task)->nofile.rlim_cur) return -RELIEFOS_EINVAL;
+    words = (size_t)((nfds + 63u) / 64u);
+    if (words > SIZE_MAX / sizeof(uint64_t)) return -RELIEFOS_EINVAL;
+    bytes = words * sizeof(uint64_t);
     if (bytes) {
         if (read_ptr && !user_range_ok(read_ptr, bytes)) return -RELIEFOS_EFAULT;
         if (write_ptr && !user_range_ok(write_ptr, bytes)) return -RELIEFOS_EFAULT;
@@ -242,17 +269,40 @@ int64_t syscall_select_common(uint64_t nfds_arg, uint64_t read_ptr,
         if (read_ptr && !user_range_writable(read_ptr, bytes)) return -RELIEFOS_EFAULT;
         if (write_ptr && !user_range_writable(write_ptr, bytes)) return -RELIEFOS_EFAULT;
         if (except_ptr && !user_range_writable(except_ptr, bytes)) return -RELIEFOS_EFAULT;
-        if (read_ptr) __builtin_memcpy(read_set, (const void *)(uintptr_t)read_ptr, bytes);
-        if (write_ptr) __builtin_memcpy(write_set, (const void *)(uintptr_t)write_ptr, bytes);
-        if (except_ptr) __builtin_memcpy(except_set, (const void *)(uintptr_t)except_ptr, bytes);
+        uint32_t set_count = (read_ptr != 0) + (write_ptr != 0) + (except_ptr != 0);
+        if (set_count) {
+            if (bytes > SIZE_MAX / set_count) return -RELIEFOS_EINVAL;
+            bitmap_storage = kernel_malloc(bytes * set_count);
+            if (!bitmap_storage) return -RELIEFOS_ENOMEM;
+            __builtin_memset(bitmap_storage, 0, bytes * set_count);
+            uint64_t *next = bitmap_storage;
+            if (read_ptr) {
+                read_set = next;
+                __builtin_memcpy(read_set, (const void *)(uintptr_t)read_ptr, bytes);
+                next += words;
+            }
+            if (write_ptr) {
+                write_set = next;
+                __builtin_memcpy(write_set, (const void *)(uintptr_t)write_ptr, bytes);
+                next += words;
+            }
+            if (except_ptr) {
+                except_set = next;
+                __builtin_memcpy(except_set, (const void *)(uintptr_t)except_ptr, bytes);
+            }
+        }
     }
     if (timeout_ptr) {
         if (pselect_timeout) {
             struct linux_timespec timeout;
-            if (!user_range_ok(timeout_ptr, sizeof(timeout))) return -RELIEFOS_EFAULT;
+            if (!user_range_ok(timeout_ptr, sizeof(timeout))) {
+                result = -RELIEFOS_EFAULT;
+                goto select_out;
+            }
             timeout = *(const struct linux_timespec *)(uintptr_t)timeout_ptr;
             if (timeout.tv_sec < 0 || timeout.tv_nsec < 0 || timeout.tv_nsec >= 1000000000) {
-                return -RELIEFOS_EINVAL;
+                result = -RELIEFOS_EINVAL;
+                goto select_out;
             }
             timeout_ms = timeout.tv_sec > 2147482
                             ? 2147483647
@@ -260,10 +310,14 @@ int64_t syscall_select_common(uint64_t nfds_arg, uint64_t read_ptr,
         } else {
             struct linux_timeval timeout;
             if (!user_range_ok(timeout_ptr, sizeof(timeout)) ||
-                !user_range_writable(timeout_ptr, sizeof(timeout))) return -RELIEFOS_EFAULT;
+                !user_range_writable(timeout_ptr, sizeof(timeout))) {
+                result = -RELIEFOS_EFAULT;
+                goto select_out;
+            }
             timeout = *(const struct linux_timeval *)(uintptr_t)timeout_ptr;
             if (timeout.tv_sec < 0 || timeout.tv_usec < 0 || timeout.tv_usec >= 1000000) {
-                return -RELIEFOS_EINVAL;
+                result = -RELIEFOS_EINVAL;
+                goto select_out;
             }
             timeout_ms = timeout.tv_sec > 2147482
                             ? 2147483647
@@ -278,12 +332,12 @@ int64_t syscall_select_common(uint64_t nfds_arg, uint64_t read_ptr,
         if (events) ++selected;
     }
     if (selected) {
+        /* nfds is bounded to INT32_MAX above, so both products fit x86-64 size_t. */
         pollfds = (struct pollfd *)kernel_malloc((size_t)selected * sizeof(*pollfds));
         fd_map = (int *)kernel_malloc((size_t)selected * sizeof(*fd_map));
         if (!pollfds || !fd_map) {
-            kernel_free(pollfds);
-            kernel_free(fd_map);
-            return -RELIEFOS_ENOMEM;
+            result = -RELIEFOS_ENOMEM;
+            goto select_out;
         }
         uint32_t at = 0;
         for (uint32_t fd = 0; fd < (uint32_t)nfds; ++fd) {
@@ -299,16 +353,18 @@ int64_t syscall_select_common(uint64_t nfds_arg, uint64_t read_ptr,
     uint64_t generation = kernel_poll_readiness_generation();
     result = syscall_poll_impl(task, pollfds, selected, timeout_ms, generation);
     if (result < 0) goto select_out;
+    for (uint32_t i = 0; i < selected; ++i) {
+        if (pollfds[i].revents & POLLNVAL) {
+            result = -RELIEFOS_EBADF;
+            goto select_out;
+        }
+    }
     if (read_ptr && bytes) __builtin_memset((void *)(uintptr_t)read_ptr, 0, bytes);
     if (write_ptr && bytes) __builtin_memset((void *)(uintptr_t)write_ptr, 0, bytes);
     if (except_ptr && bytes) __builtin_memset((void *)(uintptr_t)except_ptr, 0, bytes);
     for (uint32_t i = 0; i < selected; ++i) {
         short revents = pollfds[i].revents;
         uint32_t fd = (uint32_t)fd_map[i];
-        if (revents & POLLNVAL) {
-            result = -RELIEFOS_EBADF;
-            goto select_out;
-        }
         if (read_ptr && (revents & (POLLIN | POLLRDNORM | POLLHUP | POLLERR)))
             ((uint64_t *)(uintptr_t)read_ptr)[fd >> 6] |= 1ULL << (fd & 63u);
         if (write_ptr && (revents & (POLLOUT | POLLWRNORM | POLLHUP | POLLERR)))
@@ -321,6 +377,7 @@ int64_t syscall_select_common(uint64_t nfds_arg, uint64_t read_ptr,
         *(struct linux_timeval *)(uintptr_t)timeout_ptr = zero;
     }
 select_out:
+    kernel_free(bitmap_storage);
     kernel_free(pollfds);
     kernel_free(fd_map);
     return result;

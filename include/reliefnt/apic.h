@@ -10,6 +10,13 @@
 
 void apic_init(void);
 void ioapic_init(void);
+/**
+ * @brief Rebind retained LAPIC/IOAPIC MMIO pages to the kernel direct map.
+ * @return None; unavailable devices are disabled if their alias cannot be set.
+ * Call after physical memory and the supervisor direct map are initialized,
+ * before interrupt routing, AP startup, or user address spaces are activated.
+ */
+void apic_map_kernel_aliases(void);
 bool apic_available(void);
 bool ioapic_available(void);
 uint32_t apic_id(void);

@@ -226,6 +226,27 @@ static void *physical_pointer(uint64_t phys)
             return (uint8_t *)allocations[i].ptr + phys - allocations[i].phys;
     return NULL;
 }
+void *mm_phys_to_virt(uint64_t phys)
+{
+    return physical_pointer(phys);
+}
+uint64_t mm_virt_to_phys(const void *address)
+{
+    uintptr_t pointer = (uintptr_t)address;
+    for (uint32_t i = 0; i < 512; ++i) {
+        if (!allocations[i].ptr) continue;
+        uintptr_t start = (uintptr_t)allocations[i].ptr;
+        uint64_t bytes = (uint64_t)allocations[i].pages * 4096ULL;
+        if (pointer >= start && pointer - start < bytes)
+            return allocations[i].phys + (pointer - start);
+    }
+    return 0;
+}
+bool paging_mmio_uncached(uint64_t phys, uint64_t bytes)
+{
+    (void)phys;
+    return bytes != 0;
+}
 static uint8_t *host_gmr_byte_pointer(uint32_t gmr, uint64_t offset)
 {
     assert(gmr < SVGA_GMRS && offset / 4096u < host_gmr_pages[gmr]);
@@ -1306,11 +1327,11 @@ static void test_cache_policy_reports_with_svga_lock_released(void)
 
     report = (struct svga_cache_report){
         .policy = "UC+NX fallback",
-        .reason = "below-user-top",
+        .reason = "overlaps-vram",
     };
     svga_report_cache_result_unlocked(&report);
     assert(strstr(console_log_text, "UC+NX fallback"));
-    assert(strstr(console_log_text, "below-user-top"));
+    assert(strstr(console_log_text, "overlaps-vram"));
 
     report = (struct svga_cache_report){
         .reason = "reservation-mismatch",
@@ -1326,6 +1347,23 @@ static void test_cache_policy_reports_with_svga_lock_released(void)
     assert(console_log_count == previous_count + 4);
     assert_console_log_unlocked = false;
     puts("SVGA cache-policy reports present outside device lock");
+}
+
+static void test_fifo_reservation_matches_physical_alias(void)
+{
+    uint64_t phys = allocate(1);
+    volatile uint32_t *fifo = mm_phys_to_virt(phys);
+    struct framebuffer fb = {
+        .auxiliary_reservation_start = phys,
+        .auxiliary_reservation_bytes = 4096,
+    };
+    assert(fifo && (uint64_t)(uintptr_t)fifo != phys);
+    assert(svga_fifo_reservation_matches(&fb, fifo, 4096));
+    assert(!svga_fifo_reservation_matches(&fb, fifo, 8192));
+    assert(!svga_fifo_reservation_matches(&fb,
+        (volatile uint32_t *)(uintptr_t)phys, 4096));
+    deallocate(phys, 1);
+    puts("SVGA FIFO reservation compares physical backing to the CPU alias");
 }
 static void test_effective_surface_limit_snapshot(void)
 {
@@ -4005,6 +4043,7 @@ int main(void)
     test_mode_lease_preserves_live_backend(); test_fallback();
     test_cache_policy_failure_restores_legacy_fifo();
     test_cache_policy_reports_with_svga_lock_released();
+    test_fifo_reservation_matches_physical_alias();
     test_effective_surface_limit_snapshot();
     test_present_try(); test_resources(); test_surface_size_rejects_mip_sum_overflow();
     test_gpu(); test_gpu_diagnostic_skips_unadvertised_fifo_busy();

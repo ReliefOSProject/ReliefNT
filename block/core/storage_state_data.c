@@ -6,6 +6,7 @@
 #include "storage_types.h"
 
 struct storage_volume g_volumes[STORAGE_MAX_VOLUMES];
+struct storage_volume g_shmem_volume;
 struct storage_volume *g_active_volume = &g_volumes[0];
 
 bool storage_io_async_context;

@@ -194,6 +194,29 @@ static int tmpfs_number(const char *text, uint64_t *out, unsigned base, bool suf
     *out = value;
     return 0;
 }
+/**
+ * @brief Allocate a regular inode with no directory link under the execution lock.
+ * @param fs Required filesystem owning the new inode.
+ * @param uid File owner UID.
+ * @param gid File owner GID.
+ * @param out Required node output receiving one hold, released by tmpfs_drop.
+ * @return Zero on success, or negative errno without transferring a hold.
+ */
+int tmpfs_create_anonymous(struct tmpfs_super *fs, uint32_t uid, uint32_t gid,
+                            struct storage_node *out)
+{
+    if (!fs || !out) return -22;
+    struct tmpfs_inode *inode;
+    int ret = tmpfs_alloc_inode(fs, LINUX_S_IFREG | 0777, &inode);
+    if (ret < 0) return ret;
+    inode->stat.st_nlink = 0;
+    inode->stat.st_uid = uid;
+    inode->stat.st_gid = gid;
+    inode->refs = 1;
+    tmpfs_node(fs, inode, out);
+    return 0;
+}
+
 int tmpfs_new(uint32_t volume, uint64_t flags, const char *options, uint32_t uid, uint32_t gid,
               struct tmpfs_super **out)
 {
@@ -436,7 +459,7 @@ static int tmpfs_page_get(struct tmpfs_super *fs, struct tmpfs_inode *n, uint64_
             kernel_free(p);
             return -12;
         }
-        __builtin_memset((void *)(uintptr_t)p->phys, 0, TMPFS_PAGE);
+        __builtin_memset(mm_phys_to_virt(p->phys), 0, TMPFS_PAGE);
         p->index = index;
         p->next = n->pages[index % TMPFS_HASH];
         n->pages[index % TMPFS_HASH] = p;
@@ -486,7 +509,7 @@ int tmpfs_read(struct tmpfs_super *fs, uint32_t ino, uint64_t offset, void *buff
             take = length - total;
         struct tmpfs_page *p = tmpfs_page_find(n, pos / TMPFS_PAGE);
         if (p)
-            __builtin_memcpy((uint8_t *)buffer + total, (uint8_t *)(uintptr_t)p->phys + skip, take);
+            __builtin_memcpy((uint8_t *)buffer + total, (uint8_t *)mm_phys_to_virt(p->phys) + skip, take);
         else
             __builtin_memset((uint8_t *)buffer + total, 0, take);
         total += take;
@@ -528,7 +551,7 @@ int tmpfs_write(struct tmpfs_super *fs, uint32_t ino, uint64_t offset, const voi
         ret = tmpfs_page_get(fs, n, index, &p);
         if (ret)
             break;
-        __builtin_memcpy((uint8_t *)(uintptr_t)p->phys + skip, (const uint8_t *)buffer + total, take);
+        __builtin_memcpy((uint8_t *)mm_phys_to_virt(p->phys) + skip, (const uint8_t *)buffer + total, take);
         total += take;
     }
     if (total) {
@@ -569,7 +592,7 @@ int tmpfs_truncate(struct tmpfs_super *fs, uint32_t ino, uint64_t length)
                     n->stat.st_blocks -= TMPFS_PAGE / 512;
                 } else {
                     if (p->index == length / TMPFS_PAGE && length % TMPFS_PAGE)
-                        __builtin_memset((uint8_t *)(uintptr_t)p->phys + length % TMPFS_PAGE, 0,
+                        __builtin_memset((uint8_t *)mm_phys_to_virt(p->phys) + length % TMPFS_PAGE, 0,
                                          TMPFS_PAGE - length % TMPFS_PAGE);
                     link = &p->next;
                 }

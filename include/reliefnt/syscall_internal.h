@@ -12,6 +12,13 @@ void task_discard_file_fd(struct task *task, int fd);
 int task_file_reference(struct task_file *destination, struct task_file *source);
 struct task_file *task_file_get(struct task_file *source);
 void task_file_put(struct task_file *description);
+/**
+ * @brief Resolve the stable OFD bound to the current syscall or descriptor.
+ * @param task Current task; NULL returns NULL.
+ * @param fd Linux descriptor number whose in-flight syscall pin may override lookup.
+ * @return Borrowed stable file description, or NULL when the descriptor is not a file.
+ * @note Caller serializes with descriptor mutation; the returned pointer is not retained.
+ */
 struct task_file *task_file_for_io(struct task *task, int fd);
 
 #include <reliefnt/sched.h>
@@ -79,7 +86,7 @@ int64_t syscall_timer_gettime(uint64_t timerid, uint64_t value);
 int64_t syscall_timer_getoverrun(uint64_t timerid);
 int64_t syscall_rt_sigtimedwait(uint64_t mask, uint64_t info, uint64_t timeout, uint64_t sigset_size);
 
-#define TASK_PIPE_CAP 65535u
+#define TASK_PIPE_CAP 65536u
 
 struct task_file *task_file_for_fd(struct task *task, int fd);
 int file_can_read(const struct task_file *file);
@@ -99,11 +106,41 @@ int task_fifo_open(struct task *task, const struct storage_node *node, uint32_t 
  * @param task Task whose pending FIFO open should be released; may be NULL.
  */
 void task_fifo_cancel(struct task *task);
+/** @brief Acquire endpoint counts for a newly owned pipe description.
+ * @param file Pinned pipe description under execution ownership.
+ */
 void task_pipe_retain(struct task_file *file);
+/** @brief Release an endpoint, wake peers and reclaim the final pipe and ring.
+ * @param file Retiring owned pipe description under execution ownership.
+ */
 void task_pipe_release(struct task_file *file);
+/** @brief Read buffered bytes, EOF or an interruptible empty-pipe retry.
+ * @param file Pinned readable description under execution ownership.
+ * @param buffer Validated writable destination for length bytes.
+ * @param length Maximum byte count.
+ * @return Byte count, zero at EOF, or negative EBADF/EAGAIN.
+ */
 int task_pipe_read(struct task_file *file, void *buffer, uint32_t length);
+/** @brief Write pipe bytes atomically up to PIPE_BUF and signal absent readers.
+ * @param file Pinned writable description under execution ownership.
+ * @param buffer Validated source for length bytes.
+ * @param length Requested byte count.
+ * @return Bytes accepted or negative EBADF/EPIPE/EAGAIN; EPIPE also raises SIGPIPE.
+ */
 int task_pipe_write(struct task_file *file, const void *buffer, uint32_t length);
+/** @brief Query readiness without parking; include terminal HUP/ERR conditions.
+ * @param file Pinned description under execution ownership.
+ * @param events Requested Linux poll bits.
+ * @return Ready event bits or POLLNVAL for a stale/nonpipe description.
+ */
 short task_pipe_poll(const struct task_file *file, short events);
+/** @brief Query or resize one pipe's byte capacity under execution ownership.
+ * @param file Borrowed pipe description, readable or writable.
+ * @param setting True for F_SETPIPE_SZ, false for F_GETPIPE_SZ.
+ * @param bytes Requested unsigned Linux int capacity; ignored for queries.
+ * @return Actual page-rounded capacity or negative EBADF/EINVAL/EBUSY/EPERM/ENOMEM.
+ */
+int64_t task_pipe_capacity(struct task_file *file, bool setting, uint32_t bytes);
 int task_inet_read(struct task_file *file, void *buffer, uint32_t length);
 int task_net_control(struct task_file *file, uint32_t request, uint64_t address);
 int task_inet_write(struct task_file *file, const void *buffer, uint32_t length);
@@ -135,17 +172,63 @@ uint64_t task_socket_event_generation(const struct task_file *file);
 int task_socket_ioctl(struct task_file *file, uint64_t request, uint64_t address);
 int64_t syscall_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
                                 uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5);
+/** @brief Create two resource-backed pipe endpoints with complete failure rollback.
+ * @param user_ptr User destination for two int descriptors, checked writable.
+ * @return Zero or a negative descriptor/allocation/EFAULT error; execution ownership required.
+ */
 int syscall_ipc_pipe(uint64_t user_ptr);
 int syscall_ipc_pipe2(uint64_t user_ptr, uint64_t flags);
+/** @brief Retain the seal state of an anonymous shmem description.
+ * @param file Live description under execution ownership, nullable.
+ */
 void task_shm_retain(struct task_file *file);
+/** @brief Release seal state; OFD and VMA inode pins own the backing pages.
+ * @param file Retiring description under execution ownership, nullable.
+ */
 void task_shm_release(struct task_file *file);
+/** @brief Attach an owned anonymous tmpfs inode and independent seal state.
+ * @param file Fresh description; ownership transfers only on success.
+ * @param create_flags Validated Linux MFD flags.
+ * @return Zero or negative EINVAL, ENOMEM, ENFILE or backing-store error.
+ */
 int task_shm_attach(struct task_file *file, uint32_t create_flags);
+/** @brief Change logical size sparsely and revoke pages removed by shrink.
+ * @param file Writable shmem description under execution ownership.
+ * @param size New nonnegative signed-off_t size in bytes.
+ * @return Zero or negative EINVAL, EBADF, EPERM or backing-store error.
+ */
 int task_shm_truncate(struct task_file *file, uint64_t size);
+/** @brief Read bytes or sparse zeros and advance the shared OFD offset.
+ * @param file Pinned description under execution ownership.
+ * @param buffer Validated destination for length bytes.
+ * @param length Maximum byte count.
+ * @return Bytes read, zero at EOF, or a negative error.
+ */
 int task_shm_read(struct task_file *file, void *buffer, uint32_t length);
+/** @brief Write sparse pages and preserve partial progress on allocation failure.
+ * @param file Pinned writable description under execution ownership.
+ * @param buffer Validated source for length bytes.
+ * @param length Requested byte count.
+ * @return Bytes written or negative EBADF, EFAULT, EFBIG, EPERM or backing error.
+ */
 int task_shm_write(struct task_file *file, const void *buffer, uint32_t length);
-int task_shm_map(const struct task_file *file, uint64_t offset, uint64_t length,
-                 uint32_t prot, uint64_t *physical);
+/** @brief Check memfd mapping seals and restrict later protection upgrades.
+ * @param file Pinned shmem description under execution ownership.
+ * @param flags Linux MAP flags. @param prot Requested PROT bits.
+ * @param max_prot In/out permitted protection mask, nullable.
+ * @return Zero or negative EBADF/EPERM; private mappings retain COW semantics.
+ */
+int task_shm_mmap_check(const struct task_file *file, uint32_t flags, uint32_t prot, uint32_t *max_prot);
+/** @brief Read the inode-wide monotonic seal set.
+ * @param file Pinned description under execution ownership, nullable.
+ * @return Seal mask or negative EINVAL/EBADF.
+ */
 int64_t task_shm_get_seals(const struct task_file *file);
+/** @brief Add seals atomically after access and live shared-mapping checks.
+ * @param file Writable shmem description under execution ownership.
+ * @param seals Known Linux seal bits to add; existing bits remain set.
+ * @return Zero or negative EPERM, EINVAL, EBADF or EBUSY; no change on failure.
+ */
 int task_shm_add_seals(struct task_file *file, uint32_t seals);
 int syscall_fs_owns(uint64_t number);
 int64_t syscall_fs_dispatch(uint64_t number, uint64_t a0, uint64_t a1,

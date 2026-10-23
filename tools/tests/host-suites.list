@@ -2,11 +2,13 @@
 acpi_pm_timer tools/test_acpi_pm_timer.py
 ahci_completion tools/test_ahci_completion.py
 apic_timer tools/test_apic_timer.py
+audio_pcm_directmap tools/test_audio_pcm_directmap.py
 block_exclusive tools/test_block_exclusive.py
 console tools/test_console.py
 cpu_accounting tools/test_cpu_accounting.py
 drm tools/test_drm.py
 e1000 tools/test_e1000.py
+efi_fs_early tools/test_efi_fs_early.py
 eevdf tools/test_eevdf.py
 evdev_overflow tools/test_evdev_overflow.py
 exec_limits tools/test_exec_limits.py
@@ -28,6 +30,7 @@ gpu tools/test_gpu.py
 hda tools/test_hda.py
 input tools/test_input.py
 input_routing tools/test_input_routing.py
+installer_ramdisk tools/test_installer_ramdisk.py
 kernel_memory tools/test_kernel_memory.py
 linux_abi_contract tools/test_linux_abi_contract.py
 linux_audio tools/test_linux_audio.py abi pcm vma device params ioctl mmap control oss mixer
@@ -62,6 +65,7 @@ sched_resume tools/test_sched_resume.py
 service_roles tools/test_service_roles.py
 signal_address_space tools/test_signal_address_space.py
 smp_cpu_id tools/test_smp_cpu_id.py
+smp_trampoline_nxe tools/test_smp_trampoline_nxe.py
 storage_metadata tools/test_storage_metadata.py
 storage_mkdir_mount tools/test_storage_mkdir_mount.py
 storage_posix_paths tools/test_storage_posix_paths.py
@@ -89,3 +93,9 @@ ext4_interop_write tools/tests/ext4_interop_test.py --direction reliefos-to-linu
 ext4_crash_replay tools/tests/ext4_crash_replay_test.py
 xorg_abi tools/test_xorg_abi.py
 tmpfs tools/test_tmpfs.py
+epoll_capacity tools/test_epoll_capacity.py
+select_bitmap tools/test_select_bitmap.py
+object_capacity tools/test_object_capacity.py
+pipe_capacity tools/test_pipe_capacity.py
+memfd_resources tools/test_memfd_resources.py
+shmem_facade tools/test_shmem_facade.py

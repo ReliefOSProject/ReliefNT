@@ -38,6 +38,14 @@ static const struct reliefos_driver_kernel_api *kernel_api;
 static struct hda_module_controller *controllers;
 static uint32_t published_cards;
 
+/** @brief Expose the active HDA module's borrowed kernel-service table to sibling objects.
+ * @return API passed to module init, or NULL after safe module teardown.
+ */
+const struct reliefos_driver_kernel_api *hda_module_kernel_api(void)
+{
+    return kernel_api;
+}
+
 /** @brief Log one bounded discovery failure with stable BDF/codec identifiers.
  * @param stage Static operation name.
  * @param dev Borrowed PCI identity.
@@ -900,7 +908,8 @@ static void hda_module_fini(void)
 static int hda_module_init(const struct reliefos_driver_kernel_api *api)
 {
     if(!api || api->abi_version!=RELIEFOS_DRIVER_ABI_VERSION ||
-        api->struct_size<RELIEFOS_DRIVER_LOG_API_SIZE || !api->report_teardown_failure ||
+        api->struct_size<RELIEFOS_DRIVER_PHYS_MAP_API_SIZE || !api->phys_to_virt ||
+        !api->report_teardown_failure ||
         !api->audio_request_disconnect ||
         !api->pci_enumerate || !api->alloc_pages || !api->free_pages ||
         !api->audio_register_card || !api->audio_unregister_card || !api->audio_period_elapsed ||

@@ -21,6 +21,9 @@ void kernel_free(void *p) { free(p); }
 int time_wall_clock(struct reliefos_time_info *info)
 { memset(info,0,sizeof(*info)); info->unix_seconds=1790640000; return 0; }
 uint64_t mm_alloc_pages(uint32_t n) { return (uintptr_t)calloc(n, 4096); }
+void *mm_phys_to_virt(uint64_t physical) { return (void *)(uintptr_t)physical; }
+void mm_free_pages(uint64_t physical, uint32_t pages)
+{ (void)pages; free((void *)(uintptr_t)physical); }
 void console_printf(const char *fmt, ...) { (void)fmt; }
 
 void console_log(enum console_log_level level, const char *fmt, ...)

@@ -820,6 +820,10 @@ int hda_controller_take_disconnect_request(struct hda_controller *c,
  * Caller retains allocation and exact free responsibility; no lock, wait, or IRQ action.
  */
 void *hda_phys_to_direct_map_page(uint64_t phys);
+/** @brief Return the HDA module's borrowed kernel-service table while its resources are live.
+ * @return The API passed to module init, or NULL when the module is inactive.
+ */
+const struct reliefos_driver_kernel_api *hda_module_kernel_api(void);
 
 /** @brief Discover one codec's nodes, effective capabilities, and live routes.
  * @param c Initialized controller used for serialized task-context verbs.

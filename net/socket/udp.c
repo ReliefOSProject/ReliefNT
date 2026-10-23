@@ -14,7 +14,6 @@
 #include <linux/capability.h>
 #include <linux/poll.h>
 
-#define UDP_MAX_SOCKETS 64u
 #define UDP_QUEUE_LENGTH 16u
 #define UDP_MAX_PAYLOAD 1472u
 #define UDP_SO_BROADCAST 6
@@ -29,18 +28,27 @@ struct udp_socket {
     uint32_t local, remote;
     uint16_t port, remote_port;
     bool bound, connected, broadcast, reuse;
+    bool receive_timeout_immediate;
     int ifindex;
     uint64_t receive_timeout;
     uint32_t queued;
     struct udp_packet *head, *tail;
+    struct udp_socket *registry_next;
 };
-static struct udp_socket *sockets[UDP_MAX_SOCKETS];
+static struct udp_socket *sockets;
 static uint16_t next_port = 49152;
 static uint16_t swap16(uint16_t x) { return __builtin_bswap16(x); }
 static uint32_t swap32(uint32_t x) { return __builtin_bswap32(x); }
 static struct udp_socket *udp_from_file(struct task_file *file)
 { return file && file->kind == TASK_FILE_KIND_UDP ? (void *)(uintptr_t)file->aux : NULL; }
 
+/**
+ * @brief Bind a UDP socket to an address and check registered port conflicts.
+ * @param s Socket to bind.
+ * @param ip Requested local IPv4 address, or zero for any address.
+ * @param port Requested local port, or zero for automatic allocation.
+ * @return Zero on success or a negative errno.
+ */
 static int bind_port(struct udp_socket *s, uint32_t ip, uint16_t port)
 {
     if (s->bound) return -LINUX_EINVAL;
@@ -54,8 +62,8 @@ static int bind_port(struct udp_socket *s, uint32_t ip, uint16_t port)
         uint16_t candidate = port ? port : next_port++;
         if (next_port < 49152) next_port = 49152;
         bool conflict = false;
-        for (unsigned i = 0; i < UDP_MAX_SOCKETS; ++i) {
-            struct udp_socket *other = sockets[i];
+        for (struct udp_socket *other = sockets; other;
+             other = other->registry_next) {
             if (other && other != s && other->bound && other->port == candidate &&
                 (!ip || !other->local || ip == other->local) && !(s->reuse && other->reuse))
                 conflict = true;
@@ -66,13 +74,22 @@ static int bind_port(struct udp_socket *s, uint32_t ip, uint16_t port)
     return -LINUX_EADDRINUSE;
 }
 
+/**
+ * @brief Queue one received IPv4 datagram for each matching UDP endpoint.
+ * @param source Source IPv4 address.
+ * @param destination Destination IPv4 address.
+ * @param source_port Source transport port.
+ * @param destination_port Destination local port.
+ * @param data Datagram payload.
+ * @param length Payload bytes.
+ * @param ifindex Incoming interface index.
+ */
 void net_udp_input(uint32_t source, uint32_t destination, uint16_t source_port,
                     uint16_t destination_port, const void *data, uint32_t length, int ifindex)
 {
     if (length > UDP_MAX_PAYLOAD) return;
-    for (unsigned i = 0; i < UDP_MAX_SOCKETS; ++i) {
-        struct udp_socket *s = sockets[i];
-        if (!s || !s->bound || (s->ifindex && s->ifindex != ifindex) || s->port != destination_port ||
+    for (struct udp_socket *s = sockets; s; s = s->registry_next) {
+        if (!s->bound || (s->ifindex && s->ifindex != ifindex) || s->port != destination_port ||
             (s->local && s->local != destination) ||
             (s->connected && (s->remote != source || s->remote_port != source_port)) ||
             s->queued >= UDP_QUEUE_LENGTH) continue;
@@ -140,6 +157,18 @@ int task_udp_send(struct task_file *file, const void *data, uint32_t length,
     return ret < 0 ? ret : (int)length;
 }
 
+/**
+ * @brief Receive one queued UDP datagram or wait according to SO_RCVTIMEO.
+ * @param file Open description owning the UDP endpoint.
+ * @param data User-visible destination buffer.
+ * @param length Destination capacity.
+ * @param flags Supported receive flags.
+ * @param address Optional source-address destination.
+ * @param address_length Optional source-address length pointer.
+ * @return Received length, zero for an empty datagram, or negative errno/status.
+ * @note A negative timeval seconds value is stored as immediate timeout, distinct
+ *       from the all-zero value, which keeps the default infinite wait.
+ */
 int task_udp_recv(struct task_file *file, void *data, uint32_t length,
                    uint32_t flags, uint64_t address, uint64_t address_length)
 {
@@ -152,9 +181,10 @@ int task_udp_recv(struct task_file *file, void *data, uint32_t length,
         struct task *task = sched_current_task();
         uint64_t now = time_ticks();
         if (!task->socket_io_deadline) {
-            task->socket_io_timed = s->receive_timeout != 0;
-            task->socket_io_deadline = !s->receive_timeout || UINT64_MAX - now < s->receive_timeout
-                ? UINT64_MAX : now + s->receive_timeout;
+            task->socket_io_timed = s->receive_timeout_immediate || s->receive_timeout != 0;
+            task->socket_io_deadline = s->receive_timeout_immediate ? now :
+                !s->receive_timeout || UINT64_MAX - now < s->receive_timeout
+                    ? UINT64_MAX : now + s->receive_timeout;
         }
         if (now >= task->socket_io_deadline) return -LINUX_EAGAIN;
         sched_sleep_current_until(now + 1);
@@ -191,11 +221,17 @@ int task_udp_available(struct task_file *file)
     return !s ? -LINUX_EBADF : s->head ? (int)s->head->length : 0;
 }
 
+/**
+ * @brief Remove a final UDP socket description and release its queued datagrams.
+ * @param file File description whose final reference is being released.
+ */
 void task_udp_release(struct task_file *file)
 {
     struct udp_socket *s = udp_from_file(file);
     if (!s) return;
-    for (unsigned i = 0; i < UDP_MAX_SOCKETS; ++i) if (sockets[i] == s) sockets[i] = NULL;
+    struct udp_socket **link = &sockets;
+    while (*link && *link != s) link = &(*link)->registry_next;
+    if (*link == s) *link = s->registry_next;
     while (s->head) {
         struct udp_packet *p = s->head;
         s->head = p->next;
@@ -205,6 +241,17 @@ void task_udp_release(struct task_file *file)
     file->aux = 0;
 }
 
+/**
+ * @brief Dispatch IPv4 datagram syscalls against dynamically registered UDP sockets.
+ * @param number Native syscall number.
+ * @param a0 First syscall argument.
+ * @param a1 Second syscall argument.
+ * @param a2 Third syscall argument.
+ * @param a3 Fourth syscall argument.
+ * @param a4 Fifth syscall argument.
+ * @param a5 Sixth syscall argument.
+ * @return Syscall result or negative errno.
+ */
 int64_t syscall_udp(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
                     uint64_t a3, uint64_t a4, uint64_t a5)
 {
@@ -214,16 +261,18 @@ int64_t syscall_udp(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
     if (number == __NR_socket) {
         if (a2 && a2 != 17) return -LINUX_EPROTONOSUPPORT;
         if (a1 & ~(uint32_t)(SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC)) return -LINUX_EINVAL;
-        unsigned index = 0;
-        while (index < UDP_MAX_SOCKETS && sockets[index]) ++index;
-        if (index == UDP_MAX_SOCKETS) return -LINUX_ENFILE;
         struct udp_socket *s = kernel_malloc(sizeof(*s));
         if (!s) return -LINUX_ENOMEM;
         struct task_file *file;
         int fd = task_allocate_fd(task, 0, &file);
         if (fd < 0) { kernel_free(s); return fd; }
         *s = (struct udp_socket){0};
-        sockets[index] = s;
+        if (!sockets) sockets = s;
+        else {
+            struct udp_socket *tail = sockets;
+            while (tail->registry_next) tail = tail->registry_next;
+            tail->registry_next = s;
+        }
         file->flags = TASK_FILE_FLAG_SOCKET | TASK_FILE_FLAG_SOCKET_INET | RELIEFOS_O_RDWR |
             (a1 & SOCK_NONBLOCK ? RELIEFOS_O_NONBLOCK : 0);
         file->fd_flags = (a1 & SOCK_CLOEXEC) != 0;
@@ -296,11 +345,17 @@ int64_t syscall_udp(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
                 if (length < sizeof(tv)) return -LINUX_EINVAL;
                 if (!user_range_ok(a3, sizeof(tv))) return -LINUX_EFAULT;
                 __builtin_memcpy(tv, (void *)(uintptr_t)a3, sizeof(tv));
-                if (tv[0] < 0 || tv[1] < 0 || tv[1] >= 1000000) return -LINUX_EDOM;
-                uint64_t seconds = (uint64_t)tv[0];
-                *timeout = seconds > (UINT64_MAX - RELIEFNT_TICK_HZ) / RELIEFNT_TICK_HZ
-                    ? UINT64_MAX : seconds * RELIEFNT_TICK_HZ +
-                      ((uint64_t)tv[1] * RELIEFNT_TICK_HZ + 999999) / 1000000;
+                if (tv[1] < 0 || tv[1] >= 1000000) return -LINUX_EDOM;
+                if (tv[0] < 0) {
+                    *timeout = 0;
+                    s->receive_timeout_immediate = true;
+                } else {
+                    uint64_t seconds = (uint64_t)tv[0];
+                    *timeout = seconds > (UINT64_MAX - RELIEFNT_TICK_HZ) / RELIEFNT_TICK_HZ
+                        ? UINT64_MAX : seconds * RELIEFNT_TICK_HZ +
+                          ((uint64_t)tv[1] * RELIEFNT_TICK_HZ + 999999) / 1000000;
+                    s->receive_timeout_immediate = false;
+                }
                 return 0;
             }
             tv[0] = *timeout / RELIEFNT_TICK_HZ;

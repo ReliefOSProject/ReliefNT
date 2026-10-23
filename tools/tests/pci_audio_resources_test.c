@@ -1,6 +1,8 @@
 #include "audio_fixture.h"
 #include <sys/mman.h>
 #include <reliefos/driver.h>
+#undef RELIEFNT_KERNEL_DIRECT_MAP_BASE
+#define RELIEFNT_KERNEL_DIRECT_MAP_BASE 0
 #include "../../mm/physical/mm.c"
 #include "../../arch/x86_64/platform/pci_irq.c"
 #include "../../arch/x86_64/platform/pci.c"
@@ -500,6 +502,9 @@ static void retired_msi_cannot_reach_new_owner(void) {
 }
 int main(void) {
     setvbuf(stdout,NULL,_IONBF,0);
+    /* These MMIO ownership tests model the post-mm_init runtime allocator.
+     * Early pinned-table behavior is covered by paging_protection_test. */
+    paging_mmio_allocator_ready();
     _Static_assert(offsetof(struct reliefos_driver_kernel_api,register_audio)==160,"v1 prefix changed");
     _Static_assert(offsetof(struct reliefos_driver_kernel_api,pci_enumerate)==168,"extension must follow v1");
     _Static_assert(sizeof(struct reliefos_driver_audio_ops)==32,"v1 ops changed");

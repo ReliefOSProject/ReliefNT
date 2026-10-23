@@ -17,6 +17,8 @@
 
 void drm_file_close(struct task_file *file)
 { if (file) file->drm_file = NULL; }
+void drm_prime_file_close(struct task_file *file)
+{ if (file) file->drm_prime_file = NULL; }
 
 static int fail_allocation;
 void *kernel_malloc(size_t size) { return fail_allocation ? NULL : malloc(size); }
@@ -151,7 +153,8 @@ int main(int argc, char **argv)
     assert(task_fd_descriptor_flags(task, duplicate) == RELIEFOS_FD_CLOEXEC);
 
     /* --- Explicit PTY aliases keep their own descriptor flag word. ------- */
-    struct task_pty_fd *alias = &sched_task_fds(task)->pty_fds[0];
+    struct task_pty_fd *alias;
+    assert(sched_task_pty_alloc(task, &alias) == 0);
     *alias = (struct task_pty_fd){.used = 1, .fd = 42, .stream = 0,
                                   .status_flags = RELIEFOS_O_RDONLY};
     assert(task_fd_descriptor_flags(task, 42) == 0);
@@ -227,6 +230,7 @@ int main(int argc, char **argv)
      * freed and the sanitizer build stays leak-clean. */
     for (int index = 0; index < 1024; ++index) task_discard_file_fd(task, index);
     sched_task_file_release(task);
+    sched_task_pty_release(task);
     free(task);
     puts("PASS kernel fd-flags table: FIOCLEX/FIONCLEX, dup isolation, implicit stdio, "
          "fd reuse, O_PATH EBADF, cmd/fd truncation");

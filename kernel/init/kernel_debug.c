@@ -357,6 +357,12 @@ static int debug_apply_relocation(uint8_t *place, uint32_t type, uint64_t symbol
     return -95;
 }
 
+/** @brief Load and execute one validated kernel-debug module.
+ * @param image Immutable ET_REL image bytes.
+ * @param len Image byte length.
+ * @param api Kernel-debug service table supplied to the module.
+ * @return Module result, or a negative errno after releasing its allocation.
+ */
 static int debug_load_module(const void *image, size_t len,
                              const struct reliefos_kernel_debug_api *api)
 {
@@ -365,6 +371,7 @@ static int debug_load_module(const void *image, size_t len,
     /* Keep zero as the unallocated-section sentinel. */
     uint64_t total = 16U;
     uint64_t allocation;
+    uint8_t *allocation_map;
     uint32_t pages;
     reliefos_kernel_debug_entry_fn entry = 0;
     if (!image || len < sizeof(struct debug_elf_header)) return -22;
@@ -387,10 +394,15 @@ static int debug_load_module(const void *image, size_t len,
     pages = (uint32_t)((total + 4095U) / 4096U);
     allocation = mm_alloc_pages(pages);
     if (!allocation) return -12;
+    allocation_map = (uint8_t *)mm_phys_to_virt(allocation);
+    if (!allocation_map) {
+        mm_free_pages(allocation, pages);
+        return -12;
+    }
     for (uint16_t index = 0; index < eh->shnum; ++index) {
         const struct debug_elf_section *section = debug_section_at(eh, image, index);
         if (!section_addr[index]) continue;
-        section_addr[index] += allocation;
+        section_addr[index] = (uint64_t)(uintptr_t)allocation_map + section_addr[index];
         if (section->type == SHT_NOBITS) debug_zero((void *)(uintptr_t)section_addr[index], section->size);
         else debug_copy((void *)(uintptr_t)section_addr[index], (const uint8_t *)image + section->offset, section->size);
     }
@@ -524,6 +536,7 @@ int kernel_debug_clear_state(void)
 
 /**
  * @brief Consume the one-shot boot marker on the boot ESP.
+ * @return True for a recognized debug marker, false when absent or invalid.
  * The file is deleted whether or not its content is valid; only a matching
  * RELIEFOS-KDBG-1 (or legacy LEONOS-KDBG-1) marker requests debug mode.
  */
@@ -550,18 +563,18 @@ static bool debug_consume_boot_marker(void)
     }
     value = (const char *)data;
     if (len != (expected == marker ? sizeof(marker) : sizeof(legacy_marker)) - 1U) {
-        mm_free_pages((uint64_t)(uintptr_t)value,
+        mm_free_pages(mm_virt_to_phys(value),
                       (uint32_t)((len + 4095U) / 4096U));
         return false;
     }
     for (size_t i = 0; i < len; ++i) {
         if (value[i] != expected[i]) {
-            mm_free_pages((uint64_t)(uintptr_t)value,
+            mm_free_pages(mm_virt_to_phys(value),
                           (uint32_t)((len + 4095U) / 4096U));
             return false;
         }
     }
-    mm_free_pages((uint64_t)(uintptr_t)value,
+    mm_free_pages(mm_virt_to_phys(value),
                   (uint32_t)((len + 4095U) / 4096U));
     return true;
 }
@@ -817,6 +830,10 @@ static void debug_menu(void)
     }
 }
 
+/**
+ * @brief Load and run the optional kernel debug module, falling back to the built-in menu.
+ * @return Zero after the module session or fallback menu returns.
+ */
 int kernel_debug_run_module(void)
 {
     const void *image = 0;
@@ -849,7 +866,7 @@ int kernel_debug_run_module(void)
         console_error("[reliefnt] kernel debug module rejected or failed ret=%d\n", ret);
         debug_write("\033[31mKernel debug module rejected or failed.\033[0m\n");
     }
-    mm_free_pages((uint64_t)(uintptr_t)image, (uint32_t)((len + 4095U) / 4096U));
+    mm_free_pages(mm_virt_to_phys(image), (uint32_t)((len + 4095U) / 4096U));
     if (ret < 0) {
         debug_menu();
         return 0;

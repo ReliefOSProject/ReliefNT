@@ -49,6 +49,9 @@ uint64_t mm_alloc_page(void)
     abort();
 }
 
+void *mm_phys_to_virt(uint64_t physical) { return (void *)(uintptr_t)physical; }
+uint64_t mm_virt_to_phys(const void *address) { return (uint64_t)(uintptr_t)address; }
+
 void mm_retain_page(uint64_t physical)
 {
     for (unsigned i = 0; i < 2048; ++i)
@@ -159,12 +162,8 @@ int main(void)
     assert(memcmp((void *)(uintptr_t)text, "vdso-mapping-fixture", 20) == 0);
     assert(!address_space_user_page_writable(sched_task_as(task), ehdr));
     assert(!address_space_user_page_writable(sched_task_as(task), ehdr - 4096));
-    unsigned table = (unsigned)((ehdr - RELIEFNT_USER_BASE) / 4096 / 512);
-    unsigned slot = (unsigned)((ehdr - RELIEFNT_USER_BASE) / 4096 % 512);
-    assert(!(task->as.user_pt[table][slot] & RELIEFNT_PAGE_NOEXEC));
-    table = (unsigned)((ehdr - 4096 - RELIEFNT_USER_BASE) / 4096 / 512);
-    slot = (unsigned)((ehdr - 4096 - RELIEFNT_USER_BASE) / 4096 % 512);
-    assert(task->as.user_pt[table][slot] & RELIEFNT_PAGE_NOEXEC);
+    assert(!(address_space_user_page_flags(sched_task_as(task), ehdr) & RELIEFNT_PAGE_NOEXEC));
+    assert(address_space_user_page_flags(sched_task_as(task), ehdr - 4096) & RELIEFNT_PAGE_NOEXEC);
     unsigned found = 0;
     for (unsigned i = 0; i < sched_task_vma_capacity(task); ++i) {
         const struct task_vma *vma = sched_task_vma_at(task, i);

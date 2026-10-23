@@ -188,3 +188,99 @@ void sched_task_file_release(struct task *task)
     sched_task_fds(task)->file_extra_count = 0;
     sched_task_fds(task)->file_extra_capacity = 0;
 }
+
+/**
+ * @brief Return the number of indexable slots in the task's PTY alias table.
+ * @param task Descriptor-table owner; NULL returns zero.
+ * @return Slot count, including reusable holes.
+ */
+uint32_t sched_task_pty_capacity(const struct task *task)
+{
+    return task ? sched_task_fds(task)->pty_fd_count : 0;
+}
+
+/**
+ * @brief Resolve an existing PTY alias slot without changing table state.
+ * @param task Descriptor-table owner; NULL is accepted.
+ * @param index Zero-based index within the logical PTY alias table.
+ * @return Borrowed slot or NULL when outside the logical slot count.
+ * @note A later PTY table growth can invalidate the returned pointer.
+ */
+struct task_pty_fd *sched_task_pty_at(struct task *task, uint32_t index)
+{
+    if (!task || index >= sched_task_fds(task)->pty_fd_count) return NULL;
+    return &sched_task_fds(task)->pty_fds[index];
+}
+
+/**
+ * @brief Grow a detached descriptor table's PTY alias allocation.
+ * @param table Descriptor table whose owned PTY vector may be replaced; required.
+ * @param wanted Number of slots needed without changing the logical count.
+ * @return Zero on success or negative EINVAL/ENOMEM with existing storage intact.
+ * @note Successful growth invalidates pointers borrowed from the previous vector.
+ * The caller must serialize table mutation and must not retain entry pointers across growth.
+ */
+int sched_task_pty_table_reserve(struct task_fd_table_state *table, uint32_t wanted)
+{
+    struct task_pty_fd *replacement;
+    uint32_t capacity;
+    if (!table || wanted < table->pty_fd_count) return -RELIEFOS_EINVAL;
+    if (wanted <= table->pty_fd_capacity) return 0;
+    capacity = table->pty_fd_capacity ? table->pty_fd_capacity : 16u;
+    while (capacity < wanted) {
+        if (capacity > UINT32_MAX / 2u) return -RELIEFOS_ENOMEM;
+        capacity *= 2u;
+    }
+    if ((size_t)capacity > SIZE_MAX / sizeof(*replacement)) return -RELIEFOS_ENOMEM;
+    replacement = kernel_malloc((size_t)capacity * sizeof(*replacement));
+    if (!replacement) return -RELIEFOS_ENOMEM;
+    for (uint32_t i = 0; i < capacity; ++i)
+        replacement[i] = (struct task_pty_fd){0};
+    for (uint32_t i = 0; i < table->pty_fd_count; ++i)
+        replacement[i] = table->pty_fds[i];
+    kernel_free(table->pty_fds);
+    table->pty_fds = replacement;
+    table->pty_fd_capacity = capacity;
+    return 0;
+}
+
+/**
+ * @brief Reuse a free PTY alias slot or append one after successful growth.
+ * @param task Descriptor-table owner; required.
+ * @param out Receives the empty slot; required.
+ * @return Zero on success or negative EINVAL/ENOMEM without publishing a slot.
+ * @note The returned pointer is borrowed and may be invalidated by later growth.
+ */
+int sched_task_pty_alloc(struct task *task, struct task_pty_fd **out)
+{
+    struct task_fd_table_state *table;
+    if (!task || !out) return -RELIEFOS_EINVAL;
+    table = sched_task_fds(task);
+    for (uint32_t i = 0; i < table->pty_fd_count; ++i) {
+        if (!table->pty_fds[i].used) {
+            *out = &table->pty_fds[i];
+            return 0;
+        }
+    }
+    if (table->pty_fd_count == UINT32_MAX) return -RELIEFOS_ENOMEM;
+    uint32_t index = table->pty_fd_count;
+    int ret = sched_task_pty_table_reserve(table, index + 1u);
+    if (ret < 0) return ret;
+    table->pty_fd_count = index + 1u;
+    *out = &table->pty_fds[index];
+    return 0;
+}
+
+/**
+ * @brief Free PTY alias storage after descriptor references and table sharing end.
+ * @param task Descriptor-table owner whose entries are released and table is final; NULL is accepted.
+ */
+void sched_task_pty_release(struct task *task)
+{
+    if (!task) return;
+    struct task_fd_table_state *table = sched_task_fds(task);
+    kernel_free(table->pty_fds);
+    table->pty_fds = NULL;
+    table->pty_fd_count = 0;
+    table->pty_fd_capacity = 0;
+}

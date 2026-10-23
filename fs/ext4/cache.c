@@ -117,7 +117,11 @@ static bool ext4_cache_ensure(struct ext4_cache_table *table)
     if (!phys) {
         return false;
     }
-    table->entries = (struct storage_ext4_cache_entry *)(uintptr_t)phys;
+    table->entries = (struct storage_ext4_cache_entry *)mm_phys_to_virt(phys);
+    if (!table->entries) {
+        mm_free_pages(phys, (uint32_t)((bytes + 4095u) / 4096u));
+        return false;
+    }
     storage_memzero(table->entries, bytes);
     return true;
 }

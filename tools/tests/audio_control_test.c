@@ -16,6 +16,8 @@
 #define AUDIO_FIXTURE_NO_PTHREAD
 #include "audio_fixture.h"
 
+#define AUDIO_CONTROL_WAITERS_TEST 65u
+
 #define sched_block_current audio_test_real_sched_block_current
 #define sched_signal_wait_current audio_test_real_sched_signal_wait_current
 #include "modules/scheduler.h"
@@ -28,6 +30,9 @@
 static uint32_t injected_card;
 static int inject_before_epoch, inject_before_sleep, inject_after_sleep;
 static int inject_during_info;
+
+uint32_t smp_cpu_count(void) { return 1; }
+bool smp_cpu_online(uint32_t cpu) { return cpu == 0; }
 
 /* Inject real core notifications around real scheduler state transitions. */
 void sched_block_current(void)
@@ -622,18 +627,30 @@ static void blocking_events(uint32_t card_id)
     assert(first.state == TASK_READY && !first.waiting_queue);
     first.pending_signals = 0;
 
-    /* A full bounded queue falls back to retry without parking an unregistered task. */
-    struct task *fillers = calloc(KERNEL_WAIT_QUEUE_MAX, sizeof(*fillers));
+    /* Intrusive queues accept and wake more than the former 64-task limit. */
+    struct task *fillers = calloc(AUDIO_CONTROL_WAITERS_TEST, sizeof(*fillers));
     assert(fillers);
-    for (uint32_t i = 0; i < KERNEL_WAIT_QUEUE_MAX; ++i) {
+    for (uint32_t i = 0; i < AUDIO_CONTROL_WAITERS_TEST; ++i) {
         fillers[i].pid = 5000 + i;
+        fillers[i].state = TASK_BLOCKED;
         assert(!kernel_wait_queue_add(&audio_control_waiters, &fillers[i]));
     }
+    assert(audio_control_waiters.count == AUDIO_CONTROL_WAITERS_TEST);
     first.state = TASK_RUNNING;
-    assert(audio_control_read_task(&first, &file, &event, sizeof(event)) == -EAGAIN);
-    assert(first.state == TASK_RUNNING && !first.waiting_queue);
-    for (uint32_t i = 0; i < KERNEL_WAIT_QUEUE_MAX; ++i)
-        kernel_wait_queue_remove(&audio_control_waiters, &fillers[i]);
+    assert(audio_control_read_task(&first, &file, &event, sizeof(event)) ==
+           KERNEL_SYSCALL_BLOCKED);
+    assert(first.state == TASK_BLOCKED && first.waiting_queue == &audio_control_waiters);
+    assert(audio_control_waiters.count == AUDIO_CONTROL_WAITERS_TEST + 1u);
+    audio_control_changed(card_id, 0);
+    assert(audio_control_waiters.count == 0u && !audio_control_waiters.head &&
+           !audio_control_waiters.tail);
+    assert(first.state == TASK_READY && !first.waiting_queue);
+    for (uint32_t i = 0; i < AUDIO_CONTROL_WAITERS_TEST; ++i)
+        assert(fillers[i].state == TASK_READY && !fillers[i].waiting_queue);
+    assert(audio_control_read_file(file.audio_control_file, &event, sizeof(event)) ==
+           (int)sizeof(event));
+    assert(audio_control_read_file(other.audio_control_file, &event, sizeof(event)) ==
+           (int)sizeof(event));
     free(fillers);
 
     first.state = TASK_RUNNING;

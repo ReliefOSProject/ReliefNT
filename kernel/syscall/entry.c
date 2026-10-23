@@ -160,6 +160,13 @@ static int task_begin_syscall_io(struct task *task, uint64_t number, int32_t fd)
     return 0;
 }
 
+/**
+ * @brief Dispatch one int 0x80 request while serializing kernel execution.
+ * @param frame Validated syscall frame, updated with the result or restart state.
+ * @return A task for direct user return, or NULL when scheduler handling is required.
+ * @note Bounded TCP maintenance runs under the execution transaction; the
+ *       tick gate limits packet polling to one small batch per timer tick.
+ */
 struct task *syscall_dispatch_frame(struct trap_frame *frame)
 {
     uint64_t number;
@@ -172,6 +179,7 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
     }
     /* Several storage and GUI services still own global scratch buffers. */
     kernel_execution_lock_irqsave(&lock_flags);
+    net_tcp_maintenance();
     /* Drain a small fair batch after taking kernel execution ownership. A
      * final DRM close only queues work, including closes from signal return. */
     drm_vmwgfx_process_retirements(2);

@@ -52,6 +52,7 @@ static bool test_drm_render_ready;
 void *kernel_malloc(size_t size) { return malloc(size); }
 void kernel_free(void *p) { free(p); }
 uint64_t mm_alloc_page(void) { return (uintptr_t)aligned_alloc(4096, 4096); }
+void *mm_phys_to_virt(uint64_t physical) { return (void *)(uintptr_t)physical; }
 void mm_free_page(uint64_t p) { free((void *)(uintptr_t)p); }
 void sched_truncate_file_mappings(const struct storage_node *node, uint64_t size)
 { (void)node; (void)size; abort(); }
@@ -83,7 +84,7 @@ struct task *sched_current_task(void) { return NULL; }
 bool task_in_group(const struct task *task, uint32_t gid, bool real)
 { (void)task; (void)gid; (void)real; abort(); }
 void page_cache_invalidate_node(const struct storage_node *node)
-{ assert(node && (node->flags & STORAGE_NODE_FLAG_EXT2)); }
+{ assert(node && (node->flags & (STORAGE_NODE_FLAG_EXT2 | STORAGE_NODE_FLAG_TMPFS))); }
 uint32_t smp_cpu_count(void) { return 1; }
 int pty_lookup_path(const char *path, struct storage_node *node)
 { (void)path; (void)node; abort(); }
@@ -122,6 +123,16 @@ int main(int argc, char **argv)
 {
     assert(argc == 2);
     load_volume(argv[1], 0, "/");
+    struct storage_node metadata_root;
+    assert(!storage_lookup_path("/", &metadata_root));
+    storage_task_io_owner = 2;
+    storage_set_io_async_context(true);
+    uint64_t mount_flags = UINT64_MAX;
+    /* Mount properties are cached metadata, independent of an in-flight
+     * asynchronous disk transaction owned by another process. */
+    assert(!storage_node_mount_flags(&metadata_root, &mount_flags) && !mount_flags);
+    storage_release_task_io(2);
+    storage_set_io_async_context(false);
     struct storage_node dri;
     test_drm_registered = true;
     assert(storage_lookup_path("/dev/dri", &dri) == 0 &&

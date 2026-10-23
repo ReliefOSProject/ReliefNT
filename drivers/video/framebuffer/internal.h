@@ -181,7 +181,10 @@ struct efi_boot_services {
     struct efi_table_header hdr;
     efi_status_t (*raise_tpl)(uint64_t tpl);
     void (*restore_tpl)(uint64_t tpl);
-    char _pad1[88];
+    char _pad_allocate_pages_through_get_map[24];
+    void *allocate_pool;
+    efi_status_t (__attribute__((ms_abi)) *free_pool)(void *buffer);
+    char _pad_create_event_through_check_event[48];
     efi_status_t (*install_protocol_interface)(void);
     efi_status_t (*reinstall_protocol_interface)(void);
     efi_status_t (*uninstall_protocol_interface)(void);

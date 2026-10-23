@@ -41,7 +41,8 @@ int main(void)
     stack_task.address_space.initial_stack_low = stack_task.stack_low;
     stack_task.limits.as.rlim_cur = LINUX_RLIM_INFINITY;
     uint64_t candidate = stack_task.stack_top - 65536 - 4096;
-    uint64_t cross_pde = (stack_task.stack_top & ~(RELIEFNT_USER_PD_BYTES - 1ULL)) - 4096;
+    const uint64_t page_directory_span = 2ULL * 1024ULL * 1024ULL;
+    uint64_t cross_pde = (stack_task.stack_top & ~(page_directory_span - 1ULL)) - 4096;
     /* The inherited low identity map makes the first fault in the next 2 MiB
      * slot report PRESENT even though no user PTE exists there. */
     assert(task_stack_fault_candidate(&stack_task, cross_pde, 4));

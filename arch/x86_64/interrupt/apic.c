@@ -8,6 +8,8 @@
 #include <reliefnt/apic.h>
 #include <reliefnt/console.h>
 #include <reliefnt/lock.h>
+#include <reliefnt/mm.h>
+#include <reliefnt/paging.h>
 #include <reliefnt/power.h>
 #include <reliefnt/smp.h>
 #include <reliefnt/time.h>
@@ -66,6 +68,7 @@ struct __attribute__((packed)) madt_interrupt_override {
 };
 struct ioapic_info {
     volatile uint32_t *base; uint8_t id; uint32_t gsi_base; uint32_t gsi_count;
+    uint64_t phys;
 };
 struct isa_irq_override {
     uint32_t gsi;
@@ -77,6 +80,7 @@ static bool local_apic_present;
 static bool local_apic_enabled;
 static bool ioapic_present;
 static uintptr_t local_apic_base;
+static uint64_t local_apic_phys;
 static uint32_t bsp_apic_id;
 static uint32_t cpu_apic_ids[SMP_DISCOVERED_MAX];
 static uint32_t cpu_count;
@@ -159,7 +163,8 @@ static void discover_madt(void)
         } else if (entry->type == 1 && entry->length >= 12u && ioapic_count < IOAPIC_MAX) {
             const struct ioapic_desc *desc = (const struct ioapic_desc *)(table + offset + 2u);
             ioapics[ioapic_count] = (struct ioapic_info){
-                (volatile uint32_t *)(uintptr_t)desc->address, desc->id, desc->gsi_base, 24u};
+                (volatile uint32_t *)(uintptr_t)desc->address, desc->id,
+                desc->gsi_base, 24u, desc->address};
             ++ioapic_count;
         } else if (entry->type == 2 && entry->length >= 10u) {
             const struct madt_interrupt_override *override =
@@ -183,6 +188,7 @@ void apic_init(void)
     cpu_count = 0;
     ioapic_count = 0;
     local_apic_enabled = false;
+    local_apic_phys = 0;
     for (uint32_t i = 0; i < 16u; ++i) {
         isa_irq_overrides[i] = (struct isa_irq_override){0};
     }
@@ -197,7 +203,8 @@ void apic_init(void)
         local_apic_base = 0;
     }
     if (local_apic_present) {
-        local_apic_base = (uintptr_t)(base & 0xfffff000ULL);
+        local_apic_phys = base & 0x0000000ffffff000ULL;
+        local_apic_base = (uintptr_t)local_apic_phys;
         /* IA32_APIC_BASE contains an address in bits 12..35, not an APIC
          * identifier.  Treating its high address byte (normally 0xfe for
          * 0xfee00000) as the BSP ID makes SMP startup send INIT/SIPI to the
@@ -221,6 +228,44 @@ void ioapic_init(void)
     ioapic_present = ioapic_count != 0;
     console_info("[reliefnt] IOAPIC %s count=%u\n",
                    ioapic_present ? "detected" : "unavailable", (unsigned)ioapic_count);
+}
+
+/** @brief Rebind retained interrupt-controller MMIO to the supervisor direct map.
+ * @return None. Each supported page is permanently marked UC/NX before its
+ *         stored pointer changes; unsupported controllers are disabled safely.
+ * Call after physical-memory initialization and before IRQ routing, AP startup,
+ * or any user address space can replace low identity leaves.
+ */
+void apic_map_kernel_aliases(void)
+{
+    bool mapped_ioapic = false;
+    if (local_apic_present && local_apic_phys) {
+        void *alias = NULL;
+        if (paging_mmio_uncached(local_apic_phys, 4096))
+            alias = mm_phys_to_virt(local_apic_phys);
+        if (alias) {
+            local_apic_base = (uintptr_t)alias;
+        } else {
+            console_warn("[reliefnt] local APIC direct-map rebind failed phys=0x%llx\n",
+                         (unsigned long long)local_apic_phys);
+            local_apic_base = 0;
+            local_apic_present = false;
+            local_apic_enabled = false;
+        }
+    }
+    for (uint32_t i = 0; i < ioapic_count; ++i) {
+        struct ioapic_info *io = &ioapics[i];
+        void *alias = NULL;
+        if (paging_mmio_uncached(io->phys, 4096))
+            alias = mm_phys_to_virt(io->phys);
+        if (!alias) {
+            console_warn("[reliefnt] IOAPIC direct-map rebind failed phys=0x%llx\n",
+                         (unsigned long long)io->phys);
+        }
+        io->base = (volatile uint32_t *)alias;
+        mapped_ioapic |= alias != NULL;
+    }
+    ioapic_present = mapped_ioapic;
 }
 
 bool apic_available(void) { return local_apic_present; }

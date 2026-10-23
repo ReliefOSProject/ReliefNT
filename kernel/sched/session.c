@@ -216,8 +216,9 @@ uint32_t sched_pty_reference_count(uint32_t pty_id)
         struct task *task = tasks[i];
         if (!task || task->kind != TASK_KIND_USER) continue;
         if (task->pty_id == pty_id) ++count;
-        for (uint32_t fd = 0; fd < SCHED_TASK_PTY_FD_MAX; ++fd) {
-            if (sched_task_fds(task)->pty_fds[fd].used && sched_task_fds(task)->pty_fds[fd].pty_id == pty_id) {
+        for (uint32_t fd = 0; fd < sched_task_pty_capacity(task); ++fd) {
+            const struct task_pty_fd *entry = sched_task_pty_at(task, fd);
+            if (entry->used && entry->pty_id == pty_id) {
                 ++count;
             }
         }
@@ -226,6 +227,13 @@ uint32_t sched_pty_reference_count(uint32_t pty_id)
     return count;
 }
 
+/**
+ * @brief Count live master-endpoint references that prevent PTY session teardown.
+ * @param pty_id Stable PTY session identifier; zero has no references.
+ * @return Number of transfer references and open master aliases.
+ * @note The scheduler task-table scan runs with the scheduler lock held; the
+ * transfer count is sampled before acquiring that lock.
+ */
 uint32_t sched_pty_master_reference_count(uint32_t pty_id)
 {
     uint32_t count = pty_transfer_count(pty_id, 1);
@@ -235,8 +243,8 @@ uint32_t sched_pty_master_reference_count(uint32_t pty_id)
     for (uint32_t i = 0; i < task_count; ++i) {
         struct task *task = tasks[i];
         if (!task || task->kind != TASK_KIND_USER) continue;
-        for (uint32_t fd = 0; fd < SCHED_TASK_PTY_FD_MAX; ++fd) {
-            const struct task_pty_fd *entry = &sched_task_fds(task)->pty_fds[fd];
+        for (uint32_t fd = 0; fd < sched_task_pty_capacity(task); ++fd) {
+            const struct task_pty_fd *entry = sched_task_pty_at(task, fd);
             if (entry->used && entry->pty_id == pty_id &&
                 entry->endpoint == TASK_PTY_ENDPOINT_MASTER) ++count;
         }

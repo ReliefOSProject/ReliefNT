@@ -91,7 +91,7 @@
 #define STARTUP_DB_ENTRY_MAX 64U
 #define STARTUP_DENIAL_MAX 64U
 #define STARTUP_REQUEST_MAX 16U
-#define TASK_EPOLL_MAX_ENTRIES 128u
+#define TASK_EPOLL_INITIAL_ENTRIES 16u
 #define LINUX_RWF_HIPRI 0x00000001u
 
 struct task_timerfd {
@@ -102,6 +102,12 @@ struct task_timerfd {
     uint64_t expirations;
 };
 
+/**
+ * @brief One Linux epoll registration, keyed by descriptor and OFD identity.
+ * @note An empty interest mask still observes unconditional POLLERR/POLLHUP.
+ * The disabled bit represents EPOLLONESHOT delivery without destroying the
+ * configured mask needed by a later EPOLL_CTL_MOD rearm.
+ */
 struct task_epoll_entry {
     int32_t fd;
     uint32_t events;
@@ -109,12 +115,34 @@ struct task_epoll_entry {
     uint32_t ready;
     uint64_t generation;
     uint32_t active;
+    uint32_t disabled;
+    struct task_epoll_watch *watch;
 };
 
+/**
+ * @brief Dynamically sized storage for an epoll OFD's active registrations.
+ * @note The vector and each watch node are owned by this epoll; watched target
+ * descriptions are weakly referenced by reverse lists and never kept alive.
+ */
 struct task_epoll {
     uint32_t entries;
-    uint32_t reserved;
-    struct task_epoll_entry item[TASK_EPOLL_MAX_ENTRIES];
+    uint32_t capacity;
+    struct task_epoll_entry *item;
+};
+
+/**
+ * @brief Link one epoll registration to the watched OFD's final-release list.
+ * @note The target pointer is borrowed. Descriptor, SCM_RIGHTS, and active I/O
+ * references keep it alive; the final-release path detaches this watch before
+ * freeing the target. This node itself does not own either the target or epoll.
+ */
+struct task_epoll_watch {
+    struct task_epoll_watch *next;
+    struct task_epoll *epoll;
+    struct task_file *file;
+    struct task_pty_description *pty;
+    struct task_pty_fd pty_alias;
+    uint32_t slot;
 };
 
 
@@ -531,18 +559,6 @@ struct exec_params_kernel {
 
 
 
-#define LINUX_SELECT_MAX_FDS 1024U
-
-
-
-
-
-
-
-
-
-
-
 /* Translate the Linux fd_set ABI to the kernel's poll implementation. The
  * scheduler already owns the blocking/retry path; select only needs the
  * fixed-width bitsets and native timeout conversion around it. */
@@ -571,16 +587,27 @@ struct exec_params_kernel {
 extern struct reliefos_flock_entry reliefos_flocks[RELIEFOS_FLOCK_MAX];
 
 /**
- * @brief Remove a descriptor from every epoll set owned by a task.
- * @param task Descriptor-table owner.
- * @param fd Descriptor being closed or replaced.
- *
- * Linux removes an epoll registration when the last descriptor reference is
- * closed. Keeping a numeric fd here would otherwise let a later open reuse
- * the number while dispatching the old callback pointer, which is fatal for
- * Xorg's input thread during VT return.
+ * @brief Remove all epoll registrations borrowing a final-release file OFD.
+ * @param description Stable canonical file description with zero references;
+ *        the caller invokes this before releasing its resources or freeing it.
+ * @note The kernel execution transaction serializes this callback with epoll
+ * probes, and each linked watch is unlinked and freed before this returns.
  */
-void task_epoll_remove_fd(struct task *task, int fd);
+void task_epoll_remove_file_description(struct task_file *description);
+
+/**
+ * @brief Remove all epoll registrations borrowing a final-release PTY OFD.
+ * @param description Stable PTY description whose total references reached zero.
+ * @note The caller invokes this before dropping the terminal transfer reference
+ * or freeing the description; probes and final release share the execution lock.
+ */
+void task_epoll_remove_pty_description(struct task_pty_description *description);
+
+/**
+ * @brief Release an epoll instance and its dynamically allocated watch storage.
+ * @param epoll Heap-owned epoll state; null is ignored.
+ */
+void task_epoll_destroy(struct task_epoll *epoll);
 
 uint64_t linux_stat_inode(const char *path, const struct reliefos_stat *st);
 
@@ -649,33 +676,66 @@ void syscall_flock_release_owner(struct task_file *owner);
 int64_t syscall_flock(uint64_t fd_arg, uint32_t operation);
 
 /**
- * Clear task file.
- * @param file Value supplied by the caller.
+ * @brief Release a descriptor or canonical open-file description and its resources.
+ * @param file Descriptor slot or stable OFD to clear; null and unused entries are ignored.
+ * @return Backing inode release result, or zero when no inode release is needed.
+ * @note A final canonical release detaches weak epoll watches before releasing
+ * OFD-owned resources. SCM queue and in-flight I/O references use this same path.
  */
 int clear_task_file_result(struct task_file *file);
 
+/**
+ * @brief Clear a descriptor slot and release its resources.
+ * @param file Descriptor or canonical OFD slot; null is ignored.
+ */
 void clear_task_file(struct task_file *file);
 
+/**
+ * @brief Add a shared descriptor reference to a destination slot.
+ * @param destination Unused slot to initialize; must not alias source.
+ * @param source Live descriptor or canonical OFD.
+ * @return Zero on success, -EBADF for invalid arguments, or -ENOMEM if promotion fails.
+ */
 int task_file_reference(struct task_file *destination, struct task_file *source);
 
+/**
+ * @brief Retain a transient reference to the source's stable canonical OFD.
+ * @param source Live descriptor or description, serialized against close.
+ * @return Canonical OFD with one additional reference, or null for invalid input
+ * or promotion allocation failure.
+ */
 struct task_file *task_file_get(struct task_file *source);
 
+/**
+ * @brief Drop a transient canonical OFD reference and perform final cleanup.
+ * @param description Canonical file description returned by task_file_get().
+ * @note Final release detaches weak epoll registrations before freeing resources.
+ */
 void task_file_put(struct task_file *description);
 
 /**
- * Syscall release task files.
- * @param task Value supplied by the caller.
+ * @brief Release a final task's descriptor entries and their backing vectors.
+ * @param task Task whose file-table reference is already known to be final; NULL is accepted.
  */
 void syscall_release_task_files(struct task *task);
 
 /**
- * @brief Retains pipe endpoint references after fork copies descriptor entries by value.
+ * @brief Retain copied pipe and PTY endpoint references in a fork child's private table.
  * @param parent Source process, required to prevent accidental use on detached task records.
- * @param child Fork child whose copied pipe endpoints require new references.
- * @return Zero on success or a negative errno-style result for invalid arguments.
+ * @param child Fork child whose copied endpoint entries require new references.
+ * @return Zero on success or a negative errno-style allocation/reference error.
+ * @note PTY alias slots are reserved before references are copied. If this fails
+ * before the copy pass, no child PTY references are published; clone rollback owns
+ * and releases any detached child vector.
  */
 int syscall_clone_task_files(const struct task *parent, struct task *child);
 
+/**
+ * @brief Detach one task from a shared descriptor table while retaining each open reference.
+ * @param task Task whose current descriptor table is shared; required.
+ * @return Zero when already private or after a successful copy, otherwise a negative
+ * allocation or terminal-reference error with the shared table still installed.
+ */
 int syscall_unshare_task_files(struct task *task);
 
 /**
@@ -686,6 +746,13 @@ void syscall_close_cloexec_files(struct task *task);
 
 struct task_file *task_file_for_fd(struct task *task, int fd);
 
+/**
+ * @brief Resolve the stable OFD bound to the current syscall or descriptor.
+ * @param task Current task; NULL returns NULL.
+ * @param fd Linux descriptor number whose in-flight syscall pin may override lookup.
+ * @return Borrowed stable file description, or NULL when the descriptor is not a file.
+ * @note Caller serializes with descriptor mutation; the returned pointer is not retained.
+ */
 struct task_file *task_file_for_io(struct task *task, int fd);
 
 /**
@@ -697,10 +764,10 @@ void task_fifo_cancel(struct task *task);
 void task_release_syscall_file(struct task *task);
 
 /**
- * Task pty fd for fd.
- * @param task Value supplied by the caller.
- * @param fd Value supplied by the caller.
- * @return The value or status produced by the operation.
+ * @brief Find the PTY alias corresponding to a Linux descriptor.
+ * @param task Descriptor-table owner; NULL is accepted.
+ * @param fd Linux descriptor number.
+ * @return Borrowed alias entry or NULL when no PTY alias matches.
  */
 struct task_pty_fd *task_pty_fd_for_fd(struct task *task, int fd);
 
@@ -739,19 +806,63 @@ int task_fd_descriptor_flags(struct task *task, int fd);
  */
 int task_fd_set_descriptor_flags(struct task *task, int fd, uint32_t flags);
 
+/**
+ * @brief Resolve a descriptor to a Unix98 master/slave endpoint alias.
+ * @param task Descriptor-table owner; NULL is accepted.
+ * @param fd Linux descriptor number.
+ * @return Borrowed endpoint alias or NULL for non-endpoint aliases.
+ */
 struct task_pty_fd *task_pty_endpoint_for_fd(struct task *task, int fd);
 
+/**
+ * @brief Resolve the PTY alias used by the current syscall's I/O path.
+ * @param task Current syscall task; NULL is accepted.
+ * @param fd Linux descriptor number.
+ * @return Borrowed syscall pin or endpoint entry, otherwise NULL.
+ */
 struct task_pty_fd *task_pty_for_io(struct task *task, int fd);
 
+/**
+ * @brief Read status flags from a PTY open-file description or unpromoted alias.
+ * @param entry PTY descriptor alias; caller supplies a live entry.
+ * @return Shared Linux status flag word.
+ */
 uint32_t task_pty_status(const struct task_pty_fd *entry);
 
+/**
+ * @brief Promote one alias to a shared open-file description and retain its PTY.
+ * @param entry Live alias whose descriptor reference is promoted in place.
+ * @return Zero on success or a negative allocation/session-reference error.
+ */
 int task_pty_promote(struct task_pty_fd *entry);
 
+/**
+ * @brief Release one PTY alias and its description reference.
+ * @param entry Alias entry; null and already released entries are ignored.
+ * @note Final total release removes weak epoll watches before dropping terminal
+ * ownership or freeing the description.
+ */
 void task_pty_release_entry(struct task_pty_fd *entry);
 
+/**
+ * @brief Allocate a master or slave PTY endpoint descriptor.
+ * @param task Descriptor-table owner; required.
+ * @param pty_id Live stable PTY session ID.
+ * @param endpoint Master or slave endpoint kind.
+ * @param flags Open status and close-on-exec flags.
+ * @return New descriptor or negative errno; failure leaves no live alias.
+ */
 int task_pty_endpoint_fd(struct task *task, uint32_t pty_id,
-                                uint32_t endpoint, uint32_t flags);
+                         uint32_t endpoint, uint32_t flags);
 
+/**
+ * @brief Parse a live numeric devpts path or resolve the active-VT alias.
+ * @param path NUL-terminated endpoint path; NULL is rejected.
+ * @param pty_id Writable result for the recognized active PTY identifier.
+ * @return One for a recognized live endpoint path, zero for malformed, inactive,
+ * or out-of-range paths.
+ * @note Numeric PTY names are bounded by the signed Linux PTY identifier range.
+ */
 int task_pty_endpoint_path(const char *path, uint32_t *pty_id);
 
 int64_t syscall_eventfd_create(uint64_t initial, uint32_t flags);
@@ -775,6 +886,13 @@ int64_t syscall_memfd_create(uint64_t name_ptr, uint32_t flags);
  */
 int task_pty_stream_for_fd(struct task *task, int fd);
 
+/**
+ * @brief Materialize and promote an implicit PTY stream descriptor if needed.
+ * @param task Descriptor-table owner; required.
+ * @param fd Existing implicit stream or PTY alias descriptor.
+ * @param out Receives a borrowed live alias entry; later PTY table growth can invalidate it.
+ * @return Zero on success or negative errno without losing descriptor state.
+ */
 int task_pty_ensure_fd(struct task *task, int fd, struct task_pty_fd **out);
 
 /**
@@ -832,26 +950,42 @@ int task_allocate_fd(struct task *task, int minimum, struct task_file **slot);
 void task_discard_file_fd(struct task *task, int fd);
 
 /**
- * Task pty duplicate fd.
- * @param task Value supplied by the caller.
- * @param old_fd Value supplied by the caller.
- * @param minimum_fd Value supplied by the caller.
- * @param flags Identifier or flags controlling the operation.
- * @return The value or status produced by the operation.
+ * @brief Duplicate a PTY descriptor at or above a requested minimum.
+ * @param task Descriptor-table owner; required.
+ * @param old_fd Existing PTY or implicit stream descriptor.
+ * @param minimum_fd Inclusive lowest allowed descriptor number.
+ * @param flags Per-descriptor flags; FD_CLOEXEC is retained.
+ * @return New descriptor or negative errno without altering source ownership.
  */
 int task_pty_duplicate_fd(struct task *task, int old_fd, int minimum_fd,
-                                 uint32_t flags);
+                          uint32_t flags);
 
+/**
+ * @brief Retain a PTY alias for a Unix-domain SCM_RIGHTS transfer.
+ * @param task Descriptor-table owner; required.
+ * @param fd Open PTY or implicit PTY stream descriptor.
+ * @param out Caller-owned transfer entry receiving one retained reference.
+ * @return Zero on success or negative errno without changing output ownership.
+ */
 int task_pty_export_fd(struct task *task, int fd, struct task_pty_fd *out);
 
+/**
+ * @brief Import a retained PTY transfer entry into a task descriptor table.
+ * @param task Receiving descriptor-table owner; required.
+ * @param source Caller-owned live transfer entry; it remains owned by caller.
+ * @param flags Per-descriptor flags to install on the received alias.
+ * @return New descriptor or negative errno; source ownership is unchanged.
+ * @note The source is snapshotted before possible table growth. If it points into
+ * this same task's alias vector, growth may invalidate the caller's borrowed pointer.
+ */
 int task_pty_import_fd(struct task *task, const struct task_pty_fd *source, uint32_t flags);
 
 /**
- * Task pty dup2 fd.
- * @param task Value supplied by the caller.
- * @param old_fd Value supplied by the caller.
- * @param new_fd Value supplied by the caller.
- * @return The value or status produced by the operation.
+ * @brief Replace a target descriptor with a retained PTY alias.
+ * @param task Descriptor-table owner; required.
+ * @param old_fd Existing PTY or implicit stream descriptor.
+ * @param new_fd Target descriptor, required to be below RLIMIT_NOFILE.
+ * @return Target descriptor or negative errno without losing source ownership.
  */
 int task_pty_dup2_fd(struct task *task, int old_fd, int new_fd);
 
@@ -866,11 +1000,30 @@ int task_pty_dup2_fd(struct task *task, int old_fd, int new_fd);
  */
 int alloc_task_fd(struct task *task, const struct storage_node *node, uint32_t flags, const char *path);
 
+/**
+ * @brief Replace a descriptor with a retained source description under the execution lock.
+ * @param task Descriptor-table owner; required.
+ * @param old_fd Existing source descriptor whose description remains shared.
+ * @param new_fd Destination descriptor below RLIMIT_NOFILE.
+ * @return Destination descriptor, or negative errno preserving the target on
+ * failure. Replacement releases the old target and clears FD_CLOEXEC unless
+ * the source and destination numbers are equal.
+ */
 int task_dup2_fd(struct task *task, int old_fd, int new_fd);
 
 int task_duplicate_file_fd(struct task *task, int old_fd, int minimum_fd,
                                   uint32_t fd_flags);
 
+/**
+ * @brief Retain selected parent descriptors as a child's standard streams.
+ * @param parent Source task; required when any requested descriptor is nonnegative.
+ * @param child Destination task whose stdio aliases are replaced as needed.
+ * @param stdin_fd Source descriptor for child fd 0, or a negative value to leave it alone.
+ * @param stdout_fd Source descriptor for child fd 1, or a negative value to leave it alone.
+ * @param stderr_fd Source descriptor for child fd 2, or a negative value to leave it alone.
+ * @return Zero on success or a negative errno; retained PTY aliases are rolled back
+ * if the destination table cannot grow.
+ */
 int syscall_inherit_task_fds(struct task *parent, struct task *child,
                              int stdin_fd, int stdout_fd, int stderr_fd);
 
@@ -1153,16 +1306,58 @@ int64_t syscall_poll_impl(struct task *task, struct pollfd *fds,
                                  uint32_t nfds, int64_t timeout_ms,
                                  uint64_t generation);
 
+/**
+ * @brief Test an epoll OFD for eligible events without consuming its state.
+ * @param task Calling task used for the underlying readiness probes.
+ * @param file Epoll open-file description to inspect.
+ * @return True when an armed registration is ready, otherwise false.
+ * @note Nested epoll registrations are unsupported; this reports only direct
+ *       target readiness and preserves edge/one-shot state.
+ */
+bool task_epoll_poll_ready(struct task *task, struct task_file *file);
+
 int64_t syscall_poll(uint64_t fds_ptr, uint64_t count, int64_t timeout_ms);
 
+/**
+ * @brief Create an epoll descriptor with an initially empty dynamic watch set.
+ * @param size Linux legacy creation size hint.
+ * @param flags Supported creation flags.
+ * @return Descriptor or negative Linux errno.
+ */
 int64_t syscall_epoll_create(uint64_t size, uint32_t flags);
 
+/**
+ * @brief Modify an epoll descriptor's watched file set.
+ * @param epfd_arg Epoll descriptor number.
+ * @param op_arg Linux EPOLL_CTL operation.
+ * @param fd_arg Watched descriptor number.
+ * @param event_ptr User event pointer for ADD/MOD; unused for DEL.
+ * @return Zero on success or negative Linux errno.
+ */
 int64_t syscall_epoll_ctl(uint64_t epfd_arg, uint64_t op_arg,
                                  uint64_t fd_arg, uint64_t event_ptr);
 
+/**
+ * @brief Wait for events from an epoll descriptor.
+ * @param epfd_arg Epoll descriptor number.
+ * @param events_ptr Writable array of output events.
+ * @param maxevents_arg Capacity of the output array.
+ * @param timeout_ms Linux millisecond timeout.
+ * @return Event count, zero on timeout or negative Linux errno/block token.
+ */
 int64_t syscall_epoll_wait(uint64_t epfd_arg, uint64_t events_ptr,
                                   uint64_t maxevents_arg, int64_t timeout_ms);
 
+/**
+ * @brief Wait using epoll_pwait2's optional timespec and signal-mask arguments.
+ * @param epfd Epoll descriptor number.
+ * @param events Writable output event array.
+ * @param maxevents Output event capacity.
+ * @param timeout Optional Linux timespec pointer.
+ * @param sigmask Optional signal-mask pointer.
+ * @param sigsetsize Signal-mask byte size.
+ * @return Event count, zero on timeout or negative Linux errno.
+ */
 int64_t syscall_epoll_pwait2(uint64_t epfd, uint64_t events, uint64_t maxevents,
                                     uint64_t timeout, uint64_t sigmask, uint64_t sigsetsize);
 
@@ -1172,6 +1367,16 @@ int64_t syscall_sysinfo(uint64_t info_ptr);
 
 int64_t syscall_times(uint64_t tms_ptr);
 
+/**
+ * @brief Implement select/pselect with dynamically sized fd bitmaps.
+ * @param nfds_arg Highest descriptor plus one, in the Linux signed-int ABI.
+ * @param read_ptr Optional read fd_set pointer.
+ * @param write_ptr Optional write fd_set pointer.
+ * @param except_ptr Optional exception fd_set pointer.
+ * @param timeout_ptr Optional timeval/timespec pointer.
+ * @param pselect_timeout True selects a timespec without timeout copyback.
+ * @return Ready descriptor count, zero on timeout or negative Linux errno/token.
+ */
 int64_t syscall_select_common(uint64_t nfds_arg, uint64_t read_ptr,
                                      uint64_t write_ptr, uint64_t except_ptr,
                                      uint64_t timeout_ptr, bool pselect_timeout);

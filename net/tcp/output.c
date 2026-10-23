@@ -42,6 +42,22 @@ uint32_t net_socket_select_window(const struct net_socket *socket)
     return window > remaining ? window : remaining;
 }
 
+/**
+ * @brief Build and transmit one TCP segment with a current local receive window.
+ * @param dst_mac Ethernet destination address.
+ * @param src_ip Host-order local IPv4 source address.
+ * @param dst_ip Host-order peer IPv4 destination address.
+ * @param src_port Local TCP port.
+ * @param dst_port Peer TCP port.
+ * @param seq TCP sequence number.
+ * @param ack TCP acknowledgment number.
+ * @param flags TCP control flags.
+ * @param payload Segment payload, or null for no payload.
+ * @param payload_len Payload byte count.
+ * @return Driver result, or a negative error when the frame cannot be sent.
+ * @note The receiver window is read from the matching stable socket under the
+ * network execution transaction, then published only after successful transmit.
+ */
 int net_send_tcp_to_mac(const uint8_t *dst_mac, uint32_t src_ip,
                                uint32_t dst_ip, uint16_t src_port,
                                uint16_t dst_port, uint32_t seq,
@@ -82,8 +98,7 @@ int net_send_tcp_to_mac(const uint8_t *dst_mac, uint32_t src_ip,
     tcp[13] = flags;
     uint32_t window = 8192u;
     struct net_socket *receiver = 0;
-    for (unsigned i = 0; i < RELIEFOS_NET_SOCKET_MAX; ++i) {
-        struct net_socket *s = &net_sockets[i];
+    for (struct net_socket *s = net_sockets; s; s = s->registry_next) {
         if (s->used && s->local_port == src_port && s->remote_port == dst_port &&
             s->remote_ip == dst_ip) {
             receiver = s;

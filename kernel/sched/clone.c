@@ -100,6 +100,16 @@ void sched_vfork_child_done(struct task *child)
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
 }
 
+/**
+ * @brief Create a child task and clone or share the caller's kernel-managed state.
+ * @param parent_frame Saved user register frame to copy into the child.
+ * @param flags Supported Linux clone flags and optional exit signal.
+ * @param stack New user stack pointer, or zero to inherit the caller's stack.
+ * @param parent_tid Optional user address receiving the child ID in the parent.
+ * @param child_tid Optional user address receiving the child ID in the child.
+ * @param tls User TLS base when CLONE_SETTLS is requested.
+ * @return Child process ID, or a negative errno if creation fails.
+ */
 int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flags,
                            uint64_t stack, uint64_t parent_tid,
                            uint64_t child_tid, uint64_t tls)
@@ -179,6 +189,9 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
     child->fd_table.file_extra = NULL;
     child->fd_table.file_extra_count = 0;
     child->fd_table.file_extra_capacity = 0;
+    child->fd_table.pty_fds = NULL;
+    child->fd_table.pty_fd_count = 0;
+    child->fd_table.pty_fd_capacity = 0;
     task_copy_cwd(child, sched_task_cwd(parent));
     task_copy_identity_text(child->root_dir, sizeof(child->root_dir), sched_task_root(parent));
     *sched_task_umask(child) = *sched_task_umask(parent);
@@ -233,6 +246,9 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
     for (uint32_t i = 0; i < SCHED_TASK_TIMER_MAX; ++i)
         child->timers[i] = (struct task_posix_timer){0};
     child->waiting_queue = NULL;
+    child->wait_next = NULL;
+    child->wait_prev = NULL;
+    child->wait_minimum = 0;
     child->socket_receive_file = NULL;
     child->socket_receive_done = 0;
     child->socket_receive_message = child->socket_receive_control_capacity = 0;
@@ -397,7 +413,10 @@ fail:
     if (child->shared_files) --child->shared_files->references;
     else {
         if (files_retained) syscall_release_task_files(child);
-        sched_task_file_release(child);
+        else {
+            sched_task_file_release(child);
+            sched_task_pty_release(child);
+        }
     }
     kernel_free(child->exec_argv);
     kernel_free(child->exec_envp);

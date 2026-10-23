@@ -28,6 +28,8 @@ uint64_t mm_alloc_page(void)
     }
     abort();
 }
+void *mm_phys_to_virt(uint64_t physical) { return (void *)(uintptr_t)physical; }
+uint64_t mm_virt_to_phys(const void *address) { return (uint64_t)(uintptr_t)address; }
 void mm_retain_page(uint64_t p)
 {
     for (unsigned i = 0; i < 2048; ++i) if (pages[i].address == p && pages[i].refs) {
@@ -48,6 +50,7 @@ int page_cache_owns(uint64_t p) { (void)p; return 0; }
 void page_cache_release(uint64_t p) { (void)p; abort(); }
 void x86_64_load_cr3(uint64_t p) { (void)p; }
 void x86_64_invlpg(uint64_t p) { (void)p; }
+void smp_flush_user_tlb(void) {}
 struct task *sched_current_task(void) { return &caller; }
 struct task *sched_find(uint32_t pid) { return pid == 10 ? &caller : pid == 20 ? &target : NULL; }
 uint32_t sched_task_vma_capacity(const struct task *task) { (void)task; return SCHED_TASK_VMA_MAX; }

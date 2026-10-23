@@ -584,7 +584,11 @@ int gpt_find_esp(void)
     if (!phys) {
         return -12;
     }
-    uint8_t *table = (uint8_t *)(uintptr_t)phys;
+    uint8_t *table = (uint8_t *)mm_phys_to_virt(phys);
+    if (!table) {
+        mm_free_pages(phys, (total_sectors + 7u) / 8u);
+        return -12;
+    }
     ret = storage_read_sectors(hdr->partition_entries_lba, total_sectors, table);
     if (ret < 0) {
         mm_free_pages(phys, (total_sectors + 7u) / 8u);

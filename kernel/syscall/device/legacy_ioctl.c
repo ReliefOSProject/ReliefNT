@@ -249,19 +249,10 @@ int64_t syscall_legacy_ioctl(uint64_t number, uint64_t a0, uint64_t a1, uint64_t
             return 0;
         }
         if (a1 == FBIOGET_FSCREENINFO) {
-            struct fb_fix_screeninfo info = {0};
+            struct fb_fix_screeninfo info;
             if (!user_range_ok(a2, sizeof(info))) return -RELIEFOS_EFAULT;
-            copy_text(info.id, sizeof(info.id), "leonos-fb");
-            info.smem_start = (uint64_t)(uintptr_t)fb->pixels;
-            /* Linux fbdev semantics: smem_len is the total video memory,
-             * stable across mode sets, so an existing mapping never becomes
-             * too small when the mode changes. */
-            info.smem_len = fb->max_bytes ? fb->max_bytes
-                                         : fb->pitch * fb->height;
-            info.type = FB_TYPE_PACKED_PIXELS;
-            info.visual = fb->type == MULTIBOOT2_FRAMEBUFFER_TYPE_RGB
-                              ? FB_VISUAL_TRUECOLOR : FB_VISUAL_PSEUDOCOLOR;
-            info.line_length = fb->pitch;
+            if (!framebuffer_fbdev_get_fix_info(fb, &info))
+                return -RELIEFOS_EIO;
             *(struct fb_fix_screeninfo *)(uintptr_t)a2 = info;
             return 0;
         }

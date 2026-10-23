@@ -12,12 +12,21 @@
 #include <reliefnt/sysv_shm.h>
 #include <reliefos/fs_abi.h>
 
-/* A 64-stage shell pipeline owns 63 pipes simultaneously.  Keep an extra
- * ring sentinel byte so the advertised capacity is usable. */
-#define TASK_PIPE_MAX 256u
-#define TASK_PIPE_CAP 65535u
+/* Linux's default is sixteen pages. Capacity is per pipe, not a global pool. */
 #define TASK_PIPE_RING_CAP (TASK_PIPE_CAP + 1u)
 #define TASK_PIPE_BUF 4096u
+#define TASK_PIPE_PAGE 4096u
+#define TASK_PIPE_USER_MAX (1024u * 1024u)
+#define TASK_PIPE_USER_SOFT_PAGES 16384u
+
+struct pipe_user {
+    struct pipe_user *next;
+    uint32_t uid;
+    uint32_t pipes;
+    uint64_t pages;
+};
+
+static struct pipe_user *pipe_users;
 
 struct task_pipe {
     uint8_t used;
@@ -30,12 +39,90 @@ struct task_pipe {
     struct storage_node node;
     uint32_t head;
     uint32_t tail;
-    uint8_t data[TASK_PIPE_RING_CAP];
+    uint32_t capacity;
+    uint8_t *data;
+    struct task_pipe *next;
+    struct pipe_user *owner;
     struct kernel_wait_queue wait_read;
     struct kernel_wait_queue wait_write;
 };
 
-static struct task_pipe *task_pipes[TASK_PIPE_MAX];
+static struct task_pipe *task_pipes;
+
+/** @brief Check Linux pipe resource-limit privilege in the current credentials.
+ * @return True for CAP_SYS_RESOURCE or CAP_SYS_ADMIN, false without a current task.
+ */
+static bool task_pipe_privileged(void)
+{
+    const struct task *task = sched_current_task();
+    return task && (task->cap_effective & ((1ULL << CAP_SYS_RESOURCE) | (1ULL << CAP_SYS_ADMIN)));
+}
+
+/** @brief Allocate a stable pipe object, ring and per-UID accounting entry.
+ * @param node Optional FIFO identity, NULL for an anonymous pipe.
+ * @param error Negative error output on failure; must be writable.
+ * @return Published object under execution ownership, or NULL with no resources retained.
+ */
+static struct task_pipe *task_pipe_create(const struct storage_node *node, int *error)
+{
+    const struct task *task = sched_current_task();
+    uint32_t uid = task ? task->uid : 0;
+    struct pipe_user *owner = pipe_users;
+    while (owner && owner->uid != uid) owner = owner->next;
+    bool new_owner = !owner;
+    if (new_owner) {
+        owner = kernel_malloc(sizeof(*owner));
+        if (!owner) { *error = -RELIEFOS_ENOMEM; return NULL; }
+        *owner = (struct pipe_user){.uid = uid};
+    }
+    uint32_t capacity = !task_pipe_privileged() && owner->pages >= TASK_PIPE_USER_SOFT_PAGES
+                            ? 2u * TASK_PIPE_PAGE : TASK_PIPE_CAP;
+    struct task_pipe *pipe = kernel_malloc(sizeof(*pipe));
+    if (!pipe) { if (new_owner) kernel_free(owner); *error = -RELIEFOS_ENOMEM; return NULL; }
+    *pipe = (struct task_pipe){.used = 1, .capacity = capacity, .owner = owner};
+    pipe->data = kernel_malloc((size_t)capacity + 1u);
+    if (!pipe->data) {
+        kernel_free(pipe); if (new_owner) kernel_free(owner);
+        *error = -RELIEFOS_ENOMEM; return NULL;
+    }
+    kernel_wait_queue_init(&pipe->wait_read);
+    kernel_wait_queue_init(&pipe->wait_write);
+    pipe->handle = kernel_object_insert(kernel_objects(), pipe, KERNEL_OBJECT_PIPE);
+    if (!pipe->handle) {
+        kernel_free(pipe->data); kernel_free(pipe); if (new_owner) kernel_free(owner);
+        *error = -RELIEFOS_ENFILE; return NULL;
+    }
+    if (node) { pipe->named = true; pipe->node = *node; }
+    if (new_owner) { owner->next = pipe_users; pipe_users = owner; }
+    ++owner->pipes;
+    owner->pages += capacity / TASK_PIPE_PAGE;
+    pipe->next = task_pipes;
+    task_pipes = pipe;
+    return pipe;
+}
+
+/** @brief Unlink and free an unreferenced pipe and its ring under execution ownership.
+ * @param pipe Live object with no read or write endpoint references.
+ */
+static void task_pipe_destroy(struct task_pipe *pipe)
+{
+    struct task_pipe **link = &task_pipes;
+    while (*link && *link != pipe) link = &(*link)->next;
+    if (*link) *link = pipe->next;
+    (void)kernel_object_remove(kernel_objects(), pipe->handle, KERNEL_OBJECT_PIPE, NULL);
+    if (pipe->owner) {
+        struct pipe_user *owner = pipe->owner;
+        owner->pages -= pipe->capacity / TASK_PIPE_PAGE;
+        if (!--owner->pipes) {
+            struct pipe_user **user = &pipe_users;
+            while (*user && *user != owner) user = &(*user)->next;
+            if (*user) *user = owner->next;
+            kernel_free(owner);
+        }
+    }
+    kernel_free(pipe->data);
+    kernel_free(pipe);
+}
 
 static struct task_pipe *task_pipe_for_file(const struct task_file *file)
 {
@@ -44,6 +131,47 @@ static struct task_pipe *task_pipe_for_file(const struct task_file *file)
     }
     return (struct task_pipe *)kernel_object_lookup(kernel_objects(), file->aux,
                                                     KERNEL_OBJECT_PIPE);
+}
+
+/** @brief Apply Linux pipe sizing while retaining byte order and per-UID accounting.
+ * @param file Pinned pipe open-file description under execution ownership.
+ * @param setting True to set capacity, false to query it.
+ * @param bytes Requested unsigned int capacity; zero rounds up to one page.
+ * @return Capacity or negative EBADF, EINVAL, EPERM, EBUSY, or ENOMEM. On
+ * failure the ring, buffered bytes and accounting remain unchanged.
+ */
+int64_t task_pipe_capacity(struct task_file *file, bool setting, uint32_t bytes)
+{
+    struct task_pipe *pipe = task_pipe_for_file(file);
+    if (!pipe) return -RELIEFOS_EBADF;
+    if (!setting) return pipe->capacity;
+    if (bytes > (1u << 30)) return -RELIEFOS_EINVAL;
+    uint32_t capacity = TASK_PIPE_PAGE;
+    while (capacity < bytes) capacity <<= 1;
+    if (!task_pipe_privileged() && capacity > TASK_PIPE_USER_MAX) return -RELIEFOS_EPERM;
+    uint32_t used = (pipe->head + pipe->capacity + 1u - pipe->tail) % (pipe->capacity + 1u);
+    if (used > capacity) return -RELIEFOS_EBUSY;
+    if (capacity == pipe->capacity) return capacity;
+    if (capacity > pipe->capacity && pipe->owner && !task_pipe_privileged() &&
+        pipe->owner->pages + (capacity - pipe->capacity) / TASK_PIPE_PAGE > TASK_PIPE_USER_SOFT_PAGES)
+        return -RELIEFOS_EPERM;
+    uint8_t *data = kernel_malloc((size_t)capacity + 1u);
+    if (!data) return -RELIEFOS_ENOMEM;
+    uint32_t first = pipe->capacity + 1u - pipe->tail;
+    if (first > used) first = used;
+    __builtin_memcpy(data, pipe->data + pipe->tail, first);
+    if (used > first) __builtin_memcpy(data + first, pipe->data, used - first);
+    uint8_t *old = pipe->data;
+    if (pipe->owner)
+        pipe->owner->pages = pipe->owner->pages - pipe->capacity / TASK_PIPE_PAGE + capacity / TASK_PIPE_PAGE;
+    pipe->data = data;
+    pipe->capacity = capacity;
+    pipe->tail = 0;
+    pipe->head = used;
+    kernel_free(old);
+    (void)kernel_wait_queue_wake_all(&pipe->wait_write);
+    kernel_poll_readiness_notify();
+    return capacity;
 }
 
 /**
@@ -82,23 +210,19 @@ void task_pipe_release(struct task_file *file)
         if (!pipe->readers) (void)kernel_wait_queue_wake_all(&pipe->wait_write);
     }
     if (!pipe->readers && !pipe->writers) {
-        void *removed = NULL;
         (void)kernel_wait_queue_wake_all(&pipe->wait_read);
         (void)kernel_wait_queue_wake_all(&pipe->wait_write);
-        kernel_object_remove(kernel_objects(), file->aux, KERNEL_OBJECT_PIPE, &removed);
-        if (removed) {
-            for (uint32_t i = 0; i < TASK_PIPE_MAX; ++i) {
-                if (task_pipes[i] == (struct task_pipe *)removed) {
-                    task_pipes[i] = NULL;
-                    break;
-                }
-            }
-            kernel_free(removed);
-        }
+        task_pipe_destroy(pipe);
     }
     kernel_poll_readiness_notify();
 }
 
+/** @brief Allocate one descriptor and retain its pipe endpoint on success.
+ * @param task Owning task under execution ownership.
+ * @param pipe_handle Live generation-checked pipe handle.
+ * @param write_end Nonzero for the write endpoint, zero for the read endpoint.
+ * @return New descriptor or negative EINVAL/descriptor-allocation error.
+ */
 static int alloc_task_pipe_fd(struct task *task, uint32_t pipe_handle, int write_end)
 {
     if (!task || !kernel_object_lookup(kernel_objects(), pipe_handle, KERNEL_OBJECT_PIPE))
@@ -127,24 +251,24 @@ int task_pipe_read(struct task_file *file, void *buffer, uint32_t length)
     bool was_full;
     if (!pipe || (file->flags & RELIEFOS_O_ACCMODE) == RELIEFOS_O_WRONLY) return -RELIEFOS_EBADF;
     if (length == 0) return 0;
-    was_full = (pipe->head + 1u) % TASK_PIPE_RING_CAP == pipe->tail;
+    was_full = (pipe->head + 1u) % (pipe->capacity + 1u) == pipe->tail;
     kernel_wait_queue_remove(&pipe->wait_read, sched_current_task());
     /* Copy contiguous runs per iteration: a 64 KiB ring drained byte-by-byte
      * costs more than the syscalls it serves. */
     while (pipe->tail != pipe->head && count < length) {
         uint32_t chunk = pipe->tail < pipe->head ? pipe->head - pipe->tail
-                                                : TASK_PIPE_RING_CAP - pipe->tail;
+                                                : (pipe->capacity + 1u) - pipe->tail;
         if (chunk > length - count) chunk = length - count;
         __builtin_memcpy((uint8_t *)buffer + count, pipe->data + pipe->tail, chunk);
-        pipe->tail = (pipe->tail + chunk) % TASK_PIPE_RING_CAP;
+        pipe->tail = (pipe->tail + chunk) % (pipe->capacity + 1u);
         count += chunk;
     }
     if (count) {
-        uint32_t used = (pipe->head + TASK_PIPE_RING_CAP - pipe->tail) % TASK_PIPE_RING_CAP;
+        uint32_t used = (pipe->head + (pipe->capacity + 1u) - pipe->tail) % (pipe->capacity + 1u);
         /* Retrying an atomic writer before its complete request fits only
          * switches to a task that immediately blocks again. Wake every
          * satisfiable writer so cancellation cannot strand available space. */
-        (void)kernel_wait_queue_wake_satisfied(&pipe->wait_write, TASK_PIPE_CAP - used);
+        (void)kernel_wait_queue_wake_satisfied(&pipe->wait_write, pipe->capacity - used);
         /* Only full -> nonfull adds POLLOUT readiness. Atomic writers can
          * require more space; their threshold wakeups above are independent. */
         if (was_full) kernel_poll_readiness_notify();
@@ -175,21 +299,21 @@ int task_pipe_write(struct task_file *file, const void *buffer, uint32_t length)
     }
     kernel_wait_queue_remove(&pipe->wait_write, sched_current_task());
     {
-        uint32_t used = (pipe->head + TASK_PIPE_RING_CAP - pipe->tail) % TASK_PIPE_RING_CAP;
-        uint32_t free_bytes = TASK_PIPE_CAP - used;
+        uint32_t used = (pipe->head + (pipe->capacity + 1u) - pipe->tail) % (pipe->capacity + 1u);
+        uint32_t free_bytes = pipe->capacity - used;
         /* Small nonblocking writes are all-or-nothing. Larger ones may
          * consume the available space, as Linux/POSIX require. Blocking
          * writes retain their existing full-request wait policy. */
         uint32_t minimum = (file->flags & RELIEFOS_O_NONBLOCK) && length > TASK_PIPE_BUF
                                ? 1u : length;
-        if (length <= TASK_PIPE_CAP && free_bytes < minimum) {
+        if (length <= pipe->capacity && free_bytes < minimum) {
             if (file->flags & RELIEFOS_O_NONBLOCK) return -RELIEFOS_EAGAIN;
             kernel_wait_queue_block_current_minimum(&pipe->wait_write, length);
             return -RELIEFOS_EAGAIN;
         }
     }
     while (count < length) {
-        uint32_t next = (pipe->head + 1U) % TASK_PIPE_RING_CAP;
+        uint32_t next = (pipe->head + 1U) % (pipe->capacity + 1u);
         if (next == pipe->tail) {
             if (count) {
                 (void)kernel_wait_queue_wake_all(&pipe->wait_read);
@@ -200,12 +324,12 @@ int task_pipe_write(struct task_file *file, const void *buffer, uint32_t length)
             kernel_wait_queue_block_current_minimum(&pipe->wait_write, 1);
             return -RELIEFOS_EAGAIN;
         }
-        uint32_t used = (pipe->head + TASK_PIPE_RING_CAP - pipe->tail) % TASK_PIPE_RING_CAP;
-        uint32_t chunk = TASK_PIPE_CAP - used;
-        if (chunk > TASK_PIPE_RING_CAP - pipe->head) chunk = TASK_PIPE_RING_CAP - pipe->head;
+        uint32_t used = (pipe->head + (pipe->capacity + 1u) - pipe->tail) % (pipe->capacity + 1u);
+        uint32_t chunk = pipe->capacity - used;
+        if (chunk > (pipe->capacity + 1u) - pipe->head) chunk = (pipe->capacity + 1u) - pipe->head;
         if (chunk > length - count) chunk = length - count;
         __builtin_memcpy(pipe->data + pipe->head, (const uint8_t *)buffer + count, chunk);
-        pipe->head = (pipe->head + chunk) % TASK_PIPE_RING_CAP;
+        pipe->head = (pipe->head + chunk) % (pipe->capacity + 1u);
         count += chunk;
     }
     (void)kernel_wait_queue_wake_all(&pipe->wait_read);
@@ -230,7 +354,7 @@ short task_pipe_poll(const struct task_file *file, short events)
         if (pipe->readers == 0) {
             result |= POLLERR;
         } else if (events & POLLOUT) {
-            uint32_t next = (pipe->head + 1U) % TASK_PIPE_RING_CAP;
+            uint32_t next = (pipe->head + 1U) % (pipe->capacity + 1u);
             if (next != pipe->tail) {
                 result |= POLLOUT;
             }
@@ -261,10 +385,7 @@ int task_fifo_open(struct task *task, const struct storage_node *node,
     struct task_pipe *pipe = file ? task_pipe_for_file(file) : NULL;
     if (!file) {
         if (!node) return -RELIEFOS_EINVAL;
-        uint32_t index = TASK_PIPE_MAX;
-        for (uint32_t i = 0; i < TASK_PIPE_MAX; ++i) {
-            if (!task_pipes[i]) { if (index == TASK_PIPE_MAX) index = i; continue; }
-            struct task_pipe *candidate = task_pipes[i];
+        for (struct task_pipe *candidate = task_pipes; candidate; candidate = candidate->next) {
             if (candidate->named && candidate->node.volume_id == node->volume_id &&
                 candidate->node.first_cluster == node->first_cluster && candidate->node.flags == node->flags) {
                 pipe = candidate;
@@ -275,7 +396,6 @@ int task_fifo_open(struct task *task, const struct storage_node *node,
         if (access == RELIEFOS_O_ACCMODE) return -RELIEFOS_EINVAL;
         if (access == RELIEFOS_O_WRONLY && (flags & RELIEFOS_O_NONBLOCK) && (!pipe || !pipe->readers))
             return -6; /* Linux ENXIO, without publishing any endpoint. */
-        if (!pipe && index == TASK_PIPE_MAX) return -RELIEFOS_ENFILE;
         file = kernel_malloc(sizeof(*file));
         if (!file) return -RELIEFOS_ENOMEM;
         *file = (struct task_file){.used = 1, .node = *node, .flags = flags | TASK_FILE_FLAG_PIPE,
@@ -284,17 +404,8 @@ int task_fifo_open(struct task *task, const struct storage_node *node,
         int ret = storage_inode_get(node, &file->inode);
         if (ret < 0) { kernel_free(file); return ret; }
         if (!pipe) {
-            pipe = kernel_malloc(sizeof(*pipe));
-            if (!pipe) { (void)storage_inode_put(file->inode); kernel_free(file); return -RELIEFOS_ENOMEM; }
-            *pipe = (struct task_pipe){.used = 1, .named = true, .node = *node};
-            kernel_wait_queue_init(&pipe->wait_read);
-            kernel_wait_queue_init(&pipe->wait_write);
-            pipe->handle = kernel_object_insert(kernel_objects(), pipe, KERNEL_OBJECT_PIPE);
-            if (!pipe->handle) {
-                kernel_free(pipe); (void)storage_inode_put(file->inode); kernel_free(file);
-                return -RELIEFOS_ENFILE;
-            }
-            task_pipes[index] = pipe;
+            pipe = task_pipe_create(node, &ret);
+            if (!pipe) { (void)storage_inode_put(file->inode); kernel_free(file); return ret; }
         }
         file->aux = pipe->handle;
         /* A nonblocking reader suppresses HUP until a writer has existed. */
@@ -328,50 +439,27 @@ int task_fifo_open(struct task *task, const struct storage_node *node,
     return fd;
 }
 
+/**
+ * @brief Create two descriptors for a resource-backed anonymous pipe.
+ * @param user_ptr Validated user array for two int descriptors.
+ * @return Zero, negative descriptor/allocation error, or EFAULT; publishes
+ * neither endpoint on failure. Caller holds execution ownership.
+ */
 int syscall_ipc_pipe(uint64_t user_ptr)
 {
     struct task *task = sched_current_task();
-    int read_fd, write_fd;
-    uint32_t pipe_index;
-    uint32_t pipe_handle;
-    if (!task || !user_range_writable(user_ptr, sizeof(int) * 2U)) {
+    if (!task || !user_range_writable(user_ptr, sizeof(int) * 2u))
         return -RELIEFOS_EFAULT;
-    }
-    for (pipe_index = 0; pipe_index < TASK_PIPE_MAX; ++pipe_index) {
-        if (!task_pipes[pipe_index]) {
-            break;
-        }
-    }
-    if (pipe_index == TASK_PIPE_MAX) {
-        return -RELIEFOS_EMFILE;
-    }
-    task_pipes[pipe_index] = (struct task_pipe *)kernel_malloc(sizeof(struct task_pipe));
-    if (!task_pipes[pipe_index]) {
-        return -RELIEFOS_ENOMEM;
-    }
-    *task_pipes[pipe_index] = (struct task_pipe){.used = 1};
-    kernel_wait_queue_init(&task_pipes[pipe_index]->wait_read);
-    kernel_wait_queue_init(&task_pipes[pipe_index]->wait_write);
-    pipe_handle = kernel_object_insert(kernel_objects(), task_pipes[pipe_index],
-                                       KERNEL_OBJECT_PIPE);
-    if (!pipe_handle) {
-        kernel_free(task_pipes[pipe_index]);
-        task_pipes[pipe_index] = NULL;
-        return -RELIEFOS_EMFILE;
-    }
-    read_fd = alloc_task_pipe_fd(task, pipe_handle, 0);
-    write_fd = alloc_task_pipe_fd(task, pipe_handle, 1);
-    if (read_fd < 0 || write_fd < 0) {
-        if (read_fd >= 0) {
-            task_discard_file_fd(task, read_fd);
-        }
-        if (write_fd >= 0) {
-            task_discard_file_fd(task, write_fd);
-        }
-        kernel_object_remove(kernel_objects(), pipe_handle, KERNEL_OBJECT_PIPE, NULL);
-        kernel_free(task_pipes[pipe_index]);
-        task_pipes[pipe_index] = NULL;
-        return -RELIEFOS_EMFILE;
+    int error = 0;
+    struct task_pipe *pipe = task_pipe_create(NULL, &error);
+    if (!pipe) return error;
+    int read_fd = alloc_task_pipe_fd(task, pipe->handle, 0);
+    if (read_fd < 0) { task_pipe_destroy(pipe); return read_fd; }
+    int write_fd = alloc_task_pipe_fd(task, pipe->handle, 1);
+    if (write_fd < 0) {
+        /* Releasing the single endpoint also destroys the pipe. */
+        task_discard_file_fd(task, read_fd);
+        return write_fd;
     }
     ((int *)(uintptr_t)user_ptr)[0] = read_fd;
     ((int *)(uintptr_t)user_ptr)[1] = write_fd;

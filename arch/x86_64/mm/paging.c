@@ -7,6 +7,7 @@
 #include <reliefnt/paging.h>
 #include <reliefnt/smp.h>
 #include <reliefnt/lock.h>
+#include <reliefnt/heap.h>
 
 #define PAGE_SIZE 4096ULL
 #define PAGE_SIZE_2M 0x200000ULL
@@ -15,12 +16,26 @@
 #define LOW_PD_INDEX 0
 #define KERNEL_DIRECT_PML4_INDEX 511u
 #define KERNEL_PD_COUNT 16u /* 16 GiB identity map using 2 MiB leaves. */
+#define MMIO_EARLY_PT_TABLE_COUNT 1024u
 #define X86_EFER_MSR 0xc0000080u
 #define X86_EFER_NXE (1ULL << 11)
 
 static uint64_t kernel_pml4[512] __attribute__((aligned(4096)));
 static uint64_t kernel_pdpt[512] __attribute__((aligned(4096)));
 static uint64_t kernel_pd[KERNEL_PD_COUNT][512] __attribute__((aligned(4096)));
+/* User CR3s keep only the supervisor low-identity branch containing the
+ * physically linked kernel image; all other low identity leaves are omitted. */
+static uint64_t user_kernel_pdpt[512] __attribute__((aligned(4096)));
+static uint64_t user_kernel_pd[512] __attribute__((aligned(4096)));
+static uint64_t kernel_hole_pml4e;
+/* Before mm_init, framebuffer BAR setup can split up to 514 huge PDEs for
+ * independent unaligned 512 MiB VRAM and FIFO ranges. 1024 pinned image pages
+ * also leave room for the boot scanout aperture; successful mm_init hands
+ * subsequent splits to the ordinary physical allocator. */
+static uint64_t mmio_early_pt_tables[MMIO_EARLY_PT_TABLE_COUNT][512]
+    __attribute__((aligned(4096)));
+static uint32_t mmio_early_pt_table_count;
+static bool mmio_dynamic_tables_ready;
 
 extern void x86_64_load_cr3(uint64_t cr3);
 extern void x86_64_invlpg(uint64_t addr);
@@ -52,8 +67,9 @@ static bool nx_enabled;
  */
 static void copy_page(uint64_t destination, uint64_t source)
 {
-    uint8_t *dst = (uint8_t *)(uintptr_t)destination;
-    const uint8_t *src = (const uint8_t *)(uintptr_t)source;
+    uint8_t *dst = (uint8_t *)mm_phys_to_virt(destination);
+    const uint8_t *src = (const uint8_t *)mm_phys_to_virt(source);
+    if (!dst || !src) return;
     for (uint32_t i = 0; i < PAGE_SIZE; ++i) {
         dst[i] = src[i];
     }
@@ -157,6 +173,22 @@ void paging_init_user_identity(void)
         kernel_pdpt[i] = (uint64_t)(uintptr_t)kernel_pd[i] | RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE;
     }
 
+    /* Kernel text/data remain linked in the low physical window. User roots
+     * need that exact supervisor mapping while executing syscalls/interrupts,
+     * but inheriting the full low identity map collides with lazy user VMAs.
+     * Build a template that preserves only the explicitly reserved kernel
+     * hole; every other low-half slot remains available for user mappings. */
+    zero_table(user_kernel_pdpt);
+    zero_table(user_kernel_pd);
+    for (uint32_t pde = (uint32_t)(RELIEFNT_KERNEL_HOLE_START >> 21);
+         pde < (uint32_t)(RELIEFNT_KERNEL_HOLE_END >> 21); ++pde) {
+        user_kernel_pd[pde] = kernel_pd[0][pde];
+    }
+    user_kernel_pdpt[0] = (uint64_t)(uintptr_t)user_kernel_pd |
+                          RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE;
+    kernel_hole_pml4e = (uint64_t)(uintptr_t)user_kernel_pdpt |
+                        RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE;
+
     x86_64_load_cr3((uint64_t)(uintptr_t)kernel_pml4);
 }
 
@@ -238,6 +270,45 @@ void *paging_kernel_direct_map(uint64_t phys)
     return (void *)(uintptr_t)(RELIEFNT_KERNEL_DIRECT_MAP_BASE + phys);
 }
 
+/** @brief Make future MMIO splits use allocator-owned table pages.
+ * @return None. Boot calls this only after mm_init has initialized its bitmap.
+ * Existing early tables remain pinned in the kernel image for every CR3.
+ */
+void paging_mmio_allocator_ready(void)
+{
+    mmio_dynamic_tables_ready = true;
+}
+
+/** @brief Allocate a split table from pinned early BSS or the physical allocator.
+ * @param physical Required output for the table page's physical address.
+ * @return Kernel direct-map pointer, or NULL if the selected source is exhausted.
+ * The early reserve is never returned to the allocator; its storage is part of
+ * the image range reserved by mm_init. Dynamic allocation begins only after
+ * the one-way readiness handoff.
+ */
+static uint64_t *mmio_allocate_split_table(uint64_t *physical)
+{
+    uint64_t page;
+    uint64_t *table;
+    if (mmio_dynamic_tables_ready) {
+        page = mm_alloc_page();
+        if (!page) return NULL;
+        table = (uint64_t *)mm_phys_to_virt(page);
+        if (!table) {
+            mm_free_page(page);
+            return NULL;
+        }
+    } else {
+        if (mmio_early_pt_table_count >= MMIO_EARLY_PT_TABLE_COUNT) return NULL;
+        page = (uint64_t)(uintptr_t)mmio_early_pt_tables[mmio_early_pt_table_count];
+        table = (uint64_t *)mm_phys_to_virt(page);
+        if (!table) return NULL;
+        ++mmio_early_pt_table_count;
+    }
+    *physical = page;
+    return table;
+}
+
 /** @brief Obtain a shared 4 KiB kernel leaf, splitting only its original PDE.
  * @param phys Physical address in the kernel map.
  * @return Borrowed PTE pointer, or NULL on allocation failure. mmio_lock held.
@@ -247,9 +318,9 @@ static uint64_t *mmio_leaf(uint64_t phys)
 {
     uint64_t *pde = &kernel_pd[phys >> 30][(phys >> 21) & 511];
     if (*pde & PAGE_SIZE_FLAG) {
-        uint64_t page = mm_alloc_page();
-        if (!page) return NULL;
-        uint64_t *pt = (void *)(uintptr_t)page;
+        uint64_t page;
+        uint64_t *pt = mmio_allocate_split_table(&page);
+        if (!pt) return NULL;
         uint64_t base = *pde & RELIEFNT_PHYS_ADDR_MASK & ~(PAGE_SIZE_2M - 1);
         uint64_t flags = *pde & ~RELIEFNT_PHYS_ADDR_MASK & ~PAGE_SIZE_FLAG;
         /* Large-page PAT is bit 12; in a 4 KiB PTE it is bit 7. */
@@ -258,7 +329,8 @@ static uint64_t *mmio_leaf(uint64_t phys)
         __atomic_store_n(pde, page | RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE, __ATOMIC_RELEASE);
     }
     if (!(*pde & RELIEFNT_PAGE_PRESENT)) return NULL;
-    return &((uint64_t *)(uintptr_t)(*pde & RELIEFNT_PHYS_ADDR_MASK))[(phys >> 12) & 511];
+    uint64_t *pt = (uint64_t *)mm_phys_to_virt(*pde & RELIEFNT_PHYS_ADDR_MASK);
+    return pt ? &pt[(phys >> 12) & 511] : NULL;
 }
 /** @brief Return a leaf only when its PDE has already been split.
  * @param phys Physical address in the kernel direct map.
@@ -268,7 +340,8 @@ static uint64_t *mmio_existing_leaf(uint64_t phys)
 {
     uint64_t *pde = &kernel_pd[phys >> 30][(phys >> 21) & 511];
     if (!(*pde & RELIEFNT_PAGE_PRESENT) || (*pde & PAGE_SIZE_FLAG)) return NULL;
-    return &((uint64_t *)(uintptr_t)(*pde & RELIEFNT_PHYS_ADDR_MASK))[(phys >> 12) & 511];
+    uint64_t *pt = (uint64_t *)mm_phys_to_virt(*pde & RELIEFNT_PHYS_ADDR_MASK);
+    return pt ? &pt[(phys >> 12) & 511] : NULL;
 }
 
 /** @brief Append a sorted run, coalescing only identical adjacent states.
@@ -685,516 +758,849 @@ bool paging_mmio_writeback_nx(uint64_t phys, uint64_t len)
     return mmio_acquire(phys, len, true, MMIO_CACHE_POLICY_WB);
 }
 
-/**
- * Alloc table.
- * @return The value or status produced by the operation.
+/** @brief Allocate one zeroed page-table page and return its physical address.
+ * @return Physical page address, or zero when the allocator is exhausted.
  */
 static uint64_t alloc_table(void)
 {
     return mm_alloc_page();
 }
 
-/**
- * Address space create.
- * @param as Value supplied by the caller.
- * @return The value or status produced by the operation.
+/** @brief Resolve a page-table entry's physical address through the kernel alias.
+ * @param entry Present non-leaf entry.
+ * @return Mapped table pointer, or NULL when outside the direct-map resource.
+ */
+static uint64_t *table_from_entry(uint64_t entry)
+{
+    if (!(entry & RELIEFNT_PAGE_PRESENT)) return NULL;
+    return (uint64_t *)mm_phys_to_virt(entry & RELIEFNT_PHYS_ADDR_MASK);
+}
+
+/** @brief Return true when a user address is in the supported low canonical range.
+ * @param address Virtual byte address.
+ * @return True for a non-reserved low-half address below USER_TOP.
+ */
+static bool user_address_valid(uint64_t address)
+{
+    return address >= RELIEFNT_USER_BASE && address < RELIEFNT_USER_TOP &&
+           !(address >= RELIEFNT_KERNEL_HOLE_START &&
+             address < RELIEFNT_KERNEL_HOLE_END);
+}
+
+/** @brief Return the user leaf table for an address without allocating.
+ * @param as Address space being inspected.
+ * @param address Low canonical virtual address.
+ * @return PTE pointer or NULL for a missing, large, or inaccessible path.
+ */
+static uint64_t *address_space_pte(const struct address_space *as, uint64_t address)
+{
+    if (!as || !as->pml4 || !user_address_valid(address)) return NULL;
+    uint32_t pml4_index = (uint32_t)((address >> 39) & 511u);
+    uint32_t pdpt_index = (uint32_t)((address >> 30) & 511u);
+    uint32_t pd_index = (uint32_t)((address >> 21) & 511u);
+    uint64_t pml4e = as->pml4[pml4_index];
+    uint64_t *pdpt = table_from_entry(pml4e);
+    if (!pdpt || !(pml4e & RELIEFNT_PAGE_USER)) return NULL;
+    uint64_t pdpte = pdpt[pdpt_index];
+    if (!(pdpte & RELIEFNT_PAGE_PRESENT) || (pdpte & PAGE_SIZE_FLAG) ||
+        !(pdpte & RELIEFNT_PAGE_USER)) return NULL;
+    uint64_t *pd = table_from_entry(pdpte);
+    if (!pd) return NULL;
+    uint64_t pde = pd[pd_index];
+    if (!(pde & RELIEFNT_PAGE_PRESENT) || (pde & PAGE_SIZE_FLAG) ||
+        !(pde & RELIEFNT_PAGE_USER)) return NULL;
+    uint64_t *pt = table_from_entry(pde);
+    if (!pt) return NULL;
+    return &pt[(address >> 12) & 511u];
+}
+
+/** @brief Search one owned page-table level for its first backed user leaf.
+ * @param table Table page at @p level; borrowed through the kernel direct map.
+ * @param level 0 for PML4, 1 for PDPT, 2 for PD, or 3 for PT.
+ * @param base Virtual base address covered by @p table.
+ * @param start Inclusive search start.
+ * @param end Exclusive search end.
+ * @param out_page Required output for a found page-aligned user address.
+ * @param out_phys Optional output for the mapped physical page.
+ * @param out_flags Optional output for the full leaf flags.
+ * @return True when a backed user page was found; false otherwise.
+ * Branches are visited in virtual-address order, and absent or shared kernel
+ * branches are skipped without scanning their virtual coverage.
+ */
+static bool find_user_leaf_in_table(const uint64_t *table, uint32_t level,
+                                    uint64_t base, uint64_t start, uint64_t end,
+                                    uint64_t *out_page, uint64_t *out_phys,
+                                    uint64_t *out_flags)
+{
+    static const uint8_t index_shifts[] = {39, 30, 21, 12};
+    uint32_t shift;
+    uint64_t entry_span;
+    uint64_t table_end;
+    uint64_t first;
+    uint64_t last;
+    if (!table || level > 3 || start >= end) return false;
+    shift = index_shifts[level];
+    entry_span = 1ULL << shift;
+    table_end = base + (entry_span << 9);
+    if (start >= table_end || end <= base) return false;
+    first = start <= base ? 0 : (start - base) >> shift;
+    last = end - 1 <= base ? 0 : (end - 1 - base) >> shift;
+    if (first > 511) return false;
+    if (last > 511) last = 511;
+    for (uint64_t index = first; index <= last; ++index) {
+        uint64_t entry = table[index];
+        uint64_t child_base = base + (index << shift);
+        if (level < 3) {
+            uint64_t *child;
+            if ((entry & (RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_USER |
+                          RELIEFNT_PAGE_TABLE_OWNED)) !=
+                (RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_USER |
+                 RELIEFNT_PAGE_TABLE_OWNED) || (entry & PAGE_SIZE_FLAG))
+                continue;
+            child = table_from_entry(entry);
+            if (child && find_user_leaf_in_table(child, level + 1, child_base,
+                                                 start, end, out_page, out_phys,
+                                                 out_flags)) return true;
+            continue;
+        }
+        if (!(entry & RELIEFNT_PAGE_BACKED) || !(entry & RELIEFNT_PAGE_USER)) continue;
+        if (child_base < start || child_base >= end) continue;
+        *out_page = child_base;
+        if (out_phys) *out_phys = entry & RELIEFNT_PHYS_ADDR_MASK;
+        if (out_flags) *out_flags = entry & ~RELIEFNT_PHYS_ADDR_MASK;
+        return true;
+    }
+    return false;
+}
+
+/** @brief Find the first mapped user PTE in a validated address-space interval.
+ * @param as Address space whose private user hierarchy is searched.
+ * @param start Inclusive user address.
+ * @param end Exclusive end no greater than USER_TOP.
+ * @param out_page Required output for the aligned virtual page.
+ * @param out_phys Optional output for the physical leaf page.
+ * @param out_flags Optional output for all leaf attributes.
+ * @return True when a user leaf owns backing in the range; false when empty
+ *         or invalid. Only allocated table branches are traversed.
+ */
+bool address_space_user_page_next(const struct address_space *as, uint64_t start,
+                                  uint64_t end, uint64_t *out_page,
+                                  uint64_t *out_phys, uint64_t *out_flags)
+{
+    if (!as || !as->pml4 || !out_page || start < RELIEFNT_USER_BASE ||
+        start >= end || end > RELIEFNT_USER_TOP)
+        return false;
+    return find_user_leaf_in_table(as->pml4, 0, 0, start, end, out_page,
+                                   out_phys, out_flags);
+}
+
+/** @brief Check a valid interval for any backed user leaf.
+ * @param as Address space whose private user hierarchy is searched.
+ * @param start Inclusive user address.
+ * @param end Exclusive end no greater than USER_TOP.
+ * @return True when no backed leaf exists; false for an occupied or invalid range.
+ */
+bool address_space_user_range_free(const struct address_space *as, uint64_t start,
+                                   uint64_t end)
+{
+    uint64_t page;
+    if (start < RELIEFNT_KERNEL_HOLE_END && end > RELIEFNT_KERNEL_HOLE_START)
+        return false;
+    return !address_space_user_page_next(as, start, end, &page, NULL, NULL);
+}
+
+/** @brief Copy a physical page table into another allocated page.
+ * @param destination New zeroed table page.
+ * @param source Existing table entry, or zero for an empty table.
+ * @return True after the table is reachable through the direct map.
+ */
+static bool copy_table_entries(uint64_t *destination, uint64_t source)
+{
+    uint64_t *source_table;
+    if (!destination) return false;
+    if (!(source & RELIEFNT_PAGE_PRESENT)) {
+        for (uint32_t i = 0; i < 512; ++i) destination[i] = 0;
+        return true;
+    }
+    source_table = table_from_entry(source);
+    if (!source_table) return false;
+    for (uint32_t i = 0; i < 512; ++i) destination[i] = source_table[i];
+    return true;
+}
+
+/** @brief Split a 1 GiB leaf into equivalent 2 MiB PDEs.
+ * @param destination Newly allocated page-directory page.
+ * @param large_entry Existing 1 GiB leaf.
+ */
+static void split_1g_leaf(uint64_t *destination, uint64_t large_entry)
+{
+    const uint64_t base_mask = 0x000fffffc0000000ULL;
+    uint64_t base = large_entry & base_mask;
+    uint64_t flags = large_entry & ~RELIEFNT_PHYS_ADDR_MASK;
+    bool large_pat = (large_entry & (1ULL << 12)) != 0;
+    flags |= PAGE_SIZE_FLAG;
+    if (large_pat) flags |= (1ULL << 12);
+    for (uint32_t i = 0; i < 512; ++i)
+        destination[i] = (base + (uint64_t)i * PAGE_SIZE_2M) | flags;
+}
+
+/** @brief Split a 2 MiB leaf into equivalent 4 KiB PTEs.
+ * @param destination Newly allocated page-table page.
+ * @param large_entry Existing 2 MiB leaf.
+ */
+static void split_2m_leaf(uint64_t *destination, uint64_t large_entry)
+{
+    const uint64_t base_mask = 0x000fffffffe00000ULL;
+    uint64_t base = large_entry & base_mask;
+    uint64_t flags = large_entry & ~RELIEFNT_PHYS_ADDR_MASK;
+    bool large_pat = (large_entry & (1ULL << 12)) != 0;
+    flags &= ~PAGE_SIZE_FLAG;
+    if (large_pat) flags |= RELIEFNT_PAGE_PAT;
+    for (uint32_t i = 0; i < 512; ++i)
+        destination[i] = (base + (uint64_t)i * PAGE_SIZE) | flags;
+}
+
+/** @brief Ensure one private child table exists in a transaction's staged tree.
+ * @param parent Parent table in the staged tree.
+ * @param parent_level 0 for PML4, 1 for PDPT, or 2 for PD.
+ * @param index Entry index to prepare.
+ * @return Private child table pointer, or NULL after freeing failed allocation.
+ */
+static uint64_t *ensure_staged_child(uint64_t *parent, uint32_t parent_level,
+                                     uint32_t index)
+{
+    uint64_t old_entry = parent[index];
+    uint64_t *child;
+    uint64_t phys;
+    bool large = (old_entry & RELIEFNT_PAGE_PRESENT) &&
+                 parent_level != 0 && (old_entry & PAGE_SIZE_FLAG);
+    if ((old_entry & (RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_TABLE_OWNED |
+                      RELIEFNT_PAGE_TABLE_STAGED)) ==
+        (RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_TABLE_OWNED |
+         RELIEFNT_PAGE_TABLE_STAGED) && !large) {
+        return table_from_entry(old_entry);
+    }
+    phys = alloc_table();
+    if (!phys) return NULL;
+    child = (uint64_t *)mm_phys_to_virt(phys);
+    if (!child) {
+        mm_free_page(phys);
+        return NULL;
+    }
+    if ((old_entry & RELIEFNT_PAGE_PRESENT) && !large) {
+        if (!copy_table_entries(child, old_entry)) {
+            mm_free_page(phys);
+            return NULL;
+        }
+    } else if (large && parent_level == 1) {
+        split_1g_leaf(child, old_entry);
+    } else if (large && parent_level == 2) {
+        split_2m_leaf(child, old_entry);
+    } else {
+        for (uint32_t i = 0; i < 512; ++i) child[i] = 0;
+    }
+    parent[index] = phys | RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE |
+                    RELIEFNT_PAGE_USER | RELIEFNT_PAGE_TABLE_OWNED |
+                    RELIEFNT_PAGE_TABLE_STAGED;
+    /* Earlier staged copies retain all their other children, so only the
+     * superseded table page itself is now unreachable. */
+    if ((old_entry & RELIEFNT_PAGE_TABLE_STAGED) && !large)
+        mm_free_page(old_entry & RELIEFNT_PHYS_ADDR_MASK);
+    return child;
+}
+
+/** @brief Test whether all page-table levels for a 2 MiB region are already private.
+ * @param root PML4 root to inspect.
+ * @param address Any address in the region.
+ * @return True when a private normal 4 KiB leaf table is ready.
+ */
+static bool user_region_prepared(uint64_t *root, uint64_t address)
+{
+    uint64_t pml4e = root[(address >> 39) & 511u];
+    uint64_t *pdpt;
+    uint64_t pdpte;
+    uint64_t *pd;
+    uint64_t pde;
+    if ((pml4e & (RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_TABLE_OWNED)) !=
+        (RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_TABLE_OWNED)) return false;
+    pdpt = table_from_entry(pml4e);
+    if (!pdpt) return false;
+    pdpte = pdpt[(address >> 30) & 511u];
+    if ((pdpte & (RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_TABLE_OWNED)) !=
+        (RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_TABLE_OWNED) ||
+        (pdpte & PAGE_SIZE_FLAG)) return false;
+    pd = table_from_entry(pdpte);
+    if (!pd) return false;
+    pde = pd[(address >> 21) & 511u];
+    if ((pde & (RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_TABLE_OWNED)) !=
+        (RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_TABLE_OWNED) ||
+        (pde & PAGE_SIZE_FLAG)) return false;
+    return table_from_entry(pde) != NULL;
+}
+
+/** @brief Discard staged page-table pages after a failed range transaction.
+ * @param entry Staged branch entry.
+ * @param table_level Level of the table named by entry, in [1,3].
+ */
+static void discard_staged_branch(uint64_t entry, uint32_t table_level)
+{
+    uint64_t *table;
+    if (!(entry & RELIEFNT_PAGE_TABLE_STAGED) ||
+        !(entry & RELIEFNT_PAGE_PRESENT)) return;
+    table = table_from_entry(entry);
+    if (table && table_level < 3) {
+        for (uint32_t i = 0; i < 512; ++i) {
+            uint64_t child = table[i];
+            if ((child & RELIEFNT_PAGE_TABLE_STAGED) &&
+                !(child & PAGE_SIZE_FLAG))
+                discard_staged_branch(child, table_level + 1);
+        }
+    }
+    mm_free_page(entry & RELIEFNT_PHYS_ADDR_MASK);
+}
+
+/** @brief Remove staging metadata from newly published table branches.
+ * @param parent Parent table whose entries are being visited.
+ * @param parent_level Parent level, from 0 through 2.
+ */
+static void publish_staged_children(uint64_t *parent, uint32_t parent_level)
+{
+    if (parent_level >= 3) return;
+    for (uint32_t i = 0; i < 512; ++i) {
+        uint64_t entry = parent[i];
+        if (!(entry & RELIEFNT_PAGE_TABLE_STAGED)) continue;
+        parent[i] &= ~RELIEFNT_PAGE_TABLE_STAGED;
+        if (!(parent_level != 0 && (entry & PAGE_SIZE_FLAG))) {
+            uint64_t *child = table_from_entry(entry);
+            if (child) publish_staged_children(child, parent_level + 1);
+        }
+    }
+}
+
+/** @brief Reclaim replaced owned table pages after the new root is globally visible.
+ * @param old_entry Former branch entry.
+ * @param new_entry Published branch entry at the same index.
+ * @param table_level Level of the table referenced by old_entry.
+ */
+static void release_replaced_tables(uint64_t old_entry, uint64_t new_entry,
+                                    uint32_t table_level)
+{
+    uint64_t old_phys = old_entry & RELIEFNT_PHYS_ADDR_MASK;
+    uint64_t new_phys = new_entry & RELIEFNT_PHYS_ADDR_MASK;
+    uint64_t *old_table;
+    uint64_t *new_table = NULL;
+    if (!(old_entry & RELIEFNT_PAGE_PRESENT) ||
+        !(old_entry & RELIEFNT_PAGE_TABLE_OWNED) || old_phys == new_phys)
+        return;
+    old_table = table_from_entry(old_entry);
+    if (!old_table) return;
+    if ((new_entry & RELIEFNT_PAGE_PRESENT) &&
+        (table_level >= 3 || !(new_entry & PAGE_SIZE_FLAG)))
+        new_table = table_from_entry(new_entry);
+    if (table_level < 3) {
+        for (uint32_t i = 0; i < 512; ++i) {
+            uint64_t old_child = old_table[i];
+            if (old_child & PAGE_SIZE_FLAG) continue;
+            release_replaced_tables(old_child, new_table ? new_table[i] : 0,
+                                    table_level + 1);
+        }
+    }
+    mm_free_page(old_phys);
+}
+
+/** @brief Create an empty user address space with the reserved low kernel window and canonical high-half kernel mappings.
+ * @param as Output address space, initialized to zero on entry.
+ * @return True after allocating an independent PML4 root.
+ * The bootstrap root maps much of low physical RAM as identity-mapped
+ * supervisor pages, overlapping legal user addresses and blocking lazy
+ * faults. User roots therefore inherit only the separately built supervisor
+ * kernel-image window, plus canonical high-half mappings for kernel data and
+ * the physical direct map.
  */
 bool address_space_create(struct address_space *as)
 {
-    if (!as) {
+    uint64_t phys;
+    if (!as) return false;
+    for (size_t i = 0; i < sizeof(*as); ++i) ((uint8_t *)as)[i] = 0;
+    phys = alloc_table();
+    if (!phys) return false;
+    as->pml4 = (uint64_t *)mm_phys_to_virt(phys);
+    if (!as->pml4) {
+        mm_free_page(phys);
+        as->pml4 = NULL;
         return false;
     }
-    for (size_t i = 0; i < sizeof(*as); ++i) {
-        ((uint8_t *)as)[i] = 0;
-    }
-
-    uint64_t pml4_phys = alloc_table();
-    uint64_t pdpt_phys = alloc_table();
-    if (!pml4_phys || !pdpt_phys) {
-        if (pml4_phys) {
-            mm_free_page(pml4_phys);
-        }
-        if (pdpt_phys) {
-            mm_free_page(pdpt_phys);
-        }
-        return false;
-    }
-
-    as->pml4 = (uint64_t *)(uintptr_t)pml4_phys;
-    as->pdpt = (uint64_t *)(uintptr_t)pdpt_phys;
-    as->cr3 = pml4_phys;
     for (uint32_t i = 0; i < 512; ++i) {
-        as->pml4[i] = kernel_pml4[i];
-        as->pdpt[i] = kernel_pdpt[i];
+        if (i == 0) as->pml4[i] = kernel_hole_pml4e;
+        else as->pml4[i] = i >= 256 ? kernel_pml4[i] : 0;
     }
-    as->pml4[USER_PDPT_INDEX] = pdpt_phys | RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE | RELIEFNT_PAGE_USER;
-
-    uint64_t low_pd_phys = alloc_table();
-    if (!low_pd_phys) {
-        address_space_destroy(as);
-        return false;
-    }
-    as->pd[LOW_PD_INDEX] = (uint64_t *)(uintptr_t)low_pd_phys;
-    for (uint32_t i = 0; i < 512; ++i) {
-        as->pd[LOW_PD_INDEX][i] = kernel_pd[0][i];
-    }
-    as->pdpt[USER_PDPT_INDEX] = low_pd_phys | RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE | RELIEFNT_PAGE_USER;
-
+    as->cr3 = phys;
     return true;
 }
 
-/**
- * @brief Clone user mappings and write-protect private pages across all CPUs.
- * Caller holds the kernel execution transaction, including on failure; remote
- * CPUs acknowledge TLB invalidation before the child can become runnable.
- * @param source Parent address space whose writable mappings are write-protected in place.
- * @param destination Empty output address space with independently allocated page tables.
- * @return True if all mappings were cloned; false after releasing the partial destination.
+/** @brief Create child mappings with private page tables and shared COW backing.
+ * @param source Existing parent address space.
+ * @param destination Empty output address space.
+ * @return True on a complete clone; failure destroys the child and leaves the
+ *         parent PTEs unchanged.
  */
-bool address_space_clone_cow(struct address_space *source, struct address_space *destination)
+bool address_space_clone_cow(struct address_space *source,
+                             struct address_space *destination)
 {
-    if (!source || !destination || !source->pml4 || !source->pdpt) {
+    if (!source || !destination || !source->pml4 || !address_space_create(destination))
         return false;
-    }
-    if (!address_space_create(destination)) {
-        return false;
-    }
-    for (uint32_t table = 0; table < RELIEFNT_USER_PD_COUNT; ++table) {
-        uint64_t base = RELIEFNT_USER_BASE + (uint64_t)table * RELIEFNT_USER_PD_BYTES;
-        if (!source->user_pt[table]) {
-            continue;
-        }
-        for (uint32_t slot = 0; slot < 512; ++slot) {
-            uint64_t entry = source->user_pt[table][slot];
-            uint64_t flags;
-            uint64_t phys;
-            uint64_t page;
-            int cached;
-            if (!(entry & RELIEFNT_PAGE_BACKED)) {
-                continue;
-            }
-            phys = entry & RELIEFNT_PHYS_ADDR_MASK;
-            flags = entry & (RELIEFNT_PAGE_WRITABLE | RELIEFNT_PAGE_NOEXEC |
-                             RELIEFNT_PAGE_COW | RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_PROTNONE |
-                             RELIEFNT_PAGE_SHARED |
-                             RELIEFNT_PAGE_PWT | RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_PAT);
-            page = base + (uint64_t)slot * PAGE_SIZE;
-            if (!(entry & (RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_SHARED)) &&
-                ((entry & RELIEFNT_PAGE_WRITABLE) || (entry & RELIEFNT_PAGE_COW))) {
-                flags &= ~RELIEFNT_PAGE_WRITABLE;
-                flags |= RELIEFNT_PAGE_COW;
-                source->user_pt[table][slot] = phys | (entry & RELIEFNT_PAGE_PRESENT) |
-                                               RELIEFNT_PAGE_USER | flags;
-                x86_64_invlpg(page); paging_note_mm_change();
-            }
-            if (entry & RELIEFNT_PAGE_DEVICE) {
-                cached = 0;
-            } else {
-                cached = page_cache_retain(phys) == 0;
-                if (!cached) {
-                    mm_retain_page(phys);
+    for (uint32_t pi = 0; pi < 256; ++pi) {
+        uint64_t pml4e = source->pml4[pi];
+        uint64_t *src_pdpt;
+        if (!(pml4e & RELIEFNT_PAGE_PRESENT) ||
+            !(pml4e & RELIEFNT_PAGE_TABLE_OWNED)) continue;
+        src_pdpt = table_from_entry(pml4e);
+        if (!src_pdpt) goto fail;
+        for (uint32_t di = 0; di < 512; ++di) {
+            uint64_t pdpte = src_pdpt[di];
+            uint64_t *src_pd;
+            uint64_t region_start = ((uint64_t)pi << 39) | ((uint64_t)di << 30);
+            if (!(pdpte & RELIEFNT_PAGE_PRESENT) || (pdpte & PAGE_SIZE_FLAG) ||
+                !(pdpte & RELIEFNT_PAGE_TABLE_OWNED)) continue;
+            src_pd = table_from_entry(pdpte);
+            if (!src_pd) goto fail;
+            for (uint32_t ti = 0; ti < 512; ++ti) {
+                uint64_t pde = src_pd[ti];
+                uint64_t region_2m = region_start + (uint64_t)ti * PAGE_SIZE_2M;
+                uint64_t *src_pt;
+                if (!(pde & RELIEFNT_PAGE_PRESENT) || (pde & PAGE_SIZE_FLAG) ||
+                    !(pde & RELIEFNT_PAGE_TABLE_OWNED)) continue;
+                src_pt = table_from_entry(pde);
+                if (!src_pt) goto fail;
+                bool have_user_leaf = false;
+                for (uint32_t si = 0; si < 512; ++si) {
+                    uint64_t leaf = src_pt[si];
+                    if ((leaf & RELIEFNT_PAGE_BACKED) && (leaf & RELIEFNT_PAGE_USER)) {
+                        have_user_leaf = true;
+                        break;
+                    }
+                }
+                if (!have_user_leaf) continue;
+                if (!address_space_prepare_user_range(destination, region_2m,
+                                                     region_2m + PAGE_SIZE_2M))
+                    goto fail;
+                uint64_t *dst_pdpt = table_from_entry(destination->pml4[pi]);
+                uint64_t *dst_pd = dst_pdpt ? table_from_entry(dst_pdpt[di]) : NULL;
+                uint64_t *dst_leaf_table = dst_pd ? table_from_entry(dst_pd[ti]) : NULL;
+                if (!dst_leaf_table) goto fail;
+                for (uint32_t si = 0; si < 512; ++si) {
+                    uint64_t leaf = src_pt[si];
+                    uint64_t flags;
+                    uint64_t phys;
+                    if (!(leaf & RELIEFNT_PAGE_BACKED) ||
+                        !(leaf & RELIEFNT_PAGE_USER)) continue;
+                    phys = leaf & RELIEFNT_PHYS_ADDR_MASK;
+                    flags = leaf & ~(RELIEFNT_PHYS_ADDR_MASK | RELIEFNT_PAGE_USER |
+                                     RELIEFNT_PAGE_PRESENT);
+                    if (!(leaf & (RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_SHARED)) &&
+                        ((leaf & RELIEFNT_PAGE_WRITABLE) ||
+                         (leaf & RELIEFNT_PAGE_COW))) {
+                        flags &= ~RELIEFNT_PAGE_WRITABLE;
+                        flags |= RELIEFNT_PAGE_COW;
+                    }
+                    if (!(leaf & RELIEFNT_PAGE_DEVICE) &&
+                        page_cache_retain(phys) != 0) mm_retain_page(phys);
+                    dst_leaf_table[si] = phys | RELIEFNT_PAGE_USER | flags |
+                        (leaf & RELIEFNT_PAGE_PRESENT);
+                    ++destination->user_page_count;
                 }
             }
-            if (!address_space_map_user_page(destination, page, phys, flags)) {
-                if (entry & RELIEFNT_PAGE_DEVICE) {
-                    /* Device pages are borrowed from the framebuffer. */
-                } else if (cached) {
-                    page_cache_release(phys);
-                } else {
-                    mm_free_page(phys);
+        }
+    }
+    /* Protect the parent only after every child allocation/reference succeeded. */
+    for (uint32_t pi = 0; pi < 256; ++pi) {
+        uint64_t pml4e = source->pml4[pi];
+        uint64_t *pdpt = table_from_entry(pml4e);
+        if (!pdpt || !(pml4e & RELIEFNT_PAGE_TABLE_OWNED)) continue;
+        for (uint32_t di = 0; di < 512; ++di) {
+            uint64_t *pd = table_from_entry(pdpt[di]);
+            if (!pd || !(pdpt[di] & RELIEFNT_PAGE_TABLE_OWNED) ||
+                (pdpt[di] & PAGE_SIZE_FLAG)) continue;
+            for (uint32_t ti = 0; ti < 512; ++ti) {
+                uint64_t *pt = table_from_entry(pd[ti]);
+                if (!pt || !(pd[ti] & RELIEFNT_PAGE_TABLE_OWNED) ||
+                    (pd[ti] & PAGE_SIZE_FLAG)) continue;
+                for (uint32_t si = 0; si < 512; ++si) {
+                    uint64_t *leaf = &pt[si];
+                    if (!(*leaf & RELIEFNT_PAGE_BACKED) ||
+                        !(*leaf & RELIEFNT_PAGE_USER) ||
+                        (*leaf & (RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_SHARED))) continue;
+                    if ((*leaf & RELIEFNT_PAGE_WRITABLE) || (*leaf & RELIEFNT_PAGE_COW))
+                        *leaf = (*leaf & ~RELIEFNT_PAGE_WRITABLE) | RELIEFNT_PAGE_COW;
                 }
-                address_space_destroy(destination);
-                /* Earlier entries in the parent may already be read-only. */
-                smp_flush_user_tlb();
-                return false;
             }
         }
     }
-    /* A CLONE_VM sibling may retain writable translations of the parent's
-     * newly COW pages. The caller holds the execution transaction; invalidate
-     * remote translations before publishing the child to the scheduler. */
+    paging_note_mm_change();
     smp_flush_user_tlb();
     return true;
+fail:
+    address_space_destroy(destination);
+    return false;
 }
 
-/**
- * Address space destroy.
- * @param as Value supplied by the caller.
+/** @brief Destroy an owned user page-table branch and release mapped user pages.
+ * @param entry Owned branch entry to release.
+ * @param table_level Level of the table named by entry, from 1 through 3.
+ */
+static void destroy_user_branch(uint64_t entry, uint32_t table_level)
+{
+    uint64_t *table;
+    if (!(entry & RELIEFNT_PAGE_PRESENT) ||
+        !(entry & RELIEFNT_PAGE_TABLE_OWNED)) return;
+    table = table_from_entry(entry);
+    if (!table) return;
+    for (uint32_t i = 0; i < 512; ++i) {
+        uint64_t child = table[i];
+        if (table_level < 3) {
+            if ((child & RELIEFNT_PAGE_PRESENT) && !(child & PAGE_SIZE_FLAG))
+                destroy_user_branch(child, table_level + 1);
+        } else if ((child & RELIEFNT_PAGE_BACKED) &&
+                   (child & RELIEFNT_PAGE_USER)) {
+            uint64_t phys = child & RELIEFNT_PHYS_ADDR_MASK;
+            if (child & RELIEFNT_PAGE_DEVICE) continue;
+            if (page_cache_owns(phys)) page_cache_release(phys);
+            else mm_free_page(phys);
+        }
+    }
+    mm_free_page(entry & RELIEFNT_PHYS_ADDR_MASK);
+}
+
+/** @brief Release all private user tables and leaf ownership, then clear as.
+ * @param as Address space to destroy; NULL is ignored.
  */
 void address_space_destroy(struct address_space *as)
 {
-    if (!as) {
-        return;
-    }
-    for (uint32_t table = 0; table < RELIEFNT_USER_PD_COUNT; ++table) {
-        if (as->user_pt[table]) {
-            for (uint32_t i = 0; i < 512; ++i) {
-                uint64_t entry = as->user_pt[table][i];
-                if (entry & RELIEFNT_PAGE_BACKED) {
-                    if (entry & RELIEFNT_PAGE_DEVICE) {
-                        /* Device mappings refer to reserved physical memory. */
-                    } else if (page_cache_owns(entry & RELIEFNT_PHYS_ADDR_MASK)) {
-                        page_cache_release(entry & RELIEFNT_PHYS_ADDR_MASK);
-                    } else {
-                        mm_free_page(entry & RELIEFNT_PHYS_ADDR_MASK);
-                    }
-                }
-            }
-            mm_free_page((uint64_t)(uintptr_t)as->user_pt[table]);
-        }
-    }
-    if (as->pd[LOW_PD_INDEX]) {
-        mm_free_page((uint64_t)(uintptr_t)as->pd[LOW_PD_INDEX]);
-    }
-    if (as->pdpt) {
-        mm_free_page((uint64_t)(uintptr_t)as->pdpt);
-    }
+    if (!as) return;
     if (as->pml4) {
-        mm_free_page((uint64_t)(uintptr_t)as->pml4);
+        for (uint32_t i = 0; i < 256; ++i)
+            destroy_user_branch(as->pml4[i], 1);
+        mm_free_page(as->cr3);
     }
-    for (size_t i = 0; i < sizeof(*as); ++i) {
-        ((uint8_t *)as)[i] = 0;
-    }
+    for (size_t i = 0; i < sizeof(*as); ++i) ((uint8_t *)as)[i] = 0;
 }
 
-/**
- * @brief Prepare missing user page tables without partial allocation on failure.
- * @param as Address space pinned by the execution transaction.
- * @param start First user byte in the range.
- * @param end Exclusive range end.
- * @return True after publishing all missing tables; false leaves existing
- * tables unchanged and returns every page allocated by this operation.
+/** @brief Prepare a user range with all private table pages committed atomically.
+ * @param as Address space protected by the caller's execution ownership.
+ * @param start Inclusive first byte of the range.
+ * @param end Exclusive end, no greater than the canonical low-half boundary.
+ * @return True when all 4 KiB leaf tables are privately writable; false leaves
+ *         existing mappings untouched and frees every staged table page.
  */
 bool address_space_prepare_user_range(struct address_space *as, uint64_t start,
                                       uint64_t end)
 {
-    uint64_t first_page;
-    uint64_t last_page;
-    uint64_t first_table;
-    uint64_t last_table;
-    /* The user window fits one directory, bounding this transaction to less
-     * than 4 KiB on the 128 KiB syscall stack. Existing tables are borrowed. */
-    uint64_t prepared[RELIEFNT_USER_PD_COUNT] = {0};
-
-    if (!as || start < RELIEFNT_USER_BASE || start >= end || end > RELIEFNT_USER_TOP ||
-        (start < RELIEFNT_KERNEL_HOLE_END && end > RELIEFNT_KERNEL_HOLE_START)) {
+    uint64_t first_region;
+    uint64_t end_region;
+    uint64_t stage_phys;
+    uint64_t *stage_root;
+    uint64_t old_root[512];
+    bool needs_change = false;
+    if (!as || !as->pml4 || start < RELIEFNT_USER_BASE || start >= end ||
+        end > RELIEFNT_USER_TOP ||
+        (start < RELIEFNT_KERNEL_HOLE_END && end > RELIEFNT_KERNEL_HOLE_START))
         return false;
-    }
-    first_page = align_down(start, PAGE_SIZE);
-    last_page = align_down(end - 1ULL, PAGE_SIZE);
-    first_table = (first_page - RELIEFNT_USER_BASE) / PAGE_SIZE / 512ULL;
-    last_table = (last_page - RELIEFNT_USER_BASE) / PAGE_SIZE / 512ULL;
-    if (last_table >= RELIEFNT_USER_PD_COUNT) {
-        return false;
-    }
-    for (uint64_t table = first_table; table <= last_table; ++table) {
-        if (!as->user_pt[table]) {
-            uint64_t pt_phys = alloc_table();
-            if (!pt_phys) {
-                for (uint64_t prior = first_table; prior < table; ++prior)
-                    if (prepared[prior]) mm_free_page(prepared[prior]);
-                return false;
-            }
-            prepared[table] = pt_phys;
+    first_region = align_down(start, PAGE_SIZE_2M);
+    end_region = align_down(end - 1, PAGE_SIZE_2M) + PAGE_SIZE_2M;
+    for (uint64_t region = first_region; region < end_region; region += PAGE_SIZE_2M) {
+        if (!user_region_prepared(as->pml4, region)) {
+            needs_change = true;
+            break;
         }
     }
-    for (uint64_t table = first_table; table <= last_table; ++table) {
-        if (prepared[table]) {
-            as->user_pt[table] = (uint64_t *)(uintptr_t)prepared[table];
-            as->pd[LOW_PD_INDEX][RELIEFNT_USER_PD_START + table] =
-                prepared[table] | RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE | RELIEFNT_PAGE_USER;
-            x86_64_invlpg(RELIEFNT_USER_BASE + table * RELIEFNT_USER_PD_BYTES);
-            paging_note_mm_change();
-        }
+    if (!needs_change) return true;
+    stage_phys = alloc_table();
+    if (!stage_phys) return false;
+    stage_root = (uint64_t *)mm_phys_to_virt(stage_phys);
+    if (!stage_root) {
+        mm_free_page(stage_phys);
+        return false;
     }
+    for (uint32_t i = 0; i < 512; ++i) {
+        stage_root[i] = as->pml4[i];
+        old_root[i] = as->pml4[i];
+    }
+    for (uint64_t region = first_region; region < end_region; region += PAGE_SIZE_2M) {
+        uint32_t pml4_index = (uint32_t)((region >> 39) & 511u);
+        uint32_t pdpt_index = (uint32_t)((region >> 30) & 511u);
+        uint32_t pd_index = (uint32_t)((region >> 21) & 511u);
+        uint64_t *pdpt;
+        uint64_t *pd;
+        if (user_region_prepared(stage_root, region)) continue;
+        pdpt = ensure_staged_child(stage_root, 0, pml4_index);
+        if (!pdpt) goto rollback;
+        pd = ensure_staged_child(pdpt, 1, pdpt_index);
+        if (!pd) goto rollback;
+        if (!ensure_staged_child(pd, 2, pd_index)) goto rollback;
+    }
+    for (uint32_t i = 0; i < 512; ++i) as->pml4[i] = stage_root[i];
+    publish_staged_children(as->pml4, 0);
+    mm_free_page(stage_phys);
+    paging_note_mm_change();
+    smp_flush_user_tlb();
+    for (uint32_t i = 0; i < 256; ++i)
+        release_replaced_tables(old_root[i], as->pml4[i], 1);
     return true;
+rollback:
+    for (uint32_t i = 0; i < 256; ++i)
+        discard_staged_branch(stage_root[i], 1);
+    mm_free_page(stage_phys);
+    return false;
 }
 
-/**
- * Address space map user page.
- * @param as Value supplied by the caller.
- * @param vaddr Value supplied by the caller.
- * @param phys Value supplied by the caller.
- * @param flags Identifier or flags controlling the operation.
- * @return The value or status produced by the operation.
+/** @brief Install one owned user leaf with validated W^X and backing flags.
+ * @param as Address space receiving the mapping.
+ * @param vaddr User byte address; page-aligned internally.
+ * @param phys Aligned physical backing page.
+ * @param flags Mapping protection and software ownership flags.
+ * @return True when an empty leaf is installed; false leaves caller ownership.
  */
 bool address_space_map_user_page(struct address_space *as, uint64_t vaddr,
                                  uint64_t phys, uint64_t flags)
 {
-    if (!as || !phys || (phys & (PAGE_SIZE - 1))) {
-        return false;
-    }
     uint64_t page = align_down(vaddr, PAGE_SIZE);
-    if (page < RELIEFNT_USER_BASE || page >= RELIEFNT_USER_TOP ||
-        (page >= RELIEFNT_KERNEL_HOLE_START && page < RELIEFNT_KERNEL_HOLE_END)) {
-        return false;
-    }
-    uint64_t index = (page - RELIEFNT_USER_BASE) / PAGE_SIZE;
-    uint64_t table = index / 512;
-    uint64_t slot = index % 512;
-    if (table >= RELIEFNT_USER_PD_COUNT) {
-        return false;
-    }
-    if (!as->user_pt[table] &&
-        !address_space_prepare_user_range(as, page, page + PAGE_SIZE)) {
-        return false;
-    }
-    if (as->user_pt[table][slot] & RELIEFNT_PAGE_BACKED) {
-        return false;
-    }
-    if ((flags & RELIEFNT_PAGE_WRITABLE) && !(flags & RELIEFNT_PAGE_NOEXEC)) {
-        return false;
-    }
-    if (!nx_enabled) {
-        /* Executable user mappings are unsafe without NX because the kernel
-         * cannot enforce W^X.  Refuse the process rather than weaken it. */
-        return false;
-    }
-    as->user_pt[table][slot] = phys | RELIEFNT_PAGE_USER | flags |
-        ((flags & RELIEFNT_PAGE_PROTNONE) ? 0 : RELIEFNT_PAGE_PRESENT);
+    uint64_t *pte;
+    if (!as || !phys || (phys & ~RELIEFNT_PHYS_ADDR_MASK) ||
+        (phys & (PAGE_SIZE - 1)) || !user_address_valid(page) ||
+        ((flags & RELIEFNT_PAGE_WRITABLE) && !(flags & RELIEFNT_PAGE_NOEXEC)) ||
+        !nx_enabled) return false;
+    if (!address_space_prepare_user_range(as, page, page + PAGE_SIZE)) return false;
+    pte = address_space_pte(as, page);
+    if (!pte || (*pte & RELIEFNT_PAGE_BACKED)) return false;
+    *pte = phys | RELIEFNT_PAGE_USER | flags |
+           ((flags & RELIEFNT_PAGE_PROTNONE) ? 0 : RELIEFNT_PAGE_PRESENT);
     ++as->user_page_count;
-    x86_64_invlpg(page); paging_note_mm_change();
+    x86_64_invlpg(page);
+    paging_note_mm_change();
     return true;
 }
 
-/**
- * Address space protect user page.
- * @param as Value supplied by the caller.
- * @param vaddr Value supplied by the caller.
- * @param flags Identifier or flags controlling the operation.
- * @return The value or status produced by the operation.
+/** @brief Change permissions while retaining the current mapping's ownership.
+ * @param as Address space with the mapped leaf.
+ * @param vaddr Address within the leaf page.
+ * @param flags New protection and software permission bits.
+ * @return True after an existing backed mapping changes; false on invalid input.
  */
 bool address_space_protect_user_page(struct address_space *as, uint64_t vaddr,
                                      uint64_t flags)
 {
-    uint64_t page;
-    uint64_t index;
-    uint64_t table;
-    uint64_t slot;
+    uint64_t page = align_down(vaddr, PAGE_SIZE);
+    uint64_t *pte;
     uint64_t entry;
-    if (!as || ((flags & RELIEFNT_PAGE_WRITABLE) && !(flags & RELIEFNT_PAGE_NOEXEC))) {
+    if (!as || !user_address_valid(page) ||
+        ((flags & RELIEFNT_PAGE_WRITABLE) && !(flags & RELIEFNT_PAGE_NOEXEC)))
         return false;
-    }
-    page = align_down(vaddr, PAGE_SIZE);
-    if (page < RELIEFNT_USER_BASE || page >= RELIEFNT_USER_TOP) {
-        return false;
-    }
-    index = (page - RELIEFNT_USER_BASE) / PAGE_SIZE;
-    table = index / 512;
-    slot = index % 512;
-    if (table >= RELIEFNT_USER_PD_COUNT || !as->user_pt[table]) {
-        return false;
-    }
-    entry = as->user_pt[table][slot];
-    if (!(entry & RELIEFNT_PAGE_BACKED)) {
-        return false;
-    }
-    /* Read-only and inaccessible pages can still be shared after fork, or
-     * borrowed from the file cache. An upgrade must copy before writing. */
+    pte = address_space_pte(as, page);
+    if (!pte || !(*pte & RELIEFNT_PAGE_BACKED)) return false;
+    entry = *pte;
     if ((flags & RELIEFNT_PAGE_WRITABLE) && !(entry & RELIEFNT_PAGE_WRITABLE) &&
-        !(entry & (RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_SHARED))) {
+        !(entry & (RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_SHARED)))
         flags = (flags & ~RELIEFNT_PAGE_WRITABLE) | RELIEFNT_PAGE_COW;
-    }
     flags |= entry & (RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_SHARED | RELIEFNT_PAGE_PWT |
                       RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_PAT);
-    as->user_pt[table][slot] = (entry & RELIEFNT_PHYS_ADDR_MASK) |
-        RELIEFNT_PAGE_USER | flags |
-        ((flags & RELIEFNT_PAGE_PROTNONE) ? 0 : RELIEFNT_PAGE_PRESENT);
-    x86_64_invlpg(page); paging_note_mm_change();
+    *pte = (entry & RELIEFNT_PHYS_ADDR_MASK) | RELIEFNT_PAGE_USER | flags |
+           ((flags & RELIEFNT_PAGE_PROTNONE) ? 0 : RELIEFNT_PAGE_PRESENT);
+    x86_64_invlpg(page);
+    paging_note_mm_change();
     return true;
 }
 
-/**
- * Address space unmap user page.
- * @param as Value supplied by the caller.
- * @param vaddr Value supplied by the caller.
- * @return The value or status produced by the operation.
+/** @brief Remove a user leaf without releasing its backing reference.
+ * @param as Address space containing the leaf.
+ * @param vaddr Address within the leaf page.
+ * @return Physical backing page to the caller, or zero when absent.
  */
 uint64_t address_space_unmap_user_page(struct address_space *as, uint64_t vaddr)
 {
-    if (!as) {
-        return 0;
-    }
     uint64_t page = align_down(vaddr, PAGE_SIZE);
-    if (page < RELIEFNT_USER_BASE || page >= RELIEFNT_USER_TOP) {
-        return 0;
-    }
-    uint64_t index = (page - RELIEFNT_USER_BASE) / PAGE_SIZE;
-    uint64_t table = index / 512;
-    uint64_t slot = index % 512;
-    if (table >= RELIEFNT_USER_PD_COUNT || !as->user_pt[table]) {
-        return 0;
-    }
-    uint64_t entry = as->user_pt[table][slot];
-    if (!(entry & RELIEFNT_PAGE_BACKED)) {
-        return 0;
-    }
-    as->user_pt[table][slot] = 0;
-    if (as->user_page_count) {
-        --as->user_page_count;
-    }
-    x86_64_invlpg(page); paging_note_mm_change();
+    uint64_t *pte;
+    uint64_t entry;
+    if (!as || !user_address_valid(page)) return 0;
+    pte = address_space_pte(as, page);
+    if (!pte || !(*pte & RELIEFNT_PAGE_BACKED)) return 0;
+    entry = *pte;
+    *pte = 0;
+    if (as->user_page_count) --as->user_page_count;
+    x86_64_invlpg(page);
+    paging_note_mm_change();
     return entry & RELIEFNT_PHYS_ADDR_MASK;
 }
 
-/**
- * Address space user page phys.
- * @param as Value supplied by the caller.
- * @param vaddr Value supplied by the caller.
- * @return The value or status produced by the operation.
+/** @brief Return the physical backing page for a mapped user address.
+ * @param as Address space to inspect.
+ * @param vaddr Address within the mapping.
+ * @return Aligned physical page, or zero when no backing exists.
  */
 uint64_t address_space_user_page_phys(const struct address_space *as, uint64_t vaddr)
 {
-    if (!as) {
-        return 0;
-    }
-    uint64_t page = align_down(vaddr, PAGE_SIZE);
-    if (page < RELIEFNT_USER_BASE || page >= RELIEFNT_USER_TOP) {
-        return 0;
-    }
-    uint64_t index = (page - RELIEFNT_USER_BASE) / PAGE_SIZE;
-    uint64_t table = index / 512;
-    uint64_t slot = index % 512;
-    if (table >= RELIEFNT_USER_PD_COUNT || !as->user_pt[table]) {
-        return 0;
-    }
-    uint64_t entry = as->user_pt[table][slot];
-    return (entry & RELIEFNT_PAGE_BACKED) ? (entry & RELIEFNT_PHYS_ADDR_MASK) : 0;
+    uint64_t *pte = address_space_pte(as, vaddr);
+    return pte && (*pte & RELIEFNT_PAGE_BACKED) ?
+           (*pte & RELIEFNT_PHYS_ADDR_MASK) : 0;
 }
 
+/** @brief Return the user leaf's hardware/software flags without its PFN.
+ * @param as Address space to inspect.
+ * @param vaddr Address within the queried page.
+ * @return Leaf flags, or zero if unmapped or outside the user range.
+ */
+uint64_t address_space_user_page_flags(const struct address_space *as, uint64_t vaddr)
+{
+    uint64_t *pte = address_space_pte(as, vaddr);
+    return pte ? (*pte & ~RELIEFNT_PHYS_ADDR_MASK) : 0;
+}
+
+/** @brief Test whether a user leaf is present and readable.
+ * @param as Address space to inspect.
+ * @param vaddr Address within the queried page.
+ * @return True for a present user PTE.
+ */
+bool address_space_user_page_readable(const struct address_space *as, uint64_t vaddr)
+{
+    uint64_t *pte = address_space_pte(as, vaddr);
+    return pte && ((*pte & (RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_USER)) ==
+                   (RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_USER));
+}
+
+/** @brief Retry a fault after another thread installed adequate page permissions.
+ * @param as Address space sharing the mapping.
+ * @param vaddr Fault address.
+ * @param fault_error x86 page-fault error flags.
+ * @return True after invalidating a now-usable stale translation.
+ */
 bool address_space_retry_mapped_user_page(const struct address_space *as,
                                           uint64_t vaddr, uint64_t fault_error)
 {
-    if (!as || (fault_error & (1ULL | 8ULL)) ||
-        vaddr < RELIEFNT_USER_BASE || vaddr >= RELIEFNT_USER_TOP) return false;
-    uint64_t index = (vaddr - RELIEFNT_USER_BASE) / PAGE_SIZE;
-    uint64_t table = index / 512;
-    if (table >= RELIEFNT_USER_PD_COUNT || !as->user_pt[table]) return false;
-    uint64_t entry = as->user_pt[table][index % 512];
+    uint64_t *pte;
+    uint64_t entry;
+    if (!as || (fault_error & (1ULL | 8ULL)) || !user_address_valid(vaddr))
+        return false;
+    pte = address_space_pte(as, vaddr);
+    if (!pte) return false;
+    entry = *pte;
     if ((entry & (RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_USER)) !=
         (RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_USER)) return false;
     if ((fault_error & 2ULL) && !(entry & RELIEFNT_PAGE_WRITABLE)) return false;
     if ((fault_error & 16ULL) && (entry & RELIEFNT_PAGE_NOEXEC)) return false;
-    /* A peer sharing this mm may have resolved the same fault before this
-     * CPU acquired the fault lock. Discard its old translation before retry. */
     x86_64_invlpg(align_down(vaddr, PAGE_SIZE));
     paging_note_mm_change();
     return true;
 }
 
-bool address_space_user_page_readable(const struct address_space *as, uint64_t vaddr)
-{
-    if (!as || vaddr < RELIEFNT_USER_BASE || vaddr >= RELIEFNT_USER_TOP) return false;
-    uint64_t index = (vaddr - RELIEFNT_USER_BASE) / PAGE_SIZE;
-    uint64_t table = index / 512;
-    if (table >= RELIEFNT_USER_PD_COUNT || !as->user_pt[table]) return false;
-    uint64_t required = RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_USER;
-    return (as->user_pt[table][index % 512] & required) == required;
-}
-
-/**
- * @brief Inspect write permission on an existing user page without changing it.
- * @param as Address space, or NULL.
+/** @brief Test whether a present user mapping allows writes without resolving COW.
+ * @param as Address space, or NULL for an invalid mapping.
  * @param vaddr Address within the queried page.
- * @return True for present user-writable PTEs; false for COW or absent pages.
+ * @return True only for a present, user-accessible, writable page.
  */
 bool address_space_user_page_writable(const struct address_space *as, uint64_t vaddr)
 {
-    if (!as || vaddr < RELIEFNT_USER_BASE || vaddr >= RELIEFNT_USER_TOP) return false;
-    uint64_t index = (vaddr - RELIEFNT_USER_BASE) / PAGE_SIZE;
-    uint64_t table = index / 512;
-    if (table >= RELIEFNT_USER_PD_COUNT || !as->user_pt[table]) return false;
-    uint64_t required = RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_USER | RELIEFNT_PAGE_WRITABLE;
-    return (as->user_pt[table][index % 512] & required) == required;
+    uint64_t *pte = address_space_pte(as, vaddr);
+    uint64_t required = RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_USER |
+                        RELIEFNT_PAGE_WRITABLE;
+    return pte && ((*pte & required) == required);
 }
 
+/** @brief Test whether a user leaf is a borrowed device PFN mapping.
+ * @param as Address space to inspect.
+ * @param vaddr Address within the mapping.
+ * @return True for a backed leaf marked as device memory.
+ */
 bool address_space_user_page_is_device(const struct address_space *as, uint64_t vaddr)
 {
-    if (!as) {
-        return false;
-    }
-    uint64_t page = align_down(vaddr, PAGE_SIZE);
-    if (page < RELIEFNT_USER_BASE || page >= RELIEFNT_USER_TOP) {
-        return false;
-    }
-    uint64_t index = (page - RELIEFNT_USER_BASE) / PAGE_SIZE;
-    uint64_t table = index / 512;
-    uint64_t slot = index % 512;
-    if (table >= RELIEFNT_USER_PD_COUNT || !as->user_pt[table]) {
-        return false;
-    }
-    uint64_t entry = as->user_pt[table][slot];
-    return (entry & RELIEFNT_PAGE_BACKED) && (entry & RELIEFNT_PAGE_DEVICE);
+    uint64_t *pte = address_space_pte(as, vaddr);
+    return pte && (*pte & RELIEFNT_PAGE_BACKED) &&
+           (*pte & RELIEFNT_PAGE_DEVICE);
 }
 
-/**
- * Address space user memory kib.
- * @param as Value supplied by the caller.
- * @return The value or status produced by the operation.
+/** @brief Count mapped user bytes in KiB, including inaccessible backed leaves.
+ * @param as Address space to inspect.
+ * @return Per-address-space mapped byte count divided by 1024.
  */
-uint32_t address_space_user_memory_kib(const struct address_space *as)
+uint64_t address_space_user_memory_kib(const struct address_space *as)
 {
-    if (!as) {
-        return 0;
-    }
-    return as->user_page_count * 4U;
+    return as ? as->user_page_count * (PAGE_SIZE / 1024ULL) : 0;
 }
 
-/** @brief Count resident RAM pages, including owned PROT_NONE and shared pages. */
-uint32_t address_space_user_resident_kib(const struct address_space *as)
+/** @brief Count resident owned user RAM pages, excluding borrowed device PFNs.
+ * @param as Address space to inspect.
+ * @return Resident user bytes in KiB.
+ */
+uint64_t address_space_user_resident_kib(const struct address_space *as)
 {
-    uint32_t pages = 0;
-    if (!as) return 0;
-    for (uint32_t table = 0; table < RELIEFNT_USER_PD_COUNT; ++table) {
-        if (!as->user_pt[table]) continue;
-        for (uint32_t slot = 0; slot < 512; ++slot) {
-            uint64_t entry = as->user_pt[table][slot];
-            if ((entry & RELIEFNT_PAGE_BACKED) && !(entry & RELIEFNT_PAGE_DEVICE)) ++pages;
+    uint64_t pages = 0;
+    if (!as || !as->pml4) return 0;
+    for (uint32_t pi = 0; pi < 256; ++pi) {
+        uint64_t *pdpt = table_from_entry(as->pml4[pi]);
+        if (!pdpt || !(as->pml4[pi] & RELIEFNT_PAGE_TABLE_OWNED)) continue;
+        for (uint32_t di = 0; di < 512; ++di) {
+            uint64_t *pd = table_from_entry(pdpt[di]);
+            if (!pd || !(pdpt[di] & RELIEFNT_PAGE_TABLE_OWNED) ||
+                (pdpt[di] & PAGE_SIZE_FLAG)) continue;
+            for (uint32_t ti = 0; ti < 512; ++ti) {
+                uint64_t *pt = table_from_entry(pd[ti]);
+                if (!pt || !(pd[ti] & RELIEFNT_PAGE_TABLE_OWNED) ||
+                    (pd[ti] & PAGE_SIZE_FLAG)) continue;
+                for (uint32_t si = 0; si < 512; ++si) {
+                    uint64_t leaf = pt[si];
+                    if ((leaf & RELIEFNT_PAGE_BACKED) &&
+                        (leaf & RELIEFNT_PAGE_USER) &&
+                        !(leaf & RELIEFNT_PAGE_DEVICE)) ++pages;
+                }
+            }
         }
     }
-    return pages * 4U;
+    return pages * (PAGE_SIZE / 1024ULL);
 }
 
-/**
- * Address space map user stack.
- * @param as Value supplied by the caller.
- * @param stack_top Value supplied by the caller.
- * @return The value or status produced by the operation.
+/** @brief Map the initial stack pages ending at stack_top, rolling back failures.
+ * @param as Address space receiving the stack.
+ * @param stack_top Exclusive stack end, at or below USER_TOP.
+ * @return True when all initial pages are mapped.
  */
 bool address_space_map_user_stack(struct address_space *as, uint64_t stack_top)
 {
+    uint64_t first;
+    uint32_t mapped = 0;
     if (!as || stack_top <= (uint64_t)RELIEFNT_USER_STACK_PAGES * PAGE_SIZE ||
-        stack_top > RELIEFNT_USER_TOP) {
+        stack_top > RELIEFNT_USER_TOP || (stack_top & (PAGE_SIZE - 1))) return false;
+    first = stack_top - (uint64_t)RELIEFNT_USER_STACK_PAGES * PAGE_SIZE;
+    if (first < RELIEFNT_USER_BASE ||
+        (first < RELIEFNT_KERNEL_HOLE_END && stack_top > RELIEFNT_KERNEL_HOLE_START))
         return false;
-    }
-    uint64_t first = stack_top - (uint64_t)RELIEFNT_USER_STACK_PAGES * PAGE_SIZE;
     for (uint32_t i = 0; i < RELIEFNT_USER_STACK_PAGES; ++i) {
+        uint64_t page = first + (uint64_t)i * PAGE_SIZE;
         uint64_t phys = mm_alloc_page();
-        if (!phys || !address_space_map_user_page(as, first + (uint64_t)i * PAGE_SIZE,
-                                                  phys, RELIEFNT_PAGE_WRITABLE | RELIEFNT_PAGE_NOEXEC)) {
-            if (phys) {
-                mm_free_page(phys);
+        if (!phys || !address_space_map_user_page(as, page, phys,
+                RELIEFNT_PAGE_WRITABLE | RELIEFNT_PAGE_NOEXEC)) {
+            if (phys) mm_free_page(phys);
+            while (mapped) {
+                uint64_t old = address_space_unmap_user_page(
+                    as, first + (uint64_t)(--mapped) * PAGE_SIZE);
+                if (old) mm_free_page(old);
             }
             return false;
         }
+        ++mapped;
     }
     return true;
 }
 
+/** @brief Allocate and map one user stack-growth page.
+ * @param as Address space receiving the page.
+ * @param page Aligned virtual page address.
+ * @return True for an existing or newly mapped stack page.
+ */
 bool address_space_map_user_stack_page(struct address_space *as, uint64_t page)
 {
     uint64_t phys;
-    if (!as || (page & (PAGE_SIZE - 1ULL)) || page < RELIEFNT_USER_BASE ||
-        page >= RELIEFNT_USER_TOP) {
-        return false;
-    }
-    if (address_space_user_page_phys(as, page)) {
-        return true;
-    }
+    if (!as || (page & (PAGE_SIZE - 1)) || !user_address_valid(page)) return false;
+    if (address_space_user_page_phys(as, page)) return true;
     phys = mm_alloc_page();
-    if (!phys) {
-        return false;
-    }
+    if (!phys) return false;
     if (!address_space_map_user_page(as, page, phys,
                                      RELIEFNT_PAGE_WRITABLE | RELIEFNT_PAGE_NOEXEC)) {
         mm_free_page(phys);
@@ -1203,49 +1609,34 @@ bool address_space_map_user_stack_page(struct address_space *as, uint64_t page)
     return true;
 }
 
-/**
- * @brief Resolves a write fault by copying a shared COW page into the faulting address space.
- * @param as Address space that owns the faulting mapping.
- * @param vaddr User address within the affected page.
- * @return True when the page is now writable and private to this address space.
+/** @brief Resolve a private COW write by copying its backing page.
+ * @param as Address space containing the faulting leaf.
+ * @param vaddr Faulting virtual byte address.
+ * @return True once the new private page is writable.
  */
 bool address_space_handle_cow_fault(struct address_space *as, uint64_t vaddr)
 {
-    uint64_t page;
-    uint64_t index;
-    uint64_t table;
-    uint64_t slot;
+    uint64_t page = align_down(vaddr, PAGE_SIZE);
+    uint64_t *pte;
     uint64_t entry;
     uint64_t old_phys;
     uint64_t new_phys;
-    if (!as) {
+    if (!as || !user_address_valid(page)) return false;
+    pte = address_space_pte(as, page);
+    if (!pte) return false;
+    entry = *pte;
+    if (!(entry & RELIEFNT_PAGE_PRESENT) || !(entry & RELIEFNT_PAGE_COW))
         return false;
-    }
-    page = align_down(vaddr, PAGE_SIZE);
-    if (page < RELIEFNT_USER_BASE || page >= RELIEFNT_USER_TOP) {
-        return false;
-    }
-    index = (page - RELIEFNT_USER_BASE) / PAGE_SIZE;
-    table = index / 512;
-    slot = index % 512;
-    if (table >= RELIEFNT_USER_PD_COUNT || !as->user_pt[table]) {
-        return false;
-    }
-    entry = as->user_pt[table][slot];
-    if (!(entry & RELIEFNT_PAGE_PRESENT) || !(entry & RELIEFNT_PAGE_COW)) {
-        return false;
-    }
     old_phys = entry & RELIEFNT_PHYS_ADDR_MASK;
     new_phys = mm_alloc_page();
-    if (!new_phys) {
-        return false;
-    }
+    if (!new_phys) return false;
     copy_page(new_phys, old_phys);
-    as->user_pt[table][slot] = new_phys | RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_USER |
-                               RELIEFNT_PAGE_WRITABLE | RELIEFNT_PAGE_NOEXEC |
-                               (entry & (RELIEFNT_PAGE_PWT | RELIEFNT_PAGE_PCD |
-                                         RELIEFNT_PAGE_PAT));
-    x86_64_invlpg(page); paging_note_mm_change();
+    *pte = new_phys | RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_USER |
+           RELIEFNT_PAGE_WRITABLE |
+           (entry & (RELIEFNT_PAGE_NOEXEC | RELIEFNT_PAGE_PWT |
+                     RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_PAT));
+    x86_64_invlpg(page);
+    paging_note_mm_change();
     if (page_cache_owns(old_phys)) page_cache_release(old_phys);
     else mm_free_page(old_phys);
     return true;

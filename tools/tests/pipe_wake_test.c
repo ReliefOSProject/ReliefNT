@@ -27,6 +27,7 @@
 } while (0)
 
 static struct task_pipe pipe_fixture;
+static uint8_t pipe_fixture_data[TASK_PIPE_RING_CAP];
 static struct task test_tasks[TEST_TASK_COUNT];
 static struct task *current_task;
 static struct task_file read_end;
@@ -163,6 +164,8 @@ static void reset_pipe(void)
     pipe_fixture.handle = TEST_HANDLE;
     pipe_fixture.readers = 1;
     pipe_fixture.writers = 1;
+    pipe_fixture.capacity = TASK_PIPE_CAP;
+    pipe_fixture.data = pipe_fixture_data;
     kernel_wait_queue_init(&pipe_fixture.wait_read);
     kernel_wait_queue_init(&pipe_fixture.wait_write);
     memset(&read_end, 0, sizeof(read_end));
@@ -318,7 +321,8 @@ static int test_8192_writer_threshold_and_data(void)
         REQUIRE(test_tasks[1].state == TASK_BLOCKED,
                 "8192-byte writer woke before 16 * 512 bytes were available");
     }
-    REQUIRE(pipe_fixture.wait_write.minimum[0] == 8192u,
+    REQUIRE(pipe_fixture.wait_write.head == &test_tasks[1] &&
+            test_tasks[1].wait_minimum == 8192u,
             "queued writer must retain its full atomic request size");
     REQUIRE(read_pipe(512u) == 512, "sixteenth dd-sized read must return 512 bytes");
     REQUIRE(test_tasks[1].state == TASK_READY,
@@ -353,13 +357,14 @@ static int test_multiple_writer_thresholds_and_hol(void)
     REQUIRE(test_tasks[2].state == TASK_READY && test_tasks[3].state == TASK_READY,
             "all smaller writers must bypass an unsatisfied queue head");
     REQUIRE(pipe_fixture.wait_write.count == 1u &&
-            pipe_fixture.wait_write.waiters[0] == &test_tasks[1] &&
-            pipe_fixture.wait_write.minimum[0] == 8192u,
+            pipe_fixture.wait_write.head == &test_tasks[1] &&
+            test_tasks[1].wait_minimum == 8192u &&
+            test_tasks[1].wait_next == NULL,
             "removing satisfied middle waiters must preserve the large waiter's threshold");
 
     REQUIRE(read_pipe(512u) == 512, "additional 512-byte read must succeed");
     REQUIRE(test_tasks[1].state == TASK_BLOCKED &&
-            pipe_fixture.wait_write.minimum[0] == 8192u,
+            test_tasks[1].wait_minimum == 8192u,
             "waiter metadata must stay aligned after a middle removal");
     REQUIRE(read_pipe(6656u) == 6656, "remaining bytes must reach the large threshold");
     REQUIRE(test_tasks[1].state == TASK_READY && pipe_fixture.wait_write.count == 0u,
@@ -387,7 +392,8 @@ static int test_multiple_satisfied_writers_retry_without_lost_wakeup(void)
     REQUIRE(task_pipe_write(&write_end, writer_b_data, 512u) == -RELIEFOS_EAGAIN,
             "second writer must safely requeue if another writer consumed its space");
     REQUIRE(test_tasks[2].state == TASK_BLOCKED &&
-            pipe_fixture.wait_write.minimum[0] == 512u,
+            pipe_fixture.wait_write.head == &test_tasks[2] &&
+            test_tasks[2].wait_minimum == 512u,
             "requeued writer must retain its threshold");
 
     REQUIRE(read_pipe(512u) == 512 && test_tasks[2].state == TASK_READY,
@@ -500,7 +506,8 @@ static int test_pipe_buf_atomicity_and_contents(void)
     if (block_writer(1, writer_a_data, TEST_PIPE_BUF, &write_end)) return 1;
     REQUIRE(pipe_fixture.head == head_before,
             "PIPE_BUF-sized blocked write must not commit a partial prefix");
-    REQUIRE(pipe_fixture.wait_write.minimum[0] == TEST_PIPE_BUF,
+    REQUIRE(pipe_fixture.wait_write.head == &test_tasks[1] &&
+            test_tasks[1].wait_minimum == TEST_PIPE_BUF,
             "PIPE_BUF-sized waiter must register the complete atomic threshold");
 
     REQUIRE(read_pipe(1u) == 1 && test_tasks[1].state == TASK_READY,
@@ -560,7 +567,7 @@ static int test_generic_queue_minimum_defaults_to_zero(void)
     current_task = &test_tasks[1];
     REQUIRE(kernel_wait_queue_add(&queue, current_task) == 0,
             "generic wait-queue add must succeed");
-    REQUIRE(queue.minimum[0] == 0u,
+    REQUIRE(queue.head == current_task && current_task->wait_minimum == 0u,
             "generic waiters must have an unconditional zero threshold");
     REQUIRE(kernel_wait_queue_wake_satisfied(&queue, 0u) == 1u &&
             current_task->state == TASK_READY,
@@ -574,15 +581,18 @@ static int test_generic_queue_minimum_defaults_to_zero(void)
     current_task = &test_tasks[3];
     kernel_wait_queue_block_current_minimum(&queue, 1024u);
     kernel_wait_queue_remove(&queue, &test_tasks[1]);
-    REQUIRE(queue.count == 2u && queue.waiters[0] == &test_tasks[2] &&
-            queue.minimum[0] == 8192u && queue.minimum[1] == 1024u &&
-            queue.minimum[2] == 0u,
-            "remove must shift thresholds with waiters and clear the old tail");
+    REQUIRE(queue.count == 2u && queue.head == &test_tasks[2] &&
+            test_tasks[2].wait_minimum == 8192u &&
+            test_tasks[2].wait_next == &test_tasks[3] &&
+            test_tasks[3].wait_minimum == 1024u &&
+            queue.tail == &test_tasks[3] && test_tasks[3].wait_next == NULL,
+            "remove must preserve the ordered intrusive waiter links and thresholds");
     REQUIRE(kernel_wait_queue_wake_satisfied(&queue, 1024u) == 1u &&
             test_tasks[2].state == TASK_BLOCKED && test_tasks[3].state == TASK_READY,
             "satisfied scan must skip an unsatisfied head and wake the matching waiter");
-    REQUIRE(queue.count == 1u && queue.waiters[0] == &test_tasks[2] &&
-            queue.minimum[0] == 8192u && queue.minimum[1] == 0u,
+    REQUIRE(queue.count == 1u && queue.head == &test_tasks[2] &&
+            test_tasks[2].wait_minimum == 8192u &&
+            test_tasks[2].wait_next == NULL && queue.tail == &test_tasks[2],
             "satisfied removal must preserve the remaining threshold metadata");
     return 0;
 }
@@ -602,8 +612,10 @@ static int test_satisfied_wake_preserves_stopped_waiter(void)
 
     current_task = &test_tasks[2];
     kernel_wait_queue_block_current_minimum(&queue, 512u);
-    REQUIRE(queue.count == 2u && queue.minimum[0] == 1024u &&
-            queue.minimum[1] == 512u,
+    REQUIRE(queue.count == 2u && queue.head == &test_tasks[1] &&
+            test_tasks[1].wait_minimum == 1024u &&
+            test_tasks[1].wait_next == &test_tasks[2] &&
+            test_tasks[2].wait_minimum == 512u && queue.tail == &test_tasks[2],
             "stopped and blocked waiters must both retain their thresholds");
 
     REQUIRE(kernel_wait_queue_wake_satisfied(&queue, 1024u) == 2u,
@@ -612,8 +624,9 @@ static int test_satisfied_wake_preserves_stopped_waiter(void)
             "threshold wake must preserve TASK_STOPPED instead of resuming the task");
     REQUIRE(test_tasks[2].state == TASK_READY,
             "threshold wake must make an ordinary blocked waiter ready");
-    REQUIRE(queue.count == 0u && queue.waiters[0] == NULL &&
-            queue.minimum[0] == 0u && queue.minimum[1] == 0u &&
+    REQUIRE(queue.count == 0u && queue.head == NULL && queue.tail == NULL &&
+            test_tasks[1].wait_minimum == 0u &&
+            test_tasks[2].wait_minimum == 0u &&
             test_tasks[1].waiting_queue == NULL &&
             test_tasks[2].waiting_queue == NULL,
             "satisfied wake must unlink both waiters and clear threshold metadata");
@@ -626,8 +639,11 @@ static int test_pipe_close_wake_all_preserves_stopped_waiter(void)
     if (fill_pipe(TASK_PIPE_CAP)) return 1;
     if (block_writer(1u, writer_a_data, 8192u, &write_end)) return 1;
     if (block_writer(2u, writer_b_data, 512u, &write_end)) return 1;
-    REQUIRE(pipe_fixture.wait_write.minimum[0] == 8192u &&
-            pipe_fixture.wait_write.minimum[1] == 512u,
+    REQUIRE(pipe_fixture.wait_write.count == 2u &&
+            pipe_fixture.wait_write.head == &test_tasks[1] &&
+            test_tasks[1].wait_minimum == 8192u &&
+            test_tasks[1].wait_next == &test_tasks[2] &&
+            test_tasks[2].wait_minimum == 512u,
             "close fixture writers must be registered with their thresholds");
     test_tasks[1].state = TASK_STOPPED;
 
@@ -639,9 +655,10 @@ static int test_pipe_close_wake_all_preserves_stopped_waiter(void)
     REQUIRE(test_tasks[2].state == TASK_READY,
             "last-reader close wake_all must wake a blocked writer for EPIPE retry");
     REQUIRE(pipe_fixture.wait_write.count == 0u &&
-            pipe_fixture.wait_write.waiters[0] == NULL &&
-            pipe_fixture.wait_write.minimum[0] == 0u &&
-            pipe_fixture.wait_write.minimum[1] == 0u &&
+            pipe_fixture.wait_write.head == NULL &&
+            pipe_fixture.wait_write.tail == NULL &&
+            test_tasks[1].wait_minimum == 0u &&
+            test_tasks[2].wait_minimum == 0u &&
             test_tasks[1].waiting_queue == NULL &&
             test_tasks[2].waiting_queue == NULL,
             "close wake_all must unlink all writers and clear threshold metadata");

@@ -1,5 +1,7 @@
 #include "../../drivers/storage/ide/storage_ide.h"
 #include "../../block/core/storage_internal.h"
+#include <reliefnt/mm.h>
+#include <reliefnt/paging.h>
 static int storage_path_append_u32(char *path, uint32_t capacity, uint32_t *position,
                                    uint32_t value)
 {
@@ -433,7 +435,13 @@ void storage_init(void)
                 if (!abar_phys) {
                     continue;
                 }
-                struct ahci_hba_mem *abar = (struct ahci_hba_mem *)(uintptr_t)abar_phys;
+                if (!paging_mmio_uncached(abar_phys, sizeof(struct ahci_hba_mem))) {
+                    console_warn("[reliefnt] AHCI BAR outside supported direct-map range address=0x%llx\n",
+                                 (unsigned long long)abar_phys);
+                    continue;
+                }
+                struct ahci_hba_mem *abar = (struct ahci_hba_mem *)mm_phys_to_virt(abar_phys);
+                if (!abar) continue;
                 abar->ghc |= AHCI_GHC_AE;
                 for (uint8_t port = 0; port < 32; ++port) {
                     if ((abar->pi & (1u << port)) == 0) {
@@ -608,7 +616,7 @@ void storage_mount_boot_root(const struct boot_info *boot, bool ramdisk_root)
         console_warn("[reliefnt] storage boot root has no installer module; physical root cleared\n");
         return;
     }
-    if (storage_mount_ramdisk_root((const void *)(uintptr_t)start, length) < 0) {
+    if (storage_mount_ramdisk_root(start, length) < 0) {
         storage_memzero(g_volumes, sizeof(g_volumes));
         g_active_volume = &g_volumes[0];
         console_warn("[reliefnt] storage installer ramdisk root not mounted bytes=%llu\n",
@@ -622,17 +630,28 @@ void storage_mount_boot_root(const struct boot_info *boot, bool ramdisk_root)
     console_info("[reliefnt] storage boot root from installer ramdisk root=/\n");
 }
 
-int storage_mount_ramdisk_root(const void *image, uint64_t len)
+/**
+ * @brief Mount an installer image identified by its physical start address.
+ * @param image_phys Physical start address of the reserved Multiboot module;
+ *                   it is not a CPU pointer and is mapped only in this function.
+ * @param len Image length in bytes, at least one sector and sector-aligned;
+ *            the module stays reserved for the mounted RAM volume's lifetime.
+ * @return Zero when the FAT32 or ext-family image mounts, -EINVAL for an
+ *         invalid physical range, or -ENOENT after a filesystem mount failure.
+ * @par Context
+ * Boot or installer setup, before concurrent storage syscalls. The
+ *          mounted volume retains the direct-map pointer without copying the image.
+ */
+int storage_mount_ramdisk_root(uint64_t image_phys, uint64_t len)
 {
     struct storage_volume *root = &g_volumes[0];
-    uint64_t image_phys = (uint64_t)(uintptr_t)image;
     void *image_mapping;
     storage_memzero(root, sizeof(*root));
     g_active_volume = root;
     g_installer_root_active = 0;
     ahci_pending_clear();
     storage_cache_invalidate();
-    if (!image || len < SECTOR_SIZE || (len % SECTOR_SIZE) != 0 ||
+    if (!image_phys || len < SECTOR_SIZE || (len % SECTOR_SIZE) != 0 ||
         !paging_kernel_direct_map_range(image_phys, len)) {
         return -22;
     }
@@ -680,14 +699,24 @@ int storage_mount_ramdisk_root(const void *image, uint64_t len)
     }
     root->ready = true;
     g_installer_root_active = 1;
-    console_info("[reliefnt] storage installer root ready ramdisk=%p kernel_map=%p bytes=%llu mode=direct fs=%s\n",
-                   image,
+    console_info("[reliefnt] storage installer root ready ramdisk_phys=0x%llx kernel_map=%p bytes=%llu mode=direct fs=%s\n",
+                   (unsigned long long)image_phys,
                    image_mapping,
                    (unsigned long long)len,
                    root->filesystem == STORAGE_FILESYSTEM_EXT4 ? "ext4" : (root->filesystem == STORAGE_FILESYSTEM_EXT2 ? "ext2" : "fat32"));
     return 0;
 }
 
+/**
+ * @brief Mount the named installer-root module from Multiboot physical memory.
+ * @param boot Parsed Multiboot module list; may be NULL, in which case no
+ *             module is mounted and the root remains unavailable.
+ * @return Nothing. Missing or invalid module data is logged and leaves the
+ *         root volume cleared instead of retaining a physical-disk root.
+ * @par Context
+ * Boot setup before tasks can issue storage operations. The module's
+ *          physical range remains reserved and is mapped by the mount routine.
+ */
 void storage_init_installer_root(const struct boot_info *boot)
 {
     int mount_ret = -2;
@@ -704,9 +733,8 @@ void storage_init_installer_root(const struct boot_info *boot)
                 storage_text_eq(mod->name, "leonos-installer-root")) {
                 found = true;
                 if (mod->end > mod->start) {
-                    mount_ret = storage_mount_ramdisk_root(
-                        (const void *)(uintptr_t)mod->start,
-                        mod->end - mod->start);
+                    mount_ret = storage_mount_ramdisk_root(mod->start,
+                                                          mod->end - mod->start);
                     if (mount_ret == 0) {
                         return;
                     }

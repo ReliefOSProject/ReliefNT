@@ -17,6 +17,19 @@ static void driver_copy_text(char *dst, uint32_t cap, const char *src);
  */
 static void driver_set_error(struct driver_slot *slot, int status, const char *error);
 
+/** @brief Validate a driver's fixed descriptor header before any module callback.
+ * @param module Candidate descriptor supplied by the built-in list or loader.
+ * @return True only for the current ABI, exact descriptor size, and a callable
+ *         named module; false rejects legacy binaries without running init.
+ */
+static bool driver_module_abi_valid(const struct reliefos_driver_module *module)
+{
+    return module && module->magic == RELIEFOS_DRIVER_MODULE_MAGIC &&
+           module->abi_version == RELIEFOS_DRIVER_ABI_VERSION &&
+           module->struct_size == sizeof(*module) && module->name[0] &&
+           module->init;
+}
+
 /** @brief Invoke one module fini and collect its append-only failure report.
  * @param slot Owner slot under the manager admission gate, execution suspended.
  * @param module Live descriptor retained throughout this synchronous callback.
@@ -129,6 +142,7 @@ static const struct reliefos_driver_kernel_api driver_kernel_api = {
     .report_teardown_failure = driver_report_teardown_failure,
     .audio_request_disconnect = audio_request_controller_disconnect,
     .console_log = console_log,
+    .phys_to_virt = mm_phys_to_virt,
 };
 /** @brief Resume manager ownership after a phase that may wait or sleep.
  * @param scope Active manager wait scope whose token must be consumed.
@@ -280,9 +294,7 @@ static int driver_load_builtin(struct driver_slot *slot,
     if (slot->info.state == RELIEFOS_DRIVER_STATE_LOADED) {
         return 0;
     }
-    if (module->magic != RELIEFOS_DRIVER_MODULE_MAGIC ||
-        module->abi_version != RELIEFOS_DRIVER_ABI_VERSION ||
-        module->struct_size != sizeof(*module) || !module->name[0] || !module->init) {
+    if (!driver_module_abi_valid(module)) {
         ret = -8;
         driver_set_error(slot, ret, "Driver descriptor ABI is invalid");
         return ret;

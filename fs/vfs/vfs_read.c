@@ -258,6 +258,7 @@ int storage_read_file(const char *path, const void **out_data, size_t *out_len)
     struct storage_volume *old_volume = g_active_volume;
     uint64_t pages;
     uint64_t phys;
+    void *data;
     uint32_t got = 0;
     if (!out_data || !out_len) {
         return -22;
@@ -286,13 +287,19 @@ int storage_read_file(const char *path, const void **out_data, size_t *out_len)
         storage_restore_volume(old_volume);
         return -12;
     }
-    ret = storage_read_node(&node, 0, (void *)(uintptr_t)phys, (uint32_t)node.size, &got);
+    data = mm_phys_to_virt(phys);
+    if (!data) {
+        mm_free_pages(phys, pages ? (uint32_t)pages : 1u);
+        storage_restore_volume(old_volume);
+        return -12;
+    }
+    ret = storage_read_node(&node, 0, data, (uint32_t)node.size, &got);
     if (ret < 0 || got != node.size) {
         mm_free_pages(phys, pages ? (uint32_t)pages : 1u);
         storage_restore_volume(old_volume);
         return ret < 0 ? ret : -5;
     }
-    *out_data = (const void *)(uintptr_t)phys;
+    *out_data = data;
     *out_len = node.size;
     storage_restore_volume(old_volume);
     return 0;

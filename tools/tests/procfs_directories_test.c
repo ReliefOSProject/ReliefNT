@@ -7,25 +7,45 @@ int audio_card_snapshot(uint32_t index, uint32_t *out_id,
 { (void)index; (void)out_id; (void)identity; return -2; }
 #include "../../fs/proc/procfs.c"
 
-static struct task current = {.pid = 42, .name = "test", .uid = 1000};
+static struct task_pty_fd fixture_ptys[2];
+static struct task current = {.pid = 42, .name = "test", .uid = 1000,
+    .pty_fds = fixture_ptys, .pty_fd_count = 2, .pty_fd_capacity = 2};
 static struct task foreign = {.pid = 43, .name = "foreign", .uid = 2000};
 static bool expose_foreign;
+static struct task extra_tasks[100];
+static uint32_t visible_tasks = 1;
 struct task_pty_fd *task_pty_fd_for_fd(struct task *t, int fd)
-{ for (unsigned i = 0; i < SCHED_TASK_PTY_FD_MAX; ++i)
+{ for (unsigned i = 0; i < sched_task_pty_capacity(t); ++i)
     if (t->pty_fds[i].used && t->pty_fds[i].fd == fd) return &t->pty_fds[i];
   return NULL; }
+uint32_t sched_task_pty_capacity(const struct task *t) { return t->pty_fd_count; }
+struct task_pty_fd *sched_task_pty_at(struct task *t, uint32_t i)
+{ return i < t->pty_fd_count ? &t->pty_fds[i] : NULL; }
+uint32_t sched_task_file_capacity(const struct task *t) { (void)t; return SCHED_TASK_FILE_MAX; }
 struct task_file *task_file_for_fd(struct task *t, int fd) { (void)t; (void)fd; return NULL; }
 uint32_t pty_vt_number(uint32_t id) { return id >= 1 && id <= 6 ? id : 0; }
-uint32_t address_space_user_resident_kib(const struct address_space *as)
+uint64_t address_space_user_resident_kib(const struct address_space *as)
 { assert(as == sched_task_as(&current)); return 12; }
 struct task *sched_current_task(void) { return &current; }
 uint32_t sched_current_pid(void) { return current.pid; }
-struct task *sched_find(uint32_t pid) { return pid == current.pid ? &current : expose_foreign && pid == foreign.pid ? &foreign : NULL; }
+struct task *sched_task_at(uint32_t index)
+{ return index < visible_tasks ? (index ? &extra_tasks[index - 1] : &current) : NULL; }
+struct task *sched_find(uint32_t pid)
+{
+    if (pid == current.pid) return &current;
+    if (expose_foreign && pid == foreign.pid) return &foreign;
+    for (uint32_t i = 1; i < visible_tasks; ++i)
+        if (extra_tasks[i - 1].pid == pid) return &extra_tasks[i - 1];
+    return NULL;
+}
 uint32_t sched_snapshot(struct task_snapshot_info *out, uint32_t capacity, uint64_t *tick)
 {
     if (tick) *tick = 123;
-    if (out && capacity) out[0] = (struct task_snapshot_info){.pid = current.pid};
-    return 1;
+    if (!out || !capacity) return visible_tasks;
+    uint32_t count = visible_tasks < capacity ? visible_tasks : capacity;
+    for (uint32_t i = 0; i < count; ++i)
+        out[i] = (struct task_snapshot_info){.pid = sched_task_at(i)->pid};
+    return count;
 }
 uint64_t time_uptime_ms(void) { return 1234; }
 uint64_t mm_total_memory_kib(void) { return 1024; }
@@ -162,6 +182,13 @@ int main(void)
     offset = 0;
     assert(proc_readdir("/proc/42/fd", &offset, &entry) == 1 && !strcmp(entry.name, "0"));
     assert(proc_readdir("/proc/42/fd", &offset, &entry) == 0);
+    current.pty_fds[1] = (struct task_pty_fd){.used = 1, .fd = 2048,
+        .pty_id = 2, .endpoint = TASK_PTY_ENDPOINT_SLAVE};
+    assert(!proc_lookup("/proc/42/fd/2048", &node) && node.type == RELIEFOS_FS_TYPE_SYMLINK);
+    assert(proc_readlink("/proc/self/fd/2048", link, sizeof(link)) == 9);
+    offset = 1;
+    assert(proc_readdir("/proc/42/fd", &offset, &entry) == 1 && !strcmp(entry.name, "2048"));
+    assert(proc_readdir("/proc/42/fd", &offset, &entry) == 0);
     assert(proc_lookup("/proc/mounts", &node) == 0 && node.type == RELIEFOS_FS_TYPE_SYMLINK);
     memset(link, '#', sizeof(link));
     assert(proc_readlink("/proc/mounts", link, 4) == 4 && !memcmp(link, "self", 4) && link[4] == '#');
@@ -187,5 +214,22 @@ int main(void)
         if (!strcmp(entry.name, "42")) found = 1;
     }
     assert(found);
+    /* Both proc enumeration and Linux stat's thread count must see tasks
+     * created after the scheduler's initial 64 slots. */
+    visible_tasks = 101;
+    for (uint32_t i = 0; i < 100; ++i)
+        extra_tasks[i] = (struct task){.pid = 100 + i, .tgid = 42, .name = "thread"};
+    offset = 0;
+    unsigned numeric_entries = 0;
+    while (proc_readdir("/proc", &offset, &entry) > 0)
+        if (entry.name[0] >= '0' && entry.name[0] <= '9') ++numeric_entries;
+    if (numeric_entries != 101)
+        fprintf(stderr, "proc only exposed %u of 101 tasks\n", numeric_entries);
+    assert(numeric_entries == 101);
+    assert(proc_read("/proc/42/stat", 0, contents, sizeof(contents) - 1, &got) == 0);
+    contents[got] = 0;
+    char *field = strchr(contents, ')') + 2;
+    for (unsigned n = 3; n < 20; ++n) field = strchr(field, ' ') + 1;
+    assert(!strncmp(field, "101 ", 4));
     puts("PASS procfs task directory lookup, traversal, enumeration and overflow rejection");
 }

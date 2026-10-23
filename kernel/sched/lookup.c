@@ -116,6 +116,17 @@ struct task *sched_find(uint32_t pid)
 }
 
 /**
+ * @brief Borrow a scheduler slot with no allocation or initial-capacity cutoff.
+ * @param index Zero-based slot; caller holds execution ownership or scheduler lock.
+ * @return Stable task pointer until the caller releases ownership, or NULL
+ * after the last slot. Does not acquire a second scheduler lock.
+ */
+struct task *sched_task_at(uint32_t index)
+{
+    return index < task_count ? tasks[index] : NULL;
+}
+
+/**
  * @brief Return the first task whose name matches, or NULL when none does.
  */
 struct task *sched_find_by_name(const char *name)

@@ -20,6 +20,7 @@
 #include <reliefnt/net.h>
 #include <reliefnt/platform.h>
 #include <reliefnt/power.h>
+#include <reliefnt/paging.h>
 #include <reliefnt/pty.h>
 #include <reliefnt/page_cache.h>
 #include <reliefnt/object.h>
@@ -102,22 +103,29 @@ static void boot_log_wait_for_enter(void)
 
 /**
  * @brief Fill boot's EFI memory-map fields from a live boot-services capture.
- * Used when GRUB's Multiboot2 info carries neither memory-map tag.
+ * @param boot Writable boot information; NULL or a BIOS boot is ignored.
+ * Called after all early EFI protocol use so newly allocated boot-service
+ * data is represented before the physical allocator takes over.
  */
 static void boot_capture_efi_memory_map(struct boot_info *boot)
 {
     uint64_t entry_size = 0;
     uint32_t entry_count = 0;
 
-    if (!boot || !boot->efi_system_table || boot->mmap_entry_count || boot->efi_mmap_entry_count) {
+    if (!boot || !boot->efi_system_table) {
         return;
     }
     if (efi_boot_memory_map(boot->efi_system_table, efi_mmap_buffer,
                             sizeof(efi_mmap_buffer), &entry_size,
                             &entry_count) < 0) {
-        console_warn("[reliefnt] EFI memory map unavailable; using legacy estimate\n");
+        console_warn("[reliefnt] EFI memory map unavailable; retaining bootloader map if present\n");
         return;
     }
+    /* Prefer the final live EFI map over the older Multiboot map, which may
+     * predate the filesystem/GOP protocol allocations above. */
+    boot->mmap_addr = 0;
+    boot->mmap_entry_size = 0;
+    boot->mmap_entry_count = 0;
     boot->efi_mmap_addr = (uint64_t)(uintptr_t)efi_mmap_buffer;
     boot->efi_mmap_entry_size = (uint32_t)entry_size;
     boot->efi_mmap_entry_count = entry_count;
@@ -126,23 +134,23 @@ static void boot_capture_efi_memory_map(struct boot_info *boot)
 }
 
 /**
- * @brief Read the boot theme from the ESP display.conf, mirroring the value
- *        make_image.py stages there. Returns 1 (metro) when absent or unreadable.
+ * @brief Read the boot theme from the ESP before replacing firmware page tables.
+ * @return Zero for the Win95 theme, one for Metro or an absent/unreadable setting.
  */
 static uint32_t boot_load_ui_theme(void)
 {
     static const char reliefos_path[] = "/reliefos/config/display.conf";
     static const char legacy_path[] = "/leonos/config/display.conf";
     static const char win95[] = "theme=win95";
-    const void *data = 0;
+    char data[4096];
     size_t len = 0;
     const char *config;
 
-    if (efi_fs_read_file(reliefos_path, &data, &len) < 0 &&
-        efi_fs_read_file(legacy_path, &data, &len) < 0) {
+    if (efi_fs_read_file_into(reliefos_path, data, sizeof(data), &len) < 0 &&
+        efi_fs_read_file_into(legacy_path, data, sizeof(data), &len) < 0) {
         return 1u;
     }
-    config = (const char *)data;
+    config = data;
     for (size_t index = 0; index + sizeof(win95) - 1u <= len; ++index) {
         size_t matched = 0;
         while (matched < sizeof(win95) - 1u &&
@@ -158,10 +166,13 @@ static uint32_t boot_load_ui_theme(void)
 
 /**
  * @brief Full boot sequence: parse Multiboot2/EFI info, then initialize every kernel subsystem in order and enter userland.
+ * @param magic Multiboot2 bootloader handoff magic.
+ * @param multiboot_info Physical address of the bootloader-owned information block.
  */
 static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
 {
     bool boot_log_pause;
+    uint32_t boot_theme = 1u;
 
     __asm__ volatile("cli");
     /* The firmware left the legacy PIC unmasked with the PIT running, so IRQ0
@@ -198,10 +209,19 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
                     module_index, module->name ? module->name : "(unnamed)",
                     (unsigned long long)module->start, (unsigned long long)bytes);
     }
-    /**
- * @brief UEFI GRUB keeps boot services active and may therefore omit the Multiboot2 memory-map tags; capture the live EFI map before the allocator falls back to the legacy 512 MiB estimate.
- */
-    boot_capture_efi_memory_map(&boot);
+    /* Firmware filesystem and GOP access is confined to this pre-paging
+     * window. Snapshot retained data, close the root volume so its pools are
+     * released, then replace stale GRUB maps with the final live EFI map. */
+    if (boot.efi_system_table) {
+        efi_fs_init(boot.efi_system_table);
+        boot_theme = boot_load_ui_theme();
+        framebuffer_capture_gop(boot.efi_system_table);
+        efi_fs_shutdown();
+        /* GetMemoryMap uses the explicit table argument and does not need the
+         * filesystem handle. Capture after close but before replacing firmware
+         * mappings so any released pool pages are reflected in the allocator. */
+        boot_capture_efi_memory_map(&boot);
+    }
     boot_log_pause = cmdline_has(&boot, "bootlog-pause=1");
     /**
  * @brief Parse ACPI before the physical allocator can reclaim ACPI memory.
@@ -230,8 +250,32 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
                      cpu_info->base_mhz, cpu_info->max_mhz);
     }
     console_info("[boot] initializing display and physical page allocator\n");
+    /* Install the shared supervisor direct map before mm_init reads or writes
+     * any physical page through its alias.  Initialize it before framebuffer
+     * setup as that path also converts the firmware-provided physical surface. */
+    paging_init_user_identity();
     framebuffer_init(&boot);
     mm_init(&boot);
+    apic_map_kernel_aliases();
+    const struct framebuffer *boot_framebuffer = framebuffer_get();
+    if (boot_framebuffer->available && boot_framebuffer->reservation_start &&
+        boot_framebuffer->reservation_bytes &&
+        !paging_mmio_uncached(boot_framebuffer->reservation_start,
+                              boot_framebuffer->reservation_bytes)) {
+        console_warn("[reliefnt] framebuffer is outside the supported direct-map range\n");
+    }
+    if (boot.cmdline) {
+        boot.cmdline = (const char *)mm_phys_to_virt((uint64_t)(uintptr_t)boot.cmdline);
+    }
+    if (boot.bootloader) {
+        boot.bootloader = (const char *)mm_phys_to_virt((uint64_t)(uintptr_t)boot.bootloader);
+    }
+    for (uint32_t i = 0; i < boot.module_count; ++i) {
+        if (boot.modules[i].name) {
+            boot.modules[i].name = (const char *)mm_phys_to_virt(
+                (uint64_t)(uintptr_t)boot.modules[i].name);
+        }
+    }
     console_info("[memory] total_kib=%llu free_kib=%llu page_bytes=4096\n",
                  (unsigned long long)mm_total_memory_kib(),
                  (unsigned long long)mm_free_memory_kib());
@@ -241,10 +285,6 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
     time_init();
     input_init();
     pty_init();
-    if (boot.efi_system_table) {
-        efi_fs_init(boot.efi_system_table);
-    }
-    uint32_t boot_theme = boot_load_ui_theme();
     console_set_ui_theme(boot_theme);
     console_enable_framebuffer();
     console_enable_vga_fallback();

@@ -3,11 +3,16 @@
 
 
 /**
- * Net cpu relax.
+ * @brief Yield the processor while a synchronous networking loop waits for progress.
+ * Host network tests use PAUSE because STI/HLT is privileged outside the kernel.
  */
 void net_cpu_relax(void)
 {
+#ifdef RELIEFNT_HOST_TEST
+    __asm__ volatile("pause");
+#else
     __asm__ volatile("sti; hlt; cli");
+#endif
 }
 
 /**

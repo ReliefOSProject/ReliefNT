@@ -5,8 +5,13 @@ int storage_node_mount_flags(const struct storage_node *node, uint64_t *mount_fl
     if (!node || !mount_flags) return -22;
     uint64_t flags;
     kernel_execution_lock_irqsave(&flags);
-    int ret = node->volume_id < STORAGE_MAX_VOLUMES && g_volumes[node->volume_id].ready ? 0 : -19;
-    if (!ret) *mount_flags = g_volumes[node->volume_id].mount_flags;
+    /* Reading mount policy must not acquire the unrelated asynchronous disk
+     * transaction; mmap needs only the already pinned volume metadata. */
+    const struct storage_volume *volume = node->volume_id == STORAGE_SHMEM_VOLUME &&
+        (node->flags & STORAGE_NODE_FLAG_TMPFS) ? &g_shmem_volume :
+        node->volume_id < STORAGE_MAX_VOLUMES ? &g_volumes[node->volume_id] : NULL;
+    int ret = volume && volume->ready ? 0 : -19;
+    if (!ret) *mount_flags = volume->mount_flags;
     kernel_execution_unlock_irqrestore(flags);
     return ret;
 }

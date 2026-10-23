@@ -18,6 +18,7 @@ int storage_write_node(const char *path, uint64_t offset,
     uint32_t remaining;
     uint32_t read_len = 0;
     uint64_t phys = 0;
+    uint8_t *page_buffer;
     uint32_t pages = 0;
     int ret;
     if (out_written) {
@@ -233,20 +234,25 @@ int storage_write_node(const char *path, uint64_t offset,
     if (!phys) {
         return -12;
     }
+    page_buffer = (uint8_t *)mm_phys_to_virt(phys);
+    if (!page_buffer) {
+        mm_free_pages(phys, pages);
+        return -12;
+    }
     if (node.size) {
-        ret = storage_read_node(&node, 0, (void *)(uintptr_t)phys, (uint32_t)node.size, &read_len);
+        ret = storage_read_node(&node, 0, page_buffer, (uint32_t)node.size, &read_len);
         if (ret < 0 || read_len != node.size) {
             mm_free_pages(phys, pages);
             return ret < 0 ? ret : -5;
         }
     }
     if (offset > node.size) {
-        storage_memzero((uint8_t *)(uintptr_t)phys + node.size, (uint32_t)offset - (uint32_t)node.size);
+        storage_memzero(page_buffer + node.size, (uint32_t)offset - (uint32_t)node.size);
     }
     if (len) {
-        storage_memcpy((uint8_t *)(uintptr_t)phys + offset, buf, len);
+        storage_memcpy(page_buffer + offset, buf, len);
     }
-    ret = storage_write_file(path, (const void *)(uintptr_t)phys, total_len);
+    ret = storage_write_file(path, page_buffer, total_len);
     mm_free_pages(phys, pages);
     if (ret < 0) {
         return ret;
@@ -499,6 +505,7 @@ int storage_truncate_file(const char *path, uint64_t length)
     uint32_t pages;
     uint32_t got = 0;
     uint32_t target;
+    uint8_t *page_buffer;
     int ret;
 
     if (!path) {
@@ -539,16 +546,21 @@ int storage_truncate_file(const char *path, uint64_t length)
     if (!phys) {
         return -12;
     }
-    storage_memzero((void *)(uintptr_t)phys, pages * 4096u);
+    page_buffer = (uint8_t *)mm_phys_to_virt(phys);
+    if (!page_buffer) {
+        mm_free_pages(phys, pages);
+        return -12;
+    }
+    storage_memzero(page_buffer, pages * 4096u);
     if (node.size && target) {
         uint32_t copy = node.size < target ? (uint32_t)node.size : target;
-        ret = storage_read_node(&node, 0, (void *)(uintptr_t)phys, copy, &got);
+        ret = storage_read_node(&node, 0, page_buffer, copy, &got);
         if (ret < 0 || got != copy) {
             mm_free_pages(phys, pages);
             return ret < 0 ? ret : -5;
         }
     }
-    ret = storage_write_file(path, (const void *)(uintptr_t)phys, target);
+    ret = storage_write_file(path, page_buffer, target);
     mm_free_pages(phys, pages);
     return ret;
 }

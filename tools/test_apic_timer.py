@@ -18,17 +18,17 @@ def main() -> None:
     environment = {**os.environ, "TMPDIR": str(temporary)}
     with tempfile.TemporaryDirectory(prefix="reliefos-apic-timer-",
                                      dir=temporary) as directory:
-        executable = str(Path(directory) / "apic-timer")
-        subprocess.run([
-            compiler, "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
-            "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
-            "-fno-omit-frame-pointer", "-ffunction-sections", "-fdata-sections",
-            "-Wl,--gc-sections", "-Iinclude", "-Iinclude",
-            "-Iinclude/uapi", "-Iinclude",
-            "tools/tests/apic_timer_test.c", "-o", executable,
-        ], cwd=ROOT, env=environment, check=True)
-        subprocess.run([executable], cwd=ROOT, env=environment,
-                       check=True, timeout=30)
+        for name in ("apic_timer", "apic_directmap"):
+            executable = str(Path(directory) / name)
+            subprocess.run([
+                compiler, "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
+                "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
+                "-fno-omit-frame-pointer", "-ffunction-sections", "-fdata-sections",
+                "-Wl,--gc-sections", "-Iinclude", "-Iinclude/uapi",
+                f"tools/tests/{name}_test.c", "-o", executable,
+            ], cwd=ROOT, env=environment, check=True)
+            subprocess.run([executable], cwd=ROOT, env=environment,
+                           check=True, timeout=30)
 
 
 if __name__ == "__main__":

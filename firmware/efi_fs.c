@@ -1,7 +1,6 @@
 #include <reliefnt/efi_fs.h>
 #include <reliefnt/console.h>
 #include <reliefnt/lock.h>
-#include <reliefnt/mm.h>
 
 #define EFI_BY_PROTOCOL 2ULL
 #define EFI_FILE_MODE_READ 0x0000000000000001ULL
@@ -59,6 +58,7 @@ typedef efi_status_t (__attribute__((ms_abi)) *efi_get_memory_map_fn)(
     uint64_t *map_key,
     uint64_t *descriptor_size,
     uint32_t *descriptor_version);
+typedef efi_status_t (__attribute__((ms_abi)) *efi_free_pool_fn)(void *buffer);
 
 struct efi_boot_services {
     struct efi_table_header hdr;
@@ -68,7 +68,7 @@ struct efi_boot_services {
     void *free_pages;
     efi_get_memory_map_fn get_memory_map;
     void *allocate_pool;
-    void *free_pool;
+    efi_free_pool_fn free_pool;
     char _pad1[48];
     efi_status_t (*install_protocol_interface)(void);
     efi_status_t (*reinstall_protocol_interface)(void);
@@ -174,6 +174,7 @@ struct efi_file_info {
 static struct efi_boot_services *boot_services;
 static struct efi_file_protocol *root_dir;
 static bool ready;
+static bool sealed;
 
 static struct efi_guid sfs_guid = {
     0x964e5b22,
@@ -274,6 +275,10 @@ static int open_path(const char *path, struct efi_file_protocol **out_file)
     return 0;
 }
 
+/** @brief Locate and open the EFI system volume before page-table replacement.
+ * @param system_table_addr Firmware-owned EFI system table address.
+ * @return None. Leaves only the root file handle active for bounded early reads.
+ */
 static void efi_fs_init_impl(uint64_t system_table_addr)
 {
     struct efi_system_table *st;
@@ -281,7 +286,7 @@ static void efi_fs_init_impl(uint64_t system_table_addr)
     efi_handle_t *handles = 0;
     efi_status_t status;
 
-    if (ready) {
+    if (ready || sealed) {
         return;
     }
     if (!system_table_addr) {
@@ -291,7 +296,7 @@ static void efi_fs_init_impl(uint64_t system_table_addr)
 
     st = (struct efi_system_table *)(uintptr_t)system_table_addr;
     if (!st || !st->boot_services || !st->boot_services->locate_handle_buffer ||
-        !st->boot_services->handle_protocol) {
+        !st->boot_services->handle_protocol || !st->boot_services->free_pool) {
         console_warn("[reliefnt] efi fs init failed: boot services unavailable\n");
         return;
     }
@@ -303,6 +308,8 @@ static void efi_fs_init_impl(uint64_t system_table_addr)
         console_error("[reliefnt] efi fs locate failed status=0x%llx handles=%llu\n",
                        (unsigned long long)status,
                        (unsigned long long)handle_count);
+        if (handles && boot_services->free_pool)
+            boot_services->free_pool(handles);
         return;
     }
 
@@ -318,15 +325,24 @@ static void efi_fs_init_impl(uint64_t system_table_addr)
         if (status == EFI_SUCCESS && volume) {
             root_dir = volume;
             ready = true;
-            console_info("[reliefnt] efi fs root volume ready handles=%llu\n",
-                           (unsigned long long)handle_count);
-            return;
+            break;
         }
     }
 
-    console_error("[reliefnt] efi fs init failed: no readable FAT32 volume\n");
+    if (handles && boot_services->free_pool)
+        boot_services->free_pool(handles);
+    if (ready) {
+        console_info("[reliefnt] efi fs root volume ready handles=%llu\n",
+                     (unsigned long long)handle_count);
+    } else {
+        console_error("[reliefnt] efi fs init failed: no readable FAT32 volume\n");
+    }
 }
 
+/** @brief Initialize the EFI filesystem while firmware mappings are still active.
+ * @param system_table_addr Firmware-owned EFI system table address.
+ * @return None. Preserves the caller's interrupt state across firmware calls.
+ */
 void efi_fs_init(uint64_t system_table_addr)
 {
     /* UEFI boot services execute at TPL with interrupts enabled and return
@@ -343,6 +359,39 @@ bool efi_fs_ready(void)
     return ready;
 }
 
+/** @brief Close the root volume and seal the EFI filesystem against later firmware calls.
+ * @return None. BSP boot context while firmware boot services are still live.
+ */
+static void efi_fs_shutdown_impl(void)
+{
+    struct efi_file_protocol *volume = root_dir;
+    if (volume && volume->close) volume->close(volume);
+    root_dir = NULL;
+    boot_services = NULL;
+    ready = false;
+    sealed = true;
+}
+
+/** @brief Stop all EFI filesystem use before the kernel replaces firmware mappings.
+ * @return None. Preserves the caller's interrupt state across firmware calls.
+ */
+void efi_fs_shutdown(void)
+{
+    uint64_t irq_flags = kernel_irq_save();
+    if (!sealed) efi_fs_shutdown_impl();
+    kernel_irq_restore(irq_flags);
+}
+
+/** @brief Copy one live EFI memory map into caller-owned early-boot storage.
+ * @param system_table_addr Firmware-owned EFI system table address.
+ * @param buffer Writable destination of buffer_bytes bytes.
+ * @param buffer_bytes Destination capacity.
+ * @param out_entry_size Required output for descriptor stride.
+ * @param out_entry_count Required output for descriptor count.
+ * @return 0 on a complete map capture or a negative errno-style value. The
+ *         explicit system-table pointer remains usable after filesystem
+ *         shutdown, until the kernel replaces the firmware page tables.
+ */
 static int efi_boot_memory_map_impl(uint64_t system_table_addr, void *buffer,
                                     uint64_t buffer_bytes, uint64_t *out_entry_size,
                                     uint32_t *out_entry_count)
@@ -387,7 +436,15 @@ int efi_boot_memory_map(uint64_t system_table_addr, void *buffer,
     return ret;
 }
 
-static int efi_fs_read_file_impl(const char *path, const void **out_data, size_t *out_len)
+/** @brief Read a bounded file into caller storage while EFI file protocols are live.
+ * @param path Absolute EFI path beginning with slash.
+ * @param buffer Caller-owned writable destination.
+ * @param capacity Maximum accepted complete file size.
+ * @param out_len Required output for the number of bytes read.
+ * @return 0 on a complete read or a negative errno-style value; never allocates.
+ */
+static int efi_fs_read_file_into_impl(const char *path, void *buffer,
+                                      size_t capacity, size_t *out_len)
 {
     struct efi_file_protocol *file = 0;
     struct efi_file_info *info;
@@ -395,15 +452,12 @@ static int efi_fs_read_file_impl(const char *path, const void **out_data, size_t
     uint64_t info_size = sizeof(info_buf);
     efi_status_t status;
     uint64_t file_size;
-    uint32_t pages;
-    uint64_t phys;
     uint64_t read_size;
     int ret;
 
-    if (!out_data || !out_len) {
+    if (!path || !buffer || !capacity || !out_len) {
         return -22;
     }
-    *out_data = 0;
     *out_len = 0;
 
     ret = open_path(path, &file);
@@ -428,20 +482,13 @@ static int efi_fs_read_file_impl(const char *path, const void **out_data, size_t
 
     info = (struct efi_file_info *)info_buf;
     file_size = info->file_size;
-    if (file_size == 0) {
+    if (file_size == 0 || file_size > capacity) {
         close_file(file);
-        return -2;
-    }
-
-    pages = (uint32_t)((file_size + 4095ULL) / 4096ULL);
-    phys = mm_alloc_pages(pages);
-    if (!phys) {
-        close_file(file);
-        return -12;
+        return file_size ? -27 : -2;
     }
 
     read_size = file_size;
-    status = file->read(file, &read_size, (void *)(uintptr_t)phys);
+    status = file->read(file, &read_size, buffer);
     close_file(file);
     if (status != EFI_SUCCESS || read_size != file_size) {
         console_error("[reliefnt] efi fs read failed path=%s status=0x%llx read=%llu size=%llu\n",
@@ -449,19 +496,27 @@ static int efi_fs_read_file_impl(const char *path, const void **out_data, size_t
                        (unsigned long long)status,
                        (unsigned long long)read_size,
                        (unsigned long long)file_size);
-        mm_free_pages(phys, pages);
         return status_to_errno(status);
     }
 
-    *out_data = (const void *)(uintptr_t)phys;
     *out_len = (size_t)file_size;
     return 0;
 }
 
-int efi_fs_read_file(const char *path, const void **out_data, size_t *out_len)
+/** @brief Read one bounded file into storage that remains valid across EFI callbacks.
+ * @param path Absolute EFI path beginning with slash.
+ * @param buffer Caller-owned writable destination of capacity bytes.
+ * @param capacity Maximum complete file size accepted; oversized files are not read.
+ * @param out_len Required output, set to zero on failure and the complete size on success.
+ * @return 0 on a complete read or a negative errno-style value. Boot context
+ *         before the firmware mappings are replaced; performs no allocation.
+ */
+int efi_fs_read_file_into(const char *path, void *buffer, size_t capacity,
+                          size_t *out_len)
 {
+    if (out_len) *out_len = 0;
     uint64_t irq_flags = kernel_irq_save();
-    int ret = efi_fs_read_file_impl(path, out_data, out_len);
+    int ret = efi_fs_read_file_into_impl(path, buffer, capacity, out_len);
     kernel_irq_restore(irq_flags);
     return ret;
 }

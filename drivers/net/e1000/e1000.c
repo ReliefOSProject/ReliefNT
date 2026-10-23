@@ -1,9 +1,10 @@
 #include <reliefos/driver.h>
 
-#include <reliefnt/mm.h>
 #include <reliefnt/pci.h>
 
 static const struct reliefos_driver_kernel_api *kernel_api;
+
+static void e1000_release_rings(void);
 
 static void e1000_log(enum console_log_level level, const char *message)
 {
@@ -13,6 +14,7 @@ static void e1000_log(enum console_log_level level, const char *message)
 
 #define mm_alloc_pages(pages) kernel_api->alloc_pages((pages))
 #define mm_free_pages(address, pages) kernel_api->free_pages((address), (pages))
+#define mm_phys_to_virt(address) kernel_api->phys_to_virt((address))
 #define pci_config_read16(bus, slot, function, offset) \
     kernel_api->pci_read16((bus), (slot), (function), (offset))
 #define pci_config_write16(bus, slot, function, offset, value) \
@@ -47,6 +49,7 @@ static void e1000_log(enum console_log_level level, const char *message)
 #define E1000_REG_MTA 0x5200u
 #define E1000_REG_RAL 0x5400u
 #define E1000_REG_RAH 0x5404u
+#define E1000_REGISTER_BYTES (E1000_REG_RAH + sizeof(uint32_t))
 #define E1000_CTRL_SLU (1u << 6)
 #define E1000_CTRL_RST (1u << 26)
 
@@ -112,12 +115,16 @@ struct module_e1000_info {
 struct e1000_state {
     uint32_t present;
     uint32_t active;
+    uint32_t pci_command_valid;
+    uint16_t pci_command_original;
     struct pci_device pci;
     uintptr_t mmio_base;
     volatile struct e1000_rx_desc *rx;
     volatile struct e1000_tx_desc *tx;
     uint64_t rx_phys;
     uint64_t tx_phys;
+    uint64_t rx_buf_phys[E1000_RX_COUNT];
+    uint64_t tx_buf_phys[E1000_TX_COUNT];
     uint8_t *rx_buf[E1000_RX_COUNT];
     uint8_t *tx_buf[E1000_TX_COUNT];
     uint32_t rx_index;
@@ -245,24 +252,41 @@ static int e1000_read_mac(void)
     return 0;
 }
 
+/** @brief Allocate CPU-addressable DMA rings while retaining their bus addresses.
+ * @return Zero when all descriptor and packet pages are ready, otherwise -1
+ * after releasing every partially allocated page.
+ * Task-context initialization before DMA is enabled on the PCI function.
+ */
 static int e1000_alloc_rings(void)
 {
     g_e1000.rx_phys = mm_alloc_pages(1);
     g_e1000.tx_phys = mm_alloc_pages(1);
     if (!g_e1000.rx_phys || !g_e1000.tx_phys) {
+        e1000_release_rings();
         return -1;
     }
-    g_e1000.rx = (volatile struct e1000_rx_desc *)(uintptr_t)g_e1000.rx_phys;
-    g_e1000.tx = (volatile struct e1000_tx_desc *)(uintptr_t)g_e1000.tx_phys;
+    g_e1000.rx = (volatile struct e1000_rx_desc *)mm_phys_to_virt(g_e1000.rx_phys);
+    g_e1000.tx = (volatile struct e1000_tx_desc *)mm_phys_to_virt(g_e1000.tx_phys);
+    if (!g_e1000.rx || !g_e1000.tx) {
+        e1000_release_rings();
+        return -1;
+    }
     e1000_memzero((void *)g_e1000.rx, 4096);
     e1000_memzero((void *)g_e1000.tx, 4096);
 
     for (uint32_t i = 0; i < E1000_RX_COUNT; ++i) {
         uint64_t phys = mm_alloc_pages(1);
         if (!phys) {
+            e1000_release_rings();
             return -1;
         }
-        g_e1000.rx_buf[i] = (uint8_t *)(uintptr_t)phys;
+        g_e1000.rx_buf[i] = (uint8_t *)mm_phys_to_virt(phys);
+        if (!g_e1000.rx_buf[i]) {
+            mm_free_pages(phys, 1);
+            e1000_release_rings();
+            return -1;
+        }
+        g_e1000.rx_buf_phys[i] = phys;
         e1000_memzero(g_e1000.rx_buf[i], E1000_BUFFER_SIZE);
         g_e1000.rx[i].addr = phys;
         g_e1000.rx[i].status = 0;
@@ -270,9 +294,16 @@ static int e1000_alloc_rings(void)
     for (uint32_t i = 0; i < E1000_TX_COUNT; ++i) {
         uint64_t phys = mm_alloc_pages(1);
         if (!phys) {
+            e1000_release_rings();
             return -1;
         }
-        g_e1000.tx_buf[i] = (uint8_t *)(uintptr_t)phys;
+        g_e1000.tx_buf[i] = (uint8_t *)mm_phys_to_virt(phys);
+        if (!g_e1000.tx_buf[i]) {
+            mm_free_pages(phys, 1);
+            e1000_release_rings();
+            return -1;
+        }
+        g_e1000.tx_buf_phys[i] = phys;
         e1000_memzero(g_e1000.tx_buf[i], E1000_BUFFER_SIZE);
         g_e1000.tx[i].addr = phys;
         g_e1000.tx[i].status = E1000_TX_STATUS_DD;
@@ -315,10 +346,18 @@ static void e1000_configure_rx_tx(void)
                         E1000_RCTL_SECRC);
 }
 
+/** @brief Initialize the controller through an owned kernel MMIO alias.
+ * @return None. On success, g_e1000 owns the mapping until fini; on failure,
+ * the partially initialized state remains available for fini cleanup.
+ * Task-context driver initialization; all PCI decode and bus-master bits are
+ * disabled while the BAR is mapped. DMA buffer addresses remain physical for
+ * device programming.
+ */
 static void e1000_hardware_init(void)
 {
     struct pci_device dev;
-    uint64_t mmio;
+    uint64_t mmio_phys;
+    void *mmio_alias;
     uint16_t command;
     e1000_memzero(&g_e1000, sizeof(g_e1000));
 
@@ -331,16 +370,27 @@ static void e1000_hardware_init(void)
     }
     g_e1000.present = 1;
     g_e1000.pci = dev;
-    mmio = e1000_bar0_mmio(&dev);
-    if (!mmio) {
+    command = pci_config_read16(dev.bus, dev.slot, dev.function, 0x04);
+    g_e1000.pci_command_original = command;
+    g_e1000.pci_command_valid = 1;
+    command &= (uint16_t)~(PCI_COMMAND_IO | PCI_COMMAND_MEMORY |
+                           PCI_COMMAND_BUS_MASTER);
+    pci_config_write16(dev.bus, dev.slot, dev.function, 0x04, command);
+
+    mmio_phys = e1000_bar0_mmio(&dev);
+    if (!mmio_phys) {
         e1000_log(CONSOLE_LOG_ERROR, "BAR0 MMIO is unassigned or outside the supported 32-bit mapping");
         return;
     }
-    g_e1000.mmio_base = (uintptr_t)mmio;
+    mmio_alias = kernel_api->map_mmio(mmio_phys, E1000_REGISTER_BYTES);
+    if (!mmio_alias) {
+        e1000_log(CONSOLE_LOG_ERROR, "BAR0 MMIO mapping failed");
+        return;
+    }
+    g_e1000.mmio_base = (uintptr_t)mmio_alias;
 
     command = pci_config_read16(dev.bus, dev.slot, dev.function, 0x04);
-    command |= PCI_COMMAND_MEMORY | PCI_COMMAND_BUS_MASTER;
-    command &= (uint16_t)~PCI_COMMAND_IO;
+    command |= PCI_COMMAND_MEMORY;
     pci_config_write16(dev.bus, dev.slot, dev.function, 0x04, command);
 
     e1000_reg_write(E1000_REG_IMC, 0xffffffffu);
@@ -365,6 +415,10 @@ static void e1000_hardware_init(void)
         e1000_log(CONSOLE_LOG_ERROR, "ring allocation failed");
         return;
     }
+    command = pci_config_read16(dev.bus, dev.slot, dev.function, 0x04);
+    command |= PCI_COMMAND_MEMORY | PCI_COMMAND_BUS_MASTER;
+    command &= (uint16_t)~PCI_COMMAND_IO;
+    pci_config_write16(dev.bus, dev.slot, dev.function, 0x04, command);
     e1000_configure_rx_tx();
     g_e1000.active = 1;
     e1000_log(CONSOLE_LOG_INFO, "descriptor rings initialized; hardware MAC loaded");
@@ -501,16 +555,21 @@ static void e1000_driver_get_info(struct reliefos_driver_e1000_info *out)
     }
 }
 
+/** @brief Release the physical DMA rings and buffers without dropping device state.
+ * @return None. Ring state is cleared while the PCI identity and owned MMIO
+ * alias remain valid for initialization rollback or ordered teardown.
+ * Task-context cleanup after active ring DMA has not started or has been stopped.
+ */
 static void e1000_release_rings(void)
 {
     for (uint32_t index = 0; index < E1000_RX_COUNT; ++index) {
         if (g_e1000.rx_buf[index]) {
-            mm_free_pages((uint64_t)(uintptr_t)g_e1000.rx_buf[index], 1);
+            mm_free_pages(g_e1000.rx_buf_phys[index], 1);
         }
     }
     for (uint32_t index = 0; index < E1000_TX_COUNT; ++index) {
         if (g_e1000.tx_buf[index]) {
-            mm_free_pages((uint64_t)(uintptr_t)g_e1000.tx_buf[index], 1);
+            mm_free_pages(g_e1000.tx_buf_phys[index], 1);
         }
     }
     if (g_e1000.rx_phys) {
@@ -519,11 +578,26 @@ static void e1000_release_rings(void)
     if (g_e1000.tx_phys) {
         mm_free_pages(g_e1000.tx_phys, 1);
     }
-    e1000_memzero(&g_e1000, sizeof(g_e1000));
+    g_e1000.rx = 0;
+    g_e1000.tx = 0;
+    g_e1000.rx_phys = 0;
+    g_e1000.tx_phys = 0;
+    e1000_memzero(g_e1000.rx_buf, sizeof(g_e1000.rx_buf));
+    e1000_memzero(g_e1000.tx_buf, sizeof(g_e1000.tx_buf));
+    e1000_memzero(g_e1000.rx_buf_phys, sizeof(g_e1000.rx_buf_phys));
+    e1000_memzero(g_e1000.tx_buf_phys, sizeof(g_e1000.tx_buf_phys));
+    g_e1000.rx_index = 0;
+    g_e1000.tx_tail = 0;
+    g_e1000.active = 0;
 }
 
 static void e1000_driver_fini(void);
 
+/** @brief Validate the v2 services and register an initialized e1000 device.
+ * @param api Size-versioned kernel service table borrowed for the module lifetime.
+ * @return Zero on registration, or a negative errno after releasing partial resources.
+ * Task-context module initialization.
+ */
 static int e1000_driver_init(const struct reliefos_driver_kernel_api *api)
 {
     static const struct reliefos_driver_e1000_ops ops = {
@@ -534,7 +608,11 @@ static int e1000_driver_init(const struct reliefos_driver_kernel_api *api)
         .get_info = e1000_driver_get_info,
     };
     if (!api || api->abi_version != RELIEFOS_DRIVER_ABI_VERSION ||
-        api->struct_size < RELIEFOS_DRIVER_LOG_API_SIZE || !api->console_log) {
+        api->struct_size < RELIEFOS_DRIVER_PHYS_MAP_API_SIZE || !api->console_log ||
+        !api->phys_to_virt || !api->map_mmio || !api->unmap_mmio ||
+        !api->alloc_pages || !api->free_pages || !api->pci_find ||
+        !api->pci_read16 || !api->pci_write16 || !api->pci_read32 ||
+        !api->sleep_ms || !api->register_e1000) {
         return -22;
     }
     kernel_api = api;
@@ -548,8 +626,13 @@ static int e1000_driver_init(const struct reliefos_driver_kernel_api *api)
     return ret;
 }
 
+/** @brief Stop device access, release DMA pages, then unmap its BAR.
+ * @return None. All MMIO access ends before the owned mapping is returned.
+ * Task-context module teardown after the driver manager has stopped admissions.
+ */
 static void e1000_driver_fini(void)
 {
+    uintptr_t mmio_alias = g_e1000.mmio_base;
     if (g_e1000.mmio_base) {
         e1000_reg_write(E1000_REG_RCTL, 0);
         e1000_reg_write(E1000_REG_TCTL, 0);
@@ -557,7 +640,23 @@ static void e1000_driver_fini(void)
         (void)e1000_reg_read(E1000_REG_STATUS);
         kernel_api->sleep_ms(10);
     }
+    if (g_e1000.pci_command_valid) {
+        uint16_t command = pci_config_read16(g_e1000.pci.bus, g_e1000.pci.slot,
+                                             g_e1000.pci.function, 0x04);
+        command &= (uint16_t)~PCI_COMMAND_BUS_MASTER;
+        pci_config_write16(g_e1000.pci.bus, g_e1000.pci.slot,
+                           g_e1000.pci.function, 0x04, command);
+    }
     e1000_release_rings();
+    if (mmio_alias) {
+        kernel_api->unmap_mmio((void *)mmio_alias, E1000_REGISTER_BYTES);
+    }
+    if (g_e1000.pci_command_valid) {
+        pci_config_write16(g_e1000.pci.bus, g_e1000.pci.slot,
+                           g_e1000.pci.function, 0x04,
+                           g_e1000.pci_command_original);
+    }
+    e1000_memzero(&g_e1000, sizeof(g_e1000));
 }
 
 const struct reliefos_driver_module e1000_driver_module = {

@@ -21,6 +21,9 @@ static uint64_t vdso_image_pages[VDSO_MAX_IMAGE_PAGES];
 static uint64_t vdso_data_page;
 static uint32_t vdso_image_page_count;
 
+/** @brief Allocate and initialize the shared vDSO image and data pages.
+ * @return Zero on success or a negative Linux errno after full rollback.
+ */
 static int vdso_prepare_image(void)
 {
     uint64_t pages[VDSO_MAX_IMAGE_PAGES] = {0};
@@ -32,21 +35,30 @@ static int vdso_prepare_image(void)
     uint32_t count = (uint32_t)((length + VDSO_PAGE_SIZE - 1) / VDSO_PAGE_SIZE);
     uint64_t data = mm_alloc_page();
     if (!data) return -LINUX_ENOMEM;
-    __builtin_memset((void *)(uintptr_t)data, 0, VDSO_PAGE_SIZE);
+    void *data_map = mm_phys_to_virt(data);
+    if (!data_map) { mm_free_page(data); return -LINUX_ENOMEM; }
+    __builtin_memset(data_map, 0, VDSO_PAGE_SIZE);
     for (uint32_t i = 0; i < count; ++i) {
+        void *page_map;
         pages[i] = mm_alloc_page();
         if (!pages[i]) {
             for (uint32_t j = 0; j < i; ++j) mm_free_page(pages[j]);
             mm_free_page(data);
             return -LINUX_ENOMEM;
         }
-        __builtin_memset((void *)(uintptr_t)pages[i], 0, VDSO_PAGE_SIZE);
+        page_map = mm_phys_to_virt(pages[i]);
+        if (!page_map) {
+            for (uint32_t j = 0; j <= i; ++j) if (pages[j]) mm_free_page(pages[j]);
+            mm_free_page(data);
+            return -LINUX_ENOMEM;
+        }
+        __builtin_memset(page_map, 0, VDSO_PAGE_SIZE);
         uint64_t offset = (uint64_t)i * VDSO_PAGE_SIZE;
         uint64_t bytes = length - offset;
         if (bytes > VDSO_PAGE_SIZE) bytes = VDSO_PAGE_SIZE;
-        __builtin_memcpy((void *)(uintptr_t)pages[i], reliefnt_vdso_image_start + offset, bytes);
+        __builtin_memcpy(page_map, reliefnt_vdso_image_start + offset, bytes);
     }
-    time_vdso_bind((struct reliefnt_vdso_data *)(uintptr_t)data);
+    time_vdso_bind((struct reliefnt_vdso_data *)data_map);
     vdso_data_page = data;
     for (uint32_t i = 0; i < count; ++i) vdso_image_pages[i] = pages[i];
     vdso_image_page_count = count;

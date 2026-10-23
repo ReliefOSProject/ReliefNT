@@ -18,7 +18,7 @@
 #include <linux/kd.h>
 #include <linux/input.h>
 
-#define PTY_MAX 32u
+#define PTY_SESSION_PAGE_SIZE 32u
 #define VT_COUNT 6u
 #define PTY_INPUT_CAP 1024u
 #define PTY_OUTPUT_CAP 8192u
@@ -77,7 +77,6 @@ struct pty_session {
 #define CONSOLE_KEY_RALT   (1U << 5)
 
 
-extern struct pty_session sessions[PTY_MAX];
 extern uint8_t vt_ready;
 extern uint32_t active_vt;
 extern uint8_t vt_graphical[VT_COUNT];
@@ -97,9 +96,24 @@ extern struct kernel_wait_queue vt_waiters;
 extern uint64_t vt_display_generation;
 
 /**
- * @brief Return the PTY session for pty_id (1-based), or NULL if invalid/unused.
+ * @brief Resolve a live PTY session by its stable 1-based identifier.
+ * @param pty_id PTY ID; zero is invalid.
+ * @return Stable session pointer when allocated, otherwise NULL.
  */
 struct pty_session *find_session(uint32_t pty_id);
+
+/**
+ * @brief Resolve a PTY session slot by zero-based stable ID index.
+ * @param index Slot index where zero corresponds to PTY ID 1.
+ * @return Stable slot pointer if its backing page exists, otherwise NULL.
+ */
+struct pty_session *pty_session_slot_at(uint32_t index);
+
+/**
+ * @brief Return the current addressable PTY session slot count.
+ * @return Number of stable numeric PTY slots backed by allocated pages.
+ */
+uint32_t pty_session_slot_capacity(void);
 
 int pty_get_node(uint32_t pty_id, struct storage_node *node);
 
@@ -132,7 +146,7 @@ uint32_t ring_pop(uint8_t *ring, uint32_t cap, uint32_t *head, uint32_t *tail,
 void pty_commit_canonical_input(struct pty_session *session);
 
 /**
- * @brief Zero all PTY sessions.
+ * @brief Reset allocated PTY sessions while preserving stable backing pages.
  */
 void pty_init(void);
 
@@ -273,7 +287,9 @@ int pty_vt_graphical(uint32_t pty_id);
 void pty_console_key_event(uint8_t keycode, uint8_t pressed);
 
 /**
- * @brief Allocate and initialize a PTY for owner_pid with default termios/winsize; returns its id, or -12 when exhausted.
+ * @brief Allocate and initialize a PTY with default termios and window size.
+ * @param owner_pid Task that opened ptmx; zero is reserved for kernel consoles.
+ * @return Stable positive 1-based PTY ID or negative ENOMEM when storage growth fails.
  */
 int32_t pty_create(uint32_t owner_pid);
 
@@ -405,6 +421,7 @@ int64_t pty_check_change(uint32_t pty_id, uint32_t caller_pid, int signal_number
 
 /**
  * @brief Retire legacy owners without closing a retained Unix98 master.
+ * @param pid Task whose legacy master ownership is being retired.
  */
 void pty_process_exit(uint32_t pid);
 

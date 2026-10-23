@@ -391,20 +391,29 @@ int storage_select_volume(uint32_t volume_id)
 int storage_select_node_volume(const struct storage_node *node,
                                       struct storage_volume **old_volume)
 {
-    int ret = storage_acquire_task_io();
-    if (ret < 0) {
-        return ret;
-    }
-    if (!node || node->volume_id >= STORAGE_MAX_VOLUMES ||
-        !g_volumes[node->volume_id].ready) {
+    struct storage_volume *volume = NULL;
+    if (node && node->volume_id == STORAGE_SHMEM_VOLUME &&
+        (node->flags & STORAGE_NODE_FLAG_TMPFS) && g_shmem_volume.ready)
+        volume = &g_shmem_volume;
+    else if (node && node->volume_id < STORAGE_MAX_VOLUMES && g_volumes[node->volume_id].ready)
+        volume = &g_volumes[node->volume_id];
+    if (!volume) {
         return -2;
+    }
+    /* tmpfs operates on its own inode/page objects under the execution lock.
+     * It must not wait for, claim, or overwrite another task's disk command.
+     * In particular anonymous-file faults and final inode drops cannot return
+     * EAGAIN merely because an unrelated disk read is suspended. */
+    if (!(node->flags & STORAGE_NODE_FLAG_TMPFS) || !volume->tmpfs) {
+        int ret = storage_acquire_task_io();
+        if (ret < 0) return ret;
     }
     if (old_volume) {
         *old_volume = g_active_volume;
     }
     if ((node->flags & STORAGE_NODE_FLAG_EXT_FAMILY) && node->mount_generation &&
-        node->mount_generation != g_volumes[node->volume_id].mount_generation) return -116;
-    g_active_volume = &g_volumes[node->volume_id];
+        node->mount_generation != volume->mount_generation) return -116;
+    g_active_volume = volume;
     return 0;
 }
 

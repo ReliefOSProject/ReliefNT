@@ -3,15 +3,18 @@
 static struct task_file *task_file_promote(struct task_file *source);
 
 /**
- * Clear task files.
- * @param task Value supplied by the caller.
+ * @brief Release every file and PTY descriptor reference owned by a task table.
+ * @param task Descriptor-table owner; NULL is accepted.
  */
 static void clear_task_files(struct task *task);
 
 
 /**
- * Clear task file.
- * @param file Value supplied by the caller.
+ * @brief Release a descriptor or canonical open-file description and its resources.
+ * @param file Descriptor slot or stable OFD to clear; null and unused entries are ignored.
+ * @return Backing inode release result, or zero when no inode release is needed.
+ * @note A final canonical release detaches weak epoll watches before releasing
+ * OFD-owned resources. SCM queue and in-flight I/O references use this same path.
  */
 int clear_task_file_result(struct task_file *file)
 {
@@ -33,6 +36,7 @@ int clear_task_file_result(struct task_file *file)
         task_socket_collect();
         return result;
     }
+    if (file->references == 0) task_epoll_remove_file_description(file);
     syscall_flock_release_owner(file);
     if (file->drm_prime_file) drm_prime_file_close(file);
     if (file->flags & TASK_FILE_FLAG_DEV_NODE) {
@@ -61,7 +65,7 @@ int clear_task_file_result(struct task_file *file)
     task_inet_release(file);
     task_shm_release(file);
     if ((file->flags & TASK_FILE_FLAG_EPOLL) && file->aux) {
-        kernel_free((void *)(uintptr_t)file->aux);
+        task_epoll_destroy((struct task_epoll *)(uintptr_t)file->aux);
     }
     if ((file->flags & TASK_FILE_FLAG_TIMERFD) && file->aux) {
         kernel_free((void *)(uintptr_t)file->aux);
@@ -102,11 +106,22 @@ int clear_task_file_result(struct task_file *file)
     return result;
 }
 
+/**
+ * @brief Clear an OFD slot and release any resources still attached to it.
+ * @param file Descriptor or description slot; null and unused values are ignored.
+ */
 void clear_task_file(struct task_file *file)
 {
     (void)clear_task_file_result(file);
 }
 
+/**
+ * @brief Promote an inline descriptor into a stable heap-owned OFD when needed.
+ * @param source Live descriptor or canonical description; caller owns its lifetime.
+ * @return Borrowed canonical description, or null when allocation fails.
+ * @note Promotion does not add a reference. Newly promoted descriptions begin
+ * with the source descriptor's reference; epoll watch lists start empty.
+ */
 static struct task_file *task_file_promote(struct task_file *source)
 {
     if (source->description) return source->description;
@@ -115,6 +130,7 @@ static struct task_file *task_file_promote(struct task_file *source)
     if (!description) return NULL;
     *description = *source;
     description->references = 1;
+    description->epoll_watches = NULL;
     description->fd_flags = 0;
     /* Promotion moves the OFD, not its locks. Retarget the lock table before
      * dup/fork or an I/O pin can retire/reuse the inline descriptor slot. */
@@ -132,6 +148,12 @@ static struct task_file *task_file_promote(struct task_file *source)
     return description;
 }
 
+/**
+ * @brief Install one descriptor alias and increment the source OFD reference.
+ * @param destination Unused descriptor slot to initialize; must not alias source.
+ * @param source Live source descriptor or canonical OFD.
+ * @return Zero on success, -EBADF for invalid arguments, or -ENOMEM on promotion failure.
+ */
 int task_file_reference(struct task_file *destination, struct task_file *source)
 {
     if (!source || !source->used || !destination) return -RELIEFOS_EBADF;
@@ -142,6 +164,12 @@ int task_file_reference(struct task_file *destination, struct task_file *source)
     return 0;
 }
 
+/**
+ * @brief Retain a transient reference to a stable canonical file description.
+ * @param source Live descriptor or description; caller must serialize against close.
+ * @return Canonical OFD with one additional reference, or null for invalid input
+ * or allocation failure during promotion.
+ */
 struct task_file *task_file_get(struct task_file *source)
 {
     if (!source || !source->used) return NULL;
@@ -150,6 +178,12 @@ struct task_file *task_file_get(struct task_file *source)
     return description;
 }
 
+/**
+ * @brief Drop one transient OFD reference and perform final cleanup when needed.
+ * @param description Canonical file description returned by task_file_get().
+ * @note The final put detaches epoll watchers before releasing description-owned
+ * resources, so no watch can extend or outlive the OFD.
+ */
 void task_file_put(struct task_file *description)
 {
     if (description && --description->references == 0) {
@@ -159,8 +193,8 @@ void task_file_put(struct task_file *description)
 }
 
 /**
- * Clear task files.
- * @param task Value supplied by the caller.
+ * @brief Release every file and PTY descriptor reference owned by a task table.
+ * @param task Descriptor-table owner; NULL is accepted.
  */
 static void clear_task_files(struct task *task)
 {
@@ -178,13 +212,13 @@ static void clear_task_files(struct task *task)
         syscall_record_locks_close(task, &sched_task_fds(task)->stdio_files[i]);
         clear_task_file(&sched_task_fds(task)->stdio_files[i]);
     }
-    for (uint32_t i = 0; i < SCHED_TASK_PTY_FD_MAX; ++i)
-        task_pty_release_entry(&sched_task_fds(task)->pty_fds[i]);
+    for (uint32_t i = 0; i < sched_task_pty_capacity(task); ++i)
+        task_pty_release_entry(sched_task_pty_at(task, i));
 }
 
 /**
- * Syscall release task files.
- * @param task Value supplied by the caller.
+ * @brief Release a final task's descriptor entries and their backing vectors.
+ * @param task Task whose file-table reference is already known to be final; NULL is accepted.
  */
 void syscall_release_task_files(struct task *task)
 {
@@ -193,13 +227,17 @@ void syscall_release_task_files(struct task *task)
     }
     clear_task_files(task);
     sched_task_file_release(task);
+    sched_task_pty_release(task);
 }
 
 /**
- * @brief Retains pipe endpoint references after fork copies descriptor entries by value.
+ * @brief Retain copied pipe and PTY endpoint references in a fork child's private table.
  * @param parent Source process, required to prevent accidental use on detached task records.
- * @param child Fork child whose copied pipe endpoints require new references.
- * @return Zero on success or a negative errno-style result for invalid arguments.
+ * @param child Fork child whose copied endpoint entries require new references.
+ * @return Zero on success or a negative errno-style allocation/reference error.
+ * @note PTY alias slots are reserved before references are copied. If this fails
+ * before the copy pass, no child PTY references are published; clone rollback owns
+ * and releases any detached child vector.
  */
 int syscall_clone_task_files(const struct task *parent, struct task *child)
 {
@@ -208,17 +246,32 @@ int syscall_clone_task_files(const struct task *parent, struct task *child)
     }
     int ret = task_pty_materialize_stdio((struct task *)parent);
     if (ret < 0) return ret;
+    struct task_fd_table_state *child_files = sched_task_fds(child);
+    const struct task_fd_table_state *parent_files = sched_task_fds(parent);
+    if (child_files == parent_files) return 0;
+    /* White-box callers may have copied the whole table before asking us to
+     * retain the child's references. Never let the child alias the parent's
+     * independently owned PTY vector. */
+    if (child_files->pty_fds == parent_files->pty_fds) {
+        child_files->pty_fds = NULL;
+        child_files->pty_fd_count = 0;
+        child_files->pty_fd_capacity = 0;
+    }
+    uint32_t pty_count = parent_files->pty_fd_count;
+    ret = sched_task_pty_table_reserve(child_files, pty_count);
+    if (ret < 0) return ret;
+    child_files->pty_fd_count = pty_count;
     /* Finish all allocations before child references are published, so an
      * allocation failure cannot leak half of the inherited descriptor set. */
     for (unsigned pass = 0; pass < 2; ++pass) {
-        for (uint32_t i = 0; i < SCHED_TASK_PTY_FD_MAX; ++i) {
-            struct task_pty_fd *source = &sched_task_fds(parent)->pty_fds[i];
+        for (uint32_t i = 0; i < pty_count; ++i) {
+            struct task_pty_fd *source = &parent_files->pty_fds[i];
             if (!source->used) continue;
             if (!pass) {
                 ret = task_pty_promote(source);
                 if (ret < 0) return ret;
             } else {
-                sched_task_fds(child)->pty_fds[i] = *source;
+                *sched_task_pty_at(child, i) = *source;
                 ++source->description->references;
             }
         }
@@ -239,6 +292,12 @@ int syscall_clone_task_files(const struct task *parent, struct task *child)
     return 0;
 }
 
+/**
+ * @brief Detach a task from a multiply referenced descriptor table.
+ * @param task Task whose descriptor table is shared; required.
+ * @return Zero when already private or after a successful copy, otherwise a negative
+ * allocation or terminal-reference error while preserving the installed shared table.
+ */
 int syscall_unshare_task_files(struct task *task)
 {
     struct task_fd_table_state *old = task->shared_files;
@@ -251,19 +310,30 @@ int syscall_unshare_task_files(struct task *task)
     copy->references = 1;
     copy->lock_owner = 0;
     copy->file_extra = NULL;
+    copy->pty_fds = NULL;
+    copy->pty_fd_count = 0;
+    copy->pty_fd_capacity = 0;
     if (old->file_extra_capacity) {
         copy->file_extra = kernel_malloc(old->file_extra_capacity * sizeof(struct task_file));
         if (!copy->file_extra) { kernel_free(copy); return -RELIEFOS_ENOMEM; }
         for (uint32_t i = 0; i < old->file_extra_capacity; ++i) copy->file_extra[i] = old->file_extra[i];
     }
+    ret = sched_task_pty_table_reserve(copy, old->pty_fd_count);
+    if (ret < 0) {
+        kernel_free(copy->file_extra);
+        kernel_free(copy);
+        return ret;
+    }
+    copy->pty_fd_count = old->pty_fd_count;
     for (unsigned pass = 0; pass < 2; ++pass) {
-        for (uint32_t i = 0; i < SCHED_TASK_PTY_FD_MAX; ++i) {
+        for (uint32_t i = 0; i < old->pty_fd_count; ++i) {
             struct task_pty_fd *source = &old->pty_fds[i];
             if (!source->used) continue;
             if (!pass) {
                 ret = task_pty_promote(source);
                 if (ret < 0) {
                     kernel_free(copy->file_extra);
+                    kernel_free(copy->pty_fds);
                     kernel_free(copy);
                     return ret;
                 }
@@ -283,6 +353,7 @@ int syscall_unshare_task_files(struct task *task)
             if (!pass) {
                 if (!task_file_promote(source)) {
                     kernel_free(copy->file_extra);
+                    kernel_free(copy->pty_fds);
                     kernel_free(copy);
                     return -RELIEFOS_ENOMEM;
                 }
@@ -323,10 +394,11 @@ void syscall_close_cloexec_files(struct task *task)
             sched_task_fds(task)->cloexec_stdio_mask &= ~(1u << i);
         }
     }
-    for (uint32_t i = 0; i < SCHED_TASK_PTY_FD_MAX; ++i) {
-        if (sched_task_fds(task)->pty_fds[i].used && (sched_task_fds(task)->pty_fds[i].flags & 1u)) {
-            int fd = sched_task_fds(task)->pty_fds[i].fd;
-            task_pty_release_entry(&sched_task_fds(task)->pty_fds[i]);
+    for (uint32_t i = 0; i < sched_task_pty_capacity(task); ++i) {
+        struct task_pty_fd *entry = sched_task_pty_at(task, i);
+        if (entry->used && (entry->flags & 1u)) {
+            int fd = entry->fd;
+            task_pty_release_entry(entry);
             if (fd >= 0 && fd < 3) sched_task_fds(task)->closed_stdio_mask |= 1u << fd;
         }
     }
@@ -337,6 +409,13 @@ struct task_file *task_file_for_fd(struct task *task, int fd)
     return task_file_description(task_descriptor_for_fd(task, fd));
 }
 
+/**
+ * @brief Resolve the stable OFD bound to the current syscall or descriptor.
+ * @param task Current task; NULL returns NULL.
+ * @param fd Linux descriptor number whose in-flight syscall pin may override lookup.
+ * @return Borrowed stable file description, or NULL when the descriptor is not a file.
+ * @note Caller serializes with descriptor mutation; the returned pointer is not retained.
+ */
 struct task_file *task_file_for_io(struct task *task, int fd)
 {
     if (task && task->syscall_pty.used && task->syscall_fd == fd) return NULL;
@@ -510,7 +589,6 @@ int task_allocate_fd(struct task *task, int minimum, struct task_file **slot)
  */
 void task_discard_file_fd(struct task *task, int fd)
 {
-    task_epoll_remove_fd(task, fd);
     syscall_record_locks_close(task, task_descriptor_for_fd(task, fd));
     clear_task_file(task_descriptor_for_fd(task, fd));
     if (fd >= 0 && fd < 3) {
@@ -561,6 +639,15 @@ int alloc_task_fd(struct task *task, const struct storage_node *node, uint32_t f
     return fd;
 }
 
+/**
+ * @brief Replace a descriptor with a retained source description under the execution lock.
+ * @param task Descriptor-table owner; required.
+ * @param old_fd Existing source descriptor whose description remains shared.
+ * @param new_fd Destination descriptor below RLIMIT_NOFILE.
+ * @return Destination descriptor, or negative errno with the original target
+ * preserved on allocation or retain failure. Replacement releases its former
+ * description and record locks; a distinct destination clears FD_CLOEXEC.
+ */
 int task_dup2_fd(struct task *task, int old_fd, int new_fd)
 {
     struct task_file *old_file = task_file_for_fd(task, old_fd);
@@ -577,7 +664,6 @@ int task_dup2_fd(struct task *task, int old_fd, int new_fd)
     if (!new_file) { clear_task_file(&retained); return -RELIEFOS_ENOMEM; }
     struct task_pty_fd *replaced_pty = task_pty_fd_for_fd(task, new_fd);
     if (new_file->used) {
-        task_epoll_remove_fd(task, new_fd);
         syscall_record_locks_close(task, new_file);
         clear_task_file(new_file);
     }
@@ -609,6 +695,16 @@ int task_duplicate_file_fd(struct task *task, int old_fd, int minimum_fd,
     return fd;
 }
 
+/**
+ * @brief Retain selected parent descriptors as a child's standard streams.
+ * @param parent Source task; required when any requested descriptor is nonnegative.
+ * @param child Destination task whose stdio aliases may be replaced.
+ * @param stdin_fd Source for child fd 0, or a negative value to leave it unchanged.
+ * @param stdout_fd Source for child fd 1, or a negative value to leave it unchanged.
+ * @param stderr_fd Source for child fd 2, or a negative value to leave it unchanged.
+ * @return Zero on success or a negative errno; failed PTY alias growth releases the
+ * retained source reference without publishing a child descriptor.
+ */
 int syscall_inherit_task_fds(struct task *parent, struct task *child,
                              int stdin_fd, int stdout_fd, int stderr_fd)
 {
@@ -629,16 +725,15 @@ int syscall_inherit_task_fds(struct task *parent, struct task *child,
             struct task_pty_fd *pty_source, *pty_target = task_pty_fd_for_fd(child, i);
             int ret = task_pty_ensure_fd(parent, requested[i], &pty_source);
             if (ret < 0) return ret;
-            if (!pty_target) {
-                for (unsigned j = 0; j < SCHED_TASK_PTY_FD_MAX; ++j)
-                    if (!sched_task_fds(child)->pty_fds[j].used) {
-                        pty_target = &sched_task_fds(child)->pty_fds[j];
-                        break;
-                    }
-            }
-            if (!pty_target) return -RELIEFOS_EMFILE;
             struct task_pty_fd retained = *pty_source;
             ++retained.description->references;
+            if (!pty_target) {
+                ret = sched_task_pty_alloc(child, &pty_target);
+                if (ret < 0) {
+                    task_pty_release_entry(&retained);
+                    return ret;
+                }
+            }
             task_pty_release_entry(pty_target);
             clear_task_file(target);
             *pty_target = retained;

@@ -360,7 +360,13 @@ static bool ensure_segment_pages(struct address_space *as, uint64_t start,
 }
 
 /**
- * @brief Copy len bytes from src into the address space at vaddr, crossing page boundaries; returns false if any page is unmapped.
+ * @brief Copy executable image bytes through physical aliases of a prepared user range.
+ * @param as Owned address space whose destination pages are already mapped.
+ * @param vaddr First destination user address.
+ * @param src Readable kernel source containing len bytes.
+ * @param len Number of bytes to copy across page boundaries.
+ * @return True on success, false if any destination page has no CPU alias;
+ * previously copied bytes remain written. Requires execution ownership.
  */
 static bool copy_to_address_space(struct address_space *as, uint64_t vaddr,
                                   const uint8_t *src, uint64_t len)
@@ -375,7 +381,9 @@ static bool copy_to_address_space(struct address_space *as, uint64_t vaddr,
         if (!phys) {
             return false;
         }
-        dst = (uint8_t *)(uintptr_t)(phys + (address & (PAGE_SIZE - 1ULL)));
+        dst = (uint8_t *)mm_phys_to_virt(phys);
+        if (!dst) return false;
+        dst += address & (PAGE_SIZE - 1ULL);
         for (uint64_t i = 0; i < take; ++i) {
             dst[i] = src[copied + i];
         }
@@ -454,13 +462,30 @@ static int elf64_read_headers(const struct storage_node *node, const void **out_
     return 0;
 }
 
+/** @brief Validate canonical user bounds and reject the supervisor kernel-image window.
+ * @param start Inclusive first byte of the page-aligned segment range.
+ * @param end Exclusive end of the segment range.
+ * @return True only for a nonempty range wholly inside the low canonical user
+ * half and outside the supervisor-only kernel hole.
+ */
+static bool elf64_user_range_valid(uint64_t start, uint64_t end)
+{
+    return start >= RELIEFNT_USER_BASE && start < end && end <= RELIEFNT_USER_TOP &&
+           !(start < RELIEFNT_KERNEL_HOLE_END && end > RELIEFNT_KERNEL_HOLE_START);
+}
+
 /**
- * @brief Return true if [start, end) is a valid user range that neither overlaps the task's stack nor any of its existing VMAs.
+ * @brief Check an ELF reservation against user bounds, the stack and existing VMAs.
+ * @param task Task whose private address space is stable under the execution lock.
+ * @param start Inclusive virtual address of the proposed reservation.
+ * @param end Exclusive virtual address of the proposed reservation.
+ * @return True for a valid, nonoverlapping interval; false with a diagnostic
+ * for an invalid task, range or collision. No page tables are allocated.
  */
 static bool elf64_task_range_available(const struct task *task, uint64_t start, uint64_t end)
 {
     uint64_t stack_low;
-    if (!task || start < RELIEFNT_USER_BASE || start >= end || end > RELIEFNT_USER_TOP ||
+    if (!task || !elf64_user_range_valid(start, end) ||
         task->stack_top < (uint64_t)RELIEFNT_USER_STACK_PAGES * PAGE_SIZE) {
         console_error("[reliefnt] ELF range invalid start=0x%llx end=0x%llx stack=0x%llx\n",
                        (unsigned long long)start, (unsigned long long)end,
@@ -595,6 +620,14 @@ static uint64_t elf64_choose_bias(const struct elf_image_info *info, bool interp
 
 /**
  * @brief Create lazy file-backed VMAs for every LOAD segment of image at bias, coalescing shared read-only pages of static ET_EXEC images.
+ * @param task Pinned task whose address space and VMA metadata are owned by the caller.
+ * @param node Backing executable inode identity and size.
+ * @param image Validated ELF header and program-header bytes.
+ * @param info Image metadata receiving the highest writable segment end.
+ * @param bias Validated relocation bias for the image.
+ * @param image_name Resident diagnostic name for failure messages.
+ * @return Zero after VMA publication or a negative executable/allocation error.
+ * Page tables and backing pages are populated by faults, not by the virtual span.
  */
 static int elf64_map_one(struct task *task, const struct storage_node *node,
                           const void *image, struct elf_image_info *info,
@@ -654,18 +687,17 @@ static int elf64_map_one(struct task *task, const struct storage_node *node,
         if (!info->dynamic) {
             legacy_vma = elf64_legacy_shared_page_vma(task, node, start, end, file_offset);
         }
+        if (!elf64_user_range_valid(start, end)) {
+            console_error("[reliefnt] ELF %s LOAD[%u] user range rejected 0x%llx-0x%llx\n",
+                           image_name, i, (unsigned long long)start,
+                           (unsigned long long)end);
+            return -8;
+        }
         if (!legacy_vma && !elf64_task_range_available(task, start, end)) {
             console_error("[reliefnt] ELF %s LOAD[%u] range rejected 0x%llx-0x%llx\n",
                            image_name, i, (unsigned long long)start,
                            (unsigned long long)end);
             return -8;
-        }
-        if (!address_space_prepare_user_range(sched_task_as(task), start, end)) {
-            console_error("[reliefnt] ELF %s LOAD[%u] page table preparation failed "
-                           "0x%llx-0x%llx\n",
-                           image_name, i, (unsigned long long)start,
-                           (unsigned long long)end);
-            return -12;
         }
         vma = legacy_vma ? legacy_vma : elf64_task_free_vma(task);
         if (!vma) {

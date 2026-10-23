@@ -44,10 +44,30 @@ smp_trampoline_pmode:
 smp_trampoline_cr3_imm:
     .long 0
     mov %eax, %cr3
+
+    /* INIT resets per-CPU EFER.NXE.  Enable it before paging becomes active
+     * so the AP can use the BSP's NX-marked LAPIC and MMIO aliases. */
+    mov $0x80000000, %eax
+    cpuid
+    cmp $0x80000001, %eax
+    jb .Lap_nx_unsupported
+    mov $0x80000001, %eax
+    cpuid
+    test $(1 << 20), %edx
+    jz .Lap_nx_unsupported
     mov $0xc0000080, %ecx
     rdmsr
-    or $(1 << 8), %eax
+    or $((1 << 8) | (1 << 11)), %eax
     wrmsr
+    jmp .Lap_efer_ready
+.Lap_nx_unsupported:
+    /* The BSP uses NX on shared device aliases, so this AP cannot safely
+     * continue without NXE. Park before activating the shared page tables. */
+    cli
+1:
+    hlt
+    jmp 1b
+.Lap_efer_ready:
     mov %cr0, %eax
     or $(1 << 31), %eax
     mov %eax, %cr0

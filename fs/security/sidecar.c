@@ -329,7 +329,7 @@ static int sidecar_load(const char *directory, const uint8_t **out_data,
     }
     if (!data || length > SIDECAR_MAX_BYTES) {
         if (data) {
-            mm_free_pages((uint64_t)(uintptr_t)data,
+            mm_free_pages(mm_virt_to_phys(data),
                           sidecar_pages((uint32_t)length));
         }
         return -RELIEFOS_EIO;
@@ -343,7 +343,7 @@ static int sidecar_load(const char *directory, const uint8_t **out_data,
 static void sidecar_unload(const uint8_t *data, uint32_t length)
 {
     if (data) {
-        mm_free_pages((uint64_t)(uintptr_t)data, sidecar_pages(length));
+        mm_free_pages(mm_virt_to_phys(data), sidecar_pages(length));
     }
 }
 
@@ -700,7 +700,12 @@ static int sidecar_edit(const char *directory, const char *name, enum sidecar_ed
         sidecar_unload(image, length);
         return -RELIEFOS_ENOMEM;
     }
-    updated = (uint8_t *)(uintptr_t)phys;
+    updated = (uint8_t *)mm_phys_to_virt(phys);
+    if (!updated) {
+        mm_free_pages(phys, pages);
+        sidecar_unload(image, length);
+        return -RELIEFOS_ENOMEM;
+    }
     storage_memzero(updated, capacity);
     sidecar_put_u32(updated, SIDECAR_MAGIC);
     sidecar_put_u32(updated + 4u, SIDECAR_DISK_VERSION);

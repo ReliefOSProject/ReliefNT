@@ -7,7 +7,8 @@ ROOT = Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix="reliefos-inet-") as work:
     for name in ("udp_socket", "tcp_state"):
         binary = Path(work) / name
-        subprocess.run(["cc", "-std=c11", "-O1", "-g", "-fsanitize=address,undefined",
+        subprocess.run(["cc", "-std=c11", "-O1", "-g", "-DRELIEFNT_HOST_TEST",
+                        "-fsanitize=address,undefined",
                         "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
                         "-Iinclude", "-Iinclude", "-Iinclude/uapi", "-Iinclude",
                         f"tools/tests/{name}_test.c", "-o", str(binary)], cwd=ROOT, check=True)

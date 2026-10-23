@@ -43,9 +43,10 @@ int main(void)
 {
     const uint64_t arena = mmap_arena();
 
-    if (RELIEFNT_USER_PD_START + RELIEFNT_USER_PD_COUNT > 512u) {
-        printf("FAIL user window out of one page directory: %u entries\n",
-               (unsigned)(RELIEFNT_USER_PD_START + RELIEFNT_USER_PD_COUNT));
+    if (RELIEFNT_USER_TOP != 0x0000800000000000ULL ||
+        RELIEFNT_USER_TOP <= (1ULL << 40)) {
+        printf("FAIL user range does not cover the 48-bit canonical low half: %#llx\n",
+               (unsigned long long)RELIEFNT_USER_TOP);
         return 1;
     }
     if (arena < LARGEST_OBJECT_SPAN) {
@@ -59,7 +60,8 @@ int main(void)
                arena / MIB, (CLANG_CLOSURE_SPAN + REQUIRED_HEADROOM) / MIB, REQUIRED_HEADROOM / MIB);
         return 1;
     }
-    printf("PASS mmap arena %" PRIu64 " MiB covers a %" PRIu64 " MiB shared-object span and a %" PRIu64
+    printf("PASS 128 TiB canonical user range; mmap arena %" PRIu64
+           " MiB covers a %" PRIu64 " MiB shared-object span and a %" PRIu64
            " MiB dynamic closure\n",
            arena / MIB, LARGEST_OBJECT_SPAN / MIB, CLANG_CLOSURE_SPAN / MIB);
     return 0;

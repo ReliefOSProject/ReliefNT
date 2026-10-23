@@ -55,6 +55,47 @@ static inline struct task_fd_table_state *sched_task_fds(const struct task *task
     return task->shared_files ? task->shared_files : (struct task_fd_table_state *)&task->fd_table;
 }
 
+/**
+ * @brief Return the number of live indexable slots in the task's PTY alias table.
+ * @param task Descriptor-table owner; NULL returns zero.
+ * @return Slot count, including holes that can be reused by a later alias.
+ */
+uint32_t sched_task_pty_capacity(const struct task *task);
+
+/**
+ * @brief Resolve an existing PTY alias slot without growing the descriptor table.
+ * @param task Descriptor-table owner; NULL is accepted.
+ * @param index Zero-based slot in the live alias table.
+ * @return Borrowed slot, or NULL when index is outside the current slot count.
+ * @note A later PTY table growth can invalidate the returned pointer.
+ */
+struct task_pty_fd *sched_task_pty_at(struct task *task, uint32_t index);
+
+/**
+ * @brief Reserve PTY alias storage in a detached descriptor-table copy.
+ * @param table Descriptor table whose owned PTY vector may be replaced; required.
+ * @param wanted Number of slots needed; this call does not change the live count.
+ * @return Zero on success or negative EINVAL/ENOMEM without changing table storage.
+ * @note Successful growth invalidates pointers borrowed from the previous vector.
+ * The caller must serialize table mutation and must not retain entry pointers across growth.
+ */
+int sched_task_pty_table_reserve(struct task_fd_table_state *table, uint32_t wanted);
+
+/**
+ * @brief Extend the task's PTY alias table by one slot or reuse an empty slot.
+ * @param task Descriptor-table owner; required.
+ * @param out Receives the empty slot; required.
+ * @return Zero on success or negative EINVAL/ENOMEM without publishing a slot.
+ * @note The returned pointer is borrowed and may be invalidated by later growth.
+ */
+int sched_task_pty_alloc(struct task *task, struct task_pty_fd **out);
+
+/**
+ * @brief Free PTY alias storage after descriptor references and table sharing end.
+ * @param task Descriptor-table owner whose entries are released and table is final; NULL is accepted.
+ */
+void sched_task_pty_release(struct task *task);
+
 static inline char *sched_task_cwd(const struct task *task)
 {
     return task->shared_fs ? task->shared_fs->cwd : (char *)task->cwd;

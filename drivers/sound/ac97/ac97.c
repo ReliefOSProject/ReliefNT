@@ -264,8 +264,12 @@ static int ac97_alloc_dma(void)
         ac97_free_dma();
         return -12;
     }
-    ac97.bdl = (struct ac97_buffer_desc *)(uintptr_t)ac97.bdl_phys;
-    ac97.buffers = (uint8_t *)(uintptr_t)ac97.buffers_phys;
+    ac97.bdl = (struct ac97_buffer_desc *)kernel_api->phys_to_virt(ac97.bdl_phys);
+    ac97.buffers = (uint8_t *)kernel_api->phys_to_virt(ac97.buffers_phys);
+    if (!ac97.bdl || !ac97.buffers) {
+        ac97_free_dma();
+        return -12;
+    }
     ac97_zero(ac97.bdl, 4096U);
     ac97_zero(ac97.buffers, AC97_RING_BYTES);
     ac97_reset_stream_state();
@@ -793,7 +797,8 @@ static int ac97_driver_init(const struct reliefos_driver_kernel_api *api)
         .get_state = ac97_get_state,
     };
     if (!api || api->abi_version != RELIEFOS_DRIVER_ABI_VERSION ||
-        api->struct_size < RELIEFOS_DRIVER_LOG_API_SIZE || !api->console_log) {
+        api->struct_size < RELIEFOS_DRIVER_PHYS_MAP_API_SIZE || !api->console_log ||
+        !api->phys_to_virt) {
         return -22;
     }
     kernel_api = api;

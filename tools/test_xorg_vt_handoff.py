@@ -43,7 +43,7 @@ def run(source: str, extra: list[str], name: str, selected: str | None) -> bool:
              "-fsanitize=address,undefined",
              "-fno-sanitize-recover=all",
              *PTY_INCLUDES, *extra,
-             "-Wl,--gc-sections", source, "-o", str(binary)],
+             "-Wl,--gc-sections", source, "kernel/sched/tables.c", "-o", str(binary)],
             cwd=ROOT, check=True)
         passed = True
         for case in ([selected] if selected else [*CASES[name], "full"]):

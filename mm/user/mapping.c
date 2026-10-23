@@ -23,25 +23,27 @@ static uint64_t task_mmap_top(const struct task *task);
 static void task_drm_mapping_release(struct drm_bo **bo,
                                     struct task_file **mapping_file);
 
-/**
- * Task user pages free.
- * @param task Value supplied by the caller.
- * @param start Value supplied by the caller.
- * @param end Value supplied by the caller.
- * @return The value or status produced by the operation.
+/** @brief Check whether an interval is free of VMA reservations and backed PTEs.
+ * @param task User task whose VMA store and address space are inspected.
+ * @param start Inclusive first user virtual byte.
+ * @param end Exclusive interval end.
+ * @return 1 when valid, outside the reserved kernel hole, and unoccupied; 0 otherwise.
+ * Page-table occupancy is checked through sparse owned-table traversal.
  */
 static int task_user_pages_free(const struct task *task, uint64_t start, uint64_t end);
 
-/**
- * Task find mmap region.
- * @param task Value supplied by the caller.
- * @param len Maximum number of elements available in the related buffer.
- * @return The value or status produced by the operation.
+/** @brief Find a low-to-high free anonymous mmap interval without scanning VMA spans.
+ * @param task User task receiving the reservation.
+ * @param len Nonzero page-rounded interval length.
+ * @return First free interval base or zero when none fits below the stack.
  */
 static uint64_t task_find_mmap_region(struct task *task, uint64_t len);
 
-/**
- * @brief Keep read-only file mappings at the opposite end of the mmap interval so a large font, dictionary, or other resource cannot occupy the process break's next contiguous extension.
+/** @brief Find a high-to-low free file mmap interval without scanning VMA spans.
+ * @param task User task receiving the reservation.
+ * @param len Nonzero page-rounded interval length.
+ * @return Highest free interval base or zero when none fits below the stack.
+ * File mappings remain near the stack end to leave contiguous room for heap growth.
  */
 static uint64_t task_find_file_mmap_region(struct task *task, uint64_t len);
 
@@ -145,12 +147,7 @@ static int task_user_pages_free(const struct task *task, uint64_t start, uint64_
     if (task_vma_overlaps(task, start, end)) {
         return 0;
     }
-    for (uint64_t page = start; page < end; page += PAGE_SIZE) {
-        if (address_space_user_page_phys(sched_task_as(task), page)) {
-            return 0;
-        }
-    }
-    return 1;
+    return address_space_user_range_free(sched_task_as(task), start, end) ? 1 : 0;
 }
 
 /**
@@ -165,17 +162,32 @@ static uint64_t task_find_mmap_region(struct task *task, uint64_t len)
     if (top <= RELIEFNT_USER_MMAP_BASE || len > top - RELIEFNT_USER_MMAP_BASE) {
         return 0;
     }
-    for (uint64_t start = RELIEFNT_USER_MMAP_BASE; start + len <= top; start += PAGE_SIZE) {
-        /* Do not test every page-sized candidate inside the supervisor hole.
-         * A large anonymous mapping beginning at the mmap base would
-         * otherwise repeat the full page-presence scan thousands of times. */
-        if (start < RELIEFNT_KERNEL_HOLE_END && start + len > RELIEFNT_KERNEL_HOLE_START) {
-            start = RELIEFNT_KERNEL_HOLE_END - PAGE_SIZE;
+    for (uint64_t start = RELIEFNT_USER_MMAP_BASE; start <= top - len;) {
+        uint64_t end = start + len;
+        uint64_t occupied_end = start;
+        if (start < RELIEFNT_KERNEL_HOLE_END && end > RELIEFNT_KERNEL_HOLE_START) {
+            start = RELIEFNT_KERNEL_HOLE_END;
+            continue;
+        }
+        /* VMA metadata is sparse too: skip an entire overlapping reservation
+         * rather than retrying each page inside a multi-terabyte VMA. */
+        for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
+            const struct task_vma *vma = sched_task_vma_at(task, i);
+            if (vma && vma->used && vma->start < end && vma->end > start &&
+                vma->end > occupied_end)
+                occupied_end = vma->end;
+        }
+        if (occupied_end > start) {
+            start = align_up_page(occupied_end);
             continue;
         }
         if (task_user_pages_free(task, start, start + len)) {
             return start;
         }
+        uint64_t occupied_page;
+        if (!address_space_user_page_next(sched_task_as(task), start, end,
+                                          &occupied_page, NULL, NULL)) return 0;
+        start = occupied_page + PAGE_SIZE;
     }
     return 0;
 }
@@ -192,15 +204,40 @@ static uint64_t task_find_file_mmap_region(struct task *task, uint64_t len)
     }
     start = align_down_page(top - len);
     for (;;) {
+        uint64_t end = start + len;
+        uint64_t earliest_overlap = start + len;
+        if (start < RELIEFNT_KERNEL_HOLE_END && end > RELIEFNT_KERNEL_HOLE_START) {
+            if (RELIEFNT_KERNEL_HOLE_START < len + RELIEFNT_USER_MMAP_BASE) return 0;
+            start = align_down_page(RELIEFNT_KERNEL_HOLE_START - len);
+            continue;
+        }
+        for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
+            const struct task_vma *vma = sched_task_vma_at(task, i);
+            if (vma && vma->used && vma->start < end && vma->end > start &&
+                vma->start < earliest_overlap)
+                earliest_overlap = vma->start;
+        }
+        if (earliest_overlap < end) {
+            if (earliest_overlap < len + RELIEFNT_USER_MMAP_BASE) return 0;
+            start = align_down_page(earliest_overlap - len);
+            continue;
+        }
         if (task_user_pages_free(task, start, start + len)) {
             return start;
         }
-        if (start < RELIEFNT_USER_MMAP_BASE + PAGE_SIZE) {
-            break;
+        uint64_t cursor = start;
+        uint64_t last_page = 0;
+        uint64_t page;
+        while (address_space_user_page_next(sched_task_as(task), cursor, end,
+                                            &page, NULL, NULL)) {
+            last_page = page;
+            cursor = page + PAGE_SIZE;
         }
-        start -= PAGE_SIZE;
+        if (!last_page || last_page < len + RELIEFNT_USER_MMAP_BASE) return 0;
+        uint64_t next_start = align_down_page(last_page - len);
+        if (next_start >= start) return 0;
+        start = next_start;
     }
-    return 0;
 }
 
 /**
@@ -313,8 +350,12 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                 max_prot &= ~LINUX_PROT_EXEC;
             }
         }
+        if (file->flags & TASK_FILE_FLAG_DEV_SHM) {
+            int shm_ret = task_shm_mmap_check(file, (uint32_t)flags, (uint32_t)prot, &max_prot);
+            if (shm_ret < 0) return shm_ret;
+        }
         if (!drm_file_mapping &&
-            (file->flags & (TASK_FILE_FLAG_DEV_NODE | TASK_FILE_FLAG_DEV_SHM))) {
+            (file->flags & TASK_FILE_FLAG_DEV_NODE)) {
             uint64_t bytes;
             if ((file->flags & TASK_FILE_FLAG_DEV_NODE) &&
                 file->node.first_cluster == STORAGE_DEV_KIND_AUDIO) {
@@ -340,15 +381,15 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                 if (offset > bytes || mapped_len > bytes - offset) {
                     return -RELIEFOS_EINVAL;
                 }
-                device_phys = (uint64_t)(uintptr_t)fb->pixels + offset;
-                if (device_phys & (PAGE_SIZE - 1ULL)) {
+                device_phys = mm_virt_to_phys(fb->pixels);
+                if (!device_phys || offset > UINT64_MAX - device_phys) {
                     return -RELIEFOS_EINVAL;
                 }
-                device_mapping = 1;
-            } else if (file->flags & TASK_FILE_FLAG_DEV_SHM) {
-                int shm_map_ret = task_shm_map(file, offset, mapped_len,
-                                               (uint32_t)prot, &device_phys);
-                if (shm_map_ret < 0) return shm_map_ret;
+                device_phys += offset;
+                if (!paging_kernel_direct_map_range(device_phys, mapped_len) ||
+                    (device_phys & (PAGE_SIZE - 1ULL))) {
+                    return -RELIEFOS_EINVAL;
+                }
                 device_mapping = 1;
             } else {
                 return -RELIEFOS_EINVAL;
@@ -445,17 +486,6 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
             return -RELIEFOS_EINVAL;
         }
         device_mapping = 1;
-    }
-
-    /**
- * @brief File mappings are lazy: reserve the page-table range now so a first instruction/data fault can replace the inherited kernel huge-page identity mapping even when the CPU reports the fault as present.
- */
-    /* Anonymous mappings are lazy too, but their first page fault must not
-     * fall through to the inherited supervisor-only 2 MiB identity mapping.
-     * Replace the low page-directory entries before publishing the VMA; this
-     * reserves page-table structure without allocating the backing pages. */
-    if (!device_mapping && !address_space_prepare_user_range(sched_task_as(task), start, end)) {
-        return -RELIEFOS_ENOMEM;
     }
 
     if (prot & LINUX_PROT_WRITE) {

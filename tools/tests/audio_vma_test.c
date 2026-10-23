@@ -1,12 +1,32 @@
 /* Real PCM, scheduler VMA hooks, memory syscalls and page tables. Only CPU,
  * allocation and the hardware card are host boundaries. */
+#define mm_virt_to_phys audio_fixture_virt_to_phys
 #define main audio_device_fixture_main
 #include "audio_device_test.c"
 #undef main
+#undef mm_virt_to_phys
+
+#define RELIEFNT_PAGING_FIXTURE_EXTERNAL_SPINLOCKS
+#define mm_virt_to_phys paging_fixture_virt_to_phys
 #define main paging_fixture_main
 #include "paging_protection_test.c"
 #undef main
+#undef mm_virt_to_phys
+#undef RELIEFNT_PAGING_FIXTURE_EXTERNAL_SPINLOCKS
+
+uint64_t mm_virt_to_phys(const void *address);
 #include "modules/user_memory.h"
+
+/** @brief Translate PCM backing or a page allocated by the paging fixture.
+ * @param address Host CPU pointer to fixture-owned memory.
+ * @return Modeled physical address, or zero when neither fixture owns it.
+ */
+uint64_t mm_virt_to_phys(const void *address)
+{
+    uint64_t physical = audio_fixture_virt_to_phys(address);
+    if (physical) return physical;
+    return paging_fixture_virt_to_phys(address);
+}
 
 void storage_inode_retain(struct storage_inode_ref *inode) { assert(!inode); }
 int storage_inode_put(struct storage_inode_ref *inode) { assert(!inode); return 0; }

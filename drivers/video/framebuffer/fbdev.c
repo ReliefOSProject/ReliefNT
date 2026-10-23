@@ -2,7 +2,38 @@
 #include <linux/errno.h>
 #include <linux/fb.h>
 #include <reliefnt/framebuffer.h>
+#include <reliefnt/mm.h>
 #include <reliefnt/multiboot2.h>
+
+/**
+ * @brief Fill fbdev fixed information using the framebuffer's physical range.
+ * @param fb Active framebuffer whose pixels pointer is a kernel CPU alias.
+ * @param info Caller-owned fixed-screen-info output.
+ * @return True when the alias translates to a supported physical address;
+ *         false when the framebuffer or output is invalid.
+ * `smem_start` is an ABI physical address, never a CPU direct-map pointer.
+ */
+bool framebuffer_fbdev_get_fix_info(const struct framebuffer *fb,
+                                    struct fb_fix_screeninfo *info)
+{
+    uint64_t physical;
+    uint64_t bytes;
+    if (!fb || !fb->pixels || !info) return false;
+    physical = mm_virt_to_phys(fb->pixels);
+    if (!physical) return false;
+    bytes = fb->max_bytes ? fb->max_bytes : (uint64_t)fb->pitch * fb->height;
+    if (bytes > UINT32_MAX) return false;
+    *info = (struct fb_fix_screeninfo){
+        .smem_start = physical,
+        .smem_len = (uint32_t)bytes,
+        .type = FB_TYPE_PACKED_PIXELS,
+        .visual = fb->type == MULTIBOOT2_FRAMEBUFFER_TYPE_RGB
+                      ? FB_VISUAL_TRUECOLOR : FB_VISUAL_PSEUDOCOLOR,
+        .line_length = fb->pitch,
+    };
+    __builtin_memcpy(info->id, "leonos-fb", sizeof("leonos-fb"));
+    return true;
+}
 
 static bool fbdev_bitfield_matches(const struct fb_bitfield *field,
                                    uint32_t offset, uint32_t length)

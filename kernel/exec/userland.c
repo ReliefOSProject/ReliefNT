@@ -22,6 +22,7 @@
 #include <reliefos/layout.h>
 #include <reliefnt/permissions.h>
 #include <reliefnt/drm.h>
+#include <reliefnt/net.h>
 #include <linux/capability.h>
 #include <linux/securebits.h>
 #include <linux/mount.h>
@@ -37,18 +38,50 @@ struct sched_idle_service_state {
     uint64_t execution_flags;
 };
 
-/* The no-runnable path suspends the trap-return stack and runs this one
- * bounded progress step on a scheduler-owned ring-0 stack. IRQs only wake the
- * wait; all resource finalizers run after execution ownership is reacquired. */
+/**
+ * @brief Wait on the scheduler-owned ring-0 stack, then perform bounded maintenance.
+ * @param opaque Scheduler idle state containing execution-lock IRQ flags.
+ * @note Called with execution ownership held. The wait releases ownership;
+ *       network and resource maintenance run only after it is reacquired.
+ */
 static void sched_idle_service_wait(void *opaque)
 {
     struct sched_idle_service_state *state = opaque;
     kernel_execution_unlock_irqrestore(state->execution_flags);
     __asm__ volatile("sti; hlt; cli" ::: "memory");
     kernel_execution_lock_irqsave(&state->execution_flags);
+    net_tcp_maintenance();
     uint32_t retired = drm_vmwgfx_process_retirements(2);
     if (retired)
         console_debug("[reliefnt] drm idle retirement resources=%u\n", retired);
+}
+
+/**
+ * @brief Run bounded TCP maintenance on the scheduler-owned kernel stack.
+ * @param opaque Unused stack-call context.
+ * @note Caller holds kernel execution ownership; network polling stays out of
+ *       the timer's device-IRQ top half.
+ */
+static void sched_network_maintenance(void *opaque)
+{
+    (void)opaque;
+    net_tcp_maintenance();
+}
+
+/**
+ * @brief Switch to the scheduler-owned stack when a TCP maintenance tick is due.
+ * @note Caller holds kernel execution ownership. The no-work and same-tick
+ *       paths return without a stack switch.
+ */
+static void sched_run_network_maintenance(void)
+{
+    uint32_t cpu;
+    void *stack_top;
+    if (!net_tcp_maintenance_due()) return;
+    cpu = smp_current_cpu();
+    if (cpu >= SMP_MAX_CPUS) cpu = 0;
+    stack_top = &sched_idle_service_stacks[cpu][SCHED_IDLE_SERVICE_STACK_BYTES];
+    arch_call_on_stack(stack_top, sched_network_maintenance, 0);
 }
 
 /* Internal boot/service launch requests remain small; execve uses heap-sized vectors. */
@@ -125,10 +158,9 @@ static void task_name_from_path(const char *path, char *dst, uint32_t dst_len)
 }
 
 /**
- * @brief Append one directory entry (type + name) to entries if it fits; always increments *count.
- */
-/**
  * @brief Free the page-backed buffer allocated for a loaded executable image.
+ * @param image Owned kernel alias returned by the image loader, nullable.
+ * @param image_len Allocation size in bytes; zero requires no release.
  */
 static void free_image_buffer(const void *image, size_t image_len)
 {
@@ -137,7 +169,7 @@ static void free_image_buffer(const void *image, size_t image_len)
         return;
     }
     pages = (uint32_t)((image_len + 4095ULL) / 4096ULL);
-    mm_free_pages((uint64_t)(uintptr_t)image, pages);
+    mm_free_pages(mm_virt_to_phys(image), pages);
 }
 
 /**
@@ -214,14 +246,19 @@ static int build_exec_launch(struct exec_launch *launch, const char *path,
 
 /**
  * @brief Return a kernel pointer to the physical page backing vaddr, or NULL if unmapped.
+ * @param as Pinned address space under execution ownership.
+ * @param vaddr User address, including its offset within the page.
+ * @return Borrowed CPU alias valid while the backing page remains pinned, or NULL.
  */
 static void *user_ptr_for_phys(const struct address_space *as, uint64_t vaddr)
 {
     uint64_t phys = address_space_user_page_phys(as, vaddr);
+    uint8_t *base;
     if (!phys) {
         return 0;
     }
-    return (void *)(uintptr_t)(phys + (vaddr & 0xfffULL));
+    base = (uint8_t *)mm_phys_to_virt(phys);
+    return base ? base + (vaddr & 0xfffULL) : NULL;
 }
 
 /**
@@ -713,6 +750,8 @@ struct task *userland_schedule_from_frame(struct trap_frame *frame)
 {
     uint64_t execution_flags;
     kernel_execution_lock_irqsave(&execution_flags);
+    /* Pure-CPU user tasks reach this scheduler boundary from timer return. */
+    sched_run_network_maintenance();
     input_process_pending();
     struct task *current;
     struct task *next;

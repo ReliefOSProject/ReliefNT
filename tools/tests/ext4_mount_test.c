@@ -63,6 +63,9 @@ uint64_t mm_alloc_page(void) { return (uintptr_t)aligned_alloc(4096, 4096); }
 void mm_free_page(uint64_t p) { free((void *)(uintptr_t)p); }
 uint64_t mm_alloc_pages(uint32_t pages)
 { return test_fail_cache_alloc ? 0 : (uint64_t)(uintptr_t)calloc(pages, 4096); }
+void *mm_phys_to_virt(uint64_t physical) { return (void *)(uintptr_t)physical; }
+void mm_free_pages(uint64_t physical, uint32_t pages)
+{ (void)pages; free((void *)(uintptr_t)physical); }
 static void fixture_console_vprintf(const char *format, va_list arguments)
 {
     size_t used = strlen(console_log_buffer);

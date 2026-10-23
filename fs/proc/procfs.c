@@ -323,10 +323,10 @@ static int proc_fd_number(const char *file)
     uint32_t fd = 0;
     if (!file || __builtin_strncmp(file, "fd/", 3) || !file[3]) return -2;
     for (const char *p = file + 3; *p; ++p) {
-        if (*p < '0' || *p > '9' || fd >= SCHED_TASK_FILE_LIMIT) return -2;
+        if (*p < '0' || *p > '9' || fd >= SCHED_NR_OPEN) return -2;
         fd = fd * 10 + (uint32_t)(*p - '0');
     }
-    return fd < SCHED_TASK_FILE_LIMIT ? (int)fd : -2;
+    return fd < SCHED_NR_OPEN ? (int)fd : -2;
 }
 
 /**
@@ -433,11 +433,10 @@ static void proc_task_stat(struct task *task, struct text_stream *s)
 {
     uint64_t values[53] = {0};
     struct task_address_space_state *mm = sched_task_mm(task);
-    struct task_snapshot_info snapshots[SCHED_TASK_MAX];
-    uint32_t count = sched_snapshot(snapshots, SCHED_TASK_MAX, 0), threads = 0;
-    for (uint32_t i = 0; i < count; ++i) {
-        struct task *other = sched_find(snapshots[i].pid);
-        if (other && sched_task_tgid(other) == sched_task_tgid(task)) {
+    uint32_t threads = 0;
+    struct task *other;
+    for (uint32_t i = 0; (other = sched_task_at(i)); ++i) {
+        if (other->pid && sched_task_tgid(other) == sched_task_tgid(task)) {
             ++threads;
         }
     }
@@ -675,7 +674,8 @@ int proc_read(const char *path, uint64_t offset, void *buffer, uint32_t length,
         else if(proc_text_eq(file,"stat")) proc_task_stat(task,&stream);
         else { const char *name=task->name?task->name:"?"; uint32_t n=0; while(name[n] && n<15) ++n;
             text_bytes(&stream,name,n); text_string(&stream,"\n"); }
-        if(out_read) *out_read=stream.written; return ret;
+        if (out_read) *out_read = stream.written;
+        return ret;
     }
     int view = proc_mount_view(path);
     if (view == 1) return storage_read_mounts(offset, buffer, length, out_read);
@@ -810,7 +810,13 @@ int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *
             if (!caller || (caller->euid && sched_task_tgid(caller) != sched_task_tgid(task)))
                 return -RELIEFOS_EACCES;
             char target[RELIEFOS_FS_PATH_LEN];
-            while (*offset < SCHED_TASK_FILE_LIMIT) {
+            uint64_t limit = (uint64_t)sched_task_file_capacity(task) + 3u;
+            for (uint32_t i = 0; i < sched_task_pty_capacity(task); ++i) {
+                const struct task_pty_fd *pty = sched_task_pty_at(task, i);
+                if (pty && pty->used && pty->fd >= 0 && (uint64_t)pty->fd + 1u > limit)
+                    limit = (uint64_t)pty->fd + 1u;
+            }
+            while (*offset < limit) {
                 uint32_t fd = (uint32_t)(*offset)++;
                 if (proc_fd_target(task, (int)fd, target) < 0) continue;
                 *entry = (struct reliefos_dir_entry){.type = RELIEFOS_FS_TYPE_SYMLINK};
@@ -838,16 +844,15 @@ int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *
         return 1;
     }
     {
-        struct task_snapshot_info snapshots[SCHED_TASK_MAX];
-        uint32_t count = sched_snapshot(snapshots, SCHED_TASK_MAX, 0);
         uint32_t task_index = index - (uint32_t)(sizeof(files) / sizeof(files[0]));
-        while (task_index < count) {
+        struct task *task;
+        while ((task = sched_task_at(task_index))) {
             ++*offset;
-            if (!snapshots[task_index].pid) { ++task_index; continue; }
+            if (!task->pid) { ++task_index; continue; }
             char name[16];
             uint32_t pos = 0;
             proc_copy(name, sizeof(name), "");
-            proc_append_u64(name, &pos, sizeof(name), snapshots[task_index].pid);
+            proc_append_u64(name, &pos, sizeof(name), task->pid);
             entry->type = RELIEFOS_FS_TYPE_DIR;
             proc_copy(entry->name, sizeof(entry->name), name);
             return 1;

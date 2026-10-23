@@ -13,9 +13,9 @@ static int require_driver_management(void);
 static int require_background_service(void);
 
 /**
- * Startup release file.
- * @param data Value supplied by the caller.
- * @param len Maximum number of elements available in the related buffer.
+ * @brief Release a page-allocated startup file through its physical alias.
+ * @param data Owned kernel address returned by the startup-file loader, nullable.
+ * @param len Original allocation size in bytes, rounded up to physical pages.
  */
 static void startup_release_file(const void *data, size_t len);
 
@@ -205,15 +205,15 @@ static int require_background_service(void)
 }
 
 /**
- * Startup release file.
- * @param data Value supplied by the caller.
- * @param len Maximum number of elements available in the related buffer.
+ * @brief Release a page-allocated startup file through its physical alias.
+ * @param data Owned kernel address returned by the startup-file loader, nullable.
+ * @param len Original allocation size in bytes, rounded up to physical pages.
  */
 static void startup_release_file(const void *data, size_t len)
 {
     uint32_t pages = (uint32_t)((len + 4095U) / 4096U);
     if (data && pages) {
-        mm_free_pages((uint64_t)(uintptr_t)data, pages);
+        mm_free_pages(mm_virt_to_phys(data), pages);
     }
 }
 

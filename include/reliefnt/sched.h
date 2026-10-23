@@ -158,6 +158,13 @@ int sched_get_task_affinity(uint32_t pid, uint64_t *mask);
 int sched_set_task_affinity(uint32_t pid, uint64_t mask);
 struct task *sched_current_task(void);
 struct task *sched_find(uint32_t pid);
+/**
+ * @brief Borrow one task slot without allocating a bounded snapshot array.
+ * @param index Zero-based scheduler slot, stable while execution is serialized.
+ * @return Task or NULL at the end; caller must hold the kernel execution
+ * transaction (or scheduler lock) while accessing the borrowed task and MM.
+ */
+struct task *sched_task_at(uint32_t index);
 
 static inline uint64_t *sched_task_timer_pending(const struct task *task)
 {
@@ -320,10 +327,16 @@ int64_t sched_create_process_session(uint32_t pid);
  */
 int sched_process_group_has_pty(uint32_t process_group, uint32_t pty_id);
 /**
- * @brief Count open PTY endpoint descriptors and legacy controlling-TTY
- * attachments referencing pty_id.
+ * @brief Count endpoint descriptors and controlling-TTY attachments to a PTY.
+ * @param pty_id Stable PTY session identifier; zero has no references.
+ * @return Number of transfer references, open endpoint aliases, and attached tasks.
  */
 uint32_t sched_pty_reference_count(uint32_t pty_id);
+/**
+ * @brief Count master-endpoint references that prevent PTY session teardown.
+ * @param pty_id Stable PTY session identifier; zero has no references.
+ * @return Number of transfer references and open master aliases.
+ */
 uint32_t sched_pty_master_reference_count(uint32_t pty_id);
 /**
  * @brief Returns the POSIX process session containing a task.

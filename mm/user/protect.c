@@ -3,25 +3,30 @@
 static int syscall_mm_lock_range(uint64_t addr, uint64_t len, bool locked);
 
 
-/**
- * Task unmap pages.
- * @param task Value supplied by the caller.
- * @param start Value supplied by the caller.
- * @param end Value supplied by the caller.
+/** @brief Remove only backed user leaves in a virtual interval and release their owners.
+ * @param task User task whose address space is modified; NULL is ignored.
+ * @param start Inclusive first virtual byte to unmap.
+ * @param end Exclusive virtual range end.
+ * @return None. Backed leaves are traversed sparsely and remote user TLBs are
+ *         synchronized once after any mapping was removed.
  */
 void task_unmap_pages(struct task *task, uint64_t start, uint64_t end)
 {
-    if (!task) {
-        return;
-    }
-    for (uint64_t page = start; page < end; page += PAGE_SIZE) {
+    uint64_t cursor = start;
+    bool changed = false;
+    if (!task || start >= end) return;
+    while (cursor < end) {
+        uint64_t page;
+        uint64_t flags;
+        if (!address_space_user_page_next(sched_task_as(task), cursor, end,
+                                          &page, NULL, &flags)) break;
+        if (page >= end) break;
         struct task_vma *vma = task_vma_containing(task, page, page + PAGE_SIZE);
-        int device = address_space_user_page_is_device(sched_task_as(task), page);
         uint64_t phys = address_space_unmap_user_page(sched_task_as(task), page);
         if (phys) {
-            smp_flush_user_tlb();
+            changed = true;
             if ((vma && (vma->flags & TASK_VMA_FLAG_DEVICE)) ||
-                device) {
+                (flags & RELIEFNT_PAGE_DEVICE)) {
                 /* Framebuffer mappings borrow reserved VRAM. */
             } else if (page_cache_owns(phys)) {
                 page_cache_release(phys);
@@ -29,7 +34,9 @@ void task_unmap_pages(struct task *task, uint64_t start, uint64_t end)
                 mm_free_page(phys);
             }
         }
+        cursor = page + PAGE_SIZE;
     }
+    if (changed) smp_flush_user_tlb();
 }
 
 static int syscall_mm_lock_range(uint64_t addr, uint64_t len, bool locked)
@@ -171,8 +178,11 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
         if (!(prot & LINUX_PROT_EXEC)) page_flags |= RELIEFNT_PAGE_NOEXEC;
         if (prot == LINUX_PROT_NONE) page_flags |= RELIEFNT_PAGE_PROTNONE;
         if (vma->flags & TASK_VMA_FLAG_DEVICE) page_flags |= RELIEFNT_PAGE_DEVICE;
-        for (uint64_t page = cursor; page < piece_end; page += PAGE_SIZE) {
-            if (!address_space_user_page_phys(sched_task_as(task), page)) continue;
+        uint64_t page_cursor = cursor;
+        while (page_cursor < piece_end) {
+            uint64_t page;
+            if (!address_space_user_page_next(sched_task_as(task), page_cursor,
+                                              piece_end, &page, NULL, NULL)) break;
             if (!address_space_protect_user_page(sched_task_as(task), page,
                                                  page_flags)) {
                 /* Earlier pages may already have changed. Revoke stale remote
@@ -181,6 +191,7 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
                 return -RELIEFOS_EACCES;
             }
             pte_changed = true;
+            page_cursor = page + PAGE_SIZE;
         }
         cursor = piece_end;
     }

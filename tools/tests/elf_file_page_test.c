@@ -30,6 +30,7 @@ uint64_t mm_alloc_page(void)
     return (uintptr_t)p;
 }
 void mm_free_page(uint64_t p) { assert(allocations); --allocations; free((void *)(uintptr_t)p); }
+void *mm_phys_to_virt(uint64_t phys) { return (void *)(uintptr_t)phys; }
 int storage_read_node(const struct storage_node *node, uint64_t offset,
                       void *buffer, uint32_t size, uint32_t *got)
 {

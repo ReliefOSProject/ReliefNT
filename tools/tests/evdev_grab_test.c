@@ -130,7 +130,9 @@ static void regression(const char *name)
         /* Xorg may open event0 before xf86OpenConsole exposes /dev/tty1. */
         keyboard_file(&delayed);
         delayed.aux = input_evdev_cursor_now();
-        owner.pty_fds[0] = (struct task_pty_fd){
+        struct task_pty_fd *pty_fd;
+        assert(sched_task_pty_alloc(&owner, &pty_fd) == 0);
+        *pty_fd = (struct task_pty_fd){
             .used = 1, .pty_id = 1, .endpoint = TASK_PTY_ENDPOINT_SLAVE,
         };
         input_set_graphical_vt(1);
@@ -144,6 +146,7 @@ static void regression(const char *name)
                                 (uintptr_t)&raw_vt) == 0);
         task_evdev_bind_vt(&owner, &explicit_raw);
         assert(explicit_raw.input_vt == 0);
+        sched_task_pty_release(&owner);
     } else if (!strcmp(name, "scalar")) {
         const uint64_t values[] = {2, UINT64_MAX, 1ULL << 32, (uintptr_t)&first};
         for (unsigned i = 0; i < 4; ++i) {

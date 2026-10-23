@@ -773,7 +773,7 @@ int kernel_wait_queue_add(struct kernel_wait_queue *queue, struct task *task)
     (void)queue;
     (void)task;
     ++wait_queue_add_calls;
-    return queue && queue->count >= KERNEL_WAIT_QUEUE_MAX ? -1 : 0;
+    return 0;
 }
 
 void sched_block_current(void)
@@ -1397,9 +1397,9 @@ static void test_legacy_magic_and_empty_readiness(void)
     client.flags &= ~RELIEFOS_O_NONBLOCK;
     assert(drm_file_read(&client_task, &client, &byte, 1) == KERNEL_SYSCALL_BLOCKED);
     assert(wait_queue_add_calls == 1 && block_current_calls == 1);
-    client.drm_file->event_wait.count = KERNEL_WAIT_QUEUE_MAX;
     assert(drm_file_read(&client_task, &client, &byte, 1) == KERNEL_SYSCALL_BLOCKED);
-    assert(sleep_current_calls == 1 && sleep_current_deadline == 101);
+    assert(wait_queue_add_calls == 2 && block_current_calls == 2);
+    assert(sleep_current_calls == 0);
 
     drm_file_close(&client);
     assert(master.drm_file->master->magics == NULL);

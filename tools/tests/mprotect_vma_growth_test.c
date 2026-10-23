@@ -38,6 +38,8 @@ uint64_t mm_alloc_page(void)
     ++pages;
     return (uintptr_t)memory;
 }
+void *mm_phys_to_virt(uint64_t physical) { return (void *)(uintptr_t)physical; }
+uint64_t mm_virt_to_phys(const void *address) { return (uint64_t)(uintptr_t)address; }
 void mm_free_page(uint64_t page) { assert(pages); --pages; free((void *)(uintptr_t)page); }
 int page_cache_owns(uint64_t page) { (void)page; return 0; }
 void page_cache_release(uint64_t page) { (void)page; abort(); }

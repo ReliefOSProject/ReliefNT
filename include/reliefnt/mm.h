@@ -21,6 +21,21 @@ uint64_t mm_total_memory_kib(void);
  */
 uint64_t mm_free_memory_kib(void);
 /**
+ * @brief Translate a supported physical address through the supervisor direct map.
+ * @param phys Physical byte address in the mapped direct-map range.
+ * @return Kernel pointer including the original page offset, or NULL when the
+ *         physical byte is outside the addressable direct-map extent.
+ */
+void *mm_phys_to_virt(uint64_t phys);
+/**
+ * @brief Translate a supported supervisor kernel pointer to a physical address.
+ * @param address Pointer within the shared direct map or linked kernel hole.
+ * @return Physical byte address; zero for user pointers, other low addresses,
+ *         and addresses outside the direct-map window.
+ * The identity-mapped interval is exactly [KERNEL_HOLE_START, KERNEL_HOLE_END).
+ */
+uint64_t mm_virt_to_phys(const void *address);
+/**
  * @brief Allocate one physical page; returns its physical address (0 on failure).
  */
 uint64_t mm_alloc_page(void);

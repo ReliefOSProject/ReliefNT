@@ -245,6 +245,9 @@ const struct smp_cpu_info *smp_cpu_info(uint32_t cpu_index)
     return cpu_index < cpu_count ? &cpus[cpu_index] : 0;
 }
 
+/** @brief Start application processors with allocator-backed direct-map stacks.
+ * @return None; failed AP startup retains its stack for delayed SIPI safety.
+ */
 void smp_start_aps(void)
 {
     if (smp_ready || cpu_count <= 1 || !apic_available()) {
@@ -259,6 +262,7 @@ void smp_start_aps(void)
     }
     for (uint32_t i = 0; i < cpu_count; ++i) {
         uint64_t stack;
+        uint8_t *stack_map;
         uint32_t id = cpus[i].apic_id;
         if (cpus[i].online || id == apic_bsp_id() || id > 0xffu) continue;
         /* Never issue INIT/SIPI to the current processor.  This guard also
@@ -276,7 +280,14 @@ void smp_start_aps(void)
             console_error("[reliefnt] SMP AP%u stack allocation failed\n", (unsigned)i);
             continue;
         }
-        cpus[i].stack = stack + (uint64_t)AP_STACK_PAGES * 4096ULL;
+        stack_map = (uint8_t *)mm_phys_to_virt(stack);
+        if (!stack_map) {
+            mm_free_pages(stack, AP_STACK_PAGES);
+            console_error("[reliefnt] SMP AP%u stack is outside the direct map\n", (unsigned)i);
+            continue;
+        }
+        cpus[i].stack = (uint64_t)(uintptr_t)stack_map +
+                        (uint64_t)AP_STACK_PAGES * 4096ULL;
         cpus[i].started = 1;
         copy_trampoline_for(i, cpus[i].stack);
         apic_send_init(id);

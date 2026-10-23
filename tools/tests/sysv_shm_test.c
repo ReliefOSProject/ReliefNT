@@ -1,9 +1,12 @@
 /* Production SHM registry, scheduler VMA hooks, memory syscalls and page tables.
  * Only CPU/physical allocator/user address boundaries are replaced by host code. */
 #define RELIEFNT_TEST_REAL_SYSV_SHM
+/* The paging fixture supplies the physical translation boundary below. */
+#define AUDIO_FIXTURE_CUSTOM_MM_TRANSLATION
 #define main audio_device_shm_fixture_main
 #include "audio_device_test.c"
 #undef main
+#undef AUDIO_FIXTURE_CUSTOM_MM_TRANSLATION
 static int shm_physical_budget = -1;
 static bool shm_physical_gate(void)
 {
@@ -12,9 +15,12 @@ static bool shm_physical_gate(void)
     return true;
 }
 #define RELIEFNT_TEST_PAGE_ALLOC_GATE shm_physical_gate
+/* audio_fixture.h already includes the real kernel spinlock implementation. */
+#define RELIEFNT_PAGING_FIXTURE_EXTERNAL_SPINLOCKS
 #define main paging_shm_fixture_main
 #include "paging_protection_test.c"
 #undef main
+#undef RELIEFNT_PAGING_FIXTURE_EXTERNAL_SPINLOCKS
 #undef RELIEFNT_TEST_PAGE_ALLOC_GATE
 #include "modules/user_memory.h"
 
@@ -38,7 +44,7 @@ static uint64_t shm_test_page(void)
     if (!shm_fail_page) return 0;
     if (shm_fail_page > 0) --shm_fail_page;
     uint64_t p = mm_alloc_page();
-    memset((void *)(uintptr_t)p, 0xa5, 4096); /* Production must zero it. */
+    memset(mm_phys_to_virt(p), 0xa5, 4096); /* Production must zero it. */
     return p;
 }
 #define kernel_malloc shm_test_malloc
@@ -57,6 +63,7 @@ void drm_bo_put(struct drm_bo *bo) { assert(!bo); }
 struct task_file *task_file_get(struct task_file *description)
 { assert(!description); return NULL; }
 void task_file_put(struct task_file *description) { assert(!description); }
+void drm_vmwgfx_cancel_task_continuation(struct task *task) { (void)task; }
 /* Fork must fail before any descriptor/SEM_UNDO ownership is cloned in the
  * focused rollback case. Entering those unrelated backends is a fixture error. */
 void arch_fpu_save(void *state) { (void)state; }
@@ -143,8 +150,8 @@ int main(void)
     assert(base > 0 && !ctl(id, IPC_STAT, &stat) && stat.shm_nattch == 1);
     uint64_t backing = address_space_user_page_phys(sched_task_as(parent), base);
     assert(backing && address_space_user_page_writable(sched_task_as(parent), base));
-    for (unsigned i = 0; i < 4096; ++i) assert(!((uint8_t *)(uintptr_t)backing)[i]);
-    *(uint8_t *)(uintptr_t)backing = 0x4d;
+    for (unsigned i = 0; i < 4096; ++i) assert(!((uint8_t *)mm_phys_to_virt(backing))[i]);
+    *(uint8_t *)mm_phys_to_virt(backing) = 0x4d;
     child->state = TASK_EXITED; child->running_cpu = SCHED_CPU_NONE;
     child->flags = TASK_FLAG_RESOURCES_RELEASED;
     shm_physical_budget = 0;
@@ -169,8 +176,9 @@ int main(void)
     assert(!ctl(id, IPC_STAT, &stat) && stat.shm_nattch == 2);
     assert(address_space_user_page_phys(sched_task_as(child), base) == backing);
     assert(!address_space_handle_cow_fault(sched_task_as(child), base));
-    *(uint8_t *)(uintptr_t)address_space_user_page_phys(sched_task_as(child), base) = 0x2a;
-    assert(*(uint8_t *)(uintptr_t)backing == 0x2a);
+    *(uint8_t *)mm_phys_to_virt(
+        address_space_user_page_phys(sched_task_as(child), base)) = 0x2a;
+    assert(*(uint8_t *)mm_phys_to_virt(backing) == 0x2a);
     current_pid[0] = child->pid;
     assert(!detach(base));
     sched_task_vma_release(child); address_space_destroy(sched_task_as(child));
@@ -211,7 +219,8 @@ int main(void)
     assert(get(0x1123, 0, 0) == -LINUX_ENOENT);
     long removed = attach(id, 0, 0);
     assert(removed > 0);
-    assert(*(uint8_t *)(uintptr_t)address_space_user_page_phys(sched_task_as(parent), removed) == 0x2a);
+    assert(*(uint8_t *)mm_phys_to_virt(
+        address_space_user_page_phys(sched_task_as(parent), removed)) == 0x2a);
     assert(!detach(removed) && !detach(base));
     assert(ctl(id, IPC_STAT, &stat) == -LINUX_EINVAL && !sysv_shm_used && !shm_heap_live);
     assert(detach(base) == -LINUX_EINVAL);
@@ -243,12 +252,12 @@ int main(void)
     assert(!syscall_mm_mprotect(base + 4096, 4096, LINUX_PROT_NONE));
     assert(!ctl(id, IPC_STAT, &stat) && stat.shm_nattch == 3);
     assert(!detach(base) && !ctl(id, IPC_RMID, NULL));
-    uint64_t crossing = RELIEFNT_USER_BASE + 24 * RELIEFNT_USER_PD_BYTES - 4096;
+    uint64_t crossing = RELIEFNT_USER_BASE + 24 * (2ULL * 1024ULL * 1024ULL) - 4096;
     id = (int)get(IPC_PRIVATE, 4096, 0600);
     base = attach(id, crossing, 0);
     assert(base == (long)crossing);
     backing = address_space_user_page_phys(sched_task_as(parent), base);
-    *(uint8_t *)(uintptr_t)backing = 0x77;
+    *(uint8_t *)mm_phys_to_virt(backing) = 0x77;
     replacement = (int)get(IPC_PRIVATE, 8192, 0600);
     unsigned before_tables = live_pages();
     shm_physical_budget = 0;
@@ -256,7 +265,7 @@ int main(void)
     shm_physical_budget = -1;
     assert(live_pages() == before_tables &&
         address_space_user_page_phys(sched_task_as(parent), base) == backing &&
-        *(uint8_t *)(uintptr_t)backing == 0x77);
+        *(uint8_t *)mm_phys_to_virt(backing) == 0x77);
     assert(!ctl(id, IPC_STAT, &stat) && stat.shm_nattch == 1);
     assert(!ctl(replacement, IPC_STAT, &stat) && !stat.shm_nattch);
     assert(!detach(base) && !ctl(id, IPC_RMID, NULL) && !ctl(replacement, IPC_RMID, NULL));
@@ -337,7 +346,7 @@ int main(void)
     }
     assert(reused && !sysv_shm_used && !sysv_shm_pages && !shm_heap_live);
     id = (int)get(IPC_PRIVATE, 8192, 0600);
-    crossing = RELIEFNT_USER_BASE + 16 * RELIEFNT_USER_PD_BYTES - 4096;
+    crossing = RELIEFNT_USER_BASE + 16 * (2ULL * 1024ULL * 1024ULL) - 4096;
     before_tables = live_pages();
     shm_physical_budget = 1;
     assert(attach(id, crossing, 0) == -LINUX_ENOMEM);

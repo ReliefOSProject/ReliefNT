@@ -161,11 +161,13 @@ int64_t pty_check_change(uint32_t pty_id, uint32_t caller_pid, int signal_number
 
 /**
  * @brief Retire legacy owners without closing a retained Unix98 master.
+ * @param pid Task whose legacy master ownership is being retired.
  */
 void pty_process_exit(uint32_t pid)
 {
-    for (uint32_t i = 0; i < PTY_MAX; ++i) {
-        if (sessions[i].used && sessions[i].owner_pid == pid &&
+    for (uint32_t i = 0; i < pty_session_slot_capacity(); ++i) {
+        struct pty_session *session = pty_session_slot_at(i);
+        if (session && session->used && session->owner_pid == pid &&
             !sched_pty_master_reference_count(i + 1U)) {
             (void)pty_destroy(pid, i + 1U);
         }

@@ -31,6 +31,8 @@ def main():
     bodies = [
         ("syscall_return_body.inc", "kernel/syscall/entry.c", "syscall_dispatch_frame"),
         ("user_return_body.inc", "kernel/exec/userland.c", "userland_schedule_from_frame"),
+        ("network_maintenance_body.inc", "kernel/exec/userland.c", "sched_network_maintenance"),
+        ("network_maintenance_runner_body.inc", "kernel/exec/userland.c", "sched_run_network_maintenance"),
         ("int80_return_body.inc", "arch/x86_64/interrupt/idt.c", "int80_dispatch"),
     ]
     temporary = Path(os.environ.get("TMPDIR", str(ROOT / "out" / "tmp")))

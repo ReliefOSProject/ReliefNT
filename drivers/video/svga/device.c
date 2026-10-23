@@ -1,11 +1,11 @@
 #include "device.h"
 #include <reliefnt/console.h>
+#include <reliefnt/framebuffer.h>
+#include <reliefnt/mm.h>
 #ifndef SVGA_HOST_TEST
 #include <reliefnt/lock.h>
-#include <reliefnt/mm.h>
 #include <reliefnt/paging.h>
 #include <reliefnt/port.h>
-#include <reliefnt/framebuffer.h>
 #include <reliefnt/pci.h>
 #include <reliefnt/drm.h>
 static struct kernel_spinlock device_lock = KERNEL_SPINLOCK_INIT;
@@ -15,6 +15,22 @@ static volatile uint32_t host_device_lock;
 #endif
 
 struct svga_device svga;
+
+/** @brief Match the physical FIFO reservation against its kernel CPU alias.
+ * @param fb Framebuffer descriptor carrying the physical auxiliary range.
+ * @param fifo Kernel direct-map pointer bound to the SVGA protocol layer.
+ * @param bytes Bound FIFO size.
+ * @return True only when the alias resolves to the exact reserved PFN and size.
+ */
+bool svga_fifo_reservation_matches(const struct framebuffer *fb,
+                                   const volatile uint32_t *fifo,
+                                   uint32_t bytes)
+{
+    uint64_t physical = fifo
+        ? mm_virt_to_phys((const void *)(uintptr_t)fifo) : 0;
+    return fb && physical && fb->auxiliary_reservation_start == physical &&
+           fb->auxiliary_reservation_bytes == bytes;
+}
 
 uint64_t svga_lock(void)
 {
@@ -194,10 +210,7 @@ static int svga_prepare_fifo_cache_policy(const struct framebuffer *fb,
                                           struct svga_cache_report *report)
 {
     if (report) *report = (struct svga_cache_report){0};
-    if (!fb || !fb->auxiliary_reservation_start ||
-        !fb->auxiliary_reservation_bytes ||
-        fb->auxiliary_reservation_start != (uint64_t)(uintptr_t)svga.fifo ||
-        fb->auxiliary_reservation_bytes != svga.fifo_bytes) {
+    if (!svga_fifo_reservation_matches(fb, svga.fifo, svga.fifo_bytes)) {
         if (report) report->reason = "reservation-mismatch";
         return SVGA_ENOTSUP;
     }
@@ -218,9 +231,7 @@ static int svga_prepare_fifo_cache_policy(const struct framebuffer *fb,
     }
 
     const char *reason = NULL;
-    if (fb->auxiliary_reservation_start < RELIEFNT_USER_TOP) {
-        reason = "below-user-top";
-    } else if (svga_page_ranges_overlap(fifo_page, fifo_page_bytes,
+    if (svga_page_ranges_overlap(fifo_page, fifo_page_bytes,
                                        vram_page, vram_page_bytes)) {
         reason = "overlaps-vram";
     } else {

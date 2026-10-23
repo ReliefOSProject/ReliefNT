@@ -5,8 +5,8 @@
 #include <reliefnt/arch.h>
 #include <reliefnt/console.h>
 #include <reliefnt/framebuffer.h>
-#include <reliefnt/paging.h>
 #include <reliefnt/mm.h>
+#include <reliefnt/paging.h>
 
 #define ARCH_MAX_CPUS 64u
 /* Exception handlers must not depend on the interrupted task's kernel stack.
@@ -61,8 +61,6 @@ static struct gdt_ptr loaded_gdt_ptr[ARCH_MAX_CPUS];
 static uint8_t exception_ist_stack[ARCH_MAX_CPUS][ARCH_IST_STACK_COUNT][ARCH_IST_STACK_SIZE]
     __attribute__((aligned(16)));
 static uint64_t syscall_entry_stack[ARCH_MAX_CPUS];
-
-#define IDENTITY_MAP_LIMIT (1ULL << 32)
 
 extern void x86_64_lgdt(const struct gdt_ptr *ptr);
 extern void x86_64_load_segments(void);
@@ -189,7 +187,7 @@ static void arch_setup_cpu(uint32_t cpu_index, void *kernel_stack_top)
  * Framebuffer survives identity map.
  * @return The value or status produced by the operation.
  */
-static int framebuffer_survives_identity_map(void)
+static int framebuffer_survives_kernel_map(void)
 {
     const struct framebuffer *fb = framebuffer_get();
     uint64_t start;
@@ -198,9 +196,9 @@ static int framebuffer_survives_identity_map(void)
     if (!fb || !fb->available || !fb->pixels || !fb->pitch || !fb->height) {
         return 0;
     }
-    start = (uint64_t)(uintptr_t)fb->pixels;
+    start = mm_virt_to_phys(fb->pixels);
     bytes = (uint64_t)fb->pitch * fb->height;
-    return start < IDENTITY_MAP_LIMIT && bytes <= IDENTITY_MAP_LIMIT - start;
+    return start && paging_kernel_direct_map_range(start, bytes);
 }
 
 /**
@@ -209,11 +207,10 @@ static int framebuffer_survives_identity_map(void)
  */
 void arch_userland_init(void *kernel_stack_top)
 {
-    if (!framebuffer_survives_identity_map()) {
+    if (!framebuffer_survives_kernel_map()) {
         console_disable_framebuffer();
     }
     arch_setup_cpu(0, kernel_stack_top);
-    paging_init_user_identity();
     arch_fpu_init();
     (void)kernel_stack_top;
 }

@@ -8,18 +8,8 @@
 #include <reliefnt/types.h>
 
 #define RELIEFNT_USER_BASE 0x0000000000200000ULL
-/* Keep the user interval below the kernel's low identity-map boundary: a user
- * CR3 replaces every 2 MiB page-directory entry the interval covers, so
- * mm.c must refuse to hand out frames below RELIEFNT_USER_TOP.  The 768 MiB
- * window leaves separate heap, mmap, file-map, and stack regions while keeping
- * kernel physical pages outside the replacement range.  It is sized for the
- * largest single read-only file mapping a musl program can request: linking
- * one contiguous reservation per shared object, Alpine's libLLVM.so.22.1
- * needs a 183 MiB span and Clang's whole dependency closure needs 278 MiB.
- * Growing past 1 GiB would additionally require privatizing the second page
- * directory, because RELIEFNT_USER_PD_START + RELIEFNT_USER_PD_COUNT is capped by
- * the 512 entries of one 2 MiB page directory. */
-#define RELIEFNT_USER_TOP  0x0000000030000000ULL
+/* The exclusive end of x86_64's canonical low user-address half. */
+#define RELIEFNT_USER_TOP  0x0000800000000000ULL
 #define RELIEFNT_USER_MMAP_BASE 0x0000000008000000ULL
 #define RELIEFNT_USER_HEAP_BASE 0x0000000001000000ULL
 #define RELIEFNT_USER_HEAP_LIMIT RELIEFNT_USER_MMAP_BASE
@@ -29,24 +19,19 @@
  * RLIM_INFINITY; the window is a platform bound, not a rlimit substitute. */
 #define RELIEFNT_USER_STACK_MAX_PAGES 16384u
 /* Every address space retains this supervisor-only alias of the kernel's
- * first 16 GiB physical direct map.  Kernel code that must access a boot
- * module after a user CR3 has replaced part of the low identity map uses this
- * alias instead of a physical address as a virtual pointer. */
+ * first 16 GiB physical direct map. Kernel physical pointers must go through
+ * this alias because sparse user mappings can replace low identity leaves. */
+#ifndef RELIEFNT_KERNEL_DIRECT_MAP_BASE
 #define RELIEFNT_KERNEL_DIRECT_MAP_BASE 0xffffff8000000000ULL
+#endif
+#ifndef RELIEFNT_KERNEL_DIRECT_MAP_SIZE
 #define RELIEFNT_KERNEL_DIRECT_MAP_SIZE (16ULL * 1024ULL * 1024ULL * 1024ULL)
+#endif
 /* The current loader places the kernel at 128 MiB.  Keep a
  * supervisor-only hole in every user CR3 so creating user page tables never
  * replaces those identity-mapped kernel PDEs. */
 #define RELIEFNT_KERNEL_HOLE_START 0x0000000008000000ULL
 #define RELIEFNT_KERNEL_HOLE_END   0x000000000c000000ULL
-#define RELIEFNT_USER_PD_BYTES 0x200000ULL
-#define RELIEFNT_USER_PD_START (RELIEFNT_USER_BASE / RELIEFNT_USER_PD_BYTES)
-#define RELIEFNT_USER_PD_COUNT ((RELIEFNT_USER_TOP - RELIEFNT_USER_BASE) / RELIEFNT_USER_PD_BYTES)
-/* address_space_prepare_user_range installs one user page table in the single
- * low page directory it privatizes; exceeding its 512 slots would silently
- * alias into the kernel identity map instead of extending the user window. */
-_Static_assert(RELIEFNT_USER_PD_START + RELIEFNT_USER_PD_COUNT <= 512u,
-               "RELIEFNT_USER_TOP exceeds the low page directory reach");
 _Static_assert(RELIEFNT_KERNEL_HOLE_END < RELIEFNT_USER_TOP &&
                RELIEFNT_USER_HEAP_LIMIT <= RELIEFNT_KERNEL_HOLE_START,
                "user heap, kernel hole and mmap arena must stay ordered");
@@ -70,18 +55,18 @@ _Static_assert(RELIEFNT_KERNEL_HOLE_END < RELIEFNT_USER_TOP &&
 #define RELIEFNT_PAGE_BACKED (RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_PROTNONE)
 #define RELIEFNT_PAGE_NOEXEC (1ULL << 63)
 #define RELIEFNT_PHYS_ADDR_MASK 0x000ffffffffff000ULL
+/* Software ownership marker in non-leaf entries, ignored by x86 hardware. */
+#define RELIEFNT_PAGE_TABLE_OWNED 0x200ULL
+#define RELIEFNT_PAGE_TABLE_STAGED 0x400ULL
 
 struct address_space {
     uint64_t *pml4;
-    uint64_t *pdpt;
-    uint64_t *pd[4];
-    uint64_t *user_pt[RELIEFNT_USER_PD_COUNT];
     uint64_t cr3;
-    uint32_t user_page_count;
+    uint64_t user_page_count;
 };
 
 /**
- * @brief Build the shared low identity mapping used as the base of every address space.
+ * @brief Build boot identity mappings, the supervisor direct map and the user kernel-hole template.
  */
 void paging_init_user_identity(void);
 /**
@@ -118,6 +103,11 @@ bool paging_kernel_direct_map_range(uint64_t phys, uint64_t len);
  * @brief Translate a physical address to the supervisor-only shared kernel direct map, or NULL.
  */
 void *paging_kernel_direct_map(uint64_t phys);
+/** @brief Switch later MMIO page-table splits to the physical allocator.
+ * @return None. Call once after successful physical allocator initialization;
+ * the early page-table reserve then remains pinned in the kernel image.
+ */
+void paging_mmio_allocator_ready(void);
 /**
  * @brief Validate that a device range can be exposed with uncached semantics.
  * @param phys Physical start of the device range.
@@ -200,6 +190,36 @@ uint64_t address_space_unmap_user_page(struct address_space *as, uint64_t vaddr)
 uint64_t address_space_user_page_phys(const struct address_space *as, uint64_t vaddr);
 bool address_space_user_page_readable(const struct address_space *as, uint64_t vaddr);
 /**
+ * @brief Return the raw software and hardware flags for a user page mapping.
+ * @param as Address space whose leaf page table is queried.
+ * @param vaddr Address within the queried page.
+ * @return Leaf flags, or zero if the address is unmapped or outside user range.
+ */
+uint64_t address_space_user_page_flags(const struct address_space *as, uint64_t vaddr);
+/**
+ * @brief Find the first backed user leaf in a sparse virtual range.
+ * @param as Address space whose owned page tables are searched.
+ * @param start Inclusive low-canonical address; a reserved supervisor hole is skipped.
+ * @param end Exclusive range end, no greater than RELIEFNT_USER_TOP.
+ * @param out_page Required output for the page-aligned virtual address.
+ * @param out_phys Optional output for the physical backing page.
+ * @param out_flags Optional output for the complete PTE flags.
+ * @return True when a backed user leaf exists; false for an empty or invalid range.
+ * The walker visits only present owned table branches and backed leaves.
+ */
+bool address_space_user_page_next(const struct address_space *as, uint64_t start,
+                                  uint64_t end, uint64_t *out_page,
+                                  uint64_t *out_phys, uint64_t *out_flags);
+/**
+ * @brief Test whether a valid user interval has no backed page-table leaves.
+ * @param as Address space whose owned page tables are searched.
+ * @param start Inclusive low-canonical user byte address.
+ * @param end Exclusive range end, no greater than RELIEFNT_USER_TOP.
+ * @return True only for a valid interval with no backed user leaf.
+ */
+bool address_space_user_range_free(const struct address_space *as, uint64_t start,
+                                   uint64_t end);
+/**
  * Retry a non-present fault if another CPU has since installed a user PTE
  * with the permissions required by the faulting access.
  */
@@ -214,11 +234,18 @@ bool address_space_retry_mapped_user_page(const struct address_space *as,
 bool address_space_user_page_writable(const struct address_space *as, uint64_t vaddr);
 bool address_space_user_page_is_device(const struct address_space *as, uint64_t vaddr);
 /**
- * @brief Return how much user memory, in KiB, is currently mapped in as.
+ * @brief Report the address space's accounted user page mappings.
+ * @param as Stable address space to inspect; may be NULL.
+ * @return Mapped page count in KiB, or zero for NULL.
  */
-uint32_t address_space_user_memory_kib(const struct address_space *as);
-/** @brief Count resident user RAM mappings, excluding device PFN mappings. */
-uint32_t address_space_user_resident_kib(const struct address_space *as);
+uint64_t address_space_user_memory_kib(const struct address_space *as);
+/**
+ * @brief Count resident user RAM mappings, excluding borrowed device PFNs.
+ * @param as Address space stable under the execution lock; may be NULL.
+ * @return Backed user RAM mappings in KiB, including PROT_NONE backing; zero
+ * for an absent address space. Shared pages count once per mapping.
+ */
+uint64_t address_space_user_resident_kib(const struct address_space *as);
 /**
  * @brief Map the initial user stack pages ending at stack_top; true on success.
  */

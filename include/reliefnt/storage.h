@@ -96,6 +96,19 @@ int storage_fiemap_node(const struct storage_node *,uint64_t,uint64_t,
                        struct storage_ext4_fiemap_extent *,uint32_t,uint32_t *);
 int storage_node_mount_flags(const struct storage_node *node, uint64_t *flags);
 int storage_tmpfs_get_page(const struct storage_node *node, uint64_t offset, uint64_t *phys);
+/* Internal shmem filesystem identity; consumes no mounted-volume slot. */
+#define STORAGE_SHMEM_VOLUME 0xffu
+/**
+ * @brief Create an unlinked file on the internal shmem filesystem.
+ * @param uid Owner UID of the new file.
+ * @param gid Owner GID of the new file.
+ * @param node Required output receiving the backing node.
+ * @param reference Required output receiving one owned inode reference.
+ * @return Zero on success or negative errno. Acquires the execution lock;
+ * the caller must eventually release the returned inode reference.
+ */
+int storage_shmem_create(uint32_t uid, uint32_t gid, struct storage_node *node,
+                          struct storage_inode_ref **reference);
 int storage_remount_path(const char *path, uint64_t flags);
 int storage_mount_tmpfs(const char *source, const char *target, uint64_t flags,
                          const char *options, uint32_t uid, uint32_t gid);
@@ -284,6 +297,11 @@ void storage_release_task_io(uint32_t pid);
 void storage_drain_task_io(uint32_t pid);
 /**
  * @brief Mount the installer's root filesystem from boot info.
+ * @param boot Parsed Multiboot module list; may be NULL.
+ * @return Nothing. Missing or invalid module data is logged and leaves the
+ *         root volume cleared.
+ * @context Boot setup before storage syscalls are available. The selected
+ *          module remains reserved for the mounted volume's lifetime.
  */
 void storage_init_installer_root(const struct boot_info *boot);
 /**
@@ -313,14 +331,20 @@ const char *storage_root_filesystem_name(void);
  */
 bool storage_installer_root_active(void);
 /**
- * @brief Mount a boot-module FAT32 image (len bytes) as a writable live root; 0 on success.
- *
- * The caller owns the image backing and must keep it mapped and reserved for
- * the lifetime of the mount. Writes are kept in memory for the current
- * session and never reach the ISO source; the installer passes its Multiboot
- * module, which the physical-memory manager reserves before storage starts.
+ * @brief Mount a boot-module image as the writable live root.
+ * @param image_phys Physical start address of the reserved Multiboot module;
+ *                   this is not a CPU pointer and is direct-mapped internally.
+ * @param len Image length in bytes; must be at least one sector and
+ *            sector-aligned.
+ * @return Zero on success, -EINVAL for an invalid physical range, or -ENOENT
+ *         after a filesystem mount failure clears partial root state.
+ * @par Context
+ * Boot or installer setup before concurrent storage syscalls. The
+ *          physical image must stay reserved and mapped until the root unmounts.
+ * @note The root keeps a direct-map pointer to the module. Writes are session
+ *       local and never reach the ISO source.
  */
-int storage_mount_ramdisk_root(const void *image, uint64_t len);
+int storage_mount_ramdisk_root(uint64_t image_phys, uint64_t len);
 /**
  * @brief Resolve input against cwd into out (cap bytes); 0 on success.
  */

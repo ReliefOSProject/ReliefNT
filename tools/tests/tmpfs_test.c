@@ -9,6 +9,7 @@ static struct {
     uint64_t phys;
     unsigned refs;
 } pages[64];
+void *mm_phys_to_virt(uint64_t physical) { return (void *)(uintptr_t)physical; }
 uint64_t mm_alloc_page(void)
 {
     for (unsigned i = 0; i < 64; ++i)

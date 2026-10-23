@@ -9,6 +9,7 @@
 #include <linux/fcntl.h>
 
 #define RECORD_LOCK_MAX 256u
+#define RECORD_LOCK_PENDING_INITIAL 16u
 #define LOCK_END 0x7fffffffffffffffLL
 struct record_lock {
     uint64_t owner;
@@ -26,10 +27,12 @@ struct native_flock {
 static struct record_lock records[RECORD_LOCK_MAX];
 static struct kernel_wait_queue record_waiters;
 static uint64_t next_lock_owner;
-static struct {
+static struct record_lock_waiter {
     struct task *task;
     struct record_lock request;
-} pending[KERNEL_WAIT_QUEUE_MAX];
+} *pending;
+static uint32_t pending_count;
+static uint32_t pending_capacity;
 
 static bool same_inode(const struct storage_node *a, const struct storage_node *b)
 {
@@ -64,18 +67,68 @@ static bool conflicts(const struct record_lock *a, const struct record_lock *b)
         overlap(a, b) && (a->type == LINUX_F_WRLCK || b->type == LINUX_F_WRLCK);
 }
 
+/**
+ * @brief Remove a task's pending record-lock request from deadlock tracking.
+ * @param task Task whose blocked request is canceled; null is ignored.
+ */
 void syscall_record_lock_cancel(struct task *task)
 {
-    for (unsigned i = 0; i < KERNEL_WAIT_QUEUE_MAX; ++i)
-        if (pending[i].task == task) pending[i].task = NULL;
+    if (!task) return;
+    for (uint32_t i = 0; i < pending_count;) {
+        if (pending[i].task != task) {
+            ++i;
+            continue;
+        }
+        for (uint32_t j = i + 1u; j < pending_count; ++j)
+            pending[j - 1u] = pending[j];
+        pending[--pending_count] = (struct record_lock_waiter){0};
+    }
+}
+
+/**
+ * @brief Grow pending record-lock request storage before registering a waiter.
+ * @return Zero when one more request fits or -ENOLCK when growth fails.
+ */
+static int pending_reserve_one(void)
+{
+    uint32_t capacity;
+    size_t bytes;
+    struct record_lock_waiter *replacement;
+
+    if (pending_count < pending_capacity) return 0;
+    if (!pending_capacity) {
+        capacity = RECORD_LOCK_PENDING_INITIAL;
+    } else {
+        if (pending_capacity > UINT32_MAX / 2u) return -LINUX_ENOLCK;
+        capacity = pending_capacity * 2u;
+    }
+    bytes = (size_t)capacity * sizeof(*replacement);
+    if (capacity && bytes / sizeof(*replacement) != (size_t)capacity)
+        return -LINUX_ENOLCK;
+    replacement = kernel_malloc(bytes);
+    if (!replacement) return -LINUX_ENOLCK;
+    if (pending_count)
+        __builtin_memcpy(replacement, pending,
+                         (size_t)pending_count * sizeof(*replacement));
+    kernel_free(pending);
+    pending = replacement;
+    pending_capacity = capacity;
+    return 0;
 }
 
 /* Linux bounds its POSIX lock deadlock walk to ten owners. */
+/**
+ * @brief Search pending lock waits for a deadlock path to a target owner.
+ * @param owner Owner whose pending requests are inspected.
+ * @param target Owner sought by the wait-for walk.
+ * @param depth Remaining owner edges allowed in this bounded search.
+ * @return True when the current wait graph reaches target.
+ */
 static bool waits_for(uint64_t owner, uint64_t target, unsigned depth)
 {
     if (owner == target) return true;
     if (!depth) return false;
-    for (unsigned i = 0; i < KERNEL_WAIT_QUEUE_MAX; ++i) {
+    for (uint32_t i = 0; i < pending_count; ++i) {
         if (!pending[i].task || pending[i].request.owner != owner) continue;
         for (unsigned j = 0; j < RECORD_LOCK_MAX; ++j)
             if (conflicts(&records[j], &pending[i].request) && waits_for(records[j].owner, target, depth - 1)) return true;
@@ -137,6 +190,13 @@ static int replace_range(const struct record_lock *request)
     return ret;
 }
 
+/**
+ * @brief Query or update a POSIX byte-range lock for the current task.
+ * @param fd Descriptor naming the regular file.
+ * @param command F_GETLK, F_SETLK, or F_SETLKW operation.
+ * @param pointer User pointer to a native flock request/result.
+ * @return Zero, a blocking retry token, or a negative Linux errno.
+ */
 int64_t syscall_record_lock(int fd, uint32_t command, uint64_t pointer)
 {
     struct task *task = sched_current_task();
@@ -184,11 +244,12 @@ int64_t syscall_record_lock(int fd, uint32_t command, uint64_t pointer)
         }
         if (command == LINUX_F_SETLK) return -LINUX_EAGAIN;
         if (waits_for(held->owner, request.owner, 10)) return -LINUX_EDEADLK;
-        unsigned slot;
-        for (slot = 0; slot < KERNEL_WAIT_QUEUE_MAX && pending[slot].task; ++slot) {}
-        if (slot == KERNEL_WAIT_QUEUE_MAX) return -LINUX_ENOLCK;
-        pending[slot].task = task;
-        pending[slot].request = request;
+        int reserve = pending_reserve_one();
+        if (reserve < 0) return reserve;
+        pending[pending_count++] = (struct record_lock_waiter){
+            .task = task,
+            .request = request,
+        };
         kernel_wait_queue_block_current(&record_waiters);
         return KERNEL_SYSCALL_BLOCKED;
     }

@@ -80,7 +80,13 @@ static void free_pages(uint64_t phys,uint32_t pages)
 }
 static uint64_t alloc_dma(uint32_t pages,uint64_t mask)
 { uint64_t p=alloc_pages(pages);assert(!p || p+(uint64_t)pages*4096-1<=mask);return p; }
-void *hda_phys_to_direct_map_page(uint64_t phys){return phys && !(phys&4095)?(void*)(uintptr_t)phys:NULL;}
+static void *physical_alias(uint64_t phys){return (void *)(uintptr_t)phys;}
+void *hda_phys_to_direct_map_page(uint64_t phys)
+{
+    const struct reliefos_driver_kernel_api *api = hda_module_kernel_api();
+    return phys && !(phys & 4095) && api && api->phys_to_virt ?
+           api->phys_to_virt(phys) : NULL;
+}
 static int enumerate(uint32_t index,struct reliefos_driver_pci_device *out)
 {
     if(index>=3)return -ENODEV;
@@ -232,6 +238,7 @@ static void console_record(enum console_log_level level,const char *format,...)
 static void report(int error){if(!teardown_error)teardown_error=error;}
 static struct reliefos_driver_kernel_api api={.abi_version=RELIEFOS_DRIVER_ABI_VERSION,
     .struct_size=sizeof(struct reliefos_driver_kernel_api),.alloc_pages=alloc_pages,.free_pages=free_pages,
+    .phys_to_virt=physical_alias,
     .alloc_dma=alloc_dma,.free_dma=free_pages,.pci_enumerate=enumerate,.console_write=console,
     .console_log=console_record,
     .audio_register_card=register_card,.audio_unregister_card=audio_unregister_card,

@@ -20,6 +20,9 @@ uint64_t mm_alloc_pages(uint32_t pages)
     if (high_dma && pages == 32) return UINT64_C(0x100000000);
     return (uintptr_t)calloc(pages, 4096);
 }
+void *mm_phys_to_virt(uint64_t physical) { return (void *)(uintptr_t)physical; }
+void mm_free_pages(uint64_t physical, uint32_t pages)
+{ (void)pages; free((void *)(uintptr_t)physical); }
 void storage_memzero(void *out, size_t len) { memset(out, 0, len); }
 void storage_memcpy(void *out, const void *in, size_t len) { memcpy(out, in, len); }
 int storage_read_device(const struct storage_volume *v, uint64_t lba,

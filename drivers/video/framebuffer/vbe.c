@@ -1,5 +1,8 @@
 #include "internal.h"
 
+#include <reliefnt/mm.h>
+#include <reliefnt/paging.h>
+
 static uint16_t vbe_read(uint16_t index);
 
 static void vbe_write(uint16_t index, uint16_t value);
@@ -50,7 +53,8 @@ int framebuffer_vbe_probe(void)
     bar = pci_config_read32(device.bus, device.slot, device.function, 0x10);
     lfb_start = bar & 0xfffffff0u;
     if ((bar & 1u) != 0 ||
-        !framebuffer_range_valid((uint64_t)lfb_start, vram_bytes)) {
+        !framebuffer_range_valid((uint64_t)lfb_start, vram_bytes) ||
+        !paging_mmio_uncached((uint64_t)lfb_start, vram_bytes)) {
         return 0;
     }
 
@@ -94,7 +98,8 @@ int framebuffer_vbe_set_mode(uint32_t width, uint32_t height)
         pitch * height > fb.max_bytes) {
         return 0;
     }
-    fb.pixels = (uint32_t *)(uintptr_t)bochs_vbe.lfb_start;
+    fb.pixels = (uint32_t *)mm_phys_to_virt(bochs_vbe.lfb_start);
+    if (!fb.pixels) return 0;
     fb.width = width;
     fb.height = height;
     fb.pitch = (uint32_t)pitch;

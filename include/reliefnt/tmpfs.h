@@ -7,6 +7,16 @@ struct tmpfs_super;
 int tmpfs_new(uint32_t volume, uint64_t flags, const char *options, uint32_t uid, uint32_t gid,
               struct tmpfs_super **out);
 void tmpfs_destroy(struct tmpfs_super *fs);
+/**
+ * @brief Create an unlinked regular inode under the storage execution lock.
+ * @param fs Required filesystem owning the new inode.
+ * @param uid Owner UID of the new file.
+ * @param gid Owner GID of the new file.
+ * @param out Required output node receiving one hold, released by tmpfs_drop.
+ * @return Zero on success or negative errno; failure transfers no ownership.
+ */
+int tmpfs_create_anonymous(struct tmpfs_super *fs, uint32_t uid, uint32_t gid,
+                            struct storage_node *out);
 int tmpfs_lookup(struct tmpfs_super *fs, const char *path, struct storage_node *out);
 int tmpfs_create(struct tmpfs_super *fs, const char *path, uint32_t mode, const char *target,
                  struct storage_node *out);

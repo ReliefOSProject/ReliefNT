@@ -40,7 +40,7 @@ class SvgaTests(unittest.TestCase):
         kernel_imports = {
             "console_printf", "console_log", "framebuffer_get", "kernel_spin_lock_irqsave",
             "kernel_spin_unlock_irqrestore", "kernel_irq_save", "kernel_irq_restore",
-            "mm_alloc_pages", "mm_free_pages",
+            "mm_alloc_pages", "mm_free_pages", "mm_virt_to_phys",
             "paging_kernel_direct_map", "paging_kernel_direct_map_range",
             "paging_mmio_uncached",
             "paging_mmio_writeback_nx", "pci_device_bar_contains",

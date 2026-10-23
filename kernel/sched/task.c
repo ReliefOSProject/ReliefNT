@@ -2,7 +2,9 @@
 
 static uint64_t user_task_count_locked(uint32_t uid);
 
-/** @brief Initialize Linux v6.12 native x86-64 resource defaults. */
+/** @brief Initialize Linux v6.12 native x86-64 resource defaults.
+ * @param task Fresh task whose private limits state receives the defaults.
+ */
 static void task_init_limits(struct task *task);
 
 /**
@@ -75,7 +77,10 @@ void task_release_limits(struct task *task)
     if (!--shared->references) kernel_free(shared);
 }
 
-/** @brief Initialize Linux v6.12 native x86-64 resource defaults. */
+/**
+ * @brief Initialize native resource defaults without allocating shared limit state.
+ * @param task Fresh task whose private limits receive memory-scaled defaults.
+ */
 static void task_init_limits(struct task *task)
 {
     /* Linux's non-KASAN x86-64 default: half of RAM / (16 KiB * 8),
@@ -84,7 +89,7 @@ static void task_init_limits(struct task *task)
     if (threads < 20) threads = 20;
     if (threads > 0x3fffffff) threads = 0x3fffffff;
     task->limits = (struct task_rlimit_state){.references = 1,
-        .nofile = {SCHED_TASK_FILE_LIMIT, SCHED_NR_OPEN},
+        .nofile = {SCHED_TASK_NOFILE_DEFAULT, SCHED_NR_OPEN},
         .sigpending = {threads / 2, threads / 2},
         .nproc = {threads / 2, threads / 2},
         /* INIT_RLIMITS includes CORE even when CONFIG_COREDUMP is disabled. */

@@ -22,6 +22,7 @@ class LinuxMemoryTests(unittest.TestCase):
 
     def test_memory_ownership_and_elf_page_boundaries(self):
         cases = (("physical_pages", []), ("paging_protection", []), ("private_anon_fault", []), ("elf_interpreter", []),
+                 ("elf_sparse_reservation", []),
                  ("elf_file_page", ["mm/cache/page_cache.c"]), ("user_mmap_arena", []),
                  ("mprotect_vma_growth", [*kernel_sources("scheduler")]),
                  ("brk_collision", [*kernel_sources("user_memory")]))

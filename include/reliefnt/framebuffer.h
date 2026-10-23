@@ -91,8 +91,25 @@ struct framebuffer_blit_cmd {
  * @brief Discover and set up the framebuffer described by the boot info.
  */
 void framebuffer_init(const struct boot_info *boot);
+/**
+ * @brief Snapshot UEFI GOP display metadata while boot services are callable.
+ * @param system_table_addr Firmware-owned EFI system table address, readable
+ *        before the kernel replaces firmware mappings.
+ * @return None. Retains only copied geometry/format and a physical framebuffer
+ *         address translated later through the kernel direct map.
+ */
+void framebuffer_capture_gop(uint64_t system_table_addr);
 const struct framebuffer *framebuffer_get(void);
 struct fb_var_screeninfo;
+struct fb_fix_screeninfo;
+/** @brief Fill Linux fbdev fixed information with the framebuffer's physical PFN.
+ * @param fb Active framebuffer whose pixels pointer is a kernel CPU alias.
+ * @param info Caller-owned fixed-screen-info output.
+ * @return True when the active pixel alias translates to a supported physical
+ *         address; false for missing pointers or an invalid direct-map alias.
+ */
+bool framebuffer_fbdev_get_fix_info(const struct framebuffer *fb,
+                                    struct fb_fix_screeninfo *info);
 /**
  * @brief Validate and apply one supported Linux fbdev variable-screen request.
  * @param var Input request; on success replaced with the normalized layout.

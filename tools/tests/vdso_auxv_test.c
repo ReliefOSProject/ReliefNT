@@ -13,6 +13,7 @@ uint64_t address_space_user_page_phys(const struct address_space *as, uint64_t a
     if (address < top - sizeof(stack) || address >= top) return 0;
     return (uint64_t)(uintptr_t)(stack + ((address - (top - sizeof(stack))) & ~4095ULL));
 }
+void *mm_phys_to_virt(uint64_t physical) { return (void *)(uintptr_t)physical; }
 
 int syscall_mm_prepare_exec_stack(struct task *task, uint64_t low)
 {

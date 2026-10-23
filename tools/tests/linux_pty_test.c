@@ -1,12 +1,20 @@
 #include <reliefnt/console.h>
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "modules/pty.h"
 
 static struct task owner;
 static unsigned signals;
 static unsigned blocked, awakened;
+void *kernel_malloc(size_t size) { return malloc(size); }
+void kernel_free(void *memory) { free(memory); }
+void kernel_spin_init(struct kernel_spinlock *lock) { lock->state = 0; }
+void kernel_spin_lock_irqsave(struct kernel_spinlock *lock, uint64_t *flags)
+{ assert(!lock->state); lock->state = 1; *flags = 0; }
+void kernel_spin_unlock_irqrestore(struct kernel_spinlock *lock, uint64_t flags)
+{ (void)flags; assert(lock->state); lock->state = 0; }
 struct task *sched_current_task(void) { return &owner; }
 void kernel_wait_queue_init(struct kernel_wait_queue *q) { memset(q, 0, sizeof(*q)); }
 void kernel_wait_queue_remove(struct kernel_wait_queue *q, struct task *t) { (void)q; (void)t; }
@@ -89,6 +97,22 @@ int main(void)
     pty_init();
     id = pty_create(owner.pid);
     assert(pty_inode_permissions(&stale, &permissions, false) == -2);
+    /* A master hangup commits the unfinished canonical line so the slave
+     * drains those bytes before the next read reports EOF. */
+    int pending_id = pty_create(owner.pid);
+    assert(pending_id > 0 && pending_id != id);
+    struct reliefos_pty_termios pending_mode;
+    assert(pty_get_termios((uint32_t)pending_id, &pending_mode) == 0);
+    assert(pending_mode.c_lflag & RELIEFOS_PTY_LFLAG_ICANON);
+    assert(pty_write_input(owner.pid, (uint32_t)pending_id, "before-close", 12) == 12);
+    char pending_input[16] = {0};
+    assert(pty_input_available((uint32_t)pending_id) == 0);
+    assert(pty_read_input((uint32_t)pending_id, pending_input, sizeof(pending_input)) == -11);
+    assert(pty_destroy(owner.pid, (uint32_t)pending_id) == 0);
+    assert(pty_is_hungup((uint32_t)pending_id));
+    assert(pty_read_input((uint32_t)pending_id, pending_input, sizeof(pending_input)) == 12);
+    assert(!memcmp(pending_input, "before-close", 12));
+    assert(pty_read_input((uint32_t)pending_id, pending_input, 1) == 0);
     assert(pty_lookup_path("/dev/pts/1", &node) == 0);
     assert(pty_lookup_path("/dev/pts/1/more", &node) == -2);
     assert(pty_lookup_path("/dev/pts/9999999999999999999999999", &node) == -2);
@@ -192,7 +216,20 @@ int main(void)
     assert(pty_lookup_vt_path("/dev/tty0", &node) == 0 &&
            node.first_cluster == pty_vt_active());
     assert(pty_lookup_vt_path("/dev/ttyS0", &node) == -2);
-    assert(pty_create(owner.pid) == 7);
+    /* PTY sessions keep their numeric devpts IDs as storage grows. The six
+     * console sessions remain fixed; these are 27 additional user PTYs. */
+    int32_t first_user_pty = pty_create(owner.pid);
+    assert(first_user_pty == 7);
+    int32_t last_user_pty = first_user_pty;
+    for (uint32_t i = 1; i < 27; ++i) {
+        last_user_pty = pty_create(owner.pid);
+        assert(last_user_pty == (int32_t)(first_user_pty + i));
+    }
+    assert(last_user_pty > 32);
+    assert(pty_get_node((uint32_t)last_user_pty, &node) == 0 &&
+           node.first_cluster == (uint32_t)last_user_pty);
+    assert(pty_lookup_path("/dev/pts/33", &node) == 0 &&
+           node.first_cluster == (uint32_t)last_user_pty);
     pty_console_key_event(29, 1); /* Ctrl */
     pty_console_key_event(56, 1); /* Alt */
     pty_console_key_event(60, 1); /* F2 */

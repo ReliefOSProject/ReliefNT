@@ -25,8 +25,8 @@
 #define ntohl(value) ((((uint32_t)(value) & 0xffu) << 24) | (((uint32_t)(value) & 0xff00u) << 8) | (((uint32_t)(value) & 0xff0000u) >> 8) | ((uint32_t)(value) >> 24))
 #define htonl(value) ntohl(value)
 
-#define UNIX_SOCKET_MAX 32u
-#define UNIX_SOCKET_BACKLOG_MAX 8u
+#define UNIX_SOCKET_BACKLOG_MAX 4096u
+#define UNIX_SOCKET_PENDING_MAX (UNIX_SOCKET_BACKLOG_MAX + 1u)
 #define UNIX_SOCKET_RX_CAP 16384u
 #define UNIX_SOCKET_FD_TRANSFER_MAX 253u
 #define UNIX_SOCKET_CMSG_CAP 65536u
@@ -89,8 +89,10 @@ struct unix_socket {
     uint32_t rx_head;
     uint32_t rx_tail;
     uint32_t pending_count;
-    uint32_t backlog;
-    uint32_t pending[UNIX_SOCKET_BACKLOG_MAX];
+    uint32_t pending_capacity;
+    uint32_t backlog; /* Normalized unsigned Linux listen backlog, capped at 4096. */
+    uint32_t pending_limit; /* AF_UNIX may queue backlog plus one connection. */
+    uint32_t *pending;
     uint64_t rx_read;
     uint64_t rx_written;
     struct unix_rights *rights;
@@ -111,9 +113,43 @@ struct unix_socket {
     struct kernel_wait_queue wait_tx;
     struct kernel_wait_queue wait_accept;
     struct kernel_wait_queue wait_connect;
+    struct unix_socket *registry_next;
 };
 
-static struct unix_socket *unix_sockets[UNIX_SOCKET_MAX];
+static struct unix_socket *unix_sockets;
+
+/**
+ * @brief Grow a listener's pending handle array up to backlog plus one entry.
+ * @param socket Listener that owns the array.
+ * @param needed Number of pending handles that must fit.
+ * @return Zero on success, negative ENOMEM on allocation failure, or negative
+ *         EINVAL when needed exceeds the listener's pending limit.
+ */
+static int unix_pending_reserve(struct unix_socket *socket, uint32_t needed)
+{
+    uint32_t capacity;
+    uint32_t *pending;
+    if (needed <= socket->pending_capacity) return 0;
+    if (needed > socket->pending_limit || needed > UNIX_SOCKET_PENDING_MAX)
+        return -RELIEFOS_EINVAL;
+    capacity = socket->pending_capacity ? socket->pending_capacity : 8u;
+    while (capacity < needed) {
+        if (capacity > UNIX_SOCKET_PENDING_MAX / 2u) {
+            capacity = UNIX_SOCKET_PENDING_MAX;
+            break;
+        }
+        capacity *= 2u;
+    }
+    if (capacity > socket->pending_limit) capacity = socket->pending_limit;
+    pending = kernel_malloc((size_t)capacity * sizeof(*pending));
+    if (!pending) return -RELIEFOS_ENOMEM;
+    for (uint32_t i = 0; i < socket->pending_count; ++i)
+        pending[i] = socket->pending[i];
+    kernel_free(socket->pending);
+    socket->pending = pending;
+    socket->pending_capacity = capacity;
+    return 0;
+}
 
 static int unix_block(struct unix_socket *socket, struct task_file *file,
                        struct kernel_wait_queue *queue, bool receiving, uint32_t flags)
@@ -210,10 +246,17 @@ static int unix_text_equal(const char *left, const char *right)
     return *left == *right;
 }
 
+/**
+ * @brief Find a bound AF_UNIX endpoint by abstract or filesystem address.
+ * @param path User-visible socket address bytes.
+ * @param length Address byte count.
+ * @param resolved Resolved filesystem path, empty for an abstract address.
+ * @return Matching live socket, or null when no endpoint is bound.
+ */
 static struct unix_socket *unix_find_path(const char *path, uint32_t length, const char *resolved)
 {
-    for (uint32_t i = 0; i < UNIX_SOCKET_MAX; ++i) {
-        struct unix_socket *socket = unix_sockets[i];
+    for (struct unix_socket *socket = unix_sockets; socket;
+         socket = socket->registry_next) {
         if (!socket || !socket->used || !socket->bound || !socket->path_len) continue;
         if (resolved[0]) {
             if (socket->bound_path[0] && unix_text_equal(socket->bound_path, resolved)) return socket;
@@ -240,13 +283,22 @@ static void unix_autobind(struct unix_socket *socket)
     socket->bound = true;
 }
 
+/**
+ * @brief Clear filesystem bindings for sockets whose inode path was removed.
+ * @param path Removed path.
+ */
 void task_socket_unlink_path(const char *path)
 {
-    for (uint32_t i = 0; i < UNIX_SOCKET_MAX; ++i)
-        if (unix_sockets[i] && unix_text_equal(unix_sockets[i]->bound_path, path))
-            unix_sockets[i]->bound_path[0] = 0;
+    for (struct unix_socket *socket = unix_sockets; socket;
+         socket = socket->registry_next)
+        if (unix_text_equal(socket->bound_path, path)) socket->bound_path[0] = 0;
 }
 
+/**
+ * @brief Update registered filesystem socket paths after a rename.
+ * @param old_path Previous path prefix.
+ * @param new_path New path prefix.
+ */
 void task_socket_rename_path(const char *old_path, const char *new_path)
 {
     if (unix_text_equal(old_path, new_path)) return;
@@ -254,9 +306,8 @@ void task_socket_rename_path(const char *old_path, const char *new_path)
     uint32_t length = 0, new_length = 0;
     while (old_path[length]) ++length;
     while (new_path[new_length]) ++new_length;
-    for (uint32_t i = 0; i < UNIX_SOCKET_MAX; ++i) {
-        struct unix_socket *socket = unix_sockets[i];
-        if (!socket) continue;
+    for (struct unix_socket *socket = unix_sockets; socket;
+         socket = socket->registry_next) {
         uint32_t j;
         for (j = 0; j < length && socket->bound_path[j] == old_path[j]; ++j) {}
         if (j != length || (socket->bound_path[j] && socket->bound_path[j] != '/')) continue;
@@ -290,14 +341,15 @@ static int unix_address_out(const struct unix_socket *socket, uint64_t address, 
     return unix_name_out(socket ? socket->path : NULL, socket ? socket->path_len : 0, address, length);
 }
 
+/**
+ * @brief Allocate and register a stable AF_UNIX socket object.
+ * @param owner_pid Socket owner process identifier.
+ * @param type Socket type.
+ * @return New socket or null when either object or handle allocation fails.
+ */
 static struct unix_socket *unix_alloc(uint32_t owner_pid, uint32_t type)
 {
     struct unix_socket *socket = NULL;
-    uint32_t slot;
-    for (slot = 0; slot < UNIX_SOCKET_MAX; ++slot) {
-        if (!unix_sockets[slot]) break;
-    }
-    if (slot == UNIX_SOCKET_MAX) return NULL;
     socket = (struct unix_socket *)kernel_malloc(sizeof(*socket));
     if (!socket) return NULL;
     *socket = (struct unix_socket){
@@ -319,7 +371,12 @@ static struct unix_socket *unix_alloc(uint32_t owner_pid, uint32_t type)
     kernel_wait_queue_init(&socket->wait_tx);
     kernel_wait_queue_init(&socket->wait_accept);
     kernel_wait_queue_init(&socket->wait_connect);
-    unix_sockets[slot] = socket;
+    if (!unix_sockets) unix_sockets = socket;
+    else {
+        struct unix_socket *tail = unix_sockets;
+        while (tail->registry_next) tail = tail->registry_next;
+        tail->registry_next = socket;
+    }
     return socket;
 }
 
@@ -334,6 +391,10 @@ static void unix_wake_peer(struct unix_socket *socket)
     kernel_poll_readiness_notify();
 }
 
+/**
+ * @brief Drop one AF_UNIX socket reference and remove its final object safely.
+ * @param handle Stable kernel object handle.
+ */
 static void unix_release_handle(uint32_t handle)
 {
     struct unix_socket *socket = unix_from_handle(handle);
@@ -357,6 +418,7 @@ static void unix_release_handle(uint32_t handle)
         unix_rights_free(rights);
     }
     for (uint32_t i = 0; i < socket->pending_count; ++i) unix_release_handle(socket->pending[i]);
+    kernel_free(socket->pending);
     if (socket->peer_handle) {
         struct unix_socket *peer = unix_from_handle(socket->peer_handle);
         if (peer) {
@@ -375,9 +437,9 @@ static void unix_release_handle(uint32_t handle)
     (void)kernel_wait_queue_wake_all(&socket->wait_connect);
     kernel_poll_readiness_notify();
     (void)kernel_object_remove(kernel_objects(), handle, KERNEL_OBJECT_SOCKET, NULL);
-    for (uint32_t i = 0; i < UNIX_SOCKET_MAX; ++i) {
-        if (unix_sockets[i] == socket) unix_sockets[i] = NULL;
-    }
+    struct unix_socket **link = &unix_sockets;
+    while (*link && *link != socket) link = &(*link)->registry_next;
+    if (*link == socket) *link = socket->registry_next;
     kernel_free(socket);
 }
 
@@ -420,14 +482,13 @@ void task_socket_release(struct task_file *file)
     }
 }
 
+/** @brief Collect unreachable AF_UNIX reference cycles held by queued rights. */
 void task_socket_collect(void)
 {
     static bool collecting;
     if (collecting) return;
     collecting = true;
-    for (unsigned i = 0; i < UNIX_SOCKET_MAX; ++i) {
-        struct unix_socket *s = unix_sockets[i];
-        if (!s) continue;
+    for (struct unix_socket *s = unix_sockets; s; s = s->registry_next) {
         s->gc_roots = s->refs;
         s->gc_mark = 0;
         for (struct unix_rights *r = s->rights; r; r = r->next)
@@ -436,9 +497,7 @@ void task_socket_collect(void)
     }
     /* References owned only by queued SCM files and pending accepts are
      * graph edges. Everything else is an externally reachable root. */
-    for (unsigned i = 0; i < UNIX_SOCKET_MAX; ++i) {
-        struct unix_socket *s = unix_sockets[i];
-        if (!s) continue;
+    for (struct unix_socket *s = unix_sockets; s; s = s->registry_next) {
         for (unsigned j = 0; j < s->pending_count; ++j) {
             struct unix_socket *p = unix_from_handle(s->pending[j]);
             if (p && p->gc_roots) --p->gc_roots;
@@ -454,14 +513,13 @@ void task_socket_collect(void)
             }
         }
     }
-    for (unsigned i = 0; i < UNIX_SOCKET_MAX; ++i)
-        if (unix_sockets[i]) unix_sockets[i]->gc_mark = unix_sockets[i]->gc_roots != 0;
+    for (struct unix_socket *s = unix_sockets; s; s = s->registry_next)
+        s->gc_mark = s->gc_roots != 0;
     bool changed;
     do {
         changed = false;
-        for (unsigned i = 0; i < UNIX_SOCKET_MAX; ++i) {
-            struct unix_socket *s = unix_sockets[i];
-            if (!s || !s->gc_mark) continue;
+        for (struct unix_socket *s = unix_sockets; s; s = s->registry_next) {
+            if (!s->gc_mark) continue;
             for (unsigned j = 0; j < s->pending_count; ++j) {
                 struct unix_socket *p = unix_from_handle(s->pending[j]);
                 if (p && !p->gc_mark) { p->gc_mark = 1; changed = true; }
@@ -474,9 +532,8 @@ void task_socket_collect(void)
         }
     } while (changed);
     struct unix_rights *garbage = NULL;
-    for (unsigned i = 0; i < UNIX_SOCKET_MAX; ++i) {
-        struct unix_socket *s = unix_sockets[i];
-        if (!s || s->gc_mark) continue;
+    for (struct unix_socket *s = unix_sockets; s; s = s->registry_next) {
+        if (s->gc_mark) continue;
         while (s->rights) {
             struct unix_rights *r = s->rights;
             s->rights = r->next;
@@ -890,6 +947,15 @@ int task_socket_ioctl(struct task_file *file, uint64_t request, uint64_t address
     return 0;
 }
 
+/**
+ * @brief Read bytes from a packet, datagram, or TCP open file description.
+ * @param file Pinned descriptor for the socket being read.
+ * @param buffer Writable destination for the received bytes.
+ * @param length Maximum number of bytes requested.
+ * @return Bytes read, zero for orderly EOF, a negative errno, or the blocking sentinel.
+ * @note A blocking TCP read retains its syscall-file pin and parks on the socket
+ * read queue; the network poll tick retries input because this NIC is polled.
+ */
 int task_inet_read(struct task_file *file, void *buffer, uint32_t length)
 {
     if (file && file->kind == TASK_FILE_KIND_PACKET) return task_packet_recv(file, buffer, length, 0, 0, 0);
@@ -907,18 +973,29 @@ int task_inet_read(struct task_file *file, void *buffer, uint32_t length)
     if (!(ready & (POLLIN | POLLHUP | POLLERR))) {
         if (file->flags & RELIEFOS_O_NONBLOCK) return -RELIEFOS_EAGAIN;
         if (!task) return -LINUX_ESRCH;
-        sched_sleep_current_until(time_ticks() + 1);
-        return KERNEL_SYSCALL_BLOCKED;
+        int wait = net_socket_wait_readable(request.socket);
+        if (wait == 1) return KERNEL_SYSCALL_BLOCKED;
+        if (wait < 0) return wait;
+        ready = net_socket_poll_fd(request.socket, 0, POLLIN | POLLHUP);
     }
     if (ready & POLLERR) { int error = net_socket_error(request.socket, true); if (error) return -error; }
     if (net_socket_recv(&request, 0) < 0) return -RELIEFOS_EIO;
     if (request.status == RELIEFOS_NET_STATUS_OK) return (int)request.transferred;
-    if (request.status == RELIEFOS_NET_STATUS_SOCKET_CLOSED ||
-        request.status == RELIEFOS_NET_STATUS_TCP_RESET) return 0;
+    if (request.status == RELIEFOS_NET_STATUS_TCP_RESET) return -LINUX_ECONNRESET;
+    if (request.status == RELIEFOS_NET_STATUS_SOCKET_CLOSED) return 0;
     if (request.status == RELIEFOS_NET_STATUS_TCP_TIMEOUT && (file->flags & RELIEFOS_O_NONBLOCK)) return -RELIEFOS_EAGAIN;
     return -RELIEFOS_EIO;
 }
 
+/**
+ * @brief Queue bytes to an IPv4 stream socket without waiting while holding the syscall transaction.
+ * @param file Open file description for the network socket.
+ * @param buffer Validated message bytes to queue.
+ * @param length Requested byte count.
+ * @return Queued bytes, a negative errno, or KERNEL_SYSCALL_BLOCKED while waiting for queue space.
+ * @note Positive short progress returns immediately; data remains owned by the
+ * stable TCP socket until ACKed, so no accepted bytes are discarded on retry.
+ */
 int task_inet_write(struct task_file *file, const void *buffer, uint32_t length)
 {
     if (file && file->kind == TASK_FILE_KIND_PACKET) return task_packet_send(file, buffer, length, 0, 0, 0);
@@ -928,14 +1005,18 @@ int task_inet_write(struct task_file *file, const void *buffer, uint32_t length)
     request.socket = (int32_t)file->aux;
     request.buffer = (void *)buffer;
     request.length = length;
-    request.timeout_ms = 10000u;
-    if (net_socket_send(&request, 0) < 0) return -RELIEFOS_EIO;
-    if (request.transferred) return (int)request.transferred;
-    if (request.status == RELIEFOS_NET_STATUS_OK) return (int)request.transferred;
-    if (request.status == RELIEFOS_NET_STATUS_SOCKET_CLOSED ||
-        request.status == RELIEFOS_NET_STATUS_TCP_RESET) return -RELIEFOS_EPIPE;
-    if (request.status == RELIEFOS_NET_STATUS_TCP_TIMEOUT && (file->flags & RELIEFOS_O_NONBLOCK)) return -RELIEFOS_EAGAIN;
-    return -RELIEFOS_EIO;
+    for (;;) {
+        if (net_socket_send(&request, 0) < 0) return -RELIEFOS_EIO;
+        if (request.transferred) return (int)request.transferred;
+        if (request.status == RELIEFOS_NET_STATUS_OK) return 0;
+        if (request.status == RELIEFOS_NET_STATUS_SOCKET_CLOSED ||
+            request.status == RELIEFOS_NET_STATUS_TCP_RESET) return -RELIEFOS_EPIPE;
+        if (request.status != RELIEFOS_NET_STATUS_TCP_TIMEOUT) return -RELIEFOS_EIO;
+        if (file->flags & RELIEFOS_O_NONBLOCK) return -RELIEFOS_EAGAIN;
+        int wait = net_socket_wait_writable(request.socket);
+        if (wait == 1) return KERNEL_SYSCALL_BLOCKED;
+        if (wait < 0) return wait;
+    }
 }
 
 short task_inet_poll(const struct task_file *file, short events)
@@ -958,6 +1039,108 @@ void task_inet_release(struct task_file *file)
     if (file && (file->flags & TASK_FILE_FLAG_SOCKET_INET)) net_socket_release_fd((int32_t)file->aux);
 }
 
+/**
+ * @brief Read or update supported socket-level options for an IPv4 TCP socket.
+ * @param setting Select setsockopt when true, getsockopt otherwise.
+ * @param level Socket option level.
+ * @param option Option identifier.
+ * @param address User option value address.
+ * @param length User socklen_t address.
+ * @param handle Internal TCP socket handle.
+ * @return Zero on success or a negative errno.
+ * @note Linux SO_*TIMEO values are converted to scheduler ticks with ceiling
+ * rounding. An all-zero timeval maps to an infinite wait; negative seconds map
+ * to an immediate timeout and are reported by getsockopt as (0, 0).
+ */
+static int inet_socket_option(bool setting, int level, int option,
+                              uint64_t address, uint64_t length, int32_t handle)
+{
+    if (setting) {
+        if (level != SOL_SOCKET) return -LINUX_ENOPROTOOPT;
+        if (option != SO_RCVTIMEO && option != SO_RCVTIMEO_NEW &&
+            option != SO_SNDTIMEO && option != SO_SNDTIMEO_NEW)
+            return -LINUX_ENOPROTOOPT;
+        if ((int32_t)length < (int32_t)sizeof(struct linux_timeval))
+            return -LINUX_EINVAL;
+        if (!user_range_ok(address, sizeof(struct linux_timeval)))
+            return -LINUX_EFAULT;
+        struct linux_timeval timeout = *(const struct linux_timeval *)(uintptr_t)address;
+        if (timeout.tv_usec < 0 || timeout.tv_usec >= 1000000)
+            return -LINUX_EDOM;
+        uint64_t ticks;
+        if (timeout.tv_sec < 0) {
+            ticks = 0;
+        } else if (!timeout.tv_sec && !timeout.tv_usec) {
+            ticks = UINT64_MAX;
+        } else {
+            uint64_t seconds = (uint64_t)timeout.tv_sec;
+            uint64_t fraction = ((uint64_t)timeout.tv_usec * RELIEFNT_TICK_HZ + 999999u) /
+                                1000000u;
+            if (seconds > (UINT64_MAX - 1u - fraction) / RELIEFNT_TICK_HZ)
+                ticks = UINT64_MAX - 1u;
+            else
+                ticks = seconds * RELIEFNT_TICK_HZ + fraction;
+        }
+        return net_socket_set_timeout_ticks(handle,
+            option == SO_SNDTIMEO || option == SO_SNDTIMEO_NEW, ticks);
+    }
+
+    if (!user_range_writable(length, sizeof(socklen_t))) return -LINUX_EFAULT;
+    socklen_t capacity = *(socklen_t *)(uintptr_t)length;
+    if ((int32_t)capacity < 0) return -LINUX_EINVAL;
+    if (level != SOL_SOCKET) return -LINUX_ENOPROTOOPT;
+    int32_t value = 0;
+    struct linux_timeval timeout = {0};
+    const void *data = &value;
+    uint32_t size = sizeof(value);
+    switch (option) {
+    case SO_ERROR:
+        value = net_socket_error(handle, true);
+        break;
+    case SO_TYPE:
+        value = SOCK_STREAM;
+        break;
+    case SO_DOMAIN:
+        value = AF_INET;
+        break;
+    case SO_PROTOCOL:
+        value = 6;
+        break;
+    case SO_RCVTIMEO:
+    case SO_RCVTIMEO_NEW:
+    case SO_SNDTIMEO:
+    case SO_SNDTIMEO_NEW: {
+        uint64_t ticks = net_socket_get_timeout_ticks(handle,
+            option == SO_SNDTIMEO || option == SO_SNDTIMEO_NEW);
+        if (ticks != UINT64_MAX) {
+            timeout.tv_sec = (int64_t)(ticks / RELIEFNT_TICK_HZ);
+            timeout.tv_usec = (int64_t)((ticks % RELIEFNT_TICK_HZ) *
+                                        (1000000u / RELIEFNT_TICK_HZ));
+        }
+        data = &timeout;
+        size = sizeof(timeout);
+        break;
+    }
+    default:
+        return -LINUX_ENOPROTOOPT;
+    }
+    if (size > capacity) size = capacity;
+    if (size && !user_range_writable(address, size)) return -LINUX_EFAULT;
+    __builtin_memcpy((void *)(uintptr_t)address, data, size);
+    *(socklen_t *)(uintptr_t)length = size;
+    return 0;
+}
+
+/**
+ * @brief Dispatch socket operations for IPv4 TCP, UDP, and packet sockets.
+ * @param number Linux socket syscall number.
+ * @param a0 First syscall argument.
+ * @param a1 Second syscall argument.
+ * @param a2 Third syscall argument.
+ * @param a3 Fourth syscall argument.
+ * @param a4 Fifth syscall argument.
+ * @return Linux syscall result or a negative errno.
+ */
 static int64_t inet_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
                                     uint64_t a2, uint64_t a3, uint64_t a4)
 {
@@ -1039,24 +1222,11 @@ static int64_t inet_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
         return 0;
     }
     if (number == __NR_shutdown) return net_socket_shutdown_fd((int32_t)file->aux, (int32_t)a1);
-    if (number == __NR_setsockopt) return -LINUX_ENOPROTOOPT;
-    if (number == __NR_getsockopt) {
-        if ((int32_t)a1 != SOL_SOCKET) return -LINUX_ENOPROTOOPT;
-        if (!user_range_writable(a4, 4)) return -LINUX_EFAULT;
-        uint32_t length = *(uint32_t *)(uintptr_t)a4;
-        if ((int32_t)length < 0) return -LINUX_EINVAL;
-        if (length > 4) length = 4;
-        if (length && !user_range_writable(a3, length)) return -LINUX_EFAULT;
-        int value;
-        if ((int32_t)a2 == SO_ERROR) value = net_socket_error((int32_t)file->aux, true);
-        else if ((int32_t)a2 == SO_TYPE) value = SOCK_STREAM;
-        else if ((int32_t)a2 == SO_DOMAIN) value = AF_INET;
-        else if ((int32_t)a2 == SO_PROTOCOL) value = 6;
-        else return -LINUX_ENOPROTOOPT;
-        __builtin_memcpy((void *)(uintptr_t)a3, &value, length);
-        *(uint32_t *)(uintptr_t)a4 = length;
-        return 0;
-    }
+    if (number == __NR_setsockopt || number == __NR_getsockopt)
+        return inet_socket_option(number == __NR_setsockopt,
+                                  (int32_t)a1, (int32_t)a2,
+                                  (uint64_t)a3, (uint64_t)a4,
+                                  (int32_t)file->aux);
     return -LINUX_EOPNOTSUPP;
 }
 
@@ -1482,6 +1652,17 @@ int task_socket_message_error(struct task_file *file, int error, bool setting)
     return previous;
 }
 
+/**
+ * @brief Dispatch one Linux AF_UNIX operation on the calling task's descriptor.
+ * @param number Linux socket syscall number.
+ * @param a0 First native syscall argument.
+ * @param a1 Second native syscall argument.
+ * @param a2 Third native syscall argument.
+ * @param a3 Fourth native syscall argument, including accept4 flags.
+ * @return Linux syscall result or KERNEL_SYSCALL_BLOCKED for scheduler retry.
+ * @note The caller holds the kernel execution transaction. Blocking socket
+ * operations enqueue the task before parking and preserve pinned-file state.
+ */
 static int64_t unix_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
                                     uint64_t a2, uint64_t a3)
 {
@@ -1591,9 +1772,14 @@ static int64_t unix_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
         return 0;
     }
     if (number == __NR_listen) {
+        uint32_t requested_backlog = (uint32_t)(int32_t)a1;
         if (socket->type == SOCK_DGRAM) return -LINUX_EOPNOTSUPP;
         if (!socket->path_len || socket->state == UNIX_SOCKET_CONNECTED) return -RELIEFOS_EINVAL;
-        socket->backlog = (uint32_t)a1 >= UNIX_SOCKET_BACKLOG_MAX ? UNIX_SOCKET_BACKLOG_MAX - 1 : (uint32_t)a1;
+        if (requested_backlog > UNIX_SOCKET_BACKLOG_MAX)
+            requested_backlog = UNIX_SOCKET_BACKLOG_MAX;
+        socket->backlog = requested_backlog;
+        /* Linux AF_UNIX accepts one more pending connection than backlog. */
+        socket->pending_limit = requested_backlog + 1u;
         socket->state = UNIX_SOCKET_LISTEN;
         socket->credentials = (struct ucred){(int32_t)sched_task_tgid(task), task->euid, task->egid};
         kernel_poll_readiness_notify();
@@ -1643,9 +1829,11 @@ static int64_t unix_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
         if (listener && listener->type != socket->type) return -LINUX_EPROTOTYPE;
         if (!listener || listener->state != UNIX_SOCKET_LISTEN) return -LINUX_ECONNREFUSED;
         kernel_wait_queue_remove(&listener->wait_connect, task);
-        if (listener->pending_count > listener->backlog) {
+        if (listener->pending_count >= listener->pending_limit) {
             return unix_block(socket, file, &listener->wait_connect, false, 0);
         }
+        ret = unix_pending_reserve(listener, listener->pending_count + 1u);
+        if (ret < 0) return ret;
         server = unix_alloc(listener->owner_pid, listener->type);
         if (!server) return -RELIEFOS_ENOMEM;
         server->state = UNIX_SOCKET_CONNECTED;
@@ -1735,6 +1923,19 @@ static int64_t unix_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
     return -RELIEFOS_ENOSYS;
 }
 
+/**
+ * @brief Read or configure supported AF_UNIX socket-level options.
+ * @param socket Stable AF_UNIX socket object.
+ * @param setting Select setsockopt when true, getsockopt otherwise.
+ * @param level Socket option level.
+ * @param option Option identifier.
+ * @param address User option value address.
+ * @param length Option length or getsockopt socklen_t pointer.
+ * @return Zero on success or a negative Linux errno.
+ * @note SO_*TIMEO uses scheduler ticks, rounds positive values up, maps an
+ * all-zero timeval to an infinite wait, and maps negative seconds to an
+ * immediate timeout that getsockopt reports as (0, 0).
+ */
 static int unix_socket_option(struct unix_socket *socket, bool setting, int level,
                                int option, uint64_t address, uint64_t length)
 {
@@ -1746,12 +1947,22 @@ static int unix_socket_option(struct unix_socket *socket, bool setting, int leve
             if (length < sizeof(struct linux_timeval)) return -RELIEFOS_EINVAL;
             if (!user_range_ok(address, sizeof(struct linux_timeval))) return -RELIEFOS_EFAULT;
             struct linux_timeval timeout = *(const struct linux_timeval *)(uintptr_t)address;
-            if (timeout.tv_usec < 0 || timeout.tv_usec >= 1000000) return -LINUX_EDOM;
-            uint64_t ticks = UINT64_MAX;
-            if (timeout.tv_sec < 0) ticks = 0;
-            else if ((timeout.tv_sec || timeout.tv_usec) && timeout.tv_sec < INT64_MAX / RELIEFNT_TICK_HZ - 1)
-                ticks = (uint64_t)timeout.tv_sec * RELIEFNT_TICK_HZ +
-                    ((uint64_t)timeout.tv_usec * RELIEFNT_TICK_HZ + 999999) / 1000000;
+            if (timeout.tv_usec < 0 || timeout.tv_usec >= 1000000)
+                return -LINUX_EDOM;
+            uint64_t ticks;
+            if (timeout.tv_sec < 0) {
+                ticks = 0;
+            } else if (!timeout.tv_sec && !timeout.tv_usec) {
+                ticks = UINT64_MAX;
+            } else {
+                uint64_t seconds = (uint64_t)timeout.tv_sec;
+                uint64_t fraction = ((uint64_t)timeout.tv_usec * RELIEFNT_TICK_HZ + 999999u) /
+                                    1000000u;
+                if (seconds > (UINT64_MAX - 1u - fraction) / RELIEFNT_TICK_HZ)
+                    ticks = UINT64_MAX - 1u;
+                else
+                    ticks = seconds * RELIEFNT_TICK_HZ + fraction;
+            }
             if (option == SO_RCVTIMEO || option == SO_RCVTIMEO_NEW) socket->receive_timeout = ticks;
             else socket->send_timeout = ticks;
             return 0;
@@ -1806,6 +2017,19 @@ static int unix_socket_option(struct unix_socket *socket, bool setting, int leve
     return 0;
 }
 
+/**
+ * @brief Route native socket syscalls to AF_UNIX, TCP, UDP, and packet handlers.
+ * @param number Linux syscall number.
+ * @param a0 First native syscall argument.
+ * @param a1 Second native syscall argument.
+ * @param a2 Third native syscall argument.
+ * @param a3 Fourth native syscall argument.
+ * @param a4 Fifth native syscall argument.
+ * @param a5 Sixth native syscall argument.
+ * @return Linux syscall result or the internal blocking sentinel.
+ * @note The syscall entry owns the global execution transaction and keeps a
+ * task-file pin across retries; completion clears per-syscall timeout state.
+ */
 int64_t syscall_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
                                 uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
 {
@@ -1848,11 +2072,18 @@ int64_t syscall_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
         if (!file) return -RELIEFOS_EBADF;
         if (a2 && !user_range_ok(a1, a2)) return -RELIEFOS_EFAULT;
         if (file->flags & TASK_FILE_FLAG_SOCKET_INET) {
+            if (a3 & ~(MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE | MSG_EOR))
+                return -LINUX_EOPNOTSUPP;
             if (file->kind == TASK_FILE_KIND_PACKET)
                 return task_packet_send(file, (void *)(uintptr_t)a1, (uint32_t)a2, (uint32_t)a3, a4, (uint32_t)a5);
             if (file->kind == TASK_FILE_KIND_UDP)
                 return task_udp_send(file, (void *)(uintptr_t)a1, (uint32_t)a2, (uint32_t)a3, a4, (uint32_t)a5);
-            return task_inet_write(file, (const void *)(uintptr_t)a1, (uint32_t)a2);
+            struct task_file local = *file;
+            if (a3 & MSG_DONTWAIT) local.flags |= RELIEFOS_O_NONBLOCK;
+            int ret = task_inet_write(&local, (const void *)(uintptr_t)a1, (uint32_t)a2);
+            if (ret == -RELIEFOS_EPIPE && !(a3 & MSG_NOSIGNAL))
+                sched_signal_user_task(task->pid, 13);
+            return ret;
         }
         if (!(file->flags & TASK_FILE_FLAG_SOCKET_UNIX)) return -RELIEFOS_EBADF;
         if (a3 & ~(MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE | MSG_EOR)) return -LINUX_EOPNOTSUPP;
