@@ -21,6 +21,10 @@
   当前文档示例，保留数字 ABI 语义与最长 31 字节的完整内核版本限制。
 - 按改动范围执行内核编译、宿主工具测试、UAPI 布局和头文件导出检查。
   不改 ABI golden 或音频 manifest 来掩盖失败；记录并报告真实结果。
+- 内核测试与原生 Linux ABI 探针由本仓 `tools/`、`tools/tests/`、`tests/host/`
+  持有；不得依赖父仓用户态、应用或构建目录。完整 OS 镜像/SDK/VM 编排由
+  ReliefOS 持有并消费本仓探针。`make test-ownership test-host-smoke` 是独立
+  快速门禁，`make test-host` 按显式清单运行全部宿主套件并保留每项结果。
 - 编译、打包、QEMU、VMware 和硬件验证分别报告；未运行不是通过。
   VMware 验证未完成时必须明示。作为父仓子模块工作时，TMPDIR 使用父仓 `out/tmp`。
 - 仅提交任务文件；不提交 `out/`、`build/`、缓存、密钥和无关产物。

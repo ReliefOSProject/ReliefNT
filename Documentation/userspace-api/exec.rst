@@ -24,7 +24,7 @@ exec 参数与初始栈
 exec；失败保留旧映像、描述符和信号状态。内部 boot/service launch 请求仍
 使用原有的小型固定请求结构，该结构不限制 Linux exec 系统调用。
 
-ReliefOS 父仓中的 ``tools/test_exec_script.py`` 对生产参数复制和 shebang
+本仓 ``tools/test_exec_script.py`` 对生产参数复制和 shebang
 重写运行 ASan/UBSan 测试；``tools/test_exec_limits.py`` 在 Linux 上运行边界
 参照。对应的 ``tools/tests/exec_limits_runtime_probe.c`` 可以在 ReliefOS 内用
 GCC 编译并运行同一组用例，以验证真实系统调用与初始栈布局。测试必须区分

@@ -1,0 +1,21 @@
+# category<TAB>kernel-relative path<TAB>reason
+compatibility	block/core/storage_block.c	识别已有磁盘 GPT 名 LEONOS4_ROOT
+compatibility	fs/vfs/mount.c	旧 leonos-installer-root 引导 module tag 双接受
+compatibility	fs/proc/procfs.c	冻结 LeonOSRole/LeonOSFlags 与 /proc/leonos-drivers 接口值
+compatibility	fs/sysfs/sysfs.c	冻结 /sys/devices/platform/leonos-block 运行时设备路径
+compatibility	include/reliefos/elf_abi.h	published ELF note and runtime SONAME values
+compatibility	include/reliefos/layout.h	frozen task 6 guest layout values
+compatibility	include/uapi/reliefos/rootfs.h	frozen task 6 rootfs paths
+compatibility	kernel/init/kernel.c	识别旧 installer-root GRUB module tag
+compatibility	kernel/init/kernel_debug.c	旧 kerneldebug ELF note section 与函数名/hash 双接受
+compatibility	kernel/syscall/device/input_ioctl.c	冻结设备 ioctl 对外 identity：PS/2 名称与 leonos-fb
+compatibility	kernel/syscall/device/legacy_ioctl.c	冻结设备 ioctl 对外 identity：PS/2 名称与 leonos-fb
+compatibility	tools/tests/fixtures/legacy-abi-layout.json	旧 UAPI sizeof/offsetof/常量布局 golden，值级对比基线不得随意改写
+compatibility	tools/tests/linux_inventory_test.c	sysfs 冻结 leonos-block 接口值的 Linux 清单探针
+compatibility	include/uapi/README.rst	公开旧 libleonos.so.2 独立兼容 SONAME 的使用限制
+history	configs/kernel-source-map.json	源码拆分映射保留基线名称，仅作审计不进入生产编译
+history	Documentation/releases/5.1.2.rst	已发布 5.1.2 说明的 RST 归档，保留版本事实
+compatibility	tools/test_brand_identity.py	旧标识审计规则本身
+compatibility	tools/test_security_regressions.py	审计并拒绝旧私有 ioctl 名称
+compatibility	tools/tests/brand-allowlist.tsv	逐文件记录冻结旧 ABI 与历史标识
+compatibility	tools/test_boot_policy.py	旧磁盘身份和兼容启动标识断言

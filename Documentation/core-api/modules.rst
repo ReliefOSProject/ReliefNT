@@ -110,5 +110,5 @@ vDSO 使用其专用 PIC/链接参数，只有 ``vdso_blob.o`` 进入内核归�
 用隔离源码及输出验证源码/头/参数/工具身份和缺失产物的重建。
 
 ``tools/tests/modules/`` 仅供旧白盒宿主测试组合真实实现，不进入生产构建；
-父仓 ``tools/kernel_test_sources.py`` 为这些测试定位实际源码，避免测试复制的旧实现。
+本仓 ``tools/kernel_test_sources.py`` 为这些测试定位实际源码，避免测试复制的旧实现。
 ABI golden 和历史测试失败均应单独报告，不通过改期望值掩盖。

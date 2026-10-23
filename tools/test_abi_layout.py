@@ -59,7 +59,7 @@ CONSTANTS = [
 ]
 
 INCLUDES = ["-I", str(ROOT / "include/uapi"), "-I", str(ROOT / "include"),
-            "-I", str(ROOT / "userland/libc/include"), "-I", str(ROOT / "include/uapi")]
+            "-I", str(ROOT / "include/uapi")]
 
 
 def wire_header_paths():

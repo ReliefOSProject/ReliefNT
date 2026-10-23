@@ -1,0 +1,91 @@
+# Explicit kernel host suites. Guest image/SDK/application orchestration is in ReliefOS.
+acpi_pm_timer tools/test_acpi_pm_timer.py
+ahci_completion tools/test_ahci_completion.py
+apic_timer tools/test_apic_timer.py
+block_exclusive tools/test_block_exclusive.py
+console tools/test_console.py
+cpu_accounting tools/test_cpu_accounting.py
+drm tools/test_drm.py
+e1000 tools/test_e1000.py
+eevdf tools/test_eevdf.py
+evdev_overflow tools/test_evdev_overflow.py
+exec_limits tools/test_exec_limits.py
+exec_script tools/test_exec_script.py
+execution_lock tools/test_execution_lock.py
+exit_logging tools/test_exit_logging.py
+ext2_cache tools/test_ext2_cache.py
+ext2_performance tools/test_ext2_performance.py --output {output}/ext2-performance.json
+ext2_write_batch tools/test_ext2_write_batch.py
+ext4_dir tools/test_ext4_dir.py
+ext4_read tools/test_ext4_read.py
+ext4_vfs tools/test_ext4_vfs.py --filesystem ext4
+ext4_write tools/test_ext4_write.py
+fat_directory_growth tools/test_fat_directory_growth.py
+fbdev tools/test_fbdev.py
+framebuffer_fifo tools/test_framebuffer_fifo.py
+futimens tools/test_futimens.py
+gpu tools/test_gpu.py
+hda tools/test_hda.py
+input tools/test_input.py
+input_routing tools/test_input_routing.py
+kernel_memory tools/test_kernel_memory.py
+linux_abi_contract tools/test_linux_abi_contract.py
+linux_audio tools/test_linux_audio.py abi pcm vma device params ioctl mmap control oss mixer
+linux_capabilities tools/test_linux_capabilities.py
+linux_descriptors tools/test_linux_descriptors.py
+linux_inventory tools/test_linux_inventory.py
+linux_ioctl_cloexec tools/test_linux_ioctl_cloexec.py
+linux_memory tools/test_linux_memory.py
+linux_permissions tools/test_linux_permissions.py
+linux_process_vm tools/test_linux_process_vm.py
+linux_pty tools/test_linux_pty.py
+linux_resources tools/test_linux_resources.py
+linux_socket_batches tools/test_linux_socket_batches.py
+linux_sysv_msg tools/test_linux_sysv_msg.py
+linux_sysv_sem tools/test_linux_sysv_sem.py
+linux_sysv_shm tools/test_linux_sysv_shm.py
+linux_threads tools/test_linux_threads.py
+linux_time tools/test_linux_time.py
+linux_vfork_stack tools/test_linux_vfork_stack.py
+loadavg tools/test_loadavg.py
+network tools/test_network.py
+openrc_network tools/test_openrc_network.py
+page_cache_growth tools/test_page_cache_growth.py
+pipe_wake tools/test_pipe_wake.py
+poll_wakeup tools/test_poll_wakeup.py
+power tools/test_power.py
+procfs tools/test_procfs.py
+record_locks tools/test_record_locks.py
+regular_file_io tools/test_regular_file_io.py
+rootfs tools/test_rootfs.py
+sched_resume tools/test_sched_resume.py
+service_roles tools/test_service_roles.py
+signal_address_space tools/test_signal_address_space.py
+smp_cpu_id tools/test_smp_cpu_id.py
+storage_metadata tools/test_storage_metadata.py
+storage_mkdir_mount tools/test_storage_mkdir_mount.py
+storage_posix_paths tools/test_storage_posix_paths.py
+storage_rename tools/test_storage_rename.py
+storage_sync tools/test_storage_sync.py
+storage_write_batch tools/test_storage_write_batch.py
+svga tools/test_svga.py
+syscall_io tools/test_syscall_io.py
+uapi tools/test_uapi.py
+user_return_gate tools/test_user_return_gate.py
+vdso_mapping tools/test_vdso_mapping.py
+vdso_time tools/test_vdso_time.py
+wait_queue_race tools/test_wait_queue_race.py
+xorg_display_refresh tools/test_xorg_display_refresh.py
+xorg_vt_handoff tools/test_xorg_vt_handoff.py
+ext4_dma tools/test_ext4_dma.py
+security_regressions tools/test_security_regressions.py --strict
+boot_policy tools/test_boot_policy.py
+brand_identity tools/test_brand_identity.py
+ext4_vfs_ext2 tools/test_ext4_vfs.py --filesystem ext2
+ext4_mount tools/tests/ext4_mount_test.py
+ext4_metadata tools/tests/ext4_metadata_api_test.py
+ext4_interop_read tools/tests/ext4_interop_test.py --direction linux-to-reliefos
+ext4_interop_write tools/tests/ext4_interop_test.py --direction reliefos-to-linux
+ext4_crash_replay tools/tests/ext4_crash_replay_test.py
+xorg_abi tools/test_xorg_abi.py
+tmpfs tools/test_tmpfs.py

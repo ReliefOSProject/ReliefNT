@@ -135,7 +135,10 @@ help:
 	  '  install           install products and manifest.txt to DESTDIR' \
 	  '  defconfig / olddefconfig / menuconfig / config-sync' \
 	  '  tools / fetch / fetch-check' \
-	  '  test              host tests, ABI, header export and vDSO' \
+	  '  test              complete kernel host/native validation' \
+	  '  test-host         explicit host suites, per-suite logs and result JSON' \
+	  '  test-host-smoke   standalone host CI regression group' \
+	  '  test-ownership    reject OS/parent dependencies in kernel tests' \
 	  '  test-kconfig      standalone native configuration ownership checks' \
 	  '  htmldocs          strict Sphinx HTML manual in O/Documentation/html' \
 	  '  clean / distclean (download cache is preserved)' \
@@ -266,7 +269,7 @@ headers_install: kbuild-fixdep $(RELIEFNT_O_MARKER)
 	  fi; \
 	done < "$$export_root/manifest.txt"
 
-test-vdso: vdso vdso-runtime-test
+test-vdso: vdso vdso-runtime-test test-vdso-host
 	$(Q)$(RELIEFNT_TEST_PYTHON) $(RELIEFNT_SRC)/tools/test_vdso.py --output $(O) --no-build
 
 # Tracked host suites use the same native hostprogs engine as build tools.
@@ -311,7 +314,7 @@ test-abi:
 test-header-export: headers_install
 	$(Q)$(RELIEFNT_TEST_PYTHON) $(RELIEFNT_SRC)/tools/test_header_export.py --out $(O)
 
-test: test-tools test-abi test-header-export test-vdso test-boot-logo test-panic-console test-module-layout test-boot test-kconfig
+test: test-host test-ownership test-version test-tools test-abi test-header-export test-vdso test-boot-logo test-panic-console test-module-layout test-boot test-kconfig
 
 test-kconfig:
 	$(Q)sh $(RELIEFNT_SRC)/tools/tests/test-kconfig.sh
@@ -378,3 +381,5 @@ prepare-debug: config-sync kbuild-fixdep $(RELIEFNT_TARGET_CC_ID)
 
 test-module-layout:
 	$(Q)$(RELIEFNT_TEST_PYTHON) $(RELIEFNT_SRC)/tools/test_module_layout.py
+
+include $(RELIEFNT_SRC)/tools/tests/Makefile

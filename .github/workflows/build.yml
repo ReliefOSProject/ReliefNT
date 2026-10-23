@@ -1,7 +1,7 @@
 # Build verification for the standalone ReliefNT kernel tree: every push and
 # pull request must prove `make all` produces all three kernel products
 # (kernel.sys, kernel.debug, kerneldebug.sys).
-# Static source audit and build only: no runtime tests or artifact upload.
+# Source audit, standalone host regressions and build; no guest runtime claim.
 
 name: Build ReliefNT
 
@@ -51,6 +51,11 @@ jobs:
             gzip \
             curl \
             python3
+
+      - name: Verify standalone test ownership and host regressions
+        run: |
+          mkdir -p out/tmp
+          TMPDIR="$PWD/out/tmp" make O=out/ci-tests test-ownership test-host-smoke test-tools
 
       # Fetches the pinned Unifont build input; compilation verifies its hash.
       - name: Fetch locked dependencies
