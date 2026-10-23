@@ -37,6 +37,9 @@ module-layout 检查本地 Kbuild、重复/遗漏对象、生产实现包含和�
 ABI golden、导出头、启动、vDSO、徽标、panic、Kconfig 和模块布局检查。
 仅有 Linux 参考探针通过，不表示相同接口已在 ReliefNT 来宾运行通过。
 
+``service_roles`` 套件检查旧内核桌面实现未恢复、旧窗口服务权限标志未恢复，
+以及 exec 只保留允许的任务标志；这些内核源码检查由本仓持有，父仓不再重复。
+
 ``test-smp-time``、``test-page-cache-growth``、``test-user-return``、
 ``test-syscall-io``、``test-vdso-host`` 和 ``test-version`` 提供定向入口。
 ``make test-ext4-reference LINUX_REFERENCE=<目录>`` 检查 ext4 schema，

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reject the removed executable-GID window/service authority contract."""
+"""Reject retired desktop implementations and executable-GID service authority."""
 from pathlib import Path
 import re
 
@@ -7,6 +7,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
+    for name in ("drivers/video/framebuffer/desktop.c",
+                 "drivers/video/framebuffer/desktop_input.c"):
+        assert not (ROOT / name).exists(), f"retired desktop implementation is present: {name}"
+    print("PASS retired kernel desktop implementations are absent")
     source = (ROOT / "kernel/exec/userland.c").read_text()
     types = (ROOT / "include/reliefnt/task/types.h").read_text()
     assert not re.search(r"RELIEFOS_GID_(?:WINDOW_SERVER|SERVICE)|TASK_FLAG_WINDOW_SERVER",
