@@ -1,0 +1,95 @@
+==============
+ReliefNT 5.1.1
+==============
+
+:发布日期: 2026-10-20 12:54:47 UTC
+:发布标签: ``v5.1.1``
+:版本提交: `d561d4c8b296153723677c6b63497eb8867d024d <https://github.com/ReliefOSProject/ReliefNT/commit/d561d4c8b296153723677c6b63497eb8867d024d>`__
+:原始说明: `GitHub Release <https://github.com/ReliefOSProject/ReliefNT/releases/tag/v5.1.1>`__
+
+.. note::
+
+   本页归档发布时的完整说明，仅转换文档格式并将旧相对链接固定到对应标签。
+   文中的路径、功能范围、验证结果与已知限制均指该历史版本，不代表当前版本状态或重新验收。
+
+
+发布范围
+========
+
+- 上一版本基线：``5.1.0`` 的版本提交 `09930b87355b8abbb75e39b693a6a7765ece2397 <https://github.com/ReliefOSProject/ReliefNT/commit/09930b87355b8abbb75e39b693a6a7765ece2397>`__。
+- 本次版本：``5.1.1``，终点为 `v5.1.1 <https://github.com/ReliefOSProject/ReliefNT/tree/v5.1.1>`__ 指向的本次版本提交；完整提交身份以该标签为准。
+- 更新区间为 ``(上一版本提交, 本次版本提交]``，起点不含、终点包含。仅总结 ReliefNT 内核、驱动、UAPI 和本仓开发输入的有效变化；合并去重，不包括 ReliefOS 应用、桌面配置、安装器或镜像打包。
+- 本次是正式源码 Release，提供标签、中文说明及 GitHub 自动源码归档，不附内核二进制或系统镜像。
+
+更新内容
+========
+
+DRM、vmwgfx 与图形资源
+----------------------
+
+- 为 VMware SVGA-II 增加 Linux 兼容 DRM 设备层：按设备和能力公开 ``/dev/dri/card0``、``/dev/dri/renderD128``，实现文件/主设备认证、受拥有者约束的缓冲区与表面、传统 KMS、framebuffer 及 fence 等接口，并补充 PCI/DRM sysfs 信息。
+- 增加适配上游 Mesa 的有界 VGPU9 vmwgfx 路线：能力协商、资源与上下文、验证后的 execbuf 命令提交、着色器、查询和同步；支持同一设备内的 PRIME 表面引用交换。该接口不承诺跨设备 DMA-BUF 导入、挂接或通用 Linux DRM 全量兼容。
+- 加强 GMR、guest-backed 对象/MOB 和提交中资源的生命周期管理；关闭句柄、异常退出或解除映射时按使用状态延迟回收。无可运行任务时，在独立调度服务栈上推进有界资源退休，避免在活动陷阱返回栈上执行终结器。
+- 改进 fbdev 模式验证、framebuffer 与 DRM 映射衔接；补充 ``FB_ACTIVATE_*`` 常量，以及 ``asm/ioctl.h``、``drm.h``、``drm_mode.h``、``vmwgfx_drm.h`` 的公开导出。设备节点默认权限为 ``0660``、组 GID 44。
+
+同步、缓存与调度
+----------------
+
+- 将非 lazy vmwgfx fence 重试合并为有界、可中断的轮询批次，保持 fence 身份、超时 cookie、截止时间和信号/重启语义；减少批次元数据分配，避免将大量小重试转换为不必要的调度开销。
+- 对经过验证的 VMware BAR/FIFO 路径准备并核对 write-back 映射，补充 PCI 资源/页缓存属性处理；保留必要的 flush 通知、查询同步和资源引用，合并待提交的 KMS damage 区域。
+- 成功安装捕获信号的用户栈帧后唤醒可中断任务，避免被信号打断的无超时 futex 等待使 Xorg 长期停驻。DRM 同步阶段结合可中断性处理信号，避免在仍被设备使用时提前释放对象。
+
+描述符、映射与异常隔离
+----------------------
+
+- 补充 DRM 所需的描述符、close-on-exec、文件共享、内存映射与保护/解除映射语义，维护 fork 及 VMA 变化期间的对象引用、边界和写权限。
+- 增加按目标任务页表进行受检查的用户内存复制，避免依赖当前 CR3 读取其他任务地址；非法范围或缺页失败返回明确错误。
+- 用户态一般保护异常（#GP）转为强制 ``SIGSEGV`` 并走正常用户调度路径，使用完整陷阱帧；内核态 #GP 继续保留致命异常策略，不把过期 CR2 当作用户 #GP 的故障地址。
+- 文本 VT 历史恢复先在同布局 RAM 表面完成重放，再提交到可见 framebuffer，降低恢复过程中逐次重绘的显示开销。
+
+破坏性更新
+==========
+
+**否（相对于 5.1.0 已发布源码中的既有公开 UAPI）。** 本区间没有删除既有公开头或缩减已有线协议结构；主要新增 DRM/vmwgfx 接口与内部正确性、性能修复。
+
+- 新 DRM 节点有明确权限和能力条件，应用不能假定 render 节点总存在、任意 DRM ioctl 都受支持或任意 GPU 都可用。
+- 同设备 PRIME 不等于通用跨设备共享；不支持的请求应处理明确错误并选择适合的软件路线。
+- 这不是全量 ABI 认证：现有 ``reliefos_driver_kernel_api`` 的 golden 仍与实际结构不一致，见下文。该问题在 5.1.0 已记录，本次没有通过修改 golden 掩盖它。
+
+更新与迁移注意事项
+==================
+
+1. 获取本标签源码并重新构建内核，保持实际启动的 ``kernel.sys``、导出的 UAPI 和配套用户态版本一致；本源码 Release 不提供可直接替换的预编译文件。
+2. 需要 VMware 3D 路线时核对虚拟显卡与宿主能力；缺少相应能力时应保留二维 framebuffer 或软件渲染回退，不强行公开不可用的 render 节点。
+3. 使用 ``/dev/dri/`` 的账户需得到 GID 44 的组授权。现有账户库、自定义设备策略和不同 GID 映射应人工合并；账户创建与桌面配置由 ReliefOS 主仓负责。
+4. 更新导出白名单和 SDK 后重新编译图形用户态；按已实现的有界接口使用缓冲区、表面、fence 和同设备 PRIME，保留错误、超时和中断处理。
+5. 现有安装原地替换内核、全部应用组合及真实硬件迁移未完成整版验证。先在独立副本检查启动、VT 往返、设备权限、资源回收和软件回退。
+
+开发者提示
+==========
+
+- 生产入口为本仓根 GNU Make，产物为 ``kernel.sys``、``kernel.debug``、``kerneldebug.sys``；内核与驱动编译由本仓负责，不消费父仓私有实现。
+- 基础版本为 ``5.1.1``，数字字段为 ``5/1/1``；``EXTRAVERSION`` 与 ``LOCALVERSION`` 继续独立追加，完整版本保留现有字符集和长度检查。
+- UAPI 通过 ``headers_install`` 白名单导出。新 DRM 头用于目标用户态编译；内核私有指针、资源实现和页表结构不作为公共线协议传递。
+- 图形兼容范围受 SVGA-II、VGPU9 和实际能力检查限制。不承诺 atomic modesetting、硬件 vblank、硬件光标、跨设备 DMA-BUF、所有 Mesa 功能或物理宿主 GPU 利用率测量。
+- 本区间实现对应的 DRM/SVGA、调度与信号宿主夹具及平台验收记录保存在配套 ReliefOS 主仓；这些测试的新增属于主仓，不能算成本仓新增了同一批工具。
+- 后续版本遵循 `发布规范 <https://github.com/ReliefOSProject/ReliefNT/blob/v5.1.1/docs/RELEASE_PROCESS.md>`__，从本次版本提交之后计算更新范围，两仓独立编写说明。
+
+验证与已知限制
+==============
+
+- **源码检查：** 审阅本仓 5.1.0 版本提交后的有效差异，对合并历史去重；核对版本输入、README 当前示例和发布范围。未修改 ABI golden。
+- **本次编译与宿主工具通过：** 从父仓根执行 ``TMPDIR="$PWD/out/tmp" make -C kernel/reliefnt O="$PWD/out/xorg-vmware-debug/reliefnt" PROFILE=debug -j4 kernel test-tools test-header-export``。普通及 ASan/UBSan 共享工具检查通过；头文件导出覆盖 85 个头，包含白名单精确性、独立 C/C++ 编译、私有头隔离及移除后无残留。
+- **父仓构建适配通过：** ReliefOS 的 ``build-info kernel test-tools`` 成功，主仓与内核版本字符串为 ``5.1.1``，内核数字字段为 ``5/1/1``；父仓版本、后缀、无操作生成、适配和 procfs 定向检查通过。
+- **ABI 门禁未通过：** 本次 ``test-abi`` 再次报告 ``reliefos_driver_kernel_api`` golden 大小 168、实际大小 296，以及 PCI/DMA/IRQ/音频/日志回调的偏移差异。完整测试门禁因此不能记为通过，需维护者另行审阅 ABI 决策。
+- **打包：** 本仓不生成 ReliefOS 系统镜像；本次不发布内核二进制，未将旧内核文件重标为 5.1.1。
+- **QEMU：** 区间内配套主仓记录了有限的设备/桌面及软件回退测试；本次没有对最终 5.1.1 标签进行完整启动、图形和异常恢复验收。宿主夹具和编译不替代目标虚拟机运行证明。
+- **VMware：VMware 验证未完成。** 配套主仓的 SVGA3D 文档记录了冻结源码下的原生 VMware GPU/PRIME/KMS、桌面、软件回退及局部性能测量；这些不等同于最终 5.1.1 整版验收，也不表示所有负载都比软件渲染快。
+- **真实硬件：** 本版未验证。不声称完成 Linux/POSIX 认证或任意物理 GPU 验证。
+
+获取与追溯
+==========
+
+- 获取 `v5.1.1 源码 <https://github.com/ReliefOSProject/ReliefNT/tree/v5.1.1>`__ 及 GitHub 自动生成的 Source code ZIP/TAR.GZ；下载缓存和预编译产物不包含在本次发布中。
+- `完整提交与差异 <https://github.com/ReliefOSProject/ReliefNT/compare/09930b87355b8abbb75e39b693a6a7765ece2397...v5.1.1>`__。compare 展示完整历史，本说明不将纯合并或版本条目列作功能。
+- 配套主仓的桌面/账户集成、测试夹具和限定场景证据见 `ReliefOS 5.1.1 <https://github.com/ReliefOSProject/ReliefOS/releases/tag/v5.1.1>`__ 与该标签下的 `SVGA3D 文档 <https://github.com/ReliefOSProject/ReliefOS/blob/v5.1.1/docs/SVGA3D.md>`__。
