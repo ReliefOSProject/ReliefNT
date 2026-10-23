@@ -40,6 +40,12 @@ ABI golden、导出头、启动、vDSO、徽标、panic、Kconfig 和模块布�
 ``service_roles`` 套件检查旧内核桌面实现未恢复、旧窗口服务权限标志未恢复，
 以及 exec 只保留允许的任务标志；这些内核源码检查由本仓持有，父仓不再重复。
 
+``syscall_io`` 套件覆盖真实设备节点标志组合下的 ``/dev/null`` 写入、访问模式、
+``O_PATH`` 和 Linux ``MAX_RW_COUNT`` 上限，避免通用设备分片截短空设备写入。
+其原生探针 ``tools/tests/syscall_io_runtime_probe.c`` 编译后可用 ``--null``
+单独检查大块写入、原始 write syscall、dup 和 writev；默认模式继续运行综合
+POSIX I/O 检查。宿主 Linux 参考运行与 ReliefNT 来宾执行分别记录。
+
 ``test-smp-time``、``test-page-cache-growth``、``test-user-return``、
 ``test-syscall-io``、``test-vdso-host`` 和 ``test-version`` 提供定向入口。
 ``make test-ext4-reference LINUX_REFERENCE=<目录>`` 检查 ext4 schema，

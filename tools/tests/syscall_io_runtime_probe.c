@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #define _XOPEN_SOURCE 700
 #include <errno.h>
 #include <fcntl.h>
@@ -6,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -130,10 +134,54 @@ static int terminal_io(void)
     return 0;
 }
 
-int main(void)
+static int null_writes(void)
+{
+    static char data[131072];
+    memset(data, 'n', sizeof(data));
+    int fd = open("/dev/null", O_RDWR);
+    CHECK(fd >= 0);
+    const size_t sizes[] = {0, 1, 4096, 4097, 65536, sizeof(data)};
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+        ssize_t result = write(fd, data, sizes[i]);
+        printf("[null-write] write requested=%zu returned=%zd\n", sizes[i], result);
+        CHECK(result == (ssize_t)sizes[i]);
+    }
+    long raw_result = syscall(SYS_write, fd, data, (size_t)65536);
+    printf("[null-write] raw_write requested=65536 returned=%ld\n", raw_result);
+    CHECK(raw_result == 65536);
+    CHECK(read(fd, data, sizeof(data)) == 0);
+    int duplicate = dup(fd);
+    CHECK(duplicate >= 0 && write(duplicate, data, sizeof(data)) == sizeof(data));
+    struct iovec vectors[2] = {{data, 65536}, {data + 65536, 65536}};
+    CHECK(writev(duplicate, vectors, 2) == sizeof(data));
+    CHECK(close(duplicate) == 0 && close(fd) == 0);
+    fd = open("/dev/./null", O_WRONLY | O_NONBLOCK);
+    CHECK(fd >= 0 && write(fd, data, sizeof(data)) == sizeof(data) && close(fd) == 0);
+    fd = open("/dev/null", O_RDONLY);
+    CHECK(fd >= 0);
+    errno = 0;
+    CHECK(write(fd, data, sizeof(data)) == -1 && errno == EBADF);
+    errno = 0;
+    CHECK(write(fd, data, 0) == -1 && errno == EBADF);
+    CHECK(close(fd) == 0);
+    fd = open("/dev/null", O_PATH);
+    CHECK(fd >= 0);
+    errno = 0;
+    CHECK(write(fd, data, sizeof(data)) == -1 && errno == EBADF);
+    CHECK(close(fd) == 0);
+    return 0;
+}
+
+int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     alarm(20);
+    if (argc == 2 && !strcmp(argv[1], "--null")) {
+        if (null_writes()) return 1;
+        alarm(0);
+        printf("[null-write] DONE checks=%u failures=0\n", checks);
+        return 0;
+    }
     if (regular_file() || pipe_and_signal() || socket_io() || terminal_io()) return 1;
     int fd = open("/dev/null", O_RDWR);
     char data[512] = {0};

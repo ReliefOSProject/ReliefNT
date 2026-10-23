@@ -54,12 +54,13 @@ static int task_pty_stream_for_fd(struct task *task, int fd)
 { (void)task; (void)fd; return -1; }
 
 static uint8_t user_bytes[131072];
+static uint64_t user_range_bytes = sizeof(user_bytes);
 static bool user_writable = true;
 bool user_range_ok(uint64_t address, uint64_t length)
 {
     uintptr_t base = (uintptr_t)user_bytes;
-    return address >= base && address <= base + sizeof(user_bytes) &&
-           length <= base + sizeof(user_bytes) - address;
+    return address >= base && address <= base + user_range_bytes &&
+           length <= base + user_range_bytes - address;
 }
 bool user_range_writable(uint64_t address, uint64_t length)
 { return user_writable && user_range_ok(address, length); }
@@ -130,6 +131,47 @@ static void test_null_access_and_full_count(void)
     assert(syscall_io_write(3, (uintptr_t)user_bytes, 8) == -LINUX_EINVAL);
 }
 
+static void test_null_device_large_writes(void)
+{
+    reset_pipe();
+    struct task_file file = {
+        .used = 1,
+        .node = {.type = RELIEFOS_FS_TYPE_DEVICE,
+                 .flags = STORAGE_NODE_FLAG_DEV_NODE,
+                 .first_cluster = STORAGE_DEV_KIND_NULL},
+    };
+    const uint32_t kinds[] = {
+        TASK_FILE_FLAG_DEV_NODE | TASK_FILE_FLAG_DEV_NULL,
+        TASK_FILE_FLAG_DEV_NODE,
+        TASK_FILE_FLAG_DEV_NULL,
+    };
+    const uint64_t sizes[] = {65536, sizeof(user_bytes), 4097, 4096, 1, 0};
+    pin(&test_tasks[0], 3, &file);
+    for (size_t kind = 0; kind < sizeof(kinds) / sizeof(kinds[0]); ++kind) {
+        file.flags = kinds[kind] | RELIEFOS_O_RDWR;
+        for (size_t size = 0; size < sizeof(sizes) / sizeof(sizes[0]); ++size)
+            assert(syscall_io_write(3, (uintptr_t)user_bytes, sizes[size]) == (int64_t)sizes[size]);
+        assert(syscall_io_write(3, 0, 1) == -RELIEFOS_EFAULT);
+        file.flags = kinds[kind] | RELIEFOS_O_RDONLY;
+        assert(syscall_io_write(3, (uintptr_t)user_bytes, 65536) == -RELIEFOS_EBADF);
+        assert(syscall_io_write(3, (uintptr_t)user_bytes, 0) == -RELIEFOS_EBADF);
+        file.flags = kinds[kind] | RELIEFOS_O_WRONLY | RELIEFOS_O_NONBLOCK;
+        assert(syscall_io_write(3, (uintptr_t)user_bytes, sizeof(user_bytes)) == sizeof(user_bytes));
+        file.flags |= TASK_FILE_FLAG_PATH;
+        assert(syscall_io_write(3, (uintptr_t)user_bytes, 65536) == -RELIEFOS_EBADF);
+
+        /* Null writes must not access source bytes, so model a large valid
+         * user span without allocating or touching multiple GiB on the host. */
+        user_range_bytes = UINT64_C(0x100000000);
+        file.flags = kinds[kind] | RELIEFOS_O_WRONLY;
+        assert(syscall_io_write(3, (uintptr_t)user_bytes, UINT64_C(0x7fffefff)) == INT64_C(0x7fffefff));
+        assert(syscall_io_write(3, (uintptr_t)user_bytes, UINT64_C(0x7ffff000)) == INT64_C(0x7ffff000));
+        assert(syscall_io_write(3, (uintptr_t)user_bytes, UINT64_C(0x7ffff001)) == INT64_C(0x7ffff000));
+        assert(syscall_io_write(3, (uintptr_t)user_bytes, UINT64_C(0x100000000)) == INT64_C(0x7ffff000));
+        user_range_bytes = sizeof(user_bytes);
+    }
+}
+
 static void test_eventfd_results(void)
 {
     reset_pipe();
@@ -174,6 +216,7 @@ int main(void)
     test_redirected_stdio_and_validation();
     test_pipe_wait_retry_eof_and_signal();
     test_null_access_and_full_count();
+    test_null_device_large_writes();
     test_eventfd_results();
     test_path_descriptor_write();
     puts("syscall I/O: redirected stdio, EFAULT, EBADF, pipe wait/retry/EOF/SIGPIPE, null and eventfd passed");

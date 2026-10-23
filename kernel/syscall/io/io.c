@@ -6,8 +6,9 @@
  * @brief Run the shared write backend without unrelated legacy syscall locals.
  * @param a0 Descriptor number; entry may already pin its open description.
  * @param a1 User buffer, validated by the backend before accessing its bytes.
- * @param a2 Requested byte count, subject to each backend's existing limits.
- * @return Existing byte count, errno, or internal blocking/retry result.
+ * @param a2 Requested byte count; null writes accept up to Linux MAX_RW_COUNT.
+ * @return Accepted byte count, negative errno, or internal blocking/retry result.
+ * Null writes discard the full capped request without accessing its bytes.
  */
 int64_t syscall_io_write(uint64_t a0, uint64_t a1, uint64_t a2)
 {
@@ -99,6 +100,13 @@ int64_t syscall_io_write(uint64_t a0, uint64_t a1, uint64_t a2)
         if (a2 && !user_range_ok(a1, a2)) return -RELIEFOS_EFAULT;
         return task_shm_write(file, (const void *)(uintptr_t)a1, (uint32_t)a2);
     }
+    /* A null node can carry DEV_NODE and DEV_NULL together, or only DEV_NODE.
+     * Handle it before device chunking; discarding bytes needs no I/O slice. */
+    if ((file->flags & TASK_FILE_FLAG_DEV_NULL) ||
+        task_device_is(file, STORAGE_DEV_KIND_NULL)) {
+        if (!file_can_write(file)) return -RELIEFOS_EBADF;
+        return (int64_t)(a2 > 0x7ffff000u ? 0x7ffff000u : a2);
+    }
     if (file->flags & TASK_FILE_FLAG_DEV_NODE) {
         if (!file_can_write(file)) return -RELIEFOS_EBADF;
         if (file->flags & TASK_FILE_FLAG_DEV_BLOCK) {
@@ -114,12 +122,6 @@ int64_t syscall_io_write(uint64_t a0, uint64_t a1, uint64_t a2)
             }
             return result;
         }
-    }
-    if (file->flags & TASK_FILE_FLAG_DEV_NULL) {
-        if (!file_can_write(file)) {
-            return -RELIEFOS_EBADF;
-        }
-        return (int64_t)a2;
     }
     if (!file_can_write(file)) {
         return -RELIEFOS_EBADF;

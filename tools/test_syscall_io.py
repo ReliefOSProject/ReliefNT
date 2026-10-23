@@ -51,7 +51,7 @@ def main():
         start = source.index("struct task_timerfd {")
         end = source.index("\n};", start) + 3
         bodies = [source[start:end]]
-        for name in ("copy_text", "task_file_for_io", "task_pty_for_io", "task_pty_status", "file_can_read", "file_can_write"):
+        for name in ("copy_text", "task_file_for_io", "task_pty_for_io", "task_pty_status", "file_can_read", "file_can_write", "task_device_is"):
             bodies.append(function(source, name))
         bodies.extend(io_backend(source, operation) for operation in ("read", "write"))
         (work / "syscall_io_body.inc").write_text("\n\n".join(bodies))
@@ -76,6 +76,8 @@ def main():
         ], cwd=ROOT, check=True)
         print("Linux reference:", flush=True)
         subprocess.run([str(executable)], cwd=ROOT,
+                       env={**os.environ, "TMPDIR": str(temporary)}, check=True, timeout=30)
+        subprocess.run([str(executable), "--null"], cwd=ROOT,
                        env={**os.environ, "TMPDIR": str(temporary)}, check=True, timeout=30)
 
 
