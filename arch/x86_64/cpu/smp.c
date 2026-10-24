@@ -14,6 +14,7 @@
 #include <reliefnt/sched.h>
 #include <reliefnt/smp.h>
 #include <reliefnt/inventory.h>
+#include <reliefnt/lock.h>
 #include <reliefnt/userland.h>
 
 #include "../idt.h"
@@ -51,8 +52,12 @@ static uint64_t membarrier_request[SMP_MAX_CPUS];
 static uint64_t membarrier_ack[SMP_MAX_CPUS];
 static bool membarrier_sync_core;
 static bool membarrier_flush_tlb;
+static struct kernel_spinlock membarrier_lock = KERNEL_SPINLOCK_INIT;
 extern void x86_64_flush_user_tlb(void);
 
+/** @brief Apply the published rendezvous operation on the current CPU.
+ * @param sync_core Also serialize instruction fetch when true.
+ */
 static void cpu_memory_barrier(bool sync_core)
 {
     if (membarrier_flush_tlb) x86_64_flush_user_tlb();
@@ -64,6 +69,7 @@ static void cpu_memory_barrier(bool sync_core)
     }
 }
 
+/** @brief Acknowledge a published barrier without locks or enabled interrupts. */
 void smp_membarrier_poll(void)
 {
     uint32_t cpu = smp_current_cpu();
@@ -73,8 +79,17 @@ void smp_membarrier_poll(void)
     __atomic_store_n(&membarrier_ack[cpu], request, __ATOMIC_RELEASE);
 }
 
+/** @brief Serialize a synchronous rendezvous and service peers while waiting.
+ * @param sync_core Serialize instruction fetch on each online CPU.
+ * @param flush_tlb Invalidate user translations on each online CPU.
+ * The spinlock keeps request generations and operation flags stable until all
+ * acknowledgements arrive. Both lock contention and acknowledgement waits poll
+ * pending requests, since callers may already have local interrupts masked.
+ */
 static void smp_cpu_barrier(bool sync_core, bool flush_tlb)
 {
+    uint64_t irq_flags;
+    kernel_spin_lock_irqsave(&membarrier_lock, &irq_flags);
     uint32_t current = smp_current_cpu();
     uint64_t targets = 0, sequence = ++membarrier_sequence;
     membarrier_sync_core = sync_core;
@@ -88,13 +103,20 @@ static void smp_cpu_barrier(bool sync_core, bool flush_tlb)
     }
     for (uint32_t cpu = 0; cpu < smp_cpu_count(); ++cpu) {
         if (!(targets & (1ULL << cpu))) continue;
-        while (__atomic_load_n(&membarrier_ack[cpu], __ATOMIC_ACQUIRE) != sequence)
+        while (__atomic_load_n(&membarrier_ack[cpu], __ATOMIC_ACQUIRE) != sequence) {
+            smp_membarrier_poll();
             __asm__ volatile("pause" : : : "memory");
+        }
     }
     cpu_memory_barrier(sync_core);
+    kernel_spin_unlock_irqrestore(&membarrier_lock, irq_flags);
 }
 
+/** @brief Order online CPUs, preserving the caller's interrupt state.
+ * @param sync_core Also serialize instruction fetch on each CPU when true.
+ */
 void smp_membarrier(bool sync_core) { smp_cpu_barrier(sync_core, false); }
+/** @brief Synchronously invalidate user TLBs, including during parallel faults. */
 void smp_flush_user_tlb(void) { smp_cpu_barrier(false, true); }
 
 static uint32_t trampoline_offset(const uint8_t *symbol)

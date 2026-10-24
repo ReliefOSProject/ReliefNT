@@ -32,11 +32,16 @@ const struct smp_cpu_info *smp_cpu_info(uint32_t cpu_index);
 /** @brief Execute and acknowledge any pending CPU barrier; takes no locks. */
 void smp_membarrier_poll(void);
 /**
- * @brief Order all online CPUs and wait for acknowledgements. The caller must
- * hold the kernel execution lock; sync_core also serializes instruction fetch.
+ * @brief Order online CPUs and wait for acknowledgements without enabling IRQs.
+ * @param sync_core Also serialize instruction fetch on each online CPU.
+ * Concurrent callers are serialized internally; masked-IRQ waiters service
+ * pending rendezvous requests. The original local IRQ state is restored.
  */
 void smp_membarrier(bool sync_core);
-/* Execution-lock serialized invalidation before reusing unmapped user pages. */
+/** @brief Invalidate online CPUs' user TLBs before reusing unmapped pages.
+ * Concurrent callers and callers with masked IRQs are supported; return only
+ * after acknowledgement. Preserves the original local interrupt state.
+ */
 void smp_flush_user_tlb(void);
 
 #endif

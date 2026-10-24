@@ -20,6 +20,14 @@ class LinuxMemoryTests(unittest.TestCase):
                            cwd=ROOT, check=True)
             subprocess.run([executable], cwd=ROOT, check=True, timeout=30)
 
+    def test_jit_memory_linux_reference(self):
+        with tempfile.TemporaryDirectory(prefix="reliefos-jit-reference-") as tmp:
+            executable = str(Path(tmp) / "jit-memory-runtime")
+            subprocess.run(["cc", "-std=c11", "-O1", "-Wall", "-Wextra", "-Werror",
+                            "tools/tests/jit_memory_runtime_probe.c", "-o", executable],
+                           cwd=ROOT, check=True)
+            subprocess.run([executable], cwd=ROOT, check=True, timeout=30)
+
     def test_memory_ownership_and_elf_page_boundaries(self):
         cases = (("physical_pages", []), ("paging_protection", []), ("private_anon_fault", []), ("elf_interpreter", []),
                  ("elf_sparse_reservation", []),

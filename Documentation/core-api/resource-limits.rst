@@ -115,6 +115,25 @@ TCP 工作；硬件 IRQ 中不执行会分配内存的网络处理。单次维�
 栈增长窗口也仍有实现边界。这不是无条件可用的完整 128 TiB 连续区间。
 ``RLIMIT_AS`` 和页权限检查继续有效。
 
+普通匿名及文件 ``mmap``/``mprotect`` 按请求分别设置读、写和执行权限，
+允许显式 ``PROT_WRITE | PROT_EXEC``，以兼容 HotSpot 等 JIT 运行时。
+没有请求执行权限的数据页保持 NX；再次移除 ``PROT_EXEC`` 会恢复 NX。
+懒分配、驻留匿名页及私有 COW 保持同一权限语义。文件访问模式、只读挂载、
+``noexec``、设备映射限制及 VMA 的 ``max_prot`` 上限继续生效，不能通过
+后续 ``mprotect`` 增加被禁止的权限。
+
+这对应 Linux 默认权限组合行为，不表示已实现 Linux 的 MDWE/LSM 策略接口；
+SysV SHM 等独立接口的限制也不因此改变。参考
+`Linux 6.12 权限及 MDWE 规则
+<https://github.com/torvalds/linux/blob/v6.12/include/linux/mman.h>`_。
+``tools/tests/jit_memory_runtime_probe.c`` 可在 Linux 和 ReliefOS 中运行，
+检查 W→WX、RWX 映射、撤销执行权限的 NX 效果及 fork COW 隔离。
+
+跨核屏障和用户 TLB 刷新在内部串行发布请求，使请求代际与操作类型在
+所有 CPU 确认前保持稳定。等待锁或确认的 CPU 即使关闭本地中断，也会
+处理其他 CPU 已发布的请求；返回时恢复调用前的中断状态。并行缺页中的
+刷新也使用同一发布与确认路径。
+
 懒加载 ELF 段只登记 VMA，较大的 BSS 不会提前分配覆盖全段的空页表。
 实际访问时才建立页表和数据页。``fork`` 同时保护父子进程的私有可写页面，
 写入后分别进行 COW；物理页引用计数超过 65535 仍保持完整所有权。

@@ -288,11 +288,11 @@ int64_t syscall_mm_mlockall(uint64_t flags);
 int64_t syscall_mm_munlockall(void);
 
 /**
- * Syscall mm mprotect.
- * @param addr Value supplied by the caller.
- * @param len Maximum number of elements available in the related buffer.
- * @param prot Value supplied by the caller.
- * @return The value or status produced by the operation.
+ * @brief Apply explicit R/W/X permissions without exceeding existing VMA limits.
+ * @param addr Page-aligned first user byte of the protected interval.
+ * @param len Byte length rounded up to whole pages; zero is a no-op.
+ * @param prot Linux PROT_NONE or a combination of READ, WRITE and EXEC.
+ * @return Zero on success; negative EINVAL, ENOMEM, EACCES or EOPNOTSUPP.
  */
 int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot);
 

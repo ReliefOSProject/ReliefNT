@@ -5,9 +5,11 @@
 #include <stdarg.h>
 #include <string.h>
 #include <linux/mman.h>
+#include <linux/mount.h>
 #include <reliefnt/audio.h>
 #include <reliefnt/console.h>
 #include <reliefnt/drm.h>
+#include <reliefnt/syscall.h>
 #include <reliefnt/framebuffer.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/mm.h>
@@ -32,6 +34,8 @@ static const uint64_t framebuffer_physical = 0x42000000ULL;
 static unsigned eager_range_prepares;
 static unsigned page_alloc_attempts;
 static uint64_t last_device_mapping_phys;
+static uint64_t file_mount_flags;
+static int file_writable = 1;
 struct task *sched_current_task(void) { return current_task; }
 
 uint32_t sched_task_vma_capacity(const struct task *task)
@@ -84,11 +88,11 @@ int storage_inode_get(const struct storage_node *node, struct storage_inode_ref 
 { (void)node; *out = NULL; return 0; }
 int storage_inode_refresh(struct storage_node *node) { (void)node; return 0; }
 int storage_node_mount_flags(const struct storage_node *node, uint64_t *flags)
-{ (void)node; *flags = 0; return 0; }
+{ (void)node; *flags = file_mount_flags; return 0; }
 struct task_file *task_file_for_fd(struct task *task, int fd)
 { (void)task; return fd == 7 ? &framebuffer_file : NULL; }
 int file_can_read(const struct task_file *file) { return file == &framebuffer_file; }
-int file_can_write(const struct task_file *file) { return file == &framebuffer_file; }
+int file_can_write(const struct task_file *file) { return file == &framebuffer_file && file_writable; }
 int task_shm_mmap_check(const struct task_file *file, uint32_t flags, uint32_t prot, uint32_t *maximum)
 { (void)file; (void)flags; (void)prot; (void)maximum; return -1; }
 const struct framebuffer *framebuffer_get(void) { return &framebuffer_device; }
@@ -149,6 +153,34 @@ int main(void)
         .flags = TASK_VMA_FLAG_ANON, .prot = LINUX_PROT_READ,
     };
     current_task = &task;
+
+    /* Linux permits an explicit anonymous W|X reservation for JIT runtimes.
+     * Admission remains lazy and unknown protection bits remain invalid. */
+    const uint64_t jit_start = 0x0000000040000000ULL;
+    assert(syscall_mm_mmap(jit_start, page,
+        LINUX_PROT_WRITE | LINUX_PROT_EXEC,
+        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED_NOREPLACE,
+        UINT64_MAX, 0) == (int64_t)jit_start);
+    assert(!eager_range_prepares && !page_alloc_attempts);
+    assert(syscall_mm_munmap(jit_start, page) == 0);
+    assert(syscall_mm_mmap(jit_start, page, 0x80,
+        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED_NOREPLACE,
+        UINT64_MAX, 0) == -RELIEFOS_EINVAL);
+
+    framebuffer_file.node.type = RELIEFOS_FS_TYPE_FILE;
+    framebuffer_file.node.flags = STORAGE_NODE_FLAG_EXT2;
+    framebuffer_file.node.size = page;
+    file_mount_flags = MS_NOEXEC;
+    assert(syscall_mm_mmap(jit_start, page, LINUX_PROT_WRITE | LINUX_PROT_EXEC,
+        LINUX_MAP_PRIVATE | LINUX_MAP_FIXED_NOREPLACE, 7, 0) == -RELIEFOS_EPERM);
+    file_mount_flags = MS_RDONLY;
+    assert(syscall_mm_mmap(jit_start, page, LINUX_PROT_WRITE | LINUX_PROT_EXEC,
+        LINUX_MAP_SHARED | LINUX_MAP_FIXED_NOREPLACE, 7, 0) == -RELIEFOS_EROFS);
+    file_mount_flags = 0;
+    file_writable = 0;
+    assert(syscall_mm_mmap(jit_start, page, LINUX_PROT_WRITE | LINUX_PROT_EXEC,
+        LINUX_MAP_SHARED | LINUX_MAP_FIXED_NOREPLACE, 7, 0) == -RELIEFOS_EACCES);
+    file_writable = 1;
 
     /* Linux brk(2) returns the old break when an existing VMA blocks growth. */
     int64_t result = syscall_mm_brk(start + 2 * page);

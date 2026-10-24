@@ -282,10 +282,8 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     if ((prot & ~(uint64_t)(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC)) != 0) {
         return -RELIEFOS_EINVAL;
     }
-    if ((prot & (LINUX_PROT_WRITE | LINUX_PROT_EXEC)) ==
-        (LINUX_PROT_WRITE | LINUX_PROT_EXEC)) {
-        return -RELIEFOS_EACCES;
-    }
+    /* Linux permits explicit W|X for ordinary mappings. File/mount/device
+     * restrictions below still determine this VMA's maximum permissions. */
     if ((flags & ~((uint64_t)LINUX_MAP_SUPPORTED)) != 0) {
         return -RELIEFOS_EINVAL;
     }
