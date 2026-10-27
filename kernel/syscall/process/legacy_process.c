@@ -52,47 +52,38 @@ int64_t syscall_legacy_process(uint64_t number, uint64_t a0, uint64_t a1, uint64
         return 0;
     }
 
-    if (number == LINUX_SYS_EXECVE || number == LINUX_SYS_EXECVEAT) {
-        struct task *task = sched_current_task();
-        char path[RELIEFOS_FS_PATH_LEN];
-        char raw[RELIEFOS_FS_PATH_LEN], execfn[RELIEFOS_FS_PATH_LEN + 32];
-        struct exec_params_kernel params;
-        bool at = number == LINUX_SYS_EXECVEAT;
-        uint32_t flags = at ? (uint32_t)a4 : 0;
-        if (flags & ~(LINUX_AT_EMPTY_PATH | LINUX_AT_SYMLINK_NOFOLLOW)) return -RELIEFOS_EINVAL;
-        int dirfd = at ? (int32_t)a0 : LINUX_AT_FDCWD;
-        uint64_t path_pointer = at ? a1 : a0;
-        int ret = copy_user_path(raw, sizeof(raw), path_pointer);
-        if (ret < 0) return ret;
-        struct task_file *file = NULL;
-        ret = resolve_kernel_path_at_flags(task, dirfd, raw, flags & LINUX_AT_EMPTY_PATH,
-                    path, &file, false, flags & LINUX_AT_SYMLINK_NOFOLLOW ? 0 : FS_LOOKUP_FOLLOW);
-        if (ret < 0) return ret;
-        struct storage_node node;
-        if (file) node = file->node;
-        else {
-            ret = storage_lookup_path(path, &node);
-            if (ret < 0) return ret;
+    if(number==LINUX_SYS_EXECVE || number==LINUX_SYS_EXECVEAT) {
+        struct task *task=sched_current_task();bool at=number==LINUX_SYS_EXECVEAT;
+        uint32_t flags=at ? (uint32_t)a4 : 0;
+        if(flags&~(LINUX_AT_EMPTY_PATH|LINUX_AT_SYMLINK_NOFOLLOW))return -RELIEFOS_EINVAL;
+        int32_t dirfd=at ? (int32_t)a0 : LINUX_AT_FDCWD;
+        struct task_user_text raw={0};struct vfs_lookup_result found={0};
+        int rc=task_lookup_user_text(task,at ? a1 : a0,VFS_PATH_MAX,false,&raw);if(rc)return rc;
+        rc=resolve_kernel_object_at_flags(vfs_system_namespace(),task,dirfd,raw.text,
+            (flags&LINUX_AT_EMPTY_PATH)!=0,false,flags&LINUX_AT_SYMLINK_NOFOLLOW ? 0 : VFS_LOOKUP_FOLLOW,&found);
+        if(!rc && vfs_path_node(&found.path)->type==RELIEFOS_FS_TYPE_SYMLINK)rc=-LINUX_ELOOP;
+        char *execfn=NULL;
+        if(!rc){execfn=kernel_malloc(VFS_PATH_MAX+32);if(!execfn)rc=-RELIEFOS_ENOMEM;}
+        if(!rc) {
+            uint32_t position=0;execfn[0]=0;
+            if(at && raw.text[0]!='/' && dirfd!=LINUX_AT_FDCWD) {
+                path_append_text(execfn,&position,VFS_PATH_MAX+32,"/dev/fd/");
+                path_append_u64(execfn,&position,VFS_PATH_MAX+32,(uint32_t)dirfd);
+                if(raw.text[0])path_append_char(execfn,&position,VFS_PATH_MAX+32,'/');
+                path_append_text(execfn,&position,VFS_PATH_MAX+32,raw.text);
+            } else copy_text(execfn,VFS_PATH_MAX+32,raw.text);
+            struct exec_params_kernel params;
+            rc=copy_exec_params_from_user(at ? a2 : a1,at ? a3 : a2,&params);
+            if(!rc) {
+                bool inaccessible=at && raw.text[0]!='/' && dirfd!=LINUX_AT_FDCWD &&
+                    (task_fd_descriptor_flags(task,dirfd)&RELIEFOS_FD_CLOEXEC);
+                rc=exec_resolve_scripts(task,&found.path,execfn,inaccessible,&params);
+                if(!rc)rc=userland_exec_current_path(&found.path,execfn,params.argc,params.argv,
+                    params.envc,params.envp,params.data,params.data_len);
+                free_exec_params(&params);
+            }
         }
-        if (node.type == RELIEFOS_FS_TYPE_SYMLINK) return -LINUX_ELOOP;
-        if (at && raw[0] != '/' && dirfd != LINUX_AT_FDCWD) {
-            uint32_t position = 0;
-            execfn[0] = 0;
-            path_append_text(execfn, &position, sizeof(execfn), "/dev/fd/");
-            path_append_u64(execfn, &position, sizeof(execfn), (uint32_t)dirfd);
-            if (raw[0]) path_append_char(execfn, &position, sizeof(execfn), '/');
-            path_append_text(execfn, &position, sizeof(execfn), raw);
-        } else copy_text(execfn, sizeof(execfn), raw);
-        ret = copy_exec_params_from_user(at ? a2 : a1, at ? a3 : a2, &params);
-        if (ret < 0) return ret;
-        bool inaccessible = at && raw[0] != '/' && dirfd != LINUX_AT_FDCWD &&
-                            (task_fd_descriptor_flags(task, dirfd) & RELIEFOS_FD_CLOEXEC);
-        ret = exec_resolve_scripts(task, path, &node, execfn, inaccessible, &params);
-        if (!ret) ret = userland_exec_current_node(path, &node, execfn, params.argc, params.argv,
-                                                   params.envc, params.envp,
-                                                   params.data, params.data_len);
-        free_exec_params(&params);
-        return ret;
+        kernel_free(execfn);vfs_path_put(&found.path);kernel_free(raw.allocation);return rc;
     }
 
     if (number == LINUX_SYS_FORK) {

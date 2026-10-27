@@ -5,6 +5,8 @@
 #include <reliefnt/paging.h>
 #include <reliefnt/signal.h>
 #include <reliefnt/storage.h>
+#include <reliefnt/blkdev.h>
+#include <reliefnt/mount.h>
 #include <reliefnt/trap.h>
 #include <reliefnt/types.h>
 #include <reliefnt/eevdf.h>
@@ -21,11 +23,12 @@ struct audio_file;
 struct audio_control_file;
 struct audio_oss_file;
 struct audio_mixer_file;
-struct audio_pcm;
 struct drm_file;
-struct drm_bo;
 struct drm_prime_file;
 struct task_epoll_watch;
+struct task_identity;
+struct vfs_exec_source;
+struct task_transfer_state;
 
 #define SCHED_TASK_NAME_LEN 32u
 /* Initial task-table capacity; the scheduler grows beyond this value. */
@@ -35,6 +38,10 @@ struct task_epoll_watch;
 #define SCHED_TASK_NOFILE_DEFAULT 1024u
 #define SCHED_NR_OPEN 1048576u
 #define SCHED_TASK_STDIO_MAX 3u
+/* An OFD diagnostic label must fit a NAME_MAX anonymous label plus slash,
+ * deleted suffix and NUL. Object lookup/lifetime uses path_ref, not this text. */
+#define SCHED_TASK_FILE_PATH_LEN ((RELIEFOS_FS_PATH_LEN > VFS_NAME_MAX + sizeof("/ (deleted)")) ? \
+    RELIEFOS_FS_PATH_LEN : VFS_NAME_MAX + sizeof("/ (deleted)"))
 /* Linux MAX_ARG_STRINGS / MAX_ARG_STRLEN; the total budget follows RLIMIT_STACK. */
 #define SCHED_EXEC_ARG_MAX 0x7fffffffu
 #define SCHED_EXEC_ENV_MAX 0x7fffffffu
@@ -84,23 +91,21 @@ struct task_vma {
     uint64_t end;
     uint64_t file_offset;
     uint64_t file_limit;
-    /* Physical base of device-backed mappings (shmem, framebuffer, DRM BO);
+    /* First physical page of device-backed mappings (shmem, framebuffer, provider);
      * zero for ordinary file and anonymous mappings. */
     uint64_t device_physical;
     struct storage_node file_node;
     struct storage_inode_ref *inode;
-    struct audio_pcm *audio_pcm;
-    /* A DRM VMA retains its BO and the source DRM open-file description.
-     * The latter preserves master/auth state after numeric fd close. */
-    struct drm_bo *drm_bo;
-    struct task_file *drm_mapping_file;
+    struct device_mapping *device_mapping;
+    /* Every regular-file VMA retains its source OFD, including writable
+     * access and seal/owner state after fd close. Device providers retain their
+     * own backing/OFD through device_mapping instead. */
+    struct task_file *mapping_file;
+    /* ELF LOAD VMAs share an immutable provider/deny-write source. mmap uses
+     * its canonical OFD above; neither source is a diagnostic pathname. */
+    struct vfs_exec_source *exec_source;
     struct sysv_shm_attachment *sysv_shm_attachment;
-    uint32_t audio_mmap_region;
-    uint32_t audio_mmap_generation;
-    uint32_t audio_mmap_prot;
-    uint32_t audio_mmap_reserved;
-    uint64_t audio_mmap_offset;
-    uint64_t audio_mmap_length;
+    uint64_t device_map_offset;
 };
 
 struct task_file {
@@ -118,6 +123,12 @@ struct task_file {
     struct task_epoll_watch *epoll_watches;
     struct storage_node node;
     struct storage_inode_ref *inode;
+    /* Canonical OFD owns one mount/dentry pair, independent of its display name. */
+    struct vfs_path path_ref;
+    struct block_device_ref block_ref; /* Canonical OFD owns exact native device/code. */
+    struct vfs_open_file *provider_file; /* Optional state shared by this canonical OFD. */
+    struct character_file *character_file; /* Exact character provider owned once per canonical OFD. */
+    bool inode_write_access; /* One writable lease per canonical OFD. */
     uint64_t offset;
     uint64_t aux;
     /* Per-descriptor device state; currently the evdev EVIOCGRAB token. */
@@ -143,7 +154,7 @@ struct task_file {
     uint32_t input_vt; /* evdev graphical-VT filter, zero for the raw stream. */
     uint8_t input_vt_manual; /* EVIOCSVT explicitly selected the filter mode. */
     struct storage_read_cursor read_cursor;
-    char path[RELIEFOS_FS_PATH_LEN];
+    char path[SCHED_TASK_FILE_PATH_LEN];
 };
 
 #define TASK_FILE_KIND_SIGNALFD 1u
@@ -175,6 +186,7 @@ static inline struct task_file *task_file_description(struct task_file *file)
 #define TASK_FILE_FLAG_PATH        0x00000004u
 
 struct task_pty_description {
+    struct vfs_path path_ref;
     uint32_t references;
     uint32_t status_flags;
     uint32_t pty_id;
@@ -281,6 +293,10 @@ struct task_address_space_state {
     /* Zero-initialized new/exec address spaces are dumpable by default. */
     bool nondumpable;
     struct storage_inode_ref *executable_inode;
+    bool executable_denied_write;
+    /* MM-owned executable identity. Diagnostic task.path never reopens it;
+     * this path keeps the actual filesystem provider alive across rename. */
+    struct vfs_path executable_path;
     /* Linux membarrier registration commands are process/MM scoped. */
     uint32_t membarrier_registrations;
 };
@@ -306,10 +322,15 @@ struct task_fd_table_state {
     uint64_t lock_owner;
 };
 
+struct task_fs_paths {
+    struct vfs_path root,cwd;
+};
+
 struct task_fs_state {
     uint32_t umask;
     char cwd[RELIEFOS_FS_PATH_LEN];
     char root_dir[RELIEFOS_FS_PATH_LEN];
+    struct task_fs_paths paths;
     uint32_t references;
 };
 
@@ -453,11 +474,40 @@ struct task_sysv_msg_state {
 struct task_mmsg_state {
     uint64_t vector, timeout_pointer;
     struct linux_timespec deadline, remaining;
+    /* Start of the current message's scoped header/address/path operands.
+     * Completed messages never replay slot0 after syscall-entry rewinds. */
+    size_t lookup_cursor;
     uint32_t count, length, flags;
     bool active, receiving;
 };
 
+/* Stable operands for the pre-I/O syscall retry. Two inline slots
+ * cover Linux's ordinary two-path operations; a linked extension has no fixed
+ * operand cap. Entries own copied text and, for paths, mount/dentry references. */
+struct task_lookup_path {
+    struct vfs_path root,start;
+    struct vfs_walk *walk;
+    struct vfs_lookup_result result;
+    /* An exec operand may own an inode read guard through a suspended walk.
+     * result.path separately pins its provider until after guard retirement. */
+    struct storage_inode_ref *read_inode;
+    char *name;
+    int32_t dirfd;
+    uint32_t flags;
+    bool allow_empty,real_ids,complete;
+};
+struct task_lookup_extra;
+struct task_lookup_scope {
+    struct task_lookup_path paths[2];
+    struct task_lookup_extra *extra;
+    uint64_t number,args[6];
+    size_t cursor;
+    bool armed;
+};
+
 struct task {
+    /* Lazily allocated PID identity, retained independently by proc inodes. */
+    struct task_identity *identity_token;
     struct eevdf_entity fair;
     uint64_t start_uptime_ms;
     bool no_new_privs;
@@ -481,6 +531,8 @@ struct task {
     struct task *vfork_child;
     struct task_fd_table_state *shared_files;
     struct task_fs_state *shared_fs;
+    struct task_lookup_scope lookup_scope;
+    struct task_transfer_state *transfer_io;
     struct task_sighand_state *shared_sighand;
     uint64_t robust_list;
     uint64_t rseq_area;
@@ -519,6 +571,8 @@ struct task {
     uint64_t socket_receive_name;
     unsigned char socket_receive_path[111];
     struct task_file *syscall_file;
+    /* Owned inode/read-deny lease across finit_module snapshot I/O retries. */
+    struct storage_inode_ref *module_file_inode;
     /* Task-owned vmwgfx ioctl continuation; opaque to the scheduler. */
     void *drm_vmwgfx_continuation;
     struct task_file *fifo_open_file; /* Unpublished endpoint held during FIFO rendezvous. */
@@ -530,6 +584,7 @@ struct task {
         uint64_t buffer, count, position, done;
         bool active;
     } regular_io;
+    struct task_vector_state *vector_io; /* Owned imported ordinary-file iovecs. */
     uint64_t socket_io_deadline;
     bool socket_io_timed;
     struct task_mmsg_state mmsg;
@@ -649,6 +704,9 @@ struct task {
             char root_dir[RELIEFOS_FS_PATH_LEN];
         };
     };
+    /* Root/cwd are independently owned FS objects. Scalar credential copies
+     * during staged exec must neither copy nor replace their references. */
+    struct task_fs_paths fs_paths;
     union {
         struct task_terminal_state terminal_state;
         struct {

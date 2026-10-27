@@ -1,3 +1,4 @@
+#include <reliefnt/export.h>
 #include "internal.h"
 #include <reliefnt/lock.h>
 #include <reliefnt/mm.h>
@@ -216,6 +217,11 @@ void framebuffer_init(const struct boot_info *boot)
     }
 }
 
+/**
+ * @brief Borrow the permanent framebuffer descriptor without allocating or probing hardware.
+ * @return Stable core-owned descriptor, whose available flag describes actual binding.
+ * Boot/task/IRQ snapshot context. No ownership is transferred; callers serialize mutable mode fields with the existing display/execution policy.
+ */
 const struct framebuffer *framebuffer_get(void)
 {
     return &fb;
@@ -266,3 +272,5 @@ int framebuffer_set_mode(uint32_t width, uint32_t height)
     fb = previous;
     return -1;
 }
+
+EXPORT_SYMBOL(framebuffer_get);

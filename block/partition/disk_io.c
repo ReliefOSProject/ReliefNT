@@ -1,4 +1,5 @@
 #include "internal.h"
+#include <reliefnt/heap.h>
 
 static int disk_block_cache_load(uint32_t disk_id, struct install_disk_state *disk,
                                  uint64_t sector_count);
@@ -15,18 +16,27 @@ static int disk_block_range(uint32_t disk_id, struct install_disk_state *disk,
  */
 static int disk_gpt_header_valid(const struct gpt_header *header, uint64_t sector_count);
 
-static struct disk_block_partition_cache disk_block_partition_cache[STORAGE_MAX_INSTALL_DISKS];
+/** @brief Retire cached GPT validity for one stable core disk identity.
+ * @param disk_id Reserved inventory slot; unknown/no-cache entries are ignored.
+ * Execution ownership required; no I/O/allocation/reference transfer, cache
+ * bytes remain owned by their core record until reset/device retirement.
+ */
 void disk_block_cache_invalidate(uint32_t disk_id)
 {
-    if (disk_id < STORAGE_MAX_INSTALL_DISKS) {
-        disk_block_partition_cache[disk_id].valid = 0;
+    if (disk_id < g_install_disk_count && g_install_disks[disk_id].block_cache) {
+        g_install_disks[disk_id].block_cache->valid = 0;
     }
 }
 
+/** @brief Consume all core GPT caches during a quiescent boot reset.
+ * Execution ownership before concurrent cache users; each exact allocation is
+ * freed once and its record pointer cleared. No native code, I/O or code pin.
+ */
 void storage_disk_block_cache_reset(void)
 {
-    storage_memzero(disk_block_partition_cache,
-                    sizeof(disk_block_partition_cache));
+    for(uint32_t i=0;i<g_install_disk_count;++i) {
+        kernel_free(g_install_disks[i].block_cache);g_install_disks[i].block_cache=NULL;
+    }
 }
 
 void disk_block_cache_invalidate_disk(const struct install_disk_state *disk)
@@ -40,6 +50,13 @@ void disk_block_cache_invalidate_disk(const struct install_disk_state *disk)
     }
 }
 
+/** @brief Lazily allocate/validate the exact core record's native GPT snapshot.
+ * @param disk_id Stable admitted inventory slot. @param disk Borrowed record
+ * valid for this execution transaction. @param sector_count Actual disk sectors.
+ * @return Zero or allocation/geometry/native errno. Caller holds a complete
+ * block/code transaction pin; cache is core-owned and no record pointer escapes.
+ * OOM leaves existing geometry/cache state intact, no registry lock spans I/O.
+ */
 static int disk_block_cache_load(uint32_t disk_id, struct install_disk_state *disk,
                                  uint64_t sector_count)
 {
@@ -47,8 +64,13 @@ static int disk_block_cache_load(uint32_t disk_id, struct install_disk_state *di
     struct disk_gpt_table table;
     const struct gpt_entry *entries;
     int ret;
-    if (disk_id >= STORAGE_MAX_INSTALL_DISKS || !disk) return -22;
-    cache = &disk_block_partition_cache[disk_id];
+    if (disk_id >= g_install_disk_count || !disk) return -22;
+    if(!disk->block_cache) {
+        disk->block_cache=kernel_malloc(sizeof(*disk->block_cache));
+        if(!disk->block_cache)return -12;
+        storage_memzero(disk->block_cache,sizeof(*disk->block_cache));
+    }
+    cache = disk->block_cache;
     if (cache->valid && cache->disk_sectors == sector_count) {
         return cache->status;
     }
@@ -107,9 +129,9 @@ static int disk_block_range(uint32_t disk_id, struct install_disk_state *disk,
     }
     ret = disk_block_cache_load(disk_id, disk, sector_count);
     if (ret < 0) return ret;
-    if (!disk_block_partition_cache[disk_id].entries[partition_index].present) return -2;
-    *out_first_lba = disk_block_partition_cache[disk_id].entries[partition_index].first_lba;
-    *out_sector_count = disk_block_partition_cache[disk_id].entries[partition_index].sector_count;
+    if (!g_install_disks[disk_id].block_cache->entries[partition_index].present) return -2;
+    *out_first_lba = g_install_disks[disk_id].block_cache->entries[partition_index].first_lba;
+    *out_sector_count = g_install_disks[disk_id].block_cache->entries[partition_index].sector_count;
     return 0;
 }
 
@@ -203,6 +225,7 @@ int disk_manage_prepare(uint32_t disk_id, struct install_disk_state **out_disk,
     struct install_disk_state *disk;
     uint64_t sector_count;
     int ret;
+    storage_refresh_disks();
     if (!out_disk || !out_sector_count || disk_id >= g_install_disk_count ||
         !g_install_disks[disk_id].present) {
         return -2;
@@ -304,7 +327,7 @@ int disk_gpt_load(struct install_disk_state *disk, uint64_t sector_count,
     return 0;
 }
 
-int storage_disk_block_info(uint32_t disk_id, int32_t partition_index,
+static int storage_disk_block_info_owned(uint32_t disk_id, int32_t partition_index,
                             uint64_t *out_first_lba, uint64_t *out_sector_count)
 {
     struct install_disk_state *disk;
@@ -321,26 +344,23 @@ int storage_disk_block_info(uint32_t disk_id, int32_t partition_index,
                             out_first_lba, out_sector_count);
 }
 
+/** @brief Flush one raw disk/optical transaction with exact block/code ownership.
+ * @param disk_id Stable inventory or optical identity.
+ * @return Zero or native lookup/flush errno. Owns execution and transport
+ * exclusion, forces synchronous completion, releases token on every exit.
+ * Read-only optical providers complete without unsupported ATA flush commands.
+ */
 int storage_sync_disk(uint32_t disk_id)
 {
-    uint64_t irq_flags, sectors;
-    struct install_disk_state *disk;
-    struct storage_volume volume = {0};
-    kernel_execution_lock_irqsave(&irq_flags);
-    int ret = storage_acquire_task_io();
-    if (!ret) ret = disk_manage_prepare(disk_id, &disk, &sectors);
-    if (!ret) {
-        storage_volume_from_install_disk(&volume, disk);
-        volume.ready = true;
+    uint64_t flags;kernel_execution_lock_irqsave(&flags);
+    struct block_device_ref ref={0};int rc=storage_disk_block_get(disk_id,&ref);
+    if(!rc) {
         kernel_spin_lock(&storage_transport_lock);
-        bool saved_async = storage_io_async_context;
-        storage_io_async_context = false;
-        ret = storage_flush_volume(&volume);
-        storage_io_async_context = saved_async;
+        bool async=storage_io_async_context;storage_io_async_context=false;
+        rc=block_device_flush(&ref);storage_io_async_context=async;
         kernel_spin_unlock(&storage_transport_lock);
     }
-    kernel_execution_unlock_irqrestore(irq_flags);
-    return ret;
+    block_device_put(&ref);kernel_execution_unlock_irqrestore(flags);return rc;
 }
 
 /** @brief Return a validated GPT partition UUID; caller holds the storage lock.
@@ -349,18 +369,18 @@ int storage_sync_disk(uint32_t disk_id)
  * @param uuid Output buffer of at least 37 bytes, including NUL.
  * @return Zero or negative errno; no UUID is fabricated for non-GPT disks.
  */
-int storage_disk_partition_uuid(uint32_t disk_id, uint32_t partition_index, char uuid[37])
+static int storage_disk_partition_uuid_owned(uint32_t disk_id, uint32_t partition_index, char uuid[37])
 {
-    if (!uuid || disk_id >= STORAGE_MAX_INSTALL_DISKS || partition_index >= RELIEFOS_DISK_MAX_PARTITIONS) return -22;
+    if (!uuid || disk_id >= g_install_disk_count || partition_index >= RELIEFOS_DISK_MAX_PARTITIONS) return -22;
     uint64_t first, sectors;
     int ret = storage_disk_block_info(disk_id, (int32_t)partition_index, &first, &sectors);
     if (ret < 0) return ret;
-    const uint8_t *guid = disk_block_partition_cache[disk_id].entries[partition_index].unique_guid;
+    const uint8_t *guid = g_install_disks[disk_id].block_cache->entries[partition_index].unique_guid;
     storage_partition_guid_text(guid, uuid);
     return 0;
 }
 
-int storage_disk_block_read(uint32_t disk_id, int32_t partition_index,
+static int storage_disk_block_read_owned(uint32_t disk_id, int32_t partition_index,
                             uint64_t offset, void *buffer, uint32_t length,
                             uint32_t *out_read)
 {
@@ -400,7 +420,7 @@ int storage_disk_block_read(uint32_t disk_id, int32_t partition_index,
     return 0;
 }
 
-int storage_disk_block_write(uint32_t disk_id, int32_t partition_index,
+static int storage_disk_block_write_owned(uint32_t disk_id, int32_t partition_index,
                              uint64_t offset, const void *buffer, uint32_t length,
                              uint32_t *out_written)
 {
@@ -461,7 +481,15 @@ int storage_disk_block_write(uint32_t disk_id, int32_t partition_index,
     return 0;
 }
 
-int storage_disk_block_reread(uint32_t disk_id)
+/**
+ * @brief Invalidate a discovered disk's partition cache after excluding active mounts.
+ * @param disk_id Borrowed registered whole-disk identifier.
+ * @return Zero or negative ownership/discovery/protected-root/busy errno.
+ * Storage execution ownership required; no namespace or module lock spans
+ * preparation I/O. Actual volume memberships, including detached held ones,
+ * keep the disk busy. Cache invalidation does not transfer device ownership.
+ */
+static int storage_disk_block_reread_owned(uint32_t disk_id)
 {
     struct install_disk_state *disk;
     uint64_t sectors;
@@ -470,10 +498,112 @@ int storage_disk_block_reread(uint32_t disk_id)
     ret = disk_manage_prepare(disk_id, &disk, &sectors);
     if (ret < 0) return ret;
     if ((disk->boot_root && !storage_installer_root_active()) ||
-        disk->target_mounted || storage_disk_has_data_mount(disk_id)) {
+        storage_disk_has_data_mount(disk_id)) {
         return -16;
     }
     storage_cache_invalidate();
     disk_block_cache_invalidate(disk_id);
     return 0;
+}
+
+/** @brief Retain the exact block/code identity for a complete disk transaction.
+ * @param disk_id Stable inventory identity, never a native pointer.
+ * @param partition_index GPT entry index or whole-device selector as supported.
+ * @param out_first_lba Caller-owned operation argument/output; existing worker validates bounds.
+ * @param out_sector_count Caller-owned operation argument/output; existing worker validates bounds.
+ * @return Zero or existing validation/lookup/native errno, including EAGAIN.
+ * Caller holds execution ownership. The token spans every GPT/data/cache step
+ * and all worker exits, with no registry/module lock over native I/O. Failed
+ * writes never release code/backing early or resolve a reloaded device identity.
+ */
+int storage_disk_block_info(uint32_t disk_id, int32_t partition_index,
+                            uint64_t *out_first_lba, uint64_t *out_sector_count)
+{
+    struct block_device_ref ref={0};int rc=storage_disk_block_get(disk_id,&ref);
+    if(!rc && (disk_id&STORAGE_BLOCK_OPTICAL_BIT)) {
+        if(!out_first_lba || !out_sector_count || partition_index!=-1)rc=-22;
+        else {
+            struct block_device_info info;rc=block_device_info(&ref,&info);
+            if(!rc && (info.block_size!=2048 || info.blocks>UINT64_MAX/4))rc=-75;
+            if(!rc){*out_first_lba=0;*out_sector_count=info.blocks*4;}
+        }
+    } else if(!rc)rc=storage_disk_block_info_owned(disk_id,partition_index,out_first_lba,out_sector_count);
+    block_device_put(&ref);return rc;
+}
+
+/** @brief Retain the exact block/code identity for a complete disk transaction.
+ * @param disk_id Stable inventory identity, never a native pointer.
+ * @param partition_index GPT entry index or whole-device selector as supported.
+ * @param offset Caller-owned operation argument/output; existing worker validates bounds.
+ * @param buffer Current readable/writable kernel extent as required by operation.
+ * @param length Byte count bounded by the existing worker.
+ * @param out_read Optional completed-byte output, cleared before admission.
+ * @return Zero or existing validation/lookup/native errno, including EAGAIN.
+ * Caller holds execution ownership. The token spans every GPT/data/cache step
+ * and all worker exits, with no registry/module lock over native I/O. Failed
+ * writes never release code/backing early or resolve a reloaded device identity.
+ */
+int storage_disk_block_read(uint32_t disk_id, int32_t partition_index,
+                            uint64_t offset, void *buffer, uint32_t length,
+                            uint32_t *out_read)
+{
+    if(out_read)*out_read=0;
+    struct block_device_ref ref={0};int rc=storage_disk_block_get(disk_id,&ref);
+    if(!rc && (disk_id&STORAGE_BLOCK_OPTICAL_BIT))
+        rc=partition_index==-1 ? storage_optical_read(&ref,offset,buffer,length,out_read) : -22;
+    else if(!rc)rc=storage_disk_block_read_owned(disk_id,partition_index,offset,buffer,length,out_read);
+    block_device_put(&ref);return rc;
+}
+
+/** @brief Retain the exact block/code identity for a complete disk transaction.
+ * @param disk_id Stable inventory identity, never a native pointer.
+ * @param partition_index GPT entry index or whole-device selector as supported.
+ * @param offset Caller-owned operation argument/output; existing worker validates bounds.
+ * @param buffer Current readable/writable kernel extent as required by operation.
+ * @param length Byte count bounded by the existing worker.
+ * @param out_written Optional completed-byte output, cleared before admission.
+ * @return Zero or existing validation/lookup/native errno, including EAGAIN.
+ * Caller holds execution ownership. The token spans every GPT/data/cache step
+ * and all worker exits, with no registry/module lock over native I/O. Failed
+ * writes never release code/backing early or resolve a reloaded device identity.
+ */
+int storage_disk_block_write(uint32_t disk_id, int32_t partition_index,
+                             uint64_t offset, const void *buffer, uint32_t length,
+                             uint32_t *out_written)
+{
+    if(out_written)*out_written=0;
+    struct block_device_ref ref={0};int rc=storage_disk_block_get(disk_id,&ref);
+    if(!rc && (disk_id&STORAGE_BLOCK_OPTICAL_BIT))rc=-30;
+    else if(!rc)rc=storage_disk_block_write_owned(disk_id,partition_index,offset,buffer,length,out_written);
+    block_device_put(&ref);return rc;
+}
+
+/** @brief Retain the exact block/code identity for a complete disk transaction.
+ * @param disk_id Stable inventory identity, never a native pointer.
+ * @return Zero or existing validation/lookup/native errno, including EAGAIN.
+ * Caller holds execution ownership. The token spans every GPT/data/cache step
+ * and all worker exits, with no registry/module lock over native I/O. Failed
+ * writes never release code/backing early or resolve a reloaded device identity.
+ */
+int storage_disk_block_reread(uint32_t disk_id)
+{
+    struct block_device_ref ref={0};int rc=storage_disk_block_get(disk_id,&ref);
+    if(!rc)rc=storage_disk_block_reread_owned(disk_id);
+    block_device_put(&ref);return rc;
+}
+
+/** @brief Retain the exact block/code identity for a complete disk transaction.
+ * @param disk_id Stable inventory identity, never a native pointer.
+ * @param partition_index GPT entry index or whole-device selector as supported.
+ * @param uuid Caller-owned operation argument/output; existing worker validates bounds.
+ * @return Zero or existing validation/lookup/native errno, including EAGAIN.
+ * Caller holds execution ownership. The token spans every GPT/data/cache step
+ * and all worker exits, with no registry/module lock over native I/O. Failed
+ * writes never release code/backing early or resolve a reloaded device identity.
+ */
+int storage_disk_partition_uuid(uint32_t disk_id, uint32_t partition_index, char uuid[37])
+{
+    struct block_device_ref ref={0};int rc=storage_disk_block_get(disk_id,&ref);
+    if(!rc)rc=storage_disk_partition_uuid_owned(disk_id,partition_index,uuid);
+    block_device_put(&ref);return rc;
 }

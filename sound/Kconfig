@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+menuconfig SOUND
+    bool "Sound support"
+    default y
+
+if SOUND
+config SND
+    tristate "ALSA and OSS sound core"
+    default y
+    help
+      Linux-compatible ALSA/OSS character interfaces, card registry, PCM,
+      control/mixer/timer operations and provider-owned user mappings.
+      With M, build snd.ko for this exact ReliefNT kernel. Native hardware
+      driver dependencies load it first. Open files, mapped PCM backing,
+      registered cards and deferred disconnect work prevent unsafe unload.
+endif

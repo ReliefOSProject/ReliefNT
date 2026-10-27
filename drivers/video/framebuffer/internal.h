@@ -3,7 +3,6 @@
 
 #include <reliefos/psf_font.h>
 #include <reliefnt/console.h>
-#include <reliefnt/drm.h>
 #include <reliefnt/framebuffer.h>
 #include <reliefnt/pci.h>
 #include <reliefnt/port.h>
@@ -80,6 +79,7 @@
 #define VMWARE_SVGA_UPDATE_WORDS 5u
 
 struct vmware_svga_state {
+    struct pci_device pci;
     uint16_t io_port;
     uint32_t max_width;
     uint32_t max_height;

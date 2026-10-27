@@ -17,7 +17,7 @@ def main():
         env={**os.environ,'TMPDIR':str(temporary)}
         for name,sources in (
             ('page_cache_growth',['kernel/sync/lock.c']),
-            ('elf_file_page',[]),
+            ('elf_file_page',['fs/vfs/mount_tree.c','fs/vfs/file.c','fs/vfs/attributes.c','fs/vfs/exec_file.c']),
         ):
             binary=Path(directory)/name
             subprocess.run([compiler,'-std=c11','-pthread','-O1','-g','-Wall','-Wextra','-Werror',

@@ -1,3 +1,4 @@
+#include <reliefnt/export.h>
 #include "device.h"
 #include <reliefnt/heap.h>
 
@@ -499,6 +500,9 @@ static int shader_copy_bytecode(const struct svga_ops *ops,
  * @param local_id VGPU9-local key, or SVGA3D_INVALID_ID to unbind.
  * @return Zero when staged, SVGA_EBUSY for lock contention, SVGA_ENOMEM for
  *         metadata/output exhaustion, or SVGA_EINVAL for an unresolved key.
+ * Task/execution context for module callers; never enter with the SVGA lock held.
+ * Caller retains resources/backing and its independent module call pin through
+ * return, and through the real fence or successful teardown when asynchronous.
  */
 int svga_batch_bind_shader(struct svga_batch *batch, svga_handle context,
                            uint32_t type, uint32_t local_id)
@@ -579,6 +583,9 @@ done:
  * @param bytes DWORD-aligned bytecode length within host and page limits.
  * @return Zero when staged, SVGA_EBUSY on lock contention, SVGA_ENOMEM for
  *         resource/capacity exhaustion, or SVGA_EINVAL for invalid input/key.
+ * Task/execution context for module callers; never enter with the SVGA lock held.
+ * Caller retains resources/backing and its independent module call pin through
+ * return, and through the real fence or successful teardown when asynchronous.
  */
 int svga_batch_shader_define(struct svga_batch *batch, svga_handle context,
                              uint32_t local_id, uint32_t type,
@@ -716,6 +723,9 @@ unlock_reserve:
  * @param type Vertex or pixel shader type.
  * @return Zero when staged, SVGA_EBUSY on lock contention, SVGA_ENOMEM for
  *         capacity exhaustion, or SVGA_EINVAL when no visible version exists.
+ * Task/execution context for module callers; never enter with the SVGA lock held.
+ * Caller retains resources/backing and its independent module call pin through
+ * return, and through the real fence or successful teardown when asynchronous.
  */
 int svga_batch_shader_destroy(struct svga_batch *batch, svga_handle context,
                               uint32_t local_id, uint32_t type)
@@ -883,6 +893,9 @@ void svga_shader_abort_batch_locked(struct svga_batch *batch)
  * @param reaped Writable count of records detached and freed.
  * @return Zero on success, SVGA_EINVAL for null output, or SVGA_EBUSY if the
  *         lock is contended before any record is detached.
+ * Task/execution context for module callers; never enter with the SVGA lock held.
+ * Caller retains resources/backing and its independent module call pin through
+ * return, and through the real fence or successful teardown when asynchronous.
  */
 int svga_backend_reap_retired(uint32_t budget, uint32_t *reaped)
 {
@@ -935,6 +948,9 @@ int svga_backend_reap_retired(uint32_t budget, uint32_t *reaped)
  * @param registers Number of consecutive 16-byte registers.
  * @return Zero on append, SVGA_ENOMEM on output exhaustion, SVGA_EBUSY on lock
  *         contention, or SVGA_EINVAL for invalid register ranges or input.
+ * Task/execution context for module callers; never enter with the SVGA lock held.
+ * Caller retains resources/backing and its independent module call pin through
+ * return, and through the real fence or successful teardown when asynchronous.
  */
 int svga_batch_shader_constants(struct svga_batch *batch, svga_handle context,
                                 uint32_t reg, uint32_t type, uint32_t const_type,
@@ -969,3 +985,9 @@ done:
     svga_unlock(flags);
     return ret;
 }
+
+EXPORT_SYMBOL(svga_backend_reap_retired);
+EXPORT_SYMBOL(svga_batch_bind_shader);
+EXPORT_SYMBOL(svga_batch_shader_constants);
+EXPORT_SYMBOL(svga_batch_shader_define);
+EXPORT_SYMBOL(svga_batch_shader_destroy);

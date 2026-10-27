@@ -25,6 +25,16 @@ struct reliefos_permissions {
     uint32_t uid;
     uint32_t gid;
 };
+/** @brief Assemble the initial shared namespace from explicit boot roles.
+ * @return Zero or negative errno. Called once after root/controller probing,
+ * before kernel configuration readers, runtime-directory preparation or PID1,
+ * under exclusive execution ownership with synchronous storage. Publishes
+ * root/devfs/proc/sysfs, the ready boot ESP, numbered optical instances and a
+ * fresh sticky shm filesystem together, without consulting volume path labels.
+ * Failure retires unpublished mounts and this call's new shm context; existing
+ * backends are never destroyed. No graph/module lock spans provider callbacks.
+ */
+int storage_namespace_bootstrap(void);
 
 /* Legacy installation records are internal-only while boot storage is being
  * simplified.  They are deliberately absent from the public SDK; userland
@@ -80,22 +90,99 @@ struct storage_node {
     uint64_t size;
     uint32_t mount_generation;
     uint32_t inode_generation;
+    /* Backend-native directory-record/key identity, never a userspace inode ABI.
+     * FAT/exFAT use an on-disk record location; anonymous shmem uses a held,
+     * generation-checked kernel object handle. */
+    uint64_t entry_id;
 };
 
 struct storage_inode_ref;
+struct vfs_mount;
+/** @brief Create an owned detached runtime tmpfs attachment with final policy.
+ * @param source Optional kernel diagnostic source label, copied with PATH_MAX bounds.
+ * @param flags Final supported mount flags, without operation bits.
+ * @param options Borrowed NUL-terminated tmpfs option string, nullable.
+ * @param uid Root inode owner filesystem UID.
+ * @param gid Root inode owner filesystem GID.
+ * @param out Receives one owned detached mount; empty on every failure.
+ * @return Zero or negative option/quota/allocation/capacity errno. No target
+ * pathname is stored. Final path/mount put destroys the owned backend after
+ * all inode pins retire. Caller holds execution ownership, no graph locks.
+ */
+int storage_new_tmpfs_mount(const char *source,uint64_t flags,const char *options,
+                               uint32_t uid,uint32_t gid,struct vfs_mount **out);
+/** @brief Open a GPT-backed filesystem as an owned detached graph attachment.
+ * @param disk Block disk ID derived from a retained standard device node.
+ * @param partition GPT entry index on that disk.
+ * @param filesystem Kernel filesystem type, nullable for native detection.
+ * @param flags Supported final mount policy, excluding operation bits.
+ * @param out Owned detached mount output, cleared on failure.
+ * @return Zero or negative device/filesystem/busy/I/O/allocation errno.
+ * Mount ownership releases the backend after final reference retirement;
+ * no target pathname or prefix alias is installed. Serialized task context,
+ * synchronous metadata I/O without graph/module spinlocks.
+ */
+int storage_new_block_mount(uint32_t disk,uint32_t partition,const char *filesystem,
+                               uint64_t flags,struct vfs_mount **out);
+/** @brief Acquire an actual inode lease and its resident cluster timestamps.
+ * @param node Required native identity; a cluster generation must remain current.
+ * @param out Required owned reference output, cleared before validation.
+ * @return Zero, including NULL for unsupported synthetic nodes, or negative
+ * allocation/stale/native metadata/I/O errno. Serializes under execution
+ * ownership. Cluster metadata is captured before unlink can reuse the record;
+ * each returned reference requires storage_inode_put. No module/graph callback
+ * lock spans native I/O; shared inode/cache ownership outlives directory names.
+ */
 int storage_inode_get(const struct storage_node *node, struct storage_inode_ref **out);
 void storage_inode_retain(struct storage_inode_ref *reference);
 int storage_inode_put(struct storage_inode_ref *reference);
 int storage_inode_refresh(struct storage_node *node);
+/** @brief Acquire one writable-file lease on a held regular inode.
+ * @param reference Caller-owned inode pin, required; not transferred.
+ * @return Zero, -ETXTBSY while kernel reads deny writes, or negative errno.
+ * Task context; serializes through the reentrant execution transaction.
+ */
+int storage_inode_write_get(struct storage_inode_ref *reference);
+/** @brief Release one writable-file lease before dropping its inode pin.
+ * @param reference Held inode with one acquired write lease, or NULL.
+ * Task context; serializes with deny/acquire through execution ownership.
+ */
+void storage_inode_write_put(struct storage_inode_ref *reference);
+/** @brief Prevent new writers while taking a stable kernel file snapshot.
+ * @param reference Caller-owned regular inode pin, required; not transferred.
+ * @return Zero, -ETXTBSY if any writable OFD/VMA remains, or negative errno.
+ * Multiple kernel guards may coexist. Serialized task context, no backend I/O.
+ */
+int storage_inode_deny_write(struct storage_inode_ref *reference);
+/** @brief Release one kernel read guard before releasing its owned inode pin.
+ * @param reference Held inode with an acquired deny guard, or NULL.
+ * Task context under the reentrant execution transaction; no backend I/O.
+ */
+void storage_inode_allow_write(struct storage_inode_ref *reference);
 struct storage_ext4_fiemap_extent { uint64_t logical,physical,length; uint32_t flags; };
 #define EXT4_FIEMAP_UNWRITTEN 1u
 #define EXT4_FIEMAP_HOLE 2u
 #define EXT4_FIEMAP_LAST 4u
-int storage_fallocate_node(struct storage_node *,uint32_t,uint64_t,uint64_t);
+/** @brief Change ext inode allocation through its retained native provider.
+ * @param node Borrowed mutable retained ext inode. @param mode Linux fallocate mode.
+ * @param offset Range start. @param length Range length.
+ * @return Zero or unsupported/provider errno. Caller authorizes; recursively
+ * enters execution and restores selection, no graph/module lock across I/O.
+ */
+int storage_fallocate_node(struct storage_node *node,uint32_t mode,uint64_t offset,uint64_t length);
 int storage_fiemap_node(const struct storage_node *,uint64_t,uint64_t,
                        struct storage_ext4_fiemap_extent *,uint32_t,uint32_t *);
 int storage_node_mount_flags(const struct storage_node *node, uint64_t *flags);
 int storage_tmpfs_get_page(const struct storage_node *node, uint64_t offset, uint64_t *phys);
+/** @brief Reserve pages in the exact selected mounted or anonymous tmpfs inode.
+ * @param node Borrowed live node, refreshed on success; not a displayed name.
+ * @param mode Zero or Linux KEEP_SIZE; other modes return EOPNOTSUPP.
+ * @param offset Nonnegative start byte.
+ * @param length Positive byte length with a signed-off_t representable end.
+ * @return Zero or allocation/quota/type/range errno with balanced volume
+ * selection and execution ownership. Caller retains an inode/path pin.
+ */
+int storage_tmpfs_fallocate(struct storage_node *node,uint32_t mode,uint64_t offset,uint64_t length);
 /* Internal shmem filesystem identity; consumes no mounted-volume slot. */
 #define STORAGE_SHMEM_VOLUME 0xffu
 /**
@@ -109,10 +196,17 @@ int storage_tmpfs_get_page(const struct storage_node *node, uint64_t offset, uin
  */
 int storage_shmem_create(uint32_t uid, uint32_t gid, struct storage_node *node,
                           struct storage_inode_ref **reference);
-int storage_remount_path(const char *path, uint64_t flags);
-int storage_mount_tmpfs(const char *source, const char *target, uint64_t flags,
-                         const char *options, uint32_t uid, uint32_t gid);
+/** @brief Settle native filesystem writeback before its registered device flush.
+ * @param volume_id Existing native volume slot.
+ * @return Zero or first writeback/transport errno; absent/not-ready is ENODEV.
+ * Acquires execution exclusion, saves/restores async state and pins provider
+ * code through callbacks without holding any filesystem/device registry lock.
+ */
 int storage_sync_volume(uint32_t volume_id);
+/** @brief Sync every ready volume while retaining the first observed error.
+ * @return Zero or first native writeback/transport errno; later instances are
+ * still attempted. Acquires execution exclusion, delegates per-volume ordering.
+ */
 int storage_sync_all(void);
 int storage_sync_disk(uint32_t disk_id);
 int storage_write_held_node(struct storage_node *node, uint64_t offset,
@@ -124,61 +218,6 @@ int storage_inode_permissions(const struct storage_node *node,
 int storage_inode_stat(const struct storage_node *node, struct linux_stat_abi *value);
 int storage_inode_utimensat(const struct storage_node *node, int64_t atime, int64_t mtime,
                             bool set_atime, bool set_mtime);
-/**
- * @brief Read or write uid/gid/mode for a member of a sidecar metadata volume.
- * @param path Absolute, already-normalized path; ':' is not accepted.
- * @param value Metadata; input for write, output otherwise. Must not be NULL.
- * @param write True to store `value` for this path, false to recall it.
- * @return Zero, -EINVAL for a malformed path, or -EIO when the directory's
- *         sidecar file is damaged. A path with no stored record yields the
- *         filesystem default rather than an error.
- * @context Process context like the other storage entry points; performs file
- *          I/O on the volume's own locking and holds no lock of its own.
- */
-int storage_sidecar_permissions(const char *path, struct reliefos_permissions *value,
-                                bool write);
-/**
- * @brief Drop the sidecar record of a member that has just been deleted.
- * @param path Absolute path that no longer exists.
- * @return Zero, or a negative errno when the directory's records could not be
- *         rewritten. A damaged sidecar is left untouched and reported as zero.
- * @context Process context; performs file I/O.
- */
-int storage_sidecar_note_deleted(const char *path);
-/**
- * @brief Re-key a sidecar record after a rename within the same directory.
- * @param path Absolute path before the rename.
- * @param new_path Absolute path after the rename; must share `path`'s directory,
- *                 otherwise nothing changes and zero is returned.
- * @return Zero, or a negative errno when the records could not be rewritten.
- * @context Process context; performs file I/O.
- */
-int storage_sidecar_note_renamed(const char *path, const char *new_path);
-/**
- * @brief Create a socket or FIFO inode on a supporting filesystem.
- * @param path Resolved, parent-authorized absolute path.
- * @param mode S_IFSOCK or S_IFIFO; permissions are applied separately.
- * @param out Receives the created inode identity.
- * @return Zero or negative errno, including EOPNOTSUPP for unsupported backends.
- */
-int storage_create_special(const char *path, uint32_t mode, struct storage_node *out);
-int storage_create_socket(const char *path, struct storage_node *out);
-/**
- * @brief Creates a symbolic link on the filesystem containing a resolved parent.
- * @param target Literal link text; never resolved during creation.
- * @param path Absolute link name with its parent already resolved and authorized.
- * @return Zero or negative errno; serializes allocation and restores the active volume.
- */
-int storage_symlink(const char *target, const char *path);
-/**
- * @brief Reads literal symlink bytes while holding the storage execution lock.
- * @param path Absolute name whose intermediate components have been resolved.
- * @param buffer Writable kernel buffer; no NUL terminator is appended.
- * @param capacity Positive buffer capacity in bytes.
- * @param out_len Optional byte count, reset to zero on failure.
- * @return Zero or negative errno, including EINVAL for a non-symlink.
- */
-int storage_readlink(const char *path, char *buffer, uint32_t capacity, uint32_t *out_len);
 int storage_statfs(const struct storage_node *node, struct linux_statfs_abi *value);
 
 /**
@@ -211,6 +250,11 @@ struct storage_read_cursor {
 #define STORAGE_NODE_FLAG_AUDIO_CONTROL 0x00004000u
 #define STORAGE_NODE_FLAG_AUDIO_MIXER 0x00008000u
 #define STORAGE_NODE_FLAG_AUDIO_TIMER 0x00010000u
+#define STORAGE_NODE_FLAG_FAT32   0x00020000u
+#define STORAGE_NODE_FLAG_MAGIC_LINK 0x00040000u
+#define STORAGE_NODE_FLAG_MEMFD 0x00080000u
+/* Native inode carrying st_rdev; first_cluster remains its inode identity. */
+#define STORAGE_NODE_FLAG_RDEV 0x00100000u
 #define STORAGE_SYSFS_DEVICE 202u
 #define STORAGE_NODE_FLAG_DEV_LINK 0x00000200u
 /* Anonymous filesystem device numbers, also exported in proc mountinfo. */
@@ -231,11 +275,22 @@ uint64_t storage_volume_device(uint32_t volume_id);
 #define STORAGE_BLOCK_PARTITION(value) ((int32_t)(((uint32_t)(value) >> 16) & 0xffffu) - 1)
 #define STORAGE_BLOCK_MAJOR 259u
 #define STORAGE_BLOCK_MINOR(value) (STORAGE_BLOCK_DISK_ID(value) * 256u + STORAGE_BLOCK_PARTITION(value) + 1u)
-static inline uint64_t storage_block_rdev(uint32_t value)
-{
-    uint32_t minor = STORAGE_BLOCK_MINOR(value);
-    return ((uint64_t)STORAGE_BLOCK_MAJOR << 8) | (minor & 255u) | ((uint64_t)(minor & ~255u) << 12);
-}
+struct block_device_ref;
+#define STORAGE_BLOCK_OPTICAL_BIT 0x8000u
+/** @brief Resolve the immutable Linux dev_t retained by an inventory/node identity.
+ * @param value Encoded stable disk/partition ID, including optical major-11 IDs.
+ * @return Linux dev_t, or zero for an unknown identity. Execution ownership;
+ * scalar observation only, no provider callback/I/O/reference acquisition.
+ */
+uint64_t storage_block_rdev(uint32_t value);
+/** @brief Pin one exact inventory/optical identity for an OFD or full transaction.
+ * @param disk_id Stable native disk ID, or flagged optical minor.
+ * @param out Empty required owned block-reference output.
+ * @return Zero or -ENODEV/lookup errno. Execution ownership required; refreshes
+ * scalar inventory without callbacks, and never aliases an unloaded/reloaded ID.
+ * Caller releases the token on every close/error after all multi-I/O work.
+ */
+int storage_disk_block_get(uint32_t disk_id,struct block_device_ref *out);
 #define STORAGE_BLOCK_VOLUME_ID(disk, partition) \
     ((uint32_t)(disk) & 0xffffu) | ((uint32_t)((partition) + 1) << 16)
 
@@ -278,7 +333,10 @@ static inline uint64_t storage_block_rdev(uint32_t value)
 struct boot_info;
 
 /**
- * @brief Initialize the storage subsystem and mount the boot filesystems.
+ * @brief Discover transports and native root/optical instances before VFS bootstrap.
+ * BSP boot-only before tasks or AP I/O: initializes storage state, caches and
+ * persistent disk records. Logging discovery does not publish a mountpoint;
+ * storage_namespace_bootstrap later constructs the actual initial graph.
  */
 void storage_init(void);
 /**
@@ -292,7 +350,10 @@ uint64_t storage_metadata_generation(void);
  */
 void storage_release_task_io(uint32_t pid);
 /**
- * @brief Wait for pid's outstanding I/O to finish.
+ * @brief Drain/discard an exiting task's I/O without dereferencing saved memory.
+ * @param pid Exiting task identity, zero ignored; reaper context only under the
+ * single-CPU async ownership protocol. On timeout live DMA backing remains owned
+ * and quarantined by the controller, independently of the task's address space.
  */
 void storage_drain_task_io(uint32_t pid);
 /**
@@ -318,7 +379,9 @@ void storage_init_installer_root(const struct boot_info *boot);
  */
 void storage_mount_boot_root(const struct boot_info *boot, bool ramdisk_root);
 /**
- * @brief Return true once the root filesystem is mounted and usable.
+ * @brief Report whether the reserved runtime-root filesystem instance is ready.
+ * @return True after successful native root discovery, false before or on failure.
+ * Execution-owned observation only; no I/O, allocation or ownership transfer.
  */
 bool storage_ready(void);
 /**
@@ -327,34 +390,20 @@ bool storage_ready(void);
  */
 const char *storage_root_filesystem_name(void);
 /**
- * @brief Return true when the installer's root filesystem is mounted.
+ * @brief Report whether the current runtime root is the installer RAM image.
+ * @return True for an active reserved installer root, false for disk/absent root.
+ * Execution-owned observation only; retains no pointer or module reference.
  */
 bool storage_installer_root_active(void);
-/**
- * @brief Mount a boot-module image as the writable live root.
- * @param image_phys Physical start address of the reserved Multiboot module;
- *                   this is not a CPU pointer and is direct-mapped internally.
- * @param len Image length in bytes; must be at least one sector and
- *            sector-aligned.
- * @return Zero on success, -EINVAL for an invalid physical range, or -ENOENT
- *         after a filesystem mount failure clears partial root state.
- * @par Context
- * Boot or installer setup before concurrent storage syscalls. The
- *          physical image must stay reserved and mapped until the root unmounts.
- * @note The root keeps a direct-map pointer to the module. Writes are session
- *       local and never reach the ISO source.
+/** @brief Mount a reserved boot-module image through the standard RAM block device.
+ * @param image_phys Reserved physical start; mapped only by the boot transport.
+ * @param len Sector-aligned bytes, held through shutdown.
+ * @return Zero or source/geometry/allocation/provider errno; failure clears the
+ * unpublished root. BSP exclusive setup, before namespace users. The transport
+ * borrows the direct map, never copies the whole image, and writes only session
+ * memory. Filesystem/device ownership survives until final native retirement.
  */
 int storage_mount_ramdisk_root(uint64_t image_phys, uint64_t len);
-/**
- * @brief Resolve input against cwd into out (cap bytes); 0 on success.
- */
-int storage_resolve_path(const char *cwd, const char *input, char *out, uint32_t cap);
-/** Resolves a path to its internal mounted-volume identity. */
-int storage_path_volume_id(const char *path, uint32_t *out_volume_id);
-/**
- * @brief Look up path and fill out with its storage node; 0 on success.
- */
-int storage_lookup_path(const char *path, struct storage_node *out);
 /**
  * @brief Read len bytes of node from offset into buf, reporting bytes read in out_read.
  */
@@ -378,84 +427,52 @@ int storage_read_node_cursor(const struct storage_node *node, uint64_t offset,
  */
 int storage_readdir_node(const struct storage_node *node, uint64_t *cursor,
                          struct reliefos_dir_entry *entry);
-/**
- * @brief Load the whole file at path into a buffer returned via out_data/out_len.
- */
-int storage_read_file(const char *path, const void **out_data, size_t *out_len);
-/**
- * @brief Overwrite the file at path with len bytes from buf; 0 on success.
- */
-int storage_write_file(const char *path, const void *buf, uint32_t len);
-/**
- * @brief Resize the file at path to length bytes; 0 on success.
- */
-int storage_truncate_file(const char *path, uint64_t length);
-/**
- * @brief Write len bytes of buf to the node at path from offset; reports bytes in out_written.
- */
-int storage_write_node(const char *path, uint64_t offset,
-                       const void *buf, uint32_t len, uint32_t *out_written);
-/**
- * @brief List up to capacity directory entries of path into entries; count in out_count.
- */
-int storage_list_dir(const char *path, struct reliefos_dir_entry *entries,
-                     uint32_t capacity, uint32_t *out_count);
-/**
- * @brief Fill st with metadata for path; 0 on success.
- */
-int storage_stat_path(const char *path, struct reliefos_stat *st);
-/** @brief Read a byte range of the current mount table, with proc-style escaping. */
-int storage_read_mounts(uint64_t offset, void *buffer, uint32_t capacity,
-                         uint32_t *out_read);
-/** @brief Read Linux mountinfo with IDs, parentage, devices and escaped paths. */
-int storage_read_mountinfo(uint64_t offset, void *buffer, uint32_t capacity,
-                           uint32_t *out_read);
 /** @brief Return a GPT UUID in a 37-byte buffer under the storage lock, or negative errno. */
 int storage_disk_partition_uuid(uint32_t disk_id, uint32_t partition_index, char uuid[37]);
-/**
- * @brief Create the directory path; 0 on success.
+/** @brief Write a control file on the boot volume's actual visible attachment.
+ * @param path Trusted absolute /boot/ descendant, required.
+ * @param buf Kernel bytes, NULL only at length0. @param len Complete byte count.
+ * @return Zero or negative errno. Standard state directories are ensured0755;
+ * new files0644, existing metadata preserved. Rejects absent/overmounted ESP
+ * and paths escaping its attachment. Caller authorizes under execution
+ * ownership; storage synchronous, all path/writer/code pins balanced without
+ * graph/module callback locks. Failure after truncation may leave a prefix.
  */
-int storage_mkdir(const char *path);
-/**
- * @brief Delete the file path; 0 on success.
+int storage_write_boot_esp_file(const char *path,const void *buf,uint32_t len);
+/** @brief Unlink a literal control entry on the actual boot ESP attachment.
+ * @param path Trusted absolute /boot/ descendant, required.
+ * @return Zero including absent member, or negative errno. Refuses an absent
+ * or overmounted ESP; final symlinks are victims, never deletion targets.
+ * Caller authorizes under execution ownership; synchronous I/O, balanced pins,
+ * preserved mutation latch and no graph/module locks across callbacks.
  */
-int storage_unlink(const char *path);
-/**
- * Writes a small control file to the ESP belonging to the current boot disk.
- * The ESP is available through the normal `/boot` mount.
- */
-int storage_write_boot_esp_file(const char *path, const void *buf, uint32_t len);
-/** Removes a control file from the current boot disk ESP. */
 int storage_unlink_boot_esp_file(const char *path);
-/**
- * @brief Remove the empty directory path; 0 on success.
+/** @brief Adopt PID1's mounted boot ESP after an initramfs root transition.
+ * @return Zero or lookup/type/ENODEV/EBUSY errno. Boot policy calls once under
+ * execution ownership after mounting the root's fstab. Records only an exact
+ * registered device identity; no path/code reference survives. Later control
+ * operations revalidate the visible native attachment against that identity.
+ * No graph/module lock spans I/O, and failed adoption leaves the binding intact.
  */
-int storage_rmdir(const char *path);
+int storage_bind_boot_esp(void);
 /**
- * @brief Rename old_path to new_path; 0 on success.
- */
-int storage_rename(const char *old_path, const char *new_path);
-/** @brief Create a hard link to an existing regular file. */
-int storage_link(const char *old_path, const char *new_path);
-/**
- * @brief List up to capacity install disks into disks; count in out_count.
+ * @brief Copy discovered installer disk identities without inventing mount state.
+ * @param disks Writable array of capacity entries; NULL permitted at capacity zero.
+ * @param capacity Maximum records to copy, clamped to the discovered disk count.
+ * @param out_count Required total-count output, including omitted records.
+ * @return Zero or -EINVAL/-EAGAIN. A disk with unknown size may be identified.
+ * @par Context Storage execution ownership; callers retain their output memory.
+ * Actual filesystem attachments are queried through VFS, never a disk flag.
  */
 int storage_install_list_disks(struct reliefos_install_disk *disks,
                                uint32_t capacity, uint32_t *out_count);
-/**
- * @brief Format the EFI system partition on disk_id; 0 on success.
+/** @brief Copy all present registered disk identities, including ephemeral RAM media.
+ * @param disks Caller array, nullable at zero capacity. @param capacity Entry capacity.
+ * @param out_count Required complete count, including records omitted by capacity.
+ * @return Zero or validation/execution/inventory errno. Execution ownership
+ * required; scalar snapshots transfer no native pointers or provider references.
  */
-int storage_install_format_esp(uint32_t disk_id);
-/**
- * @brief Formats an installer target as a GPT disk with FAT32 ESP and ext4 root.
- * @param disk_id Installer-selected AHCI, IDE/PATA, or NVMe disk identifier.
- * @return Zero on success or a negative errno-style storage error.
- */
-int storage_install_format_target(uint32_t disk_id);
-/**
- * @brief Mount the installer target on disk_id for file placement; 0 on success.
- */
-int storage_install_mount_target(uint32_t disk_id);
+int storage_list_block_disks(struct reliefos_install_disk *disks,uint32_t capacity,uint32_t *out_count);
 /**
  * @brief Lists GPT partitions on a detected block disk exposed to disk management.
  * @param disk_id Detected AHCI, IDE/PATA, or NVMe disk identifier.
@@ -482,16 +499,15 @@ int storage_disk_block_read(uint32_t disk_id, int32_t partition_index,
 int storage_disk_block_write(uint32_t disk_id, int32_t partition_index,
                              uint64_t offset, const void *buffer, uint32_t length,
                              uint32_t *out_written);
-/** Revalidates a disk's GPT metadata after an external partition-table change. */
+/**
+ * @brief Invalidate a discovered disk's partition cache after excluding active mounts.
+ * @param disk_id Borrowed registered whole-disk identifier.
+ * @return Zero or negative ownership/discovery/protected-root/busy errno.
+ * Storage execution ownership required; no namespace or module lock spans
+ * preparation I/O. Actual volume memberships, including detached held ones,
+ * keep the disk busy. Cache invalidation does not transfer device ownership.
+ */
 int storage_disk_block_reread(uint32_t disk_id);
-/** Mount a GPT partition exposed through a /dev block node. */
-int storage_mount_block_partition(uint32_t disk_id, uint32_t partition_index,
-                                  const char *target, const char *filesystem,
-                                  uint64_t flags, uint32_t *out_volume_id);
-/** Resolve an exact mounted path to its internal volume identity. */
-int storage_mount_path_volume_id(const char *target, uint32_t *out_volume_id);
-/** Tear down an exact standard mount after the syscall layer checks use. */
-int storage_unmount_path(const char *target, uint32_t *out_volume_id);
 /**
  * @brief Formats an unprotected GPT partition as FAT32, exFAT, ext4, or legacy ext2.
  * @param request Partition selector and requested filesystem.
@@ -510,13 +526,6 @@ int storage_disk_delete_partition(const struct reliefos_disk_partition_delete *r
  * @return Zero on success or a negative errno-style storage error.
  */
 int storage_disk_create_partition(const struct reliefos_disk_partition_create *request);
-/**
- * @brief Mounts one FAT32, exFAT, ext4, or legacy ext2 data partition at its
- *        deterministic path.
- * @param request Disk and GPT-entry selector; receives the mount path.
- * @return Zero on success or a negative errno-style storage error.
- */
-int storage_disk_mount_partition(struct reliefos_disk_partition_mount *request);
 /**
  * @brief Returns the mounted path for a runtime data partition.
  * @param disk_id AHCI, IDE/PATA, or NVMe disk identifier.

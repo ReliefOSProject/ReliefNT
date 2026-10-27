@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Objects are owned by this directory; child modules own their own lists.
-obj-y := exfat/ ext2/ ext4/ fat/ iso9660/ proc/ security/ sysfs/ tmpfs/ vfs/
+obj-y := initramfs/ devfs/ proc/ security/ sysfs/ tmpfs/ vfs/
+obj-$(CONFIG_EXT_FS_COMMON) += ext_common/
+obj-$(CONFIG_EXT2_FS) += ext2/
+obj-$(CONFIG_EXT4_FS) += ext4/
+obj-$(CONFIG_FAT_FS) += fat/
+obj-$(CONFIG_EXFAT_FS) += exfat/
+obj-$(CONFIG_ISO9660_FS) += iso9660/
 
 include $(srctree)/scripts/Makefile.module

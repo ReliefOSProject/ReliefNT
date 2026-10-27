@@ -86,4 +86,44 @@ int fat32_dir_is_empty(uint32_t dir_cluster);
 
 int fat32_iter_dir_entry(uint32_t dir_cluster, uint64_t index, struct reliefos_dir_entry *entry);
 
+int fat32_mkdir_child(const struct storage_node *parent,const char *name,struct storage_node *out);
+int fat32_remove_child(const struct storage_node *parent,const char *name,bool directory);
+
+/** @brief Rename between explicit retained FAT parent directories.
+ * @param parent Required current source directory. @param old_name Literal source leaf.
+ * @param destination Required target directory. @param new_name Validated target leaf.
+ * @param committed Required irreversible-publication output, initially false.
+ * @return Zero or negative native metadata/validation/I/O errno. Errors after
+ * publication retain committed=true. Source times survive both new-target and
+ * replacement renames; failed publication restores the original target record.
+ * Caller owns execution and all inode/code pins, checks mountpoint/ancestry and
+ * reserves mutation resources. No global path resolution or callback locks.
+ */
+int fat32_rename_child(const struct storage_node *parent,const char *old_name,
+                          const struct storage_node *destination,const char *new_name,bool *committed);
+/** @brief Decode native FAT modification/access fields without a pathname.
+ * @param node Borrowed retained node in the selected live FAT volume.
+ * @param out Required output, cleared on failure; invalid date fields stay unknown.
+ * @return Zero or negative record/I/O errno. Roots have no persistent timestamp.
+ * FAT has no stored status-change time; initial ctime follows native mtime,
+ * matching the Linux FAT inode view. Execution ownership; no reference transfer.
+ */
+int fat32_inode_times(const struct storage_node *node,struct storage_inode_times *out);
+/** @brief Update only a retained FAT inode's access-date field in its current record.
+ * @param node Required linked node in the selected volume; roots have no record.
+ * @param seconds Current UTC seconds, clamped to the native1980..2107 date range.
+ * @param actual Required normalized midnight-seconds output, unchanged on failure.
+ * @return Zero or negative record/I/O errno. Execution ownership/synchronous I/O
+ * required. Unchanged dates avoid writes; mutation is latched before updating.
+ * Caller owns the inode pin and excludes orphans from all directory-record I/O.
+ */
+int fat32_inode_access(const struct storage_node *node,int64_t seconds,int64_t *actual);
+
+/** @brief Write native fat32 metadata into an authorized unmounted extent.
+ * @param disk Borrowed managed target. @param start_lba First validated sector.
+ * @param sector_count Validated extent length in 512-byte sectors.
+ * @return Zero or layout/I/O errno. Execution ownership and admitted provider
+ * pin required across all writes; no graph/module lock or pointer retention.
+ */
+int install_format_fat32(struct install_disk_state *disk,uint64_t start_lba,uint64_t sector_count);
 #endif

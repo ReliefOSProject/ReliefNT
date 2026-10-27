@@ -21,6 +21,8 @@ with tempfile.TemporaryDirectory(prefix='hda-', dir=qa) as work:
         binary = Path(work) / suite
         try:
             sources = [f'tools/tests/{SUITES[suite]}']
+            if suite == 'resources':
+                sources.append('arch/x86_64/mm/ioremap.c')
             if suite == 'codec':
                 sources.extend(kernel_sources("hda_codec"))
                 sources.append('drivers/sound/hda/controls.c')

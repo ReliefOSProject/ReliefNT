@@ -1,8 +1,10 @@
 #define _POSIX_C_SOURCE 200809L
+#include <reliefnt/graphics_service.h>
 #include <assert.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <reliefnt/arch.h>
@@ -14,6 +16,7 @@
 #include <reliefnt/signal.h>
 #include <reliefnt/userland.h>
 #include <reliefnt/syscall.h>
+#include <reliefnt/module.h>
 #include <reliefnt/syscall_internal.h>
 #include <reliefnt/storage.h>
 #include <reliefnt/framebuffer.h>
@@ -138,12 +141,14 @@ static bool async_io, inject_input;
 static int64_t backend_result;
 static unsigned slept, io_releases;
 static bool syscall_trace_task(const struct task *task) { (void)task; return false; }
-static int task_begin_syscall_io(struct task *task, uint64_t nr, int32_t fd)
-{ (void)task; (void)nr; (void)fd; assert(exclusive()); return 0; }
-void task_release_syscall_file(struct task *task) { (void)task; assert(exclusive()); }
+static int task_begin_syscall_io(struct task *task, uint64_t nr, int32_t fd, uint64_t arg2)
+{ (void)task; (void)nr; (void)fd; (void)arg2; assert(exclusive()); return 0; }
+void *kernel_malloc(size_t size){return malloc(size);}
+void kernel_free(void *pointer){free(pointer);}
+void task_release_syscall_file(struct task *task) { assert(exclusive()); task_lookup_scope_cancel(task); }
 static int syscall_eagain_is_nonblocking_device(struct task *task, uint64_t nr, uint64_t fd)
 { (void)task; (void)nr; (void)fd; return 0; }
-uint32_t drm_vmwgfx_process_retirements(uint32_t budget)
+uint32_t graphics_service_process_retirements(uint32_t budget)
 { (void)budget; assert(exclusive()); return 0; }
 void driver_manager_process_audio_faults(void) { assert(exclusive()); }
 void task_sysv_sem_cancel(struct task *task) { (void)task; assert(false); }
@@ -151,6 +156,9 @@ void task_sysv_msg_cancel(struct task *task) { (void)task; assert(false); }
 void task_fifo_cancel(struct task *task) { (void)task; assert(false); }
 uint32_t sched_current_pid(void) { return current.pid; }
 void storage_release_task_io(uint32_t pid) { assert(exclusive() && pid==current.pid); ++io_releases; }
+void storage_drain_task_io(uint32_t pid){assert(exclusive() && pid==current.pid);}
+void kernel_wait_queue_remove(struct kernel_wait_queue *queue,struct task *task)
+{(void)queue;(void)task;abort();} /* No device wait is published in this fixture. */
 void storage_set_io_async_context(bool enabled) { assert(exclusive()); async_io=enabled; }
 uint64_t time_ticks(void) { return 100; }
 void sched_sleep_current_until(uint64_t tick)
@@ -245,3 +253,12 @@ int main(void)
     test_restored_context_and_fallback();
     puts("PASS syscall user return: one transaction, result/TLS, signal, deferred input, retry, exec/sigreturn and retirement");
 }
+
+/* These socket/return fixtures never create an executable guard. Scope
+ * cancellation must not cross this absent inode backend with a live guard. */
+void storage_inode_allow_write(struct storage_inode_ref *inode){assert(!inode);}
+int storage_inode_put(struct storage_inode_ref *inode){assert(!inode);return 0;}
+
+/* No copy transaction is created in the return-gate-only fixture. */
+void task_transfer_enter(struct task *task,const struct trap_frame *frame)
+{(void)frame;assert(!task || !task->transfer_io);}

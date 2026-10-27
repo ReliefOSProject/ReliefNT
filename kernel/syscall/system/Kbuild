@@ -1,4 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-obj-y := legacy_system.o startup.o user_string.o
+obj-y := legacy_system.o startup.o user_string.o modules.o
 
 include $(srctree)/scripts/Makefile.module

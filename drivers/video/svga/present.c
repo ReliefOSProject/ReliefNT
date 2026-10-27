@@ -1,3 +1,4 @@
+#include <reliefnt/export.h>
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "device.h"
 
@@ -9,6 +10,9 @@
  * @param fence Output token, cleared before validation.
  * @return Zero after publication, SVGA_EBUSY for transient contention, or an
  *         unchanged negative SVGA status without publishing any packet.
+ * Task/execution context for module callers; never enter with the SVGA lock held.
+ * Caller retains resources/backing and its independent module call pin through
+ * return, and through the real fence or successful teardown when asynchronous.
  */
 int svga3d_present_try(svga_handle surface, const struct svga_present_rect *rects,
                       uint32_t count, svga_handle *fence)
@@ -52,3 +56,5 @@ done:
     svga_unlock(flags);
     return ret;
 }
+
+EXPORT_SYMBOL(svga3d_present_try);

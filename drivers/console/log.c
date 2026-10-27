@@ -1,4 +1,5 @@
 #include "internal.h"
+#include <reliefnt/export.h>
 
 static void print_unsigned_raw(uint64_t value, unsigned base, bool upper);
 
@@ -273,6 +274,12 @@ void console_vlog(enum console_log_level level, const char *fmt, va_list argumen
     kernel_irq_restore(flags);
 }
 
+/** @brief Append one formatted diagnostic through the permanent console/log core.
+ * @param level Severity selecting the configured log policy.
+ * @param fmt Borrowed terminated format string. @param ... Values matching fmt.
+ * IRQ-safe and bounded by the underlying console policy. No caller storage is
+ * retained; the core restores incoming IRQ state and serial callback pins.
+ */
 void console_log(enum console_log_level level, const char *fmt, ...)
 {
     va_list arguments;
@@ -280,6 +287,7 @@ void console_log(enum console_log_level level, const char *fmt, ...)
     console_vlog(level, fmt, arguments);
     va_end(arguments);
 }
+EXPORT_SYMBOL(console_log);
 
 void console_log_write(const char *text)
 {

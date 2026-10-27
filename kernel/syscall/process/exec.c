@@ -269,38 +269,43 @@ static int exec_script_arguments(struct exec_params_kernel *params, const char *
     return ret;
 }
 
-/** @brief Resolve interpreter scripts and rebuild argv before any exec commit.
- * @param task Calling task under execution serialization.
- * @param path Mutable resolved path. @param node Mutable held executable node.
- * @param execfn Original execution name. @param inaccessible FD has CLOEXEC set.
- * @param params Owned arguments/environment; preserves the stack-derived budget.
- * @return Zero for a resolved executable or a negative lookup/format/copy error.
+/** @brief Resolve shebang interpreters through actual held inode paths.
+ * @param task Caller under execution ownership with an optional retry scope.
+ * @param image Owned path updated only after the next interpreter is resolved.
+ * @param execfn Original execution name, preserved in the first script argv.
+ * @param inaccessible Original execveat script FD would close on exec.
+ * @param params Owned argument staging, rebuilt within the existing stack budget.
+ * @return Zero for an ELF candidate or negative lookup/format/copy errno.
+ * Reads and authorizes actual held objects; diagnostics never reopen images.
+ * Temporary names/paths retire on every outcome, without locks across I/O.
  */
-int exec_resolve_scripts(struct task *task, char *path, struct storage_node *node,
-                                 const char *execfn, bool inaccessible,
-                                 struct exec_params_kernel *params)
+int exec_resolve_scripts(struct task *task,struct vfs_path *image,const char *execfn,
+                            bool inaccessible,struct exec_params_kernel *params)
 {
-    char script[RELIEFOS_FS_PATH_LEN + 32];
-    copy_text(script, sizeof(script), execfn);
-    for (unsigned depth = 0; ; ++depth) {
-        if (depth > 5) return -LINUX_ELOOP;
-        if (node->type != RELIEFOS_FS_TYPE_FILE) return -RELIEFOS_EACCES;
-        int ret = fs_permissions_check_node(task, path, node, FS_ACCESS_EXEC, false);
-        if (ret < 0) return ret;
-        char header[256] = {0}, *interpreter, *argument;
-        uint32_t got = 0;
-        ret = storage_read_node(node, 0, header, sizeof(header), &got);
-        if (ret < 0) return ret;
-        ret = script_header(header, &interpreter, &argument);
-        if (ret <= 0) return ret;
-        if (inaccessible) return -RELIEFOS_ENOENT;
-        ret = exec_script_arguments(params, interpreter, argument, script);
-        if (ret < 0) return ret;
-        copy_text(script, sizeof(script), interpreter);
-        ret = fs_permissions_resolve(task, sched_task_cwd(task), interpreter,
-                                      path, RELIEFOS_FS_PATH_LEN, false);
-        if (ret < 0) return ret;
-        ret = storage_lookup_path(path, node);
-        if (ret < 0) return ret;
+    char *script=kernel_malloc(VFS_PATH_MAX+32);if(!script)return -RELIEFOS_ENOMEM;
+    copy_text(script,VFS_PATH_MAX+32,execfn);int rc=0;
+    struct storage_inode_ref *temporary_guard=NULL;
+    for(unsigned depth=0;;++depth) {
+        const struct storage_node *node=vfs_path_node(image);
+        if(depth>5){rc=-LINUX_ELOOP;break;}
+        if(!node || node->type!=RELIEFOS_FS_TYPE_FILE){rc=-RELIEFOS_EACCES;break;}
+        rc=fs_permissions_check_path(task,image,FS_ACCESS_EXEC,false);if(rc)break;
+        rc=task_lookup_exec_guard(task,image,&temporary_guard);if(rc)break;
+        char header[256]={0},*interpreter,*argument;uint32_t got=0;
+        rc=vfs_path_read(image,0,header,sizeof(header),&got);if(rc)break;
+        rc=script_header(header,&interpreter,&argument);if(rc<=0)break;
+        if(inaccessible){rc=-RELIEFOS_ENOENT;break;}
+        rc=exec_script_arguments(params,interpreter,argument,script);if(rc)break;
+        copy_text(script,VFS_PATH_MAX+32,interpreter);
+        struct vfs_lookup_result next={0};
+        rc=resolve_kernel_object_at_flags(vfs_system_namespace(),task,LINUX_AT_FDCWD,interpreter,
+            false,false,VFS_LOOKUP_FOLLOW,&next);
+        if(rc)break;
+        if(temporary_guard) {
+            storage_inode_allow_write(temporary_guard);(void)storage_inode_put(temporary_guard);temporary_guard=NULL;
+        }
+        vfs_path_put(image);*image=next.path;
     }
+    if(temporary_guard){storage_inode_allow_write(temporary_guard);(void)storage_inode_put(temporary_guard);}
+    kernel_free(script);return rc;
 }

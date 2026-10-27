@@ -1,3 +1,4 @@
+#include <reliefnt/graphics_service.h>
 #include "internal.h"
 
 /**
@@ -137,7 +138,7 @@ int pty_vt_reset_mode(uint32_t pty_id)
     vt_graphical[index] = 0;
     vt_keyboard_modes[index] = K_XLATE;
     if (was_graphical && active_vt == pty_id) {
-        drm_device_kms_vt_release();
+        graphics_service_kms_vt_release();
         ++vt_display_generation;
         input_set_graphical_vt(0);
         console_vt_activate(pty_id, false);
@@ -212,7 +213,7 @@ static int pty_vt_commit_switch(uint32_t number)
     if (active_vt && active_vt <= VT_COUNT) vt_release_pending[active_vt - 1u] = 0;
     vt_switch_target = 0;
     ++vt_display_generation;
-    if (active_vt && active_vt != number) drm_device_kms_vt_release();
+    if (active_vt && active_vt != number) graphics_service_kms_vt_release();
     active_vt = number;
     /* A grabbed graphical client can consume modifier releases while the
      * display is away. Do not carry stale Ctrl/Alt state into the next VT;
@@ -372,7 +373,7 @@ int pty_vt_set_graphics(uint32_t pty_id, int enabled)
     console_info("[reliefnt] VT graphics vt=%u enabled=%d\n", pty_id, enabled);
     vt_graphical[pty_id - 1u] = (uint8_t)enabled;
     if (active_vt == pty_id) {
-        if (!enabled) drm_device_kms_vt_release();
+        if (!enabled) graphics_service_kms_vt_release();
         ++vt_display_generation;
         input_set_graphical_vt(enabled ? pty_id : 0);
         console_vt_activate(pty_id, enabled != 0);

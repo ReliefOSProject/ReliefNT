@@ -1,4 +1,7 @@
+#include <reliefnt/sound_service.h>
 #include "manager_internal.h"
+#include <reliefnt/driver_module.h>
+#include <reliefnt/export.h>
 
 /** @brief Resume manager ownership after a phase that may wait or sleep.
  * @param scope Active manager wait scope whose token must be consumed.
@@ -56,24 +59,14 @@ static struct driver_slot *driver_claim_slot(void);
  * @return 0 or negative errno. Task context, no registry lock during callbacks;
  * a failed audio STOP or unsafe fini retains the slot with its recorded error.
  */
-static int driver_load_builtin(struct driver_slot *slot,
+static int driver_load_registered(struct driver_slot *slot,
                                const struct reliefos_driver_module *module);
 
-/** @brief Initialize the built-in drivers with manager admission and execution ownership held.
- * @return None. Called only by the public boot hook.
- */
-static void driver_manager_load_builtin_admitted(void);
+
 
 int early_serial_ready;
 
-static const struct reliefos_driver_module *const builtin_modules[] = {
-    &serial_driver_module,
-    &ac97_driver_module,
-    &e1000_driver_module,
-    &es1371_driver_module,
-    &hda_driver_module,
-    &mouse_driver_module,
-};
+
 struct driver_slot driver_slots[RELIEFOS_DRIVER_MAX];
 
 int32_t loading_slot = -1;
@@ -103,47 +96,7 @@ struct mouse_state mouse_cache;
 
 struct kernel_spinlock manager_service_lock = KERNEL_SPINLOCK_INIT;
 
-static const struct reliefos_driver_kernel_api driver_kernel_api = {
-    .abi_version = RELIEFOS_DRIVER_ABI_VERSION,
-    .struct_size = sizeof(struct reliefos_driver_kernel_api),
-    .inb = driver_api_inb,
-    .outb = driver_api_outb,
-    .inl = driver_api_inl,
-    .outl = driver_api_outl,
-    .alloc_pages = mm_alloc_pages,
-    .free_pages = mm_free_pages,
-    .console_write = console_log_write,
-    .input_push_mouse = input_push_mouse,
-    .input_push_mouse_wheel = input_push_mouse_wheel,
-    .framebuffer_size = driver_api_framebuffer_size,
-    .pci_find = driver_api_pci_find,
-    .pci_read16 = pci_config_read16,
-    .pci_write16 = pci_config_write16,
-    .pci_read32 = pci_config_read32,
-    .ticks = time_ticks,
-    .sleep_ms = time_sleep_ms,
-    .register_mouse = driver_register_mouse,
-    .register_serial = driver_register_serial,
-    .register_e1000 = driver_register_e1000,
-    .register_audio = driver_register_audio,
-    .pci_enumerate = pci_enumerate,
-    .map_mmio = driver_map_mmio,
-    .unmap_mmio = driver_unmap_mmio,
-    .alloc_dma = driver_alloc_dma,
-    .free_dma = driver_free_dma,
-    .request_pci_irq = driver_request_pci_irq,
-    .free_pci_irq = driver_free_pci_irq,
-    .audio_register_card = driver_audio_register_card,
-    .audio_unregister_card = audio_unregister_card,
-    .audio_period_elapsed = audio_period_elapsed,
-    .audio_control_changed = audio_control_changed,
-    .pci_write32 = pci_config_write32,
-    .audio_set_service = audio_card_set_service,
-    .report_teardown_failure = driver_report_teardown_failure,
-    .audio_request_disconnect = audio_request_controller_disconnect,
-    .console_log = console_log,
-    .phys_to_virt = mm_phys_to_virt,
-};
+
 /** @brief Resume manager ownership after a phase that may wait or sleep.
  * @param scope Active manager wait scope whose token must be consumed.
  * @return None. A lost transaction is a kernel invariant failure; no slot state
@@ -284,7 +237,7 @@ static struct driver_slot *driver_claim_slot(void)
  * @return 0 or negative errno. Task context, no registry lock during callbacks;
  * a failed audio STOP or unsafe fini retains the slot with its recorded error.
  */
-static int driver_load_builtin(struct driver_slot *slot,
+static int driver_load_registered(struct driver_slot *slot,
                                const struct reliefos_driver_module *module)
 {
     int ret;
@@ -315,7 +268,7 @@ static int driver_load_builtin(struct driver_slot *slot,
         driver_set_error(slot, ret, "Cannot release execution transaction for init");
         return ret;
     }
-    ret = module->init(&driver_kernel_api);
+    ret = module->init(driver_kernel_services());
     driver_manager_wait_end_or_panic(&init_scope);
     loading_slot = -1;
     if (ret < 0) {
@@ -323,7 +276,7 @@ static int driver_load_builtin(struct driver_slot *slot,
         driver_manager_service_close(slot->info.id);
         if (driver_manager_wait_begin(&rollback_scope) < 0)
             panic("driver manager cannot suspend execution for init rollback");
-        int disconnect = audio_unregister_owner(slot->info.id, 1);
+        int disconnect = sound_service_unregister_owner(slot->info.id, 1);
         if (disconnect) {
             /* A failed STOP forbids reclaiming resources still owned by the
              * device. Keep the slot retained and its services open. */
@@ -366,41 +319,10 @@ void driver_manager_init(void)
 {
     driver_memzero(driver_slots, sizeof(driver_slots));
     mouse_cache = (struct mouse_state){0};
-    console_info("[driver] manager ready abi=%u slots=%u builtins=%u\n",
-                 RELIEFOS_DRIVER_ABI_VERSION, RELIEFOS_DRIVER_MAX,
-                 (unsigned)(sizeof(builtin_modules) / sizeof(builtin_modules[0])));
+    console_info("[driver] manager ready abi=%u slots=%u\n",
+                 RELIEFOS_DRIVER_ABI_VERSION, RELIEFOS_DRIVER_MAX);
 }
 
-/** @brief Initialize the built-in drivers with manager admission and execution ownership held.
- * @return None. Called only by the public boot hook.
- */
-static void driver_manager_load_builtin_admitted(void)
-{
-    for (uint32_t index = 0;
-         index < sizeof(builtin_modules) / sizeof(builtin_modules[0]); ++index) {
-        const struct reliefos_driver_module *module = builtin_modules[index];
-        struct driver_slot *slot = driver_claim_slot();
-        if (!slot) {
-            console_warn("[driver] no free slot for builtin %s\n", module->name);
-            continue;
-        }
-        driver_copy_text(slot->info.file, sizeof(slot->info.file), module->name);
-        if (driver_load_builtin(slot, module) < 0) {
-            if (slot->info.state == RELIEFOS_DRIVER_STATE_LOADED) continue;
-            console_warn("[driver] retrying %s\n", slot->info.file);
-            /* Second init attempt after the first failed. */
-            (void)driver_load_builtin(slot, module);
-        }
-    }
-    uint32_t loaded = 0;
-    uint32_t inactive = 0;
-    for (uint32_t index = 0; index < RELIEFOS_DRIVER_MAX; ++index) {
-        if (!driver_slots[index].info.file[0]) continue;
-        if (driver_slots[index].info.state == RELIEFOS_DRIVER_STATE_LOADED) ++loaded;
-        else ++inactive;
-    }
-    console_info("[driver] built-in summary loaded=%u inactive=%u\n", loaded, inactive);
-}
 
 /**
  * @brief Initialize every driver linked into the kernel image.
@@ -409,16 +331,115 @@ static void driver_manager_load_builtin_admitted(void)
  */
 void driver_manager_load_builtin(void)
 {
-    if (driver_manager_phase_try_enter() < 0) {
-        console_warn("[driver] builtin load skipped: manager busy\n");
-        return;
-    }
     uint64_t execution_flags;
     kernel_execution_lock_irqsave(&execution_flags);
-    driver_manager_load_builtin_admitted();
+    (void)module_run_builtin_initcalls();
     kernel_execution_unlock_irqrestore(execution_flags);
-    driver_manager_phase_leave();
 }
+
+/** @brief Close a native binding and synchronously stop its hardware callbacks.
+ * @param context Stable driver slot owned by this module's cleanup ledger.
+ * @return Zero once quiesced or an errno retaining the module and its resources.
+ * Task context under depth-one execution ownership; no manager lock spans waits.
+ */
+static int driver_module_quiesce(void *context)
+{
+    struct driver_slot *slot=context;
+    int ret=driver_manager_phase_try_enter();
+    if(ret) return ret;
+    driver_manager_service_close(slot->info.id);
+    struct driver_manager_wait_scope scope={0};
+    ret=driver_manager_wait_begin(&scope);
+    if(!ret) {
+        if(slot->info.state==RELIEFOS_DRIVER_STATE_LOADED) {
+            ret=sound_service_unregister_owner(slot->info.id,1);
+            if(!ret) {
+                driver_manager_service_drain(slot->info.id);
+                driver_resources_release(slot->info.id,true);
+                ret=driver_run_fini(slot,slot->module);
+            }
+        }
+        driver_manager_wait_end_or_panic(&scope);
+    }
+    if(!ret) {
+        driver_clear_services(slot->info.id);
+        slot->info.state=RELIEFOS_DRIVER_STATE_UNLOADED;
+    }
+    driver_manager_phase_leave();
+    return ret;
+}
+
+/** @brief Release a quiesced native slot after all module callbacks have drained.
+ * @param context Exclusively owned slot; all admissions are already closed.
+ * Task context with execution ownership; hardware STOP and IRQ synchronization
+ * completed in quiesce, so no driver code runs while freeing the remaining leases.
+ */
+static void driver_module_release(void *context)
+{
+    struct driver_slot *slot=context;
+    driver_resources_release(slot->info.id,false);
+    driver_memzero(slot,sizeof(*slot));
+}
+
+/** @brief Compare immutable descriptor names with bounded driver-info names.
+ * @param left Terminated descriptor name.
+ * @param right Terminated registry name.
+ * @return True when the names match; no locks or ownership changes.
+ */
+static bool driver_names_equal(const char *left,const char *right)
+{
+    while(*left && *right && *left==*right) { ++left; ++right; }
+    return *left==*right;
+}
+
+/** @brief Reserve a driver slot and its native cleanup before probing hardware.
+ * @param descriptor Immutable retained native descriptor.
+ * @param owner COMING module or NULL for a permanent builtin binding.
+ * @return Zero including absent hardware, or a negative Linux errno.
+ * Init task under depth-one execution ownership. Serialized manager admission
+ * prevents init globals from crossing drivers; no spinlock spans callbacks.
+ */
+int driver_module_register(const struct reliefos_driver_module *descriptor,struct module *owner)
+{
+    if(!driver_module_abi_valid(descriptor)) return -8;
+    int ret=driver_manager_phase_try_enter();
+    if(ret) return ret;
+    struct driver_slot *slot=NULL;
+    for(uint32_t i=0;i<RELIEFOS_DRIVER_MAX;++i) {
+        if(driver_slots[i].info.file[0] && driver_names_equal(descriptor->name,driver_slots[i].info.file)) {
+            ret=-17; goto done;
+        }
+    }
+    slot=driver_claim_slot();
+    if(!slot) { ret=-28; goto done; }
+    slot->code_owner=owner;
+    if(owner) slot->info.flags&=~RELIEFOS_DRIVER_FLAG_BUILTIN;
+    driver_copy_text(slot->info.file,sizeof(slot->info.file),descriptor->name);
+    if(owner) {
+        ret=module_add_resource(owner,driver_module_quiesce,driver_module_release,slot);
+        if(ret) { driver_memzero(slot,sizeof(*slot)); goto done; }
+    }
+    ret=driver_load_registered(slot,descriptor);
+    if(ret==-19) ret=0;
+done:
+    driver_manager_phase_leave();
+    return ret;
+}
+EXPORT_SYMBOL(driver_module_register);
+
+#ifdef CONFIG_MODULES
+/** @brief Borrow a slot's owner under manager initialization or service lifetime gates.
+ * @param id Slot retained by manager admission or an open/active service gate.
+ * @return Borrowed native code owner or NULL for builtin/invalid slots.
+ * IRQ-safe, no lock or reference transfer. Cleanup closes/drains the service
+ * gate and child registrations before clearing this pointer.
+ */
+struct module *driver_module_owner(uint32_t id)
+{
+    return id<RELIEFOS_DRIVER_MAX ? driver_slots[id].code_owner : NULL;
+}
+EXPORT_SYMBOL(driver_module_owner);
+#endif
 
 /**
  * @brief Fill the query with up to capacity driver infos and set the total count.
@@ -612,10 +633,17 @@ int driver_manager_audio_acquire(uint32_t *generation, struct reliefos_audio_sta
     if (!ops || !driver_manager_service_try_pin(owner)) {
         kernel_spin_unlock_irqrestore(&manager_service_lock, flags);return -19;
     }
-    if (audio_lease_generation == token) {
+    if (driver_slots[owner].audio_lease_token) {
         kernel_spin_unlock_irqrestore(&manager_service_lock, flags);
         driver_manager_service_unpin(owner);return -16;
     }
+    struct module *code_owner=driver_slots[owner].code_owner;
+    if(!try_module_get(code_owner)) {
+        kernel_spin_unlock_irqrestore(&manager_service_lock,flags);
+        driver_manager_service_unpin(owner);return -19;
+    }
+    driver_slots[owner].audio_lease_token=token;
+    driver_slots[owner].audio_lease_module=code_owner;
     audio_lease_generation = token;
     kernel_spin_unlock_irqrestore(&manager_service_lock, flags);
     if (ops->is_ready() && ops->get_state) ops->get_state(state);
@@ -632,7 +660,22 @@ int driver_manager_audio_acquire(uint32_t *generation, struct reliefos_audio_sta
  */
 void driver_manager_audio_release(uint32_t generation)
 {
+    struct module *drop=NULL;
     uint64_t flags;kernel_spin_lock_irqsave(&manager_service_lock, &flags);
+    for(uint32_t i=0;generation && i<RELIEFOS_DRIVER_MAX;++i) {
+        if(driver_slots[i].audio_lease_token!=generation) continue;
+        drop=driver_slots[i].audio_lease_module;
+        driver_slots[i].audio_lease_module=NULL;
+        driver_slots[i].audio_lease_token=0;
+        break;
+    }
     if (generation && generation == audio_lease_generation) audio_lease_generation = 0;
     kernel_spin_unlock_irqrestore(&manager_service_lock, flags);
+    module_put(drop);
 }
+
+EXPORT_SYMBOL(driver_manager_audio_acquire);
+EXPORT_SYMBOL(driver_manager_audio_configure_bound);
+EXPORT_SYMBOL(driver_manager_audio_release);
+EXPORT_SYMBOL(driver_manager_audio_state_bound);
+EXPORT_SYMBOL(driver_manager_audio_write_bound);

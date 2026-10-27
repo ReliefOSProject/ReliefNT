@@ -1,0 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+#ifndef RELIEFNT_ATA_PROTOCOL_H
+#define RELIEFNT_ATA_PROTOCOL_H
+#define ATA_CLASS_MASS_STORAGE 0x01u
+#define ATA_SUBCLASS_SATA 0x06u
+#define ATA_PROGIF_AHCI 0x01u
+#define ATA_SUBCLASS_IDE 0x01u
+#define ATA_SUBCLASS_NVM 0x08u
+#define ATA_PROGIF_NVME 0x02u
+
+#define ATA_CMD_READ_DMA_EXT 0x25u
+#define ATA_CMD_WRITE_DMA_EXT 0x35u
+#define ATA_CMD_PACKET 0xa0u
+#define ATA_CMD_IDENTIFY_DEVICE 0xECu
+#define ATA_DEV_BUSY 0x80u
+#define ATA_DEV_DRQ 0x08u
+
+#define SCSI_CMD_READ10 0x28u
+#endif

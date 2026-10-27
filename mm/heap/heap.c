@@ -2,6 +2,7 @@
  * ReliefOS kernel heap implementation.
  * Uses the physical page allocator through the kernel's shared direct map.
  */
+#include <reliefnt/export.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/console.h>
 #include <reliefnt/mm.h>
@@ -76,3 +77,8 @@ void kernel_free(void *memory)
     uint64_t phys = mm_virt_to_phys(header);
     if (phys) mm_free_pages(phys, header->pages);
 }
+
+/* Native filesystem modules share this core-owned interface; CRC/release
+ * checks bind it to the exact kernel, without a stable cross-release API. */
+EXPORT_SYMBOL(kernel_free);
+EXPORT_SYMBOL(kernel_malloc);

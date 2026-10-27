@@ -5,6 +5,7 @@
 #include <reliefnt/version.h>
 
 #include <generated/build_info.h>
+#include <generated/module_abi.h>
 
 #if defined(__x86_64__)
 #define RELIEFNT_ARCHITECTURE "x86_64"
@@ -16,7 +17,7 @@
 
 static const struct reliefos_system_info system_info = {
     .kernel_name = RELIEFOS_KERNEL_NAME,
-    .kernel_version = RELIEFOS_KERNEL_VERSION,
+    .kernel_version = RELIEFNT_KERNEL_RELEASE,
     .reserved_subsystem_name = "",
     .build_time = RELIEFOS_BUILD_TIME,
     .copyright = RELIEFOS_COPYRIGHT,

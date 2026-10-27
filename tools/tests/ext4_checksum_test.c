@@ -2,7 +2,7 @@
  *
  * Covers the CRC32C/CRC16 primitives, the superblock / group-descriptor /
  * inode checksum algorithms in
- * fs/ext4/checksum.c.
+ * fs/ext_common/checksum.c.
  *
  * Independent oracles (the implementation under test is table-driven and
  * shares no code with these):
@@ -33,7 +33,7 @@
  *     -Iinclude -Iinclude \
  *     -Iinclude/uapi -Iinclude \
  *     tools/tests/ext4_checksum_test.c \
- *     fs/ext4/checksum.c \
+ *     fs/ext_common/checksum.c \
  *     -o /tmp/reliefos-ext4-checksum-test
  *   ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
  *     /tmp/reliefos-ext4-checksum-test

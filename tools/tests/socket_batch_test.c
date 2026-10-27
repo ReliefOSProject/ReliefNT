@@ -29,6 +29,13 @@ int64_t task_socket_message(struct task *task, struct task_file *file, uint64_t 
     assert(task == &current && file == &socket_file && batch);
     assert(message == (uintptr_t)&messages[cursor]);
     ++calls;
+    if (mode == 10) {
+        /* The socket boundary consumes three scoped operands per message.
+         * A retry of slot1 must resume its own operands, never slot0's. */
+        assert(task->lookup_scope.cursor == (size_t)cursor * 3);
+        task->lookup_scope.cursor += 3;
+        if (cursor == 1 && calls == 2) return KERNEL_SYSCALL_BLOCKED;
+    }
     out->requested = 8;
     if (mode == 1 && cursor == 1) return -LINUX_EAGAIN;
     if (mode == 2 && cursor == 1) return -LINUX_EFAULT;
@@ -59,6 +66,13 @@ static void reset(unsigned next)
 
 int main(void)
 {
+    reset(10);
+    current.lookup_scope.armed = true;
+    assert(syscall_socket_mmsg(false,3,(uintptr_t)messages,3,0,0)==KERNEL_SYSCALL_BLOCKED);
+    assert(current.mmsg.count==1);
+    current.lookup_scope.cursor=0; /* Real syscall entry rewinds matching scope. */
+    assert(syscall_socket_mmsg(false,3,(uintptr_t)messages,3,0,0)==3);
+    current.lookup_scope=(struct task_lookup_scope){0};
     reset(0);
     assert(syscall_socket_mmsg(false, -1, 0, 0, MSG_CMSG_COMPAT, 0) == -LINUX_EINVAL);
     assert(syscall_socket_mmsg(false, -1, 0, 0, 0, 0) == -LINUX_EBADF);

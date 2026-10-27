@@ -33,7 +33,7 @@ void kernel_spin_unlock_irqrestore(struct kernel_spinlock *lock, uint64_t flags)
     (void)flags;
     assert(held-- == 1);
 }
-void audio_service_tick(void) { assert(!held); }
+void sound_service_tick(void) { assert(!held); }
 void usb_poll(void) { assert(!held); }
 void sched_on_tick(void) { assert(!held); }
 void console_display_tick(void) { assert(!held); }

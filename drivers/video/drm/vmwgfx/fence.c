@@ -1,3 +1,4 @@
+#include "../memory.h"
 #include "execbuf_internal.h"
 
 static struct drm_vmwgfx_fence *drm_vmwgfx_fence_find_locked(
@@ -322,6 +323,17 @@ void drm_vmwgfx_fence_wait_finish(
     drm_vmwgfx_continuation_release(continuation);
 }
 
+/**
+ * @brief Wait or suspend on a retained original fence without losing code ownership.
+ * @param task Execution-owned caller.
+ * @param file Retained original DRM file.
+ * @param command Linux ioctl selector.
+ * @param arg Imported kernel fence request/reply.
+ * @param user_argument Original user address used as continuation identity.
+ * @param diagnostics Nullable borrowed diagnostic context.
+ * @return Original wait result, Linux errno or internal blocked status.
+ * Task context under file pin. Published continuations retain module/fence ownership across execution suspension; no queue lock spans waits or usercopy.
+ */
 int64_t drm_vmwgfx_fence_wait(
     struct task *task, struct drm_file *file, uint32_t command,
     struct drm_vmw_fence_wait_arg *arg, uint64_t user_argument,
@@ -446,7 +458,7 @@ int64_t drm_vmwgfx_fence_wait(
     }
 
     if (!resumed) {
-        continuation = kernel_malloc(sizeof(*continuation));
+        continuation = drm_async_alloc(sizeof(*continuation));
         if (!continuation) {
             drm_vmwgfx_fence_put(fence);
             drm_vmwgfx_fence_diag(diagnostics, -LINUX_ENOMEM,

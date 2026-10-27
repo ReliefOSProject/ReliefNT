@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and exercise the production kernel memcpy/memset on the host."""
+"""Build and exercise the production kernel memcpy/memmove/memset on the host."""
 
 from pathlib import Path
 import os
@@ -83,6 +83,7 @@ def main() -> int:
                         f"-O{optimization}",
                         "-Iinclude",
                         "-Dmemcpy=kernel_memcpy",
+                        "-Dmemmove=kernel_memmove",
                         "-Dmemset=kernel_memset",
                         "-Dmemcmp=kernel_memcmp",
                         "-Dstrlen=kernel_strlen",

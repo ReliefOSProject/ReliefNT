@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 from pathlib import Path
+from storage_graph_test_sources import STORAGE_GRAPH_SOURCES
 import tempfile
 from test_ext4_read import run
 
@@ -9,11 +10,11 @@ def main():
     args=p.parse_args()
     with tempfile.TemporaryDirectory(prefix="reliefos-ext4-vfs-") as d:
         work=Path(d); binary=work/"test"; image=work/"image"; result=work/"result"
-        run(["cc","-std=c11","-O1","-g","-fsanitize=address,undefined","-fno-sanitize-recover=all",
+        run(["cc","-std=c11","-DRELIEFNT_FIXTURE_REAL_DAC","-O1","-g","-fsanitize=address,undefined","-fno-sanitize-recover=all",
              "-ffunction-sections","-fdata-sections","-Wl,--gc-sections","-Iinclude",
              "-Iinclude","-Iinclude/uapi","-Iinclude",
              "tools/tests/ext4_vfs_test.c","fs/tmpfs/core.c",
-             "lib/text_utf16.c","-o",str(binary)])
+             "lib/text_utf16.c",*STORAGE_GRAPH_SOURCES,"-o",str(binary)])
         features="none,filetype,large_file,dir_index"
         if args.filesystem=="ext4": features+=",extents,64bit,metadata_csum,extra_isize,flex_bg,has_journal"
         with image.open("wb") as f:f.truncate(64*1024*1024)

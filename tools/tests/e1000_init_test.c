@@ -3,7 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
-#include "../../drivers/net/e1000/e1000.c"
+#include "../../drivers/net/e1000/e1000_main.c"
 
 static unsigned allocations, allocation_limit = 1024;
 static uint64_t next_physical = 0x100000ULL;
@@ -11,6 +11,7 @@ static uint64_t next_physical = 0x100000ULL;
 #define TEST_E1000_REGISTER_BYTES 0x5408ULL
 static struct { uint64_t phys; uint32_t pages; void *host; } allocation_map[1024];
 static int registration_error;
+static int stuck_reset, teardown_error;
 static int fail_mmio_map;
 static unsigned mmio_map_calls, mmio_maps, mmio_unmaps;
 static uint16_t command_bits;
@@ -85,7 +86,8 @@ static void unmap_mmio(void *pointer, uint64_t bytes)
     ++mmio_unmaps;
 }
 static void pause_ms(uint64_t ms)
-{ (void)ms; *(uint32_t *)(registers + E1000_REG_CTRL) &= ~(1u << 26); }
+{ (void)ms; if(!stuck_reset) *(uint32_t *)(registers + E1000_REG_CTRL) &= ~(1u << 26); }
+static void report_teardown(int error) { teardown_error=error; }
 static void log_text(const char *text) { (void)text; }
 static void log_record(enum console_log_level level, const char *format, ...)
 { (void)level; (void)format; }
@@ -107,6 +109,7 @@ int main(void)
         .map_mmio = map_mmio, .unmap_mmio = unmap_mmio,
         .pci_find = find, .pci_read16 = read16, .pci_write16 = write16,
         .pci_read32 = read32, .sleep_ms = pause_ms, .register_e1000 = register_ops,
+        .report_teardown_failure = report_teardown,
     };
     struct reliefos_driver_kernel_api old_api = api;
     old_api.abi_version = 1U;
@@ -181,7 +184,13 @@ int main(void)
         }
         assert(e1000_poll(frame, sizeof(frame), &length) == 0 && length == 0);
     }
+    stuck_reset=1;
     e1000_driver_fini();
+    assert(teardown_error==-110 && allocations && mmio_maps==mmio_unmaps+1);
+    assert(!(command_bits&PCI_COMMAND_BUS_MASTER));
+    stuck_reset=0; teardown_error=0;
+    e1000_driver_fini();
+    assert(!teardown_error);
     assert(!allocations && !g_e1000.active && mmio_maps == mmio_unmaps);
     assert(command_bits == (PCI_COMMAND_IO | PCI_COMMAND_MEMORY | PCI_COMMAND_BUS_MASTER));
     assert(munmap(registers, 0x20000) == 0);

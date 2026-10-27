@@ -3,6 +3,44 @@
 #define RELIEFNT_TASK_ACCESSORS_H
 #include <reliefnt/task/types.h>
 
+/** @brief Retain a stable PID identity that cannot retarget on task-slot reuse.
+ * @param task Live task or waitable zombie, borrowed under execution ownership.
+ * @param out Empty output receiving one identity reference, empty on failure.
+ * @return Zero or negative EINVAL/ESRCH/ENOMEM, without a partial task binding.
+ * Lazy allocation requires task context without scheduler_lock. The task keeps
+ * its own reference until reap/recycle; proc inodes keep independent references.
+ */
+int sched_task_identity_get(struct task *task,struct task_identity **out);
+/** @brief Borrow the task currently carrying a retained PID identity.
+ * @param identity Held identity, nullable, under execution ownership.
+ * @return Borrowed task, or NULL after reap/recycle. Never a replacement task.
+ */
+struct task *sched_task_identity_task(const struct task_identity *identity);
+/** @brief Release one retained PID identity without touching task resources.
+ * @param identity Owned identity, or NULL. Execution ownership required.
+ * Only the last reference frees the identity; no backend I/O or allocation.
+ */
+void sched_task_identity_put(struct task_identity *identity);
+/** @brief Invalidate a task's PID identity before reaping or reusing its record.
+ * @param task Stable task under execution ownership or scheduler_lock, nullable.
+ * Existing proc references become dead and cannot retarget a later task/PID.
+ * Drops only the task's reference; no backend I/O or allocation.
+ */
+void sched_task_identity_detach(struct task *task);
+/** @brief Move retained PID identities together with exec's native PID swap.
+ * @param left Stable task exchanging its PID under scheduler_lock.
+ * @param right Other stable task exchanging its PID under scheduler_lock.
+ * Neither pointer may be NULL. No allocation or reference-count changes;
+ * retained proc identities continue to follow their original PID objects.
+ */
+void sched_task_identity_swap(struct task *left,struct task *right);
+
+/** @brief Prepare current-task state and owned root/cwd paths for image commit.
+ * @param task Current task under exclusive execution ownership; required.
+ * @return Zero, a file-table error, or EAGAIN until remote siblings retire.
+ * Detaches native shared FS state without losing object pins; no caller-held
+ * scheduler_lock. Signal state updates take that lock internally.
+ */
 int sched_prepare_exec_current(struct task *task);
 void sched_signalfd_reconfigure(struct task *task);
 void sched_exec_replace_mm(struct task *task, const struct address_space *replacement);
@@ -101,6 +139,46 @@ static inline char *sched_task_cwd(const struct task *task)
     return task->shared_fs ? task->shared_fs->cwd : (char *)task->cwd;
 }
 
+/** @brief Borrow the task's owned mount/root/cwd handles, honoring CLONE_FS.
+ * @param task Stable task under execution ownership; required.
+ * @return Mutable owned state; no references are transferred to the caller.
+ */
+static inline struct task_fs_paths *sched_task_paths(const struct task *task)
+{
+    return task->shared_fs ? &task->shared_fs->paths : (struct task_fs_paths *)&task->fs_paths;
+}
+
+/** @brief Initialize a new unpublished task's root/cwd from the shared namespace.
+ * @param task Fresh filesystem state under execution ownership.
+ * @param ns Published shared namespace; borrowed for this call.
+ * @return Zero, ENODEV before namespace publication, or EINVAL for partial
+ * state. Fully initialized inherited state is preserved. No allocation/I/O;
+ * may run while the scheduler excludes publication of the new task.
+ */
+int sched_task_fs_start(struct task *task,struct vfs_namespace *ns);
+
+/** @brief Copy independent root/cwd references when creating an unshared task.
+ * @param task New task with private filesystem state under execution ownership.
+ * @param parent Stable source task whose root/cwd references are borrowed.
+ * No allocation; new pins are acquired before any old destination pins drop.
+ */
+void sched_task_fs_inherit(struct task *task,const struct task *parent);
+
+/** @brief Detach shared FS state while retaining the same root/cwd objects.
+ * @param task Task under exclusive execution ownership; NULL is accepted.
+ * Preserves the existing native exec unshare policy and cached names/umask.
+ * No allocation; the last shared reference releases its backend pins only
+ * after the task has acquired independent pins. Final release may perform I/O.
+ */
+void sched_task_fs_unshare(struct task *task);
+
+/** @brief Retire task root/cwd pins or its one shared CLONE_FS reference.
+ * @param task Quiescent task under execution ownership; nullable.
+ * Clears ownership before final backend release, which may perform I/O.
+ * Only the final shared holder releases the underlying paths and state.
+ */
+void sched_task_fs_release(struct task *task);
+
 static inline uint32_t *sched_task_umask(const struct task *task)
 {
     return task->shared_fs ? &task->shared_fs->umask : (uint32_t *)&task->umask;
@@ -145,6 +223,17 @@ static inline struct kernel_sigqueue *sched_task_process_signal_queue(struct tas
         &task->process_signal_queue;
 }
 
+/** @brief Clone or share a user's resources and owned filesystem paths.
+ * @param frame Borrowed saved user frame, required.
+ * @param flags Supported Linux clone flags and exit signal.
+ * @param stack Optional new user stack, zero inherits.
+ * @param parent_tid Optional writable parent-side TID address.
+ * @param child_tid Optional writable child-side TID address.
+ * @param tls User TLS base for CLONE_SETTLS.
+ * @return Child PID or negative errno; rollback releases only child ownership.
+ * Execution transaction required; takes scheduler_lock. CLONE_FS shares the
+ * actual root/cwd owner; ordinary fork retains independent path references.
+ */
 int64_t sched_clone_current(const struct trap_frame *frame, uint64_t flags,
                            uint64_t stack, uint64_t parent_tid,
                            uint64_t child_tid, uint64_t tls);

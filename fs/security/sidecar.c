@@ -1,4 +1,5 @@
 #include "../../block/core/storage_internal.h"
+#include "sidecar.h"
 /*
  * ReliefOS FAT/exFAT POSIX metadata sidecar.
  *
@@ -175,101 +176,6 @@ static int sidecar_path_is_system_tree(const char *path)
     return 0;
 }
 
-/**
- * @brief Split an absolute path into its directory and final component.
- * @param path Absolute POSIX path; ':' is valid inside a component.
- * @param parent Output directory, absolute; "/" for a top-level name.
- * @param parent_cap Bytes available at `parent`.
- * @param name Output component; "." for the root directory itself, so the root
- *             keeps its own record in the sidecar of '/'.
- * @param name_cap Bytes available at `name`.
- * @return Zero, -EINVAL for a relative, empty or over-long component, or
- *         -ENAMETOOLONG when a component does not fit its output.
- */
-static int sidecar_parent_name(const char *path, char *parent, uint32_t parent_cap,
-                               char *name, uint32_t name_cap)
-{
-    uint32_t slash = 0;
-    uint32_t pos = 0;
-    if (!path || path[0] != '/' || !parent || !name || parent_cap < 2 || name_cap == 0) {
-        return -RELIEFOS_EINVAL;
-    }
-    if (!path[1]) {
-        if (parent_cap < 2 || name_cap < 2) {
-            return -RELIEFOS_ENAMETOOLONG;
-        }
-        parent[0] = '/';
-        parent[1] = 0;
-        name[0] = '.';
-        name[1] = 0;
-        return 0;
-    }
-    for (uint32_t i = 1; path[i]; ++i) {
-        if (path[i] == '/') {
-            slash = i;
-        }
-    }
-    if (slash == 0) {
-        parent[0] = '/';
-        parent[1] = 0;
-    } else {
-        if (slash + 1u > parent_cap) {
-            return -RELIEFOS_ENAMETOOLONG;
-        }
-        for (uint32_t i = 0; i < slash; ++i) {
-            parent[i] = path[i];
-        }
-        parent[slash] = 0;
-    }
-    for (uint32_t i = slash + 1u; path[i]; ++i) {
-        if (pos + 1u >= name_cap) {
-            return -RELIEFOS_ENAMETOOLONG;
-        }
-        name[pos++] = path[i];
-    }
-    name[pos] = 0;
-    return name[0] ? 0 : -RELIEFOS_EINVAL;
-}
-
-/**
- * @brief Build the sidecar file path belonging to a directory.
- * @param directory Absolute directory path.
- * @param out Output buffer.
- * @param cap Bytes available at `out`.
- * @return Zero or -ENAMETOOLONG; a truncated path is never silently queried.
- */
-static int sidecar_metadata_path(const char *directory, char *out, uint32_t cap)
-{
-    uint32_t pos = 0;
-    const char *suffix = SIDECAR_FILE_NAME;
-    if (!directory || !out || cap == 0) {
-        return -RELIEFOS_EINVAL;
-    }
-    while (directory[pos] && pos + 1u < cap) {
-        out[pos] = directory[pos];
-        ++pos;
-    }
-    out[pos] = 0;
-    if (directory[pos]) {
-        return -RELIEFOS_ENAMETOOLONG;
-    }
-    if (pos > 1u) {
-        if (pos + 1u >= cap) {
-            return -RELIEFOS_ENAMETOOLONG;
-        }
-        out[pos++] = '/';
-        out[pos] = 0;
-    }
-    while (*suffix) {
-        if (pos + 1u >= cap) {
-            return -RELIEFOS_ENAMETOOLONG;
-        }
-        out[pos++] = *suffix++;
-        out[pos] = 0;
-    }
-    return 0;
-}
-
 /** @brief Page count a buffer of `length` bytes was allocated from. */
 static uint32_t sidecar_pages(uint32_t length)
 {
@@ -277,64 +183,29 @@ static uint32_t sidecar_pages(uint32_t length)
                        SIDECAR_PAGE_BYTES));
 }
 
-/**
- * @brief True when the volume owning `path` records metadata in a sidecar file.
- * @param path Absolute path whose mounted volume is in question.
- * @return Nonzero for FAT32 and exFAT volumes, which have no inode fields.
- *
- * ext2, tmpfs, proc-like and device nodes keep ownership elsewhere; probing
- * them for a sidecar would create a second authority over the same fact and
- * cost a directory scan on every unlink and rename.
+/** @brief Read metadata through the caller's already selected directory.
+ * @param io Borrowed backend and context; no namespace lookup is performed here.
+ * @param out_data Receives owned page allocation or NULL for absent metadata.
+ * @param out_len Receives image length, zero if absent.
+ * @return Zero or negative errno; errors release any successful read buffer.
  */
-static int sidecar_volume_owns(const char *path)
-{
-    uint32_t volume_id = 0;
-    if (storage_path_volume_id(path, &volume_id) < 0) {
-        return 0;
-    }
-    if (volume_id >= STORAGE_MAX_VOLUMES || !g_volumes[volume_id].ready) {
-        return 0;
-    }
-    return g_volumes[volume_id].filesystem == STORAGE_FILESYSTEM_FAT32 ||
-           g_volumes[volume_id].filesystem == STORAGE_FILESYSTEM_EXFAT;
-}
-
-/**
- * @brief Read a directory's sidecar image into freshly allocated pages.
- * @param directory Absolute directory path owning the sidecar.
- * @param out_data Output image; NULL when the file is absent, which is a valid
- *                 "no explicit metadata" state rather than an error.
- * @param out_len Output; bytes at `*out_data`.
- * @return Zero or the storage error. Damaged content is reported by
- *         sidecar_is_corrupt(), not here, so callers can tell them apart.
- */
-static int sidecar_load(const char *directory, const uint8_t **out_data,
+static int sidecar_load(const struct storage_sidecar_io *io,const uint8_t **out_data,
                         uint32_t *out_len)
 {
-    char path[RELIEFOS_FS_PATH_LEN];
     const void *data = 0;
     size_t length = 0;
-    int ret = sidecar_metadata_path(directory, path, sizeof(path));
-    if (ret < 0) {
-        return ret;
-    }
-    ret = storage_read_file(path, &data, &length);
+    int ret = io->read(io->context,&data,&length);
     if (ret == -RELIEFOS_ENOENT) {
         *out_data = 0;
         *out_len = 0;
         return 0;
     }
-    if (ret < 0) {
-        return ret;
-    }
+    if (ret < 0) return ret;
     if (!data || length > SIDECAR_MAX_BYTES) {
-        if (data) {
-            mm_free_pages(mm_virt_to_phys(data),
-                          sidecar_pages((uint32_t)length));
-        }
+        if (data) mm_free_pages(mm_virt_to_phys(data),sidecar_pages((uint32_t)length));
         return -RELIEFOS_EIO;
     }
-    *out_data = (const uint8_t *)data;
+    *out_data = data;
     *out_len = (uint32_t)length;
     return 0;
 }
@@ -574,24 +445,21 @@ static void sidecar_default_permissions(const char *path, struct reliefos_permis
 
 /**
  * @brief Read one sidecar member's metadata, or its default when unstored.
- * @param path Absolute path to query.
+ * @param io Borrowed selected-directory I/O under execution ownership.
+ * @param name Single member name; dot identifies filesystem root metadata.
+ * @param path Intrinsic backend name used only for unstored default policy.
  * @param out Output metadata.
  * @return Zero, -EINVAL for a malformed path, or -EIO when the directory's
  *         sidecar is damaged (a default is never substituted for it).
  */
-static int sidecar_fetch(const char *path, struct reliefos_permissions *out)
+static int sidecar_fetch(const struct storage_sidecar_io *io,const char *name,
+                          const char *path,struct reliefos_permissions *out)
 {
-    char parent[RELIEFOS_FS_PATH_LEN];
-    char name[RELIEFOS_FS_NAME_LEN];
     const uint8_t *image = 0;
     uint32_t length = 0;
     uint32_t cursor = SIDECAR_HEADER_BYTES;
     struct sidecar_record record;
-    int ret = sidecar_parent_name(path, parent, sizeof(parent), name, sizeof(name));
-    if (ret < 0) {
-        return ret;
-    }
-    ret = sidecar_load(parent, &image, &length);
+    int ret = sidecar_load(io, &image, &length);
     if (ret < 0) {
         return ret;
     }
@@ -627,11 +495,15 @@ static int sidecar_fetch(const char *path, struct reliefos_permissions *out)
 
 /**
  * @brief Apply one edit to a directory's sidecar records and store the result.
- * @param directory Absolute directory path owning the sidecar.
+ * @param io Borrowed selected-directory I/O under execution ownership.
  * @param name Record the edit targets, matched case-insensitively.
  * @param edit How to touch the targeted record.
- * @param value Metadata for SIDECAR_EDIT_SET; ignored otherwise.
+ * @param value Metadata for SET, or a RENAME fallback when the source has no
+ * explicit record. Existing source ACL records remain intact.
  * @param new_name Final component for SIDECAR_EDIT_RENAME; ignored otherwise.
+ * @param replacement Optional full record/ACL cloned for SET by prepared moves.
+ * @param normalize Emit an unchanged decoded record set to the capture writer,
+ * dropping old padding before new space is reserved; ordinary edits pass false.
  * @return Zero or a negative errno, and zero without any write when the edit
  *         has nothing to change. A damaged sidecar is left untouched by REMOVE
  *         and RENAME, because repairing it would need the information that is
@@ -641,8 +513,9 @@ static int sidecar_fetch(const char *path, struct reliefos_permissions *out)
  * so a version-1 record's denial bits normalize the same way an older write
  * normalized them.
  */
-static int sidecar_edit(const char *directory, const char *name, enum sidecar_edit edit,
-                        const struct reliefos_permissions *value, const char *new_name)
+static int sidecar_edit(const struct storage_sidecar_io *io,const char *name, enum sidecar_edit edit,
+                        const struct reliefos_permissions *value, const char *new_name,const struct sidecar_record *replacement,
+                        bool normalize)
 {
     const uint8_t *image = 0;
     uint32_t length = 0;
@@ -651,7 +524,6 @@ static int sidecar_edit(const char *directory, const char *name, enum sidecar_ed
     uint32_t count = 0;
     uint64_t phys;
     uint8_t *updated;
-    char path[RELIEFOS_FS_PATH_LEN];
     struct sidecar_record record;
     struct sidecar_record candidate;
     int replaced = 0;
@@ -668,7 +540,7 @@ static int sidecar_edit(const char *directory, const char *name, enum sidecar_ed
     if (edit == SIDECAR_EDIT_RENAME && sidecar_names_match(name, new_name)) {
         return 0;
     }
-    ret = sidecar_load(directory, &image, &length);
+    ret = sidecar_load(io, &image, &length);
     if (ret < 0) {
         return ret;
     }
@@ -676,18 +548,19 @@ static int sidecar_edit(const char *directory, const char *name, enum sidecar_ed
         sidecar_unload(image, length);
         return edit == SIDECAR_EDIT_SET ? -RELIEFOS_EIO : 0;
     }
-    if (!image && edit != SIDECAR_EDIT_SET) {
+    if (!image && edit != SIDECAR_EDIT_SET && !(edit==SIDECAR_EDIT_RENAME && value)) {
         /* Nothing is tracked in this directory, so there is nothing to drop
          * or re-key, and creating a file would be a new on-disk fact. */
         return 0;
     }
-    if (edit == SIDECAR_EDIT_SET) {
-        candidate = (struct sidecar_record){0};
-        storage_copy_text(candidate.name, sizeof(candidate.name), name);
-        candidate.owner_uid = value->uid;
-        candidate.gid = value->gid;
-        candidate.mode = value->mode & 0177777u;
-        candidate.has_mode = 1;
+    if (edit == SIDECAR_EDIT_SET || (edit==SIDECAR_EDIT_RENAME && value)) {
+        if(replacement)candidate=*replacement;
+        else {
+            candidate = (struct sidecar_record){0};
+            candidate.owner_uid=value->uid;candidate.gid=value->gid;
+            candidate.mode=value->mode&0177777u;candidate.has_mode=1;
+        }
+        storage_copy_text(candidate.name,sizeof(candidate.name),edit==SIDECAR_EDIT_RENAME ? new_name : name);
     }
     uint32_t capacity = length > SIDECAR_HEADER_BYTES ? length : SIDECAR_HEADER_BYTES;
     uint32_t extra = SIDECAR_TLV_BYTES + SIDECAR_POSIX_PREFIX_BYTES +
@@ -752,14 +625,14 @@ static int sidecar_edit(const char *directory, const char *name, enum sidecar_ed
         sidecar_unload(image, length);
         return edit == SIDECAR_EDIT_SET ? -RELIEFOS_EIO : 0;
     }
-    if (ret == 0 && edit == SIDECAR_EDIT_SET && !replaced) {
+    if (ret == 0 && (edit == SIDECAR_EDIT_SET || (edit==SIDECAR_EDIT_RENAME && value)) && !replaced) {
         ret = sidecar_emit_record(updated, capacity, &position, &count,
                                   &candidate);
         if (ret == 0) {
             changed = 1;
         }
     }
-    if (ret == 0 && !changed) {
+    if (ret == 0 && !changed && !normalize) {
         mm_free_pages(phys, pages);
         sidecar_unload(image, length);
         return 0;
@@ -767,74 +640,150 @@ static int sidecar_edit(const char *directory, const char *name, enum sidecar_ed
     if (ret == 0) {
         sidecar_put_u32(updated + 8u, count);
         sidecar_put_u32(updated + 12u, sidecar_checksum(updated, position));
-        ret = sidecar_metadata_path(directory, path, sizeof(path));
-        if (ret == 0) {
-            ret = storage_write_file(path, updated, position);
-        }
+        ret = io->write(io->context,updated,position);
     }
     mm_free_pages(phys, pages);
     sidecar_unload(image, length);
     return ret;
 }
 
-int storage_sidecar_permissions(const char *path, struct reliefos_permissions *value,
-                                bool write)
+int storage_sidecar_permissions_at(const struct storage_sidecar_io *io,const char *name,
+                                      const char *intrinsic,struct reliefos_permissions *value,bool write)
 {
-    char parent[RELIEFOS_FS_PATH_LEN];
-    char name[RELIEFOS_FS_NAME_LEN];
-    int ret;
-    if (!path || !value) {
+    if(!io || !io->read || !name || !name[0] || !intrinsic || intrinsic[0]!='/' ||
+       !value || (write && !io->write))return -RELIEFOS_EINVAL;
+    size_t length=storage_strlen(name);
+    if(length>=RELIEFOS_FS_NAME_LEN)return -RELIEFOS_ENAMETOOLONG;
+    if(storage_text_eq(name,".."))return -RELIEFOS_EINVAL;
+    for(size_t i=0;i<length;++i)if(name[i]=='/')return -RELIEFOS_EINVAL;
+    return write ? sidecar_edit(io,name,SIDECAR_EDIT_SET,value,0,NULL,false) : sidecar_fetch(io,name,intrinsic,value);
+}
+
+/* Capture the existing codec's output before any directory rename. All page
+ * allocation and record validation happens here, rather than after commit. */
+struct sidecar_capture {const struct storage_sidecar_io *original;void *bytes;uint32_t length;};
+static int sidecar_capture_read(void *context,const void **data,size_t *length)
+{
+    struct sidecar_capture *capture=context;
+    return capture->original->read(capture->original->context,data,length);
+}
+static int sidecar_capture_write(void *context,const void *data,uint32_t length)
+{
+    struct sidecar_capture *capture=context;
+    uint64_t address=mm_alloc_pages(sidecar_pages(length));
+    if(!address)return -RELIEFOS_ENOMEM;
+    void *bytes=mm_phys_to_virt(address);
+    if(!bytes){mm_free_pages(address,sidecar_pages(length));return -RELIEFOS_ENOMEM;}
+    storage_memcpy(bytes,data,length);capture->bytes=bytes;capture->length=length;return 0;
+}
+
+/* Unknown TLVs are already part of the on-disk forward-compatible format.
+ * Valid padding reserves enough existing file space for either image, so the
+ * final metadata write cannot allocate, grow a chain, or report ENOSPC. */
+static int sidecar_pad_image(const uint8_t *image,uint32_t length,uint32_t capacity,void **out)
+{
+    *out=NULL;
+    if(capacity<length || capacity<SIDECAR_HEADER_BYTES || capacity>SIDECAR_MAX_BYTES)return -RELIEFOS_EINVAL;
+    uint64_t address=mm_alloc_pages(sidecar_pages(capacity));if(!address)return -RELIEFOS_ENOMEM;
+    uint8_t *bytes=mm_phys_to_virt(address);
+    if(!bytes){mm_free_pages(address,sidecar_pages(capacity));return -RELIEFOS_ENOMEM;}
+    storage_memzero(bytes,capacity);
+    if(image)storage_memcpy(bytes,image,length);
+    else {
+        sidecar_put_u32(bytes,SIDECAR_MAGIC);sidecar_put_u32(bytes+4,SIDECAR_DISK_VERSION);
+        length=SIDECAR_HEADER_BYTES;
+    }
+    uint32_t at=length;
+    while(at<capacity) {
+        uint32_t remaining=capacity-at,chunk=remaining>65539u ? 65539u : remaining;
+        if(remaining>chunk && remaining-chunk<SIDECAR_TLV_BYTES+SIDECAR_RECORD_PREFIX_BYTES)
+            chunk-=SIDECAR_TLV_BYTES+SIDECAR_RECORD_PREFIX_BYTES;
+        if(chunk<SIDECAR_TLV_BYTES+SIDECAR_RECORD_PREFIX_BYTES) {
+            mm_free_pages(address,sidecar_pages(capacity));return -RELIEFOS_EINVAL;
+        }
+        sidecar_put_u16(bytes+at,0xffff);sidecar_put_u16(bytes+at+2,(uint16_t)(chunk-SIDECAR_TLV_BYTES));
+        at+=chunk;
+    }
+    sidecar_put_u32(bytes+12,sidecar_checksum(bytes,capacity));*out=bytes;return 0;
+}
+
+static int sidecar_prepare_image(const struct storage_sidecar_io *io,const char *old_name,
+                                    enum sidecar_edit edit,const char *new_name,
+                                    const struct reliefos_permissions *fallback,
+                                    const struct sidecar_record *replacement,struct storage_sidecar_change *out)
+{
+    if(!out)return -RELIEFOS_EINVAL;
+    *out=(struct storage_sidecar_change){0};
+    if(!io || !io->read || !old_name || (edit==SIDECAR_EDIT_RENAME && !new_name))return -RELIEFOS_EINVAL;
+    const char *names[]={old_name,new_name};
+    for(unsigned n=0;n<2;++n) {
+        if(!names[n])continue;
+        size_t length=storage_strlen(names[n]);
+        if(!length || length>=RELIEFOS_FS_NAME_LEN || storage_text_eq(names[n],".") || storage_text_eq(names[n],".."))return -RELIEFOS_EINVAL;
+        for(size_t i=0;i<length;++i)if(names[n][i]=='/')return -RELIEFOS_EINVAL;
+    }
+    const uint8_t *before=NULL;uint32_t old_length=0;
+    int rc=sidecar_load(io,&before,&old_length);if(rc)return rc;
+    if(sidecar_is_corrupt(before,old_length)){sidecar_unload(before,old_length);return -RELIEFOS_EIO;}
+    struct sidecar_capture capture={.original=io};
+    struct storage_sidecar_io deferred={&capture,sidecar_capture_read,sidecar_capture_write};
+    rc=sidecar_edit(&deferred,old_name,edit,fallback,new_name,replacement,true);
+    if(!rc && !capture.bytes) {
+        uint8_t empty[SIDECAR_HEADER_BYTES]={0};
+        sidecar_put_u32(empty,SIDECAR_MAGIC);sidecar_put_u32(empty+4,SIDECAR_DISK_VERSION);
+        sidecar_put_u32(empty+12,sidecar_checksum(empty,sizeof(empty)));
+        rc=sidecar_capture_write(&capture,before ? before : empty,before ? old_length : sizeof(empty));
+    }
+    uint32_t capacity=capture.length+SIDECAR_PAGE_BYTES;
+    if(capacity<old_length)capacity=old_length;
+    if(capacity>old_length && capacity-old_length<SIDECAR_TLV_BYTES+SIDECAR_RECORD_PREFIX_BYTES)
+        capacity+=SIDECAR_PAGE_BYTES;
+    if(!rc && capacity>SIDECAR_MAX_BYTES)rc=-RELIEFOS_EFBIG;
+    if(!rc)rc=sidecar_pad_image(before,old_length,capacity,&out->before);
+    if(!rc)rc=sidecar_pad_image(capture.bytes,capture.length,capacity,&out->after);
+    sidecar_unload(before,old_length);sidecar_unload(capture.bytes,capture.length);
+    out->length=capacity;
+    if(rc)storage_sidecar_change_release(out);
+    return rc;
+}
+
+int storage_sidecar_prepare_rename(const struct storage_sidecar_io *io,const char *old_name,
+                                      const char *new_name,const struct reliefos_permissions *fallback,
+                                      struct storage_sidecar_change *out)
+{
+    if(!fallback)return -RELIEFOS_EINVAL;
+    return sidecar_prepare_image(io,old_name,SIDECAR_EDIT_RENAME,new_name,fallback,NULL,out);
+}
+
+int storage_sidecar_prepare_move(const struct storage_sidecar_io *source,const char *old_name,
+                                    const struct storage_sidecar_io *destination,const char *new_name,
+                                    const struct reliefos_permissions *fallback,
+                                    struct storage_sidecar_change *old_image,struct storage_sidecar_change *new_image)
+{
+    if(!old_image || !new_image)return -RELIEFOS_EINVAL;
+    *old_image=(struct storage_sidecar_change){0};*new_image=(struct storage_sidecar_change){0};
+    if(!source || !source->read || !destination || !destination->read || !old_name || !new_name || !fallback)
         return -RELIEFOS_EINVAL;
+    struct sidecar_record candidate={.owner_uid=fallback->uid,.gid=fallback->gid,
+        .mode=fallback->mode,.has_mode=1};
+    const uint8_t *bytes=NULL;uint32_t length=0,cursor=SIDECAR_HEADER_BYTES;
+    int rc=sidecar_load(source,&bytes,&length);
+    if(!rc && sidecar_is_corrupt(bytes,length))rc=-RELIEFOS_EIO;
+    while(!rc && bytes) {
+        struct sidecar_record found;int next=sidecar_next_record(bytes,length,&cursor,&found);
+        if(next<=0){rc=next;break;}
+        if(sidecar_names_match(found.name,old_name)){candidate=found;break;}
     }
-    if (!write) {
-        return sidecar_fetch(path, value);
-    }
-    ret = sidecar_parent_name(path, parent, sizeof(parent), name, sizeof(name));
-    if (ret < 0) {
-        return ret;
-    }
-    return sidecar_edit(parent, name, SIDECAR_EDIT_SET, value, 0);
+    sidecar_unload(bytes,length);
+    if(!rc)rc=sidecar_prepare_image(source,old_name,SIDECAR_EDIT_REMOVE,NULL,NULL,NULL,old_image);
+    if(!rc)rc=sidecar_prepare_image(destination,new_name,SIDECAR_EDIT_SET,NULL,fallback,&candidate,new_image);
+    if(rc){storage_sidecar_change_release(old_image);storage_sidecar_change_release(new_image);}
+    return rc;
 }
 
-int storage_sidecar_note_deleted(const char *path)
+void storage_sidecar_change_release(struct storage_sidecar_change *change)
 {
-    char parent[RELIEFOS_FS_PATH_LEN];
-    char name[RELIEFOS_FS_NAME_LEN];
-    int ret;
-    if (!path || !sidecar_volume_owns(path)) {
-        return 0;
-    }
-    ret = sidecar_parent_name(path, parent, sizeof(parent), name, sizeof(name));
-    if (ret < 0) {
-        return ret;
-    }
-    return sidecar_edit(parent, name, SIDECAR_EDIT_REMOVE, 0, 0);
-}
-
-int storage_sidecar_note_renamed(const char *path, const char *new_path)
-{
-    char old_parent[RELIEFOS_FS_PATH_LEN];
-    char new_parent[RELIEFOS_FS_PATH_LEN];
-    char old_name[RELIEFOS_FS_NAME_LEN];
-    char new_name[RELIEFOS_FS_NAME_LEN];
-    int ret;
-    if (!path || !new_path || !sidecar_volume_owns(new_path)) {
-        return 0;
-    }
-    ret = sidecar_parent_name(path, old_parent, sizeof(old_parent),
-                              old_name, sizeof(old_name));
-    if (ret < 0) {
-        return ret;
-    }
-    ret = sidecar_parent_name(new_path, new_parent, sizeof(new_parent),
-                              new_name, sizeof(new_name));
-    if (ret < 0) {
-        return ret;
-    }
-    if (!storage_text_eq_ci(old_parent, new_parent)) {
-        /* Moving between directories leaves the record with the old
-         * directory, matching the behavior this replaces. */
-        return 0;
-    }
-    return sidecar_edit(old_parent, old_name, SIDECAR_EDIT_RENAME, 0, new_name);
+    if(!change)return;
+    sidecar_unload(change->before,change->length);sidecar_unload(change->after,change->length);
+    *change=(struct storage_sidecar_change){0};
 }

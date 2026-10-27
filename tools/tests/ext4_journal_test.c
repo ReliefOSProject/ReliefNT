@@ -55,7 +55,7 @@ static void load_geometry(void)
     volume.ext4.inode_size=sb.inode_size; volume.ext4.inodes_count=sb.inodes_count;
     volume.ext4.inodes_per_group=sb.inodes_per_group; volume.ext4.blocks_per_group=sb.blocks_per_group;
     volume.ext_sector_count=disk_len/512; ++volume.mount_generation;
-    volume.kind=STORAGE_VOLUME_RAM; volume.ready=1; volume.filesystem=STORAGE_FILESYSTEM_EXT4;
+    volume.kind=STORAGE_VOLUME_BLOCK; volume.ready=1; volume.filesystem=STORAGE_FILESYSTEM_EXT4;
     volume.read_only_reason=0; volume.ext4.fs_error=0;
 }
 static uint64_t file_block(uint64_t ino, uint64_t logical)

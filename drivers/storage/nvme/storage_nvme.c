@@ -1,3 +1,4 @@
+#include <reliefnt/console.h>
 /*
  * Synchronous NVMe 1.x PCI transport.
  *
@@ -12,12 +13,14 @@
 
 #include "storage_nvme.h"
 #include "../../../block/core/storage_core_api.h"
-#include "../../../fs/fs_mount_api.h"
+#include <reliefnt/module.h>
+#include <reliefnt/heap.h>
 #include <reliefnt/mm.h>
 #include <reliefnt/pci.h>
 #include <reliefnt/paging.h>
 
 #define NVME_MAX_CONTROLLERS 8u
+#define NVME_MMIO_BYTES 0x4000u
 #define NVME_QUEUE_DEPTH 32u
 #define NVME_MAX_PRP_ENTRIES (NVME_IO_BUFFER_PAGES - 1u)
 #define NVME_WAIT_SPINS 40000000u
@@ -76,26 +79,21 @@ struct __attribute__((packed)) nvme_completion {
 
 
 static struct nvme_controller g_nvme_controllers[NVME_MAX_CONTROLLERS];
-static uint32_t g_nvme_controller_count;
 
 static void nvme_write32(const struct nvme_controller *controller, uint32_t offset,
                          uint32_t value);
 static int nvme_wait_ready(const struct nvme_controller *controller, uint8_t wanted);
-static void nvme_release_controller_memory(struct nvme_controller *controller);
+/** @brief Free only controller backing for which STOP proved no further DMA.
+ * @param controller Stable exclusively locked driver-owned controller.
+ * @return Zero, -EINVAL for NULL, -EBUSY when hardware ownership remains.
+ */
+static int nvme_release_controller_memory(struct nvme_controller *controller);
+/** @brief Disable and wait for RDY=0, including a previous incomplete disable.
+ * @param controller Stable mapped controller under driver exclusion.
+ * @return Zero, -EINVAL or -EIO; failed STOP retains dma_active and all pages.
+ */
+static int nvme_disable_controller(struct nvme_controller *controller);
 
-void nvme_reset_all_controllers(void)
-{
-    for (uint32_t i = 0; i < g_nvme_controller_count; ++i) {
-        struct nvme_controller *controller = &g_nvme_controllers[i];
-        if (controller->mmio && controller->ready) {
-            nvme_write32(controller, NVME_REG_CC, 0);
-            (void)nvme_wait_ready(controller, 0);
-        }
-        nvme_release_controller_memory(controller);
-        storage_memzero(controller, sizeof(*controller));
-    }
-    g_nvme_controller_count = 0;
-}
 
 static void nvme_cpu_relax(void)
 {
@@ -174,23 +172,24 @@ static void nvme_reset_queue_state(struct nvme_controller *controller)
     controller->next_command_id = 0;
 }
 
+/** @brief Disable hardware and await RDY=0 even when CC.EN is already clear.
+ * @param controller Exclusively locked mapped controller with owned DMA pages.
+ * @return Zero only after RDY clears, -EINVAL or -EIO. Sticky CFS does not
+ * prevent observing a stopped device; failed STOP retains backing ownership.
+ */
 static int nvme_disable_controller(struct nvme_controller *controller)
 {
-    uint32_t cc;
-    if (!controller || !controller->mmio) {
-        return -22;
-    }
-    cc = nvme_read32(controller, NVME_REG_CC);
-    if ((cc & NVME_CC_EN) == 0) {
-        controller->ready = 0;
-        return 0;
-    }
-    nvme_write32(controller, NVME_REG_CC, cc & ~NVME_CC_EN);
+    if (!controller || !controller->mmio) return -22;
+    uint32_t cc = nvme_read32(controller, NVME_REG_CC);
     controller->ready = 0;
-    /* CSTS.CFS is sticky until the controller is re-enabled.  Do not let a
-     * fatal command prevent the recovery path from observing RDY=0. */
+    if (nvme_read32(controller, NVME_REG_CSTS) & NVME_CSTS_RDY)
+        controller->dma_active = 1;
+    nvme_write32(controller, NVME_REG_CC, cc & ~NVME_CC_EN);
+    nvme_memory_barrier();
     for (uint32_t i = 0; i < NVME_WAIT_SPINS; ++i) {
-        if ((nvme_read32(controller, NVME_REG_CSTS) & NVME_CSTS_RDY) == 0) {
+        if (!(nvme_read32(controller, NVME_REG_CSTS) & NVME_CSTS_RDY)) {
+            nvme_memory_barrier();
+            controller->dma_active = 0;
             return 0;
         }
         nvme_cpu_relax();
@@ -258,11 +257,14 @@ static void nvme_release_page(uint64_t *phys)
     nvme_release_pages(phys, 1u);
 }
 
-static void nvme_release_controller_memory(struct nvme_controller *controller)
+/** @brief Reclaim pages only after the hardware DMA ownership bit was retired.
+ * @param controller Stable exclusively owned controller, retained on error.
+ * @return Zero, -EINVAL for NULL, or -EBUSY while DMA may still run. No I/O.
+ */
+static int nvme_release_controller_memory(struct nvme_controller *controller)
 {
-    if (!controller) {
-        return;
-    }
+    if (!controller) return -22;
+    if (controller->dma_active) return -16;
     nvme_release_page(&controller->admin_sq_phys);
     nvme_release_page(&controller->admin_cq_phys);
     nvme_release_page(&controller->io_sq_phys);
@@ -281,6 +283,7 @@ static void nvme_release_controller_memory(struct nvme_controller *controller)
     controller->io_buffer = 0;
     controller->prp_list = 0;
     controller->io_buffer_pages = 0;
+    return 0;
 }
 
 static int nvme_submit_locked(struct nvme_controller *controller, uint8_t admin,
@@ -444,6 +447,11 @@ static int nvme_create_io_queues(struct nvme_controller *controller)
     return ret;
 }
 
+/** @brief Publish owned queues and enable hardware only after proven STOP.
+ * @param controller Stable mapped driver-owned controller, task context.
+ * @return Zero or native error; once enabled dma_active retains all backing
+ * until a later successful STOP, including initialization timeout/error.
+ */
 static int nvme_program_controller(struct nvme_controller *controller)
 {
     uint32_t cc;
@@ -464,6 +472,12 @@ static int nvme_program_controller(struct nvme_controller *controller)
     nvme_memory_barrier();
     cc = NVME_CC_EN | (6u << NVME_CC_IOSQES_SHIFT) |
          (4u << NVME_CC_IOCQES_SHIFT);
+    /* Enable bus mastering only after STOP and complete owned queue setup. */
+    uint16_t pci_command = pci_config_read16(controller->bus, controller->slot,
+                                            controller->function, 0x04);
+    pci_config_write16(controller->bus, controller->slot, controller->function,
+                       0x04, (uint16_t)(pci_command | 0x0006u));
+    controller->dma_active = 1;
     nvme_write32(controller, NVME_REG_CC, cc);
     ret = nvme_wait_ready(controller, 1);
     if (ret < 0) {
@@ -473,6 +487,11 @@ static int nvme_program_controller(struct nvme_controller *controller)
     return nvme_create_io_queues(controller);
 }
 
+/** @brief Rebuild queue state only after the failed controller stopped DMA.
+ * @param controller Stable controller with its lock held by the I/O caller.
+ * @return Zero or native error; failed STOP preserves old queue/data pages and
+ * marks the controller unavailable without clearing hardware ownership.
+ */
 static int nvme_reinitialize_controller(struct nvme_controller *controller)
 {
     int ret;
@@ -490,6 +509,7 @@ static int nvme_reinitialize_controller(struct nvme_controller *controller)
         nvme_write64(controller, NVME_REG_ASQ, controller->admin_sq_phys);
         nvme_write64(controller, NVME_REG_ACQ, controller->admin_cq_phys);
         nvme_memory_barrier();
+        controller->dma_active = 1;
         nvme_write32(controller, NVME_REG_CC,
                      NVME_CC_EN | (6u << NVME_CC_IOSQES_SHIFT) |
                      (4u << NVME_CC_IOCQES_SHIFT));
@@ -507,13 +527,17 @@ static int nvme_reinitialize_controller(struct nvme_controller *controller)
     return ret;
 }
 
+/** @brief Validate native NVMe capabilities and create owned queues/data pages.
+ * @param controller Reserved mapped slot, BSP probe or serialized task context.
+ * @return Zero or native error; partial allocations are freed only after STOP.
+ * Failed STOP retains the occupied slot and pages for cleanup/retry.
+ */
 static int nvme_initialize_controller(struct nvme_controller *controller)
 {
     uint64_t cap;
     uint32_t max_entries;
     uint32_t mpsmin;
     uint32_t mpsmax;
-    uint32_t cc;
     uint32_t version;
     int ret;
 
@@ -556,13 +580,8 @@ static int nvme_initialize_controller(struct nvme_controller *controller)
         return -95;
     }
 
-    cc = nvme_read32(controller, NVME_REG_CC);
-    if (cc & NVME_CC_EN) {
-        nvme_write32(controller, NVME_REG_CC, cc & ~NVME_CC_EN);
-        if (nvme_wait_ready(controller, 0) < 0) {
-            return -5;
-        }
-    }
+    ret = nvme_disable_controller(controller);
+    if (ret < 0) return ret;
 
     ret = nvme_allocate_page(&controller->admin_sq_phys, (uint8_t **)(void *)&controller->admin_sq);
     if (ret < 0) goto fail;
@@ -601,9 +620,12 @@ static int nvme_initialize_controller(struct nvme_controller *controller)
 
 fail:
     controller->ready = 0;
-    nvme_write32(controller, NVME_REG_CC, 0);
-    (void)nvme_wait_ready(controller, 0);
-    nvme_release_controller_memory(controller);
+    if (!nvme_disable_controller(controller)) {
+        (void)nvme_release_controller_memory(controller);
+    } else {
+        console_error("[reliefnt] NVMe init rollback retained live DMA pci=%u:%u.%u\n",
+                      controller->bus, controller->slot, controller->function);
+    }
     return ret < 0 ? ret : -5;
 }
 
@@ -749,39 +771,120 @@ static int nvme_namespace_usable(struct nvme_controller *controller, uint32_t ns
     return 0;
 }
 
-static void nvme_register_namespace(struct nvme_controller *controller, uint32_t nsid,
-                                    uint8_t *root_ready)
+struct nvme_namespace {
+    struct nvme_controller *controller;
+    uint32_t nsid;
+    struct block_device_registration registration;
+};
+
+/** @brief Read a namespace extent through controller-owned PRP/DMA backing.
+ * @param context Stable owned namespace. @param first First sector.
+ * @param count Validated sectors. @param buffer Current writable kernel bytes.
+ * @return Zero or native errno. Caller pins exact block/code and transport;
+ * controller lock serializes queues, no registry lock spans native commands.
+ */
+static int nvme_block_read(void *context,uint64_t first,uint32_t count,void *buffer)
+{
+    struct nvme_namespace *ns=context;
+    return nvme_readwrite(ns->controller,ns->nsid,first,count,buffer,0);
+}
+/** @brief Write one validated namespace extent from current readable kernel bytes.
+ * @param context Stable owned namespace. @param first First sector.
+ * @param count Nonzero sectors. @param buffer Readable current extent.
+ * @return Zero or native errno; queue/DMA exclusion and exact code are pinned
+ * by caller, no registry lock spans hardware, caller memory is never DMA.
+ */
+static int nvme_block_write(void *context,uint64_t first,uint32_t count,const void *buffer)
+{
+    struct nvme_namespace *ns=context;
+    return nvme_readwrite(ns->controller,ns->nsid,first,count,(void *)buffer,1);
+}
+/** @brief Flush one registered namespace after filesystem writeback completes.
+ * @param context Stable owned namespace under exact block/code lifetime.
+ * @return Zero or native errno; caller owns transport exclusion, no registry
+ * lock spans completion. The controller serializes its native queue internally.
+ */
+static int nvme_block_flush(void *context)
+{
+    struct nvme_namespace *ns=context;return nvme_flush_cache(ns->controller,ns->nsid);
+}
+static const struct block_device_operations nvme_operations={
+    .read=nvme_block_read,.write=nvme_block_write,.flush=nvme_block_flush};
+
+/** @brief Release one namespace only after its registration and controller drain.
+ * @param context Owned heap namespace, consumed once by owner final release.
+ * Execution cleanup task, no native I/O or callback. Controller backing has its
+ * own ledger entry and remains valid through all namespace release callbacks.
+ */
+static void nvme_namespace_release(void *context) {kernel_free(context);}
+
+/** @brief Identify and register a namespace independently of filesystem presence.
+ * @param controller Stable initialized controller with cleanup already owned.
+ * @param nsid Nonzero NVMe namespace identity.
+ * @return Zero for absent/incompatible or successfully published namespaces;
+ * negative allocation/registration errno triggers complete native init rollback.
+ * Init task, no module self-pin; immutable scalar geometry precedes admission.
+ */
+static int nvme_register_namespace(struct nvme_controller *controller,uint32_t nsid)
 {
     uint64_t sectors;
-    struct install_disk_state *disk;
-    if (!controller || !root_ready || !nsid ||
-        g_install_disk_count >= STORAGE_MAX_INSTALL_DISKS ||
-        nvme_namespace_usable(controller, nsid, &sectors) < 0) {
-        return;
-    }
-    disk = &g_install_disks[g_install_disk_count++];
-    storage_memzero(disk, sizeof(*disk));
-    disk->present = true;
-    disk->bus = controller->bus;
-    disk->slot = controller->slot;
-    disk->function = controller->function;
-    disk->port = nsid <= 0xffu ? (uint8_t)nsid : 0xffu;
-    disk->transport = STORAGE_TRANSPORT_NVME;
-    disk->nvme = controller;
-    disk->nvme_controller_index = controller->controller_index;
-    disk->nvme_nsid = nsid;
-    disk->sector_count = sectors;
-    storage_copy_text(disk->device_model, sizeof(disk->device_model), controller->model);
-    console_info("[reliefnt] NVMe namespace ready pci=%u:%u.%u nsid=%u sectors=%llu model=\"%s\"\n",
-                   controller->bus, controller->slot, controller->function, nsid,
-                   (unsigned long long)sectors, disk->device_model);
-    if (!*root_ready && storage_try_mount_root_disk(disk) == 0) {
-        *root_ready = 1;
-    }
+    if(nvme_namespace_usable(controller,nsid,&sectors)<0)return 0;
+    struct nvme_namespace *ns=kernel_malloc(sizeof(*ns));if(!ns)return -12;
+    *ns=(struct nvme_namespace){.controller=controller,.nsid=nsid,.registration={
+        .info={.device=block_device_allocate_number(false),.blocks=sectors,.block_size=512,
+            .max_blocks=NVME_MAX_SECTORS,.transport=STORAGE_TRANSPORT_NVME,
+            .bus=controller->bus,.slot=controller->slot,.function=controller->function,
+            .port=nsid<256 ? nsid : 255,.controller=controller->controller_index,.namespace_id=nsid},
+        .operations=&nvme_operations,.context=ns,.owner=THIS_MODULE}};
+    storage_copy_text(ns->registration.info.model,sizeof(ns->registration.info.model),controller->model);
+    int rc=module_add_resource(THIS_MODULE,NULL,nvme_namespace_release,ns);
+    if(rc){kernel_free(ns);return rc;}
+    rc=register_block_device(&ns->registration);
+    if(rc && !THIS_MODULE)kernel_free(ns);
+    if(!rc)console_info("[nvme] registered pci=%u:%u.%u nsid=%u sectors=%llu model=%s\n",
+        controller->bus,controller->slot,controller->function,nsid,(unsigned long long)sectors,controller->model);
+    return rc;
 }
 
-void storage_scan_nvme_controller(uint8_t bus, uint8_t slot, uint8_t function,
-                                         uint8_t *root_ready)
+/** @brief STOP one controller while retaining all pages and BAR on failure.
+ * @param context Stable controller, admission/users already closed.
+ * @return Zero or native STOP errno, including repeated EN=0/RDY=1 waits.
+ * Cleanup under execution ownership, no module/registry lock across MMIO wait.
+ */
+static int nvme_controller_stop(void *context)
+{
+    struct nvme_controller *controller=context;
+    if(!controller->mmio)return 0;
+    int rc=nvme_disable_controller(controller);
+    if(!rc) {
+        uint16_t command=pci_config_read16(controller->bus,controller->slot,controller->function,4);
+        pci_config_write16(controller->bus,controller->slot,controller->function,4,command&~4u);
+    }
+    return rc;
+}
+/** @brief Release exact owned queue/data pages and BAR only after successful STOP.
+ * @param context Owned static controller slot, consumed/reset after all namespace
+ * registrations/users/callbacks drain. Cleanup task, no allocation/native I/O;
+ * failed quiesce never reaches this callback or frees a live queue/PRP pointer.
+ */
+static void nvme_controller_release(void *context)
+{
+    struct nvme_controller *controller=context;
+    if(!controller->mmio)return;
+    (void)nvme_release_controller_memory(controller);
+    pci_unmap_mmio((void *)controller->mmio,NVME_MMIO_BYTES);
+    storage_memzero(controller,sizeof(*controller));
+}
+
+/** @brief Probe one PCI controller into a free, nonquarantined native slot.
+ * @param bus PCI bus number.
+ * @param slot PCI slot number.
+ * @param function PCI function number.
+ * @return Zero or native allocation/probe errno; no filesystem callbacks.
+ * Caller serializes discovery before tasks/AP I/O. Failed STOP retains its slot;
+ * later controllers never overwrite live queue pointers, even after init fails.
+ */
+static int nvme_probe_controller(uint8_t bus,uint8_t slot,uint8_t function)
 {
     struct nvme_controller *controller;
     uint32_t bar0;
@@ -794,45 +897,49 @@ void storage_scan_nvme_controller(uint8_t bus, uint8_t slot, uint8_t function,
     uint8_t list_failed = 0;
     int ret;
 
-    if (!root_ready || g_nvme_controller_count >= NVME_MAX_CONTROLLERS) {
-        return;
-    }
+    uint32_t controller_index = 0;
+    while (controller_index < NVME_MAX_CONTROLLERS &&
+           g_nvme_controllers[controller_index].mmio) ++controller_index;
+    if (controller_index == NVME_MAX_CONTROLLERS) return -19;
     bar0 = pci_config_read32(bus, slot, function, 0x10);
     if (!bar0 || (bar0 & 1u) != 0) {
         console_error("[reliefnt] NVMe pci=%u:%u.%u has no memory BAR0\n", bus, slot, function);
-        return;
+        return -19;
     }
     if (((bar0 >> 1) & 3u) == 2u) {
         bar1 = pci_config_read32(bus, slot, function, 0x14);
     } else if (((bar0 >> 1) & 3u) != 0u) {
-        return;
+        return -19;
     }
     bar_phys = ((uint64_t)bar1 << 32) | (bar0 & ~0x0fu);
-    if (!bar_phys || !paging_kernel_direct_map_range(bar_phys, 0x4000u)) {
-        return;
-    }
-    controller = &g_nvme_controllers[g_nvme_controller_count];
+    if (!bar_phys) return -19;
+    controller = &g_nvme_controllers[controller_index];
     storage_memzero(controller, sizeof(*controller));
     controller->bus = bus;
     controller->slot = slot;
     controller->function = function;
-    controller->controller_index = (uint16_t)g_nvme_controller_count;
-    controller->mmio = (volatile uint8_t *)paging_kernel_direct_map(bar_phys);
-    if (!controller->mmio) {
-        return;
-    }
-    kernel_spin_init(&controller->lock);
+    controller->controller_index = (uint16_t)controller_index;
     pci_command = pci_config_read16(bus, slot, function, 0x04);
-    pci_config_write16(bus, slot, function, 0x04, (uint16_t)(pci_command | 0x0006u));
+    pci_config_write16(bus, slot, function, 0x04,
+                       (uint16_t)((pci_command | 0x0002u) & ~0x0004u));
+    controller->mmio = pci_map_mmio(bar_phys, NVME_MMIO_BYTES);
+    if (!controller->mmio) {
+        console_error("[reliefnt] NVMe BAR mapping failed pci=%u:%u.%u physical=0x%llx\n",
+                      bus, slot, function, (unsigned long long)bar_phys);
+        storage_memzero(controller, sizeof(*controller));
+        return -19;
+    }
+    ret=module_add_resource(THIS_MODULE,nvme_controller_stop,nvme_controller_release,controller);
+    if(ret){pci_unmap_mmio((void *)controller->mmio,NVME_MMIO_BYTES);storage_memzero(controller,sizeof(*controller));return ret;}
+    kernel_spin_init(&controller->lock);
     ret = nvme_initialize_controller(controller);
     if (ret < 0) {
         console_error("[reliefnt] NVMe controller init failed pci=%u:%u.%u ret=%d\n",
                        bus, slot, function, ret);
-        storage_memzero(controller, sizeof(*controller));
-        return;
+        if(!THIS_MODULE && !nvme_controller_stop(controller))nvme_controller_release(controller);
+        return ret;
     }
     controller->present = 1;
-    ++g_nvme_controller_count;
 
     for (uint32_t page = 0; page < NVME_MAX_NAMESPACE_SCAN_PAGES && !finished; ++page) {
         ret = nvme_identify(controller, start_nsid, NVME_IDENTIFY_ACTIVE_NAMESPACE_LIST,
@@ -855,7 +962,7 @@ void storage_scan_nvme_controller(uint8_t bus, uint8_t slot, uint8_t function,
             }
             start_nsid = nsid;
             ++namespace_ids_seen;
-            nvme_register_namespace(controller, nsid, root_ready);
+            ret=nvme_register_namespace(controller,nsid);if(ret)return ret;
         }
         if (start_nsid >= controller->namespace_count) {
             finished = 1;
@@ -866,7 +973,26 @@ void storage_scan_nvme_controller(uint8_t bus, uint8_t slot, uint8_t function,
         console_info("[reliefnt] NVMe using bounded namespace scan pci=%u:%u.%u nn=%u\n",
                        bus, slot, function, controller->namespace_count);
         for (uint32_t nsid = 1; nsid <= limit; ++nsid) {
-            nvme_register_namespace(controller, nsid, root_ready);
+            ret=nvme_register_namespace(controller,nsid);if(ret)return ret;
         }
     }
+    return 0;
+}
+
+/** @brief Discover/register NVMe devices in early builtin or native module init.
+ * @return Zero when absent/successful, or first controller error triggering
+ * native owner rollback. Init task after MM/IRQ setup, no root/filesystem code.
+ * No registration self-pins its owner; COMING admission remains closed.
+ */
+int nvme_probe_all(void)
+{
+    int first=0;
+    for(unsigned bus=0;bus<256;++bus)for(unsigned slot=0;slot<32;++slot)for(unsigned fn=0;fn<8;++fn) {
+        struct pci_device device;
+        if(pci_read_device(bus,slot,fn,&device)){if(!fn)break;continue;}
+        if(device.class_code==ATA_CLASS_MASS_STORAGE && device.subclass==ATA_SUBCLASS_NVM && device.prog_if==ATA_PROGIF_NVME) {
+            int rc=nvme_probe_controller(bus,slot,fn);if(rc && !first)first=rc;
+        }
+    }
+    return first;
 }

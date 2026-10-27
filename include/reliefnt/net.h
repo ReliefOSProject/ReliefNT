@@ -109,6 +109,15 @@ int net_socket_send(struct reliefos_net_socket_io *request, uint32_t owner_pid);
  */
 int net_socket_recv(struct reliefos_net_socket_io *request, uint32_t owner_pid);
 /**
+ * @brief Copy TCP receive bytes while preserving the unread ring and window.
+ * @param request Borrowed handle, writable length-byte buffer and output status/progress.
+ * @param owner_pid Optional owner filter, zero for the caller's independently held socket.
+ * @return Zero when processed, negative internal validation error otherwise.
+ * Caller owns execution and socket lifetime. EOF/reset/timeout use the same
+ * status mapping as net_socket_recv; no code or buffer ownership is transferred.
+ */
+int net_socket_peek(struct reliefos_net_socket_io *request, uint32_t owner_pid);
+/**
  * @brief Begin closing a TCP socket after queued stream data has drained.
  * @param request Socket handle and output status.
  * @param owner_pid Required socket owner process identifier.

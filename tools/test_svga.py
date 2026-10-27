@@ -44,7 +44,7 @@ class SvgaTests(unittest.TestCase):
             "paging_kernel_direct_map", "paging_kernel_direct_map_range",
             "paging_mmio_uncached",
             "paging_mmio_writeback_nx", "pci_device_bar_contains",
-            "drm_device_pci_identity", "x86_64_inl",
+            "framebuffer_vmware_pci_identity", "x86_64_inl",
             "x86_64_outl", "memcpy", "memset", "memmove", "kernel_malloc",
             "kernel_free",
         }

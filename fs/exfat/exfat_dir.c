@@ -1,4 +1,5 @@
 #include "internal.h"
+#include "../dos_time.h"
 
 static int exfat_dir_cache_load(uint32_t directory_cluster, uint8_t nofat,
                                 uint64_t offset);
@@ -15,9 +16,8 @@ static int exfat_read_file_set(uint32_t directory_cluster, uint8_t nofat, uint32
                                uint16_t name[255], uint32_t *out_name_length,
                                struct storage_node *out_node);
 
-static int exfat_find_free_span(uint32_t directory_cluster, uint8_t nofat,
-                                const struct exfat_dir_ref *self_ref,
-                                uint32_t needed, uint32_t *out_index);
+static int exfat_find_free_span(uint32_t directory_cluster,uint8_t nofat,
+                                const struct exfat_dir_ref *self_ref,uint32_t needed,uint32_t *out_index);
 
 static int exfat_write_file_set(const struct exfat_dir_ref *ref, uint8_t entries[20][EXFAT_ENTRY_SIZE]);
 
@@ -195,6 +195,8 @@ static int exfat_read_file_set(uint32_t directory_cluster, uint8_t nofat, uint32
     out_node->first_cluster = storage_get_u32(entries[1] + 20u);
     out_node->volume_id = g_storage.volume_id;
     out_node->size = exfat_get_u64(entries[1] + 24u);
+    out_node->entry_id=(uint64_t)directory_cluster<<32 | index |
+        (nofat ? UINT64_C(1)<<63 : 0);
     {
         uint64_t valid_length = exfat_get_u64(entries[1] + 8u);
         uint64_t needed = out_node->size
@@ -236,7 +238,8 @@ int exfat_find_in_dir_ref(uint32_t directory_cluster, uint8_t nofat, const char 
     if (!wanted || !exfat_cluster_valid(directory_cluster)) return -22;
     /* Callers that will rewrite an entry need its physical entry-set
      * reference, so they must bypass the node-only directory cache. */
-    if (!out_ref && storage_dir_index_lookup(directory_cluster, wanted, out)) return 0;
+    if (!out_ref && storage_dir_index_lookup(directory_cluster, wanted, out))
+        return out ? storage_inode_cache_node(out) : 0;
     limit = exfat_dir_entry_limit();
     for (uint64_t pos = 0; pos < limit; ) {
         uint8_t first[EXFAT_ENTRY_SIZE];
@@ -261,6 +264,7 @@ int exfat_find_in_dir_ref(uint32_t directory_cluster, uint8_t nofat, const char 
                 return ret;
             }
             if (exfat_name_equals(name, length, wanted)) {
+                ret=storage_inode_cache_node(&node);if(ret)return ret;
                 if (out) *out = node;
                 if (out_ref) {
                     out_ref->directory_cluster = directory_cluster;
@@ -280,58 +284,7 @@ int exfat_find_in_dir_ref(uint32_t directory_cluster, uint8_t nofat, const char 
     return -2;
 }
 
-int exfat_lookup_path_ref(const char *path, struct storage_node *out,
-                                 struct exfat_dir_ref *out_ref)
-{
-    struct storage_node node;
-    struct exfat_dir_ref matched_ref;
-    char name[RELIEFOS_FS_NAME_LEN];
-    uint32_t length = 0;
-    const char *cursor;
-    if (!path || path[0] != '/') return -22;
-    storage_memzero(&node, sizeof(node));
-    node.type = RELIEFOS_FS_TYPE_DIR;
-    node.flags = STORAGE_NODE_FLAG_ROOT | STORAGE_NODE_FLAG_EXFAT;
-    node.first_cluster = g_storage.exfat_root_cluster;
-    node.volume_id = g_storage.volume_id;
-    if (out_ref) storage_memzero(out_ref, sizeof(*out_ref));
-    cursor = path + 1;
-    while (*cursor) {
-        if (*cursor == '/') {
-            if (length) {
-                name[length] = 0;
-                int ret;
-                if (node.type != RELIEFOS_FS_TYPE_DIR) return -20;
-                ret = exfat_find_in_dir_ref(node.first_cluster,
-                                            (node.flags & STORAGE_NODE_FLAG_EXFAT_NOFAT) != 0,
-                                            name, &node, &matched_ref);
-                if (ret < 0) return ret;
-                if (out_ref) *out_ref = matched_ref;
-                length = 0;
-            }
-        } else if (length + 1u < sizeof(name)) {
-            name[length++] = *cursor;
-        } else return -22;
-        ++cursor;
-    }
-    if (length) {
-        name[length] = 0;
-        int ret;
-        if (node.type != RELIEFOS_FS_TYPE_DIR) return -20;
-        ret = exfat_find_in_dir_ref(node.first_cluster,
-                                    (node.flags & STORAGE_NODE_FLAG_EXFAT_NOFAT) != 0,
-                                    name, &node, &matched_ref);
-        if (ret < 0) return ret;
-        if (out_ref) *out_ref = matched_ref;
-    }
-    if (out) *out = node;
-    return 0;
-}
 
-int exfat_lookup_path(const char *path, struct storage_node *out)
-{
-    return exfat_lookup_path_ref(path, out, 0);
-}
 
 int exfat_iter_dir_entry(uint32_t directory_cluster, uint8_t nofat, uint64_t wanted,
                                 struct reliefos_dir_entry *out)
@@ -376,58 +329,60 @@ int exfat_iter_dir_entry(uint32_t directory_cluster, uint8_t nofat, uint64_t wan
     return -2;
 }
 
-static int exfat_find_free_span(uint32_t directory_cluster, uint8_t nofat,
-                                const struct exfat_dir_ref *self_ref,
-                                uint32_t needed, uint32_t *out_index)
+/* Bound the search by the actual allocated directory stream, not the volume.
+ * Entry sets may span logical cluster boundaries; a physical FAT link decides
+ * whether more capacity is needed. Contiguous streams use their real length. */
+static int exfat_directory_capacity(uint32_t directory_cluster,uint8_t nofat,
+                                       const struct exfat_dir_ref *self_ref,uint64_t *entries)
 {
-    uint64_t limit = exfat_dir_entry_limit();
-    if (!out_index || needed == 0 || !exfat_cluster_valid(directory_cluster)) return -22;
-    for (;;) {
-        uint32_t run = 0;
-        uint8_t grew = 0;
-        for (uint64_t pos = 0; pos < limit; ++pos) {
+    if(!entries || !exfat_cluster_valid(directory_cluster) || !g_storage.cluster_bytes)return -22;
+    if(nofat) {
+        if(!self_ref)return -5;
+        uint8_t raw[20][EXFAT_ENTRY_SIZE],count;uint16_t name[255];uint32_t length;
+        struct storage_node node;
+        int rc=exfat_read_file_set(self_ref->directory_cluster,self_ref->directory_nofat,self_ref->first_entry,
+            raw,&count,name,&length,&node);
+        if(rc)return rc;
+        uint64_t bytes=exfat_get_u64(raw[1]+24);
+        if(node.type!=RELIEFOS_FS_TYPE_DIR || node.first_cluster!=directory_cluster || !bytes ||
+           bytes%g_storage.cluster_bytes)return -5;
+        *entries=bytes/EXFAT_ENTRY_SIZE;return 0;
+    }
+    uint32_t at=directory_cluster;
+    for(uint64_t clusters=1;clusters<=g_storage.exfat_cluster_count;++clusters) {
+        uint32_t next;int rc=exfat_read_fat(at,&next);if(rc)return rc;
+        if(next>=EXFAT_EOC){*entries=clusters*(g_storage.cluster_bytes/EXFAT_ENTRY_SIZE);return 0;}
+        if(!exfat_cluster_valid(next))return -5;
+        at=next;
+    }
+    return -5;
+}
+
+static int exfat_find_free_span(uint32_t directory_cluster,uint8_t nofat,
+                                const struct exfat_dir_ref *self_ref,uint32_t needed,uint32_t *out_index)
+{
+    if(!out_index || !needed)return -22;
+    uint64_t capacity=0,limit=exfat_dir_entry_limit();
+    int rc=exfat_directory_capacity(directory_cluster,nofat,self_ref,&capacity);if(rc)return rc;
+    for(;;) {
+        uint32_t run=0;
+        for(uint64_t pos=0;pos<capacity && pos<limit;++pos) {
             uint8_t entry[EXFAT_ENTRY_SIZE];
-            int ret = exfat_dir_read_entry(directory_cluster, nofat, (uint32_t)pos, entry);
-            if (ret < 0) {
-                console_error("[reliefnt] exfat find-free-span read failed dir=%u nofat=%u needed=%u pos=%u ret=%d\n",
-                               directory_cluster, nofat, needed, (uint32_t)pos, ret);
-                return ret;
-            }
-            if ((entry[0] & 0x80u) != 0u) {
-                run = 0;
-                continue;
-            }
+            rc=exfat_dir_read_entry(directory_cluster,nofat,(uint32_t)pos,entry);if(rc)return rc;
+            if(entry[0]&0x80u){run=0;continue;}
             ++run;
-            if (run == needed) {
-                *out_index = (uint32_t)(pos + 1u - needed);
-                return 0;
-            }
-            if (entry[0] == 0u) {
-                /* Entries after the end marker are free, but may only be used
-                 * inside the currently allocated cluster. Grow explicitly if
-                 * the complete entry-set would cross that boundary. */
-                uint32_t candidate = (uint32_t)(pos + 1u - run);
-                uint32_t per_cluster = g_storage.cluster_bytes / EXFAT_ENTRY_SIZE;
-                uint32_t in_cluster = per_cluster ? candidate % per_cluster : 0u;
-                if (per_cluster && needed <= per_cluster - in_cluster) {
-                    *out_index = candidate;
-                    return 0;
+            if(run==needed){*out_index=(uint32_t)(pos+1u-needed);return 0;}
+            if(!entry[0]) {
+                uint64_t candidate=pos+1u-run;
+                if(candidate+needed<=capacity && candidate+needed<=limit) {
+                    *out_index=(uint32_t)candidate;return 0;
                 }
-                if (nofat) return -28;
-                ret = exfat_grow_directory(directory_cluster, nofat, self_ref);
-                if (ret < 0) {
-                    console_error("[reliefnt] exfat find-free-span grow after end failed dir=%u needed=%u pos=%u ret=%d\n",
-                                   directory_cluster, needed, (uint32_t)pos, ret);
-                    return ret;
-                }
-                grew = 1;
                 break;
             }
         }
-        if (grew) continue;
-        console_error("[reliefnt] exfat find-free-span exhausted dir=%u needed=%u\n",
-                       directory_cluster, needed);
-        return -28;
+        if(nofat || capacity>=limit)return -28;
+        rc=exfat_grow_directory(directory_cluster,nofat,self_ref);if(rc)return rc;
+        capacity+=g_storage.cluster_bytes/EXFAT_ENTRY_SIZE;
     }
 }
 
@@ -559,6 +514,14 @@ static int exfat_grow_directory(uint32_t directory_cluster, uint8_t directory_no
     uint8_t new_nofat;
     int ret;
     if (directory_nofat || !exfat_cluster_valid(directory_cluster)) return -28;
+    struct storage_node before={0};
+    if(self_ref) {
+        uint8_t raw[20][EXFAT_ENTRY_SIZE],count;uint16_t name[255];uint32_t length;
+        ret=exfat_read_file_set(self_ref->directory_cluster,self_ref->directory_nofat,self_ref->first_entry,
+            raw,&count,name,&length,&before);
+        if(ret)return ret;
+        if(before.type!=RELIEFOS_FS_TYPE_DIR || before.first_cluster!=directory_cluster)return -5;
+    }
     while (clusters <= g_storage.exfat_cluster_count) {
         ret = exfat_read_fat(tail, &next);
         if (ret < 0) return ret;
@@ -595,6 +558,10 @@ static int exfat_grow_directory(uint32_t directory_cluster, uint8_t directory_no
         ret = exfat_update_entry_data(self_ref, directory_cluster,
                                       (uint64_t)(clusters + 1u) * g_storage.cluster_bytes, 0u);
         if (ret < 0) return ret;
+        struct storage_node after=before;
+        after.size=(uint64_t)(clusters+1u)*g_storage.cluster_bytes;
+        after.flags&=~STORAGE_NODE_FLAG_EXFAT_NOFAT;
+        storage_inode_note_data(&before,&after);
     }
     return 0;
 }
@@ -652,4 +619,126 @@ int exfat_dir_is_empty(const struct storage_node *node)
         ++pos;
     }
     return -5;
+}
+
+/** @brief Decode a native exFAT calendar value with its signed15minute UTC offset.
+ * @param date Native date. @param clock Native double-second clock.
+ * @param increment Optional10ms modification increment. @param zone Native offset byte.
+ * @param seconds Required UTC output. @param nanoseconds Required fraction output.
+ * @return None. Invalid/unset date fields stay unknown rather than hiding file
+ * data; an unspecified offset uses the system's UTC mount default. Pure math.
+ */
+static void exfat_timestamp_decode(uint16_t date,uint16_t clock,uint8_t increment,uint8_t zone,
+                                      int64_t *seconds,uint32_t *nanoseconds)
+{
+    if(storage_dos_decode(date,clock,increment,seconds,nanoseconds) || !*seconds)return;
+    if(zone&0x80) {
+        int offset=zone&0x7f;if(offset>=64)offset-=128;
+        *seconds-=(int64_t)offset*900;
+    }
+}
+/** @brief Read the current checksum-validated entry set for one retained exFAT inode.
+ * @param node Required linked node in the execution-selected volume.
+ * @param ref Required copied entry-set location.
+ * @param entries Required20entry scratch array, owned by the caller.
+ * @return Zero or negative validation/native metadata errno. No pathname
+ * lookup or reference transfer; root inodes have no directory entry set.
+ * Caller owns execution and inode/code pins; shared buffers are not returned.
+ */
+static int exfat_time_reference(const struct storage_node *node,struct exfat_dir_ref *ref,
+                                   uint8_t entries[20][EXFAT_ENTRY_SIZE])
+{
+    if(!node || !ref || !entries || node->volume_id!=g_storage.volume_id ||
+       !(node->flags&STORAGE_NODE_FLAG_EXFAT))return -22;
+    int rc=exfat_node_ref(node,ref);if(rc)return rc;
+    uint8_t count;uint16_t name[255];uint32_t length;struct storage_node found;
+    rc=exfat_read_file_set(ref->directory_cluster,ref->directory_nofat,ref->first_entry,
+                           entries,&count,name,&length,&found);
+    if(!rc && (count!=ref->secondary_count || found.first_cluster!=node->first_cluster))rc=-116;
+    return rc;
+}
+/** @brief Decode native exFAT access/modification metadata for one held inode.
+ * @param node Required linked node in the selected volume. Roots have no record.
+ * @param out Required output, cleared on failure; invalid time fields remain unknown.
+ * @return Zero or negative structural/record/I/O errno. Native UTC offsets and
+ * modification10ms fields are respected; initial ctime follows mtime because
+ * the format stores birth time separately, not a persistent POSIX change time.
+ * Execution ownership required; no graph/module lock or ownership transfer.
+ */
+int exfat_inode_times(const struct storage_node *node,struct storage_inode_times *out)
+{
+    if(!out)return -22;
+    *out=(struct storage_inode_times){0};
+    if(!node || node->volume_id!=g_storage.volume_id)return -22;
+    if(node->flags&STORAGE_NODE_FLAG_ROOT)return 0;
+    struct exfat_dir_ref ref;uint8_t raw[20][EXFAT_ENTRY_SIZE];
+    int rc=exfat_time_reference(node,&ref,raw);if(rc)return rc;
+    exfat_timestamp_decode(exfat_get_u16(raw[0]+18),exfat_get_u16(raw[0]+16),0,raw[0][24],&out->atime,&out->atime_nsec);
+    exfat_timestamp_decode(exfat_get_u16(raw[0]+14),exfat_get_u16(raw[0]+12),raw[0][21],raw[0][23],&out->mtime,&out->mtime_nsec);
+    out->ctime=out->mtime;out->ctime_nsec=out->mtime_nsec;return 0;
+}
+/** @brief Update one current exFAT primary entry's UTC access time and checksum.
+ * @param node Required linked node in the selected volume; roots have no record.
+ * @param seconds Current UTC Unix seconds, clamped to the native date range.
+ * @param actual Required normalized even-second output, unchanged on failure.
+ * @return Zero or negative validation/metadata/I/O errno. Only the primary
+ * entry changes, preserving stream/name records. Equal encoded fields avoid
+ * writes. Caller owns execution, synchronous I/O and a retained inode/code pin;
+ * orphans are excluded by the caller, no global pathname or callback locks.
+ */
+int exfat_inode_access(const struct storage_node *node,int64_t seconds,int64_t *actual)
+{
+    if(!node || !actual || node->volume_id!=g_storage.volume_id)return -22;
+    struct storage_dos_time encoded;int rc=storage_dos_encode(seconds,0,&encoded);if(rc)return rc;
+    int64_t normalized;uint32_t fraction;
+    rc=storage_dos_decode(encoded.date,encoded.clock,0,&normalized,&fraction);if(rc)return rc;
+    if(!(node->flags&STORAGE_NODE_FLAG_ROOT)) {
+        struct exfat_dir_ref ref;uint8_t raw[20][EXFAT_ENTRY_SIZE];
+        rc=exfat_time_reference(node,&ref,raw);if(rc)return rc;
+        if(exfat_get_u16(raw[0]+16)!=encoded.clock || exfat_get_u16(raw[0]+18)!=encoded.date || raw[0][24]!=0x80) {
+            exfat_put_u16(raw[0]+16,encoded.clock);exfat_put_u16(raw[0]+18,encoded.date);raw[0][24]=0x80;
+            exfat_put_u16(raw[0]+2,exfat_checksum(&raw[0][0],ref.secondary_count+1));
+            storage_begin_mutation();rc=exfat_dir_write_entry(ref.directory_cluster,ref.directory_nofat,ref.first_entry,raw[0]);
+            if(rc)return rc;
+        }
+    }
+    *actual=normalized;return 0;
+}
+
+/** @brief Read the checksum-validated native time bytes of one exFAT entry set.
+ * @param ref Required selected-directory location; never a global name.
+ * @param out Required byte-record output, cleared on failure.
+ * @return Zero or negative metadata/structure/I/O errno. Execution ownership and
+ * retained source/target identities are required; no allocation, callback lock
+ * or ownership transfer. All creation/modification/access bytes are preserved.
+ */
+int exfat_entry_times_read(const struct exfat_dir_ref *ref,struct exfat_entry_timestamps *out)
+{
+    if(!out)return -22;
+    *out=(struct exfat_entry_timestamps){0};
+    if(!ref || ref->secondary_count<2 || ref->secondary_count>19)return -22;
+    uint8_t raw[20][EXFAT_ENTRY_SIZE],count;uint16_t name[255];uint32_t length;struct storage_node node;
+    int rc=exfat_read_file_set(ref->directory_cluster,ref->directory_nofat,ref->first_entry,raw,&count,name,&length,&node);
+    if(!rc && count!=ref->secondary_count)rc=-5;
+    if(!rc)storage_memcpy(out->bytes,raw[0]+8,sizeof(out->bytes));
+    return rc;
+}
+/** @brief Write only native exFAT time bytes and their primary-entry checksum.
+ * @param ref Required selected-directory location, held stable by the caller.
+ * @param value Required borrowed byte-exact time record.
+ * @return Zero or negative metadata/structure/I/O errno. Unchanged bytes avoid
+ * writes; a changed primary entry is published under the mutation latch. Caller
+ * owns synchronous execution and retained inode/code identities; no allocation
+ * or graph/module callback lock. Stream/name bytes and unrelated metadata stay.
+ */
+int exfat_entry_times_write(const struct exfat_dir_ref *ref,const struct exfat_entry_timestamps *value)
+{
+    if(!ref || !value || ref->secondary_count<2 || ref->secondary_count>19)return -22;
+    uint8_t raw[20][EXFAT_ENTRY_SIZE],count;uint16_t name[255];uint32_t length;struct storage_node node;
+    int rc=exfat_read_file_set(ref->directory_cluster,ref->directory_nofat,ref->first_entry,raw,&count,name,&length,&node);
+    if(!rc && count!=ref->secondary_count)rc=-5;
+    if(rc || !storage_memcmp(raw[0]+8,value->bytes,sizeof(value->bytes)))return rc;
+    storage_memcpy(raw[0]+8,value->bytes,sizeof(value->bytes));
+    exfat_put_u16(raw[0]+2,exfat_checksum(&raw[0][0],count+1));
+    storage_begin_mutation();return exfat_dir_write_entry(ref->directory_cluster,ref->directory_nofat,ref->first_entry,raw[0]);
 }

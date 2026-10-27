@@ -382,3 +382,7 @@ int main(void)
     printf("task-exit logging failures=%u\n", failures);
     return failures ? 1 : 0;
 }
+
+#include "exec_source_fixture_stubs.h"
+/* This exit-log fixture has no executable inode denial to retire. */
+void storage_inode_allow_write(struct storage_inode_ref *inode){assert(!inode);}

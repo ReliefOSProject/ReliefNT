@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+config MOUSE_PS2
+    tristate "PS/2 and VMware backdoor mouse"
+    default y
+    help
+      Poll PS/2 packets and VMware absolute mouse events through the native
+      input core. M builds mouse.ko. The permanent IRQ/input queue dispatch
+      closes and drains callbacks before the mouse provider is removed.

@@ -13,5 +13,6 @@ with tempfile.TemporaryDirectory(prefix="shmem-facade-", dir=temporary) as work:
     subprocess.run(["cc", "-std=gnu11", "-O1", "-g", "-ffunction-sections", "-fdata-sections",
                     "-Wl,--gc-sections", "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
                     "-Iinclude", "-Iinclude/uapi", "tools/tests/shmem_facade_test.c",
-                    "fs/tmpfs/core.c", "lib/text_utf16.c", "-o", binary], cwd=root, check=True)
+                    "fs/tmpfs/core.c", "lib/text_utf16.c", "fs/vfs/mount_tree.c", "fs/vfs/object.c",
+                    "fs/vfs/write_access.c", "fs/vfs/attributes.c", "fs/vfs/file.c", "fs/vfs/open.c", "fs/vfs/path.c", "-o", binary], cwd=root, check=True)
     subprocess.run([binary], check=True, timeout=20)

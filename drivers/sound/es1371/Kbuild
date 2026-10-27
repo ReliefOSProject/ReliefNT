@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Objects are owned by this directory; child modules own their own lists.
-obj-y := es1371.o
+obj-$(CONFIG_SND_ENS1371) += es1371.o
+es1371-y := es1371_main.o module.o
 
 include $(srctree)/scripts/Makefile.module

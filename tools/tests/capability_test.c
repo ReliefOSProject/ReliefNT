@@ -11,8 +11,6 @@ uint64_t sched_user_task_count(uint32_t uid) { (void)uid; return 0; }
 bool user_range_ok(uint64_t p, uint64_t n) { return p >= 4096 && n <= UINT64_MAX - p; }
 bool user_range_writable(uint64_t p, uint64_t n) { return p != readonly && user_range_ok(p, n); }
 /* Standard ID syscalls must not consult a userspace service or mutate peers. */
-int storage_read_file(const char *p, const void **d, size_t *n)
-{ (void)p; (void)d; (void)n; assert(0); return -1; }
 void sched_set_task_identity(uint32_t p, const struct reliefos_user_info *u, uint32_t s)
 { (void)p; (void)u; (void)s; assert(0); }
 void sched_set_session_identity(uint32_t p, const struct reliefos_user_info *u, uint32_t s)

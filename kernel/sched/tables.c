@@ -1,4 +1,6 @@
+#include <reliefnt/export.h>
 #include "internal.h"
+#include <reliefnt/exec_file.h>
 
 
 
@@ -55,6 +57,13 @@ uint32_t sched_task_vma_capacity(const struct task *task)
     return task ? SCHED_TASK_VMA_MAX + sched_task_mm(task)->vma_extra_count : 0;
 }
 
+/** @brief Release all VMA and executable references of a retiring MM.
+ * @param task Task whose final MM ownership has been established by caller,
+ * or NULL. Borrowed copied resources must have been cleared before rollback.
+ * Execution-owned task context; drops inode references before the executable
+ * path's last provider pin. Final puts may perform I/O, so no scheduler,
+ * filesystem graph or module-table spinlock may span this operation.
+ */
 void sched_task_vma_release(struct task *task)
 {
     if (!task) return;
@@ -62,18 +71,21 @@ void sched_task_vma_release(struct task *task)
         struct task_vma *vma = sched_task_vma_at(task, i);
         if (vma) {
             sysv_shm_vma_release(task, vma);
-            if (vma->audio_pcm) audio_pcm_mmap_release(vma->audio_pcm, (enum audio_pcm_mmap_region)vma->audio_mmap_region);
-            if (vma->drm_bo) drm_bo_put(vma->drm_bo);
-            if (vma->drm_mapping_file) task_file_put(vma->drm_mapping_file);
+            if (vma->device_mapping) device_mapping_put(vma->device_mapping);
+            if (vma->mapping_file) task_file_put(vma->mapping_file);
+            vfs_exec_source_put(vma->exec_source);
             (void)storage_inode_put(vma->inode);
             vma->inode = NULL;
-            vma->audio_pcm = NULL;
-            vma->drm_bo = NULL;
-            vma->drm_mapping_file = NULL;
+            vma->device_mapping = NULL;
+            vma->mapping_file = NULL;
+            vma->exec_source = NULL;
         }
     }
+    if(sched_task_mm(task)->executable_denied_write)storage_inode_allow_write(sched_task_mm(task)->executable_inode);
+    sched_task_mm(task)->executable_denied_write=false;
     (void)storage_inode_put(sched_task_mm(task)->executable_inode);
     sched_task_mm(task)->executable_inode = NULL;
+    vfs_path_put(&sched_task_mm(task)->executable_path);
     if (!sched_task_mm(task)->vma_extra) return;
     kernel_free(sched_task_mm(task)->vma_extra);
     sched_task_mm(task)->vma_extra = NULL;
@@ -81,47 +93,45 @@ void sched_task_vma_release(struct task *task)
     sched_task_mm(task)->vma_extra_capacity = 0;
 }
 
-/**
- * @brief Retain the PCM mapping reference represented by a copied VMA.
- * @param dst Child VMA receiving the copied audio mapping metadata.
- * @param src Parent VMA whose mapping reference is still live.
- * @return Zero when no mapping exists or the reference was retained, else a negative errno.
+/** @brief Share an independently pinned device backing with a copied VMA.
+ * @param dst Child VMA with no acquired device reference yet.
+ * @param src Parent VMA retaining its original backing.
+ * @return Zero or negative errno; failure leaves dst unowned. Execution-owned
+ * task context, no backend callback or allocation spans fork/split admission.
  */
-int sched_task_vma_retain_audio(struct task_vma *dst,
-                                       const struct task_vma *src)
+int sched_task_vma_retain_device(struct task_vma *dst,const struct task_vma *src)
 {
-    if (!dst || !src || !src->audio_pcm) return 0;
-    int ret = audio_pcm_mmap_retain(src->audio_pcm,
-                          (enum audio_pcm_mmap_region)src->audio_mmap_region);
-    if (ret < 0) return ret;
-    dst->audio_pcm = src->audio_pcm;
-    dst->audio_mmap_region = src->audio_mmap_region;
-    dst->audio_mmap_generation = src->audio_mmap_generation;
-    dst->audio_mmap_prot = src->audio_mmap_prot;
-    dst->audio_mmap_offset = src->audio_mmap_offset;
-    dst->audio_mmap_length = src->audio_mmap_length;
-    return 0;
+    if(!dst || !src || !src->device_mapping)return 0;
+    int rc=device_mapping_get(src->device_mapping);if(rc)return rc;
+    dst->device_mapping=src->device_mapping;dst->device_map_offset=src->device_map_offset;return 0;
 }
 
-/** @brief Retain the BO and OFD references represented by a copied DRM VMA. */
-int sched_task_vma_retain_drm(struct task_vma *dst,
+/** @brief Retain a copied VMA's source OFD/ELF provider.
+ * @param dst Child VMA with no owned file pins yet, required.
+ * @param src Parent VMA held stable under the execution transaction, required.
+ * @return Zero or negative EINVAL/ENOMEM. No reference is transferred on failure;
+ * Canonical OFD and ELF source references do not allocate; the latter keeps
+ * provider code and immutable bytes alive through fork, split and lazy faults.
+ */
+int sched_task_vma_retain_file(struct task_vma *dst,
                                      const struct task_vma *src)
 {
     struct task_file *mapping_file = NULL;
     if (!dst || !src) return -LINUX_EINVAL;
-    if (src->drm_mapping_file) {
-        mapping_file = task_file_get(src->drm_mapping_file);
+    if (src->mapping_file) {
+        mapping_file = task_file_get(src->mapping_file);
         if (!mapping_file) return -LINUX_ENOMEM;
     }
-    if (src->drm_bo) drm_bo_get(src->drm_bo);
-    dst->drm_mapping_file = mapping_file;
-    dst->drm_bo = src->drm_bo;
+    dst->mapping_file = mapping_file;
+    dst->exec_source = vfs_exec_source_get(src->exec_source);
     return 0;
 }
 
-/** @brief Resolve a Linux descriptor number without acquiring a description.
- * @param task Owner under the execution lock. @param fd Linux fd, not array index.
- * @return Borrowed live slot or NULL. Includes stdio and the grown file table.
+/** @brief Borrow a live numeric descriptor slot without promoting its OFD.
+ * @param task Execution-owned task/fd table, nullable. @param fd Linux descriptor number.
+ * @return Borrowed live slot or NULL, including stdio/grown tables. No reference
+ * is acquired, no allocation/lock/wait occurs; retain the canonical description
+ * before any operation that can suspend ownership or permit fd-table reuse.
  */
 struct task_file *task_descriptor_for_fd(struct task *task, int fd)
 {
@@ -284,3 +294,5 @@ void sched_task_pty_release(struct task *task)
     table->pty_fd_count = 0;
     table->pty_fd_capacity = 0;
 }
+
+EXPORT_SYMBOL(task_descriptor_for_fd);

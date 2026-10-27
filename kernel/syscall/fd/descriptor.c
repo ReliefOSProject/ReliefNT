@@ -1,4 +1,7 @@
+#include <reliefnt/export.h>
+#include <reliefnt/graphics_service.h>
 #include "../internal.h"
+#include <reliefnt/module.h>
 
 static struct task_file *task_file_promote(struct task_file *source);
 
@@ -15,12 +18,11 @@ static void clear_task_files(struct task *task);
  * @return Backing inode release result, or zero when no inode release is needed.
  * @note A final canonical release detaches weak epoll watches before releasing
  * OFD-owned resources. SCM queue and in-flight I/O references use this same path.
+ * Captured provider state closes before its inode/path/code can retire. Caller
+ * holds execution ownership without graph/scheduler/module locks across cleanup.
  */
 int clear_task_file_result(struct task_file *file)
 {
-    /**
- * @brief Descriptor cleanup can be reached both from the immediate exit path and from later zombie reaping. A released pipe end must only decrement its shared reference count once.
- */
     if (!file || !file->used) {
         return 0;
     }
@@ -38,26 +40,18 @@ int clear_task_file_result(struct task_file *file)
     }
     if (file->references == 0) task_epoll_remove_file_description(file);
     syscall_flock_release_owner(file);
-    if (file->drm_prime_file) drm_prime_file_close(file);
+    struct character_file *character_file=file->character_file;file->character_file=NULL;
+    character_file_close(character_file,file);
     if (file->flags & TASK_FILE_FLAG_DEV_NODE) {
         if (file->node.first_cluster == STORAGE_DEV_KIND_CONSOLE && file->aux &&
             !(file->flags & TASK_FILE_FLAG_PATH))
             pty_transfer_put((uint32_t)file->aux, TASK_PTY_ENDPOINT_SLAVE);
-        if (file->drm_file) drm_file_close(file);
-        if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_PCM)
-            (void)audio_device_close(file);
-        if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_CONTROL)
-            (void)audio_control_close(file);
-        if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_MIXER)
-            (void)audio_mixer_close(file);
-        if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_TIMER)
-            (void)audio_timer_close(file);
-        if (file->node.first_cluster == STORAGE_DEV_KIND_AUDIO &&
-            !(file->node.flags & (STORAGE_NODE_FLAG_AUDIO_PCM |
-                                  STORAGE_NODE_FLAG_AUDIO_CONTROL |
-                                  STORAGE_NODE_FLAG_AUDIO_MIXER)))
-            (void)audio_oss_close(file);
     }
+    block_device_put(&file->block_ref);
+    struct vfs_open_file *provider_file=file->provider_file;file->provider_file=NULL;
+    vfs_file_close(provider_file);
+    if(file->inode_write_access)storage_inode_write_put(file->inode);
+    file->inode_write_access=false;
     int result = storage_inode_put(file->inode);
     file->inode = NULL;
     task_pipe_release(file);
@@ -76,6 +70,7 @@ int clear_task_file_result(struct task_file *file)
         file->aux2 != 0) {
         input_evdev_release(file->node.first_cluster, file->aux2);
     }
+    vfs_path_put(&file->path_ref);
     file->used = 0;
     file->kind = 0;
     file->node.type = 0;
@@ -144,15 +139,17 @@ static struct task_file *task_file_promote(struct task_file *source)
                     entry->shared_owners[j] = description;
         }
     }
+    source->block_ref=(struct block_device_ref){0}; /* Move token into canonical OFD. */
     source->description = description;
     return description;
 }
 
 /**
- * @brief Install one descriptor alias and increment the source OFD reference.
- * @param destination Unused descriptor slot to initialize; must not alias source.
- * @param source Live source descriptor or canonical OFD.
- * @return Zero on success, -EBADF for invalid arguments, or -ENOMEM on promotion failure.
+ * @brief Install a descriptor alias retaining the original canonical OFD.
+ * @param destination Required unused writable table slot, distinct from source.
+ * @param source Borrowed live descriptor or canonical OFD stable against close.
+ * @return Zero, EBADF for invalid input, or ENOMEM if canonical promotion fails.
+ * Execution-owned task context; promotion may allocate. Success transfers a table-owned reference into destination, later consumed by normal close.
  */
 int task_file_reference(struct task_file *destination, struct task_file *source)
 {
@@ -165,10 +162,10 @@ int task_file_reference(struct task_file *destination, struct task_file *source)
 }
 
 /**
- * @brief Retain a transient reference to a stable canonical file description.
- * @param source Live descriptor or description; caller must serialize against close.
- * @return Canonical OFD with one additional reference, or null for invalid input
- * or allocation failure during promotion.
+ * @brief Acquire a transient canonical OFD reference, promoting inline state if needed.
+ * @param source Borrowed live descriptor/OFD, stable against concurrent close.
+ * @return Owned canonical OFD reference or NULL for invalid input or promotion OOM.
+ * Execution-owned task context; promotion may allocate. Release exactly once with task_file_put; the reference preserves the original provider and backing.
  */
 struct task_file *task_file_get(struct task_file *source)
 {
@@ -178,11 +175,23 @@ struct task_file *task_file_get(struct task_file *source)
     return description;
 }
 
+/** @brief Give a canonical OFD an independent reference to its actual path.
+ * @param file Live descriptor or canonical OFD, borrowed under execution ownership.
+ * @param path Borrowed held path or NULL to detach a former binding.
+ * Retains before releasing, so rebinding to the same pair is safe. No allocation;
+ * final backend release may perform I/O and runs without a mount graph lock.
+ */
+void task_file_bind_path(struct task_file *file,const struct vfs_path *path)
+{
+    file=task_file_description(file);if(!file || !file->used)return;
+    struct vfs_path next={0};vfs_path_get(path,&next);
+    struct vfs_path old=file->path_ref;file->path_ref=next;vfs_path_put(&old);
+}
+
 /**
- * @brief Drop one transient OFD reference and perform final cleanup when needed.
- * @param description Canonical file description returned by task_file_get().
- * @note The final put detaches epoll watchers before releasing description-owned
- * resources, so no watch can extend or outlive the OFD.
+ * @brief Consume one transient OFD reference and perform final resource cleanup.
+ * @param description Owned canonical reference from task_file_get, or NULL.
+ * Execution-owned task context, serialized with descriptor mutations. Final put detaches epoll watchers and runs original file/provider cleanup before heap release; no registry spinlock spans those callbacks.
  */
 void task_file_put(struct task_file *description)
 {
@@ -404,6 +413,13 @@ void syscall_close_cloexec_files(struct task *task)
     }
 }
 
+/**
+ * @brief Resolve a table descriptor to its canonical open-file description.
+ * @param task Borrowed table owner.
+ * @param fd Descriptor number to resolve.
+ * @return Borrowed canonical OFD or NULL; no reference is acquired.
+ * Execution-owned task context. Keep table ownership through use or take an independent task_file_get reference before permitting concurrent close.
+ */
 struct task_file *task_file_for_fd(struct task *task, int fd)
 {
     return task_file_description(task_descriptor_for_fd(task, fd));
@@ -434,15 +450,33 @@ void task_fifo_cancel(struct task *task)
     task->fifo_open_file = NULL;
     task_pipe_release(file);
     (void)storage_inode_put(file->inode);
+    vfs_path_put(&file->path_ref);
     kernel_free(file);
 }
 
+/** @brief Cancel task-owned lookup/I/O state and drop the stable syscall OFD.
+ * @param task Owner under the execution transaction, nullable.
+ * Unlinks the wait record and drains active ordinary/directory/vector I/O before
+ * any provider reference can retire. Retires imported vectors after draining.
+ * Drains/retires a two-OFD transfer and its staging bytes before copied
+ * lookup text and root/dirfd references, then cancels module
+ * read denial before releasing the OFD/inode; final resource
+ * callbacks may perform I/O. Signals, call replacement and exit share this path.
+ */
 void task_release_syscall_file(struct task *task)
 {
     if (!task) return;
+    if(task->waiting_queue)kernel_wait_queue_remove(task->waiting_queue,task);
+    if(task->regular_io.active || task->vector_io) {
+        task->regular_io.active=false;storage_drain_task_io(task->pid);
+    }
+    task_vector_cancel(task);
+    task_transfer_cancel(task);
+    task_lookup_scope_cancel(task);
+    module_file_cancel(task);
     /* Signal handoff and syscall mismatch invalidate DRM ioctl snapshots here;
      * the vmwgfx hook only queues bounded task-context cleanup. */
-    drm_vmwgfx_cancel_task_continuation(task);
+    graphics_service_cancel_task_continuation(task);
     task_sysv_msg_cancel(task);
     task_sysv_sem_cancel(task);
     task_fifo_cancel(task);
@@ -560,11 +594,12 @@ int task_can_allocate_fd(const struct task *task)
 }
 
 /**
- * @brief Reserve the lowest free file descriptor, growing backing storage if needed.
- * @param task Descriptor-table owner, serialized by the syscall execution lock.
- * @param minimum Inclusive lower bound.
- * @param slot Receives the initialized descriptor entry.
- * @return Descriptor number or negative errno without consuming a slot on failure.
+ * @brief Reserve the lowest available descriptor and initialize its table-owned slot.
+ * @param task Required live table owner under the execution transaction.
+ * @param minimum Inclusive descriptor lower bound.
+ * @param slot Required writable borrowed-slot output, assigned only on success.
+ * @return Descriptor number or negative validation/resource errno without consuming a slot on failure.
+ * Task context, serialized against table mutation; storage may grow. Caller constructs the OFD before publication or rolls back with task_discard_file_fd.
  */
 int task_allocate_fd(struct task *task, int minimum, struct task_file **slot)
 {
@@ -583,9 +618,10 @@ int task_allocate_fd(struct task *task, int minimum, struct task_file **slot)
 }
 
 /**
- * @brief Release a file descriptor after a failed multi-fd operation, including stdio slots.
- * @param task Descriptor-table owner.
- * @param fd Reserved file descriptor to roll back.
+ * @brief Roll back a reserved descriptor and its partially constructed resources.
+ * @param task Required table owner under execution ownership.
+ * @param fd Reserved descriptor to consume; stdio closure masks are updated.
+ * Task context, serialized against close/dup. Releases record locks and file resources; final callbacks may run, so no table/provider spinlock may span this call.
  */
 void task_discard_file_fd(struct task *task, int fd)
 {
@@ -603,8 +639,8 @@ void task_discard_file_fd(struct task *task, int fd)
  * @param node Validated backing node, borrowed during initialization.
  * @param flags Validated status and internal device flags.
  * @param path Optional NUL-terminated device or file pathname.
- * @return Descriptor number or negative errno; failed console setup releases
- * the allocated slot and inode reference. O_PATH does not open a terminal.
+ * @return Descriptor number or negative errno; failed inode/write/console setup
+ * releases the slot, inode and any write lease. O_PATH does not open a terminal.
  */
 int alloc_task_fd(struct task *task, const struct storage_node *node, uint32_t flags, const char *path)
 {
@@ -614,12 +650,18 @@ int alloc_task_fd(struct task *task, const struct storage_node *node, uint32_t f
     if (fd < 0) return fd;
     int ret = storage_inode_get(node, &file->inode);
     if (ret < 0) {
-        *file = (struct task_file){0};
+        task_discard_file_fd(task,fd);
         return ret;
     }
     file->node = *node;
     file->flags = flags;
     file->fd_flags = (flags & RELIEFOS_O_CLOEXEC) ? RELIEFOS_FD_CLOEXEC : 0;
+    if(file->inode && node->type==RELIEFOS_FS_TYPE_FILE &&
+       !(flags&TASK_FILE_FLAG_PATH) && file_can_write(file)) {
+        ret=storage_inode_write_get(file->inode);
+        if(ret){task_discard_file_fd(task,fd);return ret;}
+        file->inode_write_access=true;
+    }
     copy_text(file->path, sizeof(file->path), path);
     if (task_device_is(file, STORAGE_DEV_KIND_CONSOLE) &&
         !(flags & TASK_FILE_FLAG_PATH)) {
@@ -756,9 +798,10 @@ int syscall_inherit_task_fds(struct task *parent, struct task *child,
 }
 
 /**
- * File can read.
- * @param file Value supplied by the caller.
- * @return The value or status produced by the operation.
+ * @brief Check the retained file access mode without acquiring a reference.
+ * @param file Borrowed stable OFD; NULL preserves the legacy read-only default.
+ * @return One for RDONLY/RDWR, zero otherwise.
+ * Execution-owned task context; no allocation, locks, user access or ownership transfer.
  */
 int file_can_read(const struct task_file *file)
 {
@@ -767,12 +810,22 @@ int file_can_read(const struct task_file *file)
 }
 
 /**
- * File can write.
- * @param file Value supplied by the caller.
- * @return The value or status produced by the operation.
+ * @brief Check whether the retained file access mode permits writes.
+ * @param file Borrowed stable OFD, nullable.
+ * @return One for WRONLY/RDWR, zero otherwise, including NULL.
+ * Execution-owned task context; no allocation, locks, user access or ownership transfer.
  */
 int file_can_write(const struct task_file *file)
 {
     uint32_t acc = file ? (file->flags & RELIEFOS_O_ACCMODE) : RELIEFOS_O_RDONLY;
     return acc == RELIEFOS_O_WRONLY || acc == RELIEFOS_O_RDWR;
 }
+
+EXPORT_SYMBOL(file_can_read);
+EXPORT_SYMBOL(file_can_write);
+EXPORT_SYMBOL(task_allocate_fd);
+EXPORT_SYMBOL(task_discard_file_fd);
+EXPORT_SYMBOL(task_file_for_fd);
+EXPORT_SYMBOL(task_file_get);
+EXPORT_SYMBOL(task_file_put);
+EXPORT_SYMBOL(task_file_reference);

@@ -23,4 +23,12 @@ int sysfs_read(const char *path, uint64_t offset, void *buffer, uint32_t length,
 int sysfs_readlink(const char *path, char *buffer, uint32_t capacity);
 /** @brief Enumerate sysfs; returns one entry, zero at EOF, or negative errno. */
 int sysfs_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *entry);
+struct vfs_mount;
+/** @brief Create an independently owned sysfs filesystem mount.
+ * @param out Empty output receiving one detached mount, empty on failure.
+ * @return Zero or negative errno; virtual inode keys/context are reclaimed
+ * on failure or final mount release. Execution transaction required. Relative
+ * sysfs links and generated attributes do not depend on the visible mountpoint.
+ */
+int sysfs_create_vfs_mount(struct vfs_mount **out);
 #endif

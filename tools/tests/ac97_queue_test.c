@@ -8,6 +8,33 @@
 static uint8_t regs[256];
 static int hardware_model;
 static unsigned run_writes;
+static unsigned dma_allocations, dma_frees;
+static unsigned fail_dma_allocation;
+static int teardown_guard, reset_stuck, teardown_error;
+static uint16_t pci_command;
+static uint8_t dma_backing[17u * 4096u];
+static uint64_t allocate_high_pages(uint32_t pages)
+{ (void)pages; return 0x100002000ULL; }
+static uint64_t allocate_dma(uint32_t pages, uint64_t mask)
+{
+    assert(mask == 0xffffffffULL && (pages == 1 || pages == 16));
+    if (++dma_allocations == fail_dma_allocation) return 0;
+    return pages == 1 ? 0x100000 : 0x101000;
+}
+static void free_dma(uint64_t physical, uint32_t pages)
+{
+    assert(!teardown_guard || !(pci_command & 4u));
+    assert((physical == 0x100000 && pages == 1) ||
+           (physical == 0x101000 && pages == 16));
+    ++dma_frees;
+}
+static void free_high_pages(uint64_t physical, uint32_t pages)
+{ (void)physical; (void)pages; }
+static void *map_dma(uint64_t physical)
+{
+    assert(physical >= 0x100000 && physical < 0x111000);
+    return dma_backing + physical - 0x100000;
+}
 static void fetch_descriptor(void);
 static uint16_t ac97_test_inw(uint16_t port)
 { uint16_t value;memcpy(&value,regs+port,sizeof value);return value; }
@@ -16,7 +43,11 @@ static void ac97_test_outw(uint16_t port,uint16_t value)
     if(port==0x16){uint16_t old=ac97_test_inw(port);value=old&~value;}
     memcpy(regs+port,&value,sizeof value);
 }
-static uint8_t read_byte(uint16_t port) { return regs[port]; }
+static uint8_t read_byte(uint16_t port)
+{
+    if (teardown_guard && port == 0x5b && !reset_stuck) regs[port] &= ~2u;
+    return regs[port];
+}
 static void write_byte(uint16_t port,uint8_t value)
 {
     regs[port]=value;
@@ -36,8 +67,13 @@ static void write_long(uint16_t port,uint32_t value) { memcpy(regs+port,&value,s
 static void log_text(const char *text) { (void)text; }
 static void log_record(enum console_log_level level, const char *format, ...)
 { (void)level; (void)format; }
+static uint16_t read_pci(uint8_t bus, uint8_t slot, uint8_t function, uint8_t offset)
+{ (void)bus; (void)slot; (void)function; assert(offset == 4); return pci_command; }
+static void write_pci(uint8_t bus, uint8_t slot, uint8_t function, uint8_t offset, uint16_t value)
+{ (void)bus; (void)slot; (void)function; assert(offset == 4); pci_command = value; }
+static void report_teardown(int error) { teardown_error = error; }
 #ifndef AC97_QUEUE_SOURCE
-#define AC97_QUEUE_SOURCE "../../drivers/sound/ac97/ac97.c"
+#define AC97_QUEUE_SOURCE "../../drivers/sound/ac97/ac97_main.c"
 #endif
 #include AC97_QUEUE_SOURCE
 static void fetch_descriptor(void)
@@ -98,5 +134,33 @@ int main(void)
     picb=0;memcpy(regs+0x18,&picb,2);status=1;memcpy(regs+0x16,&status,2);
     ac97_get_state(&state);assert(!state.queued_bytes);
     puts("actual_AC97_partial_CIV_transition_and_zero_PICB_account_exactly_once_through_wrap PASS");
+    api.alloc_pages = allocate_high_pages; api.free_pages = free_high_pages;
+    api.alloc_dma = allocate_dma; api.free_dma = free_dma;
+    api.phys_to_virt = map_dma;
+    memset(&ac97, 0, sizeof(ac97));
+    assert(!ac97_alloc_dma());
+    assert(dma_allocations == 2 && ac97.bdl_phys == 0x100000 &&
+           ac97.buffers_phys == 0x101000);
+    ac97_free_dma();
+    assert(dma_frees == 2 && !ac97.bdl && !ac97.buffers);
+    dma_allocations = dma_frees = 0; fail_dma_allocation = 2;
+    assert(ac97_alloc_dma() == -12);
+    assert(dma_allocations == 2 && dma_frees == 1 &&
+           !ac97.bdl_phys && !ac97.buffers_phys);
+    puts("actual_AC97_32bit_DMA_pool_and_partial_allocation_rollback PASS");
+    dma_allocations = dma_frees = fail_dma_allocation = 0;
+    assert(!ac97_alloc_dma());
+    api.pci_read16 = read_pci; api.pci_write16 = write_pci;
+    api.report_teardown_failure = report_teardown;
+    ac97.bus_master_port = 0x40; ac97.present = ac97.active = 1;
+    pci_command = 5; teardown_guard = reset_stuck = 1;
+    ac97_driver_fini();
+    assert(teardown_error == -110 && !dma_frees && ac97.bdl_phys == 0x100000 &&
+           ac97.buffers_phys == 0x101000);
+    reset_stuck = 0; teardown_error = 0;
+    ac97_driver_fini();
+    assert(!teardown_error && dma_frees == 2 && !(pci_command & 4) &&
+           !ac97.bdl_phys && !ac97.buffers_phys);
+    puts("actual_AC97_failed_RESET_retains_DMA_then_retry_disables_bus_master_before_release PASS");
     return 0;
 }

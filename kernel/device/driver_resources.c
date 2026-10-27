@@ -7,31 +7,38 @@
 #define DRIVER_RESOURCE_DMA 1U
 #define DRIVER_RESOURCE_MMIO 2U
 #define DRIVER_RESOURCE_IRQ 3U
-struct driver_resource { uint32_t live, owner, kind; uint64_t address, amount; };
+struct driver_resource { uint32_t live, owner, kind; uint64_t address, amount, physical, extent; };
 static struct driver_resource driver_resources[DRIVER_RESOURCE_MAX];
 static struct kernel_spinlock driver_resource_lock = KERNEL_SPINLOCK_INIT;
 /** @brief Record a module-owned resource allocated during serialized init.
  * @param owner Loading module slot; must be less than RELIEFOS_DRIVER_MAX.
  * @param kind DMA/MMIO/IRQ resource selector.
  * @param address Physical address, pointer value or IRQ token.
- * @param amount Pages or mapping bytes, zero for IRQ.
+ * @param amount Pages or original mapping bytes, zero for IRQ.
+ * @param physical MMIO bus base for exclusion, DMA base for diagnostics, zero for IRQ.
  * @return 0 or -ENOSPC/-EINVAL/-EBUSY (another owner maps this BAR). IRQ-safe ledger; no callback/ownership on failure.
  */
-static int driver_resource_add(uint32_t owner,uint32_t kind, uint64_t address, uint64_t amount)
+static int driver_resource_add(uint32_t owner,uint32_t kind, uint64_t address, uint64_t amount, uint64_t physical)
 {
     if (owner >= RELIEFOS_DRIVER_MAX) return -22;
+    uint64_t extent = 0;
+    if (kind == DRIVER_RESOURCE_MMIO) {
+        if (!amount || amount > UINT64_MAX - 4095u || (physical & 4095u)) return -22;
+        extent = (amount + 4095u) & ~4095ull;
+        if (physical > UINT64_MAX - extent) return -22;
+    }
     uint64_t flags;
     kernel_spin_lock_irqsave(&driver_resource_lock,&flags);
     if (kind==DRIVER_RESOURCE_MMIO) for(uint32_t i=0;i<DRIVER_RESOURCE_MAX;++i) {
         const struct driver_resource *r=&driver_resources[i];
         if(r->live && r->kind==kind && r->owner!=owner &&
-           address < r->address+r->amount && r->address < address+amount) {
+           physical < r->physical+r->extent && r->physical < physical+extent) {
             kernel_spin_unlock_irqrestore(&driver_resource_lock,flags);return -16;
         }
     }
     for (uint32_t i=0;i<DRIVER_RESOURCE_MAX;++i) if (!driver_resources[i].live) {
         driver_resources[i]=(struct driver_resource){.live=1,.owner=owner,
-            .kind=kind,.address=address,.amount=amount};
+            .kind=kind,.address=address,.amount=amount,.physical=physical,.extent=extent};
         kernel_spin_unlock_irqrestore(&driver_resource_lock,flags); return 0;
     }
     kernel_spin_unlock_irqrestore(&driver_resource_lock,flags); return -28;
@@ -62,7 +69,7 @@ uint64_t driver_alloc_dma_owned(uint32_t owner,uint32_t pages,uint64_t mask)
 {
     if(owner>=RELIEFOS_DRIVER_MAX)return 0;
     uint64_t phys=mm_alloc_pages_below(pages,mask);
-    if(phys && driver_resource_add(owner,DRIVER_RESOURCE_DMA,phys,pages)) {mm_free_pages(phys,pages);return 0;}
+    if(phys && driver_resource_add(owner,DRIVER_RESOURCE_DMA,phys,pages,phys)) {mm_free_pages(phys,pages);return 0;}
     return phys;
 }
 /** @brief Return one exact DMA lease; duplicate/unmatched frees are ignored.
@@ -79,7 +86,8 @@ void driver_free_dma(uint64_t phys,uint32_t pages)
  * @param phys Aligned memory BAR base.
  * @param bytes Requested bytes entirely inside BAR pages.
  * @return Owned kernel pointer or NULL. Task context; wrapper acquires a short
- * execution transaction. Rollback restores attributes if ledger registration fails.
+ * execution transaction. Exclusion compares rounded physical extents even when
+ * CPU aliases differ; failed ledger admission releases only its exact mapping lease.
  */
 void *driver_map_mmio_owned(uint32_t owner,uint64_t phys,uint64_t bytes)
 {
@@ -87,7 +95,7 @@ void *driver_map_mmio_owned(uint32_t owner,uint64_t phys,uint64_t bytes)
     uint64_t execution_flags;
     kernel_execution_lock_irqsave(&execution_flags);
     void *ptr=pci_map_mmio(phys,bytes);
-    if(ptr && driver_resource_add(owner,DRIVER_RESOURCE_MMIO,(uint64_t)(uintptr_t)ptr,bytes)) {
+    if(ptr && driver_resource_add(owner,DRIVER_RESOURCE_MMIO,(uint64_t)(uintptr_t)ptr,bytes,phys)) {
         pci_unmap_mmio(ptr,bytes);ptr=NULL;
     }
     kernel_execution_unlock_irqrestore(execution_flags);
@@ -120,7 +128,7 @@ int driver_request_pci_irq_owned(uint32_t owner,const struct reliefos_driver_pci
     if(owner>=RELIEFOS_DRIVER_MAX || !out_handle)return -22;
     uint32_t handle;int ret=pci_request_irq(dev,handler,opaque,&handle);
     if(ret)return ret;
-    ret=driver_resource_add(owner,DRIVER_RESOURCE_IRQ,handle,0);
+    ret=driver_resource_add(owner,DRIVER_RESOURCE_IRQ,handle,0,0);
     if(ret){pci_free_irq(handle);return ret;}
     *out_handle=handle;return 0;
 }

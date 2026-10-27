@@ -128,6 +128,8 @@ void task_packet_release(struct task_file *file) { (void)file; }
 void task_udp_release(struct task_file *file) { (void)file; }
 void net_socket_release_fd(int32_t handle) { (void)handle; }
 int storage_inode_put(struct storage_inode_ref *reference) { (void)reference; return 0; }
+/* These socket/input fixture objects never hold a regular inode writer. */
+void storage_inode_write_put(struct storage_inode_ref *inode){(void)inode;abort();}
 void task_pipe_release(struct task_file *file) { (void)file; }
 void task_shm_release(struct task_file *file) { (void)file; }
 /* This fixture exercises poll readiness, not PTY aliases. */
@@ -166,14 +168,7 @@ struct task_file *task_descriptor_for_fd(struct task *task, int fd)
     return task && fd == 3 ? &task->files[0] : NULL;
 }
 
-int fs_permissions_resolve_flags(const struct task *task, const char *base,
-                                 const char *path, char *out, uint32_t capacity,
-                                 bool real_ids, uint32_t flags)
-{ (void)task; (void)base; (void)path; (void)out; (void)capacity; (void)real_ids; (void)flags; return -1; }
 
-int fs_permissions_check(const struct task *task, const char *path,
-                         uint32_t access, bool real_ids)
-{ (void)task; (void)path; (void)access; (void)real_ids; return -1; }
 
 uint32_t pty_vt_number(uint32_t pty_id) { (void)pty_id; return 1; }
 int pty_is_hungup(uint32_t pty_id) { (void)pty_id; return 0; }
@@ -315,3 +310,12 @@ int main(void)
     puts("PASS poll readiness wake, stopped/exited cleanup, finite timeout, and nfds=0 fallback");
     return 0;
 }
+
+/* Real counted UNIX address parsing runs in this fixture. Only filesystem
+ * endpoint resolution is outside its scope and must abort if ever reached;
+ * actual inode/DAC/bind cases live in mount_backend_test and the native probe. */
+int syscall_unix_path(struct vfs_namespace *ns,struct task *task,const char *name,
+                          bool create,struct vfs_path *out)
+{ (void)ns;(void)task;(void)name;(void)create;(void)out;abort(); }
+
+#include "block_description_fixture.h"

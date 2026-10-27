@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run the installer RAM-root mapping regression against a real ext2 image."""
 from pathlib import Path
+from storage_graph_test_sources import STORAGE_GRAPH_SOURCES
 import os
 import subprocess
 import tempfile
@@ -21,6 +22,6 @@ with tempfile.TemporaryDirectory(prefix="reliefos-installer-ramdisk-", dir=TEMP_
         "cc", "-std=c11", "-O1", "-g", "-fsanitize=address,undefined",
         "-fno-sanitize-recover=all", "-ffunction-sections", "-fdata-sections",
         "-Wl,--gc-sections", "-Iinclude", "-Iinclude/uapi", "-Iinclude",
-        "tools/tests/installer_ramdisk_test.c", "-o", str(executable),
+        "tools/tests/installer_ramdisk_test.c", "block/ramdisk/boot.c", *STORAGE_GRAPH_SOURCES, "-o", str(executable),
     ], cwd=ROOT, check=True)
     subprocess.run([str(executable), str(image)], cwd=ROOT, check=True, timeout=30)

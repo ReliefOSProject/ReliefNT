@@ -9,5 +9,5 @@ with tempfile.TemporaryDirectory(prefix="reliefos-ahci-") as directory:
     subprocess.run(["cc", "-std=c11", "-O1", "-g", "-fsanitize=address,undefined",
                     "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
                     "-Iinclude", "-Iinclude", "-Iinclude/uapi", "-Iinclude",
-                    "tools/tests/ahci_completion_test.c", "-o", executable], cwd=ROOT, check=True)
+                    "tools/tests/ahci_completion_test.c", "kernel/dma/buffer.c", "drivers/storage/ahci/dma.c", "-o", executable], cwd=ROOT, check=True)
     subprocess.run([executable], check=True, timeout=10)

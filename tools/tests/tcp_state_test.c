@@ -85,6 +85,31 @@ int task_udp_recv(struct task_file *file, void *buffer, uint32_t length,
                   uint32_t flags, uint64_t address, uint64_t address_length)
 { (void)file; (void)buffer; (void)length; (void)flags; (void)address; (void)address_length; return -LINUX_EOPNOTSUPP; }
 
+static void test_tcp_peek(struct net_socket *s)
+{
+    uint32_t saved_head=s->rx_head,saved_length=s->rx_len;
+    bool saved_fin=s->fin_received;
+    s->rx_head=NET_SOCKET_RX_CAP-3;s->rx_len=8;s->fin_received=false;
+    const unsigned char text[]="HTTP/1.0";
+    for(unsigned n=0;n<8;++n)s->rx[(s->rx_head+n)%NET_SOCKET_RX_CAP]=text[n];
+    struct task_file file={.flags=TASK_FILE_FLAG_SOCKET_INET,.aux=s->handle};
+    unsigned before=wait_queue_adds,sent_before=sent_count;
+    unsigned char data[16]={0};
+    for(unsigned repeat=0;repeat<2;++repeat) {
+        assert(task_inet_recv(&file,data,8,MSG_PEEK|MSG_DONTWAIT)==8);
+        assert(!__builtin_memcmp(data,text,8) && s->rx_head==NET_SOCKET_RX_CAP-3 && s->rx_len==8);
+        assert(sent_count==sent_before && !(file.flags&RELIEFOS_O_NONBLOCK));
+    }
+    assert(task_inet_recv(&file,data,8,MSG_TRUNC)==-LINUX_EOPNOTSUPP && s->rx_len==8);
+    assert(task_inet_read(&file,data,8)==8 && !__builtin_memcmp(data,text,8) && !s->rx_len);
+    assert(task_inet_recv(&file,data,8,MSG_PEEK|MSG_DONTWAIT)==-RELIEFOS_EAGAIN);
+    assert(wait_queue_adds==before && !(file.flags&RELIEFOS_O_NONBLOCK));
+    s->fin_received=true;
+    assert(task_inet_recv(&file,data,8,MSG_PEEK|MSG_DONTWAIT)==0);
+    assert(task_inet_recv(&file,NULL,0,MSG_PEEK)==0);
+    s->rx_head=saved_head;s->rx_len=saved_length;s->fin_received=saved_fin;
+}
+
 static void test_small_reads(struct net_socket *s)
 {
     s->remote_seq += NET_SOCKET_RX_CAP - s->rx_len;
@@ -893,6 +918,7 @@ int main(void)
     net_socket_handle_tcp(s->remote_ip, s->remote_port, s->local_port,
                           500, 100, 65535, TCP_FLAG_ACK, bytes, sizeof(bytes));
     assert(s->rx_len == 2 && s->remote_seq == 504 && s->rx[0] == 3 && s->rx[1] == 4);
+    test_tcp_peek(s);
     test_small_reads(s);
     test_window_edges(s);
     net_close_owner_sockets(7);
@@ -938,3 +964,10 @@ int main(void)
     puts("[tcp-state] PASS socket lifetime, queued TCP, congestion/window flow, retransmit and partial ACK");
     return 0;
 }
+
+/* Real counted UNIX address parsing runs in this fixture. Only filesystem
+ * endpoint resolution is outside its scope and must abort if ever reached;
+ * actual inode/DAC/bind cases live in mount_backend_test and the native probe. */
+int syscall_unix_path(struct vfs_namespace *ns,struct task *task,const char *name,
+                          bool create,struct vfs_path *out)
+{ (void)ns;(void)task;(void)name;(void)create;(void)out;abort(); }

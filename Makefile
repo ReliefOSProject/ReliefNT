@@ -87,6 +87,7 @@ HOST_LDFLAGS ?=
 HEADER_EXPORT_LIST ?= $(RELIEFNT_SRC)/configs/header-export.list
 RELIEFNT_TEST_PYTHON ?= python3
 DESTDIR ?= $(O)/kernel-install
+INSTALL_MOD_PATH ?= $(O)/module-install
 
 include $(RELIEFNT_SRC)/scripts/Makefile.reliefnt
 
@@ -100,7 +101,9 @@ RELIEFNT_LOCK_SKIP := \
 	$(if $(findstring n,$(firstword -$(MAKEFLAGS))),1) \
 	$(if $(findstring q,$(firstword -$(MAKEFLAGS))),1)
 ifeq ($(MAKECMDGOALS),)
+ifeq ($(strip $(M)),)
 RELIEFNT_LOCK_SKIP += 1
+endif
 else ifeq ($(words $(filter-out $(RELIEFNT_READ_ONLY_GOALS),$(MAKECMDGOALS))),0)
 RELIEFNT_LOCK_SKIP += 1
 endif
@@ -113,7 +116,7 @@ endif
 export RELIEFOS_BUILD_OWNER := $(RELIEFNT_BUILD_OWNER)
 endif
 
-.DEFAULT_GOAL := help
+.DEFAULT_GOAL := $(if $(strip $(M)),modules,help)
 .SUFFIXES:
 .DELETE_ON_ERROR:
 
@@ -129,11 +132,17 @@ help:
 	  '  all               kernel.sys, kernel.debug, kerneldebug.sys' \
 	  '  kernel            kernel.sys and kernel.debug' \
 	  '  kerneldebug       kerneldebug.sys' \
+	  '  modules           build configured native .ko modules (also the default with M=)' \
+	  '  modules_prepare   prepare original modpost/genksyms and native headers' \
+	  '  modules_install   stage modules under INSTALL_MOD_PATH/lib/modules/<release>' \
+	  '  modules_sdk       export a matching prepared SDK under INSTALL_MOD_PATH/usr/src' \
+	  '  kernelrelease     print the native ABI-qualified release' \
 	  '  vdso              build vDSO ELF and embedded object' \
 	  '  test-vdso         inspect and exercise the generated vDSO' \
 	  '  headers_install   export the UAPI whitelist to $(O)/kernel-export' \
 	  '  install           install products and manifest.txt to DESTDIR' \
 	  '  defconfig / olddefconfig / menuconfig / config-sync' \
+	  '  allmodconfig / allyesconfig' \
 	  '  tools / fetch / fetch-check' \
 	  '  test              complete kernel host/native validation' \
 	  '  test-host         explicit host suites, per-suite logs and result JSON' \
@@ -164,11 +173,7 @@ FORCE:
 
 define RELIEFNT_WRITE_TOOL_ID
 set -eu; \
-tool_name=$$(printf '%s\n' '$(1)' | awk '{ print $$1 }'); \
-tool_path=$$(command -v "$$tool_name"); \
-tool_version=$$($(1) --version 2>&1 | head -n1); \
-tool_hash=$$(sha256sum "$$tool_path" | cut -d' ' -f1); \
-identity=$$(printf '%s\n%s\n%s\n' '$(1)' "$$tool_version" "$$tool_hash" | sha256sum | cut -d' ' -f1); \
+identity=$$(sh '$(RELIEFNT_SRC)/scripts/tool-identity.sh' $(1)); \
 printf '%s\n' "$$identity" > '$@.tmp'; \
 if cmp -s '$@.tmp' '$@' 2>/dev/null; then rm -f '$@.tmp'; \
 else mv -f '$@.tmp' '$@'; fi
@@ -207,6 +212,11 @@ defconfig: kconfig-tools $(RELIEFNT_O_MARKER)
 	+$(Q)$(call RELIEFNT_KCONFIG,defconfig)
 	+$(Q)$(call RELIEFNT_KCONFIG,syncconfig)
 
+.PHONY: allmodconfig allyesconfig
+allmodconfig allyesconfig: kconfig-tools $(RELIEFNT_O_MARKER)
+	+$(Q)$(call RELIEFNT_KCONFIG,$@)
+	+$(Q)$(call RELIEFNT_KCONFIG,syncconfig)
+
 olddefconfig: kconfig-tools $(RELIEFNT_O_MARKER)
 	+$(Q)if [ ! -f '$(O)/.config' ]; then $(call RELIEFNT_KCONFIG,defconfig); fi
 	+$(Q)$(call RELIEFNT_KCONFIG,olddefconfig)
@@ -221,9 +231,60 @@ config-sync: kconfig-tools $(RELIEFNT_O_MARKER)
 	+$(Q)if [ ! -f '$(O)/.config' ]; then $(call RELIEFNT_KCONFIG,defconfig); fi
 	+$(Q)$(call RELIEFNT_KCONFIG,syncconfig)
 
-kernel: config-sync vdso prepare-assets prepare-debug kbuild-fixdep \
-	$(RELIEFNT_TARGET_CC_ID) $(RELIEFNT_TARGET_AR_ID) $(RELIEFNT_TARGET_LD_ID) $(RELIEFNT_TARGET_OBJCOPY_ID)
-	+$(Q)$(call RELIEFNT_KBUILD,obj=.)
+# Explicit config changes precede every compilation consumer even in a mixed
+# parallel invocation such as `make -j olddefconfig modules modules_install`.
+reliefnt_config_goals := $(filter defconfig olddefconfig menuconfig allmodconfig allyesconfig,$(MAKECMDGOALS))
+ifneq ($(word 2,$(reliefnt_config_goals)),)
+$(error select only one configuration operation per make invocation)
+endif
+config-sync: $(reliefnt_config_goals)
+
+# Native objects and every module are compiled by the unchanged per-directory
+# engine. Original vmlinux_o/modpost/modfinal own ELF metadata and final .ko.
+.PHONY: module-tools modules_prepare modules modules_install
+module-tools: config-sync kbuild-fixdep $(RELIEFNT_HOST_CC_ID) $(RELIEFNT_TARGET_CC_ID)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=scripts/genksyms KBUILD_HOSTCFLAGS='$(RELIEFNT_HOST_CFLAGS) -std=gnu11 $(RELIEFNT_HOST_CPPFLAGS)')
+	+$(Q)$(call RELIEFNT_KBUILD,obj=scripts/mod KBUILD_HOSTCFLAGS='$(RELIEFNT_HOST_CFLAGS) -std=gnu11 $(RELIEFNT_HOST_CPPFLAGS)')
+
+modules_prepare: module-tools prepare-assets prepare-debug prepare-module-abi \
+	$(RELIEFNT_TARGET_AR_ID) $(RELIEFNT_TARGET_LD_ID) $(RELIEFNT_TARGET_OBJCOPY_ID)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=arch/x86_64/module arch/x86_64/module/module.lds)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=. ./scripts/module.lds)
+
+kernel: modules_prepare vdso
+	+$(Q)$(call RELIEFNT_KBUILD,obj=. ./built-in.a ./modules.order ./vmlinux.a)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=. RELIEFNT_KBUILD_FILE=scripts/Makefile.vmlinux_o)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=. RELIEFNT_KBUILD_FILE=scripts/Makefile.modpost)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=. ./.vmlinux.export.o ./generated/system/kernel.sys ./generated/system/kernel.debug ./generated/system/kerneldebug.sys ./System.map)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=. RELIEFNT_KBUILD_FILE=scripts/Makefile.modfinal)
+	$(Q)sh $(RELIEFNT_SRC)/scripts/modules-clean-stale.sh '$(O)' '$(O)/modules.order'
+	$(Q)sh $(RELIEFNT_SRC)/scripts/modules-manifest.sh '$(O)'
+
+modules: kernel
+ifneq ($(strip $(M)),)
+	$(Q)if ! grep -q '^CONFIG_MODULES=y$$' '$(O)/.config'; then \
+	    echo 'external modules require CONFIG_MODULES=y in this kernel output' >&2; exit 1; fi
+	+$(Q)$(call RELIEFNT_KBUILD,obj=$(abspath $(M)) KBUILD_EXTMOD=$(abspath $(M)) extmod_prefix=$(abspath $(M))/ MODORDER=$(abspath $(M))/modules.order VPATH=)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=$(abspath $(M)) KBUILD_EXTMOD=$(abspath $(M)) extmod_prefix=$(abspath $(M))/ MODORDER=$(abspath $(M))/modules.order VPATH= RELIEFNT_KBUILD_FILE=scripts/Makefile.modpost)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=$(abspath $(M)) KBUILD_EXTMOD=$(abspath $(M)) extmod_prefix=$(abspath $(M))/ MODORDER=$(abspath $(M))/modules.order VPATH= RELIEFNT_KBUILD_FILE=scripts/Makefile.modfinal)
+	$(Q)sh $(RELIEFNT_SRC)/scripts/modules-clean-stale.sh '$(abspath $(M))' '$(abspath $(M))/modules.order'
+endif
+
+modules_install: modules
+	+$(Q)sh $(RELIEFNT_SRC)/scripts/modules-stage.sh '$(RELIEFNT_SRC)' '$(O)' \
+	    '$(INSTALL_MOD_PATH)' "$$(cat $(O)/include/config/kernel.release)" '$(if $(M),$(abspath $(M)))' \
+	    $(call RELIEFNT_KBUILD,RELIEFNT_KBUILD_FILE=scripts/Makefile.modinst \
+	      KBUILD_EXTMOD='$(if $(M),$(abspath $(M)))' extmod_prefix='$(if $(M),$(abspath $(M))/)' \
+	      MODORDER='$(if $(M),$(abspath $(M))/,)modules.order' INSTALL_MOD_STRIP='$(INSTALL_MOD_STRIP)')
+
+.PHONY: modules_sdk
+modules_sdk: kernel
+	$(Q)SDK_ARCH='$(ARCH)' SDK_PROFILE='$(PROFILE)' SDK_TRIPLE='$(TRIPLE_KERNEL)' \
+	    SDK_CC='$(TARGET_CC)' SDK_AR='$(TARGET_AR)' SDK_LD='$(TARGET_LD)' \
+	    SDK_OBJCOPY='$(TARGET_OBJCOPY)' SDK_NM='$(TARGET_NM)' SDK_STRIP='$(TARGET_STRIP)' \
+	    SDK_CFLAGS='$(KERNEL_CFLAGS)' SDK_AFLAGS='$(KERNEL_AFLAGS)' SDK_LDFLAGS='$(KERNEL_LDFLAGS)' \
+	    SDK_SOURCE_ID='$(RELIEFNT_SOURCE_ID)' \
+	    sh '$(RELIEFNT_SRC)/scripts/modules-sdk.sh' '$(RELIEFNT_SRC)' '$(O)' '$(INSTALL_MOD_PATH)'
 
 all: kernel
 
@@ -335,7 +396,8 @@ test-boot: kernel multiboot2-runtime-test boot-root-runtime-test file-flags-runt
 	$(Q)$(O)/tools/tests/sidecar_directory_runtime_test
 	$(Q)$(RELIEFNT_TEST_PYTHON) $(RELIEFNT_SRC)/tools/test_boot_entry.py --output $(O)
 
-install: all headers_install
+install: INSTALL_MOD_PATH = $(DESTDIR)
+install: all headers_install modules_install tools
 	$(Q)set -eu; \
 	dest='$(DESTDIR)'; \
 	mkdir -p "$$dest"; \
@@ -359,6 +421,8 @@ install: all headers_install
 	  (cd "$$dest" && sha256sum kernel.sys kernel.debug kerneldebug.sys | sed 's/^/  /'); \
 	} > "$$dest/manifest.txt.tmp"; \
 	mv -f "$$dest/manifest.txt.tmp" "$$dest/manifest.txt"
+	$(Q)'$(O)/tools/host/manifest/reliefnt-install-bundle' '$(DESTDIR)' \
+	    "$$(cat '$(O)/include/config/kernel.release')" '$(ARCH)' '$(PROFILE)'
 
 clean:
 	$(Q)if [ -f '$(RELIEFNT_O_MARKER)' ]; then \
@@ -375,6 +439,14 @@ distclean:
 .PHONY: prepare-assets prepare-debug test-module-layout
 prepare-assets: tools
 	+$(Q)$(call RELIEFNT_KBUILD,obj=. ./include/generated/build_info.h ./include/generated/cjk_font.h)
+
+.PHONY: prepare-module-abi kernelrelease
+prepare-module-abi: config-sync kbuild-fixdep $(RELIEFNT_TARGET_CC_ID) \
+	$(RELIEFNT_TARGET_AR_ID) $(RELIEFNT_TARGET_LD_ID) $(RELIEFNT_TARGET_OBJCOPY_ID)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=. ./include/generated/module_abi.h)
+
+kernelrelease: prepare-module-abi
+	$(Q)cat $(O)/include/config/kernel.release
 
 prepare-debug: config-sync kbuild-fixdep $(RELIEFNT_TARGET_CC_ID)
 	+$(Q)$(call RELIEFNT_KBUILD,obj=debug)

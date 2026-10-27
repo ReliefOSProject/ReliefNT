@@ -57,8 +57,24 @@ struct reliefos_kernel_debug_benchmark {
 
 typedef int (*reliefos_kernel_debug_entry_fn)(const struct reliefos_kernel_debug_api *api);
 
+/**
+ * @brief Read or persist the optional diagnostic module's boot policy.
+ * @param control Authorized kernel-owned request, updated with enabled state.
+ * @return Zero or a negative validation, permission, VFS or ESP error.
+ * @note Caller validates privilege/user memory. Task context without registry
+ * locks; persistent changes may block. This is independent of .ko ABI admission.
+ */
 int kernel_debug_control(struct reliefos_kernel_debug_control *control);
 bool kernel_debug_boot_requested(void);
+struct task;
+/** @brief Complete deferred boot controls after PID1 leaves its initial memory root.
+ * @param task Committed executing task, nullable; only initial PID1 is admitted.
+ * @return None. Called with execution ownership after ELF-loader serialization
+ * is released. Binds the actual fstab ESP, consumes the original one-shot marker
+ * and retains the existing optional debug session behavior before real init.
+ * Failed/early tmpfs execs do not complete the checkpoint; no code/path pin escapes.
+ */
+void kernel_debug_finish_initramfs_boot(struct task *task);
 int kernel_debug_run_module(void);
 int kernel_debug_clear_state(void);
 

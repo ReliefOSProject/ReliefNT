@@ -6,7 +6,7 @@
 #include "../../block/core/storage_state_data.c"
 
 #define EXT4_BLOCK_CACHE_ENTRIES 2u
-#include "../../fs/ext4/cache.c"
+#include "../../fs/ext_common/cache.c"
 
 static uint8_t disk[64 * 4096];
 static uint8_t output[8 * 4096];

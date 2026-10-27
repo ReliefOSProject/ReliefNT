@@ -1,10 +1,12 @@
+#include <reliefnt/export.h>
 #include "internal.h"
 
 static void sched_wait_info(struct linux_siginfo *info, const struct task *task, int status);
 
 
 /**
- * @brief Wake a non-exited task: clear its wait state and set it READY.
+ * @brief Mark the current live non-idle task blocked with no timed wakeup.
+ * Execution-owned task context. Updates state under scheduler_lock; idle, absent or exited tasks are ignored. Scheduling occurs at the normal return boundary, not inside this function.
  */
 void sched_block_current(void)
 {
@@ -20,9 +22,11 @@ void sched_block_current(void)
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
 }
 
-/**
- * @brief Wake a published interruptible wait without resuming stopped/exited tasks.
- * @param task Task pinned by the kernel execution lock; it may still be retiring on another CPU.
+/** @brief Wake a blocked task without reviving stopped/exited/vfork-wait tasks.
+ * @param task Borrowed task pinned by execution/wait lifetime, nullable.
+ * IRQ/task safe scheduler-lock transaction; requests remote rescheduling only
+ * after publishing readiness. No allocation, callback or ownership transfer;
+ * running_cpu keeps an unretired frame from being claimed by another CPU.
  */
 void sched_wake_interruptible(struct task *task)
 {
@@ -66,7 +70,9 @@ void sched_mark_ready(uint32_t pid)
 }
 
 /**
- * @brief Put the current task to sleep until wake_tick (no-op for the idle or an exited task).
+ * @brief Block the current live non-idle task until an absolute scheduler tick.
+ * @param wake_tick Absolute wake tick; zero retains the untimed-blocked convention.
+ * Execution-owned task context. Scheduler lock protects state/wake_tick; absent, idle or exited tasks are ignored. CPU ownership stays reserved until the normal saved-frame scheduling boundary.
  */
 void sched_sleep_current_until(uint64_t wake_tick)
 {
@@ -117,6 +123,7 @@ static void sched_wait_info(struct linux_siginfo *info, const struct task *task,
  * -2 for an absent waiter, or -RELIEFOS_EAGAIN while a matching child is pending.
  * The caller must not hold scheduler_lock; resource teardown and diagnostics
  * execute outside it. WNOWAIT observes without consuming or logging a reap.
+ * Consuming a zombie invalidates its retained PID identity before PID unpublish.
  */
 int64_t sched_wait_reap(uint32_t waiter_pid, int32_t wanted_pid,
                         uint32_t options, int *status, struct linux_siginfo *info)
@@ -207,6 +214,7 @@ int64_t sched_wait_reap(uint32_t waiter_pid, int32_t wanted_pid,
         if (reap_task->pid == reap_pid &&
             (reap_task->flags & TASK_FLAG_REAP_IN_PROGRESS)) {
             reap_task->parent_pid = 0;
+            sched_task_identity_detach(reap_task);
             task_release_limits(reap_task);
             reap_task->flags &= ~(TASK_FLAG_WAITABLE_CHILD | TASK_FLAG_REAP_IN_PROGRESS);
             task_copy_name(reap_task, "reaped");
@@ -241,3 +249,8 @@ int64_t sched_wait_reap(uint32_t waiter_pid, int32_t wanted_pid,
     kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
     return found_child ? -RELIEFOS_EAGAIN : 0;
 }
+
+EXPORT_SYMBOL(sched_wake_interruptible);
+
+EXPORT_SYMBOL(sched_block_current);
+EXPORT_SYMBOL(sched_sleep_current_until);

@@ -4,6 +4,8 @@
 
 int fat32_mount(void)
 {
+    int cache_status=storage_inode_purge_volume(g_storage.volume_id);
+    if(cache_status)return cache_status;
     struct fat32_bpb *bpb = (struct fat32_bpb *)(void *)storage_scratch;
     uint16_t fs_info_sector;
     uint16_t backup_boot_sector;

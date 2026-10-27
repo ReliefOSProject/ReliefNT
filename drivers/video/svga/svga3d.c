@@ -1,3 +1,4 @@
+#include <reliefnt/export.h>
 #include "device.h"
 
 static int require_ready(void)
@@ -77,6 +78,16 @@ static int managed_command(uint32_t command)
     }
 }
 
+/**
+ * @brief Decode supported SVGA storage geometry and its capability selector.
+ * @param format Native format code.
+ * @param bw Required writable block width.
+ * @param bh Required writable block height.
+ * @param bytes Required writable bytes per block.
+ * @param cap Required writable capability selector.
+ * @return Zero, EINVAL for missing output, or ENOTSUP for unsupported format; non-NULL outputs receive defaults before format decoding.
+ * Pure kernel query, no lock, hardware access, allocation or ownership transfer.
+ */
 int svga_format(uint32_t format, uint32_t *bw, uint32_t *bh,
                 uint32_t *bytes, uint32_t *cap)
 {
@@ -154,6 +165,13 @@ static int format_operations_locked(uint32_t format, uint32_t *out)
     return 0;
 }
 
+/**
+ * @brief Snapshot supported host operations for one SVGA surface format.
+ * @param format Native SVGA format selector.
+ * @param out Required writable operations mask, cleared before lock acquisition.
+ * @return Zero, EBUSY for contention, EINVAL for NULL output, or the format capability error.
+ * Task context for module callers; takes the SVGA lock internally. No allocation, retained resource or ownership transfer.
+ */
 int svga3d_format_operations(uint32_t format, uint32_t *out)
 {
     if (!out) return SVGA_EINVAL;
@@ -427,6 +445,12 @@ int svga3d_context_destroy(svga_handle context)
     return SVGA_EBUSY;
 }
 
+/**
+ * @brief Publish a new native context with a real readiness fence and mode lease.
+ * @param out Required owned-handle output, cleared before validation.
+ * @return Zero with an owned handle, EBUSY for lock/FIFO pressure, or a validation/device/allocation error.
+ * Execution-owned task context; no caller SVGA lock. Successful initialization may still await its readiness fence. Caller retains the handle and retries try_destroy until zero before releasing ownership.
+ */
 int svga3d_context_try_create(svga_handle *out)
 {
     if (!out) return SVGA_EINVAL;
@@ -489,6 +513,12 @@ done:
     return ret;
 }
 
+/**
+ * @brief Retire a context only after its queries, shaders and FIFO work quiesce.
+ * @param handle Owned native context, including retirement already in progress.
+ * @return Zero after backing/lease release, EBUSY while active or fenced work remains, or a device/validation error.
+ * Execution-owned task context; no caller SVGA lock. Busy/errors retain backing and ownership, requiring retry; no callback into optional module code is stored.
+ */
 int svga3d_context_try_destroy(svga_handle handle)
 {
     uint32_t reaped = 0;
@@ -694,6 +724,13 @@ int svga3d_surface_destroy(svga_handle surface)
     return ret;
 }
 
+/**
+ * @brief Publish a validated native surface and its readiness fence/mode lease.
+ * @param desc Borrowed validated kernel descriptor copied on success.
+ * @param out Required owned-handle output, cleared before validation.
+ * @return Zero with an owned handle, EBUSY for lock/FIFO pressure, or validation/device/allocation error.
+ * Execution-owned task context; no caller SVGA lock. Retain the handle/backing through readiness and until try_destroy confirms final hardware retirement.
+ */
 int svga3d_surface_try_create(const struct svga_surface_desc *desc,
                               svga_handle *out)
 {
@@ -787,6 +824,12 @@ done:
     return ret;
 }
 
+/**
+ * @brief Retire an unbound surface after actual FIFO completion.
+ * @param handle Owned surface handle, including pending retirement.
+ * @return Zero after backing/lease release, EBUSY while referenced or fenced, or a device/validation error.
+ * Execution-owned task context; no caller SVGA lock. Busy/errors preserve ownership; successful final destruction is the only permission to drop external backing/code pins.
+ */
 int svga3d_surface_try_destroy(svga_handle handle)
 {
     uint64_t flags;
@@ -1075,3 +1118,10 @@ int svga3d_present(svga_handle surface, const struct svga_present_rect *rects,
     svga_unlock(flags);
     return ret;
 }
+
+EXPORT_SYMBOL(svga3d_context_try_create);
+EXPORT_SYMBOL(svga3d_context_try_destroy);
+EXPORT_SYMBOL(svga3d_format_operations);
+EXPORT_SYMBOL(svga3d_surface_try_create);
+EXPORT_SYMBOL(svga3d_surface_try_destroy);
+EXPORT_SYMBOL(svga_format);

@@ -9,6 +9,7 @@
 #include <reliefnt/storage.h>
 #include <reliefnt/time.h>
 #include <reliefnt/wait.h>
+#include <reliefnt/export.h>
 #include <linux/input.h>
 
 #define INPUT_QUEUE_CAP 512U
@@ -91,6 +92,7 @@ void input_handle_scancode(uint8_t keycode, uint8_t pressed)
     }
     kernel_spin_unlock_irqrestore(&input_lock, flags);
 }
+EXPORT_SYMBOL(input_handle_scancode);
 
 /** @brief Drain a bounded key batch while the caller holds the kernel execution transaction.
  * Terminal/session mutation and framebuffer replay never run in a keyboard IRQ.

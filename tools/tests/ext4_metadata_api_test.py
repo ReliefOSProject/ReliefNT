@@ -16,7 +16,7 @@ def main():
              "-DRELIEFOS_STORAGE_STANDALONE_TU","-Iinclude","-Iinclude",
              "-Iinclude/uapi","-Iinclude",
              "-include",str(STORAGE/"core/storage_internal.h"),"tools/tests/ext4_xattr_test.c",
-             *[str(FS/"ext4"/f"{n}.c") for n in
+             *[str(FS/"ext_common"/f"{n}.c") for n in
                ("format","checksum","cache","alloc","extent","ops","journal","dir","xattr")],"-o",str(binary)])
         for bs in (1024,4096):
             for kind,features in (("ext2","none,filetype,ext_attr"),

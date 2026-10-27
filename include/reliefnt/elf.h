@@ -9,7 +9,7 @@
 #include <reliefos/fs_abi.h>
 
 struct address_space;
-struct storage_node;
+struct vfs_path;
 struct task;
 
 struct elf_image_info {
@@ -38,8 +38,15 @@ bool elf64_probe(const void *image, size_t len, struct elf_image_info *out);
 bool elf64_load_address_space(struct address_space *as, const void *image, size_t len,
                               struct elf_image_info *out);
 /**
- * @brief Map an executable into the task; return zero or a negative errno.
+ * @brief Map an executable and PT_INTERP from retained filesystem objects.
+ * @param task Staged task owning its MM and actual root/cwd, required.
+ * @param image Borrowed main executable path retaining its provider.
+ * @param out Receives successful entry/auxiliary-vector metadata.
+ * @return Zero or negative executable/provider/permission errno. Caller rolls
+ * back partial VMAs on failure. Each lazy ELF VMA owns a shared immutable
+ * provider source. Execution/loader ownership is required; no graph/module
+ * lock spans I/O. Interpreter operands survive active syscall retries.
  */
-int elf64_map_task_image(struct task *task, const struct storage_node *node,
+int elf64_map_task_image(struct task *task, const struct vfs_path *image,
                           struct elf_image_info *out);
 #endif

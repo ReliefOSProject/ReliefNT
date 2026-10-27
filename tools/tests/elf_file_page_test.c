@@ -4,8 +4,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <reliefnt/lock.h>
+#define RELIEFNT_TEST_REAL_EXEC_SOURCE
 #include "modules/user_memory.h"
 #include "sysv_shm_fixture_stubs.h"
+#include "exec_file_fixture.h"
 
 static unsigned char file_bytes[8192];
 static uint64_t mapped;
@@ -33,7 +35,12 @@ void mm_free_page(uint64_t p) { assert(allocations); --allocations; free((void *
 void *mm_phys_to_virt(uint64_t phys) { return (void *)(uintptr_t)phys; }
 int storage_read_node(const struct storage_node *node, uint64_t offset,
                       void *buffer, uint32_t size, uint32_t *got)
+{(void)node;(void)offset;(void)buffer;(void)size;(void)got;abort();}
+static int exec_fixture_read(void *context,const struct storage_node *node,uint64_t offset,
+                               void *buffer,uint32_t size,uint32_t *got,uint64_t mount_flags)
 {
+    (void)mount_flags;
+    assert(context==&exec_fixture_pins && exec_fixture_pins && exec_fixture_denials);
     assert(node->size == sizeof(file_bytes) && offset + size <= node->size);
     ++reads;
     *got = 0;
@@ -64,8 +71,10 @@ int main(void)
         .used = 1, .prot = LINUX_PROT_READ,
         .flags = TASK_VMA_FLAG_FILE | TASK_VMA_FLAG_LAZY | TASK_VMA_FLAG_SHARED_FILE,
         .start = 0x5000000, .end = 0x5001000, .file_offset = 0,
-        .file_limit = 0x800, .file_node = {.size = sizeof(file_bytes)}
+        .file_limit = 0x800, .file_node = {.type=RELIEFOS_FS_TYPE_FILE,.size = sizeof(file_bytes)}
     };
+    struct vfs_exec_source *source=exec_fixture_open(&prefix.file_node);
+    prefix.exec_source=source;
     struct task_vma text = prefix;
     text.start += 4096;
     text.end += 4096;
@@ -144,6 +153,8 @@ int main(void)
         page_cache_invalidate_node(&text.file_node);
     }
     assert(!allocations);
+    vfs_exec_source_put(source);
+    assert(!exec_fixture_pins && !exec_fixture_inode_refs && !exec_fixture_denials);
     puts("PASS pinned cache growth: shared identity, allocation failure and private fallback without leaks");
     puts("PASS ELF segments sharing a file page: independent zero-fill and intact code cache");
     puts("PASS cold ELF usercopy faults: synchronous I/O, cache hits, errors and short-read cleanup");

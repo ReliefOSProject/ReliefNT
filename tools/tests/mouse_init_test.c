@@ -1,7 +1,7 @@
 #include <assert.h>
 #include <stdio.h>
 
-#include "../../drivers/input/mouse/mouse.c"
+#include "../../drivers/input/mouse/mouse_main.c"
 
 void console_log(enum console_log_level level, const char *format, ...)
 {

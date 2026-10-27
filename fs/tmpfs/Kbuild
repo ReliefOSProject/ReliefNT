@@ -2,4 +2,6 @@
 # Objects are owned by this directory; child modules own their own lists.
 obj-y := core.o tmpfs.o
 
+obj-y += native.o
+
 include $(srctree)/scripts/Makefile.module

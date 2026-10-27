@@ -32,8 +32,9 @@ static void hda_test_before_sleep(const struct hda_controller *c){(void)c;}
 #undef audio_period_elapsed
 #include "modules/pcm.h"
 #include "../../kernel/device/driver_manager_phase.c"
+#include "modules/audio_work.h"
 #define memset module_memset
-#include "../../drivers/sound/hda/hda.c"
+#include "../../drivers/sound/hda/hda_main.c"
 #undef memset
 #include "../../drivers/sound/hda/stream.c"
 #include "../../drivers/sound/hda/controls.c"
@@ -496,6 +497,7 @@ static void actual_module_prepare_preserves_volume_without_auto_mute(void)
 
 int main(void)
 {
+    audio_fixture_work_start();
     actual_module_auto_mute_running_group_transaction();
     actual_module_auto_mute_pause_contention_and_fail_closed();
     actual_module_prepare_preserves_volume_without_auto_mute();
@@ -533,5 +535,6 @@ int main(void)
         for(unsigned n=0;n<CARD_MAX;n++)assert(!cards[n].live);
     }
     fail_nth=0;printf("module_each_Nth_metadata_DMA_allocation_failure_reclaimed %u PASS\n",total);
+    audio_fixture_work_stop();
     return 0;
 }

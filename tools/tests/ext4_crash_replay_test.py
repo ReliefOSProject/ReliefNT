@@ -25,7 +25,7 @@ def main():
         work = Path(directory)
         binary = work / "journal-test"
         storage = ROOT / "block/core"
-        fs = ROOT / "fs/ext4"
+        fs = ROOT / "fs/ext_common"
         run(["cc", "-std=c11", "-O1", "-g", "-D_GNU_SOURCE",
              "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
              "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
@@ -41,7 +41,7 @@ def main():
              "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
              "-Iinclude", "-Iinclude", "-Iinclude/uapi",
              "-Iinclude", "tools/tests/ext4_vfs_read_test.c",
-             "fs/tmpfs/core.c", "-o", str(vfs)])
+             "fs/tmpfs/core.c", "lib/text_utf16.c", "-o", str(vfs)])
         stage = work / "stage"
         stage.mkdir()
         (stage / "payload").write_bytes(b"original" * 1024)

@@ -10,10 +10,7 @@ static int str_eq(const char *a, const char *b);
  */
 static const char *task_path_basename(const char *path);
 
-/**
- * @brief True when path resolves to the given volume id (used to detect in-use mounts).
- */
-static bool sched_path_uses_volume(const char *path, uint32_t volume_id);
+
 
 
 /**
@@ -166,76 +163,4 @@ struct task *sched_find_by_path_basename(const char *basename)
         }
     }
     return NULL;
-}
-
-/**
- * @brief True when path resolves to the given volume id (used to detect in-use mounts).
- */
-static bool sched_path_uses_volume(const char *path, uint32_t volume_id)
-{
-    uint32_t path_volume_id;
-    return path && storage_path_volume_id(path, &path_volume_id) == 0 &&
-           path_volume_id == volume_id;
-}
-
-/**
- * @brief True when any live task's cwd, path, image node, or open files/VMA reference this volume.
- */
-bool sched_volume_has_writers(uint32_t volume_id)
-{
-    for (uint32_t i = 0; i < task_count; ++i) {
-        struct task *task = tasks[i];
-        if (!task || !task->pid || (task->flags & TASK_FLAG_RESOURCES_RELEASED)) continue;
-        for (uint32_t j = 0; j < sched_task_file_capacity(task) + SCHED_TASK_STDIO_MAX; ++j) {
-            struct task_file *slot = j < SCHED_TASK_STDIO_MAX ?
-                &sched_task_fds(task)->stdio_files[j] : sched_task_file_at(task, j - SCHED_TASK_STDIO_MAX);
-            struct task_file *file = task_file_description(slot);
-            if (file && file->used && (file->node.flags & STORAGE_NODE_FLAG_TMPFS) &&
-                file->node.volume_id == volume_id &&
-                ((file->flags & LINUX_O_ACCMODE) == LINUX_O_WRONLY ||
-                 (file->flags & LINUX_O_ACCMODE) == LINUX_O_RDWR)) return true;
-        }
-        for (uint32_t j = 0; j < sched_task_vma_capacity(task); ++j) {
-            struct task_vma *vma = sched_task_vma_at(task, j);
-            if (vma && vma->used && (vma->flags & TASK_VMA_FLAG_SHARED_FILE) &&
-                vma->file_node.volume_id == volume_id &&
-                (vma->max_prot & TASK_VMA_PROT_WRITE)) return true;
-        }
-    }
-    return false;
-}
-
-bool sched_volume_in_use(uint32_t volume_id)
-{
-    for (uint32_t i = 0; i < task_count; ++i) {
-        const struct task *task = tasks[i];
-        if (!task->pid || task->state == TASK_EXITED) {
-            continue;
-        }
-        if (sched_path_uses_volume(sched_task_cwd(task), volume_id) ||
-            sched_path_uses_volume(task->path, volume_id) ||
-            task->image_node.volume_id == volume_id) {
-            return true;
-        }
-        for (uint32_t fd = 0; fd < sched_task_file_capacity(task); ++fd) {
-            const struct task_file *file = task_file_description(sched_task_file_at((struct task *)task, fd));
-            if (file && file->used && file->node.volume_id == volume_id) {
-                return true;
-            }
-        }
-        for (uint32_t fd = 0; fd < SCHED_TASK_STDIO_MAX; ++fd) {
-            struct task_file *file = task_file_description(&sched_task_fds(task)->stdio_files[fd]);
-            if (file->used && file->node.volume_id == volume_id) {
-                return true;
-            }
-        }
-        for (uint32_t vma = 0; vma < SCHED_TASK_VMA_MAX; ++vma) {
-            if (sched_task_mm(task)->vmas[vma].used &&
-                (sched_task_mm(task)->vmas[vma].flags & TASK_VMA_FLAG_FILE) &&
-                sched_task_mm(task)->vmas[vma].file_node.volume_id == volume_id) {
-                return true;
-            }
-        }
-    }
-    return false;
 }

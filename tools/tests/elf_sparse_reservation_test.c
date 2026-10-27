@@ -6,6 +6,7 @@
 
 #include <reliefnt/sched.h>
 #include <reliefnt/storage.h>
+#include "exec_file_fixture.h"
 
 #include "../../kernel/exec/elf.c"
 #define align_down paging_align_down
@@ -94,13 +95,11 @@ struct task_vma *sched_task_vma_at(struct task *task, uint32_t index)
     return &sched_task_mm(task)->vmas[index];
 }
 
-int storage_inode_get(const struct storage_node *node,
-                      struct storage_inode_ref **out_reference)
-{
-    assert(node && out_reference);
-    *out_reference = NULL;
-    return 0;
-}
+void *kernel_malloc(size_t size){return calloc(1,size);}
+void kernel_free(void *memory){free(memory);}
+static int exec_fixture_read(void *context,const struct storage_node *node,uint64_t offset,
+                               void *buffer,uint32_t length,uint32_t *read,uint64_t mount_flags)
+{(void)context;(void)node;(void)offset;(void)buffer;(void)length;(void)read;(void)mount_flags;abort();}
 
 void console_log(enum console_log_level level, const char *format, ...)
 {
@@ -123,6 +122,7 @@ int main(void)
     };
     struct task task = {0};
     struct address_space child = {0};
+    struct vfs_exec_source *source=exec_fixture_open(&node);
 
     nx_enabled = true;
     task.kind = TASK_KIND_USER;
@@ -144,7 +144,7 @@ int main(void)
     unsigned attempts_before_load = page_alloc_attempts;
     unsigned pages_before_load = live_pages;
     page_budget = TEST_PT_BUDGET;
-    int map_result = elf64_map_one(&task, &node, &image, &info, 0, "sparse-test");
+    int map_result = elf64_map_one(&task, source, &image, &info, 0, "sparse-test");
     page_budget = UINT32_MAX;
     if (map_result != 0 || page_alloc_attempts != attempts_before_load ||
         live_pages != pages_before_load) {
@@ -156,6 +156,9 @@ int main(void)
     assert(page_alloc_attempts == attempts_before_load);
     assert(live_pages == pages_before_load);
     assert(task.address_space.vmas[0].used);
+    assert(task.address_space.vmas[0].exec_source==source);
+    vfs_exec_source_put(source); /* Only the lazy VMA retains the provider now. */
+    assert(exec_fixture_pins==2 && exec_fixture_denials==1);
     assert(task.address_space.vmas[0].start == SPARSE_ELF_BASE);
     assert(task.address_space.vmas[0].end == SPARSE_ELF_BASE + SPARSE_ELF_SIZE);
     assert(!address_space_user_page_phys(sched_task_as(&task), SPARSE_ELF_BASE));
@@ -166,13 +169,13 @@ int main(void)
         .p_vaddr = RELIEFNT_KERNEL_HOLE_START, .p_filesz = 0,
         .p_memsz = 4096, .p_align = 4096,
     };
-    assert(elf64_map_one(&task, &node, &image, &info, 0, "kernel-hole") < 0);
+    assert(elf64_map_one(&task, source, &image, &info, 0, "kernel-hole") < 0);
     assert(page_alloc_attempts == attempts_before_reject);
     assert(!task.address_space.vmas[1].used);
 
     image.ph.p_vaddr = RELIEFNT_USER_TOP - 4096;
     image.ph.p_memsz = 8192;
-    assert(elf64_map_one(&task, &node, &image, &info, 0, "canonical-overflow") < 0);
+    assert(elf64_map_one(&task, source, &image, &info, 0, "canonical-overflow") < 0);
     assert(page_alloc_attempts == attempts_before_reject);
     assert(!task.address_space.vmas[1].used);
 
@@ -194,6 +197,8 @@ int main(void)
 
     address_space_destroy(&child);
     address_space_destroy(sched_task_as(&task));
+    vfs_exec_source_put(task.address_space.vmas[0].exec_source);
+    assert(!exec_fixture_pins && !exec_fixture_inode_refs && !exec_fixture_denials);
     assert(!live_pages);
     puts("PASS sparse 1 TiB ELF BSS: no eager page tables; high map, COW fork/fault and destruction");
 }

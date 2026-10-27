@@ -1,3 +1,4 @@
+#define AUDIO_FIXTURE_CUSTOM_HEAP 1
 #include <assert.h>
 #include <errno.h>
 #include <stdint.h>
@@ -23,25 +24,28 @@ enum {
 static uint8_t *test_ring_storage;
 static size_t test_ring_storage_bytes;
 static uint64_t test_kernel_free_count;
+static uint8_t *test_metadata_storage;
+static size_t test_metadata_storage_bytes;
+static int test_fail_heap;
 
 /** @brief Model a heap allocation returned through the supervisor direct map. */
 void *kernel_malloc(size_t size)
 {
+    if(test_fail_heap)return NULL;
     void *memory = NULL;
     if (posix_memalign(&memory, 4096, size)) return NULL;
-    test_ring_storage = memory;
-    test_ring_storage_bytes = size;
+    if(size<65536) {assert(!test_metadata_storage);test_metadata_storage=memory;test_metadata_storage_bytes=size;}
+    else {assert(!test_ring_storage);test_ring_storage=memory;test_ring_storage_bytes=size;}
     return memory;
 }
 
 /** @brief Release the retained direct-map heap allocation after the last VMA. */
 void kernel_free(void *memory)
 {
-    assert(memory == test_ring_storage);
+    if(!memory)return;
     ++test_kernel_free_count;
-    free(memory);
-    test_ring_storage = NULL;
-    test_ring_storage_bytes = 0;
+    if(memory==test_metadata_storage){free(memory);test_metadata_storage=NULL;test_metadata_storage_bytes=0;}
+    else {assert(memory==test_ring_storage);free(memory);test_ring_storage=NULL;test_ring_storage_bytes=0;}
 }
 
 /** @brief Translate test direct-map and low linked pointers to physical bytes. */
@@ -53,9 +57,8 @@ uint64_t mm_virt_to_phys(const void *address)
         value - start < test_ring_storage_bytes) {
         return TEST_DMA_PHYS + (value - start);
     }
-    /* The no-PIE fixture places static kernel objects in the modeled identity
-     * window, corresponding to the kernel's low supervisor image mapping. */
-    if (value >= 0x10000u && value < 0x40000000u) return (uint64_t)value;
+    start=(uintptr_t)test_metadata_storage;
+    if(test_metadata_storage && value>=start && value-start<test_metadata_storage_bytes)return 0x26000000u+(value-start);
     return 0;
 }
 
@@ -66,8 +69,7 @@ void *mm_phys_to_virt(uint64_t physical)
         physical - TEST_DMA_PHYS < test_ring_storage_bytes) {
         return test_ring_storage + (physical - TEST_DMA_PHYS);
     }
-    if (physical >= 0x10000u && physical < 0x40000000u)
-        return (void *)(uintptr_t)physical;
+    if(test_metadata_storage && physical>=0x26000000u && physical-0x26000000u<test_metadata_storage_bytes)return test_metadata_storage+(physical-0x26000000u);
     return NULL;
 }
 
@@ -87,6 +89,8 @@ static void test_large_ring_physical_alias_and_lifetime(void)
     int error = 0;
     struct audio_pcm *pcm = audio_pcm_open(card.id, 0, AUDIO_PLAYBACK, &error);
     assert(pcm && !error);
+    assert(pcm->metadata_storage==test_metadata_storage && test_metadata_storage);
+    assert(pcm->status_page==test_metadata_storage && pcm->control_page==test_metadata_storage+4096);
     pcm->caps.buffer_bytes_max = AUDIO_PCM_BUFFER_BYTES;
     struct audio_params params = {48000, 2, 16, 4, 8192, 32768};
     assert(!audio_pcm_hw_params(pcm, &params));
@@ -132,13 +136,17 @@ static void test_large_ring_physical_alias_and_lifetime(void)
     audio_pcm_mmap_release(pcm, AUDIO_PCM_MMAP_STATUS);
     audio_pcm_mmap_release(pcm, AUDIO_PCM_MMAP_CONTROL);
     audio_pcm_mmap_release(pcm, AUDIO_PCM_MMAP_DATA);
-    assert(test_kernel_free_count == 1);
+    assert(test_kernel_free_count == 2 && !test_metadata_storage && !test_ring_storage);
     assert(!audio_unregister_card(card.id, 0));
 }
 
 /** @brief Exercise DMA physical address, mmap alias coherence, and VMA pinning. */
 int main(void)
 {
+    struct audio_test_card failed_card;audio_test_card_init(&failed_card);
+    int error=0;test_fail_heap=1;
+    assert(!audio_pcm_open(failed_card.id,0,AUDIO_PLAYBACK,&error) && error==-ENOMEM);
+    test_fail_heap=0;assert(!audio_unregister_card(failed_card.id,0));
     test_large_ring_physical_alias_and_lifetime();
     puts("PASS PCM direct-map DMA and mmap backing coherence/lifetime");
     return 0;

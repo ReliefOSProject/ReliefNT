@@ -5,15 +5,18 @@
 int main(int argc, char **argv)
 {
     assert(argc == 2);
-    load_volume(argv[1], 0, "/");
-    load_volume(argv[1], 1, "/target");
+    load_volume(argv[1], 0);
+    load_volume(argv[1], 1);
+    struct block_device_info media;
+    assert(g_volumes[0].device_ref.device && g_volumes[1].device_ref.device);
+    assert(!block_device_info(&g_volumes[0].device_ref,&media) && media.transport==BLOCK_TRANSPORT_MEMORY);
+    assert(g_volumes[0].device_ref.device!=g_volumes[1].device_ref.device);
     uint8_t input[4096], output[4096];
     uint32_t size = g_storage.ext2_block_size, sectors = size / SECTOR_SIZE;
     /* Use a free block only as isolated cache data; no allocation is published. */
     uint32_t block = g_storage.ext2_blocks_count - 1;
     uint64_t lba = (uint64_t)block * sectors;
-    free(ext2_cache);
-    ext2_cache = NULL;
+    assert(!ext2_cache_release());
     test_fail_cache_alloc = 1;
     memset(input, 'F', size);
     assert(ext2_write_block(block, input) == 0);
@@ -40,16 +43,16 @@ int main(int argc, char **argv)
     assert(output[0] == 'A' && output[512] == 'C');
 
     /* Failed writes cannot publish the requested bytes as clean data. */
-    uint64_t bytes = g_storage.ram_bytes;
-    g_storage.ram_bytes = lba * SECTOR_SIZE;
+    uint64_t previous_failure = test_memory_disk(&g_storage)->failure_lba;
+    test_memory_disk(&g_storage)->failure_lba = lba;
     memset(input, 'D', size);
     assert(ext2_write_block(block, input) < 0);
     assert(!ext2_cache_read(lba, sectors, output));
-    g_storage.ram_bytes = bytes;
+    test_memory_disk(&g_storage)->failure_lba = previous_failure;
     assert(ext2_read_block(block, output) == 0 && output[0] == 'A');
 
     /* Reusing a volume object at remount must not reuse its old blocks. */
-    memset(g_storage.ram_base + lba * SECTOR_SIZE, 'E', size);
+    memset(test_memory_bytes(&g_storage) + lba * SECTOR_SIZE, 'E', size);
     assert(ext2_mount() == 0);
     storage_cache_invalidate();
     assert(!ext2_cache_read(lba, sectors, output));
@@ -67,6 +70,6 @@ int main(int argc, char **argv)
     bitmap[3] &= ~(1u << 1);
     assert(ext2_free_bitmap_bit(bitmap, 29, 23) == 25);
     assert(ext2_free_bitmap_bit(bitmap, 29, UINT32_MAX) == 2);
-    for (unsigned i = 0; i < 2; ++i) free(g_volumes[i].ram_base);
+    for (unsigned i = 0; i < 2; ++i) test_memory_release(&g_volumes[i]);
     puts("PASS ext2 cache: allocation failure, volume isolation, raw alias writes, failed writes, remount, eviction and bitmap wrap");
 }

@@ -1,3 +1,4 @@
+#include <reliefnt/export.h>
 /*
  * ReliefOS wait queue implementation.
  * IRQ wakeups only walk task-owned intrusive links and never allocate memory.
@@ -109,8 +110,9 @@ static bool kernel_wait_queue_unlink_locked(struct kernel_wait_queue *queue,
 }
 
 /**
- * @brief Initialize an empty wait queue and its spinlock.
- * @param queue Queue storage owned by the caller; null is ignored.
+ * @brief Initialize unpublished wait-queue storage and its embedded lock.
+ * @param queue Caller-owned unpublished queue, nullable; NULL is ignored.
+ * Boot/task context before publication, or after the caller has drained all prior users. Initializes metadata only; no allocation or lock acquisition.
  */
 void kernel_wait_queue_init(struct kernel_wait_queue *queue)
 {
@@ -122,11 +124,11 @@ void kernel_wait_queue_init(struct kernel_wait_queue *queue)
     __atomic_store_n(&queue->fast_state, 0, __ATOMIC_RELEASE);
 }
 
-/**
- * @brief Register a task without a resource threshold.
- * @param queue Queue receiving the task link.
- * @param task Task to link; it may already belong to another queue.
- * @return Zero on success, or -1 for invalid input or count overflow.
+/** @brief Publish a task's intrusive wait link without allocating queue storage.
+ * @param queue Borrowed live destination queue. @param task Execution-pinned task.
+ * @return Zero or -1 for invalid input/count overflow. Caller keeps queue and
+ * task alive through unlink/wake; execution ownership serializes cross-queue
+ * moves. Short IRQ-safe queue locks, no scheduling, allocation or code pin transfer.
  */
 int kernel_wait_queue_add(struct kernel_wait_queue *queue, struct task *task)
 {
@@ -175,10 +177,10 @@ static int kernel_wait_queue_add_minimum(struct kernel_wait_queue *queue,
     return 0;
 }
 
-/**
- * @brief Remove a task's link when it still belongs to the supplied queue.
- * @param queue Queue expected to own task; null is ignored.
- * @param task Task to detach; null or a different queue is ignored.
+/** @brief Detach a task only from the queue that still owns its wait link.
+ * @param queue Borrowed queue, nullable. @param task Execution-pinned task, nullable.
+ * Execution-owned task/IRQ-safe caller context; queue/task storage stays alive
+ * through return. Short queue lock, no callback, allocation or ownership transfer.
  */
 void kernel_wait_queue_remove(struct kernel_wait_queue *queue, struct task *task)
 {
@@ -243,10 +245,11 @@ uint32_t kernel_wait_queue_wake_one(struct kernel_wait_queue *queue)
     return kernel_wait_queue_wake_one_raw(queue, UINT32_MAX);
 }
 
-/**
- * @brief Wake and detach every linked task.
- * @param queue Queue whose tasks are woken; null has no waiters.
- * @return Number of tasks detached and passed to the scheduler.
+/** @brief Detach and wake every currently linked interruptible queue waiter.
+ * @param queue Borrowed live queue, nullable for no waiters.
+ * @return Number detached and passed to the scheduler. IRQ/task safe with task
+ * storage pinned by its existing wait/exit protocol. No allocation or module
+ * callback; queue locks do not transfer backing or provider references.
  */
 uint32_t kernel_wait_queue_wake_all(struct kernel_wait_queue *queue)
 {
@@ -389,3 +392,9 @@ void kernel_wait_queue_block_current_minimum(struct kernel_wait_queue *queue,
      * state must become visible atomically to IRQ and other CPU publishers. */
     (void)kernel_wait_queue_add_minimum(queue, task, minimum, true);
 }
+
+EXPORT_SYMBOL(kernel_wait_queue_add);
+EXPORT_SYMBOL(kernel_wait_queue_remove);
+EXPORT_SYMBOL(kernel_wait_queue_wake_all);
+
+EXPORT_SYMBOL(kernel_wait_queue_init);

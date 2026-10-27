@@ -32,6 +32,8 @@ uint32_t sched_current_pid(void) { return calling_pid; }
 void *kernel_malloc(size_t size) { return malloc(size); }
 void kernel_free(void *ptr) { free(ptr); }
 int storage_inode_put(struct storage_inode_ref *inode) { assert(!inode); return 0; }
+/* These socket/input fixture objects never hold a regular inode writer. */
+void storage_inode_write_put(struct storage_inode_ref *inode){(void)inode;abort();}
 int storage_disk_block_read(uint32_t disk_id, int32_t partition_index,
                             uint64_t offset, void *buffer, uint32_t length,
                             uint32_t *out_read)
@@ -308,3 +310,5 @@ int main(int argc, char **argv)
     printf("PASS Linux EVIOCGRAB scalar argument and OFD grab lifetime\n");
     return 0;
 }
+
+#include "block_description_fixture.h"

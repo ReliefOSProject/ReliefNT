@@ -1,3 +1,4 @@
+#include "../memory.h"
 #include "execbuf_internal.h"
 
 static void drm_vmwgfx_exec_submit_diag(
@@ -151,6 +152,17 @@ static void drm_vmwgfx_exec_submit_fail(
         output_bytes, output_capacity, &failure);
 }
 
+/**
+ * @brief Submit validated GPU commands while retaining work and fault continuations.
+ * @param task Execution-owned caller.
+ * @param file Retained DRM file.
+ * @param command Original Linux ioctl selector.
+ * @param arg Imported kernel request/reply.
+ * @param user_argument Original checked userspace argument address.
+ * @param diagnostics Nullable borrowed diagnostic state, never retained.
+ * @return Zero, Linux errno or internal blocked status with independently pinned continuation.
+ * Task context under file pin; partial work survives failure until actual hardware quiescence. No module/queue lock spans usercopy or waits.
+ */
 static int drm_vmwgfx_execbuf(struct task *task, struct drm_file *file,
                               uint32_t command, struct drm_vmw_execbuf_arg *arg,
                               uint64_t user_argument,
@@ -282,7 +294,7 @@ static int drm_vmwgfx_execbuf(struct task *task, struct drm_file *file,
     work->fence_object = fence;
     struct drm_vmwgfx_task_continuation *fault_wait = NULL;
     if (arg->fence_rep) {
-        fault_wait = kernel_malloc(sizeof(*fault_wait));
+        fault_wait = drm_async_alloc(sizeof(*fault_wait));
         if (!fault_wait) {
             drm_vmwgfx_exec_fence_fail(work, diagnostics, -LINUX_ENOMEM,
                                       "exec.fence.reply_heap");
@@ -298,7 +310,7 @@ static int drm_vmwgfx_execbuf(struct task *task, struct drm_file *file,
         ? drm_vmwgfx_map_svga_status(svga_batch_submit(&work->batch, &token))
         : drm_vmwgfx_map_svga_status(svga_fence_try_insert(&token));
     if (status) {
-        kernel_free(fault_wait);
+        drm_async_free(fault_wait);
         if (arg->command_size)
             drm_vmwgfx_exec_submit_fail(work, diagnostics, status,
                                         "exec.fifo_submit");
@@ -345,10 +357,20 @@ static int drm_vmwgfx_execbuf(struct task *task, struct drm_file *file,
         sched_sleep_current_until(time_ticks() + 1u);
         return KERNEL_SYSCALL_BLOCKED;
     }
-    kernel_free(fault_wait);
+    drm_async_free(fault_wait);
     return 0;
 }
 
+/**
+ * @brief Apply BO CPU synchronization with pinned resumable task state.
+ * @param task Execution-owned caller.
+ * @param file Retained original DRM file.
+ * @param command Original ioctl selector.
+ * @param arg Imported kernel synchronization request.
+ * @param user_argument Original user address used only as continuation identity.
+ * @return Original synchronization result, errno or internal blocked status.
+ * Task context under file pin; a published continuation independently retains its original code/BO until cancellation or completion outside queue locks.
+ */
 static int64_t drm_vmwgfx_synccpu(
     struct task *task, struct drm_file *file, uint32_t command,
     struct drm_vmw_synccpu_arg *arg, uint64_t user_argument)
@@ -400,7 +422,7 @@ static int64_t drm_vmwgfx_synccpu(
     }
 
     if (!resumed) {
-        continuation = kernel_malloc(sizeof(*continuation));
+        continuation = drm_async_alloc(sizeof(*continuation));
         if (!continuation) {
             drm_bo_put(bo);
             return -LINUX_ENOMEM;

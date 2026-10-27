@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+config E1000
+    tristate "Intel PRO/1000 (8254x, QEMU and VMware e1000)"
+    default y
+    help
+      Native PCI Ethernet driver. With M, build e1000.ko for this ReliefNT
+      kernel. Device registration, DMA STOP and callback drain use the same
+      entry points for builtin and loadable configurations.

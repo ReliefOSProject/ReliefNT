@@ -32,6 +32,15 @@ int main(int argc, char **argv)
     assert(expected && out); uint32_t done; struct ext4_inode_view in;
     uint64_t before_free=volume.ext4.super_view.free_blocks_count,offset=0;
     memset(out,0x37,bs*32);
+    /* A sequential append must use a bounded metadata transaction count,
+     * independently of the block size. Committing once per new data block
+     * turns a normal copy into repeated journal and device-cache barriers.
+     * The remainder still exercises ENOSPC/reclaim and independent fsck.
+     */
+    uint64_t before_commits=volume.ext4.journal_commits;
+    check(storage_ext4_write_file_range(&volume,ino,0,out,bs*32,&done));
+    assert(done==bs*32);
+    assert(volume.ext4.journal_commits-before_commits<=2);
     for (;;) {
         int ret=storage_ext4_write_file_range(&volume,ino,offset,out,bs*32,&done);
         offset+=done;

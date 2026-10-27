@@ -1,12 +1,9 @@
-#include "../../block/core/storage_internal.h"
+#include "services.h"
 /* Registry-backed Linux sound namespace; no disk or MMIO access. */
 #include <reliefnt/audio.h>
 #include <reliefnt/storage.h>
 
-/* storage_audio.c is also compiled directly by the focused devfs fixture,
- * where storage_state.c (the normal owner of storage_copy_text) is not
- * included.  Keep this small bounded copier local so both build paths share
- * the same production parser without relying on include order. */
+/* Sound namespace copying has no dependency on a block/storage backend. */
 static void storage_audio_copy_text(char *out, uint32_t cap, const char *text)
 {
     if (!out || !cap) return;

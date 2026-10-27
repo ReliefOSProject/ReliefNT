@@ -9,6 +9,9 @@
  * @param a2 Requested byte count; null writes accept up to Linux MAX_RW_COUNT.
  * @return Accepted byte count, negative errno, or internal blocking/retry result.
  * Null writes discard the full capped request without accessing its bytes.
+ * Ordinary writes use the actual OFD provider independently of display text;
+ * entry owns its lifetime through waits under execution ownership, without
+ * graph/module locks spanning provider callbacks.
  */
 int64_t syscall_io_write(uint64_t a0, uint64_t a1, uint64_t a2)
 {
@@ -81,11 +84,11 @@ int64_t syscall_io_write(uint64_t a0, uint64_t a1, uint64_t a2)
     if (!file) {
         return -RELIEFOS_EBADF;
     }
-    if (file->drm_file) {
-        if (!file_can_write(file)) return -RELIEFOS_EBADF;
-        return -LINUX_EINVAL;
+    if(file->character_file) {
+        if(!file_can_write(file))return -RELIEFOS_EBADF;
+        return character_file_write(file->character_file,task,file,(const void *)(uintptr_t)a1,
+                                     task_device_write_length(file,a2));
     }
-    if (file->drm_prime_file) return drm_prime_file_rw(file, true);
     if (file->flags & TASK_FILE_FLAG_EVENTFD) {
         uint64_t value;
         if (a2 != sizeof(uint64_t)) return -RELIEFOS_EINVAL;
@@ -129,7 +132,7 @@ int64_t syscall_io_write(uint64_t a0, uint64_t a1, uint64_t a2)
     if (file->node.type == RELIEFOS_FS_TYPE_DIR) {
         return -RELIEFOS_EISDIR;
     }
-    if (file->node.type != RELIEFOS_FS_TYPE_FILE || !file->path[0]) {
+    if (file->node.type != RELIEFOS_FS_TYPE_FILE) {
         return -RELIEFOS_EBADF;
     }
     return syscall_regular_io(task, file, a1, a2, 0, true, false);
@@ -140,7 +143,10 @@ int64_t syscall_io_write(uint64_t a0, uint64_t a1, uint64_t a2)
  * @param a0 Descriptor number; entry may already pin its open description.
  * @param a1 User buffer, validated by the backend before accessing its bytes.
  * @param a2 Requested byte count, subject to each backend's existing limits.
- * @return Existing byte count, errno, or internal blocking/retry result.
+ * @return Byte count, negative errno (including EISDIR for directories), or
+ * internal retry. Ordinary reads use the actual OFD provider/open capture;
+ * diagnostic paths never select an inode. Entry owns the OFD through waits,
+ * under execution ownership without graph/module locks across callbacks.
  */
 int64_t syscall_io_read(uint64_t a0, uint64_t a1, uint64_t a2)
 {
@@ -149,15 +155,16 @@ int64_t syscall_io_read(uint64_t a0, uint64_t a1, uint64_t a2)
     uint32_t request_len;
     int pty_stream;
     file = task_file_for_io(task, (int32_t)a0);
+    if (file && (file->flags & TASK_FILE_FLAG_PATH)) return -RELIEFOS_EBADF;
     if (file && file->kind == TASK_FILE_KIND_SIGNALFD) return task_signalfd_read(task, file, a1, a2);
     if (!user_range_writable(a1, a2)) {
         return -RELIEFOS_EFAULT;
     }
-    if (file && file->drm_file) {
-        return syscall_drm_read(task, file, a1, a2);
+    if(file && file->character_file) {
+        if(!file_can_read(file))return -RELIEFOS_EBADF;
+        uint32_t count=a2>RELIEFOS_FS_IO_SLICE_BYTES ? RELIEFOS_FS_IO_SLICE_BYTES : (uint32_t)a2;
+        return character_file_read(file->character_file,task,file,(void *)(uintptr_t)a1,count);
     }
-    if (file && file->drm_prime_file)
-        return drm_prime_file_rw(file, false);
     {
         struct task_pty_fd *endpoint = task_pty_for_io(task, (int)a0);
         if (endpoint) {
@@ -259,56 +266,11 @@ int64_t syscall_io_read(uint64_t a0, uint64_t a1, uint64_t a2)
         }
         return 0;
     }
-    if (file->node.flags & STORAGE_NODE_FLAG_PROC) {
-        if (file->node.type == RELIEFOS_FS_TYPE_DIR) {
-            struct reliefos_dir_entry entry;
-            int step = proc_readdir(file->path, &file->offset, &entry);
-            if (step < 0) return step;
-            if (step == 0) return 0;
-            if (a2 < sizeof(entry)) return -RELIEFOS_EINVAL;
-            *(struct reliefos_dir_entry *)(uintptr_t)a1 = entry;
-            return (int64_t)sizeof(entry);
-        }
-        if (file->node.type == RELIEFOS_FS_TYPE_FILE) {
-            uint32_t request = a2 > RELIEFOS_FS_READ_SLICE_BYTES
-                                   ? RELIEFOS_FS_READ_SLICE_BYTES : (uint32_t)a2;
-            uint32_t proc_got = 0;
-            int ret = proc_read(file->path, file->offset,
-                                (void *)(uintptr_t)a1, request, &proc_got);
-            if (ret < 0) return ret == -2 ? -RELIEFOS_ENOENT : ret;
-            file->offset += proc_got;
-            return (int64_t)proc_got;
-        }
-        return -RELIEFOS_EBADF;
-    }
-    /* Open file access survives later chmod/chown, as on Linux. */
-    if (file->node.type == RELIEFOS_FS_TYPE_DIR) {
-        struct reliefos_dir_entry entry;
-        int step = storage_readdir_node(&file->node, &file->offset, &entry);
-        if (step == 0 && file->node.volume_id == 0 &&
-            (file->node.flags & STORAGE_NODE_FLAG_ROOT) && file->aux == 0) {
-            entry.type = RELIEFOS_FS_TYPE_DIR;
-            copy_text(entry.name, sizeof(entry.name), "dev");
-            file->aux = 1;
-            step = 1;
-        }
-        if (step < 0) {
-            return step;
-        }
-        if (step == 0) {
-            return 0;
-        }
-        if (a2 < sizeof(entry)) {
-            return -RELIEFOS_EINVAL;
-        }
-        *(struct reliefos_dir_entry *)(uintptr_t)a1 = entry;
-        return (int64_t)sizeof(entry);
-    }
-    if (file->node.type != RELIEFOS_FS_TYPE_FILE) {
-        return -RELIEFOS_EBADF;
-    }
-    if (!file_can_read(file)) {
-        return -RELIEFOS_EBADF;
-    }
+    /* Every ordinary provider, including proc/sysfs, follows its retained
+     * inode and optional open-time capture. Linux read(2) never enumerates
+     * directories; getdents owns that separate record ABI. */
+    if (!file_can_read(file)) return -RELIEFOS_EBADF;
+    if (file->node.type == RELIEFOS_FS_TYPE_DIR) return -RELIEFOS_EISDIR;
+    if (file->node.type != RELIEFOS_FS_TYPE_FILE) return -RELIEFOS_EBADF;
     return syscall_regular_io(task, file, a1, a2, 0, false, false);
 }

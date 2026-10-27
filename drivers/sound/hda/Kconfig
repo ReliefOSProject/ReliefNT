@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+config SND_HDA_INTEL
+    tristate "Intel/AMD High Definition Audio"
+    depends on SND
+    default y
+    help
+      Native PCI HDA controller, codec, PCM and mixer driver. The sound core
+      retains provider code for open files and mappings. With M, build hda.ko
+      for this ReliefNT kernel; an absent controller leaves it unbound.

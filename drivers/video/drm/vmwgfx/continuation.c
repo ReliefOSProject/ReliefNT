@@ -1,3 +1,4 @@
+#include "../memory.h"
 #include "execbuf_internal.h"
 
 static int64_t drm_vmwgfx_resume_continuation(
@@ -31,13 +32,18 @@ void drm_vmwgfx_continuation_set_key(
     continuation->user_argument = user_argument;
 }
 
+/**
+ * @brief Consume a detached continuation after dropping its retained BO and fence.
+ * @param continuation Owned asynchronous allocation or NULL.
+ * Execution-owned task context under independent file/service pin; no queue lock spans final backing, heap or module release.
+ */
 void drm_vmwgfx_continuation_release(
     struct drm_vmwgfx_task_continuation *continuation)
 {
     if (!continuation) return;
     drm_bo_put(continuation->bo);
     drm_vmwgfx_fence_put(continuation->fence_object);
-    kernel_free(continuation);
+    drm_async_free(continuation);
 }
 
 void drm_vmwgfx_continuation_queue_release(

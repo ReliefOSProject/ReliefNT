@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+menu "Block device transports"
+config SATA_AHCI
+	tristate "AHCI SATA and ATAPI block devices"
+	default y
+	help
+	  Native AHCI ATA/ATAPI transport. Module name: ahci.
+config PATA_IDE
+	tristate "PCI IDE ATA and ATAPI PIO block devices"
+	default y
+	help
+	  Native PCI IDE CPU-PIO transport. Module name: ide.
+config BLK_DEV_NVME
+	tristate "NVMe PCI block devices"
+	default y
+	help
+	  Native NVMe PCI transport with owned queues/PRPs. Module name: nvme.
+endmenu

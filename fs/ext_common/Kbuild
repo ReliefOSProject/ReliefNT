@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-$(CONFIG_EXT_FS_COMMON) := ext_common.o
+ext_common-y := alloc.o cache.o checksum.o dir.o extent.o format.o journal.o mount.o ops.o vfs.o xattr.o
+ext_common-y += native.o sync.o mkfs.o ext2.o ext2_cache.o ext2_write.o init.o
+include $(srctree)/scripts/Makefile.module

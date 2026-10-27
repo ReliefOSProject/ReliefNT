@@ -2,9 +2,13 @@
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
 #include <linux/mman.h>
+#include <linux/errno.h>
+#include <linux/mount.h>
+#include <reliefnt/mount.h>
 #include <reliefnt/audio.h>
 #include <reliefnt/console.h>
 #include <reliefnt/drm.h>
@@ -25,12 +29,17 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
 int64_t syscall_mm_munmap(uint64_t addr, uint64_t len);
 
 static struct task *current_task;
-static struct task_file framebuffer_file;
+static struct task_file framebuffer_file,second_file;
+static int fail_file_pin;
 static struct framebuffer framebuffer_device;
 static const uint64_t framebuffer_alias = 0xffffff8000200000ULL;
 static const uint64_t framebuffer_physical = 0x42000000ULL;
 static unsigned eager_range_prepares;
 static unsigned page_alloc_attempts;
+static unsigned mmap_provider_pins;
+static uint64_t mmap_provider_flags,mmap_provider_size=16384;
+static bool mmap_numeric_replaced;
+static bool mmap_async_requested=true;
 static uint64_t last_device_mapping_phys;
 struct task *sched_current_task(void) { return current_task; }
 
@@ -82,13 +91,16 @@ int storage_inode_put(struct storage_inode_ref *reference) { (void)reference; re
 void storage_inode_retain(struct storage_inode_ref *reference) { (void)reference; }
 int storage_inode_get(const struct storage_node *node, struct storage_inode_ref **out)
 { (void)node; *out = NULL; return 0; }
-int storage_inode_refresh(struct storage_node *node) { (void)node; return 0; }
+int storage_inode_refresh(struct storage_node *node) { (void)node;fputs("unexpected bare mmap metadata refresh\n",stderr);abort(); }
 int storage_node_mount_flags(const struct storage_node *node, uint64_t *flags)
-{ (void)node; *flags = 0; return 0; }
+{ (void)node;(void)flags;fputs("unexpected bare mmap mount policy\n",stderr);abort(); }
+void storage_set_io_async_context(bool requested){mmap_async_requested=requested;}
 struct task_file *task_file_for_fd(struct task *task, int fd)
-{ (void)task; return fd == 7 ? &framebuffer_file : NULL; }
-int file_can_read(const struct task_file *file) { return file == &framebuffer_file; }
-int file_can_write(const struct task_file *file) { return file == &framebuffer_file; }
+{ (void)task; return fd == 7 ? (mmap_numeric_replaced ? &second_file : &framebuffer_file) : fd == 8 ? &second_file : NULL; }
+struct task_file *task_file_for_io(struct task *task,int fd)
+{return task->syscall_file && task->syscall_fd==fd ? task->syscall_file : task_file_for_fd(task,fd);}
+int file_can_read(const struct task_file *file) { return file == &framebuffer_file || file == &second_file; }
+int file_can_write(const struct task_file *file) { return file == &framebuffer_file || file == &second_file; }
 int task_shm_mmap_check(const struct task_file *file, uint32_t flags, uint32_t prot, uint32_t *maximum)
 { (void)file; (void)flags; (void)prot; (void)maximum; return -1; }
 const struct framebuffer *framebuffer_get(void) { return &framebuffer_device; }
@@ -111,31 +123,112 @@ void console_log(enum console_log_level level, const char *fmt, ...)
 }
 void *kernel_malloc(size_t size) { return __builtin_malloc(size); }
 void kernel_free(void *ptr) { __builtin_free(ptr); }
-void drm_bo_get(struct drm_bo *bo) { (void)bo; }
-void drm_bo_put(struct drm_bo *bo) { (void)bo; }
-uint64_t drm_bo_page_physical(const struct drm_bo *bo, uint64_t offset)
-{ (void)bo; (void)offset; return 0; }
-int drm_file_mmap_bo(struct task_file *file, uint64_t offset, uint64_t length,
-                     struct drm_bo **bo, uint64_t *bo_offset)
-{ (void)file; (void)offset; (void)length; (void)bo; (void)bo_offset; return -1; }
-int drm_prime_file_mmap(struct task_file *file, uint64_t flags,
-                        uint64_t protection)
-{ (void)file; (void)flags; (void)protection; return -1; }
-struct task_file *task_file_get(struct task_file *source) { return source; }
-void task_file_put(struct task_file *description) { (void)description; }
-int audio_device_mmap(struct task *task, struct task_file *file,
-                      uint64_t offset, uint64_t length, uint32_t prot,
-                      struct audio_pcm_mmap *mapping)
-{ (void)task; (void)file; (void)offset; (void)length; (void)prot; (void)mapping; return -1; }
-int audio_pcm_mmap_retain(struct audio_pcm *pcm,
-                          enum audio_pcm_mmap_region region)
-{ (void)pcm; (void)region; return 0; }
-void audio_pcm_mmap_release(struct audio_pcm *pcm,
-                            enum audio_pcm_mmap_region region)
-{ (void)pcm; (void)region; }
+struct task_file *task_file_get(struct task_file *source)
+{if(fail_file_pin)return NULL;assert(source && source->references);++source->references;return source;}
+void task_file_put(struct task_file *description)
+{if(description){assert(description->references);if(!--description->references)vfs_path_put(&description->path_ref);}}
+static int mmap_provider_lookup(void *context,const struct storage_node *parent,const char *name,struct storage_node *out)
+{(void)context;(void)parent;(void)name;(void)out;return -ENOENT;}
+static int mmap_provider_retain(void *context,const struct storage_node *node,void **pin)
+{assert(context==&mmap_provider_pins && node);++mmap_provider_pins;*pin=NULL;return 0;}
+static void mmap_provider_release(void *context,const struct storage_node *node,void *pin)
+{assert(context==&mmap_provider_pins && node && !pin && mmap_provider_pins);--mmap_provider_pins;}
+static bool mmap_provider_same(void *context,const struct storage_node *left,const struct storage_node *right)
+{(void)context;return left->type==right->type && left->first_cluster==right->first_cluster;}
+static int mmap_provider_stat(void *context,const struct vfs_path *path,struct linux_stat_abi *out)
+{assert(context==&mmap_provider_pins && !mmap_async_requested && vfs_path_node(path)->type==RELIEFOS_FS_TYPE_FILE);*out=(struct linux_stat_abi){.st_size=(int64_t)mmap_provider_size,.st_mode=0100600};return 0;}
+static uint64_t mmap_provider_policy(void *context)
+{assert(context==&mmap_provider_pins);return mmap_provider_flags;}
+static void bind_mmap_provider(struct task_file *file)
+{
+    static const struct vfs_backend_ops ops={.lookup=mmap_provider_lookup,.retain=mmap_provider_retain,
+        .release=mmap_provider_release,.same_node=mmap_provider_same,.getattr=mmap_provider_stat,.mount_flags=mmap_provider_policy};
+    struct storage_node root={.type=RELIEFOS_FS_TYPE_DIR};struct vfs_mount *mount=NULL;
+    assert(!file->path_ref.mount && !vfs_mount_new(&ops,&mmap_provider_pins,NULL,&root,&mount));
+    assert(!vfs_path_anonymous(mount,&file->node,&file->path_ref));vfs_mount_put(mount);
+}
+
+static void test_regular_mapping_description(void)
+{
+    struct task owner={0};owner.kind=TASK_KIND_USER;
+    owner.stack_top=RELIEFNT_USER_TOP-4096;
+    owner.limits.as.rlim_cur=owner.limits.as.rlim_max=LINUX_RLIM_INFINITY;
+    current_task=&owner;
+    framebuffer_file=(struct task_file){.used=1,.references=1,.flags=LINUX_O_RDWR,
+        .node={.type=RELIEFOS_FS_TYPE_FILE,.first_cluster=50,.size=16384}};
+    bind_mmap_provider(&framebuffer_file);
+    const uint64_t base=0x50000000,page=4096;
+    assert(syscall_mm_mmap(base,3*page,LINUX_PROT_READ,
+        LINUX_MAP_PRIVATE|LINUX_MAP_FIXED_NOREPLACE,7,0)==(int64_t)base);
+    task_file_put(&framebuffer_file); /* Numeric close at the OFD boundary. */
+    assert(framebuffer_file.references==1);
+    assert(!syscall_mm_munmap(base+page,page));assert(framebuffer_file.references==2);
+    assert(!syscall_mm_munmap(base,page));assert(framebuffer_file.references==1);
+    assert(!syscall_mm_munmap(base+2*page,page));assert(!framebuffer_file.references);
+    framebuffer_file.references=1;bind_mmap_provider(&framebuffer_file);second_file=framebuffer_file;
+    second_file.path_ref=(struct vfs_path){0};vfs_path_get(&framebuffer_file.path_ref,&second_file.path_ref);
+    assert(syscall_mm_mmap(base,page,LINUX_PROT_READ,LINUX_MAP_PRIVATE|LINUX_MAP_FIXED_NOREPLACE,7,0)==(int64_t)base);
+    assert(syscall_mm_mmap(base+page,page,LINUX_PROT_READ,LINUX_MAP_PRIVATE|LINUX_MAP_FIXED_NOREPLACE,8,page)==(int64_t)(base+page));
+    task_file_put(&framebuffer_file);task_file_put(&second_file);
+    assert(framebuffer_file.references==1 && second_file.references==1);
+    assert(!syscall_mm_munmap(base,page));assert(!framebuffer_file.references && second_file.references==1);
+    assert(!syscall_mm_munmap(base+page,page));assert(!second_file.references);
+    framebuffer_file.references=1;bind_mmap_provider(&framebuffer_file);fail_file_pin=1;
+    assert(syscall_mm_mmap(base,page,LINUX_PROT_READ,LINUX_MAP_PRIVATE|LINUX_MAP_FIXED_NOREPLACE,7,0)==-ENOMEM);
+    fail_file_pin=0;assert(framebuffer_file.references==1);
+    task_file_put(&framebuffer_file);assert(!mmap_provider_pins);
+    for(unsigned i=0;i<SCHED_TASK_VMA_MAX;++i)assert(!owner.address_space.vmas[i].used);
+    puts("PASS regular mmap keeps its OFD after close and partial unmap; different OFDs do not merge and pin failure publishes no VMA");
+}
+
+/* Mount policy applies to every regular provider, including those without
+ * the old EXT2/TMPFS node flags. Metadata comes from the held inode provider. */
+static struct task_vma *mmap_result_vma(struct task *task,uint64_t address)
+{
+    for(uint32_t i=0;i<sched_task_vma_capacity(task);++i) {
+        struct task_vma *vma=sched_task_vma_at(task,i);
+        if(vma && vma->used && vma->start<=address && address<vma->end)return vma;
+    }
+    return NULL;
+}
+static void test_regular_mapping_provider(void)
+{
+    struct task owner={.kind=TASK_KIND_USER};owner.stack_top=RELIEFNT_USER_TOP-4096;
+    owner.limits.as.rlim_cur=owner.limits.as.rlim_max=LINUX_RLIM_INFINITY;current_task=&owner;
+    framebuffer_file=(struct task_file){.used=1,.references=1,.flags=LINUX_O_RDWR,
+        .node={.type=RELIEFOS_FS_TYPE_FILE,.first_cluster=50,.size=1}};
+    bind_mmap_provider(&framebuffer_file);const uint64_t base=0x52000000,page=4096;
+    uint64_t fixed=LINUX_MAP_FIXED_NOREPLACE;mmap_provider_size=3*page;
+    assert(!vfs_mount_set_flags(framebuffer_file.path_ref.mount,MS_NOEXEC));
+    assert(syscall_mm_mmap(base,page,LINUX_PROT_EXEC,LINUX_MAP_PRIVATE|fixed,7,0)==-EPERM);
+    mmap_provider_flags=MS_RDONLY;
+    assert(!vfs_mount_set_flags(framebuffer_file.path_ref.mount,0));
+    assert(syscall_mm_mmap(base,page,LINUX_PROT_WRITE,LINUX_MAP_SHARED|fixed,7,0)==-EROFS);
+    assert(syscall_mm_mmap(base,page,LINUX_PROT_READ,LINUX_MAP_SHARED|fixed,7,0)==(int64_t)base);
+    struct task_vma *vma=mmap_result_vma(&owner,base);assert(vma && !(vma->max_prot&LINUX_PROT_WRITE));
+    assert(vma->file_node.size==3*page);assert(!syscall_mm_munmap(base,page));
+    assert(syscall_mm_mmap(base,page,LINUX_PROT_WRITE,LINUX_MAP_PRIVATE|fixed,7,0)==(int64_t)base);
+    assert(!syscall_mm_munmap(base,page));mmap_provider_flags=0;
+    /* The actual mmap consumer must honor common admission even after the
+     * numeric table entry names a different inode. */
+    second_file=(struct task_file){.used=1,.references=1,.flags=LINUX_O_RDWR,
+        .node={.type=RELIEFOS_FS_TYPE_FILE,.first_cluster=60,.size=1}};
+    bind_mmap_provider(&second_file);owner.syscall_file=task_file_get(&framebuffer_file);owner.syscall_fd=7;
+    task_file_put(&framebuffer_file);mmap_numeric_replaced=true;
+    assert(syscall_mm_mmap(base,page,LINUX_PROT_READ,LINUX_MAP_PRIVATE|fixed,7,0)==(int64_t)base);
+    vma=mmap_result_vma(&owner,base);
+    assert(vma && vma->file_node.first_cluster==50 && vma->mapping_file==&framebuffer_file);
+    task_file_put(owner.syscall_file);owner.syscall_file=NULL;
+    assert(!syscall_mm_munmap(base,page) && !framebuffer_file.references);
+    task_file_put(&second_file);assert(!mmap_provider_pins);
+    mmap_numeric_replaced=false;mmap_provider_size=16384;
+    puts("PASS regular mmap uses actual provider metadata, all-filesystem RO/noexec policy and original admitted OFD");
+}
 
 int main(void)
 {
+    test_regular_mapping_provider();
+    test_regular_mapping_description();
     const uint64_t page = 4096;
     const uint64_t start = RELIEFNT_USER_HEAP_BASE + 0x20000;
     struct task task = {0};

@@ -2,6 +2,7 @@
 """Check XDM-compatible colon pathnames against the real ext2/ext4 storage code."""
 import argparse
 from pathlib import Path
+from storage_graph_test_sources import STORAGE_GRAPH_SOURCES
 import subprocess
 import tempfile
 
@@ -21,12 +22,12 @@ def main():
     with tempfile.TemporaryDirectory(prefix="reliefos-posix-paths-") as directory:
         work = Path(directory)
         binary = work / "paths"
-        run(["cc", "-std=c11", "-O1", "-g", "-fsanitize=address,undefined",
+        run(["cc", "-std=c11", "-DRELIEFNT_FIXTURE_REAL_DAC", "-O1", "-g", "-fsanitize=address,undefined",
              "-fno-sanitize-recover=all", "-ffunction-sections", "-fdata-sections",
              "-Wl,--gc-sections", "-Iinclude", "-Iinclude",
              "-Iinclude/uapi", "-Iinclude",
              "tools/tests/storage_posix_paths_test.c", "fs/tmpfs/core.c",
-             "lib/text_utf16.c", "-o", str(binary)])
+             "lib/text_utf16.c", *STORAGE_GRAPH_SOURCES, "-o", str(binary)])
         for filesystem in filesystems:
             image = work / (filesystem + ".img")
             with image.open("wb") as stream:

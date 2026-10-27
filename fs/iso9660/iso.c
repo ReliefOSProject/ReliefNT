@@ -155,11 +155,12 @@ int iso9660_find_in_dir(uint32_t extent, uint32_t size, const char *name,
             }
             if (record[32] > 1u && iso_name_match(record + 33, record[32], name)) {
                 if (out) {
-                    out->type = (record[25] & 0x02u) ? RELIEFOS_FS_TYPE_DIR : RELIEFOS_FS_TYPE_FILE;
-                    out->flags = 0;
-                    out->first_cluster = iso_u32_le(record + 2);
-                    out->volume_id = g_storage.volume_id;
-                    out->size = iso_u32_le(record + 10);
+                    *out = (struct storage_node){
+                        .type = (record[25] & 0x02u) ? RELIEFOS_FS_TYPE_DIR : RELIEFOS_FS_TYPE_FILE,
+                        .first_cluster = iso_u32_le(record + 2),
+                        .volume_id = g_storage.volume_id,
+                        .size = iso_u32_le(record + 10),
+                    };
                 }
                 return 0;
             }

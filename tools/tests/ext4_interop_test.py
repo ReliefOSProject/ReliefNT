@@ -21,7 +21,7 @@ from ext4_fixture import create_image, e2fsck_read_only, run_checked
 
 ROOT = Path(__file__).resolve().parents[2]
 STORAGE = ROOT / "block/core"
-FS = ROOT / "fs/ext4"
+FS = ROOT / "fs/ext_common"
 LOG_DIR = Path(os.environ.get("RELIEFNT_TEST_OUT", str(ROOT / "out/test-work/ext4-interop")))
 EXT4_SOURCES = [
     FS / f"{name}.c"

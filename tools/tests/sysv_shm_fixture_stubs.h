@@ -3,6 +3,7 @@
  * The dedicated SHM fixture links the actual registry and lifecycle functions. */
 #ifndef RELIEFOS_SYSV_SHM_FIXTURE_STUBS_H
 #define RELIEFOS_SYSV_SHM_FIXTURE_STUBS_H
+#include "exec_source_fixture_stubs.h"
 #ifndef RELIEFNT_TEST_REAL_SYSV_SHM
 #include <assert.h>
 #include <reliefnt/sysv_shm.h>

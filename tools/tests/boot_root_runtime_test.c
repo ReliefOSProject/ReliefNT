@@ -3,7 +3,8 @@
 #include <string.h>
 #include "../../block/core/storage_internal.h"
 
-struct install_disk_state g_install_disks[STORAGE_MAX_INSTALL_DISKS];
+static struct install_disk_state fixture_disks[STORAGE_INSTALL_DISK_INITIAL_CAPACITY];
+struct install_disk_state *g_install_disks=fixture_disks;
 uint32_t g_install_disk_count;
 static int duplicate, absent, nvme;
 static const char identity[] = "12345678-1234-4abc-90ab-112233445566";

@@ -1,4 +1,24 @@
 #include "memory_internal.h"
+#include <reliefnt/exec_file.h>
+
+/** @brief Read a lazy file mapping through its retained executable/OFD source.
+ * @param vma Stable file VMA whose source owns the provider callback lifetime.
+ * @param offset Nonnegative file byte offset.
+ * @param buffer Writable kernel destination for capacity bytes.
+ * @param capacity Requested bytes, bounded to one allocator page by callers.
+ * @param read Required output for completed bytes.
+ * @return Zero or backing errno; absent source fails EBADF. Caller owns the
+ * execution/loader transaction and forces synchronous fault I/O. No displayed
+ * name, unpinned filesystem callback or graph/module spinlock participates.
+ */
+static int file_vma_read(const struct task_vma *vma,uint64_t offset,void *buffer,
+                            uint32_t capacity,uint32_t *read)
+{
+    if(vma->exec_source)return vfs_exec_source_read(vma->exec_source,offset,buffer,capacity,read);
+    const struct task_file *file=task_file_description(vma->mapping_file);
+    if(file && vfs_path_node(&file->path_ref))return vfs_path_read(&file->path_ref,offset,buffer,capacity,read);
+    *read=0;return -RELIEFOS_EBADF;
+}
 
 /**
  * @brief Clear one allocator page through the kernel direct map.
@@ -113,7 +133,7 @@ static int load_file_cache_page(uint64_t phys, void *opaque)
     uint64_t offset;
     uint32_t want;
     uint32_t got = 0;
-    if (!context || !context->node) {
+    if (!context || !context->vma) {
         return -RELIEFOS_EINVAL;
     }
     zero_phys_page(phys);
@@ -130,7 +150,7 @@ static int load_file_cache_page(uint64_t phys, void *opaque)
     storage_set_io_async_context(false);
     void *page = mm_phys_to_virt(phys);
     if (!page) return -RELIEFOS_ENOMEM;
-    if (storage_read_node(context->node, offset, page,
+    if (file_vma_read(context->vma, offset, page,
                           want, &got) < 0 || got != want) {
         return -RELIEFOS_EIO;
     }
@@ -164,7 +184,7 @@ static int task_map_file_vma_page(struct task *task, const struct task_vma *vma,
         int ret = storage_tmpfs_get_page(&vma->file_node, file_offset, &phys);
         if (ret < 0) return ret;
     } else if (cached) {
-        context.node = &vma->file_node;
+        context.vma = vma;
         context.offset = vma->file_offset + (page - vma->start);
         context.limit = vma->file_limit;
         int result = page_cache_load(&vma->file_node, context.offset,
@@ -202,7 +222,7 @@ static int task_map_file_vma_page(struct task *task, const struct task_vma *vma,
             else mm_free_page(phys);
             return -RELIEFOS_ENOMEM;
         }
-        ret = storage_read_node(&vma->file_node, file_offset,
+        ret = file_vma_read(vma, file_offset,
                                 frame, want, &got);
         storage_set_io_async_context(false);
         if (ret < 0 || got != want) {

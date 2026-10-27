@@ -1,12 +1,13 @@
+#include <reliefnt/sound_service.h>
 /*
  * ReliefOS kernel timekeeping: provides ticks, clocks, and timer services.
  * Coordinates scheduler wakeups, elapsed time, and periodic device polling.
  */
+#include <reliefnt/export.h>
 #include <reliefos/system_abi.h>
 #include <reliefnt/console.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/time.h>
-#include <reliefnt/audio.h>
 #include <reliefnt/usb.h>
 #include <linux/time.h>
 #include <linux/timex.h>
@@ -701,7 +702,7 @@ void time_on_tick(void)
     }
     time_vdso_publish_locked();
     kernel_spin_unlock_irqrestore(&clock_lock, flags);
-    audio_service_tick();
+    sound_service_tick();
     usb_poll();
     sched_on_tick();
     /* Fallback scanout refresh cadence for hosts without framebuffer traces.
@@ -714,7 +715,10 @@ void time_on_tick(void)
 }
 
 /**
- * @brief Return the monotonic tick count.
+ * @brief Read the aligned monotonic boot tick counter.
+ * @return Number of delivered timer ticks since initialization; no wall-clock adjustment.
+ * @par Context
+ * Boot/task/IRQ snapshot on x86_64, without allocation, wait, reference transfer or clock lock.
  */
 uint64_t time_ticks(void)
 {
@@ -799,7 +803,11 @@ static int time_clock_get_locked(int32_t clock, struct linux_timespec *value)
     }
 }
 
-/** @brief Read wall or monotonic time atomically across CPUs and timer interrupts. */
+/** @brief Read a supported wall/monotonic clock atomically across CPUs and IRQs.
+ * @param clock Linux clock ID. @param value Writable caller-owned timespec output.
+ * @return Zero or EINVAL for an unsupported clock; no pointer ownership transfer.
+ * IRQ/task safe short clock lock; no allocation, scheduling or hardware wait.
+ */
 int time_clock_get(int32_t clock, struct linux_timespec *value)
 {
     uint64_t flags;
@@ -809,6 +817,13 @@ int time_clock_get(int32_t clock, struct linux_timespec *value)
     return result;
 }
 
+/**
+ * @brief Validate a supported Linux clock and copy its current resolution.
+ * @param clock Linux clock selector.
+ * @param value Optional writable kernel result; NULL validates without copying.
+ * @return Zero or EINVAL for an unsupported clock, leaving output unchanged on failure.
+ * Task/IRQ-safe query under the clock lock, with no user access, allocation or ownership transfer.
+ */
 int time_clock_getres(int32_t clock, struct linux_timespec *value)
 {
     uint64_t flags;
@@ -896,6 +911,11 @@ static uint16_t pit_current_count(void)
     return (uint16_t)((uint16_t)low | ((uint16_t)high << 8));
 }
 
+/**
+ * @brief Read boot uptime using bounded TSC interpolation with PIT/tick fallback.
+ * @return Best-effort elapsed microseconds from boot, with no wall-clock adjustment.
+ * Task/IRQ context after time setup; no allocation or retained pointer. Retries preserve paired tick anchors; failed interpolation falls back to the existing lower-resolution clock path.
+ */
 uint64_t time_uptime_us(void)
 {
     uint64_t tick_count;
@@ -955,7 +975,11 @@ uint64_t time_uptime_us(void)
 }
 
 /**
- * @brief Fill info with the current wall-clock time and uptime; returns -1 if the clock is invalid.
+ * @brief Copy a consistent wall-clock calendar and uptime snapshot.
+ * @param info Required writable kernel output, updated only when the clock is valid.
+ * @return Zero after a valid snapshot, or internal -1 for NULL output or an invalid wall clock.
+ * @par Context
+ * Acquires the IRQ-safe clock lock; no user-pointer access, allocation or ownership transfer. Timezone conversion is not performed.
  */
 int time_wall_clock(struct reliefos_time_info *info)
 {
@@ -1028,3 +1052,14 @@ void time_sleep_ms(uint64_t ms)
         __asm__ volatile("sti; hlt; cli");
     }
 }
+
+/* Native filesystem modules share this core-owned interface; CRC/release
+ * checks bind it to the exact kernel, without a stable cross-release API. */
+EXPORT_SYMBOL(time_wall_clock);
+
+EXPORT_SYMBOL(time_ticks);
+
+EXPORT_SYMBOL(time_clock_get);
+
+EXPORT_SYMBOL(time_clock_getres);
+EXPORT_SYMBOL(time_uptime_us);

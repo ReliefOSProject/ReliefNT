@@ -20,6 +20,10 @@
 
 struct storage_node;
 
+#define LINUX_SYS_INIT_MODULE __NR_init_module
+#define LINUX_SYS_DELETE_MODULE __NR_delete_module
+#define LINUX_SYS_FINIT_MODULE __NR_finit_module
+
 #define LINUX_SYS_READ __NR_read
 #define LINUX_SYS_WRITE __NR_write
 #define LINUX_SYS_OPEN __NR_open
@@ -333,6 +337,10 @@ int64_t syscall_process_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
                               uint64_t arg4, uint64_t arg5);
 /**
  * @brief Execute the syscall described by frame and return its result.
+ * @param frame Kernel-owned normalized number/argument snapshot, nullable.
+ * @return Backend result, negative errno or ENOSYS for an unknown number.
+ * @note Task context; selected implementations validate capabilities and user
+ * ranges. The dispatcher does not transfer ownership of the argument snapshot.
  */
 int64_t syscall_dispatch(const struct syscall_frame *frame);
 /**
@@ -391,6 +399,13 @@ void syscall_record_lock_cancel(struct task *task);
 int syscall_clone_task_files(const struct task *parent, struct task *child);
 int syscall_unshare_task_files(struct task *task);
 uint64_t task_socket_cancel_receive(struct task *task);
+/** @brief Cancel the calling task's pending syscall-owned resources.
+ * @param task Owner under execution ownership, nullable.
+ * Retires copied lookup inputs and retained root/dirfd paths, module snapshots,
+ * OFD/PTY pins and pending subsystem operations. Detaches ownership before final
+ * release; backend callbacks may perform I/O without scheduler/graph/module
+ * spinlocks. Signals, exit, call replacement and final return use this path.
+ */
 void task_release_syscall_file(struct task *task);
 /**
  * @brief Closes all explicitly marked close-on-exec descriptors.

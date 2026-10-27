@@ -16,6 +16,8 @@ with tempfile.TemporaryDirectory(prefix="reliefos-threads-") as tmp:
             "-Iinclude", "-Iinclude", "-Iinclude/uapi", "-Iinclude",
             *(["-D_GNU_SOURCE"] if test == "signal_address_space" else []),
         f"tools/tests/{test}_test.c", "kernel/syscall/ipc/sysv_sem.c",
+        *(["arch/x86_64/cpu/barrier.c"] if test == "membarrier_cpu" else []),
+        *(["kernel/syscall/io/vector.c"] if test == "signal_wake" else []),
         *(["kernel/syscall/fs/locks.c"] if test == "signal_address_space" else []), "-o", output,
         ], cwd=root, check=True)
         subprocess.run([output], cwd=root, check=True, timeout=20)

@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+menu "Loadable module support"
+
+config MODULES
+    bool "Enable loadable kernel modules"
+    modules
+    default y
+    help
+      Build eligible components as native ReliefNT ELF modules when set to M.
+      The default configuration keeps production components built in.
+      Modules must match this kernel's build and exported interface versions.
+
+config MODULE_UNLOAD
+    bool "Module unloading"
+    depends on MODULES
+    default y
+    help
+      Permit unloading modules after their users and callbacks have drained.
+      In-use modules cannot be forcibly unloaded.
+
+config MODVERSIONS
+    bool
+    depends on MODULES
+    default y
+
+source "tools/tests/kmodules/Kconfig"
+
+endmenu

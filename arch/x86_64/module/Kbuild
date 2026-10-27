@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := memory.o relocate.o
+always-y += module.lds
+include $(srctree)/scripts/Makefile.module

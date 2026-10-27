@@ -1,4 +1,5 @@
 #include "memory_internal.h"
+#include <reliefnt/exec_file.h>
 
 /**
  * Task vma attrs match.
@@ -33,13 +34,17 @@ static int task_vma_file_attrs_match(const struct task_vma *vma,
  * @param prot Value supplied by the caller.
  * @param flags Identifier or flags controlling the operation.
  * @param file_node Value supplied by the caller.
- * @param file_offset Value supplied by the caller.
+ * @param file_offset Offset of the first mapped file byte.
+ * @param max_prot Maximum protection authorized by the source description.
+ * @param mapping_file Source OFD for mmap, NULL for anonymous/ELF metadata;
+ *        adjacent mappings coalesce only when this OFD identity also matches.
  * @return The value or status produced by the operation.
  */
 static struct task_vma *task_vma_left_adjacent(struct task *task, uint64_t start,
                                                 uint64_t prot, uint32_t flags,
                                                 const struct storage_node *file_node,
-                                                uint64_t file_offset, uint32_t max_prot);
+                                                uint64_t file_offset, uint32_t max_prot,
+                                       struct task_file *mapping_file);
 
 /**
  * Task vma right adjacent.
@@ -56,7 +61,8 @@ static struct task_vma *task_vma_right_adjacent(struct task *task, uint64_t end,
                                                  uint64_t prot, uint32_t flags,
                                                  const struct storage_node *file_node,
                                                  uint64_t file_offset,
-                                                 uint64_t len, uint32_t max_prot);
+                                                 uint64_t len, uint32_t max_prot,
+                                       struct task_file *mapping_file);
 
 
 /**
@@ -144,48 +150,44 @@ static int task_vma_file_attrs_match(const struct task_vma *vma,
            file_node && vma->file_limit == file_node->size;
 }
 
-/**
- * Task vma clear.
- * @param vma Value supplied by the caller.
+/** @brief Clear one retired VMA after its user PTEs have been removed.
+ * @param vma Owned metadata slot, nullable; all backing references are consumed.
+ * Execution-owned task context without graph/module locks. Final device/OFD,
+ * executable and inode puts finish before zeroing; callbacks may perform I/O.
  */
 void task_vma_clear(struct task_vma *vma)
 {
     if (vma) {
         sysv_shm_vma_release(sched_current_task(), vma);
-        if (vma->audio_pcm) audio_pcm_mmap_release(vma->audio_pcm, (enum audio_pcm_mmap_region)vma->audio_mmap_region);
-        if (vma->drm_bo) drm_bo_put(vma->drm_bo);
-        if (vma->drm_mapping_file) task_file_put(vma->drm_mapping_file);
+        device_mapping_put(vma->device_mapping);
+        if (vma->mapping_file) task_file_put(vma->mapping_file);
+        vfs_exec_source_put(vma->exec_source);
         (void)storage_inode_put(vma->inode);
         *vma = (struct task_vma){0};
     }
 }
 
 /**
- * @brief Give a copied DRM VMA segment independent backing and OFD pins.
- * @param dst Output pointer to the copied destination VMA whose DRM references
+ * @brief Give a copied file VMA independent OFD/ELF pins.
+ * @param dst Output pointer to the copied destination VMA whose file references
  *        do not yet own pins; may be null, in which case no fields are changed.
- * @param src Borrowed input pointer to a stable source VMA; its optional BO and
- *        task_file references are retained for dst. It may be null, in which
+ * @param src Borrowed input pointer to a stable source VMA; its optional task_file or immutable ELF source are retained for dst. It may be null, in which
  *        case no fields are changed.
  * @return No value; installs independent backing and OFD pins in dst in place.
  *
  * No VMA-store lock is acquired and no VMA address bounds are changed here; the
  * caller keeps the source metadata stable and sets the destination segment's
- * range. This helper only replaces copied DRM pointers with independently
- * retained pins.
+ * range. The ELF source owns its provider path and deny-write guard; retaining
+ * it allocates nothing. Execution ownership is required, without a graph lock.
  */
-void task_vma_retain_drm(struct task_vma *dst,
+void task_vma_retain_file(struct task_vma *dst,
                                 const struct task_vma *src)
 {
     if (!dst || !src) return;
-    dst->drm_bo = NULL;
-    dst->drm_mapping_file = NULL;
-    if (src->drm_bo) {
-        drm_bo_get(src->drm_bo);
-        dst->drm_bo = src->drm_bo;
-    }
-    if (src->drm_mapping_file)
-        dst->drm_mapping_file = task_file_get(src->drm_mapping_file);
+    dst->mapping_file = NULL;
+    dst->exec_source = vfs_exec_source_get(src->exec_source);
+    if (src->mapping_file)
+        dst->mapping_file = task_file_get(src->mapping_file);
 }
 
 /**
@@ -216,13 +218,17 @@ struct task_vma *task_vma_containing(struct task *task, uint64_t start, uint64_t
  * @param prot Value supplied by the caller.
  * @param flags Identifier or flags controlling the operation.
  * @param file_node Value supplied by the caller.
- * @param file_offset Value supplied by the caller.
+ * @param file_offset Offset of the first mapped file byte.
+ * @param max_prot Maximum protection authorized by the source description.
+ * @param mapping_file Source OFD for mmap, NULL for anonymous/ELF metadata;
+ *        adjacent mappings coalesce only when this OFD identity also matches.
  * @return The value or status produced by the operation.
  */
 static struct task_vma *task_vma_left_adjacent(struct task *task, uint64_t start,
                                                 uint64_t prot, uint32_t flags,
                                                 const struct storage_node *file_node,
-                                                uint64_t file_offset, uint32_t max_prot)
+                                                uint64_t file_offset, uint32_t max_prot,
+                                       struct task_file *mapping_file)
 {
     if (!task) {
         return NULL;
@@ -233,6 +239,7 @@ static struct task_vma *task_vma_left_adjacent(struct task *task, uint64_t start
         if (task_vma_attrs_match(vma, prot, flags) && vma->max_prot == max_prot &&
             vma->end == start &&
             task_vma_file_attrs_match(vma, file_node) &&
+            vma->mapping_file == task_file_description(mapping_file) &&
             (!(flags & TASK_VMA_FLAG_FILE) ||
              vma->file_offset + (vma->end - vma->start) == file_offset)) {
             return vma;
@@ -256,7 +263,8 @@ static struct task_vma *task_vma_right_adjacent(struct task *task, uint64_t end,
                                                  uint64_t prot, uint32_t flags,
                                                  const struct storage_node *file_node,
                                                  uint64_t file_offset,
-                                                 uint64_t len, uint32_t max_prot)
+                                                 uint64_t len, uint32_t max_prot,
+                                       struct task_file *mapping_file)
 {
     if (!task) {
         return NULL;
@@ -267,6 +275,7 @@ static struct task_vma *task_vma_right_adjacent(struct task *task, uint64_t end,
         if (task_vma_attrs_match(vma, prot, flags) && vma->max_prot == max_prot &&
             vma->start == end &&
             task_vma_file_attrs_match(vma, file_node) &&
+            vma->mapping_file == task_file_description(mapping_file) &&
             (!(flags & TASK_VMA_FLAG_FILE) ||
              file_offset + len == vma->file_offset)) {
             return vma;
@@ -283,18 +292,22 @@ static struct task_vma *task_vma_right_adjacent(struct task *task, uint64_t end,
  * @param prot Value supplied by the caller.
  * @param flags Identifier or flags controlling the operation.
  * @param file_node Value supplied by the caller.
- * @param file_offset Value supplied by the caller.
+ * @param file_offset Offset of the first mapped file byte.
+ * @param max_prot Maximum protection authorized by the source description.
+ * @param mapping_file Source OFD for mmap, NULL for anonymous/ELF metadata;
+ *        adjacent mappings coalesce only when this OFD identity also matches.
  * @return The value or status produced by the operation.
  */
 int task_vma_can_record_mapping(struct task *task, uint64_t start, uint64_t end,
                                        uint64_t prot, uint32_t flags,
                                        const struct storage_node *file_node,
-                                       uint64_t file_offset, uint32_t max_prot)
+                                       uint64_t file_offset, uint32_t max_prot,
+                                       struct task_file *mapping_file)
 {
     uint64_t len = end - start;
     if (flags & TASK_VMA_FLAG_DEVICE) return task_vma_free_slot(task) != NULL;
-    return task_vma_left_adjacent(task, start, prot, flags, file_node, file_offset, max_prot) ||
-           task_vma_right_adjacent(task, end, prot, flags, file_node, file_offset, len, max_prot) ||
+    return task_vma_left_adjacent(task, start, prot, flags, file_node, file_offset, max_prot, mapping_file) ||
+           task_vma_right_adjacent(task, end, prot, flags, file_node, file_offset, len, max_prot, mapping_file) ||
            task_vma_free_slot(task);
 }
 
@@ -306,56 +319,45 @@ int task_vma_can_record_mapping(struct task *task, uint64_t start, uint64_t end,
  * @param prot Value supplied by the caller.
  * @param flags Identifier or flags controlling the operation.
  * @param file_node Value supplied by the caller.
- * @param file_offset Value supplied by the caller.
+ * @param file_offset Offset of the first mapped file byte.
+ * @param max_prot Maximum protection authorized by the source description.
+ * @param mapping_file Source OFD for mmap, NULL for anonymous/ELF metadata;
+ *        adjacent mappings coalesce only when this OFD identity also matches.
  * @return The value or status produced by the operation.
  */
 int task_vma_record_mapping(struct task *task, uint64_t start, uint64_t end,
                                    uint64_t prot, uint32_t flags,
                                    const struct storage_node *file_node,
-                                   uint64_t file_offset, uint32_t max_prot)
+                                   uint64_t file_offset, uint32_t max_prot,
+                                   struct task_file *mapping_file)
 {
+    struct task_file *pin=mapping_file ? task_file_get(mapping_file) : NULL;
+    if(mapping_file && !pin)return -RELIEFOS_ENOMEM;
     uint64_t len = end - start;
     struct task_vma *left = (flags & TASK_VMA_FLAG_DEVICE) ? NULL :
-        task_vma_left_adjacent(task, start, prot, flags, file_node, file_offset, max_prot);
+        task_vma_left_adjacent(task, start, prot, flags, file_node, file_offset, max_prot, pin);
     struct task_vma *right = (flags & TASK_VMA_FLAG_DEVICE) ? NULL :
-        task_vma_right_adjacent(task, end, prot, flags, file_node, file_offset, len, max_prot);
+        task_vma_right_adjacent(task, end, prot, flags, file_node, file_offset, len, max_prot, pin);
     if (left && right && left != right) {
         left->end = right->end;
-        task_vma_clear(right);
+        task_vma_clear(right);task_file_put(pin);
         return 0;
     }
-    if (left) {
-        left->end = end;
-        return 0;
-    }
+    if (left) { left->end=end;task_file_put(pin);return 0; }
     if (right) {
-        right->start = start;
-        if (flags & TASK_VMA_FLAG_FILE) right->file_offset = file_offset;
-        return 0;
+        right->start=start;
+        if(flags&TASK_VMA_FLAG_FILE)right->file_offset=file_offset;
+        task_file_put(pin);return 0;
     }
-
-    struct task_vma *slot = task_vma_free_slot(task);
-    if (!slot) {
-        return -RELIEFOS_ENOMEM;
-    }
-    struct storage_inode_ref *inode = NULL;
-    int ret = file_node ? storage_inode_get(file_node, &inode) : 0;
-    if (ret < 0) return ret;
-    slot->inode = inode;
-    slot->used = 1;
-    slot->prot = (uint32_t)prot;
-    slot->max_prot = max_prot;
-    slot->flags = flags;
-    slot->reserved = 0;
-    slot->start = start;
-    slot->end = end;
-    slot->file_offset = file_offset;
-    slot->file_limit = file_node ? file_node->size : 0;
-    if (file_node) {
-        slot->file_node = *file_node;
-    } else {
-        slot->file_node = (struct storage_node){0};
-    }
+    struct task_vma *slot=task_vma_free_slot(task);
+    if(!slot){task_file_put(pin);return -RELIEFOS_ENOMEM;}
+    struct storage_inode_ref *inode=NULL;
+    int ret=file_node ? storage_inode_get(file_node,&inode) : 0;
+    if(ret<0){task_file_put(pin);return ret;}
+    *slot=(struct task_vma){.inode=inode,.mapping_file=pin,.used=1,.prot=(uint32_t)prot,
+        .max_prot=max_prot,.flags=flags,.start=start,.end=end,.file_offset=file_offset,
+        .file_limit=file_node ? file_node->size : 0};
+    if(file_node)slot->file_node=*file_node;
     return 0;
 }
 

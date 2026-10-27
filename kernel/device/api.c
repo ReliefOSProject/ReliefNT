@@ -1,3 +1,4 @@
+#include <reliefnt/sound_service.h>
 #include "manager_internal.h"
 
 
@@ -122,7 +123,7 @@ int driver_audio_register_card(const struct audio_card_identity *identity,
     const struct audio_card_ops *ops,void *opaque,uint32_t *out_id)
 {
     if(loading_slot<0)return -22;
-    return audio_register_card_owned(identity,ops,opaque,(uint32_t)loading_slot,out_id);
+    return sound_service_register_card(identity,ops,opaque,(uint32_t)loading_slot,out_id);
 }
 
 /** @brief Record the first unsafe teardown result in the serialized fini phase.
@@ -135,4 +136,54 @@ void driver_report_teardown_failure(int error)
         cleanup_slot < (int32_t)RELIEFOS_DRIVER_MAX &&
         !driver_slots[cleanup_slot].cleanup_error)
         driver_slots[cleanup_slot].cleanup_error = error;
+}
+
+static const struct reliefos_driver_kernel_api driver_kernel_api = {
+    .abi_version = RELIEFOS_DRIVER_ABI_VERSION,
+    .struct_size = sizeof(struct reliefos_driver_kernel_api),
+    .inb = driver_api_inb,
+    .outb = driver_api_outb,
+    .inl = driver_api_inl,
+    .outl = driver_api_outl,
+    .alloc_pages = mm_alloc_pages,
+    .free_pages = mm_free_pages,
+    .console_write = console_log_write,
+    .input_push_mouse = input_push_mouse,
+    .input_push_mouse_wheel = input_push_mouse_wheel,
+    .framebuffer_size = driver_api_framebuffer_size,
+    .pci_find = driver_api_pci_find,
+    .pci_read16 = pci_config_read16,
+    .pci_write16 = pci_config_write16,
+    .pci_read32 = pci_config_read32,
+    .ticks = time_ticks,
+    .sleep_ms = time_sleep_ms,
+    .register_mouse = driver_register_mouse,
+    .register_serial = driver_register_serial,
+    .register_e1000 = driver_register_e1000,
+    .register_audio = driver_register_audio,
+    .pci_enumerate = pci_enumerate,
+    .map_mmio = driver_map_mmio,
+    .unmap_mmio = driver_unmap_mmio,
+    .alloc_dma = driver_alloc_dma,
+    .free_dma = driver_free_dma,
+    .request_pci_irq = driver_request_pci_irq,
+    .free_pci_irq = driver_free_pci_irq,
+    .audio_register_card = driver_audio_register_card,
+    .audio_unregister_card = sound_service_unregister_card,
+    .audio_period_elapsed = sound_service_period_elapsed,
+    .audio_control_changed = sound_service_control_changed,
+    .pci_write32 = pci_config_write32,
+    .audio_set_service = sound_service_set_service,
+    .report_teardown_failure = driver_report_teardown_failure,
+    .audio_request_disconnect = sound_service_request_disconnect,
+    .console_log = console_log,
+    .phys_to_virt = mm_phys_to_virt,
+};
+
+/** @brief Borrow the immutable native driver services for one retained descriptor.
+ * @return Permanent kernel-owned service table; no allocation, locking or callbacks.
+ */
+const struct reliefos_driver_kernel_api *driver_kernel_services(void)
+{
+    return &driver_kernel_api;
 }

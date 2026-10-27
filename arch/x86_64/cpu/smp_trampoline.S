@@ -69,7 +69,9 @@ smp_trampoline_cr3_imm:
     jmp 1b
 .Lap_efer_ready:
     mov %cr0, %eax
-    or $(1 << 31), %eax
+    /* Every CPU must honor supervisor read-only mappings, including module
+     * text and its physical aliases. INIT does not inherit the BSP's WP. */
+    or $((1 << 31) | (1 << 16)), %eax
     mov %eax, %cr0
     .byte 0xea
 smp_trampoline_longmode_off:

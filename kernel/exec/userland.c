@@ -17,12 +17,18 @@
 #include <reliefnt/lock.h>
 #include <reliefnt/smp.h>
 #include <reliefnt/userland.h>
+#include <reliefnt/kernel_debug.h>
 #include <reliefnt/vdso.h>
 #include <reliefnt/svga.h>
 #include <reliefos/layout.h>
 #include <reliefnt/permissions.h>
-#include <reliefnt/drm.h>
+#include <reliefnt/graphics_service.h>
 #include <reliefnt/net.h>
+#include <reliefnt/mount.h>
+#include "runtime.h"
+#include "pending.h"
+#include "../init/init_program.h"
+#include "../../fs/initramfs/boot.h"
 #include <linux/capability.h>
 #include <linux/securebits.h>
 #include <linux/mount.h>
@@ -51,7 +57,8 @@ static void sched_idle_service_wait(void *opaque)
     __asm__ volatile("sti; hlt; cli" ::: "memory");
     kernel_execution_lock_irqsave(&state->execution_flags);
     net_tcp_maintenance();
-    uint32_t retired = drm_vmwgfx_process_retirements(2);
+    vfs_reclaim_mounts(2);
+    uint32_t retired = graphics_service_process_retirements(2);
     if (retired)
         console_debug("[reliefnt] drm idle retirement resources=%u\n", retired);
 }
@@ -452,17 +459,20 @@ static int prepare_user_exec_stack(struct task *task, const char *execfn, uint64
     return 0;
 }
 
-/**
- * @brief Map or load the task's pending executable, set the entry frame and exec stack, and mark it started.
+/** @brief Derive exec credentials from the retained main image inode.
+ * @param next Prepared task with an owned executable path and inode reference.
+ * @param old Borrowed previous credentials, stable under execution ownership.
+ * @return Zero or metadata/unsupported errno; applies set-ID, nosuid,
+ * capability, secure-exec and dumpability rules before publication. No
+ * diagnostic pathname lookup or graph/module lock spans metadata callbacks.
  */
 static int userland_prepare_exec_credentials(struct task *next, const struct task *old)
 {
     struct reliefos_permissions file;
-    uint64_t mount_flags;
-    int ret = fs_permissions_get(next->path, &next->image_node, &file);
+    const struct vfs_path *image=&sched_task_mm(next)->executable_path;
+    int ret = vfs_path_permissions(image,&file,false);
     if (ret < 0) return ret;
-    ret = storage_node_mount_flags(&next->image_node, &mount_flags);
-    if (ret < 0) return ret;
+    uint64_t mount_flags=vfs_path_mount_flags(image);
     /* bprm_fill_uid reads the held ELF inode under the execution/storage lock.
      * An interpreter's set-ID bits never replace the main ELF's authority. */
     if (!old->no_new_privs && !(mount_flags & MS_NOSUID)) {
@@ -501,6 +511,16 @@ static int userland_prepare_exec_credentials(struct task *next, const struct tas
     return 0;
 }
 
+/** @brief Map a pre-bound image and prepare the new MM's native entry stack.
+ * @param task Prepared/unstarted task retaining its actual executable path.
+ * @param old Previous credential source, or NULL for first launch.
+ * @param execfn Original AT_EXECFN string, or NULL for the diagnostic default.
+ * @return Zero or negative load/metadata/entropy/stack errno. Caller owns the
+ * execution transaction and loader serialization; pathname diagnostics never
+ * reopen the image. Pending kernel launches use the ordinary shebang handler
+ * after final credentials are set. Failed staging keeps all arguments, paths
+ * and MM references cleanup-owned before any started-task publication.
+ */
 static int userland_load_task_image_locked(struct task *task, const struct task *old, const char *execfn)
 {
     struct elf_image_info loaded;
@@ -525,21 +545,21 @@ static int userland_load_task_image_locked(struct task *task, const struct task 
         return entropy_result;
     }
     if (task->flags & TASK_FLAG_PENDING_LOAD) {
-        if (task->image_node.type != RELIEFOS_FS_TYPE_FILE) {
-            char resolved[RELIEFOS_FS_PATH_LEN];
-            int ret = fs_permissions_resolve(task, sched_task_cwd(task), task->path,
-                                             resolved, sizeof(resolved), false);
-            if (!ret) ret = storage_lookup_path(resolved, &task->image_node);
-            if (!ret) copy_text(task->path, sizeof(task->path), resolved);
-            if (ret < 0 || task->image_node.type != RELIEFOS_FS_TYPE_FILE) {
-                console_error("[reliefnt] executable lookup failed path=%s ret=%d\n",
-                               task->path, ret < 0 ? ret : -21);
-                return ret < 0 ? ret : -13;
-            }
+        int script_ret=userland_resolve_pending_scripts(task,execfn ? execfn : task->path);
+        if(script_ret)return script_ret;
+        const struct vfs_path *image=&sched_task_mm(task)->executable_path;
+        const struct storage_node *node=vfs_path_node(image);
+        if(!node || node->type!=RELIEFOS_FS_TYPE_FILE)return -13;
+        task->image_node=*node;
+        int ret=fs_permissions_check_path(task,image,FS_ACCESS_EXEC,false);
+        if(!ret)ret=storage_inode_refresh(&task->image_node);
+        if(!ret)ret=storage_inode_get(&task->image_node,&sched_task_mm(task)->executable_inode);
+        if(!ret) {
+            ret=storage_inode_deny_write(sched_task_mm(task)->executable_inode);
+            if(!ret)sched_task_mm(task)->executable_denied_write=true;
         }
-        int ret = storage_inode_get(&task->image_node, &sched_task_mm(task)->executable_inode);
         if (ret < 0) return ret;
-        ret = elf64_map_task_image(task, &task->image_node, &loaded);
+        ret = elf64_map_task_image(task, image, &loaded);
         if (ret < 0) {
             console_error("[reliefnt] failed to map executable %s\n", task->name);
             return ret;
@@ -624,22 +644,73 @@ static bool userland_load_task_image(struct task *task)
     return result;
 }
 
+/** @brief Check directory search permissions on each actual launch component.
+ * @param context Borrowed target task with final filesystem credentials.
+ * @param directory Held directory retaining its filesystem provider.
+ * @return Zero or negative DAC errno, without name replay or graph locks.
+ * Caller owns execution and the resolver keeps the directory alive over I/O.
+ */
+static int userland_image_search(void *context,const struct vfs_path *directory)
+{return fs_permissions_check_path(context,directory,FS_ACCESS_EXEC,false);}
+
+/** @brief Bind an unpublished task to its actual authorized executable inode.
+ * @param task New task with owned root/cwd, stable under execution ownership.
+ * @param path Borrowed kernel pathname, needed only through this resolution.
+ * @return Zero or lookup/type/DAC errno with the old binding intact on error.
+ * Rebinding is only for an unstarted task before its MM acquired an inode.
+ * Successful publication transfers one path; no scheduler/graph/module lock
+ * spans filesystem callbacks, and diagnostics are never used on later load.
+ */
+static int userland_bind_pending_image(struct task *task,const char *path)
+{
+    if(!task || !path || sched_task_mm(task)->executable_inode)return -22;
+    struct vfs_lookup_result found={0};const struct task_fs_paths *paths=sched_task_paths(task);
+    struct vfs_lookup_policy policy={.flags=VFS_LOOKUP_FOLLOW,.search=userland_image_search,.context=task};
+    int rc=vfs_path_resolve(vfs_system_namespace(),&paths->root,&paths->cwd,path,&policy,&found);
+    if(!rc && vfs_path_node(&found.path)->type!=RELIEFOS_FS_TYPE_FILE)rc=-13;
+    if(!rc)rc=fs_permissions_check_path(task,&found.path,FS_ACCESS_EXEC,false);
+    if(!rc) {
+        struct vfs_path previous=sched_task_mm(task)->executable_path;
+        sched_task_mm(task)->executable_path=found.path;found.path=(struct vfs_path){0};
+        sched_set_task_image_node(task->pid,vfs_path_node(&sched_task_mm(task)->executable_path));
+        vfs_path_put(&previous);
+    }
+    vfs_path_put(&found.path);return rc;
+}
+
 /**
  * @brief Create the user task for path, attach image/exec/fd parameters, and return its PID or a negative errno.
+ * @param path Borrowed resolved executable diagnostic name.
+ * @param task_name Borrowed process name, copied by task creation.
+ * @param launch Optional borrowed argv/env/data copied before publication.
+ * @param parent Parent PID; initialized filesystem paths are inherited.
+ * @param flags Native task flags supplied by the authorized launcher.
+ * @param pty_id Optional terminal ID attached before the child can run.
+ * @param stdin_fd Parent input descriptor, or negative to keep default setup.
+ * @param stdout_fd Parent output descriptor, or negative for default setup.
+ * @param stderr_fd Parent error descriptor, or negative for default setup.
+ * @param make_ready Nonzero to publish after all references/parameters attach.
+ * @return PID or negative errno. Requires the published shared namespace;
+ * initializes fresh root/cwd before publication without resetting inherited
+ * objects. Execution-owned task context; no scheduler lock spans backend I/O.
  */
 static int64_t spawn_pending_image_ex(const char *path, const char *task_name,
-                                      const struct storage_node *node,
                                       const struct exec_launch *launch,
                                       uint32_t parent, uint32_t flags, uint32_t pty_id,
                                       int stdin_fd, int stdout_fd, int stderr_fd,
                                       int make_ready)
 {
+    struct vfs_namespace *namespace=vfs_system_namespace();
+    if(!namespace)return -19;
     uint32_t pid = sched_create_user_task(task_name, 0, USER_STACK_TOP, parent, flags);
     if (!pid) {
         return -12;
     }
+    int fs_ret=sched_task_fs_start(sched_find(pid),namespace);
+    if(fs_ret<0){sched_exit(pid,127);return fs_ret;}
     sched_set_task_path(pid, path);
-    sched_set_task_image_node(pid, node);
+    fs_ret=userland_bind_pending_image(sched_find(pid),path);
+    if(fs_ret<0){sched_exit(pid,127);return fs_ret;}
     if (launch) {
         int ret = sched_set_task_exec_params(pid, launch->argc, (char *const *)launch->argv,
                                             launch->envc, (char *const *)launch->envp,
@@ -670,29 +741,28 @@ static int64_t spawn_pending_image_ex(const char *path, const char *task_name,
     return pid;
 }
 
-/**
- * @brief Create a pending-image task at path; a TASK_FLAG_SERVICE caller gets its node resolved here, ordinary callers skip the lookup.
+/** @brief Create a pre-bound pending image for an internal kernel launcher.
+ * @param path Borrowed kernel pathname, resolved before task publication.
+ * @param task_name Borrowed diagnostic command name, copied into the child.
+ * @param launch Optional copied launch vectors/data.
+ * @param parent Parent PID for filesystem/credential inheritance.
+ * @param flags Authorized internal task flags.
+ * @param pty_id Optional terminal identity.
+ * @param stdin_fd Parent stdin descriptor or negative for defaults.
+ * @param stdout_fd Parent stdout descriptor or negative for defaults.
+ * @param stderr_fd Parent stderr descriptor or negative for defaults.
+ * @param make_ready Whether to publish after all references are installed.
+ * @return PID or negative errno with child resources retired on failure.
+ * Execution ownership required; one resolver handles services and ordinary
+ * launches, without a private text route or scheduler lock across callbacks.
  */
-static int64_t spawn_path_internal_ex(const char *path, const char *task_name,
-                                      const struct exec_launch *launch,
-                                      uint32_t parent, uint32_t flags, uint32_t pty_id,
-                                      int stdin_fd, int stdout_fd, int stderr_fd,
-                                      int make_ready)
+static int64_t spawn_path_internal_ex(const char *path,const char *task_name,
+                                      const struct exec_launch *launch,uint32_t parent,
+                                      uint32_t flags,uint32_t pty_id,int stdin_fd,
+                                      int stdout_fd,int stderr_fd,int make_ready)
 {
-    struct storage_node node;
-    int ret;
-    if (flags & TASK_FLAG_SERVICE) {
-        ret = storage_lookup_path(path, &node);
-        if (ret < 0 || node.type != RELIEFOS_FS_TYPE_FILE) {
-            console_error("[reliefnt] spawn lookup failed path=%s ret=%d\n", path,
-                           ret < 0 ? ret : -21);
-            return ret < 0 ? ret : -21;
-        }
-        return spawn_pending_image_ex(path, task_name, &node, launch, parent, flags, pty_id,
-                                      stdin_fd, stdout_fd, stderr_fd, make_ready);
-    }
-    return spawn_pending_image_ex(path, task_name, NULL, launch, parent, flags, pty_id,
-                                  stdin_fd, stdout_fd, stderr_fd, make_ready);
+    return spawn_pending_image_ex(path,task_name,launch,parent,flags,pty_id,
+        stdin_fd,stdout_fd,stderr_fd,make_ready);
 }
 
 static int64_t spawn_path_internal(const char *path, const char *task_name,
@@ -874,93 +944,6 @@ static void userland_enter_task(struct task *task)
 }
 
 /**
- * @brief Empty an early-boot transient tree without following links or mounts.
- * @param root Absolute directory on the root volume; no userspace exists yet.
- * @return Zero or negative errno. A failure prevents stale state being reused.
- * The path itself is the traversal stack. Directory enumeration restarts after
- * deletion because ext2 entries can coalesce. No recursion or fixed entry cap.
- */
-static int userland_clear_transient_tree(const char *root)
-{
-    char path[RELIEFOS_FS_PATH_LEN];
-    struct storage_node base;
-    uint32_t root_length = (uint32_t)__builtin_strlen(root);
-    int ret = storage_lookup_path(root, &base);
-    if (ret < 0) return ret;
-    if (base.type != RELIEFOS_FS_TYPE_DIR || !(base.flags & STORAGE_NODE_FLAG_EXT2))
-        return -20;
-    copy_text(path, sizeof(path), root);
-    for (;;) {
-        struct storage_node directory;
-        struct reliefos_dir_entry entry;
-        uint64_t cursor = 0;
-        uint32_t length = (uint32_t)__builtin_strlen(path);
-        ret = storage_lookup_path(path, &directory);
-        if (ret < 0) return ret;
-        if (directory.volume_id != base.volume_id) return -18;
-        if (directory.type != RELIEFOS_FS_TYPE_DIR) return -20;
-        do {
-            ret = storage_readdir_node(&directory, &cursor, &entry);
-        } while (ret > 0 && entry.name[0] == '.' &&
-                 (!entry.name[1] || (entry.name[1] == '.' && !entry.name[2])));
-        if (ret < 0) return ret;
-        if (ret == 0) {
-            if (length == root_length) return 0;
-            ret = storage_rmdir(path);
-            if (ret < 0) return ret;
-            while (length > root_length && path[length - 1] != '/') --length;
-            path[length - 1] = 0;
-            continue;
-        }
-        uint32_t name_length = 0;
-        while (name_length < sizeof(entry.name) && entry.name[name_length]) {
-            if (entry.name[name_length] == '/') return -5;
-            ++name_length;
-        }
-        if (!name_length || name_length == sizeof(entry.name)) return -5;
-        if (length + 1 + name_length >= sizeof(path)) return -36;
-        path[length] = '/';
-        copy_text(path + length + 1, sizeof(path) - length - 1, entry.name);
-        struct storage_node child;
-        ret = storage_lookup_path(path, &child);
-        if (ret < 0) return ret;
-        if (child.volume_id != base.volume_id) return -18;
-        if (child.type == RELIEFOS_FS_TYPE_DIR) continue;
-        ret = storage_unlink(path); /* literal link/socket/file, never its target */
-        if (ret < 0) return ret;
-        path[length] = 0;
-    }
-}
-
-/** @brief Reset boot-scoped transient state before any process can open an IPC endpoint. */
-static int userland_prepare_runtime(void)
-{
-    static const struct { const char *path; uint32_t mode; } directories[] = {
-        {"/run", 0755}, {"/run/lock", 0755},
-        {"/dev/shm", 01777},
-    };
-    int ret = userland_clear_transient_tree("/run");
-    if (ret < 0) return ret;
-    ret = userland_clear_transient_tree("/dev/shm");
-    if (ret < 0) return ret;
-    for (uint32_t i = 0; i < sizeof(directories) / sizeof(directories[0]); ++i) {
-        struct storage_node node;
-        struct reliefos_permissions mode = {directories[i].mode, 0, 0};
-        ret = storage_lookup_path(directories[i].path, &node);
-        if (ret == -2) {
-            ret = storage_mkdir(directories[i].path);
-            if (ret < 0) return ret;
-            ret = storage_lookup_path(directories[i].path, &node);
-        }
-        if (ret < 0) return ret;
-        if (node.type != RELIEFOS_FS_TYPE_DIR) return -20;
-        ret = storage_inode_permissions(&node, &mode, true);
-        if (ret < 0) return ret;
-    }
-    return 0;
-}
-
-/**
  * @brief Return the boot loader kernel command line captured at init time.
  * @return NUL-terminated raw command line for /proc/cmdline; never NULL, an
  * empty string when the Multiboot2 info carried none. The string lives in
@@ -972,7 +955,11 @@ const char *userland_boot_cmdline(void)
 }
 
 /**
- * @brief Prepare the root and console, then execute only the configured PID 1.
+ * @brief Prepare runtime objects in the assembled namespace and start PID1.
+ * @param boot Borrowed boot handoff; namespace already owns root/providers.
+ * @return None. Stops at idle on missing root/namespace or failed preparation;
+ * otherwise starts the configured user image with inherited actual root/cwd.
+ * Exclusive boot execution precedes user tasks and secondary CPU startup.
  */
 void userland_init(const struct boot_info *boot)
 {
@@ -983,11 +970,16 @@ void userland_init(const struct boot_info *boot)
     boot_cmdline = boot ? boot->cmdline : 0;
 
     if (!storage_ready()) {
-        console_fatal("[reliefnt] no block-backed root filesystem available for userland\n");
+        console_fatal("[reliefnt] no initial root filesystem available for userland\n");
         kernel_idle_loop();
     }
 
-    int runtime_ret = userland_prepare_runtime();
+    struct vfs_namespace *namespace=vfs_system_namespace();
+    if(!namespace) {
+        console_fatal("[reliefnt] initial mount namespace is unavailable\n");
+        kernel_idle_loop();
+    }
+    int runtime_ret = userland_prepare_runtime(namespace);
     if (runtime_ret < 0) {
         console_error("[reliefnt] runtime directory initialization failed ret=%d\n", runtime_ret);
         kernel_idle_loop();
@@ -995,24 +987,11 @@ void userland_init(const struct boot_info *boot)
 
     const char *env[] = {"PATH=" RELIEFOS_DEFAULT_PATH, "HOME=/root", "PWD=/",
                         "TERM=xterm-256color", NULL};
-    char init_path[256] = "/sbin/init";
-    if (boot) {
-        const char *arg = boot->cmdline;
-        while (*arg) {
-            while (*arg == ' ') ++arg;
-            const char *end = arg;
-            while (*end && *end != ' ') ++end;
-            if (end - arg > 5 && __builtin_memcmp(arg, "init=", 5) == 0) {
-                size_t length = (size_t)(end - arg - 5);
-                if (arg[5] != '/' || length >= sizeof(init_path)) {
-                    console_warn("[reliefnt] invalid init= override\n");
-                    kernel_idle_loop();
-                }
-                __builtin_memcpy(init_path, arg + 5, length);
-                init_path[length] = 0;
-            }
-            arg = end;
-        }
+    char init_path[256];
+    int init_ret=init_program_path(boot ? boot->cmdline : NULL,storage_initramfs_active(),init_path,sizeof(init_path));
+    if(init_ret) {
+        console_fatal("[boot] invalid %s override ret=%d\n",storage_initramfs_active() ? "rdinit=" : "init=",init_ret);
+        kernel_idle_loop();
     }
     const char *argv[] = {init_path, NULL};
     struct exec_launch launch = {0};
@@ -1059,8 +1038,7 @@ void userland_process_exit(uint64_t code)
 
 /**
  * @brief Prepare a replacement image and stack before committing exec.
- * @param path Canonical name for the executable object.
- * @param held Resolved object held stable under the execution transaction.
+ * @param image Actual held executable path retaining its filesystem provider.
  * @param execfn Original exec filename for AT_EXECFN, including fd-relative names.
  * @param argc Number of entries in argv.
  * @param argv Kernel-owned argv pointers into data.
@@ -1070,7 +1048,7 @@ void userland_process_exit(uint64_t code)
  * @param data_len Number of valid data bytes.
  * @return Zero after committing the new image, or a negative errno-style value with no change.
  */
-int userland_exec_current_node(const char *path, const struct storage_node *held, const char *execfn,
+int userland_exec_current_path(const struct vfs_path *image,const char *execfn,
                                uint32_t argc, char *const argv[],
                                uint32_t envc, char *const envp[],
                                const char *data, uint32_t data_len)
@@ -1081,27 +1059,33 @@ int userland_exec_current_node(const char *path, const struct storage_node *held
     char task_name[SCHED_TASK_NAME_LEN];
     uint32_t preserved_flags;
     int ret;
-    if (!task || task->kind != TASK_KIND_USER || !path || !path[0]) {
+    const struct storage_node *held=vfs_path_node(image);
+    if (!task || task->kind != TASK_KIND_USER || !held || !execfn) {
         return -22;
     }
     if (task->nproc_exceeded) {
         if (sched_user_task_count(task->uid) > sched_task_limits(task)->nproc.rlim_cur) return -11;
         task->nproc_exceeded = false;
     }
-    if (held) { node = *held; ret = storage_inode_refresh(&node); }
-    else ret = storage_lookup_path(path, &node);
+    node=*held;ret=storage_inode_refresh(&node);
     if (ret < 0 || node.type != RELIEFOS_FS_TYPE_FILE) {
         return ret < 0 ? ret : -13;
     }
-    ret = fs_permissions_check_node(task, path, &node, FS_ACCESS_EXEC, false);
+    ret = fs_permissions_check_path(task,image,FS_ACCESS_EXEC,false);
     if (ret < 0) return ret;
     if (argc > SCHED_EXEC_ARG_MAX || envc > SCHED_EXEC_ENV_MAX || data_len > SCHED_EXEC_DATA_MAX)
         return -7;
-    task_name_from_path(path, task_name, sizeof(task_name));
+    const char *leaf=vfs_path_name(image);
+    task_name_from_path(leaf && leaf[0] ? leaf : execfn,task_name,sizeof(task_name));
+    char display[RELIEFOS_FS_PATH_LEN];
+    if(vfs_path_format_link(vfs_path_namespace(image),&sched_task_paths(task)->root,image,display,sizeof(display)))
+        copy_text(display,sizeof(display),execfn);
     prepared = kernel_malloc(sizeof(*prepared));
     if (!prepared) return -12;
     __builtin_memset(prepared, 0, sizeof(*prepared));
     prepared->credentials = task->credentials;
+    sched_task_fs_inherit(prepared,task);
+    vfs_path_get(image,&prepared->address_space.executable_path);
     copy_text(prepared->cwd, sizeof(prepared->cwd), sched_task_cwd(task));
     copy_text(prepared->root_dir, sizeof(prepared->root_dir), sched_task_root(task));
     prepared->limits = *sched_task_limits(task);
@@ -1112,8 +1096,8 @@ int userland_exec_current_node(const char *path, const struct storage_node *held
     prepared->image_node = node;
     prepared->name = task_name;
     prepared->flags = TASK_FLAG_PENDING_LOAD;
-    prepared->address_space.nondumpable = fs_permissions_check_node(task, path, &node, FS_ACCESS_READ, false) < 0;
-    copy_text(prepared->path, sizeof(prepared->path), path);
+    prepared->address_space.nondumpable = fs_permissions_check_path(task,image,FS_ACCESS_READ,false)<0;
+    copy_text(prepared->path,sizeof(prepared->path),display);
     ret = sched_copy_task_exec_params(prepared, argc, argv, envc, envp, data, data_len);
     if (ret < 0) goto failed;
     ret = -12;
@@ -1153,16 +1137,17 @@ int userland_exec_current_node(const char *path, const struct storage_node *held
 
     arch_fpu_task_init(task->fpu_state);
     arch_fpu_restore(task->fpu_state);
-    kernel_free(prepared);
+    sched_task_fs_release(prepared);kernel_free(prepared);
+    kernel_debug_finish_initramfs_boot(task);
     console_debug("[reliefnt] exec pid=%u path=%s pty=%u committed cr3=0x%llx\n",
-                   task->pid, path, task->pty_id,
+                   task->pid, display, task->pty_id,
                    (unsigned long long)(*sched_task_as(task)).cr3);
     return 0;
 failed:
     kernel_free(prepared->exec_argv); kernel_free(prepared->exec_envp); kernel_free(prepared->exec_data);
     address_space_destroy(sched_task_as(prepared));
     sched_task_vma_release(prepared);
-    kernel_free(prepared);
+    sched_task_fs_release(prepared);kernel_free(prepared);
     return ret;
 }
 
@@ -1265,9 +1250,12 @@ int64_t userland_spawn_path_argv_for_user(const char *path,
     if (ret < 0) {
         return ret;
     }
-    pid = spawn_path_internal(path, task_name, &launch, parent_pid, 0, 0, -1, -1, -1);
+    pid = spawn_path_internal_ex(path, task_name, &launch, parent_pid, 0, 0, -1, -1, -1, 0);
     if (pid > 0) {
         sched_set_task_identity((uint32_t)pid, user, session_id);
+        ret=userland_bind_pending_image(sched_find((uint32_t)pid),path);
+        if(ret<0){sched_exit((uint32_t)pid,127);return ret;}
+        sched_mark_ready((uint32_t)pid);
         console_debug("[reliefnt] spawn trusted path=%s pid=%u parent=%u user=%u\n",
                        path, (unsigned)pid, parent_pid, user->uid);
     }
@@ -1288,25 +1276,4 @@ int64_t userland_spawn_path_with_pty(const char *path, uint32_t pty_id)
 int64_t userland_spawn_path(const char *path)
 {
     return userland_spawn_path_with_pty(path, 0);
-}
-
-/**
- * @brief List directory entries into entries (special-casing /dev) and set *out_count; returns count or a negative errno.
- */
-int userland_list_dir(const char *path, struct reliefos_dir_entry *entries,
-                      uint32_t capacity, uint32_t *out_count)
-{
-    uint32_t count = 0;
-    int ret;
-
-    if (!path || !out_count) {
-        return -22;
-    }
-    if (capacity > RELIEFOS_FS_MAX_ENTRIES) {
-        capacity = RELIEFOS_FS_MAX_ENTRIES;
-    }
-
-    ret = storage_list_dir(path, entries, capacity, &count);
-    *out_count = count;
-    return ret;
 }

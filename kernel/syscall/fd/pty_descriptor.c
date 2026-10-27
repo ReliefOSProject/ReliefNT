@@ -58,7 +58,8 @@ int task_pty_promote(struct task_pty_fd *entry)
  * @brief Drop one PTY descriptor alias and release its terminal ownership.
  * @param entry Alias entry to clear; null or already released aliases are ignored.
  * @note The final total description reference removes weak epoll watches before
- * dropping the PTY transfer reference or freeing the stable description.
+ * dropping the PTY transfer and held device path references or freeing the
+ * stable description. Final path release runs without a graph lock.
  */
 void task_pty_release_entry(struct task_pty_fd *entry)
 {
@@ -72,6 +73,7 @@ void task_pty_release_entry(struct task_pty_fd *entry)
     if (description && --description->references == 0) {
         task_epoll_remove_pty_description(description);
         if (description->pty_id) pty_transfer_put(description->pty_id, description->endpoint);
+        vfs_path_put(&description->path_ref);
         kernel_free(description);
     }
     if (pty_id) {
@@ -284,19 +286,23 @@ int task_pty_materialize_stdio(struct task *task)
     return 0;
 }
 
-/**
- * Task pty fd available.
- * @param task Value supplied by the caller.
- * @param fd Value supplied by the caller.
- * @return The value or status produced by the operation.
+/** @brief Describe the original builtin terminal endpoint without path lookup.
+ * @param task Borrowed current task under execution ownership.
+ * @param fd Descriptor number with dispatcher-owned admission where applicable.
+ * @param node Required caller-owned device identity output.
+ * @param path Required output borrowing a static intrinsic metadata label.
+ * @return Zero or negative errno. No namespace I/O, allocation or reference
+ * transfer; an admitted endpoint remains stable across descriptor close/reuse.
  */
 int task_pty_node_for_fd(struct task *task, int fd, struct storage_node *node,
                                  const char **path)
 {
-    struct task_pty_fd *endpoint = task_pty_endpoint_for_fd(task, fd);
+    struct task_pty_fd *endpoint = task_pty_for_io(task, fd);
     if (endpoint && endpoint->endpoint == TASK_PTY_ENDPOINT_MASTER) {
         *path = "/dev/ptmx";
-        return storage_lookup_path(*path, node);
+        *node=(struct storage_node){.type=RELIEFOS_FS_TYPE_DEVICE,
+            .flags=STORAGE_NODE_FLAG_DEV_NODE,.first_cluster=STORAGE_DEV_KIND_PTMX};
+        return 0;
     }
     uint32_t id = endpoint ? endpoint->pty_id : task_pty_stream_for_fd(task, fd) >= 0 ? task->pty_id : 0;
     if (!id) return -RELIEFOS_EBADF;

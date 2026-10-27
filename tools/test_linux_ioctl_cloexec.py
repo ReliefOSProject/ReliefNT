@@ -73,6 +73,7 @@ def test_kernel_descriptor_table(directory: Path) -> None:
     binary = directory / "ioctl-cloexec-table"
     sources = [
         "tools/tests/ioctl_cloexec_table_test.c",
+        "fs/vfs/open.c",
         *kernel_sources("scheduler"),
         "kernel/sync/wait.c",
         "kernel/syscall/ipc/sysv_msg.c",

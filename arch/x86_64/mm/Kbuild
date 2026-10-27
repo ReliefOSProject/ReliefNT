@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # Objects are owned by this directory; child modules own their own lists.
-obj-y := paging.o
+obj-y := paging.o ioremap.o
 
 include $(srctree)/scripts/Makefile.module

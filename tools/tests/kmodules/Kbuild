@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-$(CONFIG_MODULE_TEST_PROVIDER) += test_provider.o
+test_provider-y := provider.o provider_extra.o
+obj-$(CONFIG_MODULE_TEST_CONSUMER) += consumer.o
+obj-$(CONFIG_MODULE_TEST_INIT_FAIL) += init_fail.o
+obj-$(CONFIG_MODULE_TEST_BUSY) += busy.o
+obj-$(CONFIG_MODULE_TEST_STANDALONE) += standalone.o
+obj-$(CONFIG_MODULE_TEST_PARAMETERS) += parameters.o
+include $(srctree)/scripts/Makefile.module

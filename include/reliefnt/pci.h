@@ -59,7 +59,14 @@ uint16_t pci_config_read16(uint8_t bus, uint8_t slot, uint8_t function,
 void pci_config_write16(uint8_t bus, uint8_t slot, uint8_t function,
                         uint8_t offset, uint16_t value);
 /**
- * @brief Fill out with the vendor/device/class identity at bus:slot:function; 0 if present.
+ * @brief Probe one PCI function and optionally copy its scalar identification fields.
+ * @param bus PCI bus number.
+ * @param slot PCI device slot.
+ * @param function PCI function number.
+ * @param out Optional writable scalar identity; NULL only tests presence.
+ * @return Zero for a present function or internal -1 when the vendor ID is absent.
+ * @par Context
+ * Each config transaction uses the IRQ-safe PCI config lock. No device binding, allocation, retained pointer or provider ownership is created.
  */
 int pci_read_device(uint8_t bus, uint8_t slot, uint8_t function,
                     struct pci_device *out);
@@ -93,14 +100,17 @@ int pci_enumerate(uint32_t index, struct reliefos_driver_pci_device *out);
  * @param ptr Owned pointer returned by map_mmio; invalid/stale pointers ignored.
  * @param bytes Original requested byte length, required to match the lease.
  * @return None. Task context under execution transaction; device stopped first.
- * Final page reference restores original attributes and synchronizes CPU TLBs.
+ * Final low reference restores attributes; the final high reference retires its
+ * virtual mapping and table pages after all CPU TLBs have been synchronized.
  */
 void pci_unmap_mmio(void *ptr, uint64_t bytes);
 
-/** @brief Map a quiesced PCI memory BAR from its page-aligned base UC/NX.
+/** @brief Map an exclusively controlled PCI BAR from its aligned base UC/RW/NX.
  * @param phys Page-aligned memory BAR base.
  * @param bytes Requested bytes; covering pages must lie entirely within BAR.
- * @return Owned mapping lease or NULL; task context under execution transaction.
+ * @return Owned mapping lease or NULL; task context under execution ownership.
+ * High physical BARs use the reserved inherited device virtual window; repeated
+ * exact claims share a pointer. Caller drains device/users before exact unmap.
  */
 void *pci_map_mmio(uint64_t phys, uint64_t bytes);
 #endif

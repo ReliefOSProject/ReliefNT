@@ -8,12 +8,15 @@
 #include <reliefnt/lock.h>
 #include <reliefnt/storage.h>
 #include <reliefnt/tmpfs.h>
+#include <reliefnt/fs_type.h>
+#include <reliefnt/blkdev.h>
 
-#include "storage_hardware.h"
-#include "../../fs/ext4/storage_ext4_types.h"
+#include "../../fs/ext_common/storage_ext4_types.h"
 
 /** @brief Common sector size for all supported block transports. */
 #define SECTOR_SIZE 512u
+/* Bounded generic writeback batch, independent of any optional transport. */
+#define STORAGE_WRITE_MAX_SECTORS 64u
 #define STORAGE_SCRATCH_SECTORS 8u
 #define STORAGE_FAT_CACHE_SECTORS 8u
 /* Keep the FAT cache fill to a 4 KiB DMA transfer.  This is the proven
@@ -31,8 +34,7 @@
 #define STORAGE_VOLUME_TARGET_ROOT 1u
 #define STORAGE_VOLUME_BOOT 2u
 #define STORAGE_VOLUME_DYNAMIC_FIRST 3u
-#define STORAGE_MAX_INSTALL_DISKS RELIEFOS_INSTALL_MAX_DISKS
-#define STORAGE_PATH_CACHE_ENTRIES 128u
+#define STORAGE_INSTALL_DISK_INITIAL_CAPACITY RELIEFOS_INSTALL_MAX_DISKS
 #define STORAGE_DIR_INDEX_ENTRIES 512u
 #define INSTALL_ESP_FIRST_LBA 2048ULL
 #define INSTALL_ESP_SECTORS 262144ULL
@@ -42,15 +44,17 @@
 enum storage_volume_kind {
     STORAGE_VOLUME_NONE = 0,
     STORAGE_VOLUME_AHCI = 1,
-    STORAGE_VOLUME_RAM = 2,
+    STORAGE_VOLUME_ANONYMOUS = 2,
     STORAGE_VOLUME_IDE = 3,
     STORAGE_VOLUME_NVME = 4,
+    STORAGE_VOLUME_BLOCK = 5,
 };
 
 enum storage_transport {
     STORAGE_TRANSPORT_AHCI = 1,
     STORAGE_TRANSPORT_IDE_PIO = 2,
     STORAGE_TRANSPORT_NVME = 3,
+    STORAGE_TRANSPORT_MEMORY = BLOCK_TRANSPORT_MEMORY,
 };
 
 enum storage_filesystem_kind {
@@ -64,7 +68,7 @@ enum storage_filesystem_kind {
 };
 
 
-struct nvme_controller;
+struct storage_filesystem_ops;
 
 /**
  * @brief Shared volume state used by block routing and filesystem backends.
@@ -74,9 +78,14 @@ struct nvme_controller;
  */
 struct storage_volume {
     bool ready;
+    const struct storage_filesystem_ops *fs_ops;
+    struct fs_type_ref fs_type;
+    struct block_device_ref device_ref; /* Owned until final native/cache retirement. */
     struct tmpfs_super *tmpfs;
     char tmpfs_source[RELIEFOS_FS_PATH_LEN];
     uint64_t mount_flags;
+    uint64_t vfs_mounts;
+    bool vfs_managed; /* Last graph attachment owns backend/cache teardown. */
     uint8_t volume_id;
     uint8_t kind;
     uint8_t filesystem;
@@ -85,20 +94,9 @@ struct storage_volume {
     uint8_t function;
     uint8_t port;
     uint8_t transport;
-    uint8_t ide_channel;
-    uint8_t ide_drive;
-    uint8_t ide_atapi;
-    uint16_t ide_command_base;
-    uint16_t ide_control_base;
-    uint8_t ide_lba48;
     char device_model[41];
-    struct ahci_hba_mem *abar;
-    struct ahci_hba_port *hba_port;
-    struct nvme_controller *nvme;
     uint16_t nvme_controller_index;
     uint32_t nvme_nsid;
-    uint8_t *ram_base;
-    uint64_t ram_bytes;
     uint64_t esp_start_lba;
     uint64_t esp_sector_count;
     /* Ext-family partition range (ext2/3/4 share one parser and one GPT
@@ -132,7 +130,7 @@ struct storage_volume {
     uint32_t ext2_next_block;
     uint32_t ext2_next_inode;
     /* ext4 backend state (geometry parsed at mount, bounded caches held by
-     * fs/ext4/cache.c) plus mount bookkeeping: mount_generation is
+     * fs/ext_common/cache.c) plus mount bookkeeping: mount_generation is
      * stamped into cache entries and read_only_reason is one of the
      * STORAGE_EXT4_READ_ONLY_* values (0 = writable). */
     struct storage_ext4_state ext4;
@@ -168,8 +166,15 @@ struct storage_volume {
     uint32_t source_disk_id;
     uint32_t source_partition_index;
     uint8_t data_partition_mount;
-    char mount_path[RELIEFOS_FS_PATH_LEN];
 };
+
+/** @brief Query the native format family using only permanent volume geometry.
+ * @param volume Borrowed stable instance, nullable.
+ * @return True for ext2/ext4 enum identities, false otherwise. Pure metadata
+ * observation under caller ownership; no optional code, I/O or reference change.
+ */
+static inline bool storage_filesystem_is_ext(const struct storage_volume *volume)
+{ return volume && (volume->filesystem==STORAGE_FILESYSTEM_EXT2 || volume->filesystem==STORAGE_FILESYSTEM_EXT4); }
 
 /* Spec section 8: the ext2 partition range was renamed to the ext-family
  * spelling.  Keep the old field names working as access macros so existing
@@ -178,25 +183,19 @@ struct storage_volume {
 #define ext2_sector_count ext_sector_count
 
 
+struct disk_block_partition_cache;
 struct install_disk_state {
     bool present;
+    uint64_t device; /* Stable core dev_t, never a native driver pointer. */
+    uint32_t name_index;
+    struct disk_block_partition_cache *block_cache; /* Core-owned, no native pointer. */
     uint8_t bus;
     uint8_t slot;
     uint8_t function;
     uint8_t port;
     uint8_t transport;
-    uint8_t ide_channel;
-    uint8_t ide_drive;
-    uint8_t ide_atapi;
-    uint8_t ide_lba48;
-    uint16_t ide_command_base;
-    uint16_t ide_control_base;
     char device_model[41];
     uint8_t boot_root;
-    uint8_t target_mounted;
-    struct ahci_hba_mem *abar;
-    struct ahci_hba_port *hba_port;
-    struct nvme_controller *nvme;
     uint16_t nvme_controller_index;
     uint32_t nvme_nsid;
     uint64_t sector_count;
@@ -223,7 +222,8 @@ extern bool storage_io_write_started;
  * storage state until its instruction is retried and completes. */
 extern uint32_t storage_task_io_owner;
 
-extern struct install_disk_state g_install_disks[STORAGE_MAX_INSTALL_DISKS];
+extern struct install_disk_state *g_install_disks;
+extern uint32_t g_install_disk_capacity;
 extern uint32_t g_install_disk_count;
 extern uint8_t g_devfs_enabled;
 extern uint8_t g_installer_root_active;
@@ -234,9 +234,6 @@ extern uint8_t g_installer_root_active;
  * without disabling interrupts, so SMP callers cannot corrupt a command. */
 extern struct kernel_spinlock storage_transport_lock;
 
-extern uint8_t ahci_received_fis[256] __attribute__((aligned(256)));
-extern uint8_t ahci_cmd_table_buf[256] __attribute__((aligned(128)));
-extern struct ahci_cmd_header ahci_cmd_headers[32] __attribute__((aligned(1024)));
 extern uint8_t storage_scratch[STORAGE_SCRATCH_SECTORS * SECTOR_SIZE] __attribute__((aligned(4096)));
 extern uint8_t storage_cluster_buf[64 * SECTOR_SIZE] __attribute__((aligned(4096)));
 
@@ -265,13 +262,6 @@ struct storage_cluster_cache {
     uint8_t valid;
 };
 
-struct storage_path_cache_entry {
-    struct storage_volume *volume;
-    struct storage_node node;
-    char path[RELIEFOS_FS_PATH_LEN];
-    uint8_t valid;
-};
-
 struct storage_dir_index_entry {
     struct storage_volume *volume;
     uint32_t directory_cluster;
@@ -283,8 +273,6 @@ struct storage_dir_index_entry {
 extern struct storage_sector_cache storage_fat_cache;
 extern struct storage_sector_cache storage_read_cache;
 extern struct storage_cluster_cache storage_dir_lookup_cache;
-extern struct storage_path_cache_entry storage_path_cache[STORAGE_PATH_CACHE_ENTRIES];
-extern uint32_t storage_path_cache_next;
 extern struct storage_dir_index_entry storage_dir_index[STORAGE_DIR_INDEX_ENTRIES];
 extern uint32_t storage_dir_index_next;
 
@@ -297,7 +285,7 @@ struct storage_write_chain_cache {
     uint32_t size;
     uint32_t count;
     uint32_t tail;
-    char path[RELIEFOS_FS_PATH_LEN];
+    uint32_t inode_generation;
     uint8_t valid;
 };
 

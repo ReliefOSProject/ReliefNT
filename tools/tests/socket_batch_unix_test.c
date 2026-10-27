@@ -80,13 +80,10 @@ uint32_t kernel_wait_queue_wake_all(struct kernel_wait_queue *queue)
 { if (current.waiting_queue == queue) { current.waiting_queue = NULL; current.state = TASK_READY; return 1; } return 0; }
 void kernel_wait_queue_remove(struct kernel_wait_queue *queue, struct task *task)
 { if (task->waiting_queue == queue) task->waiting_queue = NULL; }
+/* Socket-only fixture cannot own physical storage commands. */
+void storage_drain_task_io(uint32_t pid){assert(pid==current.pid);}
 /* This fixture exercises socket batching, not global poll waiters. */
 void kernel_poll_readiness_notify(void) { }
-int fs_permissions_resolve_flags(const struct task *task, const char *base, const char *path,
-    char *out, uint32_t capacity, bool real_ids, uint32_t flags)
-{ (void)task; (void)base; (void)path; (void)out; (void)capacity; (void)real_ids; (void)flags; assert(0); return -1; }
-int fs_permissions_check(const struct task *task, const char *path, uint32_t access, bool real_ids)
-{ (void)task; (void)path; (void)access; (void)real_ids; assert(0); return -1; }
 void sched_block_current(void) { current.state = TASK_BLOCKED; }
 void sched_sleep_current_until(uint64_t deadline) { current.wake_tick = deadline; sched_block_current(); }
 int sched_signal_user_task(uint32_t pid, int sig) { (void)pid; assert(sig == 13); return 0; }
@@ -110,6 +107,28 @@ int main(void)
         endpoints[i] = (struct task_file){.used = 1, .references = 1, .aux = i + 1,
             .flags = TASK_FILE_FLAG_SOCKET | TASK_FILE_FLAG_SOCKET_UNIX | RELIEFOS_O_RDWR};
     }
+    /* Linux imports the outgoing header before blocking. A changed user
+     * msg_name must not redirect or fault the already suspended send. */
+    char snapshot_data[]="pin",snapshot_received[4]={0};
+    struct iovec snapshot_vector={snapshot_data,3},snapshot_read={snapshot_received,4};
+    struct msghdr snapshot_header={.msg_iov=&snapshot_vector,.msg_iovlen=1};
+    struct trap_frame snapshot_frame={.rax=LINUX_SYS_SENDMSG,.rdi=3,.rsi=(uintptr_t)&snapshot_header};
+    current.syscall_file=&endpoints[0];peers[1].packet_count=10;
+    struct socket_message_result snapshot_result;
+    task_lookup_scope_begin(&current,&snapshot_frame);
+    assert(task_socket_message(&current,&endpoints[0],(uintptr_t)&snapshot_header,0,false,false,&snapshot_result)==KERNEL_SYSCALL_BLOCKED);
+    snapshot_header.msg_name=(void *)1;snapshot_header.msg_namelen=110;
+    peers[1].packet_count=0;current.state=TASK_READY;
+    task_lookup_scope_begin(&current,&snapshot_frame);
+    assert(task_socket_message(&current,&endpoints[0],(uintptr_t)&snapshot_header,0,false,false,&snapshot_result)==3);
+    task_lookup_scope_cancel(&current);
+    struct mmsghdr snapshot_receive={.msg_hdr={.msg_iov=&snapshot_read,.msg_iovlen=1}};
+    assert(batch(true,&snapshot_receive,1,MSG_DONTWAIT)==1 && !memcmp(snapshot_received,"pin",3));
+    assert(!peers[1].packet_count && !allocations);
+    struct iovec maximum_vectors[1024]={0};
+    struct msghdr maximum_header={.msg_iov=maximum_vectors,.msg_iovlen=1024};
+    assert(task_socket_message(&current,&endpoints[0],(uintptr_t)&maximum_header,0,false,false,&snapshot_result)==0);
+    assert(batch(true,&snapshot_receive,1,MSG_DONTWAIT)==1 && !peers[1].packet_count && !allocations);
     char payload[3][4] = {"one", "two", "end"}, buffer[3][4] = {{0}};
     struct iovec tx[3], rx[3];
     struct mmsghdr sends[3] = {0}, receives[3] = {0};
@@ -260,3 +279,15 @@ int main(void)
     }
     puts("PASS actual Unix mmsg: packet boundaries, WAITFORONE, blocking resume, length faults, SCM_RIGHTS references/CLOEXEC");
 }
+
+/* Real counted UNIX address parsing runs in this fixture. Only filesystem
+ * endpoint resolution is outside its scope and must abort if ever reached;
+ * actual inode/DAC/bind cases live in mount_backend_test and the native probe. */
+int syscall_unix_path(struct vfs_namespace *ns,struct task *task,const char *name,
+                          bool create,struct vfs_path *out)
+{ (void)ns;(void)task;(void)name;(void)create;(void)out;abort(); }
+
+/* These socket/return fixtures never create an executable guard. Scope
+ * cancellation must not cross this absent inode backend with a live guard. */
+void storage_inode_allow_write(struct storage_inode_ref *inode){assert(!inode);}
+int storage_inode_put(struct storage_inode_ref *inode){assert(!inode);return 0;}

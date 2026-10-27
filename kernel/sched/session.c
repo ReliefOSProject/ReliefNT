@@ -49,7 +49,11 @@ void task_clear_identity(struct task *task)
 }
 
 /**
- * @brief Inherit uid, role, session, username, and home from the parent task.
+ * @brief Inherit identity and independent held root/cwd paths from a parent.
+ * @param task New task with private filesystem state under execution ownership.
+ * @param parent Stable source task; NULL leaves the destination unchanged.
+ * Retains group and mount/dentry references, without allocating or resolving
+ * cached path strings. Caller serializes task publication with scheduler_lock.
  */
 void task_copy_identity_from_parent(struct task *task, const struct task *parent)
 {
@@ -78,6 +82,7 @@ void task_copy_identity_from_parent(struct task *task, const struct task *parent
     task_copy_identity_text(task->username, sizeof(task->username), parent->username);
     task_copy_identity_text(task->home, sizeof(task->home), parent->home);
     task_copy_identity_text(sched_task_root_dir(task), RELIEFOS_FS_PATH_LEN, sched_task_root(parent));
+    sched_task_fs_inherit(task,parent);
 }
 
 int64_t sched_process_group_session(uint32_t process_group)

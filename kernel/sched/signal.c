@@ -1,3 +1,4 @@
+#include <reliefnt/export.h>
 #include "internal.h"
 
 
@@ -78,9 +79,11 @@ void sched_notify_parent_exit(struct task *task)
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
 }
 
-/**
- * @brief Publish signal-wait sleep before rechecking pending notifications.
+/** @brief Publish interruptible sleep before rechecking pending notifications.
  * @param deadline Absolute tick deadline, or zero for no timeout.
+ * Execution-owned current task context; changes scheduler state under its IRQ
+ * lock and allocates nothing. Signal/deadline races restore READY before return;
+ * actual scheduling and retained OFD/provider ownership remain with the caller.
  */
 void sched_signal_wait_current(uint64_t deadline)
 {
@@ -390,3 +393,5 @@ int sched_kill_user_tasks_for_logout(uint32_t uid, uint32_t session_id,
     }
     return killed;
 }
+
+EXPORT_SYMBOL(sched_signal_wait_current);

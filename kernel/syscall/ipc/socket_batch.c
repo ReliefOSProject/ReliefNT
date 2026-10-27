@@ -43,6 +43,9 @@ static int64_t mmsg_finish(struct task *task, struct task_file *file, int error)
  * @param flags Native unsigned MSG flags.
  * @param timeout recvmmsg timespec pointer; zero for no batch timeout.
  * @return Completed message count, negative errno, or KERNEL_SYSCALL_BLOCKED.
+ * The dispatcher pins the original OFD and owns execution. Outgoing scoped
+ * operands resume at the current message; no completed message is repeated.
+ * No scheduler, filesystem graph or module-table lock spans socket callbacks.
  */
 int64_t syscall_socket_mmsg(bool receiving, int fd, uint64_t vector,
                             uint32_t length, uint32_t flags, uint64_t timeout)
@@ -55,7 +58,8 @@ int64_t syscall_socket_mmsg(bool receiving, int fd, uint64_t vector,
     if (!state->active) {
         struct task_mmsg_state initial = {.active = true, .receiving = receiving,
             .vector = vector, .length = !receiving && length > 1024 ? 1024 : length,
-            .flags = flags, .timeout_pointer = receiving ? timeout : 0};
+            .flags = flags, .timeout_pointer = receiving ? timeout : 0,
+            .lookup_cursor = task->lookup_scope.cursor};
         if (initial.timeout_pointer) {
             if (!user_range_ok(timeout, sizeof(initial.remaining))) return -LINUX_EFAULT;
             __builtin_memcpy(&initial.remaining, (const void *)(uintptr_t)timeout, sizeof(initial.remaining));
@@ -94,6 +98,7 @@ int64_t syscall_socket_mmsg(bool receiving, int fd, uint64_t vector,
             if (state->count && (state->flags & MSG_WAITFORONE)) message_flags |= MSG_DONTWAIT;
         } else if (state->count + 1 < state->length) message_flags |= MSG_BATCH;
         struct socket_message_result output = {0};
+        if(task->lookup_scope.armed)task->lookup_scope.cursor=state->lookup_cursor;
         int64_t result = task_socket_message(task, file, message, message_flags, receiving, true, &output);
         if (result == KERNEL_SYSCALL_BLOCKED) return result;
         if (result < 0) { error = (int)result; break; }
@@ -107,6 +112,7 @@ int64_t syscall_socket_mmsg(bool receiving, int fd, uint64_t vector,
         }
         __builtin_memcpy((void *)(uintptr_t)length_pointer, &message_length, sizeof(message_length));
         ++state->count;
+        state->lookup_cursor=task->lookup_scope.cursor;
         task->socket_io_deadline = 0;
         task->socket_io_timed = false;
         if (!receiving && (uint64_t)result < output.requested) break;

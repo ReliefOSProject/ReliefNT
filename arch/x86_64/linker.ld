@@ -23,6 +23,39 @@ SECTIONS
 
     .rodata ALIGN(4K) : {
         *(.rodata .rodata.*)
+        *(__ksymtab_strings)
+        . = ALIGN(8);
+        __start___ksymtab = .;
+        KEEP(*(SORT(___ksymtab+*)))
+        __stop___ksymtab = .;
+        __start___ksymtab_gpl = .;
+        KEEP(*(SORT(___ksymtab_gpl+*)))
+        __stop___ksymtab_gpl = .;
+        . = ALIGN(4);
+        __start___kcrctab = .;
+        KEEP(*(SORT(___kcrctab+*)))
+        __stop___kcrctab = .;
+        __start___kcrctab_gpl = .;
+        KEEP(*(SORT(___kcrctab_gpl+*)))
+        __stop___kcrctab_gpl = .;
+        . = ALIGN(8);
+        __start_reliefnt_fs_initcalls = .;
+        KEEP(*(.reliefnt.fs_initcall))
+        __stop_reliefnt_fs_initcalls = .;
+        __start_reliefnt_block_initcalls = .;
+        KEEP(*(.reliefnt.block_initcall))
+        __stop_reliefnt_block_initcalls = .;
+        __start_reliefnt_subsys_initcalls = .;
+        KEEP(*(.reliefnt.subsys_initcall))
+        __stop_reliefnt_subsys_initcalls = .;
+        __start_reliefnt_initcalls = .;
+        KEEP(*(.reliefnt.initcall))
+        __stop_reliefnt_initcalls = .;
+        KEEP(*(.reliefnt.exitcall))
+        . = ALIGN(8);
+        __start___param = .;
+        KEEP(*(__param))
+        __stop___param = .;
     }
 
     .data ALIGN(4K) : {
@@ -45,5 +78,6 @@ SECTIONS
         *(.eh_frame)
         *(.note .note.*)
         *(.comment)
+        *(.export_symbol)
     }
 }

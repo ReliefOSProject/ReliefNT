@@ -11,11 +11,15 @@ struct driver_manager_wait_scope {
 /**
  * @brief Admit one driver-manager operation without waiting behind a suspended manager owner.
  * @return 0 when admitted or -EBUSY when another load/unload/rescan owns manager state.
+ * Task/manager context; caller owns its admission/scope and original provider
+ * lifetime. No service/module registry lock spans execution suspension or resume.
  */
 int driver_manager_phase_try_enter(void);
 /**
  * @brief Release the current driver-manager admission gate.
  * @return None. The caller must have successfully entered the gate.
+ * Task/manager context; caller owns its admission/scope and original provider
+ * lifetime. No service/module registry lock spans execution suspension or resume.
  */
 void driver_manager_phase_leave(void);
 /** @brief Process deferred audio work before admitting a syscall's I/O pin.
@@ -29,12 +33,16 @@ void driver_manager_process_audio_faults(void);
  * @brief Suspend the depth-one execution transaction before a waitable driver phase.
  * @param scope Zero-initialized storage receiving the execution and IRQ wait token.
  * @return 0 when the phase may wait or a negative errno if the transaction cannot be suspended.
+ * Task/manager context; caller owns its admission/scope and original provider
+ * lifetime. No service/module registry lock spans execution suspension or resume.
  */
 int driver_manager_wait_begin(struct driver_manager_wait_scope *scope);
 /**
  * @brief Resume the execution transaction after a waitable driver phase.
  * @param scope Active scope returned by driver_manager_wait_begin.
  * @return 0 with execution ownership restored or a negative errno on invalid ownership.
+ * Task/manager context; caller owns its admission/scope and original provider
+ * lifetime. No service/module registry lock spans execution suspension or resume.
  */
 int driver_manager_wait_end(struct driver_manager_wait_scope *scope);
 /**

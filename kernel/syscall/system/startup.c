@@ -1,3 +1,4 @@
+#include <reliefnt/kernel_file.h>
 #include "../internal.h"
 
 /**
@@ -12,12 +13,7 @@ static int require_driver_management(void);
  */
 static int require_background_service(void);
 
-/**
- * @brief Release a page-allocated startup file through its physical alias.
- * @param data Owned kernel address returned by the startup-file loader, nullable.
- * @param len Original allocation size in bytes, rounded up to physical pages.
- */
-static void startup_release_file(const void *data, size_t len);
+
 
 /**
  * Startup command is well formed.
@@ -41,24 +37,33 @@ static int startup_db_is_well_formed(const struct startup_db *db);
 static int startup_denial_db_is_well_formed(const struct startup_denial_db *db);
 
 /**
- * Startup db load.
+ * @brief Load the system startup database through a retained namespace file.
+ * @return None. Uses synchronous kernel reads under execution ownership,
+ * releases all owned pages, and preserves the empty database on invalid input.
  */
 static void startup_db_load(void);
 
 /**
- * Startup db save.
- * @return The value or status produced by the operation.
+ * @brief Save the system startup database through the visible namespace.
+ * @return Zero or negative mkdir/replace errno. Trusted kernel configuration
+ * uses explicit root-owned directories/files; existing metadata is preserved.
+ * Execution ownership required, synchronous callbacks and balanced path/code
+ * references; the outer mutation marker remains set after accepted changes.
  */
 static int startup_db_save(void);
 
 /**
- * Startup denial db load.
+ * @brief Load the system denial database through a retained namespace file.
+ * @return None. Uses synchronous reads under execution ownership, releases
+ * owned pages, and keeps the default empty database on invalid input.
  */
 static void startup_denial_db_load(void);
 
 /**
- * Startup denial db save.
- * @return The value or status produced by the operation.
+ * @brief Save the system denial database through the visible namespace.
+ * @return Zero or negative replace errno. Existing metadata is preserved;
+ * execution-owned synchronous operations retire all path/writer/code pins and
+ * preserve the outer transaction's non-replayable mutation marker.
  */
 static int startup_denial_db_save(void);
 
@@ -79,14 +84,7 @@ static int startup_text_eq(const char *a, const char *b);
 static int startup_command_equal(const struct reliefos_startup_command *a,
                                  const struct reliefos_startup_command *b);
 
-/**
- * Startup command validate.
- * @param command Value supplied by the caller.
- * @param task Value supplied by the caller.
- * @return The value or status produced by the operation.
- */
-static int startup_command_validate(struct reliefos_startup_command *command,
-                                    const struct task *task);
+
 
 /**
  * Startup can manage uid.
@@ -204,18 +202,7 @@ static int require_background_service(void)
     return 0;
 }
 
-/**
- * @brief Release a page-allocated startup file through its physical alias.
- * @param data Owned kernel address returned by the startup-file loader, nullable.
- * @param len Original allocation size in bytes, rounded up to physical pages.
- */
-static void startup_release_file(const void *data, size_t len)
-{
-    uint32_t pages = (uint32_t)((len + 4095U) / 4096U);
-    if (data && pages) {
-        mm_free_pages(mm_virt_to_phys(data), pages);
-    }
-}
+
 
 /**
  * Startup command is well formed.
@@ -280,7 +267,9 @@ static int startup_denial_db_is_well_formed(const struct startup_denial_db *db)
 }
 
 /**
- * Startup db load.
+ * @brief Load the system startup database through a retained namespace file.
+ * @return None. Uses synchronous kernel reads under execution ownership,
+ * releases all owned pages, and preserves the empty database on invalid input.
  */
 static void startup_db_load(void)
 {
@@ -289,31 +278,36 @@ static void startup_db_load(void)
     startup_db_scratch = (struct startup_db){0};
     startup_db_scratch.magic = STARTUP_DB_MAGIC;
     startup_db_scratch.next_id = 1;
-    if (storage_read_file(STARTUP_DB_PATH, &data, &len) == 0 &&
+    if (vfs_kernel_read_file(vfs_system_namespace(),STARTUP_DB_PATH, &data, &len) == 0 &&
         data && len == sizeof(startup_db_scratch)) {
         const struct startup_db *saved = (const struct startup_db *)data;
         if (startup_db_is_well_formed(saved)) {
             startup_db_scratch = *saved;
         }
     }
-    startup_release_file(data, len);
+    vfs_kernel_file_free(data,len);
 }
 
 /**
- * Startup db save.
- * @return The value or status produced by the operation.
+ * @brief Save the system startup database through the visible namespace.
+ * @return Zero or negative mkdir/replace errno. Trusted kernel configuration
+ * uses explicit root-owned directories/files; existing metadata is preserved.
+ * Execution ownership required, synchronous callbacks and balanced path/code
+ * references; the outer mutation marker remains set after accepted changes.
  */
 static int startup_db_save(void)
 {
-    (void)storage_mkdir("/var");
-    (void)storage_mkdir("/var/lib");
-    (void)storage_mkdir(RELIEFOS_LAYOUT_VAR_LIB_RELIEFOS);
-    return storage_write_file(STARTUP_DB_PATH, &startup_db_scratch,
+    (void)vfs_kernel_mkdir(vfs_system_namespace(),"/var",0755);
+    (void)vfs_kernel_mkdir(vfs_system_namespace(),"/var/lib",0755);
+    (void)vfs_kernel_mkdir(vfs_system_namespace(),RELIEFOS_LAYOUT_VAR_LIB_RELIEFOS,0755);
+    return vfs_kernel_write_file(vfs_system_namespace(),STARTUP_DB_PATH, &startup_db_scratch,
                               sizeof(startup_db_scratch));
 }
 
 /**
- * Startup denial db load.
+ * @brief Load the system denial database through a retained namespace file.
+ * @return None. Uses synchronous reads under execution ownership, releases
+ * owned pages, and keeps the default empty database on invalid input.
  */
 static void startup_denial_db_load(void)
 {
@@ -321,26 +315,28 @@ static void startup_denial_db_load(void)
     size_t len = 0;
     startup_denial_db_scratch = (struct startup_denial_db){0};
     startup_denial_db_scratch.magic = STARTUP_DENIAL_DB_MAGIC;
-    if (storage_read_file(STARTUP_DENIAL_DB_PATH, &data, &len) == 0 &&
+    if (vfs_kernel_read_file(vfs_system_namespace(),STARTUP_DENIAL_DB_PATH, &data, &len) == 0 &&
         data && len == sizeof(startup_denial_db_scratch)) {
         const struct startup_denial_db *saved = (const struct startup_denial_db *)data;
         if (startup_denial_db_is_well_formed(saved)) {
             startup_denial_db_scratch = *saved;
         }
     }
-    startup_release_file(data, len);
+    vfs_kernel_file_free(data,len);
 }
 
 /**
- * Startup denial db save.
- * @return The value or status produced by the operation.
+ * @brief Save the system denial database through the visible namespace.
+ * @return Zero or negative replace errno. Existing metadata is preserved;
+ * execution-owned synchronous operations retire all path/writer/code pins and
+ * preserve the outer transaction's non-replayable mutation marker.
  */
 static int startup_denial_db_save(void)
 {
-    (void)storage_mkdir("/var");
-    (void)storage_mkdir("/var/lib");
-    (void)storage_mkdir(RELIEFOS_LAYOUT_VAR_LIB_RELIEFOS);
-    return storage_write_file(STARTUP_DENIAL_DB_PATH, &startup_denial_db_scratch,
+    (void)vfs_kernel_mkdir(vfs_system_namespace(),"/var",0755);
+    (void)vfs_kernel_mkdir(vfs_system_namespace(),"/var/lib",0755);
+    (void)vfs_kernel_mkdir(vfs_system_namespace(),RELIEFOS_LAYOUT_VAR_LIB_RELIEFOS,0755);
+    return vfs_kernel_write_file(vfs_system_namespace(),STARTUP_DENIAL_DB_PATH, &startup_denial_db_scratch,
                               sizeof(startup_denial_db_scratch));
 }
 
@@ -380,60 +376,6 @@ static int startup_command_equal(const struct reliefos_startup_command *a,
         }
     }
     return 1;
-}
-
-/**
- * Startup command validate.
- * @param command Value supplied by the caller.
- * @param task Value supplied by the caller.
- * @return The value or status produced by the operation.
- */
-static int startup_command_validate(struct reliefos_startup_command *command,
-                                    const struct task *task)
-{
-    char resolved[RELIEFOS_FS_PATH_LEN];
-    struct reliefos_stat st;
-    uint32_t exec_bytes;
-    int ret;
-    if (!command || !task || !command->path[0] ||
-        command->argc > RELIEFOS_STARTUP_MAX_ARGS ||
-        kernel_string_len_cap(command->path, sizeof(command->path)) >= sizeof(command->path)) {
-        return -RELIEFOS_EINVAL;
-    }
-    for (uint32_t i = 0; i < command->argc; ++i) {
-        uint32_t arg_len = kernel_string_len_cap(command->args[i], sizeof(command->args[i]));
-        if (arg_len >= sizeof(command->args[i])) {
-            return -RELIEFOS_EINVAL;
-        }
-    }
-    ret = storage_resolve_path(sched_task_cwd(task), command->path, resolved, sizeof(resolved));
-    if (ret < 0) {
-        return -RELIEFOS_EINVAL;
-    }
-    ret = storage_stat_path(resolved, &st);
-    if (ret < 0) {
-        return ret == -2 ? -RELIEFOS_EINVAL : ret;
-    }
-    if (st.type != RELIEFOS_FS_TYPE_FILE) {
-        return -RELIEFOS_EINVAL;
-    }
-    ret = fs_permissions_check(task, resolved, FS_ACCESS_EXEC, false);
-    if (ret < 0) {
-        return ret;
-    }
-    copy_text(command->path, sizeof(command->path), resolved);
-    exec_bytes = kernel_string_len_cap(command->path, sizeof(command->path)) + 1U;
-    for (uint32_t i = 0; i < command->argc; ++i) {
-        exec_bytes += kernel_string_len_cap(command->args[i], sizeof(command->args[i])) + 1U;
-    }
-    if (exec_bytes > SCHED_EXEC_DATA_MAX) {
-        return -RELIEFOS_EINVAL;
-    }
-    command->reserved = 0;
-    for (uint32_t i = command->argc; i < RELIEFOS_STARTUP_MAX_ARGS; ++i) {
-        command->args[i][0] = 0;
-    }
-    return 0;
 }
 
 /**

@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := elf.o layout.o file.o symbols.o params.o lifecycle.o info.o
+include $(srctree)/scripts/Makefile.module
+
+$(obj)/info.o: $(objtree)/include/generated/module_abi.h

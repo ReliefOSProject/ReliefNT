@@ -1,3 +1,4 @@
+#include "../memory.h"
 #include "../drm_internal.h"
 
 #include <drm/vmwgfx_drm.h>
@@ -165,6 +166,11 @@ static void drm_vmwgfx_queue_resource(struct drm_vmwgfx_resource *resource)
     kernel_spin_unlock_irqrestore(&drm_vmwgfx_resource_lock, flags);
 }
 
+/**
+ * @brief Release an unpublished resource and its independent graphics owner.
+ * @param resource Owned unpublished object with no remaining backend handle.
+ * Execution-owned task context under a caller pin; removes the resource under its lock, then frees master/object/code references outside it.
+ */
 static void drm_vmwgfx_discard_unpublished(
     struct drm_vmwgfx_resource *resource)
 {
@@ -173,14 +179,22 @@ static void drm_vmwgfx_discard_unpublished(
     drm_vmwgfx_remove_all_locked(resource);
     kernel_spin_unlock_irqrestore(&drm_vmwgfx_resource_lock, flags);
     drm_master_put(resource->creator_master);
-    kernel_free(resource);
+    drm_async_free(resource);
 }
 
+/**
+ * @brief Construct independently pinned state before any backend publication.
+ * @param type Validated context/surface kind.
+ * @param size Full nonzero derived-object allocation size.
+ * @param creator_master Nullable borrowed master retained on success.
+ * @return Owned zeroed object or NULL on unavailable owner, overflow or OOM.
+ * Execution-owned task context under the admitted file/service pin; no resource lock spans allocation.
+ */
 static struct drm_vmwgfx_resource *drm_vmwgfx_resource_allocate(
     enum drm_vmwgfx_resource_type type, size_t size,
     struct drm_master *creator_master)
 {
-    struct drm_vmwgfx_resource *resource = kernel_malloc(size);
+    struct drm_vmwgfx_resource *resource = drm_async_alloc(size);
     if (!resource) return NULL;
     __builtin_memset(resource, 0, size);
     resource->type = (uint8_t)type;
@@ -444,6 +458,14 @@ static int drm_vmwgfx_validate_surface(
     return 0;
 }
 
+/**
+ * @brief Create and publish a context whose code survives deferred destruction.
+ * @param file Retained DRM owner file.
+ * @param argument Writable imported kernel argument.
+ * @param receipt Caller-owned rollback output.
+ * @return Zero or Linux error, with partial backend objects retained for safe retirement.
+ * Execution-owned task context; no resource lock spans allocation, backend calls or final owner release.
+ */
 static int drm_vmwgfx_create_context(struct drm_file *file,
                                      struct drm_vmw_context_arg *argument,
                                      struct drm_vmwgfx_rollback_receipt *receipt)
@@ -454,7 +476,7 @@ static int drm_vmwgfx_create_context(struct drm_file *file,
     struct drm_vmwgfx_file_ref *ref = kernel_malloc(sizeof(*ref));
     if (!context || !ref) {
         if (context) drm_master_put(context->resource.creator_master);
-        kernel_free(context);
+        drm_async_free(context);
         kernel_free(ref);
         return -LINUX_ENOMEM;
     }
@@ -462,7 +484,7 @@ static int drm_vmwgfx_create_context(struct drm_file *file,
     int ret = drm_vmwgfx_reserve_resource(&context->resource);
     if (ret) {
         drm_master_put(context->resource.creator_master);
-        kernel_free(context);
+        drm_async_free(context);
         kernel_free(ref);
         return ret;
     }
@@ -483,6 +505,15 @@ static int drm_vmwgfx_create_context(struct drm_file *file,
     return 0;
 }
 
+/**
+ * @brief Create a validated surface with independently pinned deferred ownership.
+ * @param task Execution-owned caller used for usercopy.
+ * @param file Retained DRM file.
+ * @param argument Imported kernel request and reply storage.
+ * @param receipt Caller-owned rollback output.
+ * @return Zero or Linux error; partial backend state remains retained until hardware retirement.
+ * Task context under the file pin; resource locks never span usercopy, heap or backend operations.
+ */
 static int drm_vmwgfx_create_surface(
     struct task *task, struct drm_file *file,
     union drm_vmw_surface_create_arg *argument,
@@ -498,7 +529,7 @@ static int drm_vmwgfx_create_surface(
     struct drm_vmwgfx_file_ref *ref = kernel_malloc(sizeof(*ref));
     if (!surface || !ref) {
         if (surface) drm_master_put(surface->resource.creator_master);
-        kernel_free(surface);
+        drm_async_free(surface);
         kernel_free(ref);
         return -LINUX_ENOMEM;
     }
@@ -507,7 +538,7 @@ static int drm_vmwgfx_create_surface(
     ret = drm_vmwgfx_reserve_resource(&surface->resource);
     if (ret) {
         drm_master_put(surface->resource.creator_master);
-        kernel_free(surface);
+        drm_async_free(surface);
         kernel_free(ref);
         return ret;
     }
@@ -707,6 +738,12 @@ static struct drm_vmwgfx_resource *drm_vmwgfx_retire_pop_locked(void)
     return resource;
 }
 
+/**
+ * @brief Reap bounded hardware-complete objects before dropping persistent code pins.
+ * @param budget Requested budget, bounded by existing queue-specific limits.
+ * @return Number of freed vmwgfx resources; other queues receive their existing bounded passes.
+ * Execution-owned task context under an independent file/service call pin; busy hardware retains backing and module references.
+ */
 uint32_t drm_vmwgfx_process_retirements(uint32_t budget)
 {
     if (budget > DRM_VMW_RESOURCE_RETIRE_BUDGET)
@@ -763,7 +800,7 @@ uint32_t drm_vmwgfx_process_retirements(uint32_t budget)
         resource->state = DRM_VMW_RESOURCE_CREATING;
         kernel_spin_unlock_irqrestore(&drm_vmwgfx_resource_lock, flags);
         drm_master_put(resource->creator_master);
-        kernel_free(resource);
+        drm_async_free(resource);
         ++retired;
     }
     return retired;

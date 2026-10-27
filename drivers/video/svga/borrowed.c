@@ -1,4 +1,6 @@
+#include <reliefnt/export.h>
 #include "device.h"
+#include <reliefnt/module.h>
 
 /* Bound each IRQ-disabled pass while allowing inline page-number packets to
  * queue in FIFO order without a host round trip between adjacent chunks. */
@@ -47,12 +49,31 @@ static int submit_mapping_chunk_locked(uint32_t id, struct svga_gmr *g)
     return 0;
 }
 
+/** @brief Construct or progress a borrowed GMR with independent callback-code ownership.
+ * @param phys Contiguous page-aligned backing base. @param bytes Backing length.
+ * @param owner Required backing identity, transferred only on handle publication.
+ * @param owner_put Final backing callback outside the device lock.
+ * @param code_owner LIVE callback module or NULL for permanent code.
+ * @param out Required in/out native handle, zero on initial creation.
+ * @return Zero when ready, EBUSY while progressing, or SVGA error. Task/execution
+ * ownership required. Unpublished errors balance the tentative code pin; a
+ * published GMR keeps it through final hardware fence and callback return.
+ * Task/execution context for module callers; never enter with the SVGA lock held.
+ * Caller retains resources/backing and its independent module call pin through
+ * return, and through the real fence or successful teardown when asynchronous.
+ */
 int svga_gmr_borrowed_attach(uint64_t phys, uint32_t bytes, void *owner,
-                             void (*owner_put)(void *owner), svga_handle *out)
+                             void (*owner_put)(void *owner), struct module *code_owner,
+                             svga_handle *out)
 {
     if (!out) return SVGA_EINVAL;
+    bool retained=!*out;
+    if(retained && !try_module_get(code_owner))return SVGA_ENODEV;
     uint64_t flags;
-    if (!svga_try_lock_irqsave(&flags)) return SVGA_EBUSY;
+    if (!svga_try_lock_irqsave(&flags)) {
+        if(retained)module_put(code_owner);
+        return SVGA_EBUSY;
+    }
     int ret = SVGA_EINVAL;
     struct svga_gmr *g = NULL;
     uint32_t id = 0;
@@ -62,7 +83,8 @@ int svga_gmr_borrowed_attach(uint64_t phys, uint32_t bytes, void *owner,
         id = (uint32_t)found;
         g = &svga.gmrs[id];
         if (!g->borrowed || g->phys != phys || g->bytes != bytes ||
-            g->owner != owner || g->owner_put != owner_put || g->retiring)
+            g->owner != owner || g->owner_put != owner_put ||
+            g->code_owner != code_owner || g->retiring)
             goto done;
     } else {
         ret = SVGA_ENODEV;
@@ -94,12 +116,13 @@ int svga_gmr_borrowed_attach(uint64_t phys, uint32_t bytes, void *owner,
         g = &svga.gmrs[id];
         *g = (struct svga_gmr){.handle = handle, .phys = phys, .bytes = bytes,
             .pages = pages, .mobid = SVGA_EXTERNAL_MOB_BASE + id,
-            .owner = owner, .owner_put = owner_put, .borrowed = true,
+            .owner = owner, .owner_put = owner_put, .code_owner = code_owner, .borrowed = true,
             .mode_lease = true};
         /* Retain the PTable root and ownership bit in the reserved context-sized
          * MOB record. This slot is disjoint from shader and surface IDs. */
         svga.external_mobs[id] = mob;
         *out = handle;
+        retained=false;
     }
     ret = SVGA_EBUSY;
     if (g->map_inflight) {
@@ -120,9 +143,17 @@ int svga_gmr_borrowed_attach(uint64_t phys, uint32_t bytes, void *owner,
     ret = SVGA_EBUSY;
 done:
     svga_unlock(flags);
+    if(retained)module_put(code_owner);
     return ret;
 }
 
+/**
+ * @brief Resolve a fully mapped borrowed attachment to its backend MOB index.
+ * @param handle Original borrowed GMR handle.
+ * @param mobid Required writable index, initialized to UINT32_MAX.
+ * @return Zero, EBUSY for contention/mapping/retirement progress, or EINVAL for invalid input/handle.
+ * Execution-owned task context; try-lock only and no reference transfer. Caller keeps the borrowed backing and callback owner alive until final detach.
+ */
 int svga_gmr_borrowed_mob_id(svga_handle handle, uint32_t *mobid)
 {
     if (!mobid) return SVGA_EINVAL;
@@ -142,6 +173,16 @@ int svga_gmr_borrowed_mob_id(svga_handle handle, uint32_t *mobid)
     return ret;
 }
 
+/** @brief Retire hardware backing before invoking and releasing its original callback.
+ * @param handle Exact borrowed GMR handle, including partially mapped objects.
+ * @return Zero after final callback return, EBUSY while hardware/fences progress,
+ * or SVGA error preserving ownership. Task/execution-owned context; callback and
+ * final module put run outside the device lock. Code stays pinned through the
+ * complete callback, even when that callback drops its own last object reference.
+ * Task/execution context for module callers; never enter with the SVGA lock held.
+ * Caller retains resources/backing and its independent module call pin through
+ * return, and through the real fence or successful teardown when asynchronous.
+ */
 int svga_gmr_borrowed_detach(svga_handle handle)
 {
     uint64_t flags;
@@ -149,6 +190,7 @@ int svga_gmr_borrowed_detach(svga_handle handle)
     int id = svga_find_gmr(handle), ret = SVGA_EINVAL;
     void *owner = NULL;
     void (*owner_put)(void *) = NULL;
+    struct module *code_owner = NULL;
     if (id < 0 || !svga.gmrs[id].borrowed) goto done;
     struct svga_gmr *g = &svga.gmrs[id];
     ret = svga_query_prepare_gmr_retire_locked((uint32_t)id);
@@ -164,6 +206,7 @@ int svga_gmr_borrowed_detach(svga_handle handle)
         }
         owner = g->owner;
         owner_put = g->owner_put;
+        code_owner = g->code_owner;
         svga_gb_backing_free_locked(&svga.external_mobs[id]);
         *g = (struct svga_gmr){0};
         ret = 0;
@@ -176,6 +219,7 @@ int svga_gmr_borrowed_detach(svga_handle handle)
         }
         owner = g->owner;
         owner_put = g->owner_put;
+        code_owner = g->code_owner;
         svga_gb_backing_free_locked(&svga.external_mobs[id]);
         *g = (struct svga_gmr){0};
         ret = 0;
@@ -191,6 +235,10 @@ int svga_gmr_borrowed_detach(svga_handle handle)
     ret = SVGA_EBUSY;
 done:
     svga_unlock(flags);
-    if (!ret && owner_put) owner_put(owner);
+    if (!ret && owner_put) {owner_put(owner);module_put(code_owner);}
     return ret;
 }
+
+EXPORT_SYMBOL(svga_gmr_borrowed_attach);
+EXPORT_SYMBOL(svga_gmr_borrowed_detach);
+EXPORT_SYMBOL(svga_gmr_borrowed_mob_id);

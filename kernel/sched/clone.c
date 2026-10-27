@@ -1,13 +1,21 @@
 #include "internal.h"
 
 /**
- * @brief Fork the calling user task: clone its address space COW-style, copy its register frame with rax zeroed in the child, and copy descriptors; returns the child pid or a negative errno.
+ * @brief Promote requested private task resources to shareable clone state.
+ * @param task Stable parent under execution ownership and scheduler_lock.
+ * @param flags Linux clone flags selecting resources to promote.
+ * @return Zero or ENOMEM; successful promotions remain valid on later failure.
+ * CLONE_FS transfers root/cwd pins into the shared owner without extra pins.
  */
 static int task_promote_shared(struct task *task, uint64_t flags);
 
 
 /**
- * @brief Fork the calling user task: clone its address space COW-style, copy its register frame with rax zeroed in the child, and copy descriptors; returns the child pid or a negative errno.
+ * @brief Promote requested private task resources to shareable clone state.
+ * @param task Stable parent under execution ownership and scheduler_lock.
+ * @param flags Linux clone flags selecting resources to promote.
+ * @return Zero or ENOMEM; successful promotions remain valid on later failure.
+ * CLONE_FS transfers root/cwd pins into the shared owner without extra pins.
  */
 static int task_promote_shared(struct task *task, uint64_t flags)
 {
@@ -40,6 +48,10 @@ static int task_promote_shared(struct task *task, uint64_t flags)
         fs->umask = *sched_task_umask(task);
         for (unsigned i = 0; i < sizeof(fs->cwd); ++i) fs->cwd[i] = sched_task_cwd(task)[i];
         task_copy_identity_text(fs->root_dir, sizeof(fs->root_dir), sched_task_root(task));
+        /* Transfer the two owned paths to the shared state, without a second
+         * self-reference or a stale inline owner after CLONE_FS promotion. */
+        fs->paths=task->fs_paths;
+        task->fs_paths=(struct task_fs_paths){0};
         fs->references = 1;
         task->shared_fs = fs;
     }
@@ -108,7 +120,12 @@ void sched_vfork_child_done(struct task *child)
  * @param parent_tid Optional user address receiving the child ID in the parent.
  * @param child_tid Optional user address receiving the child ID in the child.
  * @param tls User TLS base when CLONE_SETTLS is requested.
- * @return Child process ID, or a negative errno if creation fails.
+ * @return Child process ID, or a negative errno if creation fails. Copies held
+ * root/cwd objects for fork, shares them for CLONE_FS, and releases only child
+ * ownership on rollback. Called under execution ownership; takes scheduler_lock.
+ * The child never borrows the parent's retained PID-identity object or pending
+ * syscall lookup names/root/dirfd references or imported vector/transfer state,
+ * including on early allocation failure.
  */
 int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flags,
                            uint64_t stack, uint64_t parent_tid,
@@ -160,6 +177,11 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
     }
     task_zero(child);
     *child = *parent;
+    child->identity_token=NULL;
+    /* Pending syscall operands belong to the caller, never its new child. */
+    child->lookup_scope=(struct task_lookup_scope){0};
+    child->transfer_io=NULL;
+    child->vector_io=NULL;
     child->exec_argv = NULL;
     child->exec_envp = NULL;
     child->exec_data = NULL;
@@ -172,6 +194,8 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
     child->vfork_child = NULL;
     child->shared_files = NULL;
     child->shared_fs = NULL;
+    child->fs_paths=(struct task_fs_paths){0};
+    if(!(flags & CLONE_FS))sched_task_fs_inherit(child,parent);
     child->shared_sighand = NULL;
     child->address_space = *sched_task_mm(parent);
     child->address_space.as = (struct address_space){0};
@@ -179,9 +203,15 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
     child->address_space.vma_extra_count = 0;
     child->address_space.vma_extra_capacity = 0;
     child->address_space.executable_inode = NULL;
+    child->address_space.executable_denied_write = false;
+    child->address_space.executable_path = (struct vfs_path){0};
     for (uint32_t i = 0; i < SCHED_TASK_VMA_MAX; ++i) {
         child->address_space.vmas[i].inode = NULL;
-        child->address_space.vmas[i].audio_pcm = NULL;
+        child->address_space.vmas[i].device_mapping = NULL;
+        /* Until each VMA is explicitly retained, copied pointers are borrowed.
+         * An early page-table clone failure must never drop parent resources. */
+        child->address_space.vmas[i].mapping_file = NULL;
+        child->address_space.vmas[i].exec_source = NULL;
         child->address_space.vmas[i].sysv_shm_attachment = NULL;
     }
     child->fd_table = *sched_task_fds(parent);
@@ -260,6 +290,7 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
     child->sysv_sem = (struct task_sysv_sem_state){0};
     child->sysv_undo = NULL;
     child->syscall_file = NULL;
+    child->module_file_inode = NULL;
     child->fifo_open_file = NULL;
     __builtin_memset(&child->regular_io, 0, sizeof(child->regular_io));
     child->tty_old_pgrp = 0;
@@ -320,18 +351,23 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
         if (!address_space_clone_cow(sched_task_as(parent), sched_task_as(child))) goto fail;
         child->address_space.executable_inode = sched_task_mm(parent)->executable_inode;
         storage_inode_retain(child->address_space.executable_inode);
+        if(sched_task_mm(parent)->executable_denied_write) {
+            if(storage_inode_deny_write(child->address_space.executable_inode)<0)goto fail;
+            child->address_space.executable_denied_write=true;
+        }
+        vfs_path_get(&sched_task_mm(parent)->executable_path,&child->address_space.executable_path);
         for (uint32_t i = 0; i < SCHED_TASK_VMA_MAX; ++i) {
             const struct task_vma *src = &sched_task_mm(parent)->vmas[i];
             struct task_vma *dst = &child->address_space.vmas[i];
             *dst = *src;
             dst->inode = NULL;
-            dst->audio_pcm = NULL;
-            dst->drm_bo = NULL;
-            dst->drm_mapping_file = NULL;
+            dst->device_mapping = NULL;
+            dst->mapping_file = NULL;
+            dst->exec_source = NULL;
             dst->sysv_shm_attachment = NULL;
             if (src->inode) storage_inode_retain(dst->inode = src->inode);
-            if (sched_task_vma_retain_audio(dst, src) < 0) goto fail;
-            if (sched_task_vma_retain_drm(dst, src) < 0) goto fail;
+            if (sched_task_vma_retain_device(dst, src) < 0) goto fail;
+            if (sched_task_vma_retain_file(dst, src) < 0) goto fail;
             if (sysv_shm_vma_clone(child, dst, src) < 0) goto fail;
         }
         for (uint32_t i = 0; i < sched_task_mm(parent)->vma_extra_count; ++i) {
@@ -340,13 +376,13 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
             const struct task_vma *src = &sched_task_mm(parent)->vma_extra[i];
             *dst = *src;
             dst->inode = NULL;
-            dst->audio_pcm = NULL;
-            dst->drm_bo = NULL;
-            dst->drm_mapping_file = NULL;
+            dst->device_mapping = NULL;
+            dst->mapping_file = NULL;
+            dst->exec_source = NULL;
             dst->sysv_shm_attachment = NULL;
             if (src->inode) storage_inode_retain(dst->inode = src->inode);
-            if (sched_task_vma_retain_audio(dst, src) < 0) goto fail;
-            if (sched_task_vma_retain_drm(dst, src) < 0) goto fail;
+            if (sched_task_vma_retain_device(dst, src) < 0) goto fail;
+            if (sched_task_vma_retain_file(dst, src) < 0) goto fail;
             if (sysv_shm_vma_clone(child, dst, src) < 0) goto fail;
         }
     }
@@ -405,6 +441,7 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
     return (int64_t)child_pid;
 
 fail:
+    sched_task_fs_release(child);
     if (child->shared_mm) --child->shared_mm->references;
     else {
         address_space_destroy(sched_task_as(child));

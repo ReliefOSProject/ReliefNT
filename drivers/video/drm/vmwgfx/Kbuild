@@ -1,4 +1,3 @@
 # SPDX-License-Identifier: Apache-2.0
-obj-y := caps.o continuation.o execbuf.o execbuf_parser.o fence.o resource.o retire.o translate.o validate.o
-
-include $(srctree)/scripts/Makefile.module
+# Members of the parent DRM composite; every source stays listed locally.
+drm-vmwgfx-y := caps.o continuation.o execbuf.o execbuf_parser.o fence.o resource.o retire.o translate.o validate.o

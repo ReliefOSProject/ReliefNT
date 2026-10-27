@@ -1,82 +1,53 @@
 #include "../internal.h"
+#include <reliefnt/devfs.h>
 
-/** @brief Encode a standard audio node as Linux ALSA major/minor device ID.
- * @param node Storage node carrying an audio control or PCM identity.
- * @return Linux old-style dev_t value, or zero for a stale identity.
+/** @brief Preserve the established fallback identity for pathless descriptions.
+ * @param st Borrowed builtin type/size metadata, nullable for an empty file.
+ * @return Nonzero stable63-bit fallback inode; no namespace lookup or lifetime
+ * transfer. Real filesystem paths obtain their native inode through getattr.
  */
-static uint64_t linux_audio_rdev(const struct storage_node *node);
-
-
-uint64_t linux_stat_inode(const char *path, const struct reliefos_stat *st)
+static uint64_t linux_stat_fallback_inode(const struct reliefos_stat *st)
 {
-
-    uint64_t hash = 1469598103934665603ULL;
-    if (path) {
-        for (const unsigned char *p = (const unsigned char *)path; *p; ++p) {
-            hash ^= *p;
-            hash *= 1099511628211ULL;
-        }
-    }
-    if (st) hash ^= st->size + ((uint64_t)st->type << 32);
-    hash &= 0x7fffffffffffffffULL;
-    return hash ? hash : 1;
+    uint64_t hash=1469598103934665603ULL;
+    if(st)hash^=st->size+((uint64_t)st->type<<32);
+    hash&=0x7fffffffffffffffULL;return hash ? hash : 1;
 }
 
-/** @brief Encode a standard audio node as Linux ALSA major/minor device ID.
- * @param node Storage node carrying an audio control or PCM identity.
- * @return Linux old-style dev_t value, or zero for a stale identity.
+/** @brief Apply the common generated-device identity policy after getattr.
+ * @param out Actual stat result, required; native rdev fields are preserved.
+ * @param node Borrowed held inode, nullable for pathless anonymous objects.
+ * No allocation/path lookup/ownership transfer. Execution ownership required;
+ * native driver/card registries remain stable through the pure query.
  */
-static uint64_t linux_audio_rdev(const struct storage_node *node)
-{
-    uint32_t card_token;
-    uint32_t ordinal;
-    uint32_t minor;
-    int index;
+static void linux_stat_device_identity(struct linux_stat_abi *out,const struct storage_node *node)
+{devfs_stat_identity(out,node);}
 
-    if (!node) return 0;
-    if ((node->flags & STORAGE_NODE_FLAG_DEV_NODE) &&
-        !(node->flags & STORAGE_NODE_FLAG_AUDIO_PCM) &&
-        node->first_cluster == STORAGE_DEV_KIND_AUDIO)
-        return ((uint64_t)14u << 8) | 3u;
-    if ((node->flags & STORAGE_NODE_FLAG_AUDIO_MIXER) &&
-        node->first_cluster == STORAGE_DEV_KIND_AUDIO_MIXER)
-        return (uint64_t)14u << 8;
-    if (node->flags & STORAGE_NODE_FLAG_AUDIO_TIMER)
-        return ((uint64_t)116u << 8) | 33u;
-    if (!(node->flags & (STORAGE_NODE_FLAG_AUDIO_PCM |
-                                  STORAGE_NODE_FLAG_AUDIO_CONTROL |
-                                  STORAGE_NODE_FLAG_AUDIO_MIXER |
-                                  STORAGE_NODE_FLAG_AUDIO_TIMER))) return 0;
-    if (node->flags & STORAGE_NODE_FLAG_AUDIO_PCM)
-        card_token = AUDIO_DEVICE_CARD(node->volume_id);
-    else
-        card_token = node->volume_id;
-    index = audio_card_index(card_token);
-    if (index < 0) return 0;
-    ordinal = (uint32_t)index;
-    if (node->flags & STORAGE_NODE_FLAG_AUDIO_MIXER) {
-        minor = ordinal * 16u;
-        return ((uint64_t)14u << 8) | (minor & 0xffu) |
-            ((uint64_t)(minor & ~0xffu) << 12);
-    }
-    if (node->flags & STORAGE_NODE_FLAG_AUDIO_CONTROL) {
-        minor = ordinal * 32u;
-    } else {
-        uint32_t device = AUDIO_DEVICE_INDEX(node->volume_id);
-        uint32_t direction = AUDIO_DEVICE_DIRECTION(node->volume_id);
-        if (device > 7u) return 0;
-        minor = ordinal * 32u + (direction ? 24u : 16u) + device;
-    }
-    return ((uint64_t)116u << 8) | (minor & 0xffu) |
-        ((uint64_t)(minor & ~0xffu) << 12);
+/** @brief Obtain metadata from a retained inode and encode device identities.
+ * @param out Required Linux stat output, empty on provider failure.
+ * @param path Borrowed inode path retaining its mount/provider during I/O.
+ * @return Zero or negative errno. Never resolves a displayed name; the caller
+ * performs directory-search authorization before obtaining this object and
+ * holds execution ownership without graph/module spinlocks across callbacks.
+ */
+int linux_stat_from_path(struct linux_stat_abi *out,const struct vfs_path *path)
+{
+    int rc=vfs_path_stat(path,out);
+    if(!rc && (vfs_path_node(path)->flags&STORAGE_NODE_FLAG_DEV_NODE))
+        linux_stat_device_identity(out,vfs_path_node(path));
+    return rc;
 }
 
-int linux_stat_from_legacy(struct linux_stat_abi *out,
-                                   const struct reliefos_stat *st,
-                                   const char *path, const struct storage_node *node)
+/** @brief Encode metadata for an admitted pathless node without name lookup.
+ * @param out Required Linux stat result. @param st Borrowed type/size, nullable.
+ * @param node Optional builtin or already-held anonymous backend identity.
+ * @return Zero or negative inode/builtin-metadata errno. Builtin devices read
+ * the same virtual inode metadata used by chmod/chown. Caller retains the descriptor/
+ * inode/provider during I/O under execution ownership. No path replay, graph
+ * lock or ownership transfer; real mounted paths use linux_stat_from_path.
+ */
+int linux_stat_from_node(struct linux_stat_abi *out,const struct reliefos_stat *st,
+                            const struct storage_node *node)
 {
-    struct storage_node found;
-    if (!node && path && storage_lookup_path(path, &found) == 0) node = &found;
     if (node && (node->flags & (STORAGE_NODE_FLAG_EXT2 | STORAGE_NODE_FLAG_TMPFS))) return storage_inode_stat(node, out);
     uint32_t type = st ? st->type : RELIEFOS_FS_TYPE_FILE;
     uint32_t mode = type == RELIEFOS_FS_TYPE_DIR ? 0040755u :
@@ -94,54 +65,21 @@ int linux_stat_from_legacy(struct linux_stat_abi *out,
         node && (node->flags & (STORAGE_NODE_FLAG_DEV_NODE | STORAGE_NODE_FLAG_DEV_DIR |
                                STORAGE_NODE_FLAG_DEV_LINK)) ? STORAGE_DEVFS_DEVICE :
         node ? storage_volume_device(node->volume_id) : 1;
-    out->st_ino = linux_stat_inode(path, st);
+    out->st_ino = linux_stat_fallback_inode(st);
     out->st_nlink = 1;
     out->st_mode = mode;
-    if (path) {
-        struct reliefos_permissions value;
-        int ret = fs_permissions_get(path, node, &value);
-        if (ret < 0) return ret;
-        out->st_uid = value.uid;
-        out->st_gid = value.gid;
-        out->st_mode = ((value.mode & LINUX_S_IFMT) ? value.mode & LINUX_S_IFMT : mode & LINUX_S_IFMT) |
-            (value.mode & 07777u);
-    }
-    /* Fixed virtual consoles use Linux's tty major (4), which Xorg's
-     * xf86HasTTYs() probes before entering VT_PROCESS.  Dynamic /dev/pts
-     * endpoints retain the Unix98 PTY major (136); other synthetic devices
-     * continue to use the per-kind minor identity used by this devfs. */
-    uint32_t device_major = node && (node->flags & STORAGE_NODE_FLAG_PTY) &&
-                            node->first_cluster >= 1u && node->first_cluster <= 6u
-                                ? 4u : 136u;
-    out->st_rdev = type == RELIEFOS_FS_TYPE_DEVICE
-        ? (device_major << 8) | (node ? node->first_cluster : 0u) : 0;
-    if (node && (node->flags & STORAGE_NODE_FLAG_DEV_BLOCK))
-        out->st_rdev = storage_block_rdev(node->volume_id);
-    if (node && (node->flags & STORAGE_NODE_FLAG_PTY)) {
-        out->st_ino = (uint64_t)node->volume_id * 16 + node->first_cluster;
-        out->st_rdev = (device_major << 8) | node->first_cluster;
-    }
-    if (node && (node->flags & STORAGE_NODE_FLAG_DEV_NODE) &&
-        !(node->flags & STORAGE_NODE_FLAG_PTY)) {
-        if (node->first_cluster == STORAGE_DEV_KIND_CONSOLE)
-            out->st_rdev = (5u << 8) | 1u;
-        else if (node->first_cluster == STORAGE_DEV_KIND_KMSG)
-            out->st_rdev = (1u << 8) | 11u;
-    }
-    if ((node && (node->flags & (STORAGE_NODE_FLAG_AUDIO_PCM |
-                                 STORAGE_NODE_FLAG_AUDIO_CONTROL |
-                                 STORAGE_NODE_FLAG_AUDIO_MIXER |
-                                 STORAGE_NODE_FLAG_AUDIO_TIMER))) ||
-        (node && (node->flags & STORAGE_NODE_FLAG_DEV_NODE) &&
-         node->first_cluster == STORAGE_DEV_KIND_AUDIO))
-        out->st_rdev = linux_audio_rdev(node);
-    if (node && node->first_cluster == STORAGE_DEV_KIND_DRM_CARD0)
-        out->st_rdev = (226u << 8);
-    if (node && node->first_cluster == STORAGE_DEV_KIND_DRM_RENDERD128)
-        out->st_rdev = (226u << 8) | 128u;
+    linux_stat_device_identity(out,node);
     out->st_size = st ? (int64_t)st->size : 0;
     out->st_blksize = 4096;
     out->st_blocks = (out->st_size + 511) / 512;
+    if(node && (node->flags&(STORAGE_NODE_FLAG_PTY|STORAGE_NODE_FLAG_DEV_NODE|
+                            STORAGE_NODE_FLAG_DEV_DIR|STORAGE_NODE_FLAG_DEV_LINK|STORAGE_NODE_FLAG_DEV_FB0))) {
+        struct reliefos_permissions value;
+        int rc=fs_virtual_permissions("builtin-device",node,&value,false);
+        if(rc){*out=(struct linux_stat_abi){0};return rc;}
+        out->st_mode=(out->st_mode&LINUX_S_IFMT)|(value.mode&07777);
+        out->st_uid=value.uid;out->st_gid=value.gid;
+    }
     return 0;
 }
 

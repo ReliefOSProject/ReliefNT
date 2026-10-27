@@ -1,3 +1,4 @@
+#include <reliefnt/device_mapping.h>
 #ifndef RELIEFNT_KERNEL_SCHED_SCHED_C_INTERNAL_H
 #define RELIEFNT_KERNEL_SCHED_SCHED_C_INTERNAL_H
 
@@ -458,17 +459,14 @@ uint32_t sched_task_vma_capacity(const struct task *task);
 void sched_task_vma_release(struct task *task);
 
 /**
- * @brief Retain the PCM mapping reference represented by a copied VMA.
- * @param dst Child VMA receiving the copied audio mapping metadata.
- * @param src Parent VMA whose mapping reference is still live.
- * @return Zero when no mapping exists or the reference was retained, else a negative errno.
+ * @brief Share provider-independent device backing with a copied VMA.
+ * @param dst Child VMA whose device reference has not yet been acquired.
+ * @param src Parent retaining its original backing reference.
+ * @return Zero or negative errno with dst unchanged on failure. Execution-owned
+ * task context; no backend callback, allocation or registry lock across sharing.
  */
-int sched_task_vma_retain_audio(struct task_vma *dst,
+int sched_task_vma_retain_device(struct task_vma *dst,
                                        const struct task_vma *src);
-
-/** @brief Retain the BO and OFD references represented by a copied DRM VMA. */
-int sched_task_vma_retain_drm(struct task_vma *dst,
-                                     const struct task_vma *src);
 
 /** @brief Resolve a Linux descriptor number without acquiring a description.
  * @param task Owner under the execution lock. @param fd Linux fd, not array index.
@@ -508,7 +506,10 @@ void task_copy_identity_text(char *dst, size_t cap, const char *src);
 void task_clear_identity(struct task *task);
 
 /**
- * @brief Inherit uid, role, session, username, and home from the parent task.
+ * @brief Inherit identity and independent held root/cwd paths from a parent.
+ * @param task New task with private filesystem state under execution ownership.
+ * @param parent Stable source task; NULL leaves the destination unchanged.
+ * Retains group and path references; caller serializes task publication.
  */
 void task_copy_identity_from_parent(struct task *task, const struct task *parent);
 
@@ -539,7 +540,10 @@ void task_release_limits(struct task *task);
 uint32_t task_allocate_pid(void);
 
 /**
- * @brief Return a zeroed task slot, recycling a reaped EXITED entry or growing the table as needed.
+ * @brief Recycle a fully retired task or allocate a stable zeroed task record.
+ * @return Borrowed unpublished task slot, or NULL on allocation/size failure.
+ * Caller holds scheduler_lock. Invalidates old PID identities before reuse;
+ * does not perform filesystem/device resource teardown or backend I/O.
  */
 struct task *alloc_task_slot(void);
 
@@ -654,6 +658,14 @@ void sched_exit_group(uint32_t tgid, uint64_t code);
 
 int sched_prepare_exec_current(struct task *task);
 
+/**
+ * @brief Commit exec after its final fallible check and release the old mm/VMA pins.
+ * @param task Execution-owned current task; saved graphics user pointers are canceled.
+ * @param replacement Prepared address space transferred to task without retaining it.
+ * @return None; caller cannot resume the replaced image after this commit.
+ * @note Task context without scheduler locks across cleanup; releases the vfork
+ * parent and switches to kernel CR3 before dropping the former address space.
+ */
 void sched_exec_replace_mm(struct task *task, const struct address_space *replacement);
 
 /** @brief Wake signalfd readers attached to the mask updater's shared sighand. */
@@ -741,7 +753,10 @@ void sched_task_counts(uint32_t *out_task_count, uint32_t *running_tasks,
                        uint32_t *ready_tasks, uint32_t *sleeping_tasks);
 
 /**
- * @brief Return the pid of the currently running task (0 before the first switch).
+ * @brief Read the current CPU execution-context task identity.
+ * @return Current pid, including zero before the first task switch or for idle execution.
+ * @par Context
+ * Boot/task/IRQ snapshot without allocation or reference acquisition. Caller must not migrate across a multi-step use of this identity.
  */
 uint32_t sched_current_pid(void);
 
@@ -769,15 +784,12 @@ struct task *sched_find_by_path(const char *path);
  */
 struct task *sched_find_by_path_basename(const char *basename);
 
-/**
- * @brief True when any live task's cwd, path, image node, or open files/VMA reference this volume.
- */
-bool sched_volume_has_writers(uint32_t volume_id);
-
-bool sched_volume_in_use(uint32_t volume_id);
 
 /**
- * @brief Return the struct task for the currently running pid, or NULL.
+ * @brief Borrow the current CPU task with the historical idle-task lookup fallback.
+ * @return Borrowed current task, idle task, or NULL when no matching task exists.
+ * @par Context
+ * Caller retains the execution transaction or scheduler lifetime protection through use. No task reference is acquired and the pointer must not survive scheduling or task retirement.
  */
 struct task *sched_current_task(void);
 

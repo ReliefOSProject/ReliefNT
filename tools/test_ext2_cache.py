@@ -11,7 +11,7 @@ with tempfile.TemporaryDirectory(prefix="ext2-cache-", dir=None) as directory:
     subprocess.run(["cc", "-std=c11", "-O1", "-g", "-fsanitize=address,undefined",
                     "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
                     "-Iinclude", "-Iinclude", "-Iinclude/uapi", "-Iinclude",
-                    "tools/tests/ext2_cache_test.c", "-o", executable], cwd=ROOT, check=True)
+                    "tools/tests/ext2_cache_test.c", "fs/tmpfs/core.c", "lib/text_utf16.c", "-o", executable], cwd=ROOT, check=True)
     for block_size in (1024, 2048, 4096):
         image = work / f"disk-{block_size}.ext2"
         subprocess.run(["mke2fs", "-q", "-t", "ext2", "-b", str(block_size), "-I", "128",

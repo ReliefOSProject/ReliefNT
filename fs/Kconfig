@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: Apache-2.0
+menu "Filesystems"
+
+config FAT_FS
+    tristate "FAT32 filesystem and formatter"
+    default y
+    help
+      Native FAT32 filesystem, including EFI system partitions. Choose M to
+      build vfat.ko; early boot must load it before mounting a FAT root or ESP.
+
+config EXFAT_FS
+    tristate "exFAT filesystem and formatter"
+    default y
+
+config EXT_FS_COMMON
+    tristate
+
+config EXT2_FS
+    tristate "ext2 filesystem and formatter"
+    default y
+    select EXT_FS_COMMON
+    help
+      Register the ext2 filesystem using ReliefNT's shared native ext engine.
+      The shared ext_common module contains the actual format, allocation,
+      journal, cache and inode implementation used by both ext frontends.
+
+config EXT4_FS
+    tristate "ext4 filesystem and formatter"
+    default y
+    select EXT_FS_COMMON
+
+config ISO9660_FS
+    tristate "ISO9660 read-only filesystem"
+    default y
+
+comment "Initial memory root, tmpfs, VFS and proc/sys/dev filesystems stay built-in"
+endmenu

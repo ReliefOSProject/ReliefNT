@@ -46,56 +46,6 @@ static volatile uint32_t smp_ready;
 static volatile uint32_t smp_scheduler_started;
 static volatile uint32_t smp_bsp_user_entry_pending;
 
-static uint64_t membarrier_sequence;
-static uint64_t membarrier_request[SMP_MAX_CPUS];
-static uint64_t membarrier_ack[SMP_MAX_CPUS];
-static bool membarrier_sync_core;
-static bool membarrier_flush_tlb;
-extern void x86_64_flush_user_tlb(void);
-
-static void cpu_memory_barrier(bool sync_core)
-{
-    if (membarrier_flush_tlb) x86_64_flush_user_tlb();
-    if (sync_core) {
-        uint32_t eax = 0, ebx, ecx, edx;
-        __asm__ volatile("cpuid" : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : : "memory");
-    } else {
-        __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    }
-}
-
-void smp_membarrier_poll(void)
-{
-    uint32_t cpu = smp_current_cpu();
-    uint64_t request = __atomic_load_n(&membarrier_request[cpu], __ATOMIC_ACQUIRE);
-    if (request == __atomic_load_n(&membarrier_ack[cpu], __ATOMIC_RELAXED)) return;
-    cpu_memory_barrier(membarrier_sync_core);
-    __atomic_store_n(&membarrier_ack[cpu], request, __ATOMIC_RELEASE);
-}
-
-static void smp_cpu_barrier(bool sync_core, bool flush_tlb)
-{
-    uint32_t current = smp_current_cpu();
-    uint64_t targets = 0, sequence = ++membarrier_sequence;
-    membarrier_sync_core = sync_core;
-    membarrier_flush_tlb = flush_tlb;
-    cpu_memory_barrier(sync_core);
-    for (uint32_t cpu = 0; cpu < smp_cpu_count(); ++cpu) {
-        if (cpu == current || !smp_cpu_online(cpu)) continue;
-        targets |= 1ULL << cpu;
-        __atomic_store_n(&membarrier_request[cpu], sequence, __ATOMIC_RELEASE);
-        apic_send_ipi(cpus[cpu].apic_id, SMP_MEMBARRIER_VECTOR);
-    }
-    for (uint32_t cpu = 0; cpu < smp_cpu_count(); ++cpu) {
-        if (!(targets & (1ULL << cpu))) continue;
-        while (__atomic_load_n(&membarrier_ack[cpu], __ATOMIC_ACQUIRE) != sequence)
-            __asm__ volatile("pause" : : : "memory");
-    }
-    cpu_memory_barrier(sync_core);
-}
-
-void smp_membarrier(bool sync_core) { smp_cpu_barrier(sync_core, false); }
-void smp_flush_user_tlb(void) { smp_cpu_barrier(false, true); }
 
 static uint32_t trampoline_offset(const uint8_t *symbol)
 {

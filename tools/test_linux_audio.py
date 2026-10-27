@@ -118,7 +118,7 @@ def run_pcm() -> int:
             "-fsanitize=address,undefined", "-ffunction-sections", "-fdata-sections",
             "-Wl,--gc-sections", "-Iinclude",
             "-Iinclude/uapi", "-Iinclude",
-            str(PCM_PROBE), "-o", str(binary),
+            str(PCM_PROBE), "kernel/device/mapping.c", "-o", str(binary),
         ], cwd=ROOT, check=True, timeout=20)
         subprocess.run([str(binary)], cwd=ROOT, check=True, timeout=10)
     print("PASS PCM state test")
@@ -136,7 +136,7 @@ def run_device() -> int:
             "-fsanitize=address,undefined", "-ffunction-sections", "-fdata-sections",
             "-Wl,--gc-sections", "-Iinclude",
             "-Iinclude/uapi", "-Iinclude",
-            str(DEVICE_PROBE), "-o", str(binary),
+            str(DEVICE_PROBE), "kernel/device/mapping.c", "-o", str(binary),
         ], cwd=ROOT, check=True, timeout=20)
         subprocess.run([str(binary)], cwd=ROOT, check=True, timeout=10)
     print("PASS audio device node/OFD/read-write/poll")
@@ -164,7 +164,7 @@ def run_vma() -> int:
             "-fsanitize=address,undefined", "-ffunction-sections", "-fdata-sections",
             "-Wl,--gc-sections", "-Iinclude",
             "-Iinclude/uapi", "-Iinclude",
-            str(VMA_PROBE), "-o", str(binary),
+            str(VMA_PROBE), "kernel/device/mapping.c", "-o", str(binary),
         ], cwd=ROOT, check=True, timeout=20)
         subprocess.run([str(binary)], cwd=ROOT, check=True, timeout=10)
     print("PASS audio VMA lifetime")
@@ -218,7 +218,7 @@ def run_mmap() -> int:
             "-fsanitize=address,undefined", "-ffunction-sections", "-fdata-sections",
             "-Wl,--gc-sections", "-Iinclude",
             "-Iinclude/uapi", "-Iinclude",
-            str(MMAP_PROBE), "-o", str(binary),
+            str(MMAP_PROBE), "kernel/device/mapping.c", "-o", str(binary),
         ], cwd=ROOT, check=True, timeout=20)
         subprocess.run([str(binary)], cwd=ROOT, check=True, timeout=10)
     print("PASS ALSA PCM mmap contract")
@@ -263,7 +263,7 @@ def run_oss() -> int:
             "-fsanitize=address,undefined", "-ffunction-sections", "-fdata-sections",
             "-Wl,--gc-sections", "-Iinclude",
             "-Iinclude/uapi", "-Iinclude",
-            str(OSS_WAIT_PROBE), "-o", str(wait_binary),
+            str(OSS_WAIT_PROBE), "kernel/device/mapping.c", "-o", str(wait_binary),
         ], cwd=ROOT, check=True, timeout=20)
         failures = []
         for direction in ("read", "write", "trigger", "prefill", "full-prefill", "grow-buffer", "bulk", "fragment", "reset", "tail", "full-tail", "negotiate", "lease", "xrun", "u8-sparse", "odd-channels", "boundary"):

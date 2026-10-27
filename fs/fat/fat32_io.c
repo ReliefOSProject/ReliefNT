@@ -1,5 +1,15 @@
 #include "internal.h"
 
+/** @brief Locate one FAT32 entry inside the selected native sector.
+ * @param cluster Unsigned native cluster number; modulo arithmetic preserves the
+ * on-disk entry offset. Selected parsed volume has nonzero bytes_per_sector.
+ * @return Byte offset within that sector; caller holds storage execution ownership.
+ */
+static uint32_t fat_offset_for_cluster(uint32_t cluster)
+{
+    return (cluster * 4u) % g_storage.bytes_per_sector;
+}
+
 static int fat32_write_fsinfo(void);
 
 

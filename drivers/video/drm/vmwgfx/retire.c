@@ -1,3 +1,5 @@
+#include "../memory.h"
+#include <reliefnt/module.h>
 #include "execbuf_internal.h"
 
 static void drm_vmwgfx_exec_attachment_owner_put(void *opaque);
@@ -39,6 +41,11 @@ void drm_vmwgfx_exec_job_enqueue_locked(
     drm_vmwgfx_exec_jobs_tail = work;
 }
 
+/**
+ * @brief Consume a hardware-retired attachment and its original object/code ownership.
+ * @param opaque Owned attachment supplied by the matching backend callback.
+ * Execution-owned task context outside the SVGA lock. Permanent SVGA holds its separate callback-code pin through return; unlink under exec lock, then release BO/object outside it.
+ */
 static void drm_vmwgfx_exec_attachment_owner_put(void *opaque)
 {
     struct drm_vmwgfx_attachment *attachment = opaque;
@@ -60,7 +67,7 @@ static void drm_vmwgfx_exec_attachment_owner_put(void *opaque)
     attachment->bo = NULL;
     kernel_spin_unlock_irqrestore(&drm_vmwgfx_exec_lock, flags);
     if (bo) drm_bo_put(bo);
-    kernel_free(attachment);
+    drm_async_free(attachment);
 }
 
 static int drm_vmwgfx_exec_attachment_progress(
@@ -75,7 +82,7 @@ static int drm_vmwgfx_exec_attachment_progress(
     if (!phys || (phys & 4095u) || !size || size > UINT32_MAX)
         return -LINUX_EINVAL;
     int status = svga_gmr_borrowed_attach(phys, (uint32_t)size, attachment,
-        drm_vmwgfx_exec_attachment_owner_put, &attachment->gmr);
+        drm_vmwgfx_exec_attachment_owner_put, THIS_MODULE, &attachment->gmr);
     if (status == SVGA_EBUSY) return -LINUX_EBUSY;
     if (status) {
         attachment->error = drm_vmwgfx_map_svga_status(status);
@@ -116,6 +123,14 @@ static void drm_vmwgfx_exec_attachment_put(
     kernel_spin_unlock_irqrestore(&drm_vmwgfx_exec_lock, flags);
 }
 
+/**
+ * @brief Retain or construct an independently pinned BO attachment cache record.
+ * @param bo Borrowed retained BO.
+ * @param out Required attachment output, including pending backend progress.
+ * @param failure_stage Optional stable diagnostic-stage output.
+ * @return Zero, EBUSY with a retained pending attachment, or validation/allocation/backend errno.
+ * Execution-owned task context under caller pin; candidate races and quota/OOM failures balance object and module references outside exec lock.
+ */
 int drm_vmwgfx_exec_attachment_get(
     struct drm_bo *bo, struct drm_vmwgfx_attachment **out,
     const char **failure_stage)
@@ -146,7 +161,7 @@ int drm_vmwgfx_exec_attachment_get(
     kernel_spin_unlock_irqrestore(&drm_vmwgfx_exec_lock, flags);
 
     if (failure_stage) *failure_stage = "exec.attach.heap";
-    struct drm_vmwgfx_attachment *candidate = kernel_malloc(sizeof(*candidate));
+    struct drm_vmwgfx_attachment *candidate = drm_async_alloc(sizeof(*candidate));
     if (!candidate) return -LINUX_ENOMEM;
     *candidate = (struct drm_vmwgfx_attachment){.bo = bo, .bytes = (uint32_t)bytes,
         .references = 1, .idle_since = time_ticks()};
@@ -159,7 +174,7 @@ int drm_vmwgfx_exec_attachment_get(
         if (attachment->references == UINT32_MAX) {
             kernel_spin_unlock_irqrestore(&drm_vmwgfx_exec_lock, flags);
             drm_bo_put(bo);
-            kernel_free(candidate);
+            drm_async_free(candidate);
             if (failure_stage) *failure_stage = "exec.attach.ref_limit";
             return -LINUX_ENOMEM;
         }
@@ -167,7 +182,7 @@ int drm_vmwgfx_exec_attachment_get(
         *out = attachment;
         kernel_spin_unlock_irqrestore(&drm_vmwgfx_exec_lock, flags);
         drm_bo_put(bo);
-        kernel_free(candidate);
+        drm_async_free(candidate);
         if (failure_stage) *failure_stage = "exec.attach.backend";
         return drm_vmwgfx_exec_attachment_progress(attachment);
     }
@@ -175,7 +190,7 @@ int drm_vmwgfx_exec_attachment_get(
         bytes > DRM_VMW_EXEC_ATTACHMENT_BYTES_MAX - drm_vmwgfx_attachment_bytes) {
         kernel_spin_unlock_irqrestore(&drm_vmwgfx_exec_lock, flags);
         drm_bo_put(bo);
-        kernel_free(candidate);
+        drm_async_free(candidate);
         if (failure_stage) *failure_stage = "exec.attach.quota";
         return -LINUX_ENOMEM;
     }
@@ -190,6 +205,11 @@ int drm_vmwgfx_exec_attachment_get(
     return drm_vmwgfx_exec_attachment_progress(candidate);
 }
 
+/**
+ * @brief Release completed work or preserve ownership when batch abort is still busy.
+ * @param work Owned work object or NULL; consumed only after abort and backend ownership end.
+ * Execution-owned task context under independent caller pin. Queued retry keeps all references; heap, BO, resource and module releases occur outside exec lock.
+ */
 void drm_vmwgfx_exec_work_release(struct drm_vmwgfx_exec_work *work)
 {
     if (!work) return;
@@ -223,7 +243,7 @@ void drm_vmwgfx_exec_work_release(struct drm_vmwgfx_exec_work *work)
     else
         drm_vmwgfx_exec_work_bytes = 0;
     kernel_spin_unlock_irqrestore(&drm_vmwgfx_exec_lock, flags);
-    kernel_free(work);
+    drm_async_free(work);
 }
 
 void drm_vmwgfx_exec_work_fail(
@@ -277,6 +297,15 @@ static void drm_vmwgfx_exec_work_alloc_diag(
                         sizeof(fields) / sizeof(fields[0]));
 }
 
+/**
+ * @brief Allocate independently pinned GPU work within the existing byte quota.
+ * @param source_bytes Validated command snapshot size.
+ * @param packet_count Validated packet count.
+ * @param error Optional errno output.
+ * @param diagnostics Nullable borrowed diagnostic context, never retained.
+ * @return Owned work state or NULL with validation, pressure, owner-admission or allocation error.
+ * Execution-owned task context under the file pin; quota lock excludes heap and retirement, and all failures roll back charges and module ownership.
+ */
 struct drm_vmwgfx_exec_work *drm_vmwgfx_exec_work_alloc(
     uint32_t source_bytes, uint32_t packet_count, int *error,
     struct drm_faildiag_context *diagnostics)
@@ -320,7 +349,7 @@ retry_quota:
     drm_vmwgfx_exec_work_bytes += (uint32_t)allocation;
     kernel_spin_unlock_irqrestore(&drm_vmwgfx_exec_lock, flags);
 
-    struct drm_vmwgfx_exec_work *work = kernel_malloc(sizeof(*work));
+    struct drm_vmwgfx_exec_work *work = drm_async_alloc(sizeof(*work));
     if (!work) goto no_memory;
     *work = (struct drm_vmwgfx_exec_work){.source_bytes = source_bytes,
         .packet_count = packet_count, .output_capacity = output_capacity,
@@ -333,7 +362,7 @@ retry_quota:
             kernel_free(work->snapshot);
             kernel_free(work->scratch);
             kernel_free(work->output);
-            kernel_free(work);
+            drm_async_free(work);
             goto no_memory;
         }
     }

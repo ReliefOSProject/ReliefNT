@@ -6,7 +6,8 @@
  * and mmap/mprotect/munmap operations.
  */
 #include <reliefnt/console.h>
-#include <reliefnt/audio.h>
+#include <reliefnt/chrdev.h>
+#include <reliefnt/device_mapping.h>
 #include <reliefnt/framebuffer.h>
 #include <reliefnt/drm.h>
 #include <reliefnt/mm.h>
@@ -100,7 +101,7 @@ _Static_assert(LINUX_PROT_READ == TASK_VMA_PROT_READ &&
  * @return The value or status produced by the operation.
  */
 struct file_page_load_context {
-    const struct storage_node *node;
+    const struct task_vma *vma;
     uint64_t offset;
     uint64_t limit;
 };
@@ -145,27 +146,20 @@ struct task_vma *task_vma_free_slot(struct task *task);
  */
 int task_vma_free_slot_index(struct task *task, uint32_t *index_out);
 
-/**
- * Task vma clear.
- * @param vma Value supplied by the caller.
+/** @brief Clear one retired VMA after its user PTEs have been removed.
+ * @param vma Owned metadata slot, nullable; all backing references are consumed.
+ * Execution-owned task context without graph/module locks. Final device/OFD,
+ * executable and inode puts finish before zeroing; callbacks may perform I/O.
  */
 void task_vma_clear(struct task_vma *vma);
 
-/**
- * @brief Give a copied DRM VMA segment independent backing and OFD pins.
- * @param dst Output pointer to the copied destination VMA whose DRM references
- *        do not yet own pins; may be null, in which case no fields are changed.
- * @param src Borrowed input pointer to a stable source VMA; its optional BO and
- *        task_file references are retained for dst. It may be null, in which
- *        case no fields are changed.
- * @return No value; installs independent backing and OFD pins in dst in place.
- *
- * No VMA-store lock is acquired and no VMA address bounds are changed here; the
- * caller keeps the source metadata stable and sets the destination segment's
- * range. This helper only replaces copied DRM pointers with independently
- * retained pins.
+/** @brief Retain a copied file VMA's canonical OFD and immutable ELF source.
+ * @param dst Unowned copied destination, nullable. @param src Stable source, nullable.
+ * Execution-owned task context; no VMA bounds or device references are changed.
+ * Canonical source references allocate nothing and retain original provider
+ * identity/writer exclusion. No graph/module lock or ownership transfer.
  */
-void task_vma_retain_drm(struct task_vma *dst,
+void task_vma_retain_file(struct task_vma *dst,
                                 const struct task_vma *src);
 
 /**
@@ -185,13 +179,17 @@ struct task_vma *task_vma_containing(struct task *task, uint64_t start, uint64_t
  * @param prot Value supplied by the caller.
  * @param flags Identifier or flags controlling the operation.
  * @param file_node Value supplied by the caller.
- * @param file_offset Value supplied by the caller.
+ * @param file_offset Offset of the first mapped file byte.
+ * @param max_prot Maximum protection authorized by the source description.
+ * @param mapping_file Source OFD for mmap, NULL for anonymous/ELF metadata;
+ *        adjacent mappings coalesce only when this OFD identity also matches.
  * @return The value or status produced by the operation.
  */
 int task_vma_can_record_mapping(struct task *task, uint64_t start, uint64_t end,
                                        uint64_t prot, uint32_t flags,
                                        const struct storage_node *file_node,
-                                       uint64_t file_offset, uint32_t max_prot);
+                                       uint64_t file_offset, uint32_t max_prot,
+                                       struct task_file *mapping_file);
 
 /**
  * Task vma record mapping.
@@ -201,13 +199,17 @@ int task_vma_can_record_mapping(struct task *task, uint64_t start, uint64_t end,
  * @param prot Value supplied by the caller.
  * @param flags Identifier or flags controlling the operation.
  * @param file_node Value supplied by the caller.
- * @param file_offset Value supplied by the caller.
+ * @param file_offset Offset of the first mapped file byte.
+ * @param max_prot Maximum protection authorized by the source description.
+ * @param mapping_file Source OFD for mmap, NULL for anonymous/ELF metadata;
+ *        adjacent mappings coalesce only when this OFD identity also matches.
  * @return The value or status produced by the operation.
  */
 int task_vma_record_mapping(struct task *task, uint64_t start, uint64_t end,
                                    uint64_t prot, uint32_t flags,
                                    const struct storage_node *file_node,
-                                   uint64_t file_offset, uint32_t max_prot);
+                                   uint64_t file_offset, uint32_t max_prot,
+                                       struct task_file *mapping_file);
 
 /**
  * Task vma overlaps.
@@ -261,21 +263,33 @@ int syscall_handle_task_page_fault(struct task *task, uint64_t fault_addr, uint6
 /** @brief Resolve a user fault in the current task's address space. */
 int syscall_handle_user_page_fault(uint64_t fault_addr, uint64_t error);
 
-/**
- * Syscall mm mmap.
- * @param addr Value supplied by the caller.
- * @param len Maximum number of elements available in the related buffer.
- * @param prot Value supplied by the caller.
- * @param flags Identifier or flags controlling the operation.
- * @param fd Value supplied by the caller.
- * @param offset Value supplied by the caller.
- * @return The value or status produced by the operation.
+/** @brief Map anonymous/provider bytes or an independently pinned device backing.
+ * @param addr Fixed address or placement hint, checked against the user aperture.
+ * @param len Nonzero byte length, rounded to complete pages without overflow.
+ * @param prot Linux PROT bits, constrained by descriptor/provider access and W^X.
+ * @param flags Linux mmap flags, including validated fixed/no-replace semantics.
+ * @param fd Original OFD admitted by the syscall, ignored for anonymous mappings.
+ * @param offset Page-aligned file offset or provider mapping selector.
+ * @return User address or negative errno. Execution-owned current MM required;
+ * no graph/module lock spans callbacks, allocation or unmap. On success one
+ * provider/device reference transfers to the VMA; unpublished failures drain
+ * installed PTEs and release each temporary owner before returning.
  */
 int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                         uint64_t flags, uint64_t fd, uint64_t offset);
 
 int64_t syscall_mm_brk(uint64_t requested);
 
+/** @brief Resize anonymous memory or shrink/move a movable retained device VMA.
+ * @param old_addr Page-aligned source address in the current execution-owned MM.
+ * @param old_len Nonzero source bytes. @param new_len Nonzero destination bytes.
+ * @param flags Linux MAYMOVE/FIXED flags; FIXED requires MAYMOVE.
+ * @param new_addr Aligned destination for FIXED, ignored otherwise.
+ * @return Resulting user address or negative errno. Device mappings never grow
+ * beyond their initial PFN mapping (EFAULT); fixed moves require the complete
+ * VMA and resolve each actual provider page. A failed destination leaves source
+ * PTEs/backing retained. No graph/module lock spans allocation or final puts.
+ */
 int64_t syscall_mm_mremap(uint64_t old_addr, uint64_t old_len, uint64_t new_len,
                           uint64_t flags, uint64_t new_addr);
 
@@ -287,20 +301,23 @@ int64_t syscall_mm_mlockall(uint64_t flags);
 
 int64_t syscall_mm_munlockall(void);
 
-/**
- * Syscall mm mprotect.
- * @param addr Value supplied by the caller.
- * @param len Maximum number of elements available in the related buffer.
- * @param prot Value supplied by the caller.
- * @return The value or status produced by the operation.
+/** @brief Protect a covered user range while preserving split backing references.
+ * @param addr Page-aligned start in the execution-owned current user MM.
+ * @param len Byte length rounded to pages; zero is a no-op.
+ * @param prot Linux PROT bits bounded by every affected VMA's maximum access.
+ * @return Zero or negative EINVAL/ENOMEM/EACCES/EOPNOTSUPP. Metadata slots are
+ * reserved before PTE changes; device permission changes synchronously flush
+ * remote user TLBs. No graph/module lock spans heap growth or backing release;
+ * successful splits acquire independent core references to the original lease.
  */
 int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot);
 
-/**
- * Syscall mm munmap.
- * @param addr Value supplied by the caller.
- * @param len Maximum number of elements available in the related buffer.
- * @return The value or status produced by the operation.
+/** @brief Remove user PTEs and release fully retired provider/device references.
+ * @param addr Page-aligned start in the execution-owned current user MM.
+ * @param len Nonzero byte length rounded to pages without aperture overflow.
+ * @return Zero or negative errno. Split-capability and free metadata are checked
+ * before modifying the VMA store; retained slices preserve provider offsets.
+ * Final backing/OFD puts may perform I/O and run without graph/module locks.
  */
 int64_t syscall_mm_munmap(uint64_t addr, uint64_t len);
 

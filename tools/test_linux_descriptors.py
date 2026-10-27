@@ -20,8 +20,16 @@ with tempfile.TemporaryDirectory(prefix="reliefos-descriptors-") as directory:
         "sound/core/device.c", "sound/core/alsa_control.c",
         "sound/core/mixer.c", "sound/core/oss.c",
         "sound/core/alsa_pcm.c",
-        "sound/core/timer.c",
-        "fs/vfs/object.c",
+        "sound/core/timer.c", "sound/core/mapping.c", "sound/core/services.c", "sound/core/work.c", "sound/core/storage_audio.c",
+        "kernel/device/service.c", "kernel/device/graphics_service.c", "kernel/device/sound_service.c", "kernel/device/driver_manager_phase.c",
+        "fs/devfs/identity.c",
+        "fs/vfs/object.c", "fs/vfs/write_access.c", "fs/vfs/path.c", "fs/vfs/file.c", "fs/vfs/open.c", "fs/vfs/attributes.c", "fs/vfs/initial.c", "fs/security/access.c", "kernel/syscall/ipc/unix_name.c",
         "-o", binary,
     ], cwd=ROOT, check=True)
     subprocess.run([binary], cwd=ROOT, check=True, timeout=20)
+    reference = str(Path(directory) / "vector_offset_linux_reference")
+    subprocess.run([
+        "clang", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+        "tools/tests/vector_offset_linux_reference.c", "-o", reference,
+    ], cwd=ROOT, check=True)
+    subprocess.run([reference], cwd=ROOT, check=True, timeout=20)

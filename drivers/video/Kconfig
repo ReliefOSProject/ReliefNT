@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+config DRM
+    tristate "DRM/KMS for the VMware SVGA framebuffer"
+    default y
+    help
+      Linux DRM and vmwgfx userspace interfaces for the VMware SVGA II
+      function already bound by the boot framebuffer. Selecting M builds
+      drm.ko. Device discovery and publication occur when the module loads;
+      the early framebuffer and console remain permanent kernel services.
+      Open card/PRIME descriptors, mappings, asynchronous jobs, resources and
+      hardware callbacks retain the exact module until safely retired.

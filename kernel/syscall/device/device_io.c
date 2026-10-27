@@ -85,19 +85,7 @@ int task_device_read(struct task *task, struct task_file *file,
         return ret;
     }
     /* The first OSS implementation is playback-only. */
-    if (task_device_is(file, STORAGE_DEV_KIND_AUDIO)) {
-        if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_PCM)
-            return audio_device_read(task, file, buffer, length);
-        return audio_oss_read(task, file, buffer, length);
-    }
-    if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_TIMER)
-        return audio_timer_read(task, file, buffer, length);
-    if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_MIXER) return -RELIEFOS_ENODEV;
-    if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_CONTROL) {
-        if (file->flags & RELIEFOS_O_NONBLOCK)
-            return audio_control_read_file(file->audio_control_file, buffer, length);
-        return audio_control_read_task(task, file, buffer, length);
-    }
+    if(file->character_file)return (int)character_file_read(file->character_file,task,file,buffer,length);
     return -RELIEFOS_EBADF;
 }
 
@@ -185,15 +173,6 @@ int task_device_write(struct task *task, struct task_file *file,
         }
         return (int)done;
     }
-    if (task_device_is(file, STORAGE_DEV_KIND_AUDIO)) {
-        if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_PCM)
-            return audio_device_write(task, file, buffer, length);
-        return audio_oss_write(task, file, buffer, length);
-    }
-    if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_TIMER)
-        return -RELIEFOS_EBADF;
-    if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_MIXER) return -RELIEFOS_EBADF;
-    if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_CONTROL)
-        return -RELIEFOS_EBADF;
+    if(file->character_file)return (int)character_file_write(file->character_file,task,file,buffer,length);
     return -RELIEFOS_EBADF;
 }

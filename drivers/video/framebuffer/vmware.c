@@ -1,7 +1,20 @@
+#include <reliefnt/export.h>
 #include "internal.h"
 
 #include <reliefnt/mm.h>
 #include <reliefnt/paging.h>
+#include <linux/errno.h>
+
+/** @brief Copy the immutable identity established by successful boot binding.
+ * @param out Required writable PCI output; unchanged when unavailable.
+ * @return Zero or -ENODEV. Called after boot framebuffer binding, with no
+ * allocation, I/O, optional-provider dependency or ownership transfer.
+ */
+int framebuffer_vmware_pci_identity(struct pci_device *out)
+{
+    if(!out || !vmware_svga.present)return -ENODEV;
+    *out=vmware_svga.pci;return 0;
+}
 
 
 
@@ -339,12 +352,8 @@ int framebuffer_vmware_probe(void)
     if (vmware_svga.max_height > FRAMEBUFFER_MODE_MAX_HEIGHT) {
         vmware_svga.max_height = FRAMEBUFFER_MODE_MAX_HEIGHT;
     }
+    vmware_svga.pci = device;
     vmware_svga.present = true;
-    int drm_ret = drm_device_register(&device);
-    if (drm_ret < 0) {
-        console_warn("[reliefnt] VMware DRM primary node unavailable ret=%d\n",
-                     drm_ret);
-    }
     framebuffer_vmware_fifo_init(true, false);
 
     fb.max_width = vmware_svga.max_width;
@@ -476,3 +485,5 @@ int framebuffer_vmware_set_mode(uint32_t width, uint32_t height)
                    fb_max_size);
     return 1;
 }
+
+EXPORT_SYMBOL(framebuffer_vmware_pci_identity);

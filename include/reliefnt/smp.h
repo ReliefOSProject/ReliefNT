@@ -29,14 +29,26 @@ void smp_ap_entry(uint32_t cpu_index) __attribute__((noreturn));
 bool smp_cpu_online(uint32_t cpu_index);
 const struct smp_cpu_info *smp_cpu_info(uint32_t cpu_index);
 
-/** @brief Execute and acknowledge any pending CPU barrier; takes no locks. */
+/** @brief Acknowledge a pending local CPU barrier without taking locks.
+ * @return None. IPI/task/spin context, including masked IRQs. Published mode is
+ * acquired before invalidation; acknowledgement releases completed effects.
+ * Saves/restores local IRQ state to prevent nested acknowledgements.
+ */
 void smp_membarrier_poll(void);
 /**
- * @brief Order all online CPUs and wait for acknowledgements. The caller must
- * hold the kernel execution lock; sync_core also serializes instruction fetch.
+ * @brief Order online CPUs and wait for every acknowledgement.
+ * @param sync_core Also serialize instruction fetch on each target.
+ * @return None; preserves the caller's original IRQ state.
+ * @note Nonrecursive boot/task context, not NMI-safe. Requests serialize
+ * internally while contenders continue polling; caller retains affected data,
+ * lifetimes and any execution transaction required by its own operation.
  */
 void smp_membarrier(bool sync_core);
-/* Execution-lock serialized invalidation before reusing unmapped user pages. */
+/** @brief Invalidate online CPUs before reusing unmapped user or kernel backing.
+ * @return None after acknowledgements, preserving the original IRQ state.
+ * @note Nonrecursive boot/task context, not NMI-safe. Caller serializes PTE
+ * changes and retains backing through this internally serialized rendezvous.
+ */
 void smp_flush_user_tlb(void);
 
 #endif

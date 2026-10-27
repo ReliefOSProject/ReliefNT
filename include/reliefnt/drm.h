@@ -105,7 +105,8 @@ void drm_vmwgfx_cancel_task_continuation(struct task *task);
 bool drm_vmwgfx_task_uninterruptible(const struct task *task);
 bool drm_vmwgfx_task_signal_busy(const struct task *task);
 
-/* DRM mmap retains one BO and one task_file/OFD reference per live VMA. */
+/* DRM owns one BO/OFD lease per generic mapping family; core VM never owns
+ * a raw BO. Slices/forks share that lease until their final generic put. */
 int drm_file_mmap_bo(struct task_file *file, uint64_t offset, uint64_t length,
                      struct drm_bo **bo_out, uint64_t *bo_offset_out);
 void drm_bo_get(struct drm_bo *bo);

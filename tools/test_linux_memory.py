@@ -21,11 +21,12 @@ class LinuxMemoryTests(unittest.TestCase):
             subprocess.run([executable], cwd=ROOT, check=True, timeout=30)
 
     def test_memory_ownership_and_elf_page_boundaries(self):
-        cases = (("physical_pages", []), ("paging_protection", []), ("private_anon_fault", []), ("elf_interpreter", []),
-                 ("elf_sparse_reservation", []),
-                 ("elf_file_page", ["mm/cache/page_cache.c"]), ("user_mmap_arena", []),
-                 ("mprotect_vma_growth", [*kernel_sources("scheduler")]),
-                 ("brk_collision", [*kernel_sources("user_memory")]))
+        cases = (("physical_pages", []), ("paging_protection", []),
+                 ("private_anon_fault", ["kernel/exec/usercopy.c"]), ("elf_interpreter", []),
+                 ("elf_sparse_reservation", ["fs/vfs/mount_tree.c","fs/vfs/file.c", "fs/vfs/open.c","fs/vfs/attributes.c","fs/vfs/exec_file.c"]),
+                 ("elf_file_page", ["mm/cache/page_cache.c","fs/vfs/mount_tree.c","fs/vfs/file.c", "fs/vfs/open.c","fs/vfs/attributes.c","fs/vfs/exec_file.c"]), ("user_mmap_arena", []),
+                 ("mprotect_vma_growth", [*kernel_sources("scheduler"),"kernel/device/character.c","fs/vfs/file.c", "fs/vfs/open.c","fs/vfs/attributes.c","fs/vfs/exec_file.c"]),
+                 ("brk_collision", [*kernel_sources("user_memory"),"fs/vfs/mount_tree.c","fs/vfs/file.c", "fs/vfs/open.c","fs/vfs/attributes.c"]))
         for name, sources in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory(prefix="reliefos-mm-") as tmp:
                 executable = str(Path(tmp) / name)

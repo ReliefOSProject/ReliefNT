@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+config SND_ENS1371
+    tristate "Ensoniq ES1371 AudioPCI playback"
+    depends on SND
+    default y
+    help
+      Native legacy OSS playback for Ensoniq 1274:1371 AudioPCI controllers.
+      With M, build es1371.ko for this kernel. Its 32-bit DMA pool and fallible
+      STOP keep hardware resources owned until a safe unload can complete.

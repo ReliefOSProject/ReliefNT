@@ -2,6 +2,7 @@
  * ReliefOS read-only page cache implementation.
  * Entries retain physical pages until invalidated or replaced while idle.
  */
+#include <reliefnt/export.h>
 #include <reliefnt/lock.h>
 #include <reliefnt/console.h>
 #include <reliefnt/heap.h>
@@ -259,6 +260,12 @@ int page_cache_owns(uint64_t phys)
     return found;
 }
 
+/**
+ * @brief Drop unreferenced resident pages matching one native backing identity.
+ * @param node Borrowed stable type/volume/inode identity, nullable for a no-op.
+ * @par Context
+ * Acquires the IRQ-safe cache lock and releases only unpinned resident pages. Pinned and overflow entries survive until their normal final release; no file/provider callback or user access.
+ */
 void page_cache_invalidate_node(const struct storage_node *node)
 {
     uint64_t flags;
@@ -297,3 +304,7 @@ void page_cache_stats(uint32_t *count, uint32_t *hits)
     }
     kernel_spin_unlock_irqrestore(&cache_lock, flags);
 }
+
+/* Native filesystem modules share this core-owned interface; CRC/release
+ * checks bind it to the exact kernel, without a stable cross-release API. */
+EXPORT_SYMBOL(page_cache_invalidate_node);

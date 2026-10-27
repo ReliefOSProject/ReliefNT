@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+menu "TTY device drivers"
+source "drivers/tty/serial/Kconfig"
+endmenu

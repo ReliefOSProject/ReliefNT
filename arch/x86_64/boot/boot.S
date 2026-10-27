@@ -120,6 +120,42 @@ x86_64_inw:
     in %dx, %ax
     ret
 
+/**
+ * @brief Read a ready repeated-port phase into current kernel CPU memory.
+ * @param port SysV rdi: 16-bit port under caller-owned protocol exclusion.
+ * @param buffer SysV rsi: stable writable count*2-byte mapping, possibly unaligned.
+ * @param count SysV rdx: exact admitted word count; zero performs no I/O.
+ * Synchronous privileged PIO; no DMA or saved pointer. Leaves DF clear and
+ * preserves callee-saved registers; IRQ/protocol ownership belongs to the caller.
+ */
+.global x86_64_insw
+.type x86_64_insw, @function
+x86_64_insw:
+    mov %rdi, %r8
+    mov %rdx, %rcx
+    mov %rsi, %rdi
+    mov %r8w, %dx
+    cld
+    rep insw
+    ret
+
+/**
+ * @brief Write current kernel CPU bytes through one ready repeated-port phase.
+ * @param port SysV rdi: 16-bit port under caller-owned protocol exclusion.
+ * @param buffer SysV rsi: stable readable count*2-byte mapping, possibly unaligned.
+ * @param count SysV rdx: exact admitted word count; zero performs no I/O.
+ * Synchronous privileged PIO; no DMA or saved pointer. Leaves DF clear and
+ * preserves callee-saved registers; IRQ/protocol ownership belongs to the caller.
+ */
+.global x86_64_outsw
+.type x86_64_outsw, @function
+x86_64_outsw:
+    mov %rdx, %rcx
+    mov %di, %dx
+    cld
+    rep outsw
+    ret
+
 /** @brief Reads a 32-bit value from the x86 I/O port in `dx`. */
 .global x86_64_inl
 .type x86_64_inl, @function

@@ -15,7 +15,13 @@ def kernel_sources(module):
     header = KERNEL / 'tools/tests/modules' / (module + '.h')
     paths = [(header.parent / name).resolve() for name in
              re.findall(r'^#include "([^"]+)"', header.read_text(), re.M)]
-    return [str(path.relative_to(ROOT)) for path in paths]
+    # VM and scheduler fixtures link the actual permanent backing owner.
+    # This is a host-link dependency, never a production compilation inventory.
+    if module in ("scheduler", "user_memory"):
+        paths.append(ROOT / "kernel/device/mapping.c")
+    if module == "user_memory":
+        paths.append(ROOT / "kernel/device/character.c")
+    return list(dict.fromkeys(str(path.relative_to(ROOT)) for path in paths))
 
 
 def module_text(module):

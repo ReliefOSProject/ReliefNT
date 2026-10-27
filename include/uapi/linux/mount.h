@@ -26,6 +26,9 @@
 #define MS_I_VERSION    (1UL << 23)
 #define MS_STRICTATIME  (1UL << 24)
 #define MS_LAZYTIME     (1UL << 25)
+/* Legacy mount(2) magic carries no policy and is discarded when present. */
+#define MS_MGC_VAL      0xc0ed0000UL
+#define MS_MGC_MSK      0xffff0000UL
 
 #define MNT_FORCE       1
 #define MNT_DETACH      2

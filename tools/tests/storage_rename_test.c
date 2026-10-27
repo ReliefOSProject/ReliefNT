@@ -5,8 +5,12 @@
 #include <string.h>
 #include "../../block/core/storage_internal.h"
 #include "../../block/core/storage_state_data.c"
+#include "../../block/core/device_number.c"
 
 static FILE *disk;
+/* This codec fixture never enters registered ISO transport metadata. */
+int block_device_info(const struct block_device_ref *reference,struct block_device_info *out)
+{(void)reference;(void)out;abort();}
 static struct task *writer;
 int time_wall_clock(struct reliefos_time_info *value)
 { value->unix_seconds = 1800000000; return 0; }
@@ -59,15 +63,6 @@ int storage_dir_index_lookup(uint32_t directory, const char *name, struct storag
 void storage_dir_index_store(uint32_t directory, const char *name, const struct storage_node *node)
 { (void)directory; (void)name; (void)node; }
 uint32_t min_u32(uint32_t a, uint32_t b) { return a < b ? a : b; }
-int storage_parent_path(const char *path, char *parent, uint32_t parent_cap, char *name, uint32_t name_cap)
-{
-    const char *slash = strrchr(path, '/');
-    if (!slash || !slash[1]) return -22;
-    snprintf(name, name_cap, "%s", slash + 1);
-    if (slash == path) snprintf(parent, parent_cap, "/");
-    else snprintf(parent, parent_cap, "%.*s", (int)(slash - path), path);
-    return 0;
-}
 void console_printf(const char *format, ...) { (void)format; }
 
 void console_log(enum console_log_level level, const char *format, ...)
@@ -83,26 +78,40 @@ void page_cache_invalidate_node(const struct storage_node *node)
 int storage_select_node_volume(const struct storage_node *node, struct storage_volume **previous)
 { *previous = g_active_volume; return node->volume_id == g_storage.volume_id ? 0 : -2; }
 void storage_restore_volume(struct storage_volume *previous) { g_active_volume = previous; }
+/* This fixture mounts ext2/ext4 only. Entering a cluster-backend operation
+ * would violate the fixture boundary instead of silently claiming coverage. */
+int storage_cluster_load_times(struct storage_inode_ref *reference)
+{(void)reference;abort();}
+int storage_cluster_write(struct storage_node *node,uint64_t offset,const void *data,
+                             uint32_t length,uint32_t *written)
+{(void)node;(void)offset;(void)data;(void)length;(void)written;abort();}
+int storage_cluster_truncate(struct storage_node *node,uint64_t length)
+{(void)node;(void)length;abort();}
+int fat32_free_chain(uint32_t cluster){(void)cluster;abort();}
+int exfat_free_clusters(uint32_t cluster,uint8_t nofat,uint64_t bytes)
+{(void)cluster;(void)nofat;(void)bytes;abort();}
 
-#include "../../fs/ext2/ext2_cache.c"
+#include "../../fs/ext_common/ext2_cache.c"
 int storage_read_device(const struct storage_volume *v,uint64_t lba,uint32_t n,void *out)
 { (void)v; return storage_read_sectors(lba,n,out); }
 int storage_write_device(const struct storage_volume *v,uint64_t lba,uint32_t n,const void *in)
 { storage_ext4_cache_invalidate_write(v,lba,n); return storage_write_sectors(lba,n,in); }
 int storage_ext4_device_flush(const struct storage_volume *v) { (void)v; return fflush(disk)?-5:0; }
-#include "../../fs/ext4/format.c"
-#include "../../fs/ext4/checksum.c"
-#include "../../fs/ext4/cache.c"
-#include "../../fs/ext4/alloc.c"
-#include "../../fs/ext4/extent.c"
-#include "../../fs/ext4/ops.c"
-#include "../../fs/ext4/xattr.c"
-#include "../../fs/ext4/journal.c"
-#include "../../fs/ext4/dir.c"
-#include "../../fs/ext4/mount.c"
+#include "../../fs/ext_common/format.c"
+#include "../../fs/ext_common/checksum.c"
+#include "../../fs/ext_common/cache.c"
+#include "../../fs/ext_common/alloc.c"
+#include "../../fs/ext_common/extent.c"
+#include "../../fs/ext_common/ops.c"
+#include "../../fs/ext_common/xattr.c"
+#include "../../fs/ext_common/journal.c"
+#include "../../fs/ext_common/dir.c"
+#include "../../fs/ext_common/mount.c"
 #include "../../fs/vfs/inode.c"
-#include "../../fs/ext4/vfs.c"
-#include "../../fs/ext2/ext2.c"
+#include "../../fs/ext_common/vfs.c"
+#include "../../fs/ext_common/sync.c"
+#include "../../fs/ext_common/native.c"
+#include "../../fs/ext_common/ext2.c"
 
 static void test_held_inode(void)
 {
@@ -214,7 +223,7 @@ int main(int argc, char **argv)
     if (argc == 3) {
         assert(!strcmp(argv[2], "--ram-root"));
         test_start_lba = 0;
-        g_storage.kind = STORAGE_VOLUME_RAM;
+        g_storage.kind = STORAGE_VOLUME_BLOCK;
     }
     disk = fopen(argv[1], "r+b");
     assert(disk);
@@ -222,6 +231,7 @@ int main(int argc, char **argv)
     assert(!fseek(disk, 0, SEEK_END));
     g_storage.ext2_sector_count = ftell(disk) / 512;
     assert(ext2_mount() == 0);
+    g_storage.fs_ops=&storage_ext_ops;
     test_symlinks();
     test_held_inode();
     test_write_privileges();

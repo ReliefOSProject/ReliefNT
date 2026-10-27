@@ -6,6 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <reliefnt/sched.h>
+#include "../../kernel/sched/internal.h"
+#define RELIEFNT_TEST_REAL_EXEC_SOURCE
+#include "exec_file_fixture.h"
 
 static struct task *current;
 static struct task *test_current_task(void) { return current; }
@@ -17,7 +20,6 @@ static struct task *test_current_task(void) { return current; }
 static unsigned pages, allocations;
 static unsigned user_tlb_flush_calls;
 static uint64_t user_tlb_flush_probe_page;
-static struct drm_bo *drm_test_bo = (struct drm_bo *)(uintptr_t)0x1000;
 static struct task_file *drm_test_file = (struct task_file *)(uintptr_t)0x2000;
 static int fail_after = -1;
 void *kernel_malloc(size_t size)
@@ -52,9 +54,9 @@ void smp_flush_user_tlb(void)
             sched_task_as(current), user_tlb_flush_probe_page));
 }
 void storage_inode_retain(struct storage_inode_ref *inode) { assert(!inode); }
-int storage_inode_put(struct storage_inode_ref *inode) { assert(!inode); return 0; }
-void drm_bo_get(struct drm_bo *bo) { assert(!bo || bo == drm_test_bo); }
-void drm_bo_put(struct drm_bo *bo) { assert(!bo || bo == drm_test_bo); }
+static int exec_fixture_read(void *context,const struct storage_node *node,uint64_t offset,
+                               void *buffer,uint32_t length,uint32_t *read,uint64_t mount_flags)
+{(void)context;(void)node;(void)offset;(void)buffer;(void)length;(void)read;(void)mount_flags;abort();}
 struct task_file *task_file_get(struct task_file *description)
 { assert(!description || description == drm_test_file); return description; }
 void task_file_put(struct task_file *description)
@@ -62,13 +64,19 @@ void task_file_put(struct task_file *description)
 void sysv_shm_vma_release(struct task *task, struct task_vma *vma)
 { (void)task; (void)vma; }
 void sysv_shm_vma_split(struct task_vma *vma) { (void)vma; }
-int audio_pcm_mmap_retain(struct audio_pcm *pcm,
-                          enum audio_pcm_mmap_region region)
-{ (void)pcm; (void)region; return 0; }
-void audio_pcm_mmap_release(struct audio_pcm *pcm,
-                            enum audio_pcm_mmap_region region)
-{ (void)pcm; (void)region; }
-
+/* mremap also links its anonymous/file alternatives. Those providers are
+ * absent here and must never be entered by the actual device-remap test. */
+void console_log(enum console_log_level level,const char *format,...)
+{(void)level;(void)format;abort();}
+uint64_t mm_free_memory_kib(void){abort();}
+struct task_file *task_file_for_io(struct task *task,int fd)
+{(void)task;(void)fd;abort();}
+int file_can_read(const struct task_file *file){(void)file;abort();}
+int file_can_write(const struct task_file *file){(void)file;abort();}
+void storage_set_io_async_context(bool enabled){(void)enabled;abort();}
+const struct framebuffer *framebuffer_get(void){abort();}
+int task_shm_mmap_check(const struct task_file *file,uint32_t flags,uint32_t prot,uint32_t *maximum)
+{(void)file;(void)flags;(void)prot;(void)maximum;abort();}
 static const uint64_t base = RELIEFNT_USER_BASE + 0x100000;
 
 static void setup(unsigned extra)
@@ -187,6 +195,8 @@ static void test_adjacent_vmas(void)
     teardown();
 }
 
+static void device_test_release(void *value){assert(value);}
+static uint64_t device_test_physical(void *value,uint64_t offset){return *(uint64_t *)value+offset;}
 static void test_drm_mprotect_flushes_remote_translations(void)
 {
     setup(1);
@@ -200,8 +210,9 @@ static void test_drm_mprotect_flushes_remote_translations(void)
                  TASK_VMA_FLAG_MMAP;
     vma->prot = LINUX_PROT_READ | LINUX_PROT_WRITE;
     vma->max_prot = LINUX_PROT_READ | LINUX_PROT_WRITE;
-    vma->drm_bo = drm_test_bo;
-    vma->drm_mapping_file = drm_test_file;
+    static const struct device_mapping_operations operations={.release=device_test_release,.physical=device_test_physical};
+    struct device_mapping_info info={.length=4096,.max_prot=3,.can_split=true,.can_move=true};
+    assert(!device_mapping_create(NULL,&operations,&physical,&info,&vma->device_mapping));
     vma->device_physical = physical;
     assert(address_space_map_user_page(sched_task_as(current), base, physical,
            RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_SHARED |
@@ -221,6 +232,72 @@ static void test_drm_mprotect_flushes_remote_translations(void)
     teardown();
 }
 
+static void test_elf_source_split_and_clone(void)
+{
+    setup(0);
+    struct storage_node node={.type=RELIEFOS_FS_TYPE_FILE,.size=6*4096,.first_cluster=1};
+    struct vfs_exec_source *source=exec_fixture_open(&node);
+    struct task_vma *vma=sched_task_vma_at(current,SCHED_TASK_VMA_MAX-1);
+    *vma=(struct task_vma){.used=1,.start=base,.end=base+6*4096,
+        .prot=LINUX_PROT_READ|LINUX_PROT_WRITE,.max_prot=LINUX_PROT_READ|LINUX_PROT_WRITE,
+        .flags=TASK_VMA_FLAG_FILE|TASK_VMA_FLAG_LAZY|TASK_VMA_FLAG_PRIVATE,
+        .file_node=node,.file_limit=node.size,.exec_source=source};
+    assert(!syscall_mm_mprotect(base+4096,3*4096,LINUX_PROT_READ));
+    vma=task_vma_containing(current,base+4096,base+2*4096);
+    assert(vma && vma->exec_source==source);
+    struct task_vma copy=*vma;copy.exec_source=NULL;
+    assert(!sched_task_vma_retain_file(&copy,vma));
+    assert(!syscall_mm_munmap(base,6*4096));
+    assert(exec_fixture_pins==2 && exec_fixture_inode_refs==1 && exec_fixture_denials==1);
+    task_vma_clear(&copy);
+    assert(!exec_fixture_pins && !exec_fixture_inode_refs && !exec_fixture_denials);
+    teardown();
+    puts("PASS ELF source survives mprotect splits, cloned VMA and original unmap; last mapping releases provider and writer denial");
+}
+
+struct movable_device_test {uint64_t physical[3];unsigned releases;};
+static void movable_device_release(void *value)
+{
+    struct movable_device_test *state=value;++state->releases;
+    for(unsigned i=0;i<3;++i)mm_free_page(state->physical[i]);
+}
+static uint64_t movable_device_physical(void *value,uint64_t offset)
+{return ((struct movable_device_test *)value)->physical[offset/4096];}
+static void test_device_remap_preserves_actual_pages_and_shared_lease(void)
+{
+    setup(1);current->stack_top=RELIEFNT_USER_TOP-4096;
+    sched_task_limits(current)->as.rlim_cur=LINUX_RLIM_INFINITY;
+    struct movable_device_test state={0};
+    for(unsigned i=0;i<3;++i)state.physical[i]=mm_alloc_page();
+    static const struct device_mapping_operations operations={
+        .release=movable_device_release,.physical=movable_device_physical};
+    struct device_mapping_info info={.length=3*4096,.max_prot=3,.can_split=true,.can_move=true};
+    struct task_vma *vma=sched_task_vma_at(current,sched_task_vma_capacity(current)-1);
+    *vma=(struct task_vma){.used=1,.start=base,.end=base+3*4096,.prot=3,.max_prot=3,
+        .flags=TASK_VMA_FLAG_DEVICE|TASK_VMA_FLAG_SHARED|TASK_VMA_FLAG_MMAP,
+        .device_physical=state.physical[0]};
+    assert(!device_mapping_create(NULL,&operations,&state,&info,&vma->device_mapping));
+    struct task_vma clone=*vma;clone.device_mapping=NULL;
+    assert(!sched_task_vma_retain_device(&clone,vma));
+    for(unsigned i=0;i<3;++i)assert(address_space_map_user_page(sched_task_as(current),base+i*4096,
+        state.physical[i],RELIEFNT_PAGE_DEVICE|RELIEFNT_PAGE_SHARED|RELIEFNT_PAGE_WRITABLE|RELIEFNT_PAGE_NOEXEC));
+    uint64_t target=base+0x1000000;
+    assert(syscall_mm_mremap(base,3*4096,4*4096,LINUX_MREMAP_MAYMOVE,0)==-RELIEFOS_EFAULT);
+    assert(syscall_mm_mremap(base,3*4096,3*4096,LINUX_MREMAP_MAYMOVE|LINUX_MREMAP_FIXED,target+1)==-RELIEFOS_EINVAL);
+    assert(address_space_user_page_phys(sched_task_as(current),base)==state.physical[0]);
+    assert(syscall_mm_mremap(base,3*4096,2*4096,LINUX_MREMAP_MAYMOVE|LINUX_MREMAP_FIXED,target)==(int64_t)target);
+    assert(!address_space_user_page_phys(sched_task_as(current),base));
+    for(unsigned i=0;i<2;++i)assert(address_space_user_page_phys(sched_task_as(current),target+i*4096)==state.physical[i]);
+    assert(!syscall_mm_mprotect(target+4096,4096,LINUX_PROT_READ));
+    assert(!syscall_mm_munmap(target,4096));
+    vma=task_vma_containing(current,target+4096,target+2*4096);
+    assert(vma && vma->device_map_offset==4096 && vma->device_physical==state.physical[1]);
+    assert(!syscall_mm_munmap(target+4096,4096));assert(!state.releases);
+    task_vma_clear(&clone);assert(state.releases==1);
+    teardown();
+    puts("PASS generic device mremap resolves each actual PFN, preserves source on invalid move, forbids expansion and shares final backing through cloned/split VMAs");
+}
+
 int main(void)
 {
     for (unsigned extra = 1; extra <= 17; ++extra) {
@@ -233,6 +310,8 @@ int main(void)
     test_append_with_spare_capacity();
     test_adjacent_vmas();
     test_drm_mprotect_flushes_remote_translations();
+    test_device_remap_preserves_actual_pages_and_shared_lease();
+    test_elf_source_split_and_clone();
     puts("PASS mprotect: VMA growth, guard pages, lazy writes, page rounding, revoke/restore and errno");
     assert(allocations);
     return 0;

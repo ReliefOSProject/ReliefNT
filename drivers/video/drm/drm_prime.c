@@ -1,4 +1,5 @@
 #include "drm_internal.h"
+#include "file_ops.h"
 
 #include <drm/drm.h>
 #include <drm/vmwgfx_drm.h>
@@ -233,6 +234,16 @@ static int drm_prime_export_surface(struct task *task, struct drm_file *file,
     slot->drm_prime_gid = task->fsgid;
     slot->fd_flags = (argument->flags & DRM_PRIME_FD_CLOEXEC)
                          ? RELIEFOS_FD_CLOEXEC : 0;
+
+    ret=drm_character_attach_prime(task,slot);
+    if(ret) {
+        /* Admission can fail before open or after its partial-close callback.
+         * This idempotent cleanup covers both without dropping a surface twice. */
+        drm_prime_file_close(slot);
+        task_discard_file_fd(task,fd);
+        drm_vmwgfx_surface_put(surface);
+        return ret;
+    }
 
     struct task_file *description = task_file_get(slot);
     if (!description) {

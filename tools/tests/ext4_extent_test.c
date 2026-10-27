@@ -30,6 +30,11 @@ void console_log(enum console_log_level level, const char *fmt, ...)
 {
     (void)level; (void)fmt;
 }
+/* This backend-only memory-disk fixture has no resumable task I/O. Record
+ * the storage-core transaction notification; the real single-CPU mutation
+ * latch and EAGAIN/readonly behavior are covered by mount_backend_test. */
+static uint64_t metadata_admissions;
+void storage_begin_mutation(void) { ++metadata_admissions; }
 void storage_memzero(void *p, size_t n) { memset(p, 0, n); }
 void storage_memcpy(void *d, const void *s, size_t n) { memcpy(d, s, n); }
 int storage_read_device(const struct storage_volume *v, uint64_t lba,

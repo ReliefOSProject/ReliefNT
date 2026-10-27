@@ -9,11 +9,11 @@ int main(int argc, char **argv)
     FILE *f = fopen(argv[1], "rb"); assert(f);
     assert(!fseek(f, 0, SEEK_END)); long bytes = ftell(f); assert(bytes > 0); rewind(f);
     struct storage_volume *v = &g_volumes[0];
-    *v = (struct storage_volume){.kind = STORAGE_VOLUME_RAM, .ram_bytes = bytes,
-                                 .ext_sector_count = bytes / 512};
-    v->ram_base = malloc(bytes); assert(v->ram_base);
-    assert(fread(v->ram_base, 1, bytes, f) == (size_t)bytes); fclose(f);
-    assert(storage_ext4_mount(v) == 0); v->ready = true; g_active_volume = v;
+    *v = (struct storage_volume){.ext_sector_count = bytes / 512};
+    uint8_t *image=malloc(bytes);assert(image);
+    assert(fread(image,1,bytes,f)==(size_t)bytes && !fclose(f));
+    test_memory_bind(v,image,(uint64_t)bytes);
+    assert(storage_ext4_mount(v) == 0); v->fs_ops=&storage_ext_ops; v->ready = true; g_active_volume = v;
     struct storage_node node = {.volume_id = 0, .first_cluster = strtoul(argv[2], NULL, 10),
                                 .type = RELIEFOS_FS_TYPE_FILE, .flags = STORAGE_NODE_FLAG_EXT2};
     struct storage_inode_ref *ref = NULL;
@@ -28,6 +28,6 @@ int main(int argc, char **argv)
     }
     fclose(f); assert(storage_inode_put(ref) == 0);
     storage_ext4_journal_close(v);
-    storage_ext4_cache_invalidate(v); free(v->ram_base); free(got); free(want);
+    storage_ext4_cache_invalidate(v); test_memory_release(v); free(got); free(want);
     puts("PASS ext4 VFS inode hold/refresh/read/release");
 }

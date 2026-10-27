@@ -1,9 +1,11 @@
 /* Production SHM registry, scheduler VMA hooks, memory syscalls and page tables.
  * Only CPU/physical allocator/user address boundaries are replaced by host code. */
 #define RELIEFNT_TEST_REAL_SYSV_SHM
+#define RELIEFNT_TEST_EXEC_EXIT_BOUNDARY
 /* The paging fixture supplies the physical translation boundary below. */
 #define AUDIO_FIXTURE_CUSTOM_MM_TRANSLATION
 #define main audio_device_shm_fixture_main
+#include <reliefnt/graphics_service.h>
 #include "audio_device_test.c"
 #undef main
 #undef AUDIO_FIXTURE_CUSTOM_MM_TRANSLATION
@@ -23,6 +25,8 @@ static bool shm_physical_gate(void)
 #undef RELIEFNT_PAGING_FIXTURE_EXTERNAL_SPINLOCKS
 #undef RELIEFNT_TEST_PAGE_ALLOC_GATE
 #include "modules/user_memory.h"
+#include "../../fs/vfs/mount_internal.h"
+#include "../../kernel/syscall/io/vector_internal.h"
 
 static int shm_fail_heap = -1, shm_fail_page = -1;
 static unsigned shm_heap_live;
@@ -57,25 +61,61 @@ static uint64_t shm_test_page(void)
 
 void storage_inode_retain(struct storage_inode_ref *inode) { assert(!inode); }
 int storage_inode_put(struct storage_inode_ref *inode) { assert(!inode); return 0; }
+void storage_inode_allow_write(struct storage_inode_ref *inode){assert(!inode);}
+int storage_inode_deny_write(struct storage_inode_ref *inode){assert(!inode);return -1;}
 /* This SHM fixture covers ordinary shared pages and never maps a DRM BO. */
-void drm_bo_get(struct drm_bo *bo) { assert(!bo); }
-void drm_bo_put(struct drm_bo *bo) { assert(!bo); }
+static struct task_file borrowed_mapping;
 struct task_file *task_file_get(struct task_file *description)
-{ assert(!description); return NULL; }
-void task_file_put(struct task_file *description) { assert(!description); }
-void drm_vmwgfx_cancel_task_continuation(struct task *task) { (void)task; }
-/* Fork must fail before any descriptor/SEM_UNDO ownership is cloned in the
- * focused rollback case. Entering those unrelated backends is a fixture error. */
+{
+    if(description){assert(description==&borrowed_mapping);++description->references;}
+    return description;
+}
+void task_file_put(struct task_file *description)
+{if(description){assert(description==&borrowed_mapping && description->references);--description->references;}}
+void graphics_service_cancel_task_continuation(struct task *task) { (void)task; }
+/* Only the focused successful clone below admits these resource-free
+ * boundaries. All original rollback cases still abort if they reach them. */
+static bool empty_clone_boundary;
 void arch_fpu_save(void *state) { (void)state; }
 uint64_t time_uptime_ms(void) { return 1000; }
 uint64_t mm_total_memory_kib(void) { return 1024 * 1024; }
 uint32_t smp_cpu_count(void) { return 1; }
 bool smp_cpu_online(uint32_t cpu) { return cpu == 0; }
 int syscall_clone_task_files(const struct task *parent, struct task *child)
-{ (void)parent; (void)child; abort(); }
-void syscall_release_task_files(struct task *task) { (void)task; abort(); }
+{
+    assert(empty_clone_boundary && parent && child && !parent->shared_files && !child->shared_files);
+    assert(!parent->file_extra_count && !parent->pty_fd_count && !child->file_extra_count && !child->pty_fd_count);
+    for(uint32_t i=0;i<SCHED_TASK_FILE_MAX;++i)assert(!parent->files[i].used && !child->files[i].used);
+    return 0;
+}
+void syscall_release_task_files(struct task *task)
+{
+    assert(empty_clone_boundary && task && !task->shared_files && !task->file_extra_count && !task->pty_fd_count);
+    for(uint32_t i=0;i<SCHED_TASK_FILE_MAX;++i)assert(!task->files[i].used);
+}
+/* The focused exec has one thread and no descriptors, pending I/O, futex or
+ * shared signal state. Keep the real exec/FS transitions; abort if its unrelated
+ * teardown would need resources this fixture does not provide. */
+static void fixture_exec_other_exit(uint32_t pid, uint64_t code)
+{ (void)pid; (void)code; abort(); }
+int syscall_unshare_task_files(struct task *task)
+{
+    assert(task && !task->shared_files);
+    for (uint32_t i=0;i<SCHED_TASK_FILE_MAX;++i) assert(!task->files[i].used);
+    assert(!task->file_extra_count);
+    return 0;
+}
+void storage_drain_task_io(uint32_t pid)
+{ assert(sched_current_task() && sched_current_task()->pid == pid); }
+void futex_task_exit(struct task *task)
+{ assert(task && !task->futex_state && !task->futex_next && !task->futex_waitv_count); }
+void kernel_signal_detach_process(struct task *task)
+{ assert(task && !task->shared_process_pending && !task->shared_process_signal_queue); }
 int task_sysv_sem_clone(struct task *parent, struct task *child, uint64_t flags)
-{ (void)parent; (void)child; (void)flags; abort(); }
+{
+    assert(empty_clone_boundary && parent && child && !parent->sysv_undo && !child->sysv_undo);
+    assert(flags==17 || flags==(CLONE_FS|17));return 0;
+}
 int user_copy_to_task(struct task *task, uint64_t address, const void *source, uint64_t size)
 {
     assert(task == sched_current_task());
@@ -89,6 +129,19 @@ static unsigned live_pages(void)
     for (unsigned i = 0; i < 1024; ++i) n += !!pages[i].refs;
     return n;
 }
+static unsigned fs_backend_pins;
+static int fs_lookup(void *context,const struct storage_node *parent,const char *name,
+                       struct storage_node *out)
+{ (void)context;(void)parent;(void)name;(void)out;return -LINUX_ENOENT; }
+static int fs_retain(void *context,const struct storage_node *node,void **pin)
+{ (void)context;(void)node;++fs_backend_pins;*pin=&fs_backend_pins;return 0; }
+static void fs_release(void *context,const struct storage_node *node,void *pin)
+{ (void)context;(void)node;assert(pin==&fs_backend_pins && fs_backend_pins);--fs_backend_pins; }
+static bool fs_same(void *context,const struct storage_node *a,const struct storage_node *b)
+{ (void)context;return a->first_cluster==b->first_cluster; }
+static const struct vfs_backend_ops fs_ops={
+    .lookup=fs_lookup,.retain=fs_retain,.release=fs_release,.same_node=fs_same
+};
 static int64_t get(int key, uint64_t bytes, unsigned flags)
 { return syscall_sysv_shm(__NR_shmget, (uint32_t)key, bytes, flags); }
 static int64_t ctl(int id, int command, void *out)
@@ -97,6 +150,56 @@ static int64_t attach(int id, uint64_t address, unsigned flags)
 { return syscall_sysv_shm(__NR_shmat, (uint32_t)id, address, flags); }
 static int64_t detach(uint64_t address)
 { return syscall_sysv_shm(__NR_shmdt, address, 0, 0); }
+
+/* Exercise the actual copy_process path with real page tables, SHM VMA
+ * ownership and mount pins. Pending syscall metadata is exclusively parent
+ * owned, even though the child inherits real root/cwd and shared data pages. */
+static void clone_pending_operands(struct task *parent,struct task *child,struct vfs_namespace *ns)
+{
+    struct task_vector_state *vector=kernel_malloc(sizeof(*vector)+sizeof(struct iovec));assert(vector);
+    *vector=(struct task_vector_state){.number=__NR_readv,.count=1,.completed=3,.requested=7};
+    char *name=kernel_malloc(32);assert(name);strcpy(name,"original-owned-operand");
+    parent->vector_io=vector;parent->syscall_file=&borrowed_mapping;
+    parent->regular_io.active=true;parent->regular_io.done=1;
+    parent->lookup_scope=(struct task_lookup_scope){.armed=true,.number=__NR_openat,.cursor=1};
+    struct task_lookup_path *operand=&parent->lookup_scope.paths[0];operand->name=name;operand->complete=true;
+    vfs_path_get(&parent->fs_paths.root,&operand->root);vfs_path_get(&parent->fs_paths.cwd,&operand->start);
+    vfs_path_get(&parent->fs_paths.root,&operand->result.path);assert(ns->root->references==6);
+    unsigned pages_before=live_pages(),heap_before=shm_heap_live;
+    for(unsigned mode=0;mode<4;++mode) {
+        if(mode==0)shm_physical_budget=0;
+        if(mode==1)shm_fail_heap=0;
+        empty_clone_boundary=mode>=2;
+        uint64_t flags=mode==3 ? CLONE_FS|17 : 17;
+        int64_t pid=sched_clone_current(&parent->frame,flags,0,0,0,0);
+        shm_physical_budget=-1;shm_fail_heap=-1;
+        assert(!child->vector_io && !child->syscall_file && !child->regular_io.active && !child->regular_io.done);
+        assert(!child->lookup_scope.armed && !child->lookup_scope.paths[0].name && !child->lookup_scope.paths[0].root.mount &&
+            !child->lookup_scope.paths[0].start.mount && !child->lookup_scope.paths[0].result.path.mount);
+        assert(parent->vector_io==vector && vector->completed==3 && parent->syscall_file==&borrowed_mapping &&
+            parent->regular_io.active && parent->regular_io.done==1 && borrowed_mapping.references==1);
+        assert(parent->lookup_scope.armed && operand->name==name && !strcmp(name,"original-owned-operand") &&
+            operand->root.mount==ns->root && operand->start.mount==ns->root && operand->result.path.mount==ns->root);
+        if(mode<2)assert(pid==-LINUX_ENOMEM && ns->root->references==6);
+        else {
+            assert(pid>0 && child->pid==(uint32_t)pid && child->state==TASK_READY);
+            assert(sched_task_paths(child)->root.mount==ns->root && sched_task_paths(child)->cwd.mount==ns->root);
+            if(mode==3)assert(child->shared_fs==parent->shared_fs && parent->shared_fs->references==2 && ns->root->references==6);
+            else assert(!child->shared_fs && ns->root->references==8);
+            syscall_release_task_files(child);address_space_destroy(sched_task_as(child));sched_task_vma_release(child);
+            sched_task_fs_release(child);task_groups_release(child);
+            kernel_free(child->exec_argv);kernel_free(child->exec_envp);kernel_free(child->exec_data);
+            task_zero(child);child->state=TASK_EXITED;child->running_cpu=SCHED_CPU_NONE;child->flags=TASK_FLAG_RESOURCES_RELEASED;
+            sched_task_fs_unshare(parent);assert(ns->root->references==6);
+        }
+        empty_clone_boundary=false;assert(live_pages()==pages_before && shm_heap_live==heap_before);
+    }
+    vfs_path_put(&operand->root);vfs_path_put(&operand->start);vfs_path_put(&operand->result.path);
+    kernel_free(name);kernel_free(vector);parent->lookup_scope=(struct task_lookup_scope){0};
+    parent->vector_io=NULL;parent->syscall_file=NULL;parent->regular_io.active=false;parent->regular_io.done=0;
+    assert(ns->root->references==3);
+    puts("PASS actual fork/CLONE_FS and page/SHM OOM keep pending operand/vector ownership only in parent");
+}
 
 int main(void)
 {
@@ -117,6 +220,21 @@ int main(void)
     child->euid = 1000; child->egid = 100; child->fsgid = 100;
     struct task *entries[] = {parent, child};
     tasks = entries; task_count = task_capacity = 2; current_pid[0] = parent->pid;
+    /* A proc inode may outlive a recycled task slot/PID. Its retained identity
+     * must become dead rather than start naming the next task in that slot. */
+    struct task_identity *old_identity=NULL;
+    assert(!sched_task_identity_get(child,&old_identity));
+    assert(sched_task_identity_task(old_identity)==child);
+    child->state=TASK_EXITED;child->flags=TASK_FLAG_RESOURCES_RELEASED;
+    child->running_cpu=SCHED_CPU_NONE;
+    assert(alloc_task_slot()==child);
+    assert(!sched_task_identity_task(old_identity));
+    child->pid=child->tgid=802;child->kind=TASK_KIND_USER;
+    child->euid=1000;child->egid=child->fsgid=100;
+    struct task_identity *new_identity=NULL;
+    assert(!sched_task_identity_get(child,&new_identity) && new_identity!=old_identity);
+    sched_task_identity_put(old_identity);sched_task_identity_put(new_identity);
+    sched_task_identity_detach(child);
     parent->limits.as.rlim_cur = child->limits.as.rlim_cur = LINUX_RLIM_INFINITY;
     parent->limits.memlock.rlim_cur = child->limits.memlock.rlim_cur = 65536;
     nx_enabled = true;
@@ -154,9 +272,60 @@ int main(void)
     *(uint8_t *)mm_phys_to_virt(backing) = 0x4d;
     child->state = TASK_EXITED; child->running_cpu = SCHED_CPU_NONE;
     child->flags = TASK_FLAG_RESOURCES_RELEASED;
+    borrowed_mapping=(struct task_file){.used=1,.references=1};
+    struct vfs_namespace namespace={0};struct vfs_mount *root_mount=NULL;
+    struct storage_node root_node={.type=RELIEFOS_FS_TYPE_DIR,.first_cluster=1};
+    assert(!vfs_mount_new(&fs_ops,NULL,NULL,&root_node,&root_mount));
+    assert(!vfs_namespace_init(&namespace,root_mount));vfs_mount_put(root_mount);
+    assert(!vfs_namespace_root(&namespace,&parent->fs_paths.root));
+    vfs_path_get(&parent->fs_paths.root,&parent->fs_paths.cwd);
+    assert(namespace.root->references==3 && fs_backend_pins==1);
+    clone_pending_operands(parent,child,&namespace);
+    /* Exec stages scalar credentials independently of root/cwd ownership.
+     * Copying creds must neither borrow destination handles nor replace the
+     * live task's FS pins when prepared credentials are committed. */
+    struct task staged_exec={0};staged_exec.credentials=parent->credentials;
+    sched_task_fs_inherit(&staged_exec,parent);
+    assert(namespace.root->references==5);
+    parent->credentials=staged_exec.credentials;
+    sched_task_fs_release(&staged_exec);
+    assert(namespace.root->references==3 && parent->fs_paths.root.mount==namespace.root &&
+        parent->fs_paths.cwd.mount==namespace.root);
+
+    parent->vmas[SCHED_TASK_VMA_MAX-1]=(struct task_vma){.used=1,
+        .flags=TASK_VMA_FLAG_FILE|TASK_VMA_FLAG_MMAP,.mapping_file=&borrowed_mapping,
+        .start=0x70000000,.end=0x70001000};
     shm_physical_budget = 0;
     assert(sched_clone_current(&parent->frame, 17, 0, 0, 0, 0) == -LINUX_ENOMEM);
     shm_physical_budget = -1;
+    assert(borrowed_mapping.references==1); /* Failure never owned the parent's file pin. */
+    assert(namespace.root->references==3 && parent->fs_paths.root.mount && parent->fs_paths.cwd.mount);
+    assert(!child->fs_paths.root.mount && !child->fs_paths.cwd.mount && !child->shared_fs);
+    assert(!task_promote_shared(parent,CLONE_FS));
+    assert(parent->shared_fs && parent->shared_fs->references==1);
+    assert(!parent->fs_paths.root.mount && !parent->fs_paths.cwd.mount);
+    struct task fs_sibling={.shared_fs=parent->shared_fs};++fs_sibling.shared_fs->references;
+    assert(!sched_prepare_exec_current(parent));
+    assert(!parent->shared_fs && parent->fs_paths.root.mount==namespace.root && parent->fs_paths.cwd.mount==namespace.root);
+    assert(fs_sibling.shared_fs->references==1 && namespace.root->references==5);
+    sched_task_fs_release(parent);
+    assert(fs_sibling.shared_fs->references==1 && namespace.root->references==3);
+    assert(sched_task_paths(&fs_sibling)->root.mount==namespace.root);
+    sched_task_fs_release(&fs_sibling);
+    assert(namespace.root->references==1);
+    /* Exec by the last CLONE_FS holder must release the old state's two pins. */
+    assert(!vfs_namespace_root(&namespace,&parent->fs_paths.root));
+    vfs_path_get(&parent->fs_paths.root,&parent->fs_paths.cwd);
+    task_copy_cwd(parent,"/kept");
+    task_copy_identity_text(parent->root_dir,sizeof(parent->root_dir),"/private");
+    parent->umask=0027;
+    assert(!task_promote_shared(parent,CLONE_FS));
+    assert(!sched_prepare_exec_current(parent));
+    assert(!parent->shared_fs && namespace.root->references==3);
+    assert(!strcmp(parent->cwd,"/kept") && !strcmp(parent->root_dir,"/private") && parent->umask==0027);
+    sched_task_fs_release(parent);
+    assert(namespace.root->references==1 && !vfs_namespace_destroy(&namespace) && !fs_backend_pins);
+    task_file_put(&borrowed_mapping);parent->vmas[SCHED_TASK_VMA_MAX-1]=(struct task_vma){0};
     assert(child->running_cpu == SCHED_CPU_NONE);
     assert(!ctl(id, IPC_STAT, &stat) && stat.shm_nattch == 1);
     assert(parent->vmas[0].sysv_shm_attachment &&

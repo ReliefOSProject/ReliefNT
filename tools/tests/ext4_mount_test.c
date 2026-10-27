@@ -1,6 +1,6 @@
 /* Host-side tests for the ext4 mount path, feature policy and bounded caches.
  *
- * Covers fs/ext4/mount.c and
+ * Covers fs/ext_common/mount.c and
  * storage_ext4_cache.c against real mke2fs images that
  * tools/tests/ext4_mount_test.py patches per case:
  *
@@ -57,6 +57,11 @@ static unsigned transport_lock_depth;
 static unsigned test_transport_flushes;
 static char console_log_buffer[16384];
 
+/* This backend-only memory-disk fixture has no resumable task I/O. Record
+ * the storage-core transaction notification; the real single-CPU mutation
+ * latch and EAGAIN/readonly behavior are covered by mount_backend_test. */
+static uint64_t fixture_metadata_admissions;
+void storage_begin_mutation(void) { ++fixture_metadata_admissions; }
 void *kernel_malloc(size_t size) { return malloc(size); }
 void kernel_free(void *p) { free(p); }
 uint64_t mm_alloc_page(void) { return (uintptr_t)aligned_alloc(4096, 4096); }
@@ -119,8 +124,7 @@ bool paging_kernel_direct_map_range(uint64_t phys, uint64_t len)
 { (void)phys; (void)len; return false; }
 void *paging_kernel_direct_map(uint64_t phys) { (void)phys; return NULL; }
 
-/* RAM-disk device layer.  Bounds mirror the production STORAGE_VOLUME_RAM
- * branch of storage_read_device; counters and the lock-depth check are the
+/* RAM-disk device layer.  Bounds exercise the standalone codec transport contract; counters and the lock-depth check are the
  * test's observability points. */
 int storage_read_device(const struct storage_volume *volume, uint64_t lba,
                                uint32_t sector_count, void *buffer)
@@ -153,61 +157,28 @@ int storage_write_device(const struct storage_volume *volume, uint64_t lba,
     return 0;
 }
 
-#include "../../drivers/storage/ide/storage_ide.c"
-
-void storage_volume_ide_device(const struct storage_volume *volume,
-                                      struct ide_device_info *device)
+int block_device_flush(const struct block_device_ref *ref)
 {
-    (void)volume;
-    *device = (struct ide_device_info){.present = 1, .command_base = 0x1f0,
-                                       .control_base = 0x3f6};
+    assert(ref && ref->device && transport_lock_depth==1);
+    ++test_transport_flushes;test_transport_flush_step=++test_step;return 0;
 }
-int nvme_flush_cache(struct nvme_controller *controller, uint32_t nsid)
-{ (void)controller; (void)nsid; abort(); }
-int ahci_flush_cache(struct ahci_hba_port *port)
-{
-    assert(port && transport_lock_depth == 1);
-    ++test_transport_flushes;
-    test_transport_flush_step = ++test_step;
-    return 0;
-}
+int block_device_info(const struct block_device_ref *ref,struct block_device_info *out)
+{(void)ref;(void)out;abort();}
 
-/* Route-level fakes for storage_mount.c: ext2_mount() is the fallback under
- * test, so it records whether the legacy backend was ever reached. */
-static unsigned ext2_mount_calls;
-int ext2_mount(void)
-{
-    ++ext2_mount_calls;
-    g_storage.filesystem = STORAGE_FILESYSTEM_EXT2;
-    return 0;
-}
-int exfat_mount(void) { return -2; }
-int fat32_mount(void) { return -2; }
-int iso9660_mount(void) { return -2; }
-int gpt_find_esp(void) { return -2; }
-void storage_volume_from_install_disk(struct storage_volume *volume,
-                                             const struct install_disk_state *disk)
-{ (void)volume; (void)disk; }
-const char *storage_transport_name(uint8_t transport)
-{ (void)transport; return "ahci"; }
-void ahci_pending_clear(void) {}
-int ahci_setup_port(struct ahci_hba_port *port) { (void)port; return -1; }
-void nvme_reset_all_controllers(void) {}
-void storage_scan_nvme_controller(uint8_t bus, uint8_t slot, uint8_t function,
-                                         uint8_t *root_ready)
-{ (void)bus; (void)slot; (void)function; (void)root_ready; }
 
-#include "../../fs/ext4/format.c"
-#include "../../fs/ext4/checksum.c"
-#include "../../fs/ext4/cache.c"
-#include "../../fs/ext4/alloc.c"
-#include "../../fs/ext4/extent.c"
-#include "../../fs/ext4/ops.c"
-#include "../../fs/ext4/xattr.c"
-#include "../../fs/ext4/journal.c"
-#include "../../fs/ext4/mount.c"
-#include "../../fs/vfs/mount.c"
+#include "../../fs/ext_common/format.c"
+#include "../../fs/ext_common/checksum.c"
+#include "../../fs/ext_common/cache.c"
+#include "../../fs/ext_common/alloc.c"
+#include "../../fs/ext_common/extent.c"
+#include "../../fs/ext_common/ops.c"
+#include "../../fs/ext_common/xattr.c"
+#include "../../fs/ext_common/journal.c"
+#include "../../fs/ext_common/sync.c"
+#include "../../fs/ext_common/mount.c"
 #include "../../block/core/storage_sync.c"
+
+static const struct storage_filesystem_ops fixture_sync_ops={.sync=storage_ext4_sync};
 
 /* ---- fixture helpers -------------------------------------------------- */
 static void load_disk(const char *image, uint64_t part_offset_sectors,
@@ -226,11 +197,15 @@ static void load_disk(const char *image, uint64_t part_offset_sectors,
     assert(!fclose(file));
     storage_memzero(volume, sizeof(*volume));
     volume->volume_id = 0;
-    volume->kind = STORAGE_VOLUME_RAM;
+    volume->fs_ops=&fixture_sync_ops;
+    volume->kind = STORAGE_VOLUME_BLOCK;
+    /* The standalone codec mocks read/write/geometry and an observable flush.
+     * Give that existing boundary a nonempty token for recovery barriers too. */
+    volume->device_ref.device = (struct block_device *)(uintptr_t)4096;
     volume->ext_start_lba = part_offset_sectors;
     volume->ext_sector_count = part_sector_count ? part_sector_count
                                                 : (disk_size / SECTOR_SIZE) - part_offset_sectors;
-    storage_copy_text(volume->mount_path, sizeof(volume->mount_path), "/");
+
     g_active_volume = volume;
 }
 
@@ -385,7 +360,7 @@ static void case_multi_group(const char *image)
     puts("PASS ext4 mount: multi-group descriptors all verified");
 }
 
-/* ---- root route cases (storage_mount_ext_family) ---------------------- */
+/* ---- native mount admission policy cases ---------------------------- */
 static void case_route_policy_reject(const char *image)
 {
     /* ext2-shaped image with RO_COMPAT_BIGALLOC: the feature policy must
@@ -396,8 +371,7 @@ static void case_route_policy_reject(const char *image)
     load_disk(image, 0, 0);
     volume = &g_volumes[0];
     console_log_buffer[0] = 0;
-    assert(storage_mount_ext_family(volume) == -RELIEFOS_EOPNOTSUPP);
-    assert(ext2_mount_calls == 0);
+    assert(storage_ext4_mount(volume) == -RELIEFOS_EOPNOTSUPP);
     assert(!volume->ready);
     assert_volume_untouched(volume);
     assert(strstr(console_log_buffer, "ro_compat=0x200\n") != NULL);
@@ -406,32 +380,29 @@ static void case_route_policy_reject(const char *image)
 
 static void case_route_probe_fallback(const char *image)
 {
-    /* A probe failure that is not a policy rejection (unrecognized image)
-     * keeps the legacy fallback behavior. */
+    /* Non-ext media is rejected before any writable mount is published. */
     struct storage_volume *volume;
     load_disk(image, 0, 0);
     volume = &g_volumes[0];
-    assert(storage_mount_ext_family(volume) == -RELIEFOS_EINVAL);
-    assert(ext2_mount_calls == 0);
+    assert(storage_ext4_mount(volume) == -RELIEFOS_EINVAL);
     puts("PASS ext-family probe: non-ext media never enters a legacy backend");
 }
 
 static void case_route_corrupt_metadata(const char *image)
 {
     load_disk(image, 0, 0);
-    assert(storage_mount_ext_family(&g_volumes[0]) == -RELIEFOS_EIO);
-    assert(ext2_mount_calls == 0 && test_write_commands == 0);
+    assert(storage_ext4_mount(&g_volumes[0]) == -RELIEFOS_EIO);
+    assert(test_write_commands == 0);
     puts("PASS corrupt ext metadata never falls back to legacy ext2");
 }
 
 static void case_route_ext2_classify(const char *image)
 {
-    /* Classic ext2 classification also keeps the legacy backend. */
+    /* Classic indirect ext2 uses the same feature-checked native parser. */
     struct storage_volume *volume;
     load_disk(image, 0, 0);
     volume = &g_volumes[0];
-    assert(storage_mount_ext_family(volume) == 0);
-    assert(ext2_mount_calls == 0);
+    assert(storage_ext4_mount(volume) == 0);
     assert(volume->filesystem == STORAGE_FILESYSTEM_EXT2);
     puts("PASS ext-family route: EXT2 classification uses the unified backend");
 }
@@ -443,8 +414,7 @@ static void case_route_ext4(const char *image)
     struct storage_volume *volume;
     load_disk(image, 0, 0);
     volume = &g_volumes[0];
-    assert(storage_mount_ext_family(volume) == 0);
-    assert(ext2_mount_calls == 0);
+    assert(storage_ext4_mount(volume) == 0);
     assert(volume->filesystem == STORAGE_FILESYSTEM_EXT4);
     assert(volume->read_only_reason == STORAGE_EXT4_READ_ONLY_NONE);
     puts("PASS ext4 root route: ext4 image mounts without ext2_mount");
@@ -617,7 +587,7 @@ static void case_sync(const char *image){
     /* Present an AHCI transport so the device-cache flush is observable. */
     volume->kind = STORAGE_VOLUME_AHCI;
     volume->transport = STORAGE_TRANSPORT_AHCI;
-    volume->hba_port = (struct ahci_hba_port *)(uintptr_t)4096;
+    volume->device_ref.device = (struct block_device *)(uintptr_t)4096;
     volume->ready = true;
     assert(storage_sync_volume(0) == 0);
     assert(disk_bytes[150 * (uint64_t)volume->ext4.block_size] == 'S');

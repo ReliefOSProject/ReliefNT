@@ -11,5 +11,6 @@ with tempfile.TemporaryDirectory(prefix="reliefos-inet-") as work:
                         "-fsanitize=address,undefined",
                         "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
                         "-Iinclude", "-Iinclude", "-Iinclude/uapi", "-Iinclude",
-                        f"tools/tests/{name}_test.c", "-o", str(binary)], cwd=ROOT, check=True)
+                        f"tools/tests/{name}_test.c", "fs/vfs/mount_tree.c", "fs/vfs/file.c", "fs/vfs/open.c", "fs/vfs/initial.c", "kernel/syscall/ipc/unix_name.c", "kernel/syscall/fs/lookup_state.c",
+                        "-o", str(binary)], cwd=ROOT, check=True)
         subprocess.run([str(binary)], check=True, timeout=20)

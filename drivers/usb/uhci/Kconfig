@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+config USB_UHCI_HCD
+    tristate "UHCI USB HID host controller"
+    default y
+    help
+      Native PCI UHCI and boot HID keyboard/mouse support. M builds uhci.ko.
+      All schedule/transfer DMA comes from explicit 32-bit coherent backing;
+      permanent USB input dispatch drains callbacks before hardware teardown.

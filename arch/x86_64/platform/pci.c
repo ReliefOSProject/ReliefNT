@@ -1,3 +1,4 @@
+#include <reliefnt/export.h>
 /*
  * ReliefOS x86_64 PCI access: enumerates and configures PCI devices.
  * Provides low-level configuration-space reads and writes for drivers.
@@ -129,12 +130,14 @@ void pci_config_write16(uint8_t bus,uint8_t slot,uint8_t function,uint8_t offset
 }
 
 /**
- * Pci read device.
- * @param bus Value supplied by the caller.
- * @param slot Value supplied by the caller.
- * @param function Value supplied by the caller.
- * @param out Output storage updated by the function.
- * @return The value or status produced by the operation.
+ * @brief Probe one PCI function and optionally copy its scalar identification fields.
+ * @param bus PCI bus number.
+ * @param slot PCI device slot.
+ * @param function PCI function number.
+ * @param out Optional writable scalar identity; NULL only tests presence.
+ * @return Zero for a present function or internal -1 when the vendor ID is absent.
+ * @par Context
+ * Each config transaction uses the IRQ-safe PCI config lock. No device binding, allocation, retained pointer or provider ownership is created.
  */
 int pci_read_device(uint8_t bus, uint8_t slot, uint8_t function,
                     struct pci_device *out)
@@ -515,41 +518,82 @@ bool pci_device_bar_contains(const struct pci_device *device, uint8_t bar,
 }
 
 #define PCI_MMIO_MAX 64U
-struct pci_mmio_mapping { uint64_t phys, bytes, aligned, length; void *ptr; uint32_t refs; };
+struct pci_mmio_mapping { uint64_t phys, bytes, aligned, length; void *ptr; uint32_t refs; bool high; };
 static struct pci_mmio_mapping pci_mappings[PCI_MMIO_MAX];
 static struct kernel_spinlock pci_mapping_lock = KERNEL_SPINLOCK_INIT;
-/** @brief Map only the requested memory BAR pages UC/NX in the kernel alias.
- * @param phys Page-aligned BAR base of a quiesced PCI function.
- * @param bytes Requested byte range, nonzero; covers only rounded 4 KiB pages.
- * @return Borrowed MMIO pointer with one owned mapping reference, or NULL.
- * Task context under execution transaction/pre-SMP; caller unmaps matching bytes.
- * BAR must occupy whole pages so rounding never changes adjacent RAM attributes.
+/** @brief Map validated BAR pages UC/RW/NX, including high physical PCI space.
+ * @param phys Page-aligned BAR base of an exclusively controlled PCI function.
+ * @param bytes Nonzero requested bytes; covering pages must fit the actual BAR.
+ * @return Owned mapping lease or NULL. Task context under execution ownership;
+ * repeated exact claims share a pointer/reference, high BARs use the inherited
+ * device virtual window, and low BARs keep precise direct-map attribute leases.
  */
 void *pci_map_mmio(uint64_t phys, uint64_t bytes)
 {
-    if ((phys & 4095) || !bytes || !paging_kernel_direct_map_range(phys,bytes) || !pci_bar_contains(phys,bytes)) return NULL;
-    uint64_t aligned = phys & ~4095ULL, end = (phys + bytes + 4095) & ~4095ULL;
-    if (end <= aligned || !pci_bar_contains(aligned,end-aligned)) return NULL;
+    if ((phys & 4095u) || !bytes || bytes > UINT64_MAX - 4095u) return NULL;
+    uint64_t length = (bytes + 4095u) & ~4095ull;
+    if (phys > UINT64_MAX - length || !pci_bar_contains(phys, bytes) ||
+        !pci_bar_contains(phys, length)) return NULL;
+    bool high = !paging_kernel_direct_map_range(phys, length);
+    /* A high UC alias must never overlap a still-WB part of the RAM direct map. */
+    if (high && phys < RELIEFNT_KERNEL_DIRECT_MAP_SIZE) return NULL;
     kernel_spin_lock(&pci_mapping_lock);
-    struct pci_mmio_mapping *m = NULL;
-    for (uint32_t i=0;i<PCI_MMIO_MAX;++i) if (pci_mappings[i].refs && pci_mappings[i].phys==phys && pci_mappings[i].bytes==bytes) { m=&pci_mappings[i]; break; }
-    if (!m) for (uint32_t i=0;i<PCI_MMIO_MAX;++i) if (!pci_mappings[i].refs) { m=&pci_mappings[i]; break; }
-    if (!m || m->refs == UINT32_MAX || !paging_acquire_mmio(aligned,end-aligned)) { kernel_spin_unlock(&pci_mapping_lock); return NULL; }
-    if (!m->refs) *m=(struct pci_mmio_mapping){.phys=phys,.bytes=bytes,.aligned=aligned,.length=end-aligned,.ptr=paging_kernel_direct_map(phys)};
-    ++m->refs; void *result=m->ptr; kernel_spin_unlock(&pci_mapping_lock); return result;
+    struct pci_mmio_mapping *mapping = NULL;
+    for (uint32_t i = 0; i < PCI_MMIO_MAX; ++i)
+        if (pci_mappings[i].refs && pci_mappings[i].phys == phys &&
+            pci_mappings[i].bytes == bytes) { mapping = &pci_mappings[i]; break; }
+    if (!mapping) for (uint32_t i = 0; i < PCI_MMIO_MAX; ++i)
+        if (!pci_mappings[i].refs) { mapping = &pci_mappings[i]; break; }
+    if (!mapping || mapping->refs == UINT32_MAX) {
+        kernel_spin_unlock(&pci_mapping_lock); return NULL;
+    }
+    if (!mapping->refs) {
+        void *pointer;
+        if (high) pointer = paging_ioremap_uc(phys, length);
+        else pointer = paging_acquire_mmio(phys, length) ? paging_kernel_direct_map(phys) : NULL;
+        if (!pointer) { kernel_spin_unlock(&pci_mapping_lock); return NULL; }
+        *mapping = (struct pci_mmio_mapping){.phys = phys, .bytes = bytes,
+            .aligned = phys, .length = length, .ptr = pointer, .high = high};
+    } else if (!mapping->high && !paging_acquire_mmio(mapping->aligned, mapping->length)) {
+        kernel_spin_unlock(&pci_mapping_lock); return NULL;
+    }
+    ++mapping->refs;
+    void *result = mapping->ptr;
+    kernel_spin_unlock(&pci_mapping_lock);
+    return result;
 }
-/** @brief Release exactly one matching PCI MMIO mapping reference.
- * @param ptr Owned pointer returned by map_mmio; invalid/stale pointers ignored.
- * @param bytes Original requested byte length, required to match the lease.
- * @return None. Task context under execution transaction; device stopped first.
- * Final page reference restores original attributes and synchronizes CPU TLBs.
+/** @brief Release one exact PCI MMIO lease after the device/users have stopped.
+ * @param ptr Owned original pointer; wrong/stale pointers are ignored.
+ * @param bytes Original requested byte count, must match the lease.
+ * Task context under execution ownership. Low pages restore their attributes;
+ * the final high lease retires all CPU translations before freeing paging tables.
  */
 void pci_unmap_mmio(void *ptr, uint64_t bytes)
 {
     kernel_spin_lock(&pci_mapping_lock);
-    for (uint32_t i=0;i<PCI_MMIO_MAX;++i) if (pci_mappings[i].refs && pci_mappings[i].ptr==ptr && pci_mappings[i].bytes==bytes) {
-        paging_release_mmio(pci_mappings[i].aligned,pci_mappings[i].length);
-        --pci_mappings[i].refs; break;
+    for (uint32_t i = 0; i < PCI_MMIO_MAX; ++i) {
+        struct pci_mmio_mapping *mapping = &pci_mappings[i];
+        if (!mapping->refs || mapping->ptr != ptr || mapping->bytes != bytes) continue;
+        if (!mapping->high) paging_release_mmio(mapping->aligned, mapping->length);
+        else if (mapping->refs == 1 && !paging_iounmap(mapping->ptr, mapping->length)) {
+            kernel_spin_unlock(&pci_mapping_lock); return; /* Retain an inconsistent lease. */
+        }
+        if (!--mapping->refs) *mapping = (struct pci_mmio_mapping){0};
+        break;
     }
     kernel_spin_unlock(&pci_mapping_lock);
 }
+
+EXPORT_SYMBOL(pci_config_read16);
+
+EXPORT_SYMBOL(pci_config_read32);
+
+EXPORT_SYMBOL(pci_config_write16);
+
+EXPORT_SYMBOL(pci_device_bar_contains);
+
+EXPORT_SYMBOL(pci_map_mmio);
+
+EXPORT_SYMBOL(pci_read_device);
+
+EXPORT_SYMBOL(pci_unmap_mmio);

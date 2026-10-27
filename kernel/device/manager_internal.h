@@ -4,7 +4,7 @@
 /*
  * ReliefOS kernel driver manager: owns the built-in driver lifecycle.
  * Provides registration, probing, initialization, and device event dispatch.
- * Every driver is linked into kernel.sys; there is no runtime module loader.
+ * Native module records own descriptors and services through safe teardown.
  */
 #include <reliefnt/console.h>
 #include <reliefnt/driver_manager.h>
@@ -38,21 +38,13 @@
 
 
 
-/* Descriptors of the drivers linked into kernel.sys, in load order: serial
- * first so console output moves off the early COM1 path, then alphabetical. */
-extern const struct reliefos_driver_module serial_driver_module;
-extern const struct reliefos_driver_module ac97_driver_module;
-extern const struct reliefos_driver_module e1000_driver_module;
-extern const struct reliefos_driver_module es1371_driver_module;
-extern const struct reliefos_driver_module hda_driver_module;
-extern const struct reliefos_driver_module mouse_driver_module;
-
-
-
 struct driver_slot {
     struct reliefos_driver_info info;
     const struct reliefos_driver_module *module;
     int cleanup_error;
+    struct module *code_owner;
+    uint32_t audio_lease_token;
+    struct module *audio_lease_module;
 };
 
 
@@ -71,6 +63,11 @@ extern uint32_t audio_owner;
 extern uint32_t audio_generation, audio_lease_generation;
 extern struct mouse_state mouse_cache;
 extern struct kernel_spinlock manager_service_lock;
+
+/** @brief Borrow the immutable driver services used by builtin and native modules.
+ * @return Permanent kernel-owned service table; no locks or callbacks.
+ */
+const struct reliefos_driver_kernel_api *driver_kernel_services(void);
 
 void early_serial_write(const char *text);
 

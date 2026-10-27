@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix="regular-file-io-") as directory:
     binary = Path(directory) / "test"
     subprocess.run(["clang", "-std=c11", "-O1", "-g", "-fsanitize=address,undefined",
-                    "-fno-sanitize-recover=all", "-Iinclude", "-Iinclude", "-Iinclude/uapi",
-                    "-Iinclude", "tools/tests/regular_file_io_test.c",
+                    "-fno-sanitize-recover=all", "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections", "-Iinclude", "-Iinclude", "-Iinclude/uapi",
+                    "-Iinclude", "tools/tests/regular_file_io_test.c", "fs/vfs/mount_tree.c", "fs/vfs/file.c", "fs/vfs/open.c", "fs/vfs/attributes.c",
                     "-o", str(binary)], cwd=ROOT, check=True)
     subprocess.run([str(binary)], check=True, timeout=20)

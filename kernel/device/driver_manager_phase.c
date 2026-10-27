@@ -1,6 +1,7 @@
+#include <reliefnt/export.h>
 #include <reliefnt/driver_manager_phase.h>
 #include <reliefos/driver.h>
-#include <reliefnt/audio.h>
+#include <reliefnt/driver_module.h>
 
 static uint32_t manager_admitted;
 static struct kernel_spinlock service_lock = KERNEL_SPINLOCK_INIT;
@@ -11,6 +12,8 @@ static uint32_t service_calls[RELIEFOS_DRIVER_MAX];
 /**
  * @brief Admit one manager lifecycle operation without blocking an execution-lock holder.
  * @return 0 when admitted, or -16 while another lifecycle operation is active.
+ * Task/manager context; caller owns its admission/scope and original provider
+ * lifetime. No service/module registry lock spans execution suspension or resume.
  */
 int driver_manager_phase_try_enter(void)
 {
@@ -22,36 +25,19 @@ int driver_manager_phase_try_enter(void)
 /**
  * @brief Release the lifecycle admission acquired by driver_manager_phase_try_enter.
  * @return None. The caller owns the manager admission gate.
+ * Task/manager context; caller owns its admission/scope and original provider
+ * lifetime. No service/module registry lock spans execution suspension or resume.
  */
 void driver_manager_phase_leave(void)
 {
     __atomic_store_n(&manager_admitted, 0, __ATOMIC_RELEASE);
 }
-/** @brief Process deferred audio work before admitting a syscall's I/O pin.
- * @return None. Task context with depth-one execution ownership. Nonblocking
- * manager admission protects module images; STOP/close and card task callbacks
- * run with execution ownership suspended and IRQs enabled. Busy or failed
- * admission preserves queued work; task callbacks share a total budget of 32.
- */
-void driver_manager_process_audio_faults(void)
-{
-    if((!audio_disconnect_work_pending() && !audio_pcm_release_work_pending() &&
-        !audio_task_work_pending()) ||
-        driver_manager_phase_try_enter())return;
-    struct driver_manager_wait_scope scope={0};
-    if(!driver_manager_wait_begin(&scope)){
-        (void)audio_process_pending_disconnects(16u);
-        (void)audio_pcm_retry_releases(32u);
-        (void)audio_process_task_work(32u);
-        if(!driver_manager_wait_end(&scope))audio_pcm_finish_releases();
-    }
-    driver_manager_phase_leave();
-}
-
 /**
  * @brief Release execution ownership and enable IRQ progress for a manager waitable phase.
  * @param scope Zero-initialized storage that receives the active execution suspension token.
  * @return 0 when suspended or a negative errno when input/ownership is invalid.
+ * Task/manager context; caller owns its admission/scope and original provider
+ * lifetime. No service/module registry lock spans execution suspension or resume.
  */
 int driver_manager_wait_begin(struct driver_manager_wait_scope *scope)
 {
@@ -66,6 +52,8 @@ int driver_manager_wait_begin(struct driver_manager_wait_scope *scope)
  * @brief Reacquire execution ownership with IRQs masked after a manager waitable phase.
  * @param scope Active scope returned by driver_manager_wait_begin.
  * @return 0 when resumed or a negative errno when the token cannot be resumed.
+ * Task/manager context; caller owns its admission/scope and original provider
+ * lifetime. No service/module registry lock spans execution suspension or resume.
  */
 int driver_manager_wait_end(struct driver_manager_wait_scope *scope)
 {
@@ -137,14 +125,17 @@ void driver_manager_service_disable(uint32_t owner)
 /**
  * @brief Admit one callback only while its owning module is published and open.
  * @param owner Driver slot from the manager callback table.
- * @return True with a live reference, or false when callback admission is closed.
+ * @return True with a LIVE code pin and service reference, or false while
+ * COMING/GOING/closed. IRQ-safe; the service lock spans only counters and the
+ * short module-table transaction, never a callback or wait.
  */
 bool driver_manager_service_try_pin(uint32_t owner)
 {
     if (owner >= RELIEFOS_DRIVER_MAX) return false;
     uint64_t flags;
     kernel_spin_lock_irqsave(&service_lock, &flags);
-    bool admitted = service_enabled[owner] && !service_closing[owner];
+    bool admitted = service_enabled[owner] && !service_closing[owner] &&
+                    module_execution_get(driver_module_owner(owner));
     if (admitted) __atomic_add_fetch(&service_calls[owner], 1, __ATOMIC_ACQUIRE);
     kernel_spin_unlock_irqrestore(&service_lock, flags);
     return admitted;
@@ -153,12 +144,19 @@ bool driver_manager_service_try_pin(uint32_t owner)
 /**
  * @brief Release one callback reference so the manager may finalize its module.
  * @param owner Driver slot whose callback returned.
- * @return None. The atomic decrement pairs with service drain's acquire load.
+ * @return None. IRQ-safe; drops the code pin before exposing a drained service
+ * count, so the slot and its borrowed owner remain stable through the drop.
  */
 void driver_manager_service_unpin(uint32_t owner)
 {
-    if (owner < RELIEFOS_DRIVER_MAX)
+    if (owner >= RELIEFOS_DRIVER_MAX) return;
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&service_lock, &flags);
+    if (__atomic_load_n(&service_calls[owner], __ATOMIC_RELAXED)) {
+        module_execution_put(driver_module_owner(owner));
         __atomic_sub_fetch(&service_calls[owner], 1, __ATOMIC_RELEASE);
+    }
+    kernel_spin_unlock_irqrestore(&service_lock, flags);
 }
 
 /**
@@ -172,3 +170,8 @@ void driver_manager_service_drain(uint32_t owner)
     while (__atomic_load_n(&service_calls[owner], __ATOMIC_ACQUIRE) != 0)
         __asm__ volatile("pause" ::: "memory");
 }
+
+EXPORT_SYMBOL(driver_manager_phase_leave);
+EXPORT_SYMBOL(driver_manager_phase_try_enter);
+EXPORT_SYMBOL(driver_manager_wait_begin);
+EXPORT_SYMBOL(driver_manager_wait_end);

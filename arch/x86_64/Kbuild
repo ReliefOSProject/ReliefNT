@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Objects are owned by this directory; child modules own their own lists.
 obj-y := boot/ cpu/ interrupt/ mm/ platform/
+obj-$(CONFIG_MODULES) += module/
 
 include $(srctree)/scripts/Makefile.module

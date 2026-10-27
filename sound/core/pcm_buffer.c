@@ -1,26 +1,35 @@
 #include "pcm_internal.h"
 
+/** @brief Borrow the read-only CPU alias for a retained PCM ring.
+ * @param pcm Caller-retained PCM, serialized against reconfiguration.
+ * @return Borrowed allocation alias, nullable before HW_PARAMS; no locks.
+ */
 static const uint8_t *audio_pcm_const_buffer(const struct audio_pcm *pcm);
 
 
 /** @brief Return the CPU alias for the active PCM ring.
  * @param pcm Live PCM object; caller serializes against reconfiguration.
- * @return Borrowed CPU pointer to the inline or allocator-backed ring, never a
+ * @return Borrowed CPU pointer to the explicitly allocated ring, never a
  *         DMA bus address or a physical address.
  */
 uint8_t *audio_pcm_buffer(struct audio_pcm *pcm)
 {
-    return pcm->extended_buffer ? pcm->extended_buffer : pcm->buffer;
+    return pcm->extended_buffer;
 }
 
+/** @brief Borrow a PCM ring without translating its CPU address to a bus PFN.
+ * @param pcm Stable caller-retained PCM.
+ * @return Borrowed alias, NULL before allocation; no ownership or locks changed.
+ */
 static const uint8_t *audio_pcm_const_buffer(const struct audio_pcm *pcm)
 {
-    return pcm->extended_buffer ? pcm->extended_buffer : pcm->buffer;
+    return pcm->extended_buffer;
 }
 
-/** @brief Release the allocator owner for an extended PCM ring.
+/** @brief Retire a PCM backing allocation and its provider reference.
  * @param pcm Retired PCM object with no file or mmap references.
- * @return None. Clears both aliases before releasing backing pages.
+ * @return None. Clears both aliases before releasing backing pages and the
+ * provider. Final file/VMA and failed-STOP leases must already have retired.
  * Task context; no PCM lock may be held while the kernel heap is called.
  */
 void audio_pcm_free_buffer(struct audio_pcm *pcm)
@@ -28,16 +37,22 @@ void audio_pcm_free_buffer(struct audio_pcm *pcm)
     void *storage = pcm->extended_storage;
     pcm->extended_storage = NULL;
     pcm->extended_buffer = NULL;
-    if (storage && kernel_free) kernel_free(storage);
+    kernel_free(storage);
+    void *metadata=pcm->metadata_storage;
+    pcm->metadata_storage=NULL;pcm->status_page=NULL;pcm->control_page=NULL;
+    kernel_free(metadata);
+    struct module *owner=pcm->code_owner;
+    pcm->code_owner=NULL;
+    module_put(owner);
 }
 
 /** @brief Select or allocate an aligned CPU alias for the requested PCM ring.
  * @param pcm Live PCM object; caller serializes against reconfiguration.
  * @param bytes Validated ring length, no larger than AUDIO_PCM_BUFFER_BYTES.
  * @param new_storage Receives a new allocation owner, or NULL when reusing an
- *                    existing inline or extended ring.
+ *                    an existing allocated ring.
  * @param new_buffer Receives the writable CPU alias; it is not a DMA address.
- * @return Zero on success, -ENOMEM when extended storage cannot be allocated.
+ * @return Zero, EINVAL for invalid geometry, or ENOMEM on allocation failure.
  * Task context. On success with non-NULL new_storage, caller must either
  * publish both outputs together or free the new owner on a later failure.
  */
@@ -46,11 +61,10 @@ int audio_pcm_prepare_buffer(struct audio_pcm *pcm, uint32_t bytes,
 {
     *new_storage = NULL;
     *new_buffer = audio_pcm_buffer(pcm);
-    if (bytes <= AUDIO_PCM_BASE_BUFFER_BYTES || pcm->extended_buffer) {
-        if (pcm->extended_buffer) *new_buffer = pcm->extended_buffer;
+    if (!bytes || bytes>AUDIO_PCM_BUFFER_BYTES)return -EINVAL;
+    if (pcm->extended_buffer) {
         return 0;
     }
-    if (!kernel_malloc || !kernel_free) return -ENOMEM;
     /* Retain one backing through HW_FREE/reconfiguration. Reserve the core
      * limit so a later larger geometry cannot overrun the reused allocation. */
     size_t allocation = (size_t)AUDIO_PCM_BUFFER_BYTES + AUDIO_PCM_MMAP_PAGE_BYTES - 1u;

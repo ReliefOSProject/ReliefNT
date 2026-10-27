@@ -219,7 +219,13 @@ void fb_console_hide_tty_cursor(void);
 /** @brief Save the underlying pixels and draw the text cursor. */
 void fb_console_show_tty_cursor(void);
 
-/** @brief Scroll the active text region on the current rendering surface. */
+/**
+ * @brief Move clipped text rows upward without changing padding or other pixels.
+ * @par Context
+ * Caller serializes console state and retains the rendering surface; exact
+ * overlap-safe scalar-word copies with a byte tail require no allocation,
+ * SIMD state or mapping changes, even for unaligned 24-bit row layouts.
+ */
 void fb_console_scroll(void);
 
 /** @brief Advance the text cursor; graphical panic overlays clip instead of scrolling. */

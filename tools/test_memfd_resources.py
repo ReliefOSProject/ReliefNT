@@ -13,7 +13,8 @@ with tempfile.TemporaryDirectory(prefix="memfd-resources-", dir=temporary) as wo
     subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-g", "-O1",
                     "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
                     "-fsanitize=address,undefined", "-Iinclude", "-Iinclude/uapi",
-                    "tools/tests/memfd_resources_test.c", "fs/vfs/object.c", "fs/tmpfs/core.c", "-o", binary],
+                    "tools/tests/memfd_resources_test.c", "fs/vfs/object.c", "fs/vfs/write_access.c",
+                    "fs/vfs/mount_tree.c", "fs/tmpfs/core.c", "-o", binary],
                    cwd=root, check=True)
     results = [subprocess.run([binary, *args], timeout=20).returncode for args in ([], ["size"])]
     syscall_binary = str(Path(work) / "memfd-syscall")

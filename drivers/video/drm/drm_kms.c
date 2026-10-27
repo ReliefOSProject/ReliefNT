@@ -1,3 +1,4 @@
+#include "memory.h"
 #include "drm_internal.h"
 
 #include <drm/drm_mode.h>
@@ -150,12 +151,17 @@ static void drm_kms_fb_get(struct drm_kms_fb *fb)
     if (fb) ++fb->references;
 }
 
+/**
+ * @brief Release a framebuffer only after all file, scanout and job references drain.
+ * @param fb Owned framebuffer reference, or NULL.
+ * Execution-owned task context under independent caller pin; final surface/BO/heap/module release occurs outside graphics locks.
+ */
 static void drm_kms_fb_put(struct drm_kms_fb *fb)
 {
     if (!fb || !fb->references || --fb->references) return;
     if (fb->surface) drm_vmwgfx_surface_put(fb->surface);
     if (fb->bo) drm_bo_put(fb->bo);
-    kernel_free(fb);
+    drm_async_free(fb);
 }
 
 static int drm_kms_map_svga_status(int status)
@@ -202,12 +208,17 @@ static void drm_kms_job_remove(struct drm_kms_present_job *job)
     if (drm_kms_pending_job == job) drm_kms_pending_job = NULL;
 }
 
+/**
+ * @brief Release a hardware-complete or safely cancelled presentation job.
+ * @param job Owned job or NULL; backend must no longer retain it.
+ * Execution-owned task context under independent caller pin; drops retained framebuffer before the job module reference, outside queue locks.
+ */
 static void drm_kms_job_free(struct drm_kms_present_job *job)
 {
     if (!job) return;
     drm_kms_job_remove(job);
     if (job->fb) drm_kms_fb_put(job->fb);
-    kernel_free(job);
+    drm_async_free(job);
 }
 
 /** @brief Submit the caller-pinned surface without render-batch allocations. */
@@ -296,6 +307,10 @@ static void drm_kms_service_jobs(uint32_t budget)
     }
 }
 
+/**
+ * @brief Promote retained damage into independently pinned asynchronous presentation.
+ * Execution-owned task context under file/service pin. Pending framebuffer ownership survives pressure; no graphics lock spans allocation or backend submission.
+ */
 static void drm_kms_service_pending_damage(void)
 {
     if (drm_kms_pending_job) {
@@ -328,7 +343,7 @@ static void drm_kms_service_pending_damage(void)
         drm_kms_pending_damage_clear();
         return;
     }
-    struct drm_kms_present_job *job = kernel_malloc(sizeof(*job));
+    struct drm_kms_present_job *job = drm_async_alloc(sizeof(*job));
     if (!job) return;
     __builtin_memset(job, 0, sizeof(*job));
     job->fb = drm_kms_pending_damage.fb;
@@ -349,6 +364,16 @@ static void drm_kms_service_pending_damage(void)
     }
 }
 
+/**
+ * @brief Construct independently pinned state for the requested surface presentation.
+ * @param fb Borrowed retained framebuffer.
+ * @param x1 Validated left edge.
+ * @param y1 Validated top edge.
+ * @param x2 Validated exclusive right edge.
+ * @param y2 Validated exclusive bottom edge.
+ * @return Original submission result or Linux errno; queued jobs retain backing and code until retirement.
+ * Execution-owned task context under file/service pin, with no queue lock spanning heap or backend calls.
+ */
 static int drm_kms_submit_surface_present(struct drm_kms_fb *fb,
                                           uint32_t x1, uint32_t y1,
                                           uint32_t x2, uint32_t y2)
@@ -358,7 +383,7 @@ static int drm_kms_submit_surface_present(struct drm_kms_fb *fb,
         return -LINUX_EINVAL;
     if (drm_kms_present_job_count >= DRM_KMS_PRESENT_JOBS_MAX)
         return -LINUX_EBUSY;
-    struct drm_kms_present_job *job = kernel_malloc(sizeof(*job));
+    struct drm_kms_present_job *job = drm_async_alloc(sizeof(*job));
     if (!job) return -LINUX_ENOMEM;
     __builtin_memset(job, 0, sizeof(*job));
     job->fb = fb;
@@ -409,6 +434,19 @@ static bool drm_kms_surface_format_compatible(uint32_t drm_format,
     return false;
 }
 
+/**
+ * @brief Validate and publish a framebuffer with original provider ownership.
+ * @param file Retained owning DRM file.
+ * @param width Requested pixel width.
+ * @param height Requested pixel height.
+ * @param pitch Requested byte stride.
+ * @param format Linux DRM format.
+ * @param handle Validated file-owned BO/surface selector.
+ * @param offset Requested backing byte offset.
+ * @param id_out Required created framebuffer ID output.
+ * @return Zero or Linux validation/allocation error with balanced backing and module references.
+ * Execution-owned task context under file pin; no graphics lock spans allocation or backing destruction.
+ */
 static int drm_kms_add_fb(struct drm_file *file, uint32_t width, uint32_t height,
                           uint32_t pitch, uint32_t format, uint32_t handle,
                           uint64_t offset, uint32_t *id_out)
@@ -458,7 +496,7 @@ static int drm_kms_add_fb(struct drm_file *file, uint32_t width, uint32_t height
             return -LINUX_EINVAL;
         }
     }
-    struct drm_kms_fb *fb = kernel_malloc(sizeof(*fb));
+    struct drm_kms_fb *fb = drm_async_alloc(sizeof(*fb));
     if (!fb) {
         if (surface) drm_vmwgfx_surface_put(surface);
         if (bo) drm_bo_put(bo);
@@ -467,7 +505,7 @@ static int drm_kms_add_fb(struct drm_file *file, uint32_t width, uint32_t height
     uint32_t id;
     int ret = drm_kms_new_fb_id(&id);
     if (ret < 0) {
-        kernel_free(fb);
+        drm_async_free(fb);
         if (surface) drm_vmwgfx_surface_put(surface);
         if (bo) drm_bo_put(bo);
         return ret;

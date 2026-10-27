@@ -1,3 +1,4 @@
+#include <reliefnt/export.h>
 #include "device.h"
 #include <reliefnt/console.h>
 #include <reliefnt/framebuffer.h>
@@ -7,7 +8,6 @@
 #include <reliefnt/paging.h>
 #include <reliefnt/port.h>
 #include <reliefnt/pci.h>
-#include <reliefnt/drm.h>
 static struct kernel_spinlock device_lock = KERNEL_SPINLOCK_INIT;
 static uint16_t io_port;
 #else
@@ -236,8 +236,8 @@ static int svga_prepare_fifo_cache_policy(const struct framebuffer *fb,
         reason = "overlaps-vram";
     } else {
         struct pci_device primary;
-        if (drm_device_pci_identity(&primary) < 0) {
-            reason = "no-registered-primary";
+        if (framebuffer_vmware_pci_identity(&primary) < 0) {
+            reason = "no-bound-framebuffer";
         } else if (primary.vendor_id != 0x15adu || primary.device_id != 0x0405u) {
             reason = "primary-identity";
         } else if (!pci_device_bar_contains(&primary, 2, fifo_page,
@@ -519,6 +519,12 @@ bool svga_surface_usable(uint32_t id)
            !svga.surfaces[id].retiring && !svga.surfaces[id].gb.retiring;
 }
 
+/**
+ * @brief Resolve a current native resource handle to its backend index.
+ * @param h Generation-tagged context, surface or GMR handle.
+ * @return Current resource index, or UINT32_MAX for invalid/stale handles.
+ * Task context; acquires the SVGA lock internally. Returns only a snapshot index, not a retained resource reference.
+ */
 uint32_t svga_resource_id(svga_handle h)
 {
     uint64_t flags = svga_lock();
@@ -529,6 +535,11 @@ uint32_t svga_resource_id(svga_handle h)
     return id < 0 ? UINT32_MAX : (uint32_t)id;
 }
 
+/**
+ * @brief Copy current SVGA capabilities, generation and live resource counts.
+ * @param out Writable kernel snapshot, nullable; NULL is ignored.
+ * Task context for module callers; acquires the SVGA lock internally and copies core-owned state without transferring resource ownership.
+ */
 void svga_get_info(struct svga_info *out)
 {
     if (!out) return;
@@ -547,6 +558,13 @@ void svga_get_info(struct svga_info *out)
     svga_unlock(flags);
 }
 
+/**
+ * @brief Copy one cached host capability after applying supported local bounds.
+ * @param index SVGA3D capability selector.
+ * @param out Required writable kernel value, unchanged for an unavailable capability.
+ * @return Zero or SVGA_ENOTSUP for an unavailable selector/NULL output.
+ * Task context for module callers; acquires the SVGA lock internally. No probing, allocation, backing reference or pointer escapes.
+ */
 int svga3d_capability(uint32_t index, uint32_t *out)
 {
     uint64_t flags = svga_lock();
@@ -766,3 +784,7 @@ void svga_mode_end(uint64_t flags)
     }
     svga_unlock(flags);
 }
+
+EXPORT_SYMBOL(svga3d_capability);
+EXPORT_SYMBOL(svga_get_info);
+EXPORT_SYMBOL(svga_resource_id);

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Objects are owned by this directory; child modules own their own lists.
-obj-y := iso.o
+obj-$(CONFIG_ISO9660_FS) := isofs.o
+isofs-y := iso.o native.o type.o
 
 include $(srctree)/scripts/Makefile.module

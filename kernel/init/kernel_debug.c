@@ -18,6 +18,7 @@
 #include <reliefnt/console.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/kernel_debug.h>
+#include <reliefnt/kernel_file.h>
 #include <reliefnt/mm.h>
 #include <reliefnt/ostui.h>
 #include <reliefnt/power.h>
@@ -26,6 +27,8 @@
 #include <reliefnt/syscall.h>
 #include <reliefnt/time.h>
 #include <reliefos/layout.h>
+#include <reliefnt/mount.h>
+#include "../../fs/initramfs/boot.h"
 
 #define KERNEL_DEBUG_ENABLED_PATH RELIEFOS_PATH_KERNELDEBUG_ENABLED
 #define KERNEL_DEBUG_MODULE_PATH RELIEFOS_PATH_KERNELDEBUG_MODULE
@@ -263,10 +266,18 @@ static const struct debug_elf_section *debug_section_at(const struct debug_elf_h
                                               (uint64_t)index * eh->shentsize);
 }
 
+/** @brief Test a trusted visible pathname while retaining its actual provider.
+ * @param path Absolute kernel configuration filename, required.
+ * @return One for a regular file, zero for lookup/type failure. Execution
+ * ownership required; synchronous lookup retires all paths without callback
+ * locks and never guesses visibility from a bare inode or stale display name.
+ */
 static int debug_file_exists(const char *path)
 {
-    struct reliefos_stat st;
-    return path && storage_stat_path(path, &st) == 0 && st.type == RELIEFOS_FS_TYPE_FILE;
+    struct vfs_lookup_result found={0};
+    int rc=vfs_kernel_lookup(vfs_system_namespace(),path,VFS_LOOKUP_FOLLOW,&found);
+    bool regular=!rc && vfs_path_node(&found.path)->type==RELIEFOS_FS_TYPE_FILE;
+    vfs_path_put(&found.path);return regular;
 }
 
 static int debug_module_validate(const void *image, size_t len)
@@ -479,6 +490,14 @@ out:
     return ret;
 }
 
+/**
+ * @brief Read or persist the optional diagnostic module's boot policy.
+ * @param control Validated kernel-owned request; result_flags receives enabled state.
+ * @return Zero on success or a negative validation, permission, VFS or ESP error.
+ * @note The privileged syscall caller authorizes the request and copies user
+ * memory. Task context, without registry locks; writes may block and sync the
+ * real root or ESP. This control does not load or bypass ABI checks for .ko files.
+ */
 int kernel_debug_control(struct reliefos_kernel_debug_control *control)
 {
     uint32_t enabled = debug_file_exists(KERNEL_DEBUG_ENABLED_PATH)
@@ -492,13 +511,13 @@ int kernel_debug_control(struct reliefos_kernel_debug_control *control)
     case RELIEFOS_KERNEL_DEBUG_CONTROL_GET_STATE:
         return 0;
     case RELIEFOS_KERNEL_DEBUG_CONTROL_SET_ENABLED:
-        (void)storage_mkdir("/var");
-        (void)storage_mkdir("/var/lib");
-        (void)storage_mkdir(RELIEFOS_LAYOUT_VAR_LIB_RELIEFOS);
+        (void)vfs_kernel_mkdir(vfs_system_namespace(),"/var",0755);
+        (void)vfs_kernel_mkdir(vfs_system_namespace(),"/var/lib",0755);
+        (void)vfs_kernel_mkdir(vfs_system_namespace(),RELIEFOS_LAYOUT_VAR_LIB_RELIEFOS,0755);
         if (control->flags & RELIEFOS_KERNEL_DEBUG_STATE_ENABLED) {
-            ret = storage_write_file(KERNEL_DEBUG_ENABLED_PATH, "1\n", 2U);
+            ret = vfs_kernel_write_file(vfs_system_namespace(),KERNEL_DEBUG_ENABLED_PATH, "1\n", 2U);
         } else {
-            ret = storage_unlink(KERNEL_DEBUG_ENABLED_PATH);
+            ret = vfs_kernel_unlink(vfs_system_namespace(),KERNEL_DEBUG_ENABLED_PATH);
             if (ret == -2) ret = 0;
         }
         break;
@@ -509,7 +528,7 @@ int kernel_debug_control(struct reliefos_kernel_debug_control *control)
                                           (uint32_t)(sizeof(KERNEL_DEBUG_MARKER) - 1U));
         break;
     case RELIEFOS_KERNEL_DEBUG_CONTROL_CLEAR:
-        ret = storage_unlink(KERNEL_DEBUG_ENABLED_PATH);
+        ret = vfs_kernel_unlink(vfs_system_namespace(),KERNEL_DEBUG_ENABLED_PATH);
         if (ret == -2) ret = 0;
         if (ret == 0) {
             int marker_ret = storage_unlink_boot_esp_file(RELIEFOS_PATH_BOOT_KERNELDEBUG_MARKER);
@@ -551,10 +570,10 @@ static bool debug_consume_boot_marker(void)
     size_t len = 0;
     const char *value;
 
-    if (storage_read_file(path, &data, &len) < 0) {
+    if (vfs_kernel_read_file(vfs_system_namespace(),path, &data, &len) < 0) {
         path = legacy_path;
         expected = legacy_marker;
-        if (storage_read_file(path, &data, &len) < 0) {
+        if (vfs_kernel_read_file(vfs_system_namespace(),path, &data, &len) < 0) {
             return false;
         }
     }
@@ -563,19 +582,16 @@ static bool debug_consume_boot_marker(void)
     }
     value = (const char *)data;
     if (len != (expected == marker ? sizeof(marker) : sizeof(legacy_marker)) - 1U) {
-        mm_free_pages(mm_virt_to_phys(value),
-                      (uint32_t)((len + 4095U) / 4096U));
+        vfs_kernel_file_free(value,len);
         return false;
     }
     for (size_t i = 0; i < len; ++i) {
         if (value[i] != expected[i]) {
-            mm_free_pages(mm_virt_to_phys(value),
-                          (uint32_t)((len + 4095U) / 4096U));
+            vfs_kernel_file_free(value,len);
             return false;
         }
     }
-    mm_free_pages(mm_virt_to_phys(value),
-                  (uint32_t)((len + 4095U) / 4096U));
+    vfs_kernel_file_free(value,len);
     return true;
 }
 
@@ -583,6 +599,31 @@ bool kernel_debug_boot_requested(void)
 {
     bool marked = debug_consume_boot_marker();
     return marked && debug_file_exists(KERNEL_DEBUG_ENABLED_PATH);
+}
+
+/** @brief Run the original one-shot boot-control checkpoint on the real root.
+ * @param task Committed PID1, borrowed under execution ownership; nullable.
+ * @return None. The ELF scratch lock must be released. Only newc boots defer
+ * this step; initial /init/interpreter execs still on tmpfs cannot consume it.
+ * ESP adoption keeps only dev_t and every diagnostic/read path retires. Debug
+ * callbacks run with synchronous storage and no graph/module/loader lock held.
+ */
+void kernel_debug_finish_initramfs_boot(struct task *task)
+{
+    static bool completed;
+    if(completed || !task || task->pid!=1 || !storage_initramfs_active())return;
+    const struct storage_node *root=vfs_path_node(&sched_task_paths(task)->root);
+    if(!root || (root->flags&STORAGE_NODE_FLAG_TMPFS))return;
+    completed=true;
+    int rc=storage_bind_boot_esp();
+    if(rc) {
+        if(rc!=-2 && rc!=-19)console_warn("[boot] deferred ESP binding failed ret=%d\n",rc);
+        return;
+    }
+    if(kernel_debug_boot_requested()) {
+        console_info("[boot] entering deferred kernel debug session before real init\n");
+        (void)kernel_debug_run_module();
+    }
 }
 
 static uint64_t debug_rdtsc(void)
@@ -854,7 +895,7 @@ int kernel_debug_run_module(void)
         .reboot = power_reboot,
         .shutdown = power_shutdown,
     };
-    int ret = storage_read_file(KERNEL_DEBUG_MODULE_PATH, &image, &len);
+    int ret = vfs_kernel_read_file(vfs_system_namespace(),KERNEL_DEBUG_MODULE_PATH, &image, &len);
     if (ret < 0) {
         console_warn("[reliefnt] kernel debug module missing ret=%d\n", ret);
         debug_write("\033[31mKernel debug module missing.\033[0m\n");
@@ -866,7 +907,7 @@ int kernel_debug_run_module(void)
         console_error("[reliefnt] kernel debug module rejected or failed ret=%d\n", ret);
         debug_write("\033[31mKernel debug module rejected or failed.\033[0m\n");
     }
-    mm_free_pages(mm_virt_to_phys(image), (uint32_t)((len + 4095U) / 4096U));
+    vfs_kernel_file_free(image,len);
     if (ret < 0) {
         debug_menu();
         return 0;

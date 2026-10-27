@@ -13,6 +13,7 @@
 
 struct task;
 struct storage_node;
+struct vfs_path;
 
 /* Serialize executable and lazy file-backed page loading.  The storage
  * backend and ELF parser both contain shared state and are not reentrant. */
@@ -31,8 +32,7 @@ void userland_enter_first(void) __attribute__((noreturn));
 void userland_process_exit(uint64_t code);
 /**
  * @brief Replaces the current process image while preserving its PID and process attributes.
- * @param path Resolved executable path.
- * @param held Resolved executable object under the execution transaction.
+ * @param image Borrowed actual executable path retaining its provider.
  * @param execfn Original executable filename for AT_EXECFN.
  * @param argc Number of kernel-copied argv entries.
  * @param argv Kernel-owned argv pointers into data.
@@ -40,9 +40,11 @@ void userland_process_exit(uint64_t code);
  * @param envp Kernel-owned envp pointers into data.
  * @param data Packed NUL-terminated argument and environment strings.
  * @param data_len Number of valid data bytes.
- * @return Zero on success, or a negative errno-style failure with the old image intact.
+ * @return Zero on success, or negative errno with the old image intact.
+ * Caller owns execution; temporary MM/root/cwd references retire on failure.
+ * Diagnostic names never reopen the image or authorize metadata callbacks.
  */
-int userland_exec_current_node(const char *path, const struct storage_node *held, const char *execfn,
+int userland_exec_current_path(const struct vfs_path *image,const char *execfn,
                                uint32_t argc, char *const argv[],
                                uint32_t envc, char *const envp[],
                                const char *data, uint32_t data_len);
@@ -94,10 +96,5 @@ int64_t userland_spawn_path_argv_for_user(const char *path,
  */
 const char *userland_boot_cmdline(void);
 struct task *userland_schedule_from_frame(struct trap_frame *frame);
-/**
- * @brief List up to capacity entries of path into entries; count in out_count.
- */
-int userland_list_dir(const char *path, struct reliefos_dir_entry *entries,
-                      uint32_t capacity, uint32_t *out_count);
 
 #endif

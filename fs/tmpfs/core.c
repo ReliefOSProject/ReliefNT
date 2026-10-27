@@ -5,6 +5,7 @@
 #include <reliefnt/page_cache.h>
 #include <reliefnt/sched.h>
 #include <linux/mount.h>
+#include <linux/limits.h>
 
 #define TMPFS_PAGE 4096u
 #define TMPFS_HASH 64u
@@ -55,6 +56,12 @@ static struct tmpfs_inode *tmpfs_inode(struct tmpfs_super *fs, uint32_t ino)
             return n;
     return NULL;
 }
+/** @brief Describe one live memory inode without confusing rdev with inode ID.
+ * @param fs Borrowed serialized filesystem. @param n Borrowed live inode.
+ * @param out Optional metadata output; receives no owned inode hold.
+ * @return None. Device inodes retain first_cluster as inode identity and mark
+ * their independent stat rdev for device-open resolution. No locks/I/O.
+ */
 static void tmpfs_node(struct tmpfs_super *fs, struct tmpfs_inode *n, struct storage_node *out)
 {
     if (!out)
@@ -66,10 +73,13 @@ static void tmpfs_node(struct tmpfs_super *fs, struct tmpfs_inode *n, struct sto
                               .size = n->stat.st_size,
                               .flags = STORAGE_NODE_FLAG_TMPFS | (n == fs->root ? STORAGE_NODE_FLAG_ROOT : 0),
                               .type = mode == LINUX_S_IFDIR    ? RELIEFOS_FS_TYPE_DIR
+                                      : mode == LINUX_S_IFCHR || mode == LINUX_S_IFBLK ? RELIEFOS_FS_TYPE_DEVICE
                                       : mode == LINUX_S_IFLNK  ? RELIEFOS_FS_TYPE_SYMLINK
                                       : mode == LINUX_S_IFIFO  ? RELIEFOS_FS_TYPE_FIFO
                                       : mode == LINUX_S_IFSOCK ? RELIEFOS_FS_TYPE_SOCKET
                                                                : RELIEFOS_FS_TYPE_FILE};
+    if(mode==LINUX_S_IFCHR || mode==LINUX_S_IFBLK)
+        out->flags|=STORAGE_NODE_FLAG_DEV_NODE|STORAGE_NODE_FLAG_RDEV;
 }
 static void tmpfs_free_inode(struct tmpfs_super *fs, struct tmpfs_inode *n)
 {
@@ -365,6 +375,20 @@ int tmpfs_lookup(struct tmpfs_super *fs, const char *path, struct storage_node *
         tmpfs_node(fs, n, out);
     return ret;
 }
+int tmpfs_lookup_child(struct tmpfs_super *fs,uint32_t parent_ino,const char *name,
+                         struct storage_node *out)
+{
+    if (!fs || !name || !name[0] || !out) return -22;
+    for (const char *p=name;*p;++p) if (*p=='/') return -22;
+    if (!__builtin_strcmp(name,".") || !__builtin_strcmp(name,"..")) return -22;
+    struct tmpfs_inode *parent=tmpfs_inode(fs,parent_ino);
+    if (!parent) return -2;
+    if (!tmpfs_dir(parent)) return -20;
+    struct tmpfs_entry *entry=*tmpfs_find(parent,name);
+    if (!entry) return -2;
+    tmpfs_node(fs,entry->inode,out);return 0;
+}
+
 static struct tmpfs_entry *tmpfs_entry_new(struct tmpfs_inode *parent, const char *name,
                                            struct tmpfs_inode *n)
 {
@@ -391,32 +415,51 @@ static void tmpfs_attach(struct tmpfs_inode *parent, struct tmpfs_entry *e)
     }
     tmpfs_changed(parent, true);
 }
-int tmpfs_create(struct tmpfs_super *fs, const char *path, uint32_t mode, const char *target,
-                 struct storage_node *out)
+/** @brief Create one linked memory inode without reconstructing its parent path.
+ * @param fs Borrowed live filesystem under exclusive execution ownership.
+ * @param parent_ino Actual linked directory inode. @param name Literal component.
+ * @param mode Full supported inode type and permission bits, already authorized.
+ * @param target Nonempty symlink target, NULL for all other inode types.
+ * @param value Optional owner/group; NULL selects root ownership.
+ * @param out Optional borrowed metadata result, never a retained inode hold.
+ * @return Zero or negative input/type/readonly/existence/quota/allocation errno.
+ * Every failure rolls back before publication. Character/block inodes start
+ * at device zero; tmpfs_mknod_child supplies an explicit device number. No
+ * VFS routing, I/O, provider lock or reference transfer occurs.
+ */
+int tmpfs_create_child(struct tmpfs_super *fs,uint32_t parent_ino,const char *name,
+                           uint32_t mode,const char *target,const struct reliefos_permissions *value,
+                           struct storage_node *out)
 {
-    if (fs->flags & MS_RDONLY)
-        return -30;
-    struct tmpfs_inode *parent, *n;
-    char name[RELIEFOS_FS_NAME_LEN];
-    int ret = tmpfs_walk(fs, path, true, &parent, name);
-    if (ret)
-        return ret;
+    if(!fs || !name || !name[0] || !__builtin_strcmp(name,".") || !__builtin_strcmp(name,".."))return -22;
+    size_t length=0;
+    for(;name[length];++length) {
+        if(name[length]=='/')return -22;
+        if(length>=RELIEFOS_FS_NAME_LEN-1)return -36;
+    }
+    if(fs->flags&MS_RDONLY)return -30;
+    struct tmpfs_inode *parent=tmpfs_inode(fs,parent_ino),*n;
+    if(!parent)return -2;
+    if(!tmpfs_dir(parent))return -20;
     if (!parent->stat.st_nlink)
         return -2;
     if (*tmpfs_find(parent, name))
         return -17;
     uint32_t type = mode & LINUX_S_IFMT;
-    if (type != LINUX_S_IFDIR && type != LINUX_S_IFREG && type != LINUX_S_IFLNK && type != LINUX_S_IFSOCK && type != LINUX_S_IFIFO)
+    if (type != LINUX_S_IFDIR && type != LINUX_S_IFREG && type != LINUX_S_IFLNK && type != LINUX_S_IFSOCK &&
+        type != LINUX_S_IFIFO && type != LINUX_S_IFCHR && type != LINUX_S_IFBLK)
         return -95;
+    if(target && type!=LINUX_S_IFLNK)return -22;
     if (type == LINUX_S_IFLNK && (!target || !*target))
         return -2;
-    ret = tmpfs_alloc_inode(fs, mode, &n);
+    int ret = tmpfs_alloc_inode(fs, mode, &n);
     if (ret)
         return ret;
     n->parent = parent;
+    if(value){n->stat.st_uid=value->uid;n->stat.st_gid=value->gid;}
     if (target) {
         size_t length = __builtin_strlen(target);
-        if (length >= RELIEFOS_FS_PATH_LEN) {
+        if (length >= LINUX_PATH_MAX) {
             tmpfs_free_inode(fs, n);
             return -36;
         }
@@ -437,6 +480,54 @@ int tmpfs_create(struct tmpfs_super *fs, const char *path, uint32_t mode, const 
     tmpfs_node(fs, n, out);
     return 0;
 }
+/** @brief Create an authorized special inode and assign its independent rdev.
+ * @param fs Borrowed serialized filesystem. @param parent_ino Linked directory.
+ * @param name Literal component. @param mode S_IFCHR/S_IFBLK plus permissions.
+ * @param device Encoded Linux stat device number, never a CPU/hardware pointer.
+ * @param value Optional owner/group. @param out Optional borrowed metadata.
+ * @return Zero or native creation errno. No fallible work remains after
+ * insertion; failures publish nothing, no device driver is invoked or pinned.
+ */
+int tmpfs_mknod_child(struct tmpfs_super *fs,uint32_t parent_ino,const char *name,
+                         uint32_t mode,uint64_t device,const struct reliefos_permissions *value,
+                         struct storage_node *out)
+{
+    uint32_t type=mode&LINUX_S_IFMT;
+    if(type!=LINUX_S_IFCHR && type!=LINUX_S_IFBLK)return -22;
+    struct storage_node node;int rc=tmpfs_create_child(fs,parent_ino,name,mode,NULL,value,&node);
+    if(rc)return rc;
+    tmpfs_inode(fs,node.first_cluster)->stat.st_rdev=device;
+    if(out)*out=node;return 0;
+}
+/** @brief Replace one unpublished symlink payload without losing hardlink identity.
+ * @param fs Borrowed serialized filesystem. @param ino Shared symlink inode.
+ * @param target Borrowed nonempty NUL-terminated target shorter than PATH_MAX.
+ * @return Zero or EINVAL/ENOENT/EROFS/ENAMETOOLONG/ENOMEM. Failure retains old
+ * bytes/metadata, success changes shared payload and timestamps. Construction
+ * must own the entire private filesystem; no VFS routing, locks or I/O occur.
+ */
+int tmpfs_rewrite_symlink(struct tmpfs_super *fs,uint32_t ino,const char *target)
+{
+    if(!fs || !target || !target[0])return -22;
+    if(fs->flags&MS_RDONLY)return -30;
+    struct tmpfs_inode *n=tmpfs_inode(fs,ino);if(!n)return -2;
+    if((n->stat.st_mode&LINUX_S_IFMT)!=LINUX_S_IFLNK)return -22;
+    size_t length=0;while(length<LINUX_PATH_MAX && target[length])++length;
+    if(length>=LINUX_PATH_MAX)return -36;
+    char *copy=kernel_malloc(length+1);if(!copy)return -12;
+    __builtin_memcpy(copy,target,length+1);kernel_free(n->target);n->target=copy;
+    n->stat.st_size=length;tmpfs_changed(n,true);return 0;
+}
+int tmpfs_create(struct tmpfs_super *fs,const char *path,uint32_t mode,const char *target,
+                    struct storage_node *out)
+{
+    if(!fs || !path)return -22;
+    if(fs->flags&MS_RDONLY)return -30;
+    struct tmpfs_inode *parent;char name[RELIEFOS_FS_NAME_LEN];
+    int ret=tmpfs_walk(fs,path,true,&parent,name);if(ret)return ret;
+    return tmpfs_create_child(fs,(uint32_t)parent->stat.st_ino,name,mode,target,NULL,out);
+}
+
 static struct tmpfs_page *tmpfs_page_find(struct tmpfs_inode *n, uint64_t index)
 {
     for (struct tmpfs_page *p = n->pages[index % TMPFS_HASH]; p; p = p->next)
@@ -444,30 +535,88 @@ static struct tmpfs_page *tmpfs_page_find(struct tmpfs_inode *n, uint64_t index)
             return p;
     return NULL;
 }
-static int tmpfs_page_get(struct tmpfs_super *fs, struct tmpfs_inode *n, uint64_t index,
-                          struct tmpfs_page **out)
+/** @brief Allocate one zeroed, quota-accounted page without publishing it.
+ * @param fs Borrowed serialized filesystem.
+ * @param n Borrowed owning inode; block accounting changes on success.
+ * @param index Logical page index, not already allocated by this caller.
+ * @param out Receives one page owned by the caller until attached or freed.
+ * @return Zero or ENOSPC/ENOMEM with accounting unchanged on failure.
+ */
+static int tmpfs_page_allocate(struct tmpfs_super *fs,struct tmpfs_inode *n,uint64_t index,
+                                 struct tmpfs_page **out)
 {
-    struct tmpfs_page *p = tmpfs_page_find(n, index);
+    if (fs->max_pages && fs->used_pages >= fs->max_pages) return -28;
+    struct tmpfs_page *p=kernel_malloc(sizeof(*p));
+    if (!p) return -12;
+    p->phys=mm_alloc_page();
+    if (!p->phys) {kernel_free(p);return -12;}
+    __builtin_memset(mm_phys_to_virt(p->phys),0,TMPFS_PAGE);
+    p->index=index;p->next=NULL;
+    ++fs->used_pages;n->stat.st_blocks+=TMPFS_PAGE/512;
+    *out=p;return 0;
+}
+/** @brief Find or publish one quota-accounted file page.
+ * @param fs Borrowed serialized filesystem.
+ * @param n Borrowed live regular inode.
+ * @param index Logical page index.
+ * @param out Receives a borrowed inode-owned page, no physical retain.
+ * @return Zero or allocation errno; existing page contents are unchanged.
+ */
+static int tmpfs_page_get(struct tmpfs_super *fs,struct tmpfs_inode *n,uint64_t index,
+                            struct tmpfs_page **out)
+{
+    struct tmpfs_page *p=tmpfs_page_find(n,index);
     if (!p) {
-        if (fs->max_pages && fs->used_pages >= fs->max_pages)
-            return -28;
-        p = kernel_malloc(sizeof(*p));
-        if (!p)
-            return -12;
-        p->phys = mm_alloc_page();
-        if (!p->phys) {
-            kernel_free(p);
-            return -12;
-        }
-        __builtin_memset(mm_phys_to_virt(p->phys), 0, TMPFS_PAGE);
-        p->index = index;
+        int rc=tmpfs_page_allocate(fs,n,index,&p);if(rc)return rc;
         p->next = n->pages[index % TMPFS_HASH];
         n->pages[index % TMPFS_HASH] = p;
-        ++fs->used_pages;
-        n->stat.st_blocks += TMPFS_PAGE / 512;
     }
     *out = p;
     return 0;
+}
+/** @brief Reserve real regular-file pages as one rollback-safe transaction.
+ * @param fs Borrowed live filesystem, serialized by its caller.
+ * @param ino Existing held or linked inode number.
+ * @param mode Zero or Linux FALLOC_FL_KEEP_SIZE (1).
+ * @param offset Start byte within signed-off_t range.
+ * @param length Positive range length; end must also fit signed off_t.
+ * @return Zero or negative type/range/quota/allocation/readonly errno. New
+ * pages are private until all allocation succeeds. Old bytes, size and page
+ * identities survive failure, and success needs no future allocation for
+ * writes into the reserved range. No namespace lookup or lock across work.
+ */
+int tmpfs_fallocate(struct tmpfs_super *fs,uint32_t ino,uint32_t mode,uint64_t offset,uint64_t length)
+{
+    if(!fs || !length)return -22;
+    if(mode&~1u)return -95;
+    if(offset>INT64_MAX || length>(uint64_t)INT64_MAX-offset)return -27;
+    if(fs->flags&MS_RDONLY)return -30;
+    struct tmpfs_inode *n=tmpfs_inode(fs,ino);
+    if(!n)return -2;
+    if((n->stat.st_mode&LINUX_S_IFMT)!=LINUX_S_IFREG)return tmpfs_dir(n) ? -21 : -22;
+    uint64_t end=offset+length,first=offset/TMPFS_PAGE,last=(end+TMPFS_PAGE-1)/TMPFS_PAGE;
+    if(fs->max_pages && last-first>fs->max_pages)return -28;
+    struct tmpfs_page *pending=NULL;int rc=0;
+    for(uint64_t index=first;index<last;++index) {
+        if(tmpfs_page_find(n,index))continue;
+        struct tmpfs_page *page=NULL;
+        rc=tmpfs_page_allocate(fs,n,index,&page);if(rc)break;
+        page->next=pending;pending=page;
+    }
+    while(pending) {
+        struct tmpfs_page *page=pending;pending=page->next;
+        if(rc) {
+            mm_free_page(page->phys);kernel_free(page);
+            --fs->used_pages;n->stat.st_blocks-=TMPFS_PAGE/512;
+        } else {
+            page->next=n->pages[page->index%TMPFS_HASH];n->pages[page->index%TMPFS_HASH]=page;
+        }
+    }
+    if(!rc) {
+        if(!mode && end>(uint64_t)n->stat.st_size)n->stat.st_size=end;
+        tmpfs_changed(n,true);
+    }
+    return rc;
 }
 int tmpfs_get_page(struct tmpfs_super *fs, uint32_t ino, uint64_t offset, uint64_t *phys)
 {
@@ -485,8 +634,35 @@ int tmpfs_get_page(struct tmpfs_super *fs, uint32_t ino, uint64_t offset, uint64
     *phys = p->phys;
     return 0;
 }
-int tmpfs_read(struct tmpfs_super *fs, uint32_t ino, uint64_t offset, void *buffer, uint32_t length,
-               uint32_t *done)
+/** @brief Mark one successful inode access using only the selected mount policy.
+ * @param inode Borrowed live inode under execution ownership, required.
+ * @param flags Effective attachment/SB flags for this access.
+ * @return None. Readonly/noatime/nodiratime suppress changes. Relatime updates
+ * for older access time or a full day; strict access uses current whole-second
+ * filesystem resolution. Pure metadata update, no allocation/I/O/ownership change.
+ */
+static void tmpfs_mark_access(struct tmpfs_inode *inode,uint64_t flags)
+{
+    if(flags&(MS_NOATIME|MS_RDONLY))return;
+    if(tmpfs_dir(inode) && (flags&MS_NODIRATIME))return;
+    int64_t now=tmpfs_now();
+    if(!(flags&MS_RELATIME) || inode->stat.atime_sec<=inode->stat.mtime_sec ||
+       inode->stat.atime_sec<=inode->stat.ctime_sec ||
+       (now>=inode->stat.atime_sec && (uint64_t)now-(uint64_t)inode->stat.atime_sec>=86400))
+        inode->stat.atime_sec=now;
+}
+
+/** @brief Read retained RAM pages with attachment-local access-time policy.
+ * @param fs Borrowed live filesystem under execution ownership.
+ * @param ino Actual regular inode, including a held unlinked inode.
+ * @param offset Byte position. @param buffer Destination, NULL only at length0.
+ * @param length Requested bytes. @param done Optional completed count output.
+ * @param mount_flags Current attachment policy combined with shared readonly.
+ * @return Zero or negative inode/type/input errno; no allocation or disk I/O.
+ * Returned data and atime belong to this inode, without shared flag mutation.
+ */
+int tmpfs_read_with_flags(struct tmpfs_super *fs, uint32_t ino, uint64_t offset, void *buffer, uint32_t length,
+                            uint32_t *done,uint64_t mount_flags)
 {
     uint32_t total = 0;
     if (done)
@@ -514,16 +690,21 @@ int tmpfs_read(struct tmpfs_super *fs, uint32_t ino, uint64_t offset, void *buff
             __builtin_memset((uint8_t *)buffer + total, 0, take);
         total += take;
     }
-    if (length && !(fs->flags & (MS_NOATIME | MS_RDONLY))) {
-        int64_t now = tmpfs_now();
-        if (!(fs->flags & MS_RELATIME) || n->stat.atime_sec <= n->stat.mtime_sec ||
-            n->stat.atime_sec <= n->stat.ctime_sec || now - n->stat.atime_sec >= 86400)
-            n->stat.atime_sec = now;
-    }
+    if(length)tmpfs_mark_access(n,mount_flags);
     if (done)
         *done = total;
     return 0;
 }
+/** @brief Read an anonymous/raw inode using its filesystem's default policy.
+ * @param fs Borrowed filesystem under execution ownership, nullable on error.
+ * @param ino Retained regular inode. @param offset Byte position.
+ * @param buffer Destination, NULL only at length0. @param length Requested bytes.
+ * @param done Optional completed count output.
+ * @return Zero or negative inode/type/input errno, no allocation or I/O. This
+ * entry serves anonymous/raw users; mounted paths pass their own policy above.
+ */
+int tmpfs_read(struct tmpfs_super *fs,uint32_t ino,uint64_t offset,void *buffer,uint32_t length,uint32_t *done)
+{return tmpfs_read_with_flags(fs,ino,offset,buffer,length,done,fs ? fs->flags : 0);}
 int tmpfs_write(struct tmpfs_super *fs, uint32_t ino, uint64_t offset, const void *buffer, uint32_t length,
                 uint32_t *done)
 {
@@ -640,13 +821,32 @@ static void tmpfs_remove(struct tmpfs_super *fs, struct tmpfs_inode *parent, str
     if (!n->refs && !n->stat.st_nlink)
         tmpfs_free_inode(fs, n);
 }
-int tmpfs_unlink(struct tmpfs_super *fs, const char *path, bool directory)
+/** @brief Validate one mutation component and select its exact parent inode.
+ * @param fs Borrowed live filesystem under execution ownership.
+ * @param ino Parent inode number whose backing lifetime the caller retains.
+ * @param name Single non-special component.
+ * @param out Borrowed directory pointer on success.
+ * @return Zero or negative errno, without allocation or reference changes.
+ */
+static int tmpfs_mutation_parent(struct tmpfs_super *fs,uint32_t ino,const char *name,struct tmpfs_inode **out)
 {
+    if(!fs || !name || !name[0] || !__builtin_strcmp(name,".") || !__builtin_strcmp(name,".."))return -22;
+    for(size_t i=0;name[i];++i) {
+        if(name[i]=='/')return -22;
+        if(i>=RELIEFOS_FS_NAME_LEN-1)return -36;
+    }
+    struct tmpfs_inode *parent=tmpfs_inode(fs,ino);
+    if(!parent || !parent->stat.st_nlink)return -2;
+    if(!tmpfs_dir(parent))return -20;
+    *out=parent;return 0;
+}
+int tmpfs_unlink_child(struct tmpfs_super *fs,uint32_t parent_ino,const char *name,bool directory)
+{
+    if (!fs)return -22;
     if (fs->flags & MS_RDONLY)
         return -30;
-    char name[RELIEFOS_FS_NAME_LEN];
     struct tmpfs_inode *parent;
-    int ret = tmpfs_walk(fs, path, true, &parent, name);
+    int ret = tmpfs_mutation_parent(fs,parent_ino,name,&parent);
     if (ret)
         return ret;
     struct tmpfs_entry **link = tmpfs_find(parent, name);
@@ -660,20 +860,27 @@ int tmpfs_unlink(struct tmpfs_super *fs, const char *path, bool directory)
     tmpfs_remove(fs, parent, link);
     return 0;
 }
-int tmpfs_link(struct tmpfs_super *fs, const char *old_path, const char *new_path)
+int tmpfs_unlink(struct tmpfs_super *fs,const char *path,bool directory)
 {
+    if(!fs)return -22;
+    if(fs->flags&MS_RDONLY)return -30;
+    char name[RELIEFOS_FS_NAME_LEN];struct tmpfs_inode *parent;
+    int ret=tmpfs_walk(fs,path,true,&parent,name);
+    return ret ? ret : tmpfs_unlink_child(fs,(uint32_t)parent->stat.st_ino,name,directory);
+}
+int tmpfs_link_child(struct tmpfs_super *fs,uint32_t ino,uint32_t parent_ino,const char *name)
+{
+    if(!fs)return -22;
     if (fs->flags & MS_RDONLY)
         return -30;
-    char name[RELIEFOS_FS_NAME_LEN];
-    struct tmpfs_inode *n, *parent;
-    int ret = tmpfs_walk(fs, old_path, false, &n, NULL);
+    struct tmpfs_inode *parent;
+    int ret=tmpfs_mutation_parent(fs,parent_ino,name,&parent);
     if (ret)
         return ret;
+    struct tmpfs_inode *n=tmpfs_inode(fs,ino);
+    if(!n || !n->stat.st_nlink)return -2;
     if (tmpfs_dir(n))
         return -1;
-    ret = tmpfs_walk(fs, new_path, true, &parent, name);
-    if (ret)
-        return ret;
     if (*tmpfs_find(parent, name))
         return -17;
     if (n->stat.st_nlink >= UINT32_MAX)
@@ -690,16 +897,27 @@ int tmpfs_link(struct tmpfs_super *fs, const char *old_path, const char *new_pat
     tmpfs_changed(n, false);
     return 0;
 }
-int tmpfs_rename(struct tmpfs_super *fs, const char *old_path, const char *new_path)
+int tmpfs_link(struct tmpfs_super *fs,const char *old_path,const char *new_path)
 {
+    if(!fs)return -22;
+    if(fs->flags&MS_RDONLY)return -30;
+    char name[RELIEFOS_FS_NAME_LEN];struct tmpfs_inode *node,*parent;
+    int ret=tmpfs_walk(fs,old_path,false,&node,NULL);
+    if(!ret && tmpfs_dir(node))ret=-1;
+    if(!ret)ret=tmpfs_walk(fs,new_path,true,&parent,name);
+    return ret ? ret : tmpfs_link_child(fs,(uint32_t)node->stat.st_ino,(uint32_t)parent->stat.st_ino,name);
+}
+int tmpfs_rename_child(struct tmpfs_super *fs,uint32_t old_parent_ino,const char *old_name,
+                         uint32_t new_parent_ino,const char *new_name)
+{
+    if(!fs)return -22;
     if (fs->flags & MS_RDONLY)
         return -30;
-    char old_name[RELIEFOS_FS_NAME_LEN], new_name[RELIEFOS_FS_NAME_LEN];
     struct tmpfs_inode *old_parent, *new_parent;
-    int ret = tmpfs_walk(fs, old_path, true, &old_parent, old_name);
+    int ret=tmpfs_mutation_parent(fs,old_parent_ino,old_name,&old_parent);
     if (ret)
         return ret;
-    ret = tmpfs_walk(fs, new_path, true, &new_parent, new_name);
+    ret=tmpfs_mutation_parent(fs,new_parent_ino,new_name,&new_parent);
     if (ret)
         return ret;
     struct tmpfs_entry **old = tmpfs_find(old_parent, old_name), **dest = tmpfs_find(new_parent, new_name);
@@ -740,7 +958,26 @@ int tmpfs_rename(struct tmpfs_super *fs, const char *old_path, const char *new_p
     tmpfs_changed(n, false);
     return 0;
 }
-int tmpfs_readdir(struct tmpfs_super *fs, uint32_t ino, uint64_t *offset, struct reliefos_dir_entry *out)
+int tmpfs_rename(struct tmpfs_super *fs,const char *old_path,const char *new_path)
+{
+    if(!fs)return -22;
+    if(fs->flags&MS_RDONLY)return -30;
+    char old_name[RELIEFOS_FS_NAME_LEN],new_name[RELIEFOS_FS_NAME_LEN];
+    struct tmpfs_inode *old_parent,*new_parent;
+    int ret=tmpfs_walk(fs,old_path,true,&old_parent,old_name);
+    if(!ret)ret=tmpfs_walk(fs,new_path,true,&new_parent,new_name);
+    return ret ? ret : tmpfs_rename_child(fs,(uint32_t)old_parent->stat.st_ino,old_name,
+        (uint32_t)new_parent->stat.st_ino,new_name);
+}
+/** @brief Return one real directory entry with the selected attachment's policy.
+ * @param fs Borrowed live filesystem under execution ownership.
+ * @param ino Linked directory inode. @param offset Required opaque cursor.
+ * @param out Required entry destination. @param mount_flags Effective access flags.
+ * @return One entry, zero EOF or negative inode/type errno. Successful entries
+ * mark atime unless readonly/noatime/nodiratime; no allocation/I/O or flag mutation.
+ */
+int tmpfs_readdir_with_flags(struct tmpfs_super *fs, uint32_t ino, uint64_t *offset, struct reliefos_dir_entry *out,
+                               uint64_t mount_flags)
 {
     struct tmpfs_inode *n = tmpfs_inode(fs, ino);
     if (!n)
@@ -770,8 +1007,18 @@ int tmpfs_readdir(struct tmpfs_super *fs, uint32_t ino, uint64_t *offset, struct
     __builtin_memset(out, 0, sizeof(*out));
     out->type = node.type;
     __builtin_memcpy(out->name, name, __builtin_strlen(name) + 1);
+    tmpfs_mark_access(n,mount_flags);
     return 1;
 }
+/** @brief Enumerate a raw directory using its filesystem's default policy.
+ * @param fs Borrowed live filesystem under execution ownership.
+ * @param ino Linked directory inode. @param offset Required cursor.
+ * @param out Required entry output.
+ * @return One entry, zero EOF or negative inode/type errno. No allocation/I/O;
+ * mounted paths use the explicit-policy entry above. No ownership transfer.
+ */
+int tmpfs_readdir(struct tmpfs_super *fs,uint32_t ino,uint64_t *offset,struct reliefos_dir_entry *out)
+{return tmpfs_readdir_with_flags(fs,ino,offset,out,fs ? fs->flags : 0);}
 int tmpfs_readlink(struct tmpfs_super *fs, uint32_t ino, void *buffer, uint32_t length, uint32_t *done)
 {
     if (done)

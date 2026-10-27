@@ -19,7 +19,7 @@
 #include <linux/errno.h>
 #include <reliefnt/time.h>
 #include <reliefnt/power.h>
-#include <reliefnt/drm.h>
+#include <reliefnt/graphics_service.h>
 
 static struct kernel_signal_action *signal_action(struct task *task, int sig)
 {
@@ -217,6 +217,17 @@ int kernel_signal_queue_task_info(struct task *task, int signal_number,
     return 0;
 }
 
+/** @brief Build a user handler frame and settle interrupted syscall progress.
+ * @param task Current task with execution ownership and a stable destination MM.
+ * @param sig Validated Linux signal number whose handler is being installed.
+ * @param action Borrowed disposition, required with a user handler/restorer.
+ * @param frame Saved user registers, updated only after a complete frame copy.
+ * @param info Borrowed validated signal information for the native ABI frame.
+ * @return Zero after installing the handler context, or negative input/stack/
+ * usercopy errno. Interrupted copy/read/message progress survives cleanup;
+ * restartable zero-progress calls retain their instruction when appropriate.
+ * Drains and final resource puts require no scheduler/graph/module spinlock.
+ */
 static int signal_setup_frame(struct task *task, int sig,
                               struct kernel_signal_action *action,
                               struct trap_frame *frame, const struct linux_siginfo *info)
@@ -261,7 +272,8 @@ static int signal_setup_frame(struct task *task, int sig,
         bool interruptible = task->fifo_open_file != NULL || nr == __NR_read || nr == __NR_write || nr == __NR_readv ||
             nr == __NR_pread64 || nr == __NR_pwrite64 ||
             nr == __NR_preadv || nr == __NR_preadv2 || nr == __NR_pwritev || nr == __NR_pwritev2 ||
-            nr == __NR_writev || nr == __NR_recvfrom || nr == __NR_sendto ||
+            nr == __NR_writev || nr == __NR_sendfile || nr == __NR_copy_file_range ||
+            nr == __NR_recvfrom || nr == __NR_sendto ||
             nr == __NR_recvmsg || nr == __NR_sendmsg || nr == __NR_accept ||
             nr == __NR_recvmmsg || nr == __NR_sendmmsg ||
             nr == __NR_accept4 || nr == __NR_connect || nr == __NR_futex || nr == __NR_futex_wait ||
@@ -277,7 +289,7 @@ static int signal_setup_frame(struct task *task, int sig,
             nr != __NR_poll && nr != __NR_ppoll && nr != __NR_epoll_wait && nr != __NR_epoll_pwait &&
             nr != __NR_epoll_pwait2 && nr != __NR_select && nr != __NR_pselect6 && nr != __NR_rt_sigtimedwait && !sleeping &&
             !(nr == __NR_futex && frame->r10) && !task->socket_io_timed;
-        bool synccpu_busy = drm_vmwgfx_task_signal_busy(task);
+        bool synccpu_busy = graphics_service_task_signal_busy(task);
         if (synccpu_busy) restart = false;
         uint64_t received = task->socket_receive_done;
         bool batch = task->mmsg.active;
@@ -285,12 +297,16 @@ static int signal_setup_frame(struct task *task, int sig,
         received = task_socket_cancel_receive(task);
         if (task->regular_io.active) {
             received = task->regular_io.done;
-            storage_drain_task_io(task->pid);
         }
+        uint64_t vector_received=task_vector_progress(task);
+        if(vector_received)received=vector_received;
+        int64_t transfer_result=task->transfer_io ? task_transfer_interrupt(task) : 0;
+        if(transfer_result>0)received=(uint64_t)transfer_result;
         task_release_syscall_file(task);
-        if (received || (batch && batch_result != -LINUX_EINTR) || (interruptible && !restart)) {
+        if (received || transfer_result<0 || (batch && batch_result != -LINUX_EINTR) || (interruptible && !restart)) {
             frame->rip += 2;
             frame->rax = synccpu_busy ? (uint64_t)-LINUX_EBUSY :
+                transfer_result<0 ? (uint64_t)transfer_result :
                 batch ? (uint64_t)batch_result : received ? received : (uint64_t)-4LL;
             task->poll_deadline_ticks = 0;
         }
@@ -380,7 +396,7 @@ static int signal_deliver_pending_locked(struct task *task, struct trap_frame *f
     /* A direct delivery or RMID result precedes signal_pending in ipc/msg.c. */
     if (task->restart_syscall && task->sysv_msg.completed) return 0;
     if (task->restart_syscall && task_sysv_sem_ready(task)) return 0;
-    if (drm_vmwgfx_task_uninterruptible(task)) return 0;
+    if (graphics_service_task_uninterruptible(task)) return 0;
     int sig;
     while ((sig = kernel_signal_dequeue(task, ~(task->blocked_signals | task->sigwait_mask), &info))) {
         uint64_t bit = 1ULL << (uint32_t)(sig - 1);

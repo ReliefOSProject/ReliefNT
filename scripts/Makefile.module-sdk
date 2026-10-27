@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: Apache-2.0
+# Read-only prepared tree entry; compilation remains original Linux Kbuild.
+RELIEFNT_SRC := $(patsubst %/,%,$(dir $(realpath $(firstword $(MAKEFILE_LIST)))))
+override O := $(RELIEFNT_SRC)
+include $(RELIEFNT_SRC)/sdk-config.mk
+ARCH ?= $(SDK_ARCH)
+PROFILE ?= $(SDK_PROFILE)
+ifneq ($(ARCH):$(PROFILE),$(SDK_ARCH):$(SDK_PROFILE))
+$(error prepared SDK architecture/profile policy mismatch)
+endif
+ifneq ($(words $(RELIEFNT_SRC)),1)
+$(error Linux Kbuild requires a prepared SDK path without whitespace)
+endif
+TRIPLE_KERNEL := $(SDK_TRIPLE)
+TARGET_CC := $(if $(filter command line,$(origin CC)),$(CC),$(SDK_CC))
+TARGET_AR := $(if $(filter command line,$(origin AR)),$(AR),$(SDK_AR))
+TARGET_LD := $(if $(filter command line,$(origin LD)),$(LD),$(SDK_LD))
+TARGET_OBJCOPY := $(if $(filter command line,$(origin OBJCOPY)),$(OBJCOPY),$(SDK_OBJCOPY))
+TARGET_NM := $(if $(filter command line,$(origin NM)),$(NM),$(SDK_NM))
+TARGET_STRIP := $(if $(filter command line,$(origin STRIP)),$(STRIP),$(SDK_STRIP))
+KERNEL_CFLAGS ?= $(SDK_CFLAGS)
+KERNEL_AFLAGS ?= $(SDK_AFLAGS)
+KERNEL_LDFLAGS ?= $(SDK_LDFLAGS)
+ifneq ($(KERNEL_CFLAGS):$(KERNEL_AFLAGS):$(KERNEL_LDFLAGS),$(SDK_CFLAGS):$(SDK_AFLAGS):$(SDK_LDFLAGS))
+$(error prepared SDK compiler policy mismatch)
+endif
+HOSTCC ?= cc
+HOST_CFLAGS ?= -O2 -g
+V ?= 0
+Q := $(if $(filter 1,$(V)),,@)
+SOURCE_DATE_EPOCH := 0
+INSTALL_MOD_PATH ?= $(abspath $(M))/module-install
+include $(RELIEFNT_SRC)/scripts/Makefile.reliefnt
+RELIEFNT_SOURCE_ID := $(SDK_SOURCE_ID)
+.DEFAULT_GOAL := $(if $(strip $(M)),modules,help)
+.SUFFIXES:
+.DELETE_ON_ERROR:
+.PHONY: help check modules modules_prepare modules_install kernelrelease
+help:
+	@printf '%s\n' 'Prepared ReliefNT module SDK: make M=/absolute/module/directory [modules|modules_install]' \
+	    'kernelrelease prints the pinned native release; the SDK never rebuilds a kernel.'
+check:
+	$(Q)test -n '$(M)' || { echo 'M= must identify an external module directory' >&2; exit 2; }
+	$(Q)cd '$(O)' && sha256sum -c .reliefnt-sdk-manifest >/dev/null || \
+	    { echo 'modified prepared SDK: export a matching SDK from the kernel build' >&2; exit 1; }
+	$(Q)grep -q '^CONFIG_MODULES=y$$' '$(O)/.config'
+	$(Q)set -eu; \
+	    test "$$(sh '$(O)/scripts/tool-identity.sh' $(TARGET_CC))" = "$$(cat '$(RELIEFNT_TARGET_CC_ID)')" && \
+	    test "$$(sh '$(O)/scripts/tool-identity.sh' $(TARGET_AR))" = "$$(cat '$(RELIEFNT_TARGET_AR_ID)')" && \
+	    test "$$(sh '$(O)/scripts/tool-identity.sh' $(TARGET_LD))" = "$$(cat '$(RELIEFNT_TARGET_LD_ID)')" && \
+	    test "$$(sh '$(O)/scripts/tool-identity.sh' $(TARGET_OBJCOPY))" = "$$(cat '$(RELIEFNT_TARGET_OBJCOPY_ID)')" || \
+	    { echo 'prepared SDK toolchain identity mismatch' >&2; exit 1; }
+modules_prepare: check
+modules: check
+	+$(Q)$(call RELIEFNT_KBUILD,obj=$(abspath $(M)) KBUILD_EXTMOD=$(abspath $(M)) extmod_prefix=$(abspath $(M))/ MODORDER=$(abspath $(M))/modules.order VPATH=)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=$(abspath $(M)) KBUILD_EXTMOD=$(abspath $(M)) extmod_prefix=$(abspath $(M))/ MODORDER=$(abspath $(M))/modules.order VPATH= RELIEFNT_KBUILD_FILE=scripts/Makefile.modpost)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=$(abspath $(M)) KBUILD_EXTMOD=$(abspath $(M)) extmod_prefix=$(abspath $(M))/ MODORDER=$(abspath $(M))/modules.order VPATH= RELIEFNT_KBUILD_FILE=scripts/Makefile.modfinal)
+	$(Q)sh '$(O)/scripts/modules-clean-stale.sh' '$(abspath $(M))' '$(abspath $(M))/modules.order'
+modules_install: modules
+	+$(Q)RELIEFNT_MODINST_TMP='$(abspath $(M))' sh '$(O)/scripts/modules-stage.sh' '$(O)' '$(O)' \
+	    '$(INSTALL_MOD_PATH)' "$$(cat '$(O)/include/config/kernel.release')" '$(abspath $(M))' \
+	    $(call RELIEFNT_KBUILD,RELIEFNT_KBUILD_FILE=scripts/Makefile.modinst \
+	      KBUILD_EXTMOD='$(abspath $(M))' extmod_prefix='$(abspath $(M))/' \
+	      MODORDER='$(abspath $(M))/modules.order' INSTALL_MOD_STRIP='$(INSTALL_MOD_STRIP)')
+kernelrelease:
+	@cat '$(O)/include/config/kernel.release'

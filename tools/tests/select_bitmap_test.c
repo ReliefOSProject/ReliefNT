@@ -97,25 +97,15 @@ short task_socket_poll(const struct task_file *file, short events)
 short task_inet_poll(const struct task_file *file, short events)
 { (void)file; (void)events; return 0; }
 void task_timerfd_update(struct task_timerfd *timer) { (void)timer; }
-uint32_t drm_file_poll(struct task_file *file, uint32_t events)
-{ (void)file; (void)events; return 0; }
-uint32_t drm_prime_file_poll(const struct task_file *file, uint32_t events)
-{ (void)file; (void)events; return 0; }
+/* Select fixture has no character providers; generic routing is tested
+ * elsewhere, so reaching a provider here must fail instead of faking readiness. */
+short character_file_poll(struct character_file *handle,struct task_file *file,short events)
+{(void)handle;(void)file;(void)events;assert(!"unexpected character provider");return 0;}
 void task_evdev_bind_vt(struct task *task, struct task_file *file)
 { (void)task; (void)file; }
 int input_evdev_available_vt(uint32_t device_kind, uint64_t cursor,
                              uint64_t grab_token, uint32_t vt)
 { (void)device_kind; (void)cursor; (void)grab_token; (void)vt; return 0; }
-short audio_mixer_poll(const struct task_file *file, short events)
-{ (void)file; (void)events; return 0; }
-short audio_device_poll(const struct task_file *file, short events)
-{ (void)file; (void)events; return 0; }
-short audio_oss_poll(const struct task_file *file, short events)
-{ (void)file; (void)events; return 0; }
-short audio_control_poll_file(const struct audio_control_file *file, short events)
-{ (void)file; (void)events; return 0; }
-short audio_timer_poll(const struct task_file *file, short events)
-{ (void)file; (void)events; return 0; }
 int task_device_is(const struct task_file *file, uint32_t kind)
 { (void)file; (void)kind; return 0; }
 int file_can_read(const struct task_file *file) { (void)file; return 1; }

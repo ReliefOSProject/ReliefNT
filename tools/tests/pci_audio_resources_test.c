@@ -1,5 +1,6 @@
 #include "audio_fixture.h"
 #include <sys/mman.h>
+#include <stdlib.h>
 #include <reliefos/driver.h>
 #undef RELIEFNT_KERNEL_DIRECT_MAP_BASE
 #define RELIEFNT_KERNEL_DIRECT_MAP_BASE 0
@@ -11,6 +12,12 @@
 #undef align_down
 #include "../../sound/core/core.c"
 #include "../../kernel/device/driver_resources.c"
+
+static unsigned mapped_heap_objects;
+void *kernel_malloc(size_t bytes) {
+    void *result=calloc(1,bytes);if(result)++mapped_heap_objects;return result;
+}
+void kernel_free(void *memory) {assert(mapped_heap_objects);--mapped_heap_objects;free(memory);}
 
 void console_log(enum console_log_level level, const char *format, ...)
 {
@@ -500,6 +507,31 @@ static void retired_msi_cannot_reach_new_owner(void) {
     assert(old_count==0 && new_count==1);
     puts("delayed_old_MSI_never_reaches_new_owner_bounded_exhaustion PASS");
 }
+static void pci_high_mmio_preserves_physical_ownership(void) {
+    uint32_t low=cfg[4],high=cfg[5],mask_low=bar_masks[4],mask_high=bar_masks[5];
+    cfg[4]=4;cfg[5]=0xc0;bar_masks[4]=0xffffc004;bar_masks[5]=UINT32_MAX;
+    mm_fixture_init(0x31000000,32,0,0);nx_enabled=true;
+    uint64_t physical=0xc000000000ull;
+    void *first=driver_map_mmio_owned(13,physical,4096);assert(first);
+    assert((uintptr_t)first>=RELIEFNT_IOREMAP_BASE && (uintptr_t)first<RELIEFNT_IOREMAP_END);
+    assert(driver_map_mmio_owned(13,physical,4096)==first);
+    /* Different mapping lengths have distinct CPU aliases of the same BAR.
+     * Ownership exclusion must compare physical extents, never CPU pointers. */
+    assert(!driver_map_mmio_owned(14,physical,8192));
+    assert(pci_mmio_reference_count()==2 && owner_resource_count(13)==2);
+    void *alias=driver_map_mmio_owned(13,physical,8192);assert(alias && alias!=first);
+    assert(!driver_map_mmio_owned(14,physical+4096,4096)); /* Only BAR base accepted. */
+    assert(pci_mmio_reference_count()==3);
+    driver_unmap_mmio(first,4096);assert(pci_mmio_reference_count()==2);
+    assert(*kernel_shared_leaf((uintptr_t)first,false)&RELIEFNT_PAGE_PRESENT);
+    driver_unmap_mmio(first,4096);assert(pci_mmio_reference_count()==1);
+    assert(*kernel_shared_leaf((uintptr_t)alias,false)&RELIEFNT_PAGE_PRESENT);
+    uint64_t flags;kernel_execution_lock_irqsave(&flags);
+    driver_resources_release(13,false);kernel_execution_unlock_irqrestore(flags);
+    assert(!owner_resource_count(13) && !pci_mmio_reference_count() && free_page_count==32 && !mapped_heap_objects);
+    cfg[4]=low;cfg[5]=high;bar_masks[4]=mask_low;bar_masks[5]=mask_high;
+    puts("high_PCI_BAR_UC_NX_exact_refs_physical_owner_exclusion_and_cleanup PASS");
+}
 int main(void) {
     setvbuf(stdout,NULL,_IONBF,0);
     /* These MMIO ownership tests model the post-mm_init runtime allocator.
@@ -545,5 +577,5 @@ int main(void) {
     assert(!(cfg[0x40/4]&(1u<<16))); pci_irq_dispatch(cfg[0x4c/4]&0xff); assert(count==1);
     puts("msi_64_address_and_disable PASS");msi_disable_synchronizes_inflight();module_resource_failure_rolls_back();
     automatic_mmio_cleanup_releases_provider();retired_msi_cannot_reach_new_owner();
-    mmio_permanent_claims_are_idempotent();return 0;
+    mmio_permanent_claims_are_idempotent();pci_high_mmio_preserves_physical_ownership();return 0;
 }

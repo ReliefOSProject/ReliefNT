@@ -51,9 +51,12 @@ def main():
         start = source.index("struct task_timerfd {")
         end = source.index("\n};", start) + 3
         bodies = [source[start:end]]
+        backends = [io_backend(source, operation) for operation in ("read", "write")]
         for name in ("copy_text", "task_file_for_io", "task_pty_for_io", "task_pty_status", "file_can_read", "file_can_write", "task_device_is"):
+            if name == "copy_text" and not any("copy_text(" in body for body in backends):
+                continue
             bodies.append(function(source, name))
-        bodies.extend(io_backend(source, operation) for operation in ("read", "write"))
+        bodies.extend(backends)
         (work / "syscall_io_body.inc").write_text("\n\n".join(bodies))
         for optimization in ("-O0", "-O2"):
             executable = work / ("syscall_io" + optimization)
@@ -64,7 +67,8 @@ def main():
                 "-fno-omit-frame-pointer", "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
                 "-I" + str(work), "-Iinclude",
                 "-Iinclude", "-Iinclude", "-Iinclude/uapi",
-                "tools/tests/syscall_io_test.c", "-o", str(executable),
+                "tools/tests/syscall_io_test.c", "fs/vfs/file.c", "fs/vfs/open.c", "fs/vfs/mount_tree.c",
+                "-o", str(executable),
             ], cwd=ROOT, env={**os.environ, "TMPDIR": str(temporary)}, check=True)
             subprocess.run([str(executable)], cwd=ROOT, check=True, timeout=30)
         # The same POSIX program is staged into the guest for runtime checks.

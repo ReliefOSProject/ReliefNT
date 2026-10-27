@@ -1,3 +1,4 @@
+#define AUDIO_FIXTURE_CUSTOM_HEAP 1
 #include <assert.h>
 #include <errno.h>
 #include <linux/poll.h>

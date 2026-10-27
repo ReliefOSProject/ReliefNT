@@ -8,6 +8,14 @@
 #include <reliefnt/multiboot2.h>
 #include <reliefnt/types.h>
 
+struct pci_device;
+/** @brief Copy the immutable identity established by successful boot binding.
+ * @param out Required writable PCI output; unchanged when unavailable.
+ * @return Zero or -ENODEV. Called after boot framebuffer binding, with no
+ * allocation, I/O, optional-provider dependency or ownership transfer.
+ */
+int framebuffer_vmware_pci_identity(struct pci_device *out);
+
 struct framebuffer {
     uint32_t *pixels;
     uint32_t width;
@@ -99,6 +107,11 @@ void framebuffer_init(const struct boot_info *boot);
  *         address translated later through the kernel direct map.
  */
 void framebuffer_capture_gop(uint64_t system_table_addr);
+/**
+ * @brief Borrow the permanent framebuffer descriptor without allocating or probing hardware.
+ * @return Stable core-owned descriptor, whose available flag describes actual binding.
+ * Boot/task/IRQ snapshot context. No ownership is transferred; callers serialize mutable mode fields with the existing display/execution policy.
+ */
 const struct framebuffer *framebuffer_get(void);
 struct fb_var_screeninfo;
 struct fb_fix_screeninfo;
@@ -188,10 +201,29 @@ void framebuffer_present_region(uint32_t x, uint32_t y, uint32_t width, uint32_t
  * generate an UPDATE command themselves.
  */
 void framebuffer_display_tick(void);
-/** @brief Claim or release legacy GFB presentation for DRM scanout. */
+/**
+ * @brief Transfer a validated SVGA scanout from console tracing to DRM presentation.
+ * @return Zero, including already-owned scanout, or legacy internal -1 for unsupported framebuffer state.
+ * Execution-owned task context; takes the SVGA lock internally and disables traces only on success. No heap allocation or provider self-reference.
+ */
 int framebuffer_drm_scanout_begin(void);
+/**
+ * @brief Return the permanent SVGA scanout to ordinary framebuffer tracing.
+ * Execution-owned task context after dependent jobs drain. Clears pending DRM damage and restores tracing under the SVGA lock; does not unbind the boot console or free provider-owned backing.
+ */
 void framebuffer_drm_scanout_release(void);
-/** @brief Copy XRGB8888 damage to the SVGA GFB and retain FIFO-full damage. */
+/**
+ * @brief Copy validated XRGB8888 damage into the retained DRM-owned scanout.
+ * @param pixels Readable kernel source covering every requested row.
+ * @param pitch Source byte stride, at least the display width times four.
+ * @param format Supported XRGB8888 format code.
+ * @param x1 Inclusive left pixel.
+ * @param y1 Inclusive top pixel.
+ * @param x2 Exclusive right pixel, within display width.
+ * @param y2 Exclusive bottom pixel, within display height.
+ * @return Zero after copying/queuing damage, or legacy internal -1 for invalid or unavailable scanout.
+ * Execution-owned task context; source remains borrowed only during the copy. Coalesces FIFO pressure into permanent damage state under the SVGA lock; no module/data pointer is queued.
+ */
 int framebuffer_drm_present_region(const void *pixels, uint32_t pitch,
                                    uint32_t format, uint32_t x1, uint32_t y1,
                                    uint32_t x2, uint32_t y2);

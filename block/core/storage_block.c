@@ -1,315 +1,105 @@
-#include "../../drivers/storage/nvme/storage_nvme.h"
-#include "../../drivers/storage/ide/storage_ide.h"
+/* SPDX-License-Identifier: Apache-2.0 */
+#include <reliefnt/export.h>
 #include "storage_internal.h"
-void storage_volume_ide_device(const struct storage_volume *volume,
-                                      struct ide_device_info *device)
-{
-    if (!device) {
-        return;
-    }
-    storage_memzero(device, sizeof(*device));
-    if (!volume) {
-        return;
-    }
-    device->present = volume->ready || volume->ide_command_base != 0;
-    device->atapi = volume->ide_atapi;
-    device->lba48 = volume->ide_lba48;
-    device->channel = volume->ide_channel;
-    device->drive = volume->ide_drive;
-    device->command_base = volume->ide_command_base;
-    device->control_base = volume->ide_control_base;
-    ide_fill_device(device, volume->ide_channel, volume->ide_drive,
-                    volume->ide_command_base, volume->ide_control_base);
-    device->present = volume->ready || volume->ide_command_base != 0;
-    device->atapi = volume->ide_atapi;
-    device->lba48 = volume->ide_lba48;
-    /* The volume passes absolute disk LBAs; capacity is validated at the
-     * installer-disk layer, so do not mistake a partition length for disk
-     * capacity here. */
-    device->sector_count = 0;
-}
+#include <linux/errno.h>
 
-void storage_disk_ide_device(const struct install_disk_state *disk,
-                                    struct ide_device_info *device)
+/** @brief Transfer logical blocks through a held exact native device reference.
+ * @param volume Borrowed instance retaining device_ref for the entire call.
+ * @param lba First native logical block. @param count Nonzero native blocks.
+ * @param buffer Stable current kernel buffer of count*block_size bytes.
+ * @param write Whether buffer is readable write input instead of read output.
+ * @return Zero or negative transport errno, preserving -EAGAIN for resumable
+ * reads. Execution ownership required; transport lock spans commands but never
+ * a registry lock. The complete extent is validated before its first callback.
+ */
+static int storage_transfer_blocks(const struct storage_volume *volume,uint64_t lba,
+                                      uint32_t count,void *buffer,bool write)
 {
-    if (!device) {
-        return;
-    }
-    storage_memzero(device, sizeof(*device));
-    if (!disk) {
-        return;
-    }
-    ide_fill_device(device, disk->ide_channel, disk->ide_drive,
-                    disk->ide_command_base, disk->ide_control_base);
-    device->present = disk->present;
-    device->atapi = disk->ide_atapi;
-    device->lba48 = disk->ide_lba48;
-    device->sector_count = disk->sector_count;
-    storage_copy_text(device->model, sizeof(device->model), disk->device_model);
-}
-
-static uint8_t storage_volume_kind_for_transport(uint8_t transport)
-{
-    if (transport == STORAGE_TRANSPORT_IDE_PIO) {
-        return STORAGE_VOLUME_IDE;
-    }
-    if (transport == STORAGE_TRANSPORT_NVME) {
-        return STORAGE_VOLUME_NVME;
-    }
-    return STORAGE_VOLUME_AHCI;
-}
-
-const char *storage_transport_name(uint8_t transport)
-{
-    if (transport == STORAGE_TRANSPORT_IDE_PIO) {
-        return "ide-pio";
-    }
-    if (transport == STORAGE_TRANSPORT_NVME) {
-        return "nvme";
-    }
-    return "ahci";
-}
-
-void storage_volume_from_install_disk(struct storage_volume *volume,
-                                             const struct install_disk_state *disk)
-{
-    if (!volume || !disk) {
-        return;
-    }
-    volume->kind = storage_volume_kind_for_transport(disk->transport);
-    volume->transport = disk->transport;
-    volume->bus = disk->bus;
-    volume->slot = disk->slot;
-    volume->function = disk->function;
-    volume->port = disk->port;
-    volume->ide_channel = disk->ide_channel;
-    volume->ide_drive = disk->ide_drive;
-    volume->ide_atapi = disk->ide_atapi;
-    volume->ide_lba48 = disk->ide_lba48;
-    volume->ide_command_base = disk->ide_command_base;
-    volume->ide_control_base = disk->ide_control_base;
-    volume->abar = disk->abar;
-    volume->hba_port = disk->hba_port;
-    volume->nvme = disk->nvme;
-    volume->nvme_nsid = disk->nvme_nsid;
-    for (uint32_t i = 0; i < g_install_disk_count; ++i)
-        if (disk == &g_install_disks[i]) volume->source_disk_id = i;
-    storage_copy_text(volume->device_model, sizeof(volume->device_model), disk->device_model);
-}
-
-int storage_prepare_install_disk(struct install_disk_state *disk)
-{
-    if (!disk || !disk->present) {
-        return -22;
-    }
-    if (disk->transport == STORAGE_TRANSPORT_IDE_PIO) {
-        return disk->ide_atapi ? -30 : 0;
-    }
-    if (disk->transport == STORAGE_TRANSPORT_NVME) {
-        return disk->nvme && disk->nvme->ready && disk->nvme_nsid ? 0 : -5;
-    }
-    if (disk->transport != STORAGE_TRANSPORT_AHCI || !disk->hba_port) {
-        return -22;
-    }
-    /* AHCI command state is shared with the resumable syscall path.  The
-     * scanner initializes each port before publishing the disk, and the
-     * controller recovery path reinitializes it after a real failure.  Do
-     * not reset the port for every open/read/ioctl: a retry can be polling a
-     * live command, and clearing PxCI/its command table here would make the
-     * still-running DMA look complete with stale data (notably an invalid
-     * GPT header). */
-    return 0;
-}
-
-int storage_read_device(const struct storage_volume *volume, uint64_t lba,
-                               uint32_t sector_count, void *buffer)
-{
-    int ret = 0;
-    uint64_t start_lba = lba;
-    if (!volume || !buffer || !sector_count) {
-        return -22;
-    }
-    if (volume->kind == STORAGE_VOLUME_RAM) {
-        uint64_t offset = lba * SECTOR_SIZE;
-        uint64_t bytes = (uint64_t)sector_count * SECTOR_SIZE;
-        if (!volume->ram_base || offset + bytes < offset || offset + bytes > volume->ram_bytes) {
-            console_info("[storage] ram read out of range volume=%u lba=%llu sectors=%u ram_bytes=%llu\n",
-                           volume->volume_id, (unsigned long long)lba,
-                           sector_count, (unsigned long long)volume->ram_bytes);
-            return -22;
-        }
-        storage_memcpy(buffer, volume->ram_base + offset, (size_t)bytes);
-        return 0;
-    }
+    struct block_device_info info;
+    int rc=block_device_info(&volume->device_ref,&info);if(rc)return rc;
+    if(!count || lba>=info.blocks || count>info.blocks-lba)return -EINVAL;
     kernel_spin_lock(&storage_transport_lock);
-    if (volume->transport == STORAGE_TRANSPORT_IDE_PIO) {
-        struct ide_device_info device;
-        storage_volume_ide_device(volume, &device);
-        if (device.atapi) {
-            ret = -30;
-            goto out;
-        }
-        uint8_t *dst = (uint8_t *)buffer;
-        while (sector_count) {
-            uint32_t chunk = min_u32(sector_count, IDE_MAX_PIO_SECTORS);
-            ret = ide_pio_transfer(&device, lba, chunk, dst, 0);
-            if (ret < 0) {
-                goto out;
-            }
-            lba += chunk;
-            sector_count -= chunk;
-            dst += chunk * SECTOR_SIZE;
-        }
-        goto out;
+    while(count) {
+        uint32_t chunk=count<info.max_blocks ? count : info.max_blocks;
+        rc=write ? block_device_write(&volume->device_ref,lba,chunk,buffer) :
+            block_device_read(&volume->device_ref,lba,chunk,buffer);
+        if(rc)break;
+        count-=chunk;lba+=chunk;buffer=(uint8_t *)buffer+(size_t)chunk*info.block_size;
     }
-    if (volume->transport == STORAGE_TRANSPORT_NVME) {
-        uint8_t *dst = (uint8_t *)buffer;
-        if (!volume->nvme || !volume->nvme_nsid) {
-            ret = -22;
-            goto out;
-        }
-        while (sector_count) {
-            uint32_t chunk = min_u32(sector_count, NVME_MAX_SECTORS);
-            ret = nvme_readwrite(volume->nvme, volume->nvme_nsid, lba, chunk, dst, 0);
-            if (ret < 0) {
-                goto out;
-            }
-            lba += chunk;
-            sector_count -= chunk;
-            dst += chunk * SECTOR_SIZE;
-        }
-        goto out;
-    }
-    if (volume->transport != STORAGE_TRANSPORT_AHCI || !volume->hba_port) {
-        ret = -95;
-        goto out;
-    }
-    uint8_t *dst = (uint8_t *)buffer;
-    while (sector_count) {
-        uint32_t chunk = min_u32(sector_count, AHCI_MAX_SECTORS);
-        ret = ahci_read_lba_retry(volume->hba_port, lba, chunk, dst);
-        if (ret < 0) {
-            goto out;
-        }
-        lba += chunk;
-        sector_count -= chunk;
-        dst += chunk * SECTOR_SIZE;
-    }
-out:
-    kernel_spin_unlock(&storage_transport_lock);
-    /* Pending DMA is resumed by the syscall dispatcher, not a device error. */
-    if (ret < 0 && ret != -RELIEFOS_EAGAIN) {
+    kernel_spin_unlock(&storage_transport_lock);return rc;
+}
+
+/** @brief Read 512-byte physical sectors from an owned disk or reserved RAM image.
+ * @param volume Stable volume retaining device ownership, required.
+ * @param lba First sector. @param sector_count Nonzero complete sectors.
+ * @param buffer Current writable kernel extent sector_count*512 bytes.
+ * @return Zero or negative bounds/transport errno including -EAGAIN unchanged.
+ * Execution ownership required; DMA always belongs to the native provider.
+ */
+int storage_read_device(const struct storage_volume *volume,uint64_t lba,uint32_t sector_count,void *buffer)
+{
+    if(!volume || !buffer || !sector_count)return -EINVAL;
+    struct block_device_info info;int rc=block_device_info(&volume->device_ref,&info);
+    if(rc)return rc;if(info.block_size!=512)return -EOPNOTSUPP;
+    rc=storage_transfer_blocks(volume,lba,sector_count,buffer,false);
+    if(rc<0 && rc!=-RELIEFOS_EAGAIN)
         console_error("[storage] device read failed volume=%u kind=%u transport=%u lba=%llu sectors=%u ret=%d\n",
-                       volume->volume_id, volume->kind, volume->transport,
-                       (unsigned long long)start_lba, sector_count, ret);
-    }
-    return ret;
+            volume->volume_id,volume->kind,volume->transport,(unsigned long long)lba,sector_count,rc);
+    return rc;
 }
 
-int storage_write_device(const struct storage_volume *volume, uint64_t lba,
-                                uint32_t sector_count, const void *buffer)
+/** @brief Invalidate aliases before writing physical sectors through owned transport.
+ * @param volume Stable volume retaining device ownership, required.
+ * @param lba First sector. @param sector_count Nonzero complete sectors.
+ * @param buffer Current readable kernel extent sector_count*512 bytes.
+ * @return Zero or negative bounds/RO/transport errno; partial hardware failure is
+ * never advertised as complete. Execution ownership; mutations are synchronous
+ * under the existing syscall replay policy, no registry lock spans hardware.
+ */
+int storage_write_device(const struct storage_volume *volume,uint64_t lba,uint32_t sector_count,const void *buffer)
 {
-    int ret = 0;
-    if (!volume || !buffer || !sector_count) {
-        return -30;
-    }
-    /* Evict before submission: an error can still leave a partially written
-     * range. Only the successful ext2 caller republishes clean cache data. */
-    ext2_cache_invalidate_range(lba, sector_count);
-    storage_ext4_cache_invalidate_write(volume, lba, sector_count);
-    if (volume->kind == STORAGE_VOLUME_RAM) {
-        uint64_t offset = lba * SECTOR_SIZE;
-        uint64_t bytes = (uint64_t)sector_count * SECTOR_SIZE;
-        if (!volume->ram_base || offset + bytes < offset || offset + bytes > volume->ram_bytes) {
-            return -22;
-        }
-        storage_memcpy(volume->ram_base + offset, buffer, (size_t)bytes);
-        return 0;
-    }
-    kernel_spin_lock(&storage_transport_lock);
-    if (volume->transport == STORAGE_TRANSPORT_IDE_PIO) {
-        struct ide_device_info device;
-        storage_volume_ide_device(volume, &device);
-        if (device.atapi) {
-            ret = -30;
-            goto out;
-        }
-        const uint8_t *src = (const uint8_t *)buffer;
-        while (sector_count) {
-            uint32_t chunk = min_u32(sector_count, IDE_MAX_PIO_SECTORS);
-            ret = ide_pio_transfer(&device, lba, chunk, (void *)src, 1);
-            if (ret < 0) {
-                goto out;
-            }
-            lba += chunk;
-            sector_count -= chunk;
-            src += chunk * SECTOR_SIZE;
-        }
-        goto out;
-    }
-    if (volume->transport == STORAGE_TRANSPORT_NVME) {
-        const uint8_t *src = (const uint8_t *)buffer;
-        if (!volume->nvme || !volume->nvme_nsid) {
-            ret = -22;
-            goto out;
-        }
-        while (sector_count) {
-            uint32_t chunk = min_u32(sector_count, NVME_MAX_SECTORS);
-            ret = nvme_readwrite(volume->nvme, volume->nvme_nsid, lba, chunk,
-                                 (void *)src, 1);
-            if (ret < 0) {
-                goto out;
-            }
-            lba += chunk;
-            sector_count -= chunk;
-            src += chunk * SECTOR_SIZE;
-        }
-        goto out;
-    }
-    if (volume->transport != STORAGE_TRANSPORT_AHCI || !volume->hba_port) {
-        ret = -95;
-        goto out;
-    }
-    const uint8_t *src = (const uint8_t *)buffer;
-    while (sector_count) {
-        uint32_t chunk = min_u32(sector_count, AHCI_MAX_SECTORS);
-        ret = ahci_write_lba_retry(volume->hba_port, lba, chunk, src);
-        if (ret < 0) {
-            goto out;
-        }
-        lba += chunk;
-        sector_count -= chunk;
-        src += chunk * SECTOR_SIZE;
-    }
-out:
-    kernel_spin_unlock(&storage_transport_lock);
-    return ret;
+    if(!volume || !buffer || !sector_count)return -EINVAL;
+    storage_filesystem_cache_event(volume,lba,sector_count);
+    struct block_device_info info;int rc=block_device_info(&volume->device_ref,&info);
+    if(rc)return rc;if(info.block_size!=512)return -EOPNOTSUPP;
+    return storage_transfer_blocks(volume,lba,sector_count,(void *)buffer,true);
 }
 
-int storage_read_install_disk(const struct install_disk_state *disk, uint64_t lba,
-                                     uint32_t sector_count, void *buffer)
+/** @brief Read a bounded raw extent with temporary exact device/code ownership.
+ * @param disk Borrowed inventory record, required. @param lba First sector.
+ * @param sector_count Nonzero sectors. @param buffer Current writable bytes.
+ * @return Zero or native errno; all exits drop the temporary token. Caller holds
+ * execution ownership and any outer multi-I/O transaction/OFD lifetime pin.
+ */
+int storage_read_install_disk(const struct install_disk_state *disk,uint64_t lba,uint32_t sector_count,void *buffer)
 {
-    struct storage_volume volume;
-    if (!disk || !disk->present) {
-        return -22;
-    }
-    storage_memzero(&volume, sizeof(volume));
-    storage_volume_from_install_disk(&volume, disk);
-    return storage_read_device(&volume, lba, sector_count, buffer);
+    struct storage_volume volume={0};int rc=storage_volume_from_install_disk(&volume,disk);
+    if(!rc)rc=storage_read_device(&volume,lba,sector_count,buffer);
+    storage_volume_put_device(&volume);return rc;
 }
 
-int storage_write_install_disk(const struct install_disk_state *disk, uint64_t lba,
-                                      uint32_t sector_count, const void *buffer)
+/** @brief Write a bounded raw extent while retaining exact device/code ownership.
+ * @param disk Borrowed inventory record, required. @param lba First sector.
+ * @param sector_count Nonzero sectors. @param buffer Current readable bytes.
+ * @return Zero or native errno; all exits drop the temporary token. Caller holds
+ * execution ownership and the outer multi-I/O transaction/OFD lifetime pin.
+ */
+int storage_write_install_disk(const struct install_disk_state *disk,uint64_t lba,uint32_t sector_count,const void *buffer)
 {
-    struct storage_volume volume;
-    if (!disk || !disk->present) {
-        return -22;
-    }
-    storage_memzero(&volume, sizeof(volume));
-    storage_volume_from_install_disk(&volume, disk);
-    return storage_write_device(&volume, lba, sector_count, buffer);
+    struct storage_volume volume={0};int rc=storage_volume_from_install_disk(&volume,disk);
+    if(!rc)rc=storage_write_device(&volume,lba,sector_count,buffer);
+    storage_volume_put_device(&volume);return rc;
 }
 
+/**
+ * @brief Read physical sectors through the currently selected volume token.
+ * @param lba First physical 512-byte sector.
+ * @param sector_count Nonzero complete sector count.
+ * @param buffer Writable kernel extent of sector_count times 512 bytes, stable throughout I/O.
+ * @return Zero or negative bounds/transport errno, preserving resumable -EAGAIN.
+ * @par Context
+ * Caller holds storage execution ownership; shared volume/cache state must remain selected and live throughout the call. Uses the registered device and transport exclusion; no raw RAM backing or ownership transfer.
+ */
 int storage_read_sectors(uint64_t lba, uint32_t sector_count, void *buffer)
 {
     return storage_read_device(&g_storage, lba, sector_count, buffer);
@@ -458,56 +248,29 @@ static int storage_probe_fat32_signature(uint64_t lba)
            storage_memcmp(storage_scratch + 82u, "FAT32   ", 8u) == 0;
 }
 
-int storage_read_iso_blocks(uint64_t lba, uint32_t block_count, void *buffer)
+/** @brief Read validated optical logical blocks through an owned block provider.
+ * @param lba First 2048-byte optical block. @param block_count Nonzero blocks.
+ * @param buffer Current writable extent block_count*2048 bytes.
+ * @return Zero or native bounds/transport errno, preserving resumable -EAGAIN.
+ * Caller owns selected volume/execution context; the held block reference
+ * supports ISO modules loaded after the independent optical device was probed.
+ */
+int storage_read_iso_blocks(uint64_t lba,uint32_t block_count,void *buffer)
 {
-    uint8_t *dst = (uint8_t *)buffer;
-    if (!buffer || block_count == 0 || g_storage.filesystem != STORAGE_FILESYSTEM_ISO9660) {
-        return -22;
-    }
-    /* The PVD is read before the volume size is known. Once mounted, keep
-     * malformed directory records from issuing reads past the medium. */
-    if (g_storage.iso_sector_count != 0 &&
-        (lba >= g_storage.iso_sector_count ||
-         (uint64_t)block_count > g_storage.iso_sector_count - lba)) {
-        return -5;
-    }
-    if (g_storage.transport == STORAGE_TRANSPORT_IDE_PIO) {
-        struct ide_device_info device;
-        storage_volume_ide_device(&g_storage, &device);
-        kernel_spin_lock(&storage_transport_lock);
-        while (block_count) {
-            uint32_t chunk = min_u32(block_count, IDE_MAX_ATAPI_BLOCKS);
-            int ret = ide_atapi_read_blocks(&device, lba, chunk, dst);
-            if (ret < 0) {
-                kernel_spin_unlock(&storage_transport_lock);
-                return ret;
-            }
-            lba += chunk;
-            block_count -= chunk;
-            dst += chunk * ISO9660_BLOCK_SIZE;
-        }
-        kernel_spin_unlock(&storage_transport_lock);
-        return 0;
-    }
-    if (g_storage.transport != STORAGE_TRANSPORT_AHCI || !g_storage.hba_port) {
-        return -95;
-    }
-    kernel_spin_lock(&storage_transport_lock);
-    while (block_count) {
-        uint32_t chunk = min_u32(block_count, 32u);
-        int ret = ahci_read_atapi_blocks_retry(g_storage.hba_port, lba, chunk, dst);
-        if (ret < 0) {
-            kernel_spin_unlock(&storage_transport_lock);
-            return ret;
-        }
-        lba += chunk;
-        block_count -= chunk;
-        dst += chunk * ISO9660_BLOCK_SIZE;
-    }
-    kernel_spin_unlock(&storage_transport_lock);
-    return 0;
+    if(!buffer || !block_count || g_storage.filesystem!=STORAGE_FILESYSTEM_ISO9660)return -EINVAL;
+    if(g_storage.iso_sector_count && (lba>=g_storage.iso_sector_count || block_count>g_storage.iso_sector_count-lba))return -EIO;
+    struct block_device_info info;int rc=block_device_info(&g_storage.device_ref,&info);
+    if(rc)return rc;if(info.block_size!=2048)return -EOPNOTSUPP;
+    return storage_transfer_blocks(&g_storage,lba,block_count,buffer,false);
 }
 
+/** @brief Write selected-volume sectors using the registered native batch limit.
+ * @param lba First physical sector. @param sector_count Complete sector extent.
+ * @param buffer Current readable sector_count*512 kernel bytes.
+ * @return Zero or native errno; never replays a partly accepted mutation after
+ * EAGAIN. Execution ownership; cache invalidation precedes all device writes,
+ * provider/code and current buffer remain pinned through each synchronous step.
+ */
 int storage_write_sectors(uint64_t lba, uint32_t sector_count, const void *buffer)
 {
     const uint8_t *src = (const uint8_t *)buffer;
@@ -517,10 +280,11 @@ int storage_write_sectors(uint64_t lba, uint32_t sector_count, const void *buffe
      * not return EAGAIN and replay a partially completed mutation. */
     storage_begin_mutation();
     storage_sector_cache_invalidate();
+    struct block_device_info info;int rc=block_device_info(&g_storage.device_ref,&info);
+    if(rc)return rc;
+    uint32_t limit=info.max_blocks;
     while (sector_count) {
-        uint32_t chunk = min_u32(sector_count,
-                                  g_storage.transport == STORAGE_TRANSPORT_IDE_PIO
-                                      ? IDE_MAX_PIO_SECTORS : STORAGE_WRITE_MAX_SECTORS);
+        uint32_t chunk = min_u32(sector_count,limit);
         int ret = storage_write_device(&g_storage, lba, chunk, src);
         if (ret < 0 && chunk > 1u) {
             /* A few virtual AHCI implementations occasionally fail a
@@ -765,3 +529,11 @@ int gpt_find_esp(void)
     mm_free_pages(phys, (total_sectors + 7u) / 8u);
     return esp_found ? 0 : -2;
 }
+
+/* Native filesystem modules share this core-owned interface; CRC/release
+ * checks bind it to the exact kernel, without a stable cross-release API. */
+EXPORT_SYMBOL(storage_read_device);
+EXPORT_SYMBOL(storage_read_iso_blocks);
+EXPORT_SYMBOL(storage_read_sectors);
+EXPORT_SYMBOL(storage_write_device);
+EXPORT_SYMBOL(storage_write_sectors);

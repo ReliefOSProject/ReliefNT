@@ -3,15 +3,48 @@
 # The upstream compilation/dependency engine stays unmodified. Linux's forced
 # compiler_types.h is not an input to either project's freestanding/POSIX ABI.
 # Recursive Kbuild calls retain this adapter before loading the upstream rules.
-override build := -f $(srctree)/scripts/Makefile.port -f $(srctree)/scripts/Makefile.build obj
+override build := -f $(srctree)/scripts/Makefile.port obj
 
-override c_flags = -Wp,-MMD,$(depfile) $(NOSTDINC_FLAGS) $(LINUXINCLUDE) \
+override c_flags = -Wp,-MMD,$(depfile) $(NOSTDINC_FLAGS) \
+                  $(if $(part-of-module),-I$(srctree)/scripts/module-include) $(LINUXINCLUDE) \
                   $(_c_flags) $(modkern_cflags) $(basename_flags) $(modname_flags)
 
 # Fail product/custom actions at the first failing command.
 .SHELLFLAGS := -ec
 
+# The unchanged target-ABI offset probe needs scalar/UUID data layouts only.
+# Its original GNU-C source is compiled independently from runtime modules.
+ifeq ($(obj),scripts/mod)
+CFLAGS_devicetable-offsets.o += -std=gnu11 -include $(srctree)/scripts/module-include/offset-types.h
+endif
+
 # Do not create missing object directories when inspecting an output tree.
 ifneq ($(or $(findstring n,$(firstword -$(MAKEFLAGS))),$(findstring q,$(firstword -$(MAKEFLAGS)))),)
 override obj-dirs :=
+endif
+
+# One policy wrapper selects an unchanged upstream engine. This also lets
+# modpost/modfinal share the native compiler policy without copying rules.
+reliefnt_engine := $(or $(RELIEFNT_KBUILD_FILE),scripts/Makefile.build)
+include $(srctree)/$(reliefnt_engine)
+
+ifeq ($(reliefnt_engine),scripts/Makefile.build)
+# real-obj-* are computed by upstream Kbuild from each directory's own lists.
+# Include composite members and external modules in compiler identity tracking.
+$(filter %.o,$(real-obj-y) $(real-obj-m)): $(objtree)/.reliefnt-target-cc.id
+# Relocatable composite links also consume LD, before modfinal links the .ko.
+$(multi-obj-m): $(objtree)/.reliefnt-target-ld.id
+# Upstream permits prebuilt objects when their source disappears. Native code
+# is source-owned: retain each previously compiled leaf's actual source edge,
+# as recorded by fixdep, so deletion cannot silently reuse an old binary.
+$(foreach file,$(filter %.o,$(real-obj-y) $(real-obj-m)),\
+    $(if $(source_$(file)),$(eval $(file): $(source_$(file)))))
+endif
+ifeq ($(reliefnt_engine),scripts/Makefile.modfinal)
+$(modules:%.o=%.mod.o) $(extmod_prefix).module-common.o: $(objtree)/.reliefnt-target-cc.id
+$(modules:%.o=%.ko): $(objtree)/.reliefnt-target-ld.id
+endif
+
+ifeq ($(reliefnt_engine),scripts/Makefile.vmlinux_o)
+vmlinux.o: $(objtree)/.reliefnt-target-ld.id
 endif

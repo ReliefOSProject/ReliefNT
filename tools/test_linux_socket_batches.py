@@ -17,7 +17,7 @@ with tempfile.TemporaryDirectory(prefix="reliefos-mmsg-") as directory:
     subprocess.run(["cc", "-std=c11", "-g", "-O1", "-fsanitize=address,undefined",
                     "-fno-sanitize-recover=all", "-ffunction-sections", "-fdata-sections",
                     "-Wl,--gc-sections", "-fno-pie", "-no-pie", "-Iinclude", "-Iinclude", "-Iinclude/uapi",
-                    "-Iinclude", "tools/tests/socket_batch_unix_test.c", "-o", output],
+                    "-Iinclude", "tools/tests/socket_batch_unix_test.c", "fs/vfs/mount_tree.c", "fs/vfs/path.c", "fs/vfs/file.c", "fs/vfs/open.c", "fs/vfs/initial.c", "kernel/syscall/ipc/unix_name.c", "kernel/syscall/fs/lookup_state.c", "-o", output],
                    cwd=root, check=True)
     subprocess.run([output], cwd=root, check=True, timeout=20)
     output = str(Path(directory) / "socket_batch_abi")

@@ -3,6 +3,7 @@
  * translation unit instead of sharing one copy per file.  This file carries
  * no functions: host fixtures link it to get the shared state without also
  * pulling in the block-core primitives they replace with fakes. */
+#include <reliefnt/export.h>
 #include "storage_types.h"
 
 struct storage_volume g_volumes[STORAGE_MAX_VOLUMES];
@@ -13,18 +14,14 @@ bool storage_io_async_context;
 bool storage_io_write_started;
 uint32_t storage_task_io_owner;
 
-struct install_disk_state g_install_disks[STORAGE_MAX_INSTALL_DISKS];
+static struct install_disk_state initial_disks[STORAGE_INSTALL_DISK_INITIAL_CAPACITY];
+struct install_disk_state *g_install_disks=initial_disks;
+uint32_t g_install_disk_capacity=STORAGE_INSTALL_DISK_INITIAL_CAPACITY;
 uint32_t g_install_disk_count;
 uint8_t g_devfs_enabled = 1;
 uint8_t g_installer_root_active;
 
 struct kernel_spinlock storage_transport_lock = KERNEL_SPINLOCK_INIT;
-
-/* Shared AHCI command RAM; storage_fat32.c issues its own commands through
- * the same tables. */
-uint8_t ahci_received_fis[256] __attribute__((aligned(256)));
-uint8_t ahci_cmd_table_buf[256] __attribute__((aligned(128)));
-struct ahci_cmd_header ahci_cmd_headers[32] __attribute__((aligned(1024)));
 
 uint8_t storage_scratch[STORAGE_SCRATCH_SECTORS * SECTOR_SIZE]
     __attribute__((aligned(4096)));
@@ -42,8 +39,6 @@ uint32_t storage_new_chain[FAT32_MAX_FILE_CLUSTERS];
 struct storage_sector_cache storage_fat_cache;
 struct storage_sector_cache storage_read_cache;
 struct storage_cluster_cache storage_dir_lookup_cache;
-struct storage_path_cache_entry storage_path_cache[STORAGE_PATH_CACHE_ENTRIES];
-uint32_t storage_path_cache_next;
 struct storage_dir_index_entry storage_dir_index[STORAGE_DIR_INDEX_ENTRIES];
 uint32_t storage_dir_index_next;
 struct storage_write_chain_cache storage_write_chain_cache;
@@ -64,3 +59,21 @@ const uint8_t basic_data_guid[16] = {
     0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44,
     0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7,
 };
+
+/* Native filesystem modules share this core-owned interface; CRC/release
+ * checks bind it to the exact kernel, without a stable cross-release API. */
+EXPORT_SYMBOL(g_active_volume);
+EXPORT_SYMBOL(g_volumes);
+EXPORT_SYMBOL(storage_cluster_buf);
+EXPORT_SYMBOL(storage_dir_iter_cache);
+EXPORT_SYMBOL(storage_dir_lookup_cache);
+EXPORT_SYMBOL(storage_dir_lookup_cache_data);
+EXPORT_SYMBOL(storage_fat_cache);
+EXPORT_SYMBOL(storage_fat_cache_data);
+EXPORT_SYMBOL(storage_io_async_context);
+EXPORT_SYMBOL(storage_io_write_started);
+EXPORT_SYMBOL(storage_new_chain);
+EXPORT_SYMBOL(storage_old_chain);
+EXPORT_SYMBOL(storage_read_cache);
+EXPORT_SYMBOL(storage_read_cache_data);
+EXPORT_SYMBOL(storage_scratch);

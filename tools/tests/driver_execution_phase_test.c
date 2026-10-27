@@ -46,6 +46,7 @@ void kernel_irq_restore(uint64_t flags)
 #include "../../kernel/device/driver_manager_phase.c"
 #include "../../sound/core/core.c"
 #include "modules/pcm.h"
+#include "modules/audio_work.h"
 
 /* The phase fixture links the PCM core without the ALSA timer module. */
 void audio_timer_period_elapsed(uint32_t card, uint32_t device,
@@ -400,6 +401,7 @@ static void deferred_card_task_uses_wait_phase(struct audio_card_ops *base,
 
 int main(void)
 {
+    audio_fixture_work_start();
     setvbuf(stdout, NULL, _IONBF, 0);
     struct audio_card_identity identity = {.id = "phase", .name = "phase fixture"};
     struct audio_card_ops ops = {
@@ -478,5 +480,6 @@ int main(void)
          "execution_phase_allows_pinned_task_callback_progress PASS");
     }
     deferred_card_task_uses_wait_phase(&ops, &identity);
+    audio_fixture_work_stop();
     return 0;
 }

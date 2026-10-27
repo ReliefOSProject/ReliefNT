@@ -17,7 +17,9 @@ void mm_init(const struct boot_info *boot);
  */
 uint64_t mm_total_memory_kib(void);
 /**
- * @brief Return currently free physical RAM in KiB.
+ * @brief Snapshot unallocated physical page-pool capacity under the MM lock.
+ * @return Free physical page bytes divided by 1024; excludes reclaimable cached/heap allocations.
+ * Task/IRQ-safe snapshot after physical allocator setup; no allocation, callbacks or ownership transfer.
  */
 uint64_t mm_free_memory_kib(void);
 /**
@@ -33,6 +35,7 @@ void *mm_phys_to_virt(uint64_t phys);
  * @return Physical byte address; zero for user pointers, other low addresses,
  *         and addresses outside the direct-map window.
  * The identity-mapped interval is exactly [KERNEL_HOLE_START, KERNEL_HOLE_END).
+ * Pure IRQ/task-safe translation; no allocation, lock, I/O or ownership transfer.
  */
 uint64_t mm_virt_to_phys(const void *address);
 /**
@@ -56,7 +59,11 @@ uint64_t mm_alloc_pages_below(uint32_t page_count, uint64_t mask);
  */
 void mm_free_page(uint64_t phys);
 /**
- * @brief Return page_count contiguous physical pages starting at phys.
+ * @brief Consume one owned physical-page reference per page and reclaim pages whose count reaches zero.
+ * @param phys Page-aligned base of an owned run; zero, invalid, reserved or out-of-range runs are ignored.
+ * @param page_count Number of consecutive 4 KiB pages; zero is a no-op.
+ * @par Context
+ * IRQ-safe allocator lock; pinned and already-free pages remain unchanged. Caller must first retire every DMA, mapping and callback using the consumed references; no user access or scheduling.
  */
 void mm_free_pages(uint64_t phys, uint32_t page_count);
 /**

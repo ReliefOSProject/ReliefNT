@@ -54,7 +54,9 @@ def main():
                 "-fno-omit-frame-pointer", "-ffunction-sections", "-fdata-sections",
                 "-Wl,--gc-sections", "-I" + str(work), "-Iinclude", "-Iinclude",
                 "-Iinclude/uapi", "-Iinclude",
-                "tools/tests/" + fixture + ".c", "-o", str(executable),
+                "tools/tests/" + fixture + ".c",
+                *(["kernel/syscall/fs/lookup_state.c", "kernel/syscall/io/vector.c", "fs/vfs/mount_tree.c", "fs/vfs/path.c"]
+                  if fixture == "user_return_gate_test" else []), "-o", str(executable),
             ], cwd=ROOT, env=env, check=True)
             subprocess.run([str(executable)], cwd=ROOT, env=env, check=True, timeout=30)
 

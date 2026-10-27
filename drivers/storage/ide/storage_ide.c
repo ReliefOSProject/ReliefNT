@@ -70,17 +70,22 @@ int ide_flush_cache(const struct ide_device_info *device)
     return ide_wait_ready(device, 0);
 }
 
+/** @brief Reset a failed PIO channel while keeping its polling IRQ source masked.
+ * @param device Borrowed stable endpoint with control port, required.
+ * @return Zero, -EINVAL or -ETIMEDOUT. Caller pins code/endpoint and serializes
+ * both channel devices; no DMA pages, IRQ callbacks or CPU buffer is retained.
+ */
 static int ide_soft_reset(const struct ide_device_info *device)
 {
     uint8_t status;
     if (!device || !device->control_base) {
         return -22;
     }
-    x86_64_outb(IDE_CMD_SRST, device->control_base);
+    x86_64_outb(IDE_CMD_SRST|IDE_CONTROL_NIEN, device->control_base);
     for (uint32_t i = 0; i < 10000u; ++i) {
         __asm__ volatile("pause");
     }
-    x86_64_outb(0, device->control_base);
+    x86_64_outb(IDE_CONTROL_NIEN, device->control_base);
     for (uint32_t i = 0; i < IDE_WAIT_SPINS / 16u; ++i) {
         status = ide_status(device);
         if (!(status & IDE_STATUS_BSY)) {
@@ -123,6 +128,12 @@ static void ide_copy_model(char out[41], const uint16_t *identify)
     out[pos] = 0;
 }
 
+/** @brief Mask polling IRQs and identify one actual ATA/ATAPI endpoint.
+ * @param device Exclusive initialized endpoint, required; geometry/model are
+ * updated only from complete IDENTIFY data. @return Zero or native errno.
+ * Init/task under transport exclusion and code lifetime; unsupported non-512
+ * ATA sectors fail explicitly. No filesystem dependency, allocation or DMA.
+ */
 int ide_identify_device(struct ide_device_info *device)
 {
     uint16_t identify[256];
@@ -132,6 +143,7 @@ int ide_identify_device(struct ide_device_info *device)
     if (!device || !device->command_base) {
         return -22;
     }
+    if(device->control_base)x86_64_outb(IDE_CONTROL_NIEN,device->control_base);
     if (ide_select(device) < 0) {
         return -22;
     }
@@ -207,6 +219,15 @@ int ide_identify_device(struct ide_device_info *device)
     return 0;
 }
 
+/** @brief Transfer validated ATA sectors using correctly ordered task-file bytes.
+ * @param device Stable identified endpoint, required. @param lba First sector
+ * fitting selected LBA28/48 command. @param sectors Nonzero sectors<=128.
+ * @param buffer Current readable/writable sectors*512 bytes, any CPU alignment.
+ * @param write Nonzero selects write. @return Zero or bounds/native errno;
+ * failed completion resets the channel with IRQs still masked. Caller pins
+ * code/device and transport exclusion; repeated CPU-port transfers preserve
+ * one DRQ admission per sector. CPU bytes are never DMA addresses.
+ */
 int ide_pio_transfer(const struct ide_device_info *device, uint64_t lba,
                             uint32_t sectors, void *buffer, uint8_t write)
 {
@@ -218,6 +239,8 @@ int ide_pio_transfer(const struct ide_device_info *device, uint64_t lba,
         return -22;
     }
     use_lba48 = device->lba48;
+    uint64_t limit=use_lba48 ? (1ull<<48) : (1ull<<28);
+    if(lba>=limit || sectors>limit-lba)return -22;
     if (use_lba48) {
         if (ide_select(device) < 0 || ide_wait_ready(device, 0) < 0) {
             return -5;
@@ -226,11 +249,11 @@ int ide_pio_transfer(const struct ide_device_info *device, uint64_t lba,
         x86_64_outb((uint8_t)(lba >> 24), (uint16_t)(device->command_base + 3u));
         x86_64_outb((uint8_t)(lba >> 32), (uint16_t)(device->command_base + 4u));
         x86_64_outb((uint8_t)(lba >> 40), (uint16_t)(device->command_base + 5u));
-        x86_64_outb((uint8_t)(sectors >> 8), (uint16_t)(device->command_base + 2u));
+        x86_64_outb((uint8_t)sectors, (uint16_t)(device->command_base + 2u));
         x86_64_outb((uint8_t)lba, (uint16_t)(device->command_base + 3u));
         x86_64_outb((uint8_t)(lba >> 8), (uint16_t)(device->command_base + 4u));
         x86_64_outb((uint8_t)(lba >> 16), (uint16_t)(device->command_base + 5u));
-        x86_64_outb((uint8_t)(0x40u | (device->drive << 4)),
+        x86_64_outb((uint8_t)(0xe0u | (device->drive << 4)),
                     (uint16_t)(device->command_base + 6u));
         x86_64_outb(write ? IDE_CMD_WRITE_PIO_EXT : IDE_CMD_READ_PIO_EXT,
                     (uint16_t)(device->command_base + 7u));
@@ -253,14 +276,13 @@ int ide_pio_transfer(const struct ide_device_info *device, uint64_t lba,
             (void)ide_soft_reset(device);
             return wait_ret;
         }
-        uint16_t *words = (uint16_t *)(void *)(bytes + sector * SECTOR_SIZE);
-        for (uint32_t i = 0; i < 256u; ++i) {
-            if (write) {
-                x86_64_outw(words[i], device->command_base);
-            } else {
-                words[i] = x86_64_inw(device->command_base);
-            }
-        }
+        uint8_t *data=bytes+(size_t)sector*SECTOR_SIZE;
+        /* Keep each DRQ phase at exactly one logical sector. REP batches the
+         * CPU port words without exposing virtual addresses as DMA addresses
+         * or incurring a separate hypervisor exit for every individual word. */
+        if (write) x86_64_outsw(device->command_base,data,SECTOR_SIZE/2u);
+        else x86_64_insw(device->command_base,data,SECTOR_SIZE/2u);
+        ide_io_delay(device->control_base);
     }
     {
         int wait_ret = ide_wait_ready(device, 0);
@@ -271,23 +293,17 @@ int ide_pio_transfer(const struct ide_device_info *device, uint64_t lba,
     }
 }
 
-int ide_atapi_read_blocks(const struct ide_device_info *device, uint64_t lba,
-                                 uint32_t blocks, void *buffer)
+/** @brief Execute one standard ATAPI data-in packet using CPU PIO words.
+ * @param device Stable identified ATAPI device, borrowed under transport lock.
+ * @param packet Readable 12-byte padded CDB. @param bytes Nonzero even extent.
+ * @param buffer Writable current kernel extent of bytes bytes.
+ * @return Zero or protocol/native timeout errno; timeout resets the channel.
+ * No DMA/old task pointer is involved; caller pins device/code through completion.
+ */
+static int ide_atapi_packet(const struct ide_device_info *device,const uint8_t packet[12],uint32_t bytes,void *buffer)
 {
-    uint8_t packet[12] = {0};
-    uint8_t *dst = (uint8_t *)buffer;
-    uint32_t bytes_left = blocks * ISO9660_BLOCK_SIZE;
-    if (!device || !device->present || !device->atapi || !buffer || !blocks ||
-        blocks > IDE_MAX_ATAPI_BLOCKS) {
-        return -22;
-    }
-    packet[0] = SCSI_CMD_READ10;
-    packet[2] = (uint8_t)(lba >> 24);
-    packet[3] = (uint8_t)(lba >> 16);
-    packet[4] = (uint8_t)(lba >> 8);
-    packet[5] = (uint8_t)lba;
-    packet[7] = (uint8_t)(blocks >> 8);
-    packet[8] = (uint8_t)blocks;
+    uint8_t *dst=buffer;uint32_t bytes_left=bytes;
+    if(!device || !device->present || !device->atapi || !packet || !buffer || !bytes || (bytes&1u))return -22;
     if (ide_select(device) < 0 || ide_wait_ready(device, 0) < 0) {
         return -5;
     }
@@ -337,6 +353,32 @@ int ide_atapi_read_blocks(const struct ide_device_info *device, uint64_t lba,
     return ide_wait_ready(device, 0);
 }
 
+/** @brief Read bounded 2048-byte blocks through standard ATAPI READ(10).
+ * @param device Stable identified optical device. @param lba First logical block.
+ * @param blocks Nonzero blocks up to IDE_MAX_ATAPI_BLOCKS. @param buffer Current
+ * writable blocks*2048 bytes. @return Zero or -EINVAL/native I/O errno.
+ * Caller owns transport exclusion and device/code lifetime; all PIO is CPU I/O.
+ */
+int ide_atapi_read_blocks(const struct ide_device_info *device,uint64_t lba,uint32_t blocks,void *buffer)
+{
+    if(!blocks || blocks>IDE_MAX_ATAPI_BLOCKS || lba>UINT32_MAX || blocks-1u>UINT32_MAX-lba)return -22;
+    uint8_t packet[12]={0};packet[0]=SCSI_CMD_READ10;
+    packet[2]=lba>>24;packet[3]=lba>>16;packet[4]=lba>>8;packet[5]=lba;
+    packet[7]=blocks>>8;packet[8]=blocks;
+    return ide_atapi_packet(device,packet,blocks*2048u,buffer);
+}
+
+/** @brief Query READ CAPACITY(10) without relying on any filesystem parser.
+ * @param device Stable identified optical device. @param response Current
+ * writable eight-byte big-endian last-LBA/block-size output, valid on success.
+ * @return Zero or native I/O errno. Caller owns transport exclusion and exact
+ * code/device reference; packet PIO never treats a CPU address as physical DMA.
+ */
+int ide_read_capacity(const struct ide_device_info *device,uint8_t response[8])
+{
+    uint8_t packet[12]={0x25};return ide_atapi_packet(device,packet,8,response);
+}
+
 void ide_fill_device(struct ide_device_info *device, uint8_t channel,
                             uint8_t drive, uint16_t command, uint16_t control)
 {
@@ -345,9 +387,4 @@ void ide_fill_device(struct ide_device_info *device, uint8_t channel,
     device->drive = drive;
     device->command_base = command;
     device->control_base = control;
-}
-
-uint32_t fat_offset_for_cluster(uint32_t cluster)
-{
-    return (cluster * 4u) % g_storage.bytes_per_sector;
 }

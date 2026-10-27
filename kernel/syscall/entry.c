@@ -1,11 +1,15 @@
+#include <reliefnt/graphics_service.h>
 #include "internal.h"
+#include <reliefnt/module.h>
 
-/**
- * @brief Return 1 when an EAGAIN result is a real nonblocking-device status.
- *
- * The legacy storage path reuses EAGAIN to rewind and retry the int 0x80
- * instruction after a one-tick DMA wait.  POSIX descriptors opened with
- * O_NONBLOCK must observe EAGAIN instead.
+/** @brief Distinguish a nonblocking stream result from an internal I/O wait.
+ * @param task Current task under execution ownership, nullable.
+ * @param number Native Linux syscall number.
+ * @param fd First argument interpreted as the admitted original descriptor.
+ * @return One for userspace-visible EAGAIN, zero for a retryable storage wait.
+ * Regular files ignore O_NONBLOCK; sendfile tests its output stream and
+ * copy_file_range never turns disk waits into nonblocking errors. No callback,
+ * allocation, reference transfer or graph/module lock occurs.
  */
 static int syscall_eagain_is_nonblocking_device(struct task *task,
                                                 uint64_t number, uint64_t fd);
@@ -15,27 +19,38 @@ static bool syscall_trace_task(const struct task *task);
 
 /** @brief Pin a retryable file operation's description across waits and signals.
  * @param task Calling task under execution ownership, or NULL.
- * @param number Linux syscall number. @param fd First syscall argument.
- * @return Zero or allocation errno. A matching retry keeps the same object even
- * if another thread closes/reuses fd; task_release_syscall_file ends ownership.
+ * @param number Linux syscall number.
+ * @param fd Descriptor argument as signed low-32 bits; mmap uses argument five.
+ * @param arg2 Third syscall argument for finit_module flag preflight, or mmap
+ * fourth-argument flags so anonymous mappings ignore their numeric descriptor.
+ * @return Zero or negative authorization/validation/allocation errno. A matching
+ * retry keeps the same object even if another thread closes/reuses fd; task_release_syscall_file ends ownership.
  */
-static int task_begin_syscall_io(struct task *task, uint64_t number, int32_t fd);
+static int task_begin_syscall_io(struct task *task, uint64_t number, int32_t fd,
+                                  uint64_t arg2);
 
 static char syscall_trace_prefix[128];
-/**
- * @brief Return 1 when an EAGAIN result is a real nonblocking-device status.
- *
- * The legacy storage path reuses EAGAIN to rewind and retry the int 0x80
- * instruction after a one-tick DMA wait.  POSIX descriptors opened with
- * O_NONBLOCK must observe EAGAIN instead.
+/** @brief Distinguish a nonblocking stream result from an internal I/O wait.
+ * @param task Current task under execution ownership, nullable.
+ * @param number Native Linux syscall number.
+ * @param fd First argument interpreted as the admitted original descriptor.
+ * @return One for userspace-visible EAGAIN, zero for a retryable storage wait.
+ * Regular files ignore O_NONBLOCK; sendfile tests its output stream and
+ * copy_file_range never turns disk waits into nonblocking errors. No callback,
+ * allocation, reference transfer or graph/module lock occurs.
  */
 static int syscall_eagain_is_nonblocking_device(struct task *task,
                                                 uint64_t number, uint64_t fd)
 {
     struct task_pty_fd *endpoint;
     struct task_file *file;
-    if (number == LINUX_SYS_SENDFILE || number == LINUX_SYS_COPY_FILE_RANGE ||
-        number == LINUX_SYS_RECV || number == LINUX_SYS_RECVFROM ||
+    if(number==LINUX_SYS_COPY_FILE_RANGE)return 0;
+    if(number==LINUX_SYS_SENDFILE) {
+        file=task_file_for_io(task,(int)fd);
+        return file && (file->flags&RELIEFOS_O_NONBLOCK) &&
+            (file->flags&(TASK_FILE_FLAG_PIPE|TASK_FILE_FLAG_SOCKET_UNIX|TASK_FILE_FLAG_SOCKET_INET));
+    }
+    if (number == LINUX_SYS_RECV || number == LINUX_SYS_RECVFROM ||
         number == LINUX_SYS_RECVMSG || number == LINUX_SYS_SEND ||
         number == LINUX_SYS_SENDTO || number == LINUX_SYS_SENDMSG ||
         number == LINUX_SYS_ACCEPT || number == LINUX_SYS_ACCEPT4 ||
@@ -120,13 +135,26 @@ static bool syscall_trace_task(const struct task *task)
 
 /** @brief Pin a retryable file operation's description across waits and signals.
  * @param task Calling task under execution ownership, or NULL.
- * @param number Linux syscall number. @param fd First syscall argument.
- * @return Zero or allocation errno. A matching retry keeps the same object even
- * if another thread closes/reuses fd; task_release_syscall_file ends ownership.
+ * @param number Linux syscall number.
+ * @param fd Descriptor argument as signed low-32 bits; mmap uses argument five.
+ * @param arg2 Third syscall argument for finit_module flag preflight, or mmap
+ * fourth-argument flags so anonymous mappings ignore their numeric descriptor.
+ * @return Zero or negative authorization/validation/allocation errno. A matching
+ * retry keeps the same object even if another thread closes/reuses fd; task_release_syscall_file ends ownership.
  */
-static int task_begin_syscall_io(struct task *task, uint64_t number, int32_t fd)
+static int task_begin_syscall_io(struct task *task, uint64_t number, int32_t fd,
+                                  uint64_t arg2)
 {
-    bool file_io = number == LINUX_SYS_READ || number == LINUX_SYS_WRITE ||
+    bool file_io = (number==LINUX_SYS_MMAP && !((uint32_t)arg2&LINUX_MAP_ANONYMOUS)) ||
+        number == LINUX_SYS_READ || number == LINUX_SYS_WRITE ||
+        number == LINUX_SYS_FINIT_MODULE ||
+        number == LINUX_SYS_FSTAT || number == LINUX_SYS_FSTATFS ||
+        number == LINUX_SYS_FCHMOD || number == LINUX_SYS_FCHOWN || number == LINUX_SYS_FCHDIR ||
+        number == LINUX_SYS_FTRUNCATE || number == LINUX_SYS_FALLOCATE ||
+        number == LINUX_SYS_GETDENTS || number == LINUX_SYS_GETDENTS64 ||
+        number == LINUX_SYS_FSYNC || number == LINUX_SYS_FDATASYNC ||
+        number == LINUX_SYS_SYNCFS || number == LINUX_SYS_LSEEK ||
+        number == LINUX_SYS_UTIMENSAT || number == LINUX_SYS_FUTIMESAT ||
         number == LINUX_SYS_IOCTL ||
         number == LINUX_SYS_PREAD64 || number == LINUX_SYS_PWRITE64 ||
         number == LINUX_SYS_READV || number == LINUX_SYS_WRITEV ||
@@ -136,12 +164,22 @@ static int task_begin_syscall_io(struct task *task, uint64_t number, int32_t fd)
         number == LINUX_SYS_SENDTO || number == LINUX_SYS_RECVFROM ||
         number == LINUX_SYS_SENDMSG || number == LINUX_SYS_RECVMSG ||
         number == LINUX_SYS_SENDMMSG || number == LINUX_SYS_RECVMMSG ||
-        number == LINUX_SYS_ACCEPT || number == LINUX_SYS_ACCEPT4 || number == LINUX_SYS_CONNECT;
-    if (!task || number == LINUX_SYS_RT_SIGRETURN) return 0;
-    if ((task->syscall_file || task->syscall_pty.used) &&
+        number == LINUX_SYS_ACCEPT || number == LINUX_SYS_ACCEPT4 ||
+        number == LINUX_SYS_BIND || number == LINUX_SYS_CONNECT;
+    /* Metadata, directory and size operations can also wait for backing I/O.
+     * Hold their OFD before the first callback, exactly as scalar data I/O. */
+    if (number == LINUX_SYS_RT_SIGRETURN) return 0;
+    if (task && (task->syscall_file || task->syscall_pty.used) &&
         (!file_io || task->syscall_fd != fd || task->syscall_file_number != number))
         task_release_syscall_file(task);
-    if (!file_io || task->syscall_file || task->syscall_pty.used) return 0;
+    /* An unrelated suspended call must retire before eligibility is checked:
+     * its old OFD can have the same numeric fd as a newly opened module file.
+     * A genuine finit retry retains the original object across close/reuse. */
+    if (number == LINUX_SYS_FINIT_MODULE) {
+        int rc=syscall_module_file_prepare((uint64_t)(uint32_t)fd,arg2);
+        if (rc) return rc;
+    }
+    if (!task || !file_io || task->syscall_file || task->syscall_pty.used) return 0;
     struct task_file *file = task_file_for_fd(task, fd);
     if (file) {
         task->syscall_file = task_file_get(file);
@@ -166,6 +204,8 @@ static int task_begin_syscall_io(struct task *task, uint64_t number, int32_t fd)
  * @return A task for direct user return, or NULL when scheduler handling is required.
  * @note Bounded TCP maintenance runs under the execution transaction; the
  *       tick gate limits packet polling to one small batch per timer tick.
+ * Path operands retain their checked copy and exact directory references over
+ * pre-I/O retries; final return, signal handoff or replacement cancels ownership.
  */
 struct task *syscall_dispatch_frame(struct trap_frame *frame)
 {
@@ -180,9 +220,11 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
     /* Several storage and GUI services still own global scratch buffers. */
     kernel_execution_lock_irqsave(&lock_flags);
     net_tcp_maintenance();
-    /* Drain a small fair batch after taking kernel execution ownership. A
-     * final DRM close only queues work, including closes from signal return. */
-    drm_vmwgfx_process_retirements(2);
+    /* Drain small fair batches after taking execution ownership. Failed
+     * filesystem cleanup retains its provider until a later successful flush;
+     * final DRM close queues work, including closes from signal return. */
+    vfs_reclaim_mounts(2);
+    graphics_service_process_retirements(2);
     driver_manager_process_audio_faults();
     input_process_pending();
     number = frame->rax;
@@ -204,7 +246,12 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
         /* sigaltstack must inspect the live user SP, not the last timer frame. */
         calling_task->frame.rsp = frame->rsp;
     }
-    int pin_error = task_begin_syscall_io(calling_task, number, (int32_t)frame->rdi);
+    task_transfer_enter(calling_task,frame);
+    task_vector_enter(calling_task,frame);
+    int pin_error=task_begin_syscall_io(calling_task,number,
+        (int32_t)(number==LINUX_SYS_MMAP ? frame->r8 : frame->rdi),
+        number==LINUX_SYS_MMAP ? frame->r10 : frame->rdx);
+    task_lookup_scope_begin(calling_task,frame);
     storage_set_io_async_context(true);
     if (pin_error) {
         result = pin_error;
@@ -232,6 +279,8 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
                                        frame->r8,
                                        frame->r9);
     }
+    bool module_file_io_retry=number==LINUX_SYS_FINIT_MODULE && result==MODULE_FILE_IO_RETRY;
+    if(module_file_io_retry) result=-RELIEFOS_EAGAIN;
     if ((number == LINUX_SYS_EXECVE || number == LINUX_SYS_EXECVEAT) && result == 0 && calling_task) {
         *frame = calling_task->frame;
         /* The fresh image frame is not a SYSCALL stub frame; drop the
@@ -277,6 +326,16 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
      * while the PAM owner correctly keeps its marker locked. */
     if (number == LINUX_SYS_FLOCK && ((uint32_t)frame->rsi & RELIEFOS_FLOCK_NB) &&
         result == -RELIEFOS_EWOULDBLOCK)
+        eagain_from_nonblocking = 1;
+    /* A module's external users must release it from userspace. Rewinding
+     * delete_module on EWOULDBLOCK would park the very owner that must close
+     * its device or mapping, because Linux aliases that error to EAGAIN. */
+    /* Initializers may also return a final Linux EAGAIN after side effects and
+     * rollback. Only the explicit pre-init file token is restartable; never
+     * replay a module initializer to satisfy the legacy storage retry path. */
+    if ((number==LINUX_SYS_INIT_MODULE || number==LINUX_SYS_FINIT_MODULE ||
+         number==LINUX_SYS_DELETE_MODULE) && result==-RELIEFOS_EWOULDBLOCK &&
+        !module_file_io_retry)
         eagain_from_nonblocking = 1;
     if (result == -RELIEFOS_EAGAIN && calling_task && calling_task->socket_io_timed &&
         calling_task->socket_io_deadline <= time_ticks()) eagain_from_nonblocking = 1;

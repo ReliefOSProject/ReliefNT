@@ -1,3 +1,4 @@
+#include <reliefnt/export.h>
 #include "device.h"
 
 static int batch_stage_binding(struct svga_batch *batch, svga_handle context,
@@ -59,6 +60,17 @@ done:
     return ret;
 }
 
+/**
+ * @brief Stage a transaction-owned render-target binding without FIFO publication.
+ * @param batch Exclusively owned open batch.
+ * @param context Externally retained native context.
+ * @param target Render-target slot.
+ * @param surface Externally retained surface or supported unbind selector.
+ * @param face Surface face selector.
+ * @param mipmap Mipmap level selector.
+ * @return Zero when staged or SVGA validation/contention/capacity error.
+ * Execution-owned task context, no caller SVGA lock. Caller retains resources until commit/abort and the actual fence; failed staging publishes no hardware packet.
+ */
 int svga_batch_stage_render_target(struct svga_batch *batch,
                                    svga_handle context, uint32_t target,
                                    svga_handle surface, uint32_t face,
@@ -68,6 +80,15 @@ int svga_batch_stage_render_target(struct svga_batch *batch,
         SVGA_BATCH_BINDING_RENDER_TARGET, target, surface, face, mipmap);
 }
 
+/**
+ * @brief Stage a transaction-owned texture binding without FIFO publication.
+ * @param batch Exclusively owned open batch.
+ * @param context Externally retained native context.
+ * @param stage Texture stage selector.
+ * @param surface Externally retained surface or supported unbind selector.
+ * @return Zero when staged or SVGA validation/contention/capacity error.
+ * Execution-owned task context, no caller SVGA lock. Resource ownership remains with the caller through submission/fence or abort.
+ */
 int svga_batch_stage_texture(struct svga_batch *batch, svga_handle context,
                              uint32_t stage, svga_handle surface)
 {
@@ -222,3 +243,6 @@ void svga_batch_state_commit_locked(const struct svga_batch *batch)
             svga.contexts[cid].textures[op->index] = sid;
     }
 }
+
+EXPORT_SYMBOL(svga_batch_stage_render_target);
+EXPORT_SYMBOL(svga_batch_stage_texture);

@@ -4,6 +4,7 @@
 # in the same .cmd/fixdep format as every compiled object.
 always-y += \
     include/generated/build_info.h \
+    include/generated/module_abi.h \
     include/generated/cjk_font.h \
     generated/system/kernel.unstripped \
     generated/system/kernel.sys \
@@ -12,6 +13,7 @@ always-y += \
 
 targets += \
     include/generated/build_info.h \
+    include/generated/module_abi.h \
     include/generated/cjk_font.h \
     generated/system/kernel.unstripped \
     generated/system/kernel.sys \
@@ -30,6 +32,17 @@ $(obj)/include/generated/build_info.h: \
     $(srctree)/configs/build-version \
     $(obj)/tools/host/version/reliefos-version FORCE
 	$(call if_changed,reliefnt_build_info)
+
+# Recompute content identity even when a removed source cannot appear as a
+# prerequisite. The script preserves every output mtime when content matches.
+# This is an upstream Kbuild custom action, never a source compilation list.
+quiet_cmd_reliefnt_module_abi = GEN     $@
+cmd_reliefnt_module_abi = $(CONFIG_SHELL) $(srctree)/scripts/module-abi.sh \
+    '$(srctree)' '$(objtree)' '$(RELIEFNT_MODULE_ABI_POLICY)' \
+    '$(EXTRAVERSION)' '$(LOCALVERSION)'
+
+$(obj)/include/generated/module_abi.h: FORCE
+	$(call cmd,reliefnt_module_abi)
 
 quiet_cmd_reliefnt_cjk_font = GEN     $@
 cmd_reliefnt_cjk_font = set -eu; \
@@ -55,10 +68,10 @@ quiet_cmd_reliefnt_kernel_link = LD      $@
 cmd_reliefnt_kernel_link = $(RELIEFNT_TARGET_LD) -nostdlib \
     -z max-page-size=0x1000 $(KERNEL_LDFLAGS) \
     -T $(srctree)/arch/x86_64/linker.ld -o $@ \
-    --whole-archive $(obj)/built-in.a --no-whole-archive
+    --whole-archive $(obj)/built-in.a --no-whole-archive $(obj)/.vmlinux.export.o
 
 $(obj)/generated/system/kernel.unstripped: \
-    $(obj)/built-in.a \
+    $(obj)/built-in.a $(obj)/.vmlinux.export.o \
     $(srctree)/arch/x86_64/linker.ld \
     $(objtree)/.reliefnt-target-ld.id FORCE
 	$(call if_changed,reliefnt_kernel_link)
@@ -138,3 +151,24 @@ $(obj)/kernel-export/manifest.txt: \
     $(addprefix $(obj)/,$(RELIEFNT_HEADER_OUTPUTS)) \
     $(RELIEFNT_HEADER_LIST) FORCE
 	$(call if_changed,reliefnt_header_manifest)
+
+# Intermediate native kernel image for original modpost/vmlinux_o consumers.
+targets += vmlinux.a .vmlinux.export.o scripts/module.lds
+quiet_cmd_reliefnt_vmlinux_archive = ARCPY   $@
+cmd_reliefnt_vmlinux_archive = cp $< $@.tmp && mv -f $@.tmp $@
+$(obj)/vmlinux.a: $(obj)/built-in.a FORCE
+	$(call if_changed,reliefnt_vmlinux_archive)
+
+CFLAGS_.vmlinux.export.o += -I$(srctree)/scripts/module-include
+$(obj)/.vmlinux.export.o: $(obj)/.vmlinux.export.c $(objtree)/.reliefnt-target-cc.id
+
+quiet_cmd_reliefnt_module_lds = LDS     $@
+cmd_reliefnt_module_lds = cp $< $@.tmp && mv -f $@.tmp $@
+$(obj)/scripts/module.lds: $(obj)/arch/x86_64/module/module.lds FORCE
+	$(call if_changed,reliefnt_module_lds)
+
+targets += System.map
+quiet_cmd_reliefnt_system_map = SYSMAP  $@
+cmd_reliefnt_system_map = $(NM) -n $< > $@.tmp && mv -f $@.tmp $@
+$(obj)/System.map: $(obj)/generated/system/kernel.unstripped FORCE
+	$(call if_changed,reliefnt_system_map)

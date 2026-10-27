@@ -2,9 +2,11 @@
 模块与源码归属
 ==============
 
-ReliefNT 按职责组织静态链接的内核部件。目录模块只划分源码和私有接口，
-不改变启动顺序、调度策略、锁、磁盘格式或 Linux syscall/UAPI，也不引入
-可加载内核模块。所有生产 C 和汇编文件独立编译。
+ReliefNT 按职责组织内核部件，具有独立注册和生命周期边界的部件可以通过
+Kconfig 选择内置或编译为可加载 ELF 模块，默认保持内置。模块针对 ReliefNT
+及其精确 ABI 身份编译，不直接加载 Linux 原版二进制模块。所有生产 C 和汇编
+文件独立编译，原版 Kbuild 管理复合模块和依赖。完整迁移、启动和运行验收仍在
+进行中；交付范围与门槛见 ``Documentation/process/module-support-plan.rst``。
 
 目录边界
 ========
@@ -23,7 +25,7 @@ ReliefNT 按职责组织静态链接的内核部件。目录模块只划分源�
 
 * 路径：``kernel/syscall/``; 职责：syscall 入口/分发；``fd/``、``io/``、``fs/``、``event/``、``device/``、``process/``、``ipc/``、``system/``、``memory/``、``time/`` 各自实现所属接口。
 
-* 路径：``kernel/{device,signal,time,ipc,sync,random}/``; 职责：驱动注册和资源、信号、时钟/vDSO 数据、IPC、同步、随机源。
+* 路径：``kernel/{device,dma,module,signal,time,ipc,sync,random}/``; 职责：驱动注册和资源、DMA 物理缓冲、模块装卸与引用、信号、时钟/vDSO 数据、IPC、同步、随机源。
 
 * 路径：``mm/{heap,physical,cache,user}/``; 职责：堆、物理页、页缓存、用户内存访问。
 
@@ -31,7 +33,7 @@ ReliefNT 按职责组织静态链接的内核部件。目录模块只划分源�
 
 * 路径：``fs/vfs/``、``security/``; 职责：路径/挂载、文件和目录操作、设备节点、权限与旁路元数据。
 
-* 路径：``fs/{ext2,ext4,exfat,fat,iso9660,tmpfs,proc,sysfs}/``; 职责：各文件系统的独立实现；ext4 内部继续区分分配、缓存、目录、extent、journal 和挂载等职责。
+* 路径：``fs/{ext2,ext4,ext_common,exfat,fat,iso9660,tmpfs,proc,sysfs}/``; 职责：文件系统注册与实现。``ext2/``、``ext4/`` 是分别带 owner 的注册入口，两者显式依赖 ``ext_common/`` 的实际分配、缓存、目录、extent、journal、格式化和挂载实现。隐藏的公共配置取两个入口所需的最高链接等级，避免内置代码引用外置实现。
 
 * 路径：``net/{interface,link,ipv4,tcp,services,socket}/``; 职责：接口与配置、ARP/以太网、IP/UDP/ICMP、TCP 状态和收发、DHCP/DNS/NTP/HTTP、socket 生命周期和操作。
 

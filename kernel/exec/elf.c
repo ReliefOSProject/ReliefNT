@@ -5,6 +5,9 @@
 #include <reliefos/elf_abi.h>
 #include <reliefnt/console.h>
 #include <reliefnt/elf.h>
+#include <reliefnt/exec_file.h>
+#include <reliefnt/syscall_internal.h>
+#include <linux/fcntl.h>
 #include <reliefnt/mm.h>
 #include <reliefnt/paging.h>
 #include <reliefnt/permissions.h>
@@ -427,11 +430,17 @@ bool elf64_load_address_space(struct address_space *as, const void *image, size_
 }
 
 /**
- * @brief Read the ELF header plus program headers from node into the scratch buffer and expose them via out_image/out_len.
+ * @brief Read headers through the retained immutable ELF provider.
+ * @param source Borrowed executable source holding its provider and writer denial.
+ * @param out_image Receives scratch bytes valid until the next loader read.
+ * @param out_len Receives the completed header byte count.
+ * @return Zero or ENOEXEC/provider errno. Caller owns the loader transaction;
+ * no graph/module lock spans I/O and no displayed pathname is reopened.
  */
-static int elf64_read_headers(const struct storage_node *node, const void **out_image,
+static int elf64_read_headers(const struct vfs_exec_source *source, const void **out_image,
                                size_t *out_len)
 {
+    const struct storage_node *node=vfs_exec_source_node(source);
     const struct elf64_ehdr *eh;
     uint64_t header_len;
     uint32_t wanted;
@@ -440,7 +449,7 @@ static int elf64_read_headers(const struct storage_node *node, const void **out_
         !out_image || !out_len) {
         return -8;
     }
-    int ret = storage_read_node(node, 0, elf_header_scratch, sizeof(struct elf64_ehdr), &got);
+    int ret = vfs_exec_source_read(source, 0, elf_header_scratch, sizeof(struct elf64_ehdr), &got);
     if (ret < 0) return ret;
     if (got != sizeof(struct elf64_ehdr)) return -8;
     eh = (const struct elf64_ehdr *)elf_header_scratch;
@@ -454,7 +463,7 @@ static int elf64_read_headers(const struct storage_node *node, const void **out_
         return -8;
     }
     got = 0;
-    ret = storage_read_node(node, 0, elf_header_scratch, wanted, &got);
+    ret = vfs_exec_source_read(source, 0, elf_header_scratch, wanted, &got);
     if (ret < 0) return ret;
     if (got != wanted) return -8;
     *out_image = elf_header_scratch;
@@ -621,7 +630,7 @@ static uint64_t elf64_choose_bias(const struct elf_image_info *info, bool interp
 /**
  * @brief Create lazy file-backed VMAs for every LOAD segment of image at bias, coalescing shared read-only pages of static ET_EXEC images.
  * @param task Pinned task whose address space and VMA metadata are owned by the caller.
- * @param node Backing executable inode identity and size.
+ * @param source Borrowed immutable backing retaining its actual provider and writer denial.
  * @param image Validated ELF header and program-header bytes.
  * @param info Image metadata receiving the highest writable segment end.
  * @param bias Validated relocation bias for the image.
@@ -629,10 +638,11 @@ static uint64_t elf64_choose_bias(const struct elf_image_info *info, bool interp
  * @return Zero after VMA publication or a negative executable/allocation error.
  * Page tables and backing pages are populated by faults, not by the virtual span.
  */
-static int elf64_map_one(struct task *task, const struct storage_node *node,
+static int elf64_map_one(struct task *task, struct vfs_exec_source *source,
                           const void *image, struct elf_image_info *info,
                           uint64_t bias, const char *image_name)
 {
+    const struct storage_node *node=vfs_exec_source_node(source);
     const struct elf64_ehdr *eh = image;
     uint32_t loads = 0;
     uint32_t free_vmas = 0;
@@ -733,9 +743,6 @@ static int elf64_map_one(struct task *task, const struct storage_node *node,
             continue;
         }
         segment_node = *node;
-        struct storage_inode_ref *inode = NULL;
-        int hold_ret = storage_inode_get(node, &inode);
-        if (hold_ret < 0) return hold_ret;
         *vma = (struct task_vma){
             .used = 1,
             .prot = prot,
@@ -751,7 +758,7 @@ static int elf64_map_one(struct task *task, const struct storage_node *node,
             .file_offset = file_offset,
             .file_limit = ph->p_offset + ph->p_filesz,
             .file_node = segment_node,
-            .inode = inode,
+            .exec_source = vfs_exec_source_get(source),
         };
     }
     info->program_break = program_break;
@@ -759,120 +766,89 @@ static int elf64_map_one(struct task *task, const struct storage_node *node,
 }
 
 /**
- * @brief Map the main ELF and any PT_INTERP; only ET_DYN receives a load bias.
+ * @brief Map ELF LOADs and resolve PT_INTERP through actual task paths.
+ * @param task Staged or unpublished task with owned MM/root/cwd state.
+ * @param image_path Borrowed main executable retaining its actual provider.
+ * @param out Receives metadata only after every image is mapped successfully.
+ * @return Zero or negative executable/provider/permission errno. Failure leaves
+ * partial VMAs for the caller's staged-MM rollback; each owns its immutable
+ * backing source. The loader/execution transaction is required. Current user
+ * syscall operands retain interpreter lookup/guards across EAGAIN; no graph or
+ * module lock spans I/O. No diagnostic path or legacy text router is consulted.
  */
-int elf64_map_task_image(struct task *task, const struct storage_node *node,
+int elf64_map_task_image(struct task *task, const struct vfs_path *image_path,
                           struct elf_image_info *out)
 {
-    const void *image;
-    const void *interp_image;
-    size_t image_len;
-    size_t interp_len;
-    struct elf_image_info main_info;
-    struct elf_image_info interp_info;
-    struct storage_node interp_node;
-    uint64_t main_bias = 0;
-    uint64_t interp_bias;
-    const struct elf64_ehdr *main_eh;
-    const struct elf64_ehdr *interp_eh;
-    bool entry_found = false;
+    const void *image,*interp_image;
+    size_t image_len,interp_len;
+    struct elf_image_info main_info,interp_info;
+    struct vfs_exec_source *main_source=NULL,*interp_source=NULL;
+    struct vfs_lookup_result interpreter={0};
+    struct storage_inode_ref *temporary=NULL;
+    uint64_t main_bias=0,interp_bias;
+    bool entry_found=false;
     int ret;
-
-    if (!task || !node || !out) {
-        console_error("[reliefnt] ELF task image request is invalid\n");
-        return -22;
+    if(!task || !image_path || !out)return -22;
+    ret=vfs_exec_source_open(image_path,&main_source);
+    if(ret)return ret;
+    const struct storage_node *node=vfs_exec_source_node(main_source);
+    ret=elf64_read_headers(main_source,&image,&image_len);
+    if(ret)goto done;
+    if(!elf64_probe_image(image,image_len,node->size,false,&main_info)){ret=-8;goto done;}
+    if(main_info.dynamic) {
+        main_bias=elf64_choose_bias(&main_info,false);
+        if(!main_bias || main_info.entry>UINT64_MAX-main_bias ||
+           main_info.phdr_vaddr>UINT64_MAX-main_bias){ret=-8;goto done;}
     }
-    ret = elf64_read_headers(node, &image, &image_len);
-    if (ret < 0) {
-        console_error("[reliefnt] ELF main header read failed\n");
-        return ret;
+    const struct elf64_ehdr *main_eh=image;
+    for(uint16_t i=0;i<main_eh->e_phnum;++i) {
+        const struct elf64_phdr *ph=elf64_phdr_at(main_eh,image,i);
+        if(ph->p_type==PT_LOAD && (ph->p_flags&PF_X) && main_info.entry>=ph->p_vaddr &&
+           main_info.entry-ph->p_vaddr<ph->p_memsz)entry_found=true;
     }
-    if (!elf64_probe_image(image, image_len, node->size, false, &main_info)) {
-        console_error("[reliefnt] ELF main header validation failed\n");
-        return -8;
+    if(!entry_found){ret=-8;goto done;}
+    ret=elf64_map_one(task,main_source,image,&main_info,main_bias,"main");
+    if(ret)goto done;
+    main_info.load_bias=main_bias;main_info.entry+=main_bias;main_info.phdr_vaddr+=main_bias;
+    if(!main_info.interp[0]) {
+        main_info.interpreter_entry=main_info.entry;*out=main_info;goto done;
     }
-    main_eh = image;
-    if (main_info.dynamic) {
-        main_bias = elf64_choose_bias(&main_info, false);
-        if (!main_bias || main_info.entry > UINT64_MAX - main_bias ||
-            main_info.phdr_vaddr > UINT64_MAX - main_bias) {
-            console_error("[reliefnt] ELF main ASLR layout rejected span=0x%llx\n",
-                           (unsigned long long)(main_info.high_vaddr - main_info.low_vaddr));
-            return -8;
-        }
+    /* A staged exec task has no syscall scope. The actual caller retains the
+     * same pre-commit root/cwd plus entered components on I/O retries. */
+    struct task *caller=sched_current_task();
+    if(!caller || caller->kind!=TASK_KIND_USER)caller=task;
+    ret=resolve_kernel_object_at_flags(vfs_path_namespace(image_path),caller,LINUX_AT_FDCWD,
+        main_info.interp,false,false,VFS_LOOKUP_FOLLOW,&interpreter);
+    if(ret)goto done;
+    ret=fs_permissions_check_path(task,&interpreter.path,FS_ACCESS_EXEC,false);
+    if(ret)goto done;
+    if(fs_permissions_check_path(task,&interpreter.path,FS_ACCESS_READ,false)<0)
+        sched_task_mm(task)->nondumpable=true;
+    ret=task_lookup_exec_guard(caller,&interpreter.path,&temporary);
+    if(ret)goto done;
+    ret=vfs_exec_source_open(&interpreter.path,&interp_source);
+    if(ret)goto done;
+    ret=elf64_read_headers(interp_source,&interp_image,&interp_len);
+    if(ret){if(ret==-8)ret=-80;goto done;}
+    if(!elf64_probe_image(interp_image,interp_len,vfs_exec_source_node(interp_source)->size,true,&interp_info) ||
+       interp_info.abi_major!=main_info.abi_major){ret=-80;goto done;}
+    interp_bias=elf64_choose_bias(&interp_info,true);
+    if(!interp_bias || interp_info.entry>UINT64_MAX-interp_bias){ret=-8;goto done;}
+    ret=elf64_map_one(task,interp_source,interp_image,&interp_info,interp_bias,"interpreter");
+    if(ret)goto done;
+    task->dynamic_launch.main_base=main_info.load_bias;
+    task->dynamic_launch.main_entry=main_info.entry;
+    task->dynamic_launch.main_phdr=main_info.phdr_vaddr;
+    task->dynamic_launch.interp_base=interp_bias;
+    task->dynamic_launch.interp_entry=interp_info.entry+interp_bias;
+    task->dynamic_launch.abi_major=main_info.abi_major;
+    for(uint32_t i=0;i+1<sizeof(task->dynamic_launch.main_path) && task->path[i];++i) {
+        task->dynamic_launch.main_path[i]=task->path[i];task->dynamic_launch.main_path[i+1]=0;
     }
-    for (uint16_t i = 0; i < main_eh->e_phnum; ++i) {
-        const struct elf64_phdr *ph = elf64_phdr_at(main_eh, image, i);
-        if (ph->p_type == PT_LOAD && (ph->p_flags & PF_X) &&
-            main_info.entry >= ph->p_vaddr && main_info.entry - ph->p_vaddr < ph->p_memsz) {
-            entry_found = true;
-        }
-    }
-    if (!entry_found) {
-        console_error("[reliefnt] ELF main entry is outside an executable LOAD segment\n");
-        return -8;
-    }
-    ret = elf64_map_one(task, node, image, &main_info, main_bias, "main");
-    if (ret < 0) return ret;
-    main_info.load_bias = main_bias;
-    main_info.entry += main_bias;
-    main_info.phdr_vaddr += main_bias;
-    if (!main_info.interp[0]) {
-        /* Static ET_EXEC or PIE: enter the main image. AT_BASE stays zero via
-         * the cleared dynamic-launch state; AT_PHDR/AT_ENTRY are filled by
-         * userland_load_task_image_locked(). */
-        main_info.interpreter_entry = main_info.entry;
-        *out = main_info;
-        return 0;
-    }
-
-    char interpreter_path[RELIEFOS_FS_PATH_LEN];
-    ret = fs_permissions_resolve(task, sched_task_cwd(task), main_info.interp,
-                                 interpreter_path, sizeof(interpreter_path), false);
-    if (!ret) ret = storage_lookup_path(interpreter_path, &interp_node);
-    if (ret < 0) {
-        console_error("[reliefnt] ELF interpreter lookup failed path=%s\n", main_info.interp);
-        return ret;
-    }
-    ret = fs_permissions_check(task, interpreter_path, FS_ACCESS_EXEC, false);
-    if (ret < 0) return ret;
-    if (fs_permissions_check(task, interpreter_path, FS_ACCESS_READ, false) < 0)
-        sched_task_mm(task)->nondumpable = true;
-    ret = elf64_read_headers(&interp_node, &interp_image, &interp_len);
-    if (ret < 0) {
-        console_error("[reliefnt] ELF interpreter header read failed\n");
-        return ret == -8 ? -80 : ret;
-    }
-    if (!elf64_probe_image(interp_image, interp_len, interp_node.size, true, &interp_info)) {
-        console_error("[reliefnt] ELF interpreter header validation failed\n");
-        return -80;
-    }
-    if (interp_info.abi_major != main_info.abi_major) {
-        console_error("[reliefnt] ELF ABI mismatch main=%u interpreter=%u\n",
-                       main_info.abi_major, interp_info.abi_major);
-        return -80;
-    }
-    interp_bias = elf64_choose_bias(&interp_info, true);
-    interp_eh = interp_image;
-    if (!interp_bias || interp_info.entry > UINT64_MAX - interp_bias) {
-        console_error("[reliefnt] ELF interpreter ASLR layout rejected span=0x%llx\n",
-                       (unsigned long long)(interp_info.high_vaddr - interp_info.low_vaddr));
-        return -8;
-    }
-    ret = elf64_map_one(task, &interp_node, interp_image, &interp_info, interp_bias, "interpreter");
-    if (ret < 0) return ret;
-    (void)interp_eh;
-    task->dynamic_launch.main_base = main_info.load_bias;
-    task->dynamic_launch.main_entry = main_info.entry;
-    task->dynamic_launch.main_phdr = main_info.phdr_vaddr;
-    task->dynamic_launch.interp_base = interp_bias;
-    task->dynamic_launch.interp_entry = interp_info.entry + interp_bias;
-    task->dynamic_launch.abi_major = main_info.abi_major;
-    for (uint32_t i = 0; i + 1 < sizeof(task->dynamic_launch.main_path) && task->path[i]; ++i) {
-        task->dynamic_launch.main_path[i] = task->path[i];
-        task->dynamic_launch.main_path[i + 1] = 0;
-    }
-    main_info.interpreter_entry = interp_info.entry + interp_bias;
-    *out = main_info;
-    return 0;
+    main_info.interpreter_entry=interp_info.entry+interp_bias;*out=main_info;
+done:
+    vfs_exec_source_put(interp_source);
+    if(temporary){storage_inode_allow_write(temporary);(void)storage_inode_put(temporary);}
+    vfs_path_put(&interpreter.path);vfs_exec_source_put(main_source);
+    return ret;
 }

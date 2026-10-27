@@ -1,3 +1,4 @@
+#include <reliefnt/export.h>
 #include <reliefnt/usercopy.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/paging.h>
@@ -70,3 +71,6 @@ int user_copy_from_task(struct task *task, void *destination, uint64_t address,
     }
     return 0;
 }
+
+EXPORT_SYMBOL(user_copy_from_task);
+EXPORT_SYMBOL(user_copy_to_task);

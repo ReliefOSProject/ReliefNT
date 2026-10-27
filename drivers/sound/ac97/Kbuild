@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Objects are owned by this directory; child modules own their own lists.
-obj-y := ac97.o
+obj-$(CONFIG_SND_INTEL8X0) += ac97.o
+ac97-y := ac97_main.o module.o
 
 include $(srctree)/scripts/Makefile.module

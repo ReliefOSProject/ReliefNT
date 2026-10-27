@@ -1,5 +1,5 @@
 /* Host-side tests for the ext4 group descriptor, bitmap and flex-group
- * allocator (fs/ext4/alloc.c).
+ * allocator (fs/ext_common/alloc.c).
  *
  * Covers, against synthetic ext4 images built byte by byte here and against
  * real mke2fs images:
@@ -46,13 +46,13 @@
  *     -Iinclude/uapi -Iinclude \
  *     -include block/core/storage_internal.h \
  *     tools/tests/ext4_alloc_test.c \
- *     fs/ext4/format.c \
- *     fs/ext4/checksum.c \
- *     fs/ext4/cache.c \
- *     fs/ext4/alloc.c \
- *     fs/ext4/extent.c \
- *     fs/ext4/ops.c \
- *     fs/ext4/journal.c \
+ *     fs/ext_common/format.c \
+ *     fs/ext_common/checksum.c \
+ *     fs/ext_common/cache.c \
+ *     fs/ext_common/alloc.c \
+ *     fs/ext_common/extent.c \
+ *     fs/ext_common/ops.c \
+ *     fs/ext_common/journal.c \
  *     -o /tmp/reliefos-ext4-alloc-test
  *   ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
  *     /tmp/reliefos-ext4-alloc-test
@@ -130,8 +130,8 @@ void kernel_execution_unlock_irqrestore(uint64_t flags) { (void)flags; }
 
 /* Fake disk layer: the four facade helpers the standalone fragment TUs
  * link against (RELIEFOS_STORAGE_STANDALONE_TU prototypes in
- * storage_internal.h).  Bounds mirror the production STORAGE_VOLUME_RAM
- * branch of storage_read_device. */
+ * storage_internal.h). Bounds belong to this standalone codec transport;
+ * registered-device ownership is exercised by the storage graph suites. */
 void storage_memzero(void *dst, size_t len) { memset(dst, 0, len); }
 void storage_memcpy(void *dst, const void *src, size_t len)
 { memcpy(dst, src, len); }
@@ -197,7 +197,7 @@ int ext4_cache_block_range(const struct storage_volume *volume,
     return 0;
 }
 
-#include "../../fs/ext4/mount.c"
+#include "../../fs/ext_common/mount.c"
 
 static uint8_t ext4_alloc_block_test[EXT4_MAX_BLOCK_SIZE];
 
@@ -524,7 +524,7 @@ static struct storage_volume *mount_now(void)
      * image (the entries are stamped with the generation). */
     volume->mount_generation = ++generation;
     volume->volume_id = 0;
-    volume->kind = STORAGE_VOLUME_RAM;
+    volume->kind = STORAGE_VOLUME_BLOCK;
     volume->ext_start_lba = 0;
     volume->ext_sector_count = disk_size / SECTOR_SIZE;
     g_active_volume = volume;
@@ -1324,7 +1324,7 @@ static void case_huge_group_boundary(void)
     fixture_synthetic = 0;
     storage_memzero(volume, sizeof(*volume));
     volume->mount_generation = 0x7000; /* distinct from every mounted case */
-    volume->kind = STORAGE_VOLUME_RAM;
+    volume->kind = STORAGE_VOLUME_BLOCK;
     volume->ext_sector_count = disk_size / SECTOR_SIZE;
     volume->ext4.blocks_count = (1ull << 32) + 40000;
     volume->ext4.group_count = 131073;

@@ -22,6 +22,12 @@ int page_cache_load(const struct storage_node *node, uint64_t offset,
 void page_cache_release(uint64_t phys);
 int page_cache_retain(uint64_t phys);
 int page_cache_owns(uint64_t phys);
+/**
+ * @brief Drop unreferenced resident pages matching one native backing identity.
+ * @param node Borrowed stable type/volume/inode identity, nullable for a no-op.
+ * @par Context
+ * Acquires the IRQ-safe cache lock and releases only unpinned resident pages. Pinned and overflow entries survive until their normal final release; no file/provider callback or user access.
+ */
 void page_cache_invalidate_node(const struct storage_node *node);
 void page_cache_stats(uint32_t *entries, uint32_t *hits);
 

@@ -53,7 +53,14 @@ class SmpTrampolineNxeTests(unittest.TestCase):
         no_nx_cli = next(i for i in range(max_leaf_reject + 1, no_nx_halt + 1)
                          if instructions[i] == "cli")
         read_cr0 = instruction_index(r"mov\s+eax,cr0")
-        enable_paging = instruction_index(r"or\s+eax,0x80000000")
+        paging_writes = []
+        for index, instruction in enumerate(instructions):
+            match = re.fullmatch(r"or\s+eax,0x([0-9a-f]+)", instruction)
+            if match and int(match.group(1), 16) & (1 << 31):
+                paging_writes.append((index, int(match.group(1), 16)))
+        self.assertEqual(len(paging_writes), 1, "one AP CR0 paging enable is required")
+        enable_paging, cr0_bits = paging_writes[0]
+        self.assertTrue(cr0_bits & (1 << 16), "AP supervisor writes must honor read-only PTEs")
         load_cr0 = instruction_index(r"mov\s+cr0,eax")
         efer_writes = [i for i, instruction in enumerate(instructions)
                        if re.fullmatch(r"wrmsr", instruction)]

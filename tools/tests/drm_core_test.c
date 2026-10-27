@@ -1,3 +1,4 @@
+#include "../../drivers/video/drm/memory.h"
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,9 +25,18 @@
 #include <reliefnt/svga.h>
 #include "../../drivers/video/svga/svga_protocol.h"
 
+/* Hardware discovery is modelled by explicit drm_device_register calls below.
+ * Publication and its permanent service broker use their actual source files. */
+int framebuffer_vmware_pci_identity(struct pci_device *out)
+{ (void)out; return -LINUX_ENODEV; }
+
 #include "../../drivers/video/drm/drm_device.c"
 #include "../../drivers/video/drm/drm_faildiag.c"
 #include "../../drivers/video/drm/drm_file.c"
+#include "../../kernel/device/character.c"
+#include "../../drivers/video/drm/event_io.c"
+#include "../../drivers/video/drm/file_ops.c"
+#include "../../drivers/video/drm/mapping.c"
 #include "../../drivers/video/drm/drm_ioctl.c"
 #include "../../drivers/video/drm/drm_kms.c"
 #include "../../drivers/video/drm/drm_bo.c"
@@ -35,6 +45,13 @@
 #include "../../drivers/video/drm/drm_prime.c"
 #include "../../drivers/video/drm/vmwgfx/execbuf_parser.c"
 #include "modules/vmwgfx_execbuf.h"
+
+#ifdef RELIEFNT_DRM_NATIVE_OWNER_TEST
+#include "../../kernel/module/internal.h"
+#include "../../drivers/video/drm/memory.h"
+struct module drm_test_native_owner;
+void module_memory_free(struct module_memory *memory){assert(!memory);}
+#endif
 
 #define DRM_IOCTL_VMW_ALLOC_BO \
     DRM_IOWR(DRM_COMMAND_BASE + DRM_VMW_ALLOC_BO, union drm_vmw_alloc_bo_arg)
@@ -93,6 +110,7 @@ _Static_assert(SVGA3D_SURFACE_BIND_STREAM_OUTPUT == DRM_TEST_SURFACE_BIND_STREAM
 
 static unsigned maintenance_lock_acquisitions;
 static unsigned allocations;
+static unsigned drm_test_permanent_allocations;
 static char drm_test_diag_log_buffer[16384];
 static unsigned drm_test_diag_log_calls;
 static int fail_kernel_malloc_after = -1;
@@ -232,6 +250,7 @@ struct drm_test_borrowed {
     svga_handle handle;
     void *owner;
     void (*owner_put)(void *owner);
+    struct module *code_owner;
     uint32_t retirement_fence_seq;
     bool destruction_published;
 };
@@ -501,13 +520,14 @@ int svga_batch_query_wait(struct svga_batch *batch, svga_handle context,
 { (void)type; (void)result; (void)offset; return batch && context ? 0 : SVGA_EINVAL; }
 
 int svga_gmr_borrowed_attach(uint64_t phys, uint32_t bytes, void *owner,
-                             void (*owner_put)(void *owner), svga_handle *out)
+                             void (*owner_put)(void *owner), struct module *code_owner, svga_handle *out)
 {
     if (!phys || !bytes || !owner || !owner_put || !out ||
         drm_test_borrowed_count >= 128) return SVGA_EINVAL;
+    if(!try_module_get(code_owner))return SVGA_ENODEV;
     svga_handle handle = drm_test_next_gmr++;
     drm_test_borrowed[drm_test_borrowed_count++] = (struct drm_test_borrowed){
-        .handle = handle, .owner = owner, .owner_put = owner_put};
+        .handle = handle, .owner = owner, .owner_put = owner_put, .code_owner = code_owner};
     *out = handle;
     return 0;
 }
@@ -540,6 +560,7 @@ int svga_gmr_borrowed_detach(svga_handle handle)
         drm_test_borrowed[i] = drm_test_borrowed[--drm_test_borrowed_count];
         ++drm_test_borrowed_owner_put_calls;
         borrowed.owner_put(borrowed.owner);
+        module_put(borrowed.code_owner);
         return 0;
     }
     return SVGA_EINVAL;
@@ -1023,7 +1044,8 @@ struct task_file *task_file_get(struct task_file *source)
 
 static void drm_test_ofd_release(struct task_file *description)
 {
-    if (description->drm_prime_file) drm_prime_file_close(description);
+    struct character_file *handle=description->character_file;description->character_file=NULL;
+    character_file_close(handle,description);
     *description = (struct task_file){0};
 }
 
@@ -1045,7 +1067,8 @@ void task_discard_file_fd(struct task *task, int fd)
         if (description->references && --description->references == 0)
             drm_test_ofd_release(description);
     } else {
-        if (slot->drm_prime_file) drm_prime_file_close(slot);
+        struct character_file *handle=slot->character_file;slot->character_file=NULL;
+        character_file_close(handle,slot);
         *slot = (struct task_file){0};
     }
 }
@@ -1131,7 +1154,7 @@ static void test_registration_and_open_lifetime(void)
     assert(drm_device_register(&invalid) == -LINUX_EINVAL);
     assert(!drm_device_is_registered());
     assert(drm_file_open(&unprivileged, &first) == -LINUX_ENODEV);
-    assert(!first.drm_file && allocations == 0);
+    assert(!first.drm_file && allocations == drm_test_permanent_allocations);
 
     struct pci_device pci = vmware_device();
     assert(drm_device_register(&pci) == 0);
@@ -1160,7 +1183,7 @@ static void test_registration_and_open_lifetime(void)
     assert(!drm_device_get()->master);
     assert(drm_file_open(&admin, &third) == 0 && third.drm_file->is_master);
     drm_file_close(&third);
-    assert(allocations == 0);
+    assert(allocations == drm_test_permanent_allocations);
 }
 
 static void test_render_open_never_takes_primary_master(void)
@@ -1198,7 +1221,7 @@ static void test_render_open_never_takes_primary_master(void)
     assert(drm_device_get()->master == primary_master);
     drm_file_close(&primary);
     assert(!drm_device_get()->master);
-    assert(allocations == 0);
+    assert(allocations == drm_test_permanent_allocations);
 }
 
 static void test_render_ioctl_permission_matrix(void)
@@ -1284,7 +1307,7 @@ static void test_render_ioctl_permission_matrix(void)
 
     drm_file_close(&user_render);
     drm_file_close(&root_render);
-    assert(allocations == 0);
+    assert(allocations == drm_test_permanent_allocations);
 }
 
 static void test_core_abi_and_validation(void)
@@ -1372,7 +1395,7 @@ static void test_core_abi_and_validation(void)
 
     drm_file_close(&client);
     drm_file_close(&master);
-    assert(!drm_device_get()->master && allocations == 0);
+    assert(!drm_device_get()->master && allocations == drm_test_permanent_allocations);
 }
 
 static void test_legacy_magic_and_empty_readiness(void)
@@ -1404,7 +1427,7 @@ static void test_legacy_magic_and_empty_readiness(void)
     drm_file_close(&client);
     assert(master.drm_file->master->magics == NULL);
     drm_file_close(&master);
-    assert(allocations == 0);
+    assert(allocations == drm_test_permanent_allocations);
 }
 
 static void test_dumb_and_vmwgfx_bo_contract(void)
@@ -1613,7 +1636,7 @@ static void test_dumb_and_vmwgfx_bo_contract(void)
 
     drm_file_close(&foreign);
     drm_file_close(&owner);
-    assert(allocations == 0);
+    assert(allocations == drm_test_permanent_allocations);
 }
 
 static void test_kms_resources_properties_and_scanout(void)
@@ -1875,7 +1898,7 @@ static void test_kms_resources_properties_and_scanout(void)
     drm_file_close(&master);
     assert(scanout_release_calls == 3);
     assert(mm_pages_freed == mm_pages_allocated);
-    assert(allocations == 0);
+    assert(allocations == drm_test_permanent_allocations);
 }
 
 static void drm_test_assert_present_job_rect(
@@ -2078,7 +2101,7 @@ static void test_kms_surface_present_pressure(void)
     drm_file_close(&owner);
     drm_test_fence_passed = drm_test_fence_issued;
     drm_vmwgfx_process_retirements(2);
-    assert(allocations == 0);
+    assert(allocations == drm_test_permanent_allocations);
 }
 
 static void test_kms_surface_format_compatibility(void)
@@ -2633,7 +2656,7 @@ static void test_prime_surface_fd_lifetime(void)
     drm_file_close(&importer);
     drm_test_fence_passed = drm_test_fence_issued;
     drm_vmwgfx_process_retirements(2);
-    assert(allocations == 0);
+    assert(allocations == drm_test_permanent_allocations);
 
     /* A live cached dma-buf OFD fixes its access mode and anonymous-inode
      * owner at the first export. Later descriptors may request write access,
@@ -2700,7 +2723,7 @@ static void test_prime_surface_fd_lifetime(void)
     drm_file_close(&owner);
     task_discard_file_fd(&owner_task, readonly_second.fd);
     drm_vmwgfx_process_retirements(2);
-    assert(allocations == 0);
+    assert(allocations == drm_test_permanent_allocations);
 }
 
 static uint32_t drm_test_find_capability(const uint32_t *record,
@@ -3583,7 +3606,7 @@ static void test_vmwgfx_resource_contract(void)
     assert(drm_test_context_create_calls == 6u);
     assert(drm_test_surface_create_calls == 10u);
     assert(drm_test_surface_destroy_calls == 10u);
-    assert(allocations == 0);
+    assert(allocations == drm_test_permanent_allocations);
     (void)foreign_task;
     (void)foreign;
 }
@@ -4972,7 +4995,7 @@ static void test_vgpu9_execbuf_v1_empty_fence_abi(void)
         ((struct drm_vmwgfx_task_continuation *)
             client_task.drm_vmwgfx_continuation)->fence_object;
     struct drm_vmwgfx_task_continuation *replacement_continuation =
-        kernel_malloc(sizeof(*replacement_continuation));
+        drm_async_alloc(sizeof(*replacement_continuation));
     assert(replacement_continuation);
     *replacement_continuation = (struct drm_vmwgfx_task_continuation){
         .kind = DRM_VMW_CONT_SYNCCPU,
@@ -5571,7 +5594,7 @@ static void test_vgpu9_execbuf_v1_empty_fence_abi(void)
     client_task.syscall_file = NULL;
     drm_file_close(&client);
     drm_file_close(&owner);
-    assert(allocations == 0);
+    assert(allocations == drm_test_permanent_allocations);
 }
 
 static int drm_test_fail_alloc_bo(struct task *task, struct task_file *task_file)
@@ -5720,7 +5743,7 @@ static void test_idle_retirement_and_reactivation(void)
            "idle retirement acquired GPU queue locks");
     unsigned before = allocations;
     struct drm_vmwgfx_task_continuation *continuation =
-        kernel_malloc(sizeof(*continuation));
+        drm_async_alloc(sizeof(*continuation));
     assert(continuation);
     *continuation = (struct drm_vmwgfx_task_continuation){0};
     drm_vmwgfx_continuation_queue_release(continuation);
@@ -5734,6 +5757,21 @@ static void test_idle_retirement_and_reactivation(void)
 
 int main(void)
 {
+#ifdef RELIEFNT_DRM_NATIVE_OWNER_TEST
+    struct module_runtime *runtime=kernel_malloc(sizeof(*runtime));assert(runtime);
+    memset(runtime,0,sizeof(*runtime));
+    strcpy(drm_test_native_owner.name,"drm");strcpy(runtime->name,"drm");
+    drm_test_native_owner.runtime=runtime;runtime->owner=&drm_test_native_owner;
+    runtime->state=MODULE_LIVE;runtime->init_succeeded=true;module_list=runtime;
+    unsigned heap_before=allocations;
+    runtime->state=MODULE_GOING;assert(!drm_async_alloc(32) && allocations==heap_before);
+    runtime->state=MODULE_LIVE;
+    void *owned=drm_async_alloc(32);assert(owned && runtime->users==1);
+    assert(module_unload("drm",0)==-LINUX_EWOULDBLOCK && runtime->state==MODULE_LIVE);
+    drm_async_free(owned);assert(!runtime->users && allocations==heap_before);
+#endif
+    assert(!drm_character_init());
+    drm_test_permanent_allocations=allocations;
     test_idle_retirement_and_reactivation();
     test_faildiag_real_bo_failures();
     test_registration_and_open_lifetime();
@@ -5750,6 +5788,13 @@ int main(void)
     test_vgpu9_execbuf_v1_empty_fence_abi();
     test_exec_work_byte_pressure();
     assert(mm_pages_freed == mm_pages_allocated);
+    drm_character_exit();
+#ifdef RELIEFNT_DRM_NATIVE_OWNER_TEST
+    assert(!runtime->users && !runtime->executing);
+    assert(!module_unload("drm",0) && !module_list);
+    puts("PASS actual DRM core: native async-owner rejection, busy unload stays LIVE, full real state machines and final ledger/code teardown");
+#endif
+    assert(!allocations);
     puts("drm-core: PASS");
     return 0;
 }

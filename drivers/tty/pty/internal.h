@@ -6,7 +6,6 @@
  * Connects shells and terminal applications to their controlling sessions.
  */
 #include <reliefnt/pty.h>
-#include <reliefnt/drm.h>
 #include <reliefnt/input.h>
 #include <reliefnt/console.h>
 #include <reliefnt/framebuffer.h>

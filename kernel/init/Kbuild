@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Objects are owned by this directory; child modules own their own lists.
-obj-y := kernel.o kernel_debug.o uts.o version.o
+obj-y := kernel.o kernel_debug.o uts.o version.o initcalls.o init_program.o
 
 include $(srctree)/scripts/Makefile.module
 
-$(obj)/version.o: $(objtree)/include/generated/build_info.h
+$(obj)/version.o: $(objtree)/include/generated/build_info.h $(objtree)/include/generated/module_abi.h

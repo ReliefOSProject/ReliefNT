@@ -2,14 +2,35 @@
 #define RELIEFNT_AUDIO_H
 #include <reliefos/driver_audio.h>
 #include <reliefnt/types.h>
+#include <reliefnt/module.h>
 struct task;
+struct reliefos_driver_module;
+/** @brief Register native sound hardware with an actual mandatory core dependency.
+ * @param descriptor Persistent AUDIO driver descriptor, owned by its native image.
+ * @param owner COMING hardware module or NULL for a builtin driver.
+ * @return Zero including absent hardware, or validation/init errno. Init task
+ * context; manager hardware waits suspend execution ownership without registry
+ * locks. Native imports retain snd.ko through all hardware cleanup, and card
+ * registrations independently pin the core through deferred disconnects.
+ */
+int audio_driver_module_register(const struct reliefos_driver_module *descriptor,struct module *owner);
+/** @brief Acquire a live card provider reference for an external file/PCM owner.
+ * @param card Generation-tagged card id.
+ * @param out Required owned result; NULL denotes a permanent builtin provider.
+ * @return Zero or -EINVAL/-ENODEV; release successful results with module_put.
+ * IRQ-safe short card/module registry locks, no callbacks or I/O. COMING/GOING
+ * native providers do not admit new external users.
+ */
+int audio_card_module_get(uint32_t card,struct module **out);
 /** @brief Copy validated card metadata and bind its module owner.
  * @param identity Borrowed identity copied on success.
  * @param ops Borrowed operation table copied on success.
  * @param opaque Module context, alive until unregister returns.
  * @param owner Driver-manager slot owning callbacks.
  * @param out_id Receives generation token; untouched on failure.
- * @return 0, -EINVAL, or -ENOSPC. Task context; short IRQ-safe lock only.
+ * @return Zero or EINVAL/ENODEV/ENOSPC. Task context, no lock spans hardware
+ * callbacks. Registration pins an optional sound core through final successful
+ * disconnect, including pending/failed STOP; admission rejects COMING/GOING.
  */
 int audio_register_card_owned(const struct audio_card_identity *identity,
                              const struct audio_card_ops *ops, void *opaque,

@@ -6,7 +6,7 @@
  * @file storage_internal.h
  * @brief Private aggregate for block and filesystem implementation units.
  *
- * Transport drivers include storage_driver.h directly. Filesystem families
+ * Transport layouts/prototypes are owned by each driver directory. Filesystem families
  * share their definitions through fs/fs_internal.h; the storage_volume
  * composite is assembled from the owned type headers.
  */
@@ -29,11 +29,10 @@
 #include <reliefnt/pty.h>
 #include <linux/mount.h>
 
-#include "storage_hardware.h"
 #include "storage_types.h"
 #include "storage_core_api.h"
 #include "../partition/storage_partition.h"
 #include "../../fs/fs_internal.h"
-#include "storage_driver.h"
+#include "../../fs/operations.h"
 
 #endif /* RELIEFNT_STORAGE_INTERNAL_H */

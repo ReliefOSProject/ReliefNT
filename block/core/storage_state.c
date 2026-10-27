@@ -1,4 +1,5 @@
 #include "storage_internal.h"
+#include <reliefnt/export.h>
 static uint64_t storage_metadata_epoch = 1;
 
 uint64_t storage_metadata_generation(void)
@@ -40,6 +41,20 @@ int storage_acquire_task_io(void)
     return -RELIEFOS_EAGAIN;
 }
 
+/** @brief Drain exiting-task native transfers before releasing generic I/O ownership.
+ * @param pid Exiting identity, zero ignored. Reaper under execution ownership;
+ * no module/registry lock spans provider cancellation, which touches only owned
+ * driver DMA and discards data instead of dereferencing retired task buffers.
+ */
+void storage_drain_task_io(uint32_t pid)
+{
+    if(!pid)return;
+    kernel_spin_lock(&storage_transport_lock);
+    block_device_cancel_all(pid);
+    kernel_spin_unlock(&storage_transport_lock);
+    storage_release_task_io(pid);
+}
+
 void storage_release_task_io(uint32_t pid)
 {
     if (pid && storage_task_io_owner == pid) {
@@ -47,6 +62,12 @@ void storage_release_task_io(uint32_t pid)
     }
 }
 
+/**
+ * @brief Test whether the current single-CPU read transaction may be retried after yielding.
+ * @return True only for an asynchronous context before any write and with at most one CPU.
+ * @par Context
+ * Caller holds storage execution ownership; shared volume/cache state must remain selected and live throughout the call.
+ */
 bool storage_async_can_yield(void)
 {
     /* AHCI command descriptors, DMA staging buffers, filesystem caches and
@@ -59,6 +80,11 @@ bool storage_async_can_yield(void)
            smp_cpu_count() <= 1u;
 }
 
+/**
+ * @brief Advance the metadata epoch and make the current asynchronous transaction non-replayable.
+ * @par Context
+ * Caller holds storage execution ownership; shared volume/cache state must remain selected and live throughout the call.
+ */
 void storage_begin_mutation(void)
 {
     ++storage_metadata_epoch;
@@ -67,6 +93,13 @@ void storage_begin_mutation(void)
     }
 }
 
+/**
+ * @brief Zero exactly the requested byte extent.
+ * @param dst Writable kernel extent of len bytes; nullable only for zero length.
+ * @param len Number of bytes to clear.
+ * @par Context
+ * Caller supplies stable kernel buffers; no user-pointer access, locks, allocation or ownership transfer.
+ */
 void storage_memzero(void *dst, size_t len)
 {
     uint8_t *p = (uint8_t *)dst;
@@ -75,17 +108,41 @@ void storage_memzero(void *dst, size_t len)
     }
 }
 
+/** @brief Notify each pinned native cache provider once without optional imports.
+ * @param writer Borrowed stable raw/native writer, NULL for global invalidation.
+ * @param lba First physical sector, ignored without writer.
+ * @param sectors Sector count, ignored without writer.
+ * @return None. Execution ownership keeps all contexts stable; callbacks are
+ * IRQ-safe, nonallocating and perform no I/O. A physical alias need not have
+ * its own codec; each native provider checks its own cached device identities.
+ */
+void storage_filesystem_cache_event(const struct storage_volume *writer,uint64_t lba,uint32_t sectors)
+{
+    const struct storage_filesystem_ops *seen[STORAGE_MAX_VOLUMES+2];uint32_t count=0;
+    for(uint32_t i=0;i<STORAGE_MAX_VOLUMES+2;++i) {
+        const struct storage_volume *volume=i==0 ? writer : i==1 ? &g_shmem_volume : &g_volumes[i-2];
+        const struct storage_filesystem_ops *ops=volume ? volume->fs_ops : NULL;
+        if(!ops || (writer ? !ops->invalidate_write : !ops->invalidate))continue;
+        bool duplicate=false;
+        for(uint32_t n=0;n<count;++n)if(seen[n]==ops){duplicate=true;break;}
+        if(duplicate)continue;seen[count++]=ops;
+        if(writer)ops->invalidate_write(writer,lba,sectors);else ops->invalidate();
+    }
+}
+
+/**
+ * @brief Retire native metadata and physical-I/O cache entries.
+ * @par Context
+ * Also advances the mutation epoch used to reject replay of an accepted write.
+ * Caller holds storage execution ownership; no namespace or module callback.
+ */
 void storage_cache_invalidate(void)
 {
     ++storage_metadata_epoch;
-    exfat_cache_invalidate();
+    storage_filesystem_cache_event(NULL,0,0);
     storage_fat_cache.valid = 0;
     storage_read_cache.valid = 0;
     storage_dir_lookup_cache.valid = 0;
-    for (uint32_t i = 0; i < STORAGE_PATH_CACHE_ENTRIES; ++i) {
-        storage_path_cache[i].valid = 0;
-    }
-    storage_path_cache_next = 0;
     for (uint32_t i = 0; i < STORAGE_DIR_INDEX_ENTRIES; ++i) {
         storage_dir_index[i].valid = 0;
     }
@@ -94,16 +151,18 @@ void storage_cache_invalidate(void)
     storage_write_chain_cache.valid = 0;
 }
 
+/**
+ * @brief Retire sector and directory caches after block I/O.
+ * @par Context
+ * Advances the mutation epoch while preserving the separate write-chain hint.
+ * Caller holds storage execution ownership; no allocation or provider callback.
+ */
 void storage_sector_cache_invalidate(void)
 {
     ++storage_metadata_epoch;
     storage_fat_cache.valid = 0;
     storage_read_cache.valid = 0;
     storage_dir_lookup_cache.valid = 0;
-    for (uint32_t i = 0; i < STORAGE_PATH_CACHE_ENTRIES; ++i) {
-        storage_path_cache[i].valid = 0;
-    }
-    storage_path_cache_next = 0;
     for (uint32_t i = 0; i < STORAGE_DIR_INDEX_ENTRIES; ++i) {
         storage_dir_index[i].valid = 0;
     }
@@ -111,6 +170,14 @@ void storage_sector_cache_invalidate(void)
     storage_dir_iter_cache.valid = 0;
 }
 
+/**
+ * @brief Copy an exact nonoverlapping byte extent without allocating.
+ * @param dst Writable kernel extent of len bytes.
+ * @param src Readable kernel extent of len bytes, not overlapping dst.
+ * @param len Number of bytes to copy.
+ * @par Context
+ * Caller supplies stable kernel buffers; no user-pointer access, locks, allocation or ownership transfer.
+ */
 void storage_memcpy(void *dst, const void *src, size_t len)
 {
     uint8_t *d = (uint8_t *)dst;
@@ -120,6 +187,15 @@ void storage_memcpy(void *dst, const void *src, size_t len)
     }
 }
 
+/**
+ * @brief Compare two exact byte extents lexicographically.
+ * @param a Readable kernel extent of len bytes.
+ * @param b Readable kernel extent of len bytes.
+ * @param len Number of bytes to compare.
+ * @return Zero if equal, otherwise the difference between the first unequal unsigned bytes.
+ * @par Context
+ * Caller supplies stable kernel buffers; no user-pointer access, locks, allocation or ownership transfer.
+ */
 int storage_memcmp(const void *a, const void *b, size_t len)
 {
     const uint8_t *pa = (const uint8_t *)a;
@@ -132,6 +208,13 @@ int storage_memcmp(const void *a, const void *b, size_t len)
     return 0;
 }
 
+/**
+ * @brief Measure a nullable terminated kernel string.
+ * @param s Readable NUL-terminated kernel string, nullable.
+ * @return Bytes before NUL, or zero for NULL.
+ * @par Context
+ * Caller supplies stable kernel buffers; no user-pointer access, locks, allocation or ownership transfer.
+ */
 size_t storage_strlen(const char *s)
 {
     size_t n = 0;
@@ -141,6 +224,14 @@ size_t storage_strlen(const char *s)
     return n;
 }
 
+/**
+ * @brief Copy and terminate a bounded kernel string, truncating when necessary.
+ * @param dst Writable cap-byte kernel buffer, nullable for a no-op.
+ * @param cap Buffer capacity including its terminator; zero is a no-op.
+ * @param src Readable terminated string, nullable for empty output.
+ * @par Context
+ * Caller supplies stable kernel buffers; no user-pointer access, locks, allocation or ownership transfer.
+ */
 void storage_copy_text(char *dst, uint32_t cap, const char *src)
 {
     uint32_t i = 0;
@@ -154,6 +245,14 @@ void storage_copy_text(char *dst, uint32_t cap, const char *src)
     dst[i] = 0;
 }
 
+/**
+ * @brief Compare two terminated kernel strings byte for byte.
+ * @param a Readable terminated kernel string, nullable.
+ * @param b Readable terminated kernel string, nullable.
+ * @return One if both non-NULL strings match, zero otherwise.
+ * @par Context
+ * Caller supplies stable kernel buffers; no user-pointer access, locks, allocation or ownership transfer.
+ */
 int storage_text_eq(const char *a, const char *b)
 {
     if (!a || !b) {
@@ -166,6 +265,14 @@ int storage_text_eq(const char *a, const char *b)
     return *a == 0 && *b == 0;
 }
 
+/**
+ * @brief Compare terminated kernel strings with ASCII-only case folding.
+ * @param a Readable terminated kernel string, nullable.
+ * @param b Readable terminated kernel string, nullable.
+ * @return One if both non-NULL strings match, zero otherwise.
+ * @par Context
+ * Caller supplies stable kernel buffers; no user-pointer access, locks, allocation or ownership transfer.
+ */
 int storage_text_eq_ci(const char *a, const char *b)
 {
     if (!a || !b) {
@@ -189,44 +296,17 @@ int storage_text_eq_ci(const char *a, const char *b)
     return *a == 0 && *b == 0;
 }
 
-int storage_path_cache_lookup(const char *path, struct storage_node *out)
-{
-    if (!path || !path[0]) {
-        return 0;
-    }
-    for (uint32_t i = 0; i < STORAGE_PATH_CACHE_ENTRIES; ++i) {
-        struct storage_path_cache_entry *entry = &storage_path_cache[i];
-        if (!entry->valid || entry->volume != g_active_volume ||
-            !storage_text_eq(entry->path, path)) {
-            continue;
-        }
-        if ((entry->node.flags & STORAGE_NODE_FLAG_EXT_FAMILY) &&
-            entry->node.mount_generation != g_active_volume->mount_generation) {
-            entry->valid = 0;
-            continue;
-        }
-        if (out) {
-            *out = entry->node;
-        }
-        return 1;
-    }
-    return 0;
-}
 
-void storage_path_cache_store(const char *path, const struct storage_node *node)
-{
-    struct storage_path_cache_entry *entry;
-    if (!path || !path[0] || !node) {
-        return;
-    }
-    entry = &storage_path_cache[storage_path_cache_next % STORAGE_PATH_CACHE_ENTRIES];
-    storage_path_cache_next = (storage_path_cache_next + 1u) % STORAGE_PATH_CACHE_ENTRIES;
-    entry->volume = g_active_volume;
-    entry->node = *node;
-    storage_copy_text(entry->path, sizeof(entry->path), path);
-    entry->valid = 1;
-}
 
+/**
+ * @brief Look up a cached directory record in the currently selected volume.
+ * @param directory_cluster Native parent cluster, at least two.
+ * @param name Required nonempty terminated lookup name.
+ * @param out Optional writable copy of the cached node, assigned only on a hit.
+ * @return One for a cache hit, zero for invalid input or a miss.
+ * @par Context
+ * Caller holds storage execution ownership; shared volume/cache state must remain selected and live throughout the call.
+ */
 int storage_dir_index_lookup(uint32_t directory_cluster, const char *name,
                                     struct storage_node *out)
 {
@@ -248,6 +328,14 @@ int storage_dir_index_lookup(uint32_t directory_cluster, const char *name,
     return 0;
 }
 
+/**
+ * @brief Publish a copied directory record in the bounded replacement cache.
+ * @param directory_cluster Native parent cluster, at least two.
+ * @param name Required nonempty terminated name, copied into the cache.
+ * @param node Required borrowed live metadata, copied by value.
+ * @par Context
+ * Caller holds storage execution ownership; shared volume/cache state must remain selected and live throughout the call.
+ */
 void storage_dir_index_store(uint32_t directory_cluster, const char *name,
                                     const struct storage_node *node)
 {
@@ -343,51 +431,53 @@ void storage_format_guid(const uint8_t guid[16], char *out, uint32_t cap)
     }
 }
 
+/**
+ * @brief Identify the reserved FAT-family permissions sidecar using ASCII case folding.
+ * @param name Readable terminated basename, nullable.
+ * @return One for LEONACL.SYS regardless of ASCII case, zero otherwise.
+ * @par Context
+ * Caller supplies stable kernel buffers; no user-pointer access, locks, allocation or ownership transfer.
+ */
 int storage_is_acl_metadata_name(const char *name)
 {
     return storage_text_eq_ci(name, "LEONACL.SYS");
 }
 
+/**
+ * @brief Choose the smaller unsigned 32-bit scalar.
+ * @param a First value.
+ * @param b Second value.
+ * @return The smaller argument, unchanged.
+ * @par Context
+ * Pure scalar operation; any context and no ownership transfer.
+ */
 uint32_t min_u32(uint32_t a, uint32_t b)
 {
     return a < b ? a : b;
 }
 
+/**
+ * @brief Choose the smaller unsigned 64-bit scalar.
+ * @param a First value.
+ * @param b Second value.
+ * @return The smaller argument, unchanged.
+ * @par Context
+ * Pure scalar operation; any context and no ownership transfer.
+ */
 uint64_t min_u64(uint64_t a, uint64_t b)
 {
     return a < b ? a : b;
 }
 
-/* Caller holds the storage execution lock. Keep stat and mountinfo identities
- * equal to the registered block device; RAM/pseudo filesystems are anonymous. */
-uint64_t storage_volume_device_number(const struct storage_volume *volume)
-{
-    uint64_t device = 0;
-    if (!volume->ram_base && !volume->tmpfs) {
-        if (volume->data_partition_mount)
-            device = storage_block_rdev(STORAGE_BLOCK_VOLUME_ID(
-                volume->source_disk_id, volume->source_partition_index));
-        else if (volume->filesystem == STORAGE_FILESYSTEM_FAT32) device = volume->esp_device;
-        else if (volume->filesystem == STORAGE_FILESYSTEM_EXT2 ||
-                 volume->filesystem == STORAGE_FILESYSTEM_EXT4) device = volume->ext_device;
-        else if (volume->filesystem == STORAGE_FILESYSTEM_EXFAT) device = volume->exfat_device;
-    }
-    return device ? device : (uint64_t)volume->volume_id + 1;
-}
 
-int storage_select_volume(uint32_t volume_id)
-{
-    int ret = storage_acquire_task_io();
-    if (ret < 0) {
-        return ret;
-    }
-    if (volume_id >= STORAGE_MAX_VOLUMES || !g_volumes[volume_id].ready) {
-        return -2;
-    }
-    g_active_volume = &g_volumes[volume_id];
-    return 0;
-}
-
+/**
+ * @brief Select a live native volume while preserving the previous selection for restoration.
+ * @param node Required borrowed identity whose volume and mount generation remain live.
+ * @param old_volume Optional writable previous-selection output; initialized after I/O admission, including before a stale-generation error.
+ * @return Zero, -ENOENT for no live volume, -ESTALE for a reused mount, or I/O admission errno.
+ * @par Context
+ * Caller holds storage execution ownership; shared volume/cache state must remain selected and live throughout the call. Non-tmpfs paths may claim task I/O admission. Restore the saved selection on completion; the borrowed node must already retain its mount/provider lifetime.
+ */
 int storage_select_node_volume(const struct storage_node *node,
                                       struct storage_volume **old_volume)
 {
@@ -417,6 +507,12 @@ int storage_select_node_volume(const struct storage_node *node,
     return 0;
 }
 
+/**
+ * @brief Restore a previously borrowed native volume selection.
+ * @param old_volume Previous live selection from storage_select_node_volume; NULL leaves selection unchanged.
+ * @par Context
+ * Caller holds storage execution ownership; shared volume/cache state must remain selected and live throughout the call.
+ */
 void storage_restore_volume(struct storage_volume *old_volume)
 {
     if (old_volume) {
@@ -424,146 +520,30 @@ void storage_restore_volume(struct storage_volume *old_volume)
     }
 }
 
-bool storage_mount_path_matches(const char *path, const char *mount_path)
-{
-    uint32_t length;
-    if (!path || !mount_path || mount_path[0] != '/') {
-        return false;
-    }
-    if (mount_path[1] == 0) {
-        return path[0] == '/';
-    }
-    length = storage_strlen(mount_path);
-    return storage_memcmp(path, mount_path, length) == 0 &&
-           (path[length] == 0 || path[length] == '/');
-}
 
-/* Routes a canonical global path to the mounted backend with the longest
- * matching mount point.  Backends only receive paths rooted at their own
- * filesystem, never a user-visible mount prefix. */
-int storage_route_path(const char *path, struct storage_volume **out_volume,
-                              char *backend_path, uint32_t backend_capacity)
-{
-    struct storage_volume *best = NULL;
-    uint32_t best_length = 0;
-    uint32_t path_length;
-    uint32_t local_start;
-    uint32_t out_pos = 0;
-    if (!path || path[0] != '/' || !out_volume || !backend_path || backend_capacity < 2) {
-        return -22;
-    }
-    path_length = storage_strlen(path);
-    for (uint32_t i = 0; i < STORAGE_MAX_VOLUMES; ++i) {
-        struct storage_volume *volume = &g_volumes[i];
-        uint32_t length;
-        if (!volume->ready || volume->mount_path[0] != '/' ||
-            !storage_mount_path_matches(path, volume->mount_path)) {
-            continue;
-        }
-        length = storage_strlen(volume->mount_path);
-        if (!best || length > best_length) {
-            best = volume;
-            best_length = length;
-        }
-    }
-    if (!best) {
-        return -2;
-    }
-    local_start = best_length == 1 ? 1 : best_length;
-    backend_path[out_pos++] = '/';
-    if (path[local_start] == '/') {
-        ++local_start;
-    }
-    while (local_start < path_length) {
-        if (out_pos + 1 >= backend_capacity) {
-            return -22;
-        }
-        backend_path[out_pos++] = path[local_start++];
-    }
-    backend_path[out_pos] = 0;
-    *out_volume = best;
-    return 0;
-}
 
-int storage_backend_path(const char *path, char *backend_path, uint32_t backend_capacity)
-{
-    struct storage_volume *volume;
-    int ret = storage_route_path(path, &volume, backend_path, backend_capacity);
-    if (ret < 0) {
-        return ret;
-    }
-    return storage_select_volume(volume->volume_id);
-}
 
-int storage_path_volume_id(const char *path, uint32_t *out_volume_id)
-{
-    char resolved[RELIEFOS_FS_PATH_LEN];
-    char backend_path[RELIEFOS_FS_PATH_LEN];
-    struct storage_volume *volume;
-    if (!out_volume_id || storage_resolve_path("/", path, resolved, sizeof(resolved)) < 0) {
-        return -22;
-    }
-    if (g_devfs_enabled &&
-        (storage_text_eq_ci(resolved, "/dev") ||
-         ((resolved[0] == '/') &&
-          (resolved[1] == 'd' || resolved[1] == 'D') &&
-          (resolved[2] == 'e' || resolved[2] == 'E') &&
-          (resolved[3] == 'v' || resolved[3] == 'V') &&
-          resolved[4] == '/'))) {
-        *out_volume_id = STORAGE_VOLUME_ROOT;
-        return 0;
-    }
-    if (storage_route_path(resolved, &volume, backend_path, sizeof(backend_path)) < 0) {
-        return -2;
-    }
-    *out_volume_id = volume->volume_id;
-    return 0;
-}
 
-int storage_parent_path(const char *path, char *parent, uint32_t parent_cap,
-                               char *name, uint32_t name_cap)
-{
-    char resolved[RELIEFOS_FS_PATH_LEN];
-    uint32_t slash = 0;
-    if (!path || !parent || !name || parent_cap < 2 || name_cap == 0) {
-        return -22;
-    }
-    if (storage_resolve_path("/", path, resolved, sizeof(resolved)) < 0) {
-        return -22;
-    }
-    for (uint32_t i = 0; resolved[i]; ++i) {
-        if (resolved[i] == '/') {
-            slash = i;
-        }
-    }
-    if (resolved[slash + 1] == 0) {
-        return -22;
-    }
-    if (slash == 0) {
-        if (parent_cap < 2) {
-            return -22;
-        }
-        parent[0] = '/';
-        parent[1] = 0;
-    } else {
-        if (slash + 1 > parent_cap) {
-            return -22;
-        }
-        for (uint32_t i = 0; i < slash && i + 1 < parent_cap; ++i) {
-            parent[i] = resolved[i];
-            parent[i + 1] = 0;
-        }
-    }
-    storage_copy_text(name, name_cap, resolved + slash + 1);
-    return 0;
-}
-
+/**
+ * @brief Translate an allocated FAT-family data cluster using the selected volume geometry.
+ * @param cluster Validated data cluster at least two, within the selected filesystem.
+ * @return Physical sector address computed from the selected partition and data-area offsets.
+ * @par Context
+ * Caller holds storage execution ownership; shared volume/cache state must remain selected and live throughout the call. No I/O, allocation, range validation or reference acquisition.
+ */
 uint64_t cluster_to_lba(uint32_t cluster)
 {
     return g_storage.esp_start_lba + g_storage.data_start_sector +
            (cluster - 2u) * g_storage.sectors_per_cluster;
 }
 
+/**
+ * @brief Locate the FAT32 sector containing an allocated cluster entry.
+ * @param cluster Validated cluster index within the selected FAT.
+ * @return Physical sector address of its four-byte FAT entry.
+ * @par Context
+ * Caller holds storage execution ownership; shared volume/cache state must remain selected and live throughout the call. Geometry, including nonzero bytes_per_sector, must already be validated.
+ */
 uint64_t fat_sector_for_cluster(uint32_t cluster)
 {
     return g_storage.esp_start_lba + g_storage.fat_start_sector +
@@ -584,3 +564,40 @@ void storage_partition_guid_text(const uint8_t guid[16], char uuid[37])
     uuid[pos] = 0;
 
 }
+
+/** @brief Preserve resumable I/O errors while diagnosing permanent read failure.
+ * @param ret Native transport result; -EAGAIN must remain resumable.
+ * @return -EAGAIN unchanged, otherwise -EIO. No allocation or callback.
+ */
+int storage_read_failure(int ret)
+{
+    if (ret != -RELIEFOS_EAGAIN)
+        console_error("[storage] read failure ret=%d active_volume=%u\n", ret,
+                      g_active_volume ? g_active_volume->volume_id : 99u);
+    return ret == -RELIEFOS_EAGAIN ? ret : -5;
+}
+
+EXPORT_SYMBOL(storage_read_failure);
+
+/* Native filesystem modules share this core-owned interface; CRC/release
+ * checks bind it to the exact kernel, without a stable cross-release API. */
+EXPORT_SYMBOL(cluster_to_lba);
+EXPORT_SYMBOL(fat_sector_for_cluster);
+EXPORT_SYMBOL(min_u32);
+EXPORT_SYMBOL(min_u64);
+EXPORT_SYMBOL(storage_begin_mutation);
+EXPORT_SYMBOL(storage_cache_invalidate);
+EXPORT_SYMBOL(storage_copy_text);
+EXPORT_SYMBOL(storage_dir_index_lookup);
+EXPORT_SYMBOL(storage_dir_index_store);
+EXPORT_SYMBOL(storage_is_acl_metadata_name);
+EXPORT_SYMBOL(storage_memcmp);
+EXPORT_SYMBOL(storage_memcpy);
+EXPORT_SYMBOL(storage_memzero);
+EXPORT_SYMBOL(storage_restore_volume);
+EXPORT_SYMBOL(storage_select_node_volume);
+EXPORT_SYMBOL(storage_strlen);
+EXPORT_SYMBOL(storage_text_eq);
+EXPORT_SYMBOL(storage_text_eq_ci);
+
+EXPORT_SYMBOL(storage_async_can_yield);

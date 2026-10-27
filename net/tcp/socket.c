@@ -902,12 +902,16 @@ int net_socket_send(struct reliefos_net_socket_io *request, uint32_t owner_pid)
 }
 
 /**
- * @brief Consume queued stream bytes or report EOF, reset, or receive timeout.
+ * @brief Copy queued TCP bytes with optional consumption, or report EOF/status.
  * @param request Socket, destination buffer, requested length, and output status.
  * @param owner_pid Optional process owner filter.
+ * @param consume Advance the ring and reopen its window only when true.
  * @return Zero on a handled request, or a negative internal error.
+ * Caller holds execution ownership and the socket lifetime. A peek never
+ * advances receive state or advertises additional buffer space to the peer.
  */
-int net_socket_recv(struct reliefos_net_socket_io *request, uint32_t owner_pid)
+static int net_socket_receive(struct reliefos_net_socket_io *request, uint32_t owner_pid,
+                               bool consume)
 {
     struct net_socket *socket;
     uint8_t *dst;
@@ -955,17 +959,19 @@ int net_socket_recv(struct reliefos_net_socket_io *request, uint32_t owner_pid)
             if (first > copy_len) first = copy_len;
             net_memcpy(dst, socket->rx + socket->rx_head, first);
             net_memcpy(dst + first, socket->rx, copy_len - first);
-            socket->rx_head = (socket->rx_head + copy_len) % NET_SOCKET_RX_CAP;
-            socket->rx_len -= copy_len;
-            uint32_t remaining = net_socket_receive_window(socket);
-            uint32_t window = net_socket_select_window(socket);
-            /* Linux tcp_cleanup_rbuf() sends a window update after a
-             * significant increase, including reopening a zero window. */
-            if (!socket->fin_received && window > remaining && window >= 2u * remaining) {
-                (void)net_send_tcp_to_mac(socket->dst_mac, net_config.local_ip,
+            if (consume) {
+                socket->rx_head = (socket->rx_head + copy_len) % NET_SOCKET_RX_CAP;
+                socket->rx_len -= copy_len;
+                uint32_t remaining = net_socket_receive_window(socket);
+                uint32_t window = net_socket_select_window(socket);
+                /* Linux tcp_cleanup_rbuf() sends a window update after a
+                 * significant increase, including reopening a zero window. */
+                if (!socket->fin_received && window > remaining && window >= 2u * remaining) {
+                    (void)net_send_tcp_to_mac(socket->dst_mac, net_config.local_ip,
                                           socket->remote_ip, socket->local_port,
                                           socket->remote_port, socket->local_seq,
                                           socket->remote_seq, TCP_FLAG_ACK, 0, 0);
+                }
             }
         }
         request->transferred = copy_len;
@@ -987,6 +993,31 @@ int net_socket_recv(struct reliefos_net_socket_io *request, uint32_t owner_pid)
                        socket->rx_len, socket->fin_received);
     }
     return 0;
+}
+
+/**
+ * @brief Consume available TCP bytes through the common receive path.
+ * @param request Borrowed handle, writable length-byte buffer and output fields.
+ * @param owner_pid Optional owner filter, zero to use the held socket identity.
+ * @return Zero with status/progress, or a negative internal validation error.
+ * Execution ownership and an independent socket lifetime pin are required.
+ */
+int net_socket_recv(struct reliefos_net_socket_io *request, uint32_t owner_pid)
+{
+    return net_socket_receive(request, owner_pid, true);
+}
+
+/**
+ * @brief Copy available TCP bytes without consuming or reopening its receive ring.
+ * @param request Borrowed handle, writable length-byte buffer and output fields.
+ * @param owner_pid Optional owner filter, zero to use the held socket identity.
+ * @return Zero with status/progress, or a negative internal validation error.
+ * Execution ownership and a socket lifetime pin are required; no references
+ * escape this call. Repeated peeks observe the same unconsumed byte prefix.
+ */
+int net_socket_peek(struct reliefos_net_socket_io *request, uint32_t owner_pid)
+{
+    return net_socket_receive(request, owner_pid, false);
 }
 
 /**

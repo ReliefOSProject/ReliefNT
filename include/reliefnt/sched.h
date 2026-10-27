@@ -71,13 +71,29 @@ int sched_set_task_exec_params(uint32_t pid,
                                 const char *data, uint32_t data_len);
 struct task_vma *sched_task_vma_at(struct task *task, uint32_t index);
 uint32_t sched_task_vma_capacity(const struct task *task);
+/** @brief Release the final MM's VMA and held executable inode/path resources.
+ * @param task Task whose final MM ownership is established by the caller,
+ * or NULL. Borrowed rollback pointers must already be cleared.
+ * Execution-owned task context; final inode/provider puts may perform I/O.
+ * No scheduler, graph or module spinlock may span this operation.
+ */
 void sched_task_vma_release(struct task *task);
+/** @brief Retain a copied VMA's canonical OFD and immutable ELF source.
+ * @param dst Copied destination without owned backing pins, required.
+ * @param src Stable source VMA under execution ownership, required.
+ * @return Zero or negative EINVAL/ENOMEM; failure transfers no references.
+ * ELF source retention allocates nothing and owns provider/writer exclusion
+ * independently of the original MM. No scheduler/graph/module lock is taken.
+ */
+int sched_task_vma_retain_file(struct task_vma *dst,const struct task_vma *src);
 /* Called with the kernel execution lock held, before file pages are released. */
 void sched_truncate_file_mappings(const struct storage_node *node, uint64_t size);
 struct task_file *sched_task_file_at(struct task *task, uint32_t index);
-/** @brief Resolve a Linux fd, including stdio and descriptors beyond the inline table.
- * @param task Owner under execution serialization. @param fd Nonnegative fd.
- * @return Borrowed live descriptor slot, or NULL; does not promote or retain it.
+/** @brief Borrow a live numeric descriptor slot without promoting its OFD.
+ * @param task Execution-owned task/fd table, nullable. @param fd Linux descriptor number.
+ * @return Borrowed live slot or NULL, including stdio/grown tables. No reference
+ * is acquired, no allocation/lock/wait occurs; retain the canonical description
+ * before any operation that can suspend ownership or permit fd-table reuse.
  */
 struct task_file *task_descriptor_for_fd(struct task *task, int fd);
 uint32_t sched_task_file_capacity(const struct task *task);
@@ -114,11 +130,11 @@ void sched_on_cpu_tick(void);
 uint64_t sched_tick_count(void);
 void sched_yield_current(void);
 /**
- * @brief Request a normal scheduling decision at the next current-CPU user-return boundary.
- * @note Caller holds the IRQ-disabled syscall execution transaction and will
- *       soon reach that boundary. This publishes only the current CPU's
- *       reschedule flag; it does not change task state, queues, EEVDF
- *       accounting or deadlines, or any remote CPU's flag.
+ * @brief Request a normal scheduling decision on the current CPU.
+ * @note The caller holds the IRQ-disabled syscall execution transaction and
+ *       will soon reach the normal user-return scheduling boundary. This
+ *       changes only the local reschedule flag; it does not yield the task or
+ *       alter scheduler accounting, task state, or remote CPU flags.
  */
 void sched_request_reschedule_current(void);
 /**
@@ -150,12 +166,21 @@ void sched_load_averages(uint64_t loads[3]);
 void sched_task_counts(uint32_t *task_count, uint32_t *running_tasks,
                        uint32_t *ready_tasks, uint32_t *sleeping_tasks);
 /**
- * @brief Return the pid of the task currently running on this CPU.
+ * @brief Read the current CPU execution-context task identity.
+ * @return Current pid, including zero before the first task switch or for idle execution.
+ * @par Context
+ * Boot/task/IRQ snapshot without allocation or reference acquisition. Caller must not migrate across a multi-step use of this identity.
  */
 uint32_t sched_current_pid(void);
 uint64_t sched_all_cpu_mask(void);
 int sched_get_task_affinity(uint32_t pid, uint64_t *mask);
 int sched_set_task_affinity(uint32_t pid, uint64_t mask);
+/**
+ * @brief Borrow the current CPU task with the historical idle-task lookup fallback.
+ * @return Borrowed current task, idle task, or NULL when no matching task exists.
+ * @par Context
+ * Caller retains the execution transaction or scheduler lifetime protection through use. No task reference is acquired and the pointer must not survive scheduling or task retirement.
+ */
 struct task *sched_current_task(void);
 struct task *sched_find(uint32_t pid);
 /**
@@ -175,9 +200,6 @@ static inline uint64_t *sched_task_timer_pending(const struct task *task)
 struct task *sched_find_by_name(const char *name);
 struct task *sched_find_by_path(const char *path);
 struct task *sched_find_by_path_basename(const char *basename);
-/** Returns true when a CWD, file, image, or mapping references a volume. */
-bool sched_volume_in_use(uint32_t volume_id);
-bool sched_volume_has_writers(uint32_t volume_id);
 /**
  * @brief Save the current user frame without releasing its CPU reservation.
  * @param frame User context to publish while holding the execution transaction.
@@ -219,13 +241,14 @@ uint64_t sched_task_cr3(struct task *task);
  */
 void sched_mark_ready(uint32_t pid);
 /**
- * @brief Put the current task to sleep with no wake deadline (wait queues own
- * the wakeup path). Used by IPC primitives before returning EAGAIN internally;
- * the syscall epilogue rewinds and retries the instruction after wakeup.
+ * @brief Mark the current live non-idle task blocked with no timed wakeup.
+ * Execution-owned task context. Updates state under scheduler_lock; idle, absent or exited tasks are ignored. Scheduling occurs at the normal return boundary, not inside this function.
  */
 void sched_block_current(void);
 /**
- * @brief Put the current task to sleep until the given tick.
+ * @brief Block the current live non-idle task until an absolute scheduler tick.
+ * @param wake_tick Absolute wake tick; zero retains the untimed-blocked convention.
+ * Execution-owned task context. Scheduler lock protects state/wake_tick; absent, idle or exited tasks are ignored. CPU ownership stays reserved until the normal saved-frame scheduling boundary.
  */
 void sched_sleep_current_until(uint64_t wake_tick);
 /**
@@ -248,9 +271,19 @@ int sched_signal_user_task(uint32_t pid, int signal_number);
 int sched_signal_user_process(uint32_t tgid, int signal_number);
 /** @brief Send to a thread group's shared queue, preserving the supplied siginfo. */
 int sched_signal_user_process_info(uint32_t tgid, int sig, const struct linux_siginfo *info);
-/** @brief Park a sigtimedwait caller, rechecking pending signals after publishing sleep. */
+/** @brief Publish interruptible sleep before rechecking pending notifications.
+ * @param deadline Absolute tick deadline, or zero for no timeout.
+ * Execution-owned current task context; changes scheduler state under its IRQ
+ * lock and allocates nothing. Signal/deadline races restore READY before return;
+ * actual scheduling and retained OFD/provider ownership remain with the caller.
+ */
 void sched_signal_wait_current(uint64_t deadline);
-/** @brief Wake a blocked task pinned by the execution lock, retaining current CPU ownership. */
+/** @brief Wake a blocked task without reviving stopped/exited/vfork-wait tasks.
+ * @param task Borrowed task pinned by execution/wait lifetime, nullable.
+ * IRQ/task safe scheduler-lock transaction; requests remote rescheduling only
+ * after publishing readiness. No allocation, callback or ownership transfer;
+ * running_cpu keeps an unretired frame from being claimed by another CPU.
+ */
 void sched_wake_interruptible(struct task *task);
 /** @brief Share SEM_UNDO on CLONE_SYSVSEM; ordinary fork starts with no undo records. */
 int task_sysv_sem_clone(struct task *parent, struct task *child, uint64_t flags);

@@ -1,3 +1,4 @@
+#include <reliefnt/export.h>
 #include "internal.h"
 
 /** @brief Present a region, optionally dropping timer work under backpressure. */
@@ -131,6 +132,11 @@ void framebuffer_display_tick(void)
     framebuffer_present_region_internal(0, 0, UINT32_MAX, UINT32_MAX, true);
 }
 
+/**
+ * @brief Transfer a validated SVGA scanout from console tracing to DRM presentation.
+ * @return Zero, including already-owned scanout, or legacy internal -1 for unsupported framebuffer state.
+ * Execution-owned task context; takes the SVGA lock internally and disables traces only on success. No heap allocation or provider self-reference.
+ */
 int framebuffer_drm_scanout_begin(void)
 {
     if (!fb.available || fb.backend != FRAMEBUFFER_BACKEND_VMWARE_SVGA ||
@@ -152,6 +158,10 @@ int framebuffer_drm_scanout_begin(void)
     return 0;
 }
 
+/**
+ * @brief Return the permanent SVGA scanout to ordinary framebuffer tracing.
+ * Execution-owned task context after dependent jobs drain. Clears pending DRM damage and restores tracing under the SVGA lock; does not unbind the boot console or free provider-owned backing.
+ */
 void framebuffer_drm_scanout_release(void)
 {
     uint64_t flags = svga_lock();
@@ -175,6 +185,18 @@ static int framebuffer_drm_publish_locked(uint32_t x1, uint32_t y1,
     return 1;
 }
 
+/**
+ * @brief Copy validated XRGB8888 damage into the retained DRM-owned scanout.
+ * @param pixels Readable kernel source covering every requested row.
+ * @param pitch Source byte stride, at least the display width times four.
+ * @param format Supported XRGB8888 format code.
+ * @param x1 Inclusive left pixel.
+ * @param y1 Inclusive top pixel.
+ * @param x2 Exclusive right pixel, within display width.
+ * @param y2 Exclusive bottom pixel, within display height.
+ * @return Zero after copying/queuing damage, or legacy internal -1 for invalid or unavailable scanout.
+ * Execution-owned task context; source remains borrowed only during the copy. Coalesces FIFO pressure into permanent damage state under the SVGA lock; no module/data pointer is queued.
+ */
 int framebuffer_drm_present_region(const void *pixels, uint32_t pitch,
                                    uint32_t format, uint32_t x1, uint32_t y1,
                                    uint32_t x2, uint32_t y2)
@@ -222,3 +244,7 @@ int framebuffer_drm_present_region(const void *pixels, uint32_t pitch,
      * until a nonblocking display tick publishes its coalesced rectangle. */
     return 0;
 }
+
+EXPORT_SYMBOL(framebuffer_drm_present_region);
+EXPORT_SYMBOL(framebuffer_drm_scanout_begin);
+EXPORT_SYMBOL(framebuffer_drm_scanout_release);

@@ -89,6 +89,9 @@ struct exfat_chain_hint {
 
 
 
+/* Byte-exact native create/modify/access fields, increments and UTC offsets. */
+struct exfat_entry_timestamps {uint8_t bytes[17];};
+
 struct exfat_dir_ref {
     uint32_t directory_cluster;
     uint32_t first_entry;
@@ -307,10 +310,7 @@ uint64_t exfat_dir_entry_limit(void);
 int exfat_find_in_dir_ref(uint32_t directory_cluster, uint8_t nofat, const char *wanted,
                                  struct storage_node *out, struct exfat_dir_ref *out_ref);
 
-int exfat_lookup_path_ref(const char *path, struct storage_node *out,
-                                 struct exfat_dir_ref *out_ref);
 
-int exfat_lookup_path(const char *path, struct storage_node *out);
 
 int exfat_read_node(const struct storage_node *node, uint64_t offset,
                            void *buffer, uint32_t len, uint32_t *out_read);
@@ -334,25 +334,75 @@ int exfat_create_entry(uint32_t directory_cluster, uint8_t directory_nofat,
 int exfat_update_entry_data(const struct exfat_dir_ref *ref, uint32_t first_cluster,
                                    uint64_t size, uint8_t nofat);
 
-int exfat_write_file(const char *path, const void *buffer, uint32_t len);
 
-int exfat_write_node_path(const char *path, uint64_t offset,
-                                 const void *buffer, uint32_t len, uint32_t *out_written);
-
-int exfat_truncate_file(const char *path, uint64_t length);
-
-int exfat_mkdir(const char *path);
+int exfat_mkdir_child(const struct storage_node *parent,const char *name,struct storage_node *out);
+int exfat_node_ref(const struct storage_node *node,struct exfat_dir_ref *out);
+int exfat_remove_child(const struct storage_node *parent,const char *name,bool directory);
 
 int exfat_delete_entry(const struct exfat_dir_ref *ref);
 
 int exfat_dir_is_empty(const struct storage_node *node);
 
-int exfat_unlink(const char *path);
 
-int exfat_rmdir(const char *path);
 
-int exfat_rename(const char *old_path, const char *new_path);
 
 int exfat_mount(void);
 
+/** @brief Rename between explicit retained exFAT parent directories.
+ * @param directory Required source directory. @param old_name Literal source leaf.
+ * @param destination Required target directory. @param new_name Validated target leaf.
+ * @param committed Required irreversible-publication output, initially false.
+ * @return Zero or negative native validation/metadata/I/O errno. Errors after
+ * publication retain committed=true. Both rename branches preserve all native
+ * timestamps; replacement failures restore old target data/time records.
+ * Caller owns execution, source/target/code pins and pre-reserved mutation
+ * resources. Timestamp transfer uses stack storage; native directory growth
+ * follows its existing reservation rules. No global path/callback locks.
+ */
+int exfat_rename_child(const struct storage_node *parent,const char *old_name,
+                          const struct storage_node *destination,const char *new_name,bool *committed);
+/** @brief Decode native exFAT access/modification metadata for one held inode.
+ * @param node Required linked node in the selected volume. Roots have no record.
+ * @param out Required output, cleared on failure; invalid time fields remain unknown.
+ * @return Zero or negative structural/record/I/O errno. Native UTC offsets and
+ * modification10ms fields are respected; initial ctime follows mtime because
+ * the format stores birth time separately, not a persistent POSIX change time.
+ * Execution ownership required; no graph/module lock or ownership transfer.
+ */
+int exfat_inode_times(const struct storage_node *node,struct storage_inode_times *out);
+/** @brief Update one current exFAT primary entry's UTC access time and checksum.
+ * @param node Required linked node in the selected volume; roots have no record.
+ * @param seconds Current UTC Unix seconds, clamped to the native date range.
+ * @param actual Required normalized even-second output, unchanged on failure.
+ * @return Zero or negative validation/metadata/I/O errno. Only the primary
+ * entry changes, preserving stream/name records. Equal encoded fields avoid
+ * writes. Caller owns execution, synchronous I/O and a retained inode/code pin;
+ * orphans are excluded by the caller, no global pathname or callback locks.
+ */
+int exfat_inode_access(const struct storage_node *node,int64_t seconds,int64_t *actual);
+/** @brief Read the checksum-validated native time bytes of one exFAT entry set.
+ * @param ref Required selected-directory location; never a global name.
+ * @param out Required byte-record output, cleared on failure.
+ * @return Zero or negative metadata/structure/I/O errno. Execution ownership and
+ * retained source/target identities are required; no allocation, callback lock
+ * or ownership transfer. All creation/modification/access bytes are preserved.
+ */
+int exfat_entry_times_read(const struct exfat_dir_ref *ref,struct exfat_entry_timestamps *out);
+/** @brief Write only native exFAT time bytes and their primary-entry checksum.
+ * @param ref Required selected-directory location, held stable by the caller.
+ * @param value Required borrowed byte-exact time record.
+ * @return Zero or negative metadata/structure/I/O errno. Unchanged bytes avoid
+ * writes; a changed primary entry is published under the mutation latch. Caller
+ * owns synchronous execution and retained inode/code identities; no allocation
+ * or graph/module callback lock. Stream/name bytes and unrelated metadata stay.
+ */
+int exfat_entry_times_write(const struct exfat_dir_ref *ref,const struct exfat_entry_timestamps *value);
+
+/** @brief Write native exfat metadata into an authorized unmounted extent.
+ * @param disk Borrowed managed target. @param start_lba First validated sector.
+ * @param sector_count Validated extent length in 512-byte sectors.
+ * @return Zero or layout/I/O errno. Execution ownership and admitted provider
+ * pin required across all writes; no graph/module lock or pointer retention.
+ */
+int install_format_exfat(struct install_disk_state *disk,uint64_t start_lba,uint64_t sector_count);
 #endif

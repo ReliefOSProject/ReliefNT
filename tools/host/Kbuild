@@ -3,7 +3,10 @@
 hostprogs-always-y += \
     assets/reliefos-cjk-font \
     version/reliefos-version \
-    manifest/reliefos-deps
+    manifest/reliefos-deps \
+    manifest/reliefnt-install-bundle
+
+manifest/reliefnt-install-bundle-objs := manifest/install-bundle.o
 
 RELIEFNT_HOST_COMMON_OBJS := \
     common/buffer.o \
@@ -24,7 +27,8 @@ RELIEFNT_HOST_OBJECTS := \
     $(RELIEFNT_HOST_COMMON_OBJS) \
     version/reliefos-version.o \
     manifest/reliefos-deps.o \
-    manifest/json.o
+    manifest/json.o \
+    manifest/install-bundle.o
 
 $(addprefix $(obj)/,$(RELIEFNT_HOST_PROGRAMS) $(RELIEFNT_HOST_OBJECTS)): \
     $(objtree)/include/generated/host-toolchain-id.h

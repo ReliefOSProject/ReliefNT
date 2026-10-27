@@ -117,10 +117,8 @@ int64_t syscall_poll_impl(struct task *task, struct pollfd *fds,
             task_timerfd_update(timer);
             if ((events & (POLLIN | POLLRDNORM)) && timer && timer->expirations)
                 revents |= POLLIN | POLLRDNORM;
-        } else if (file && file->drm_file) {
-            revents = drm_file_poll(file, events);
-        } else if (file && file->drm_prime_file) {
-            revents = drm_prime_file_poll(file, events);
+        } else if (file && file->character_file) {
+            revents=character_file_poll(file->character_file,file,events);
         } else if (file && (file->flags & TASK_FILE_FLAG_DEV_NODE)) {
             if (task_device_is(file, STORAGE_DEV_KIND_KEYBOARD) ||
                 task_device_is(file, STORAGE_DEV_KIND_MOUSE)) {
@@ -130,18 +128,6 @@ int64_t syscall_poll_impl(struct task *task, struct pollfd *fds,
                                              file->aux2, file->input_vt)) {
                     revents |= POLLIN;
                 }
-            } else if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_MIXER) {
-                revents |= audio_mixer_poll(file, events);
-            } else if (task_device_is(file, STORAGE_DEV_KIND_AUDIO)) {
-                if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_PCM) {
-                    revents |= audio_device_poll(file, events);
-                } else {
-                    revents |= audio_oss_poll(file, events);
-                }
-            } else if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_CONTROL) {
-                revents |= audio_control_poll_file(file->audio_control_file, events);
-            } else if (file->node.flags & STORAGE_NODE_FLAG_AUDIO_TIMER) {
-                revents |= audio_timer_poll(file, events);
             } else if (task_device_is(file, STORAGE_DEV_KIND_TTY) ||
                        task_device_is(file, STORAGE_DEV_KIND_CONSOLE)) {
                 uint32_t terminal = task_device_is(file, STORAGE_DEV_KIND_CONSOLE)

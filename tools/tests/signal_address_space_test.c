@@ -1,3 +1,4 @@
+#include <reliefnt/graphics_service.h>
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +12,8 @@
 #include "../../kernel/signal/signal_queue.c"
 #include "../../kernel/exec/usercopy_task.c"
 #include "../../kernel/syscall/ipc/socket_batch.c"
+#include "../../kernel/syscall/io/transfer.c"
+#include "../../kernel/syscall/io/vector.c"
 
 #define STACK_ADDRESS 0x0f400000ULL
 static unsigned char target_pages[8192] __attribute__((aligned(4096)));
@@ -55,7 +58,15 @@ int time_clock_get(int32_t id, struct linux_timespec *out)
         clock_ticks % RELIEFNT_TICK_HZ * (1000000000ULL / RELIEFNT_TICK_HZ)};
     return 0;
 }
-void task_release_syscall_file(struct task *task) { memset(&task->regular_io,0,sizeof(task->regular_io)); }
+/* Disk/OFD ownership is covered by its real descriptor fixture. These
+ * synthetic completed states exercise real transfer offset publication into
+ * the signal target MM, while an unrelated old MM remains mapped at host VA. */
+void task_release_syscall_file(struct task *task)
+{
+    if(task->regular_io.active || task->vector_io)storage_drain_task_io(task->pid);
+    memset(&task->regular_io,0,sizeof(task->regular_io));task->transfer_io=NULL;
+    task->vector_io=NULL; /* Synthetic completed vector/transfer states are stack-owned here. */
+}
 struct task *sched_find(uint32_t pid) { (void)pid; return &target; }
 void sched_exit_group(uint32_t pid, uint64_t code)
 { assert(pid == 1 && code == 139); target.state = TASK_EXITED; ++exits; }
@@ -69,9 +80,9 @@ void sched_wake_interruptible(struct task *task)
         task->state = TASK_READY;
     }
 }
-bool drm_vmwgfx_task_uninterruptible(const struct task *task)
+bool graphics_service_task_uninterruptible(const struct task *task)
 { (void)task; return false; }
-bool drm_vmwgfx_task_signal_busy(const struct task *task)
+bool graphics_service_task_signal_busy(const struct task *task)
 { (void)task; return false; }
 void sched_signal_discard(struct task *task, int sig)
 { task->pending_signals &= ~(1ULL << (sig - 1)); *sched_task_process_pending(task) &= ~(1ULL << (sig - 1)); }
@@ -215,6 +226,50 @@ int main(void)
         assert(saved.uc.context.rax==65536 && saved.uc.context.rip==0x430002);
         assert(drained_io==restart+1 && !target.regular_io.active);
     }
+    const uint64_t ordinary_vector_calls[]={__NR_readv,__NR_writev,__NR_preadv,__NR_pwritev,__NR_preadv2,__NR_pwritev2};
+    for(unsigned call=0;call<6;++call)for(unsigned restart=0;restart<2;++restart)
+        for(unsigned progress=0;progress<2;++progress) {
+            unsigned before=drained_io;
+            target.blocked_signals=0;target.restart_syscall=ordinary_vector_calls[call]+1;
+            struct task_vector_state pending={.completed=progress ? 3 : 0};target.vector_io=&pending;
+            target.regular_io.active=progress;target.regular_io.done=progress ? 2 : 0;
+            target.signal_actions[2].flags=restart ? LINUX_SA_RESTART : 0;
+            assert(!kernel_signal_queue_task(&target,2));
+            frame=(struct trap_frame){.rsp=saved_rsp,.rip=0x430000,.rax=ordinary_vector_calls[call],.cs=0x23};
+            assert(kernel_signal_deliver_pending(&target,&frame)==1);
+            memcpy(&saved,target_pages+frame.rsp-STACK_ADDRESS,sizeof(saved));
+            int64_t expected=progress ? 5 : restart ? (int64_t)ordinary_vector_calls[call] : -LINUX_EINTR;
+            assert((int64_t)saved.uc.context.rax==expected);
+            assert(saved.uc.context.rip==(progress || !restart ? 0x430002u : 0x430000u));
+            assert(!target.vector_io && !target.regular_io.active && drained_io==before+1);
+        }
+    const uint64_t copy_calls[]={__NR_sendfile,__NR_copy_file_range};
+    const int64_t copy_results[]={0,3,-LINUX_EFAULT};
+    for(unsigned call=0;call<2;++call)for(unsigned restart=0;restart<2;++restart)
+        for(unsigned value=0;value<3;++value) {
+            target.blocked_signals=0;target.restart_syscall=copy_calls[call]+1;
+            struct task_transfer_state pending={.total=copy_results[value] ? 3 : 0,
+                .input_position=3,.output_position=3,.input_user=copy_results[value]<0 ? 1 : STACK_ADDRESS,
+                .output_user=STACK_ADDRESS+8};
+            target.transfer_io=&pending;
+            int64_t old_offsets[2]={91,92},target_offsets[2]={0};
+            memcpy((void *)(uintptr_t)STACK_ADDRESS,old_offsets,sizeof(old_offsets));
+            memcpy(target_pages,target_offsets,sizeof(target_offsets));
+            target.signal_actions[2].flags=restart ? LINUX_SA_RESTART : 0;
+            assert(!kernel_signal_queue_task(&target,2));
+            frame=(struct trap_frame){.rsp=saved_rsp,.rip=0x430000,.rax=copy_calls[call],.cs=0x23};
+            assert(kernel_signal_deliver_pending(&target,&frame)==1);
+            memcpy(&saved,target_pages+frame.rsp-STACK_ADDRESS,sizeof(saved));
+            int64_t expected=copy_results[value] ? copy_results[value] : restart ? (int64_t)copy_calls[call] : -LINUX_EINTR;
+            assert((int64_t)saved.uc.context.rax==expected);
+            assert(saved.uc.context.rip==(copy_results[value] || !restart ? 0x430002u : 0x430000u));
+            assert(!target.transfer_io);
+            memcpy(target_offsets,target_pages,sizeof(target_offsets));
+            if(copy_results[value]>0)assert(target_offsets[0]==3 && target_offsets[1]==3);
+            int64_t still_old[2];memcpy(still_old,(void *)(uintptr_t)STACK_ADDRESS,sizeof(still_old));
+            assert(still_old[0]==91 && still_old[1]==92);
+            memset((void *)(uintptr_t)STACK_ADDRESS,0xa5,sizeof(old_offsets));
+        }
     uint64_t process_pending = 1ULL << 1;
     target.shared_process_pending = &process_pending;
     target.blocked_signals = 0;

@@ -13,13 +13,32 @@ static int fat32_dirent_is_acl_metadata(const struct fat32_dirent *de)
     return fat32_name_match_short(de, "LEONACL.SYS");
 }
 
+/* The reserved 11-character name fits one LFN slot. Accept only its complete
+ * wire spelling, then verify the following short entry's checksum in the
+ * directory scanner. An arbitrary LEONAC~n alias is never metadata by itself. */
+static bool fat32_acl_long_name(const struct fat32_lfn *lfn)
+{
+    if(lfn->order!=0x41 || lfn->type || lfn->zero)return false;
+    const uint8_t *tail=(const uint8_t *)lfn+offsetof(struct fat32_lfn,name3);
+    if(tail[0] || tail[1] || tail[2]!=0xff || tail[3]!=0xff)return false;
+    uint16_t spelling[13];uint32_t length=0;
+    fat32_lfn_extract_utf16(lfn,spelling,&length,13);
+    if(length!=11)return false;
+    const char *reserved="LEONACL.SYS";
+    for(uint32_t i=0;i<length;++i) {
+        uint16_t ch=spelling[i];if(ch>='a' && ch<='z')ch-='a'-'A';
+        if(ch!=(uint8_t)reserved[i])return false;
+    }
+    return true;
+}
+
 int fat32_find_in_dir(uint32_t dir_cluster, const char *name, struct storage_node *out)
 {
     uint32_t cluster = dir_cluster;
     uint16_t lfn_parts[20][13];
     uint32_t lfn_count = 0;
     if (storage_dir_index_lookup(dir_cluster, name, out)) {
-        return 0;
+        return out ? storage_inode_cache_node(out) : 0;
     }
     for (;;) {
         int ret = fat32_read_lookup_cluster(cluster, storage_cluster_buf);
@@ -57,10 +76,11 @@ int fat32_find_in_dir(uint32_t dir_cluster, const char *name, struct storage_nod
             int matched = 0;
             struct storage_node candidate = {
                 .type = (de->attr & FAT32_ATTR_DIRECTORY) ? RELIEFOS_FS_TYPE_DIR : RELIEFOS_FS_TYPE_FILE,
-                .flags = 0,
+                .flags = STORAGE_NODE_FLAG_FAT32,
                 .first_cluster = ((uint32_t)de->first_cluster_hi << 16) | de->first_cluster_lo,
                 .volume_id = g_storage.volume_id,
                 .size = de->size,
+                .entry_id = (uint64_t)cluster<<32 | off,
             };
             if (lfn_count) {
                 char full[RELIEFOS_FS_NAME_LEN];
@@ -74,6 +94,8 @@ int fat32_find_in_dir(uint32_t dir_cluster, const char *name, struct storage_nod
             if (!matched) {
                 continue;
             }
+            ret=storage_inode_cache_node(&candidate);
+            if(ret)return ret;
             if (out) {
                 *out = candidate;
             }
@@ -441,6 +463,9 @@ int fat32_delete_acl_metadata_file(uint32_t dir_cluster)
     if (ret < 0) {
         return ret;
     }
+    bool retained=storage_inode_unlinked(&meta);
+    storage_cache_invalidate();
+    if(retained)return 0;
     if (meta.first_cluster >= 2) {
         ret = fat32_free_chain(meta.first_cluster);
         if (ret < 0) {
@@ -453,6 +478,7 @@ int fat32_delete_acl_metadata_file(uint32_t dir_cluster)
 int fat32_dir_is_empty(uint32_t dir_cluster)
 {
     uint32_t cluster = dir_cluster;
+    bool metadata_long=false;uint8_t metadata_checksum=0;
     for (;;) {
         int ret = fat32_read_cluster(cluster, storage_cluster_buf);
         if (ret < 0) {
@@ -463,10 +489,20 @@ int fat32_dir_is_empty(uint32_t dir_cluster)
             if (de->name[0] == 0x00) {
                 return 1;
             }
-            if (de->name[0] == 0xe5 || de->attr == FAT32_ATTR_LFN || (de->attr & 0x08u) != 0) {
+            if (de->name[0] == 0xe5 || (de->attr!=FAT32_ATTR_LFN && (de->attr&0x08u))) {
+                metadata_long=false;
                 continue;
             }
-            if (fat32_dirent_is_acl_metadata(de)) {
+            if(de->attr==FAT32_ATTR_LFN) {
+                const struct fat32_lfn *lfn=(const void *)de;
+                metadata_long=fat32_acl_long_name(lfn);metadata_checksum=lfn->checksum;
+                continue;
+            }
+            bool metadata=fat32_dirent_is_acl_metadata(de) ||
+                (metadata_long && !(de->attr&FAT32_ATTR_DIRECTORY) &&
+                 metadata_checksum==fat32_short_name_checksum(de->name));
+            metadata_long=false;
+            if (metadata) {
                 continue;
             }
             if (de->name[0] == '.' &&

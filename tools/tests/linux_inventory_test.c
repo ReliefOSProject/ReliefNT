@@ -1,5 +1,6 @@
 /* Execute the real inventory parsers and namespace against hardware fixtures. */
 #define TEST_REAL_INVENTORY
+#include <reliefnt/graphics_service.h>
 #include <reliefnt/console.h>
 #include "../../arch/x86_64/cpu/cpuinfo.c"
 #include "../../arch/x86_64/platform/platform.c"
@@ -10,17 +11,24 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <linux/errno.h>
+#include <reliefnt/blkdev.h>
 
 static unsigned fixture_cpus=1;
 static bool fixture_drm_present;
 static bool fixture_render_present;
 static bool fixture_kms_enabled;
-int storage_install_list_disks(struct reliefos_install_disk *disks, uint32_t capacity, uint32_t *count)
+static bool fixture_ram;
+int storage_list_block_disks(struct reliefos_install_disk *disks, uint32_t capacity, uint32_t *count)
 {
-    *count = 1;
+    *count = fixture_ram ? 2 : 1;
     if (capacity) *disks = (struct reliefos_install_disk){.id=0, .sector_size=512, .sector_count=131072};
+    if(fixture_ram && capacity>1)disks[1]=(struct reliefos_install_disk){.id=7,.sector_size=512,.sector_count=65536};
     return 0;
 }
+/* The fixture supplies one major-259 disk and its GPT partition. */
+uint64_t storage_block_rdev(uint32_t value)
+{ return STORAGE_BLOCK_DISK_ID(value)==7 ? block_device_make_number(1,0) :
+    block_device_make_number(259,STORAGE_BLOCK_MINOR(value)); }
 int storage_disk_block_info(uint32_t disk, int32_t part, uint64_t *start, uint64_t *count)
 {
     if (disk || part > 0) return -2;
@@ -41,6 +49,7 @@ int storage_disk_block_read(uint32_t disk, int32_t part, uint64_t offset,
 int storage_disk_device_name(uint32_t disk, int32_t part, char *out, uint32_t capacity)
 {
     int written;
+    if(disk==7 && part==-1 && capacity>=10){memcpy(out,"/dev/ram0",10);return 0;}
     if (!out || capacity == 0 || disk != 0 || part < -1 || part >= 128) return -2;
     written = snprintf(out, capacity, "/dev/sda%s", part < 0 ? "" : "1");
     return written < 0 || (uint32_t)written >= capacity ? -22 : 0;
@@ -84,7 +93,7 @@ uint32_t pci_config_read32(uint8_t b, uint8_t s, uint8_t f, uint8_t o)
     assert(!b && s == 2 && !f);
     return o == 0x2c ? 0x11001af4 : 0;
 }
-int drm_device_pci_identity(struct pci_device *out)
+int graphics_service_pci_identity(struct pci_device *out)
 {
     if (!fixture_drm_present) return -LINUX_ENODEV;
     *out = (struct pci_device){.bus = 0, .slot = 2, .function = 0,
@@ -92,11 +101,11 @@ int drm_device_pci_identity(struct pci_device *out)
                                .class_code = 3};
     return 0;
 }
-bool drm_device_render_node_ready(void)
+bool graphics_service_render_node_ready(void)
 {
     return fixture_drm_present && fixture_render_present;
 }
-bool drm_device_kms_scanout_active(void)
+bool graphics_service_kms_scanout_active(void)
 {
     return fixture_kms_enabled;
 }
@@ -201,9 +210,10 @@ int main(void)
     read_value("/sys/devices/system/cpu/online", value, sizeof(value));
     assert(!strcmp(value, "0\n"));
     read_value("/sys/devices/pci0000:00/0000:00:02.0/modalias", value, sizeof(value));
-    assert(!strcmp(value, "pci:v00001234d00001111sv00001af4sd00001100bc03sc00i00\n"));
+    assert(!strcmp(value, "pci:v00001234d00001111sv00001AF4sd00001100bc03sc00i00\n"));
     read_value("/sys/devices/pci0000:00/0000:00:02.0/uevent", value, sizeof(value));
     assert(strstr(value, "PCI_SUBSYS_ID=1AF4:1100\n"));
+    assert(strstr(value,"MODALIAS=pci:v00001234d00001111sv00001AF4sd00001100bc03sc00i00\n"));
     assert(proc_lookup("/sys/class/drm/card0", &node) == -2);
     read_value("/sys/devices/virtual/graphics/fb0/virtual_size", value, sizeof(value));
     assert(!strcmp(value, "1280,720\n"));
@@ -280,12 +290,47 @@ int main(void)
     assert(proc_lookup("/sys/class/drm/renderD128", &node) == -2);
     fixture_drm_present = false;
     assert(proc_readlink("/sys/class/dmi/id", value, 3) == 3 && !memcmp(value, "../", 3));
+    fixture_ram=true;
+    read_value("/sys/devices/platform/leonos-block/ram0/dev",value,sizeof(value));
+    assert(!strcmp(value,"1:0\n"));
+    read_value("/sys/devices/platform/leonos-block/ram0/uevent",value,sizeof(value));
+    assert(strstr(value,"MAJOR=1\nMINOR=0\nDEVNAME=ram0\n"));
+    assert(proc_lookup("/sys/dev/block/1:0",&node)==0 && node.type==RELIEFOS_FS_TYPE_SYMLINK);
     walk("/sys", 0);
     fixture_cpus=4;
     inventory[2]=inventory[0]; inventory[2].core_id=inventory[0].core_id+1;
     read_value("/proc/cpuinfo",value,sizeof(value));
     assert(strstr(value,"processor\t: 2\n") && !strstr(value,"processor\t: 1\n") && strstr(value,"cpu cores\t: 2\n"));
     read_value("/sys/devices/system/cpu/online",value,sizeof(value)); assert(!strcmp(value,"0,2\n"));
+    struct vfs_mount *sys_mount=NULL;struct vfs_namespace namespace={0};
+    struct vfs_path sys_root={0},sys_file={0};
+    assert(!sysfs_create_vfs_mount(&sys_mount));
+    assert(!vfs_namespace_init(&namespace,sys_mount));vfs_mount_put(sys_mount);
+    assert(!vfs_namespace_root(&namespace,&sys_root));
+    assert(!vfs_path_lookup(&namespace,&sys_root,&sys_root,"devices/system/cpu/online",VFS_LOOKUP_FOLLOW,&sys_file));
+    assert(!vfs_path_read(&sys_file,0,value,sizeof(value),&got) && got==4 && !memcmp(value,"0,2\n",4));
+    struct reliefos_permissions mode;
+    assert(!vfs_path_permissions(&sys_file,&mode,false) && mode.mode==0444);
+    assert(vfs_path_permissions(&sys_file,&mode,true)==-RELIEFOS_EROFS);
+    vfs_path_put(&sys_file);
+    assert(!vfs_path_lookup(&namespace,&sys_root,&sys_root,"class/dmi/id/product_name",VFS_LOOKUP_FOLLOW,&sys_file));
+    assert(!vfs_path_read(&sys_file,0,value,sizeof(value),&got) && got==8 && !memcmp(value,"Product\n",8));
+    /* Supply the MM's actual regular inode at the execution boundary. The
+     * proc adapter must use that object rather than current.path diagnostics. */
+    assert(!current.fs_paths.root.mount);
+    vfs_path_get(&sys_root,&current.fs_paths.root);
+    vfs_path_get(&sys_file,&sched_task_mm(&current)->executable_path);
+    struct vfs_path executable={0};
+    assert(!proc_mount_magic_target("/proc/self/exe",&executable));
+    assert(vfs_path_same_inode(&executable,&sys_file));vfs_path_put(&executable);
+    const char *actual_executable="/devices/virtual/dmi/id/product_name";
+    int exe_length=proc_readlink("/proc/self/exe",value,sizeof(value));
+    assert(exe_length==(int)strlen(actual_executable) && !memcmp(value,actual_executable,exe_length));
+    struct task_identity *exe_identity=NULL;bool exe_magic=false;
+    assert(!proc_mount_node_identity("/proc/self/exe",&exe_identity,&exe_magic) && exe_magic);
+    sched_task_identity_put(exe_identity);
+    vfs_path_put(&sched_task_mm(&current)->executable_path);vfs_path_put(&current.fs_paths.root);
+    vfs_path_put(&sys_file);vfs_path_put(&sys_root);assert(!vfs_namespace_destroy(&namespace));
     read_value("/sys/devices/system/cpu/offline",value,sizeof(value)); assert(!strcmp(value,"1,3\n"));
     read_value("/sys/devices/system/cpu/present",value,sizeof(value)); assert(!strcmp(value,"0,1,2,3\n"));
     struct task other=current; other.pid=77; other.tgid=77; other.uid=other.euid=other.suid=1001;

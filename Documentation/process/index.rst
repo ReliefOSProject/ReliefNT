@@ -11,3 +11,4 @@
    testing
    documentation
    releasing
+   module-support-plan

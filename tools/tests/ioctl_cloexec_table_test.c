@@ -30,6 +30,8 @@ void driver_manager_audio_release(uint32_t generation)
 int storage_inode_get(const struct storage_node *node, struct storage_inode_ref **out)
 { assert(!(node->flags & STORAGE_NODE_FLAG_EXT2)); *out = NULL; return 0; }
 int storage_inode_put(struct storage_inode_ref *inode) { assert(!inode); return 0; }
+/* This device/O_PATH fixture never acquires a regular inode write lease. */
+void storage_inode_write_put(struct storage_inode_ref *inode){(void)inode;abort();}
 void task_pipe_release(struct task_file *file) { (void)file; }
 void task_socket_release(struct task_file *file) { (void)file; }
 void task_inet_release(struct task_file *file) { (void)file; }
@@ -236,3 +238,5 @@ int main(int argc, char **argv)
          "fd reuse, O_PATH EBADF, cmd/fd truncation");
     return 0;
 }
+
+#include "block_description_fixture.h"

@@ -1,7 +1,8 @@
+#include <reliefnt/sound_service.h>
 /* Read-only procfs implementation for the Unix migration. */
 #include <reliefnt/mm.h>
+#include <reliefnt/module.h>
 #include <reliefnt/driver_manager.h>
-#include <reliefnt/audio.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/smp.h>
 #include <reliefnt/storage.h>
@@ -16,6 +17,8 @@
 #include <reliefnt/pty.h>
 #include <reliefos/fs_abi.h>
 #include <linux/capability.h>
+#include <linux/errno.h>
+#include "internal.h"
 
 #define PROCFS_PATH_MAX RELIEFOS_FS_PATH_LEN
 #define PROCFS_CONTENT_MAX 1024u
@@ -90,7 +93,7 @@ static int proc_asound_card_path(const char *path, uint32_t *ordinal,
 static int proc_asound_card_exists(uint32_t ordinal)
 {
     uint32_t token;
-    return audio_card_snapshot(ordinal, &token, NULL) == 0;
+    return sound_service_card_snapshot(ordinal, &token, NULL) == 0;
 }
 
 static int proc_path_kind(const char *path, const char **file_name,
@@ -191,7 +194,7 @@ static int proc_fill_content(const char *path, char *buffer, uint32_t capacity)
     if (proc_text_eq(path, "/proc/asound/cards")) {
         uint32_t ordinal = 0;
         struct audio_card_identity identity;
-        while (audio_card_snapshot(ordinal, NULL, &identity) == 0) {
+        while (sound_service_card_snapshot(ordinal, NULL, &identity) == 0) {
             proc_append_u64(buffer, &pos, capacity, ordinal);
             proc_append_text(buffer, &pos, capacity, " [");
             proc_append_text(buffer, &pos, capacity, identity.id);
@@ -329,42 +332,128 @@ static int proc_fd_number(const char *file)
     return fd < SCHED_NR_OPEN ? (int)fd : -2;
 }
 
+/** @brief Render a retained inode relative to the caller's actual root.
+ * @param object Borrowed held object; anonymous provider labels are allowed.
+ * @param target Writable diagnostic output, including a terminating NUL.
+ * @param capacity Available bytes including NUL and any deleted suffix.
+ * @return Zero or negative errno, without namespace lookup or I/O. Execution
+ * ownership protects the caller root; temporary path references are balanced.
+ */
+static int proc_object_target(const struct vfs_path *object,char *target,uint32_t capacity)
+{
+    struct vfs_namespace *ns=vfs_path_namespace(object);
+    if(!ns)return vfs_path_format_link(NULL,NULL,object,target,capacity);
+    struct task *caller=sched_current_task();struct vfs_path root={0};int rc=0;
+    const struct vfs_path *caller_root=caller ? &sched_task_paths(caller)->root : NULL;
+    if(caller_root && vfs_path_node(caller_root))vfs_path_get(caller_root,&root);
+    else rc=vfs_namespace_root(ns,&root);
+    if(!rc)rc=vfs_path_format_link(ns,&root,object,target,capacity);
+    vfs_path_put(&root);return rc;
+}
+
 /**
  * @brief Resolve named file and terminal descriptors for procfs readlink.
  * @param task Existing task whose descriptor table is protected by the execution lock.
  * @param fd Descriptor number.
- * @param target Kernel buffer with RELIEFOS_FS_PATH_LEN bytes.
+ * @param target Writable diagnostic buffer.
+ * @param capacity Bytes available in target, including NUL.
  * @return Zero on success, negative ENOENT for closed or unnamed descriptors.
  */
-static int proc_fd_target(struct task *task, int fd, char *target)
+static int proc_fd_target(struct task *task, int fd, char *target,uint32_t capacity)
 {
     struct task_pty_fd *pty = task_pty_fd_for_fd(task, fd);
     if (pty && pty->pty_id && pty->endpoint) {
+        if(pty->description && vfs_path_node(&pty->description->path_ref)) {
+            int rc=proc_object_target(&pty->description->path_ref,target,capacity);
+            if(rc!=-EOPNOTSUPP)return rc;
+        }
         const char *prefix = pty->endpoint == TASK_PTY_ENDPOINT_MASTER ? "/dev/ptmx" :
             pty_vt_number(pty->pty_id) ? "/dev/tty" : "/dev/pts/";
-        proc_copy(target, RELIEFOS_FS_PATH_LEN, prefix);
+        proc_copy(target, capacity, prefix);
         if (pty->endpoint == TASK_PTY_ENDPOINT_SLAVE) {
             uint32_t pos = 0;
             while (target[pos]) ++pos;
-            proc_append_u64(target, &pos, RELIEFOS_FS_PATH_LEN, pty->pty_id);
+            proc_append_u64(target, &pos, capacity, pty->pty_id);
         }
         return 0;
     }
     struct task_file *file = task_file_for_fd(task, fd);
+    if(file && vfs_path_node(&file->path_ref)) {
+        int rc=proc_object_target(&file->path_ref,target,capacity);
+        if(rc!=-EOPNOTSUPP)return rc;
+    }
     if (!file || !file->path[0]) return -2;
-    proc_copy(target, RELIEFOS_FS_PATH_LEN, file->path);
+    proc_copy(target, capacity, file->path);
     return 0;
 }
 
-/** @brief Recognize the global mount table and per-process view of this namespace. */
-static int proc_mount_view(const char *path)
+/** @brief Recognize a live process mount view and optionally return its task.
+ * @param path Intrinsic proc inode key, independent of visible attachment.
+ * @param target Optional borrowed target task output, cleared on failure.
+ * @return One for mounts, two for mountinfo, zero otherwise. The caller holds
+ * execution ownership; task identity is separately pinned by the proc inode.
+ */
+static int proc_mount_view(const char *path,struct task **target)
 {
+    if(target)*target=NULL;
     const char *file = NULL;
     uint32_t pid = 0;
     int kind = proc_path_kind(path, &file, &pid);
     if (kind == 3) pid = sched_current_pid();
-    if ((kind != 2 && kind != 3) || !file || !pid || !sched_find(pid)) return 0;
-    return proc_text_eq(file, "mounts") ? 1 : proc_text_eq(file, "mountinfo") ? 2 : 0;
+    struct task *task=pid ? sched_find(pid) : NULL;
+    if ((kind != 2 && kind != 3) || !file || !task) return 0;
+    int view=proc_text_eq(file, "mounts") ? 1 : proc_text_eq(file, "mountinfo") ? 2 : 0;
+    if(view && target)*target=task;
+    return view;
+}
+
+struct proc_open_view {struct vfs_namespace *ns;struct vfs_path root;bool mountinfo;};
+
+/** @brief Capture the selected task's mount namespace and root at open time.
+ * @param name Intrinsic authorized proc inode key, independent of attachment.
+ * @param flags Sanitized status flags, borrowed and unchanged.
+ * @param out Required owned output; ordinary generated files return NULL.
+ * @return Zero or negative errno with empty output on failure. Captures a root
+ * path rather than generated text, so later mount changes remain visible.
+ * Namespace ownership outlives its retained paths; final release drops this
+ * path even after task exit. Nonblocking, execution-owned, without graph locks.
+ */
+int proc_file_open(const char *name,uint32_t flags,void **out)
+{
+    (void)flags;if(!out)return -RELIEFOS_EINVAL;*out=NULL;
+    struct task *task=NULL;int view=proc_mount_view(name,&task);if(!view)return 0;
+    const struct vfs_path *root=&sched_task_paths(task)->root;
+    struct vfs_namespace *ns=vfs_path_namespace(root);if(!ns)return -RELIEFOS_ENOENT;
+    struct proc_open_view *state=kernel_malloc(sizeof(*state));if(!state)return -RELIEFOS_ENOMEM;
+    *state=(struct proc_open_view){.ns=ns,.mountinfo=view==2};vfs_path_get(root,&state->root);*out=state;return 0;
+}
+
+/** @brief Read a mount view using its open-time namespace/root references.
+ * @param value Borrowed captured state, independent of target PID liveness.
+ * @param offset Byte position in the currently rendered mount graph.
+ * @param buffer Kernel-accessible destination, nullable at zero capacity.
+ * @param capacity Available output bytes.
+ * @param read Required output count, cleared before validation.
+ * @return Renderer status or negative EINVAL. Does not look up a PID, change
+ * captured root, or transfer ownership. Execution-owned, no graph locks
+ * across renderer allocation or filesystem policy callbacks.
+ */
+int proc_file_read(void *value,uint64_t offset,void *buffer,uint32_t capacity,uint32_t *read)
+{
+    if(!read)return -RELIEFOS_EINVAL;*read=0;
+    struct proc_open_view *state=value;if(!state)return -RELIEFOS_EINVAL;
+    return vfs_read_mount_table(state->ns,&state->root,state->mountinfo,offset,buffer,capacity,read);
+}
+
+/** @brief Release the open-time root after the final shared OFD reference.
+ * @param value Owned optional captured state; NULL is ignored.
+ * @return None. Root/provider release can perform I/O; caller holds execution
+ * ownership without a graph, scheduler or module-table spinlock.
+ */
+void proc_file_close(void *value)
+{
+    struct proc_open_view *state=value;if(!state)return;
+    vfs_path_put(&state->root);kernel_free(state);
 }
 
 /** @brief Map scheduler states to Linux proc characters, never expose private enums. */
@@ -425,6 +514,57 @@ static bool proc_stat_mm_visible(struct task *caller, struct task *target)
                         sched_task_mm(target)->nondumpable))
         return false;
     return privileged || !(target->cap_permitted & ~caller->cap_effective);
+}
+
+/** @brief Pin the exact file path referenced by an authorized process FD.
+ * @param target Borrowed task, stable under the execution transaction.
+ * @param fd Descriptor in that task, with no borrowed OFD escaping the call.
+ * @param out Empty output receiving one independently owned path reference.
+ * @return Zero, EACCES before inspecting a foreign FD, ENOENT for missing task,
+ * descriptor or object path, or EINVAL for a missing output. Display names do
+ * not participate; detached shmem mounts and unlinked inodes remain valid.
+ */
+int proc_fd_get_path(struct task *target,int fd,struct vfs_path *out)
+{
+    if(!out)return -RELIEFOS_EINVAL;
+    *out=(struct vfs_path){0};
+    if(!target)return -RELIEFOS_ENOENT;
+    if(!proc_stat_mm_visible(sched_current_task(),target))return -RELIEFOS_EACCES;
+    struct task_file *file=task_file_for_fd(target,fd);
+    if(!file || !file->path_ref.mount)return -RELIEFOS_ENOENT;
+    vfs_path_get(&file->path_ref,out);return 0;
+}
+
+int proc_mount_node_identity(const char *name,struct task_identity **out,bool *magic)
+{
+    if(!out || !magic)return -RELIEFOS_EINVAL;
+    *out=NULL;*magic=false;
+    const char *file=NULL;uint32_t pid=0;
+    int kind=proc_path_kind(name,&file,&pid);
+    if(kind!=2 && !(kind==3 && file))return 0;
+    struct task *task=kind==3 ? sched_current_task() : sched_find(pid);
+    int rc=sched_task_identity_get(task,out);
+    if(rc)return rc==-ESRCH ? -RELIEFOS_ENOENT : rc;
+    *magic=file && (proc_fd_number(file)>=0 || proc_text_eq(file,"cwd") || proc_text_eq(file,"root") || proc_text_eq(file,"exe"));
+    return 0;
+}
+
+int proc_mount_magic_target(const char *name,struct vfs_path *out)
+{
+    if(!out)return -RELIEFOS_EINVAL;
+    *out=(struct vfs_path){0};
+    const char *file=NULL;uint32_t pid=0;int kind=proc_path_kind(name,&file,&pid);
+    if((kind!=2 && kind!=3) || !file)return -RELIEFOS_EINVAL;
+    struct task *task=kind==3 ? sched_current_task() : sched_find(pid);
+    if(!task)return -RELIEFOS_ENOENT;
+    int fd=proc_fd_number(file);if(fd>=0)return proc_fd_get_path(task,fd,out);
+    if(!proc_stat_mm_visible(sched_current_task(),task))return -RELIEFOS_EACCES;
+    struct task_fs_paths *paths=sched_task_paths(task);
+    if(proc_text_eq(file,"cwd"))vfs_path_get(&paths->cwd,out);
+    else if(proc_text_eq(file,"root"))vfs_path_get(&paths->root,out);
+    else if(proc_text_eq(file,"exe"))vfs_path_get(&sched_task_mm(task)->executable_path,out);
+    else return -RELIEFOS_EINVAL;
+    return out->mount ? 0 : -RELIEFOS_ENOENT;
 }
 /** @brief Emit Linux's ordered 52 stat fields using available task accounting.
  * Legacy private uid/role fields belong in status rather than Linux stat positions.
@@ -540,7 +680,14 @@ int proc_lookup(const char *path, struct storage_node *out)
             return 0;
         }
     }
-    if (proc_mount_view(path) || proc_text_eq(path,"/proc/cpuinfo") || proc_text_eq(path,"/proc/leonos-drivers")) {
+#ifdef CONFIG_MODULES
+    if(proc_text_eq(path,"/proc/modules")) {
+        if(out) *out=(struct storage_node){.type=RELIEFOS_FS_TYPE_FILE,.flags=STORAGE_NODE_FLAG_PROC,
+            .first_cluster=0x50524f43u,.size=0};
+        return 0;
+    }
+#endif
+    if (proc_mount_view(path,NULL) || proc_text_eq(path,"/proc/cpuinfo") || proc_text_eq(path,"/proc/leonos-drivers")) {
         if (out) *out = (struct storage_node){
             .type = RELIEFOS_FS_TYPE_FILE, .flags = STORAGE_NODE_FLAG_PROC,
             .first_cluster = 0x50524f43u, .size = 0,
@@ -643,6 +790,9 @@ int proc_read(const char *path, uint64_t offset, void *buffer, uint32_t length,
               uint32_t *out_read)
 {
     if (path && !__builtin_strncmp(path,"/sys",4) && (!path[4] || path[4]=='/')) return sysfs_read(path,offset,buffer,length,out_read);
+#ifdef CONFIG_MODULES
+    if(proc_text_eq(path,"/proc/modules")) return module_proc_read(offset,buffer,length,out_read);
+#endif
     if (proc_text_eq(path,"/proc/cpuinfo")) return cpu_inventory_read(offset,buffer,length,out_read);
     if (out_read) *out_read = 0;
     if (!buffer && length) return -22;
@@ -677,9 +827,14 @@ int proc_read(const char *path, uint64_t offset, void *buffer, uint32_t length,
         if (out_read) *out_read = stream.written;
         return ret;
     }
-    int view = proc_mount_view(path);
-    if (view == 1) return storage_read_mounts(offset, buffer, length, out_read);
-    if (view == 2) return storage_read_mountinfo(offset, buffer, length, out_read);
+    struct task *mount_task=NULL;
+    int view=proc_mount_view(path,&mount_task);
+    if(view) {
+        const struct vfs_path *root=&sched_task_paths(mount_task)->root;
+        struct vfs_namespace *ns=vfs_path_namespace(root);
+        if(!ns)return -RELIEFOS_ENOENT;
+        return vfs_read_mount_table(ns,root,view==2,offset,buffer,length,out_read);
+    }
     char content[PROCFS_CONTENT_MAX];
     uint32_t len = 0;
     int ret = proc_fill_content(path, content, sizeof(content));
@@ -732,39 +887,38 @@ int proc_readlink(const char *path, char *buffer, uint32_t capacity)
     if (!task) return -RELIEFOS_ENOENT;
     if (!file || (!proc_text_eq(file, "exe") && !proc_text_eq(file, "cwd") && !proc_text_eq(file, "root") && proc_fd_number(file) < 0))
         return proc_lookup(path, NULL) == 0 ? -RELIEFOS_EINVAL : -RELIEFOS_ENOENT;
-    /* Match the available FSCREDS/dumpable policy. Capability namespaces and
-     * executable inode tracking still need the common ptrace/VFS machinery. */
-    if (!caller) return -RELIEFOS_EACCES;
-    if (sched_task_tgid(caller) != sched_task_tgid(task) && caller->euid &&
-        (caller->fsuid != task->uid || caller->fsuid != task->euid ||
-         caller->fsuid != task->suid || caller->fsgid != task->gid ||
-         caller->fsgid != task->egid || caller->fsgid != task->sgid ||
-         sched_task_mm(task)->nondumpable)) return -RELIEFOS_EACCES;
-    char fd_target[RELIEFOS_FS_PATH_LEN];
-    if (proc_fd_number(file) >= 0 && proc_fd_target(task, proc_fd_number(file), fd_target) < 0)
-        return -RELIEFOS_ENOENT;
-    const char *target = proc_fd_number(file) >= 0 ? fd_target :
-        proc_text_eq(file, "exe") ? task->path :
-        proc_text_eq(file, "cwd") ? sched_task_cwd(task) : "/";
-    if (!target[0]) return -RELIEFOS_ENOENT;
-    while (length < capacity && target[length]) {
-        buffer[length] = target[length];
-        ++length;
+    if (!proc_stat_mm_visible(caller,task)) return -RELIEFOS_EACCES;
+    uint32_t text_capacity=VFS_PATH_MAX+sizeof(" (deleted)");
+    char *text=kernel_malloc(text_capacity);if(!text)return -RELIEFOS_ENOMEM;
+    int fd=proc_fd_number(file),rc;
+    if(fd>=0)rc=proc_fd_target(task,fd,text,text_capacity);
+    else {
+        struct vfs_path object={0};rc=proc_mount_magic_target(path,&object);
+        if(!rc)rc=proc_object_target(&object,text,text_capacity);
+        vfs_path_put(&object);
     }
-    /* readlink(2) does not append NUL and truncates at bufsiz. */
-    return (int)length;
+    if(!rc) {
+        size_t size=__builtin_strlen(text);if(size>capacity)size=capacity;
+        __builtin_memcpy(buffer,text,size);rc=(int)size;
+    }
+    kernel_free(text);return rc;
 }
 
-/** @brief Enumerate a proc directory with types matching lookup.
- * @param path Resolved proc directory pathname.
- * @param offset In/out enumeration position.
- * @param entry Writable returned directory entry.
- * @return One entry, zero at EOF, or negative errno.
+/** @brief Enumerate generated proc entries using stable numeric process cookies.
+ * @param path Borrowed intrinsic proc directory name.
+ * @param offset Required in/out cookie, zero to rewind; process cookies outlive slot compaction.
+ * @param entry Required writable record, assigned on success.
+ * @return One entry, zero EOF, or negative errno. Caller serializes execution
+ * and retains the provider; no scheduler lock spans a generated-file callback.
  */
 int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *entry)
 {
     uint32_t index;
-    static const char *files[] = {"uptime", "meminfo", "version", "filesystems", "stat", "mounts", "self", "sys", "cpuinfo", "leonos-drivers", "cmdline", "asound"};
+    static const char *files[] = {"uptime", "meminfo", "version", "filesystems", "stat", "mounts", "self", "sys", "cpuinfo", "leonos-drivers", "cmdline", "asound"
+#ifdef CONFIG_MODULES
+        , "modules"
+#endif
+    };
     if (!path || !offset || !entry) return -22;
     if (!__builtin_strncmp(path,"/sys",4) && (!path[4] || path[4]=='/')) return sysfs_readdir(path,offset,entry);
     if (proc_text_eq(path, "/proc/sys") || proc_text_eq(path, "/proc/sys/kernel")) {
@@ -807,9 +961,7 @@ int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *
             struct task *task = sched_find(pid);
             struct task *caller = sched_current_task();
             if (!task) return -RELIEFOS_ENOENT;
-            if (!caller || (caller->euid && sched_task_tgid(caller) != sched_task_tgid(task)))
-                return -RELIEFOS_EACCES;
-            char target[RELIEFOS_FS_PATH_LEN];
+            if (!proc_stat_mm_visible(caller,task)) return -RELIEFOS_EACCES;
             uint64_t limit = (uint64_t)sched_task_file_capacity(task) + 3u;
             for (uint32_t i = 0; i < sched_task_pty_capacity(task); ++i) {
                 const struct task_pty_fd *pty = sched_task_pty_at(task, i);
@@ -818,7 +970,8 @@ int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *
             }
             while (*offset < limit) {
                 uint32_t fd = (uint32_t)(*offset)++;
-                if (proc_fd_target(task, (int)fd, target) < 0) continue;
+                const struct task_pty_fd *pty=task_pty_fd_for_fd(task,(int)fd);
+                if(!task_file_for_fd(task,(int)fd) && !(pty && pty->pty_id && pty->endpoint))continue;
                 *entry = (struct reliefos_dir_entry){.type = RELIEFOS_FS_TYPE_SYMLINK};
                 uint32_t pos = 0;
                 proc_append_u64(entry->name, &pos, sizeof(entry->name), fd);
@@ -835,8 +988,9 @@ int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *
         return 1;
     }
     if (*offset > UINT32_MAX) return 0;
-    index = (uint32_t)*offset;
-    if (index < sizeof(files) / sizeof(files[0])) {
+    const uint64_t fixed_count=sizeof(files)/sizeof(files[0]);
+    if (*offset < fixed_count) {
+        index=(uint32_t)*offset;
         entry->type = index == 5 || index == 6 ? RELIEFOS_FS_TYPE_SYMLINK :
             (index == 7 || index == 11) ? RELIEFOS_FS_TYPE_DIR : RELIEFOS_FS_TYPE_FILE;
         proc_copy(entry->name, sizeof(entry->name), files[index]);
@@ -844,11 +998,14 @@ int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *
         return 1;
     }
     {
-        uint32_t task_index = index - (uint32_t)(sizeof(files) / sizeof(files[0]));
-        struct task *task;
-        while ((task = sched_task_at(task_index))) {
-            ++*offset;
-            if (!task->pid) { ++task_index; continue; }
+        uint64_t minimum=*offset-fixed_count;
+        if(minimum>UINT32_MAX)return 0;
+        struct task *task=NULL,*candidate;
+        for(uint32_t slot=0;(candidate=sched_task_at(slot));++slot)
+            if(candidate->pid && candidate->pid>=minimum &&
+               (!task || candidate->pid<task->pid))task=candidate;
+        if(task) {
+            *offset=fixed_count+(uint64_t)task->pid+1u;
             char name[16];
             uint32_t pos = 0;
             proc_copy(name, sizeof(name), "");

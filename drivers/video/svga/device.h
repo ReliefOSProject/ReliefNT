@@ -116,6 +116,7 @@ struct svga_gmr {
     svga_handle last_use_fence, progress_fence, retire_fence;
     void *owner;
     void (*owner_put)(void *owner);
+    struct module *code_owner;
     bool defined, retiring, mode_lease;
     bool borrowed, mob_defined, map_inflight;
 };
@@ -342,7 +343,6 @@ int svga_surface_dma_locked(svga_handle surface, uint32_t face, uint32_t mip,
     svga_handle buffer, uint32_t offset, uint32_t pitch, uint32_t direction,
     const struct svga_dma_box *boxes, uint32_t count);
 void svga_gpu_reset_locked(void);
-int svga_format(uint32_t format, uint32_t *bw, uint32_t *bh, uint32_t *bytes, uint32_t *cap);
 int svga_command_locked(uint32_t id, const void *data, uint32_t bytes);
 int svga_gb_init_locked(void);
 int svga_gb_shutdown_locked(void);

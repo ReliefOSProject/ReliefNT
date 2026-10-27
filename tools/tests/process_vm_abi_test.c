@@ -19,6 +19,7 @@
 static int process_vm_syscalls(void)
 {
     char input[] = "0123456789abcdef", output[32] = {0};
+    static char wide_output[32];
     struct iovec local[2] = {{output, 3}, {output + 3, 13}};
     struct iovec remote[2] = {{input, 7}, {input + 7, 9}};
     pid_t pid = getpid();
@@ -41,8 +42,16 @@ static int process_vm_syscalls(void)
     PVM_CHECK(syscall(SYS_process_vm_readv, -1, local, 2, remote, 1, 0) == -1 && errno == ESRCH);
     PVM_CHECK(syscall(SYS_process_vm_readv, pid, local, 2, remote, 1, 0) == -1 && errno == EFAULT);
     remote[0] = (struct iovec){input, 16};
-    local[0] = (struct iovec){output, INT64_MAX};
+    /* Linux's single-iovec import caps the advertised length to MAX_RW_COUNT
+     * before access_ok. A randomized stack within the final 2 GiB of the user
+     * address range legitimately fails that check even for a 16-byte remote
+     * transfer. The main executable's data remains below that boundary; use
+     * it to test length capping independently of stack ASLR. Multi-iovec
+     * import below still rejects the original, uncapped impossible length.
+     */
+    local[0] = (struct iovec){wide_output, INT64_MAX};
     PVM_CHECK(syscall(SYS_process_vm_readv, pid, local, 1, remote, 1, 0) == 16);
+    PVM_CHECK(!memcmp(wide_output, input, 16));
     PVM_CHECK(syscall(SYS_process_vm_readv, pid, local, 2, remote, 1, 0) == -1 && errno == EFAULT);
     size_t page = sysconf(_SC_PAGESIZE);
     unsigned char *guard = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE,

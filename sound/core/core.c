@@ -5,6 +5,7 @@
 #include <reliefnt/lock.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/wait.h>
+#include <reliefnt/driver_module.h>
 #define CARD_MAX 16U
 #define STREAM_MAX 64U
 #define SLOT_MASK 255U
@@ -16,6 +17,10 @@ struct card_entry {
     struct audio_card_identity identity;
     struct audio_card_ops ops;
     void *opaque;
+    struct module *code_owner;
+    /* Registration/pending disconnect retains sound-core code independently
+     * of hardware-driver ELF dependencies and external PCM/control files. */
+    struct module *core_owner;
     audio_service_fn service;
     void *service_opaque;
     uint64_t periods, frames, controls;
@@ -26,6 +31,7 @@ struct stream_entry {
     uint32_t id, card, device, live, detached, calls;
     enum audio_direction direction;
     struct audio_hw_stream hw;
+    struct module *code_owner;
     uint64_t period_frames;
     int period_error;
     uint32_t period_seq, period_seen;
@@ -71,7 +77,10 @@ static struct stream_entry *find_stream(uint32_t id)
  * @param opaque Module context, alive until unregister returns.
  * @param owner Driver-manager slot owning callbacks.
  * @param out_id Receives generation token; untouched on failure.
- * @return 0, -EINVAL, or -ENOSPC. Task context; short IRQ-safe lock only.
+ * @return Zero or EINVAL/ENODEV/ENOSPC. Task context; short IRQ-safe lock only.
+ * A live optional core is pinned before hardware callbacks and publication;
+ * full/exhausted registries balance it. The card owns that pin until its final
+ * successful disconnect, including pending/failing STOP retries.
  */
 int audio_register_card_owned(const struct audio_card_identity *identity,
                              const struct audio_card_ops *ops, void *opaque,
@@ -89,6 +98,7 @@ int audio_register_card_owned(const struct audio_card_identity *identity,
         ops->size < v1_end || !ops->pcm_caps || !ops->open || !ops->prepare ||
         !ops->trigger || !ops->pointer || !ops->close || !ops->control_count ||
         !identity->id[0] || !identity->name[0]) return -22;
+    if(!try_module_get(THIS_MODULE))return -ENODEV;
     uint32_t registered_controls = ops->control_count(opaque);
     if (registered_controls > AUDIO_CONTROL_MAX) registered_controls = AUDIO_CONTROL_MAX;
     uint64_t flags;
@@ -100,6 +110,8 @@ int audio_register_card_owned(const struct audio_card_identity *identity,
         cards[i] = (struct card_entry){0};
         cards[i].id = (++card_generation << 8) | i;
         cards[i].owner = owner;
+        cards[i].code_owner = driver_module_owner(owner);
+        cards[i].core_owner = THIS_MODULE;
         cards[i].live = 1;
         cards[i].identity = *identity;
         cards[i].ops.version = ops->version;
@@ -128,7 +140,26 @@ int audio_register_card_owned(const struct audio_card_identity *identity,
         return 0;
     }
     kernel_spin_unlock_irqrestore(&audio_lock, flags);
+    module_put(THIS_MODULE);
     return -28;
+}
+
+/** @brief Acquire an external module reference while the card registration is stable.
+ * @param card Generation-tagged card id.
+ * @param out Required owned reference result, NULL for builtin code.
+ * @return Zero or -EINVAL/-ENODEV. IRQ-safe; no locks span callbacks or I/O.
+ * The module-table lock never enters audio code, preserving lock order.
+ */
+int audio_card_module_get(uint32_t card,struct module **out)
+{
+    if(!out) return -EINVAL;
+    *out=NULL;
+    uint64_t flags; kernel_spin_lock_irqsave(&audio_lock,&flags);
+    struct card_entry *entry=find_card(card);
+    bool admitted=entry && !entry->closing && try_module_get(entry->code_owner);
+    if(admitted) *out=entry->code_owner;
+    kernel_spin_unlock_irqrestore(&audio_lock,flags);
+    return admitted ? 0 : -ENODEV;
 }
 /** @brief Release a callback/module execution pin under the registry lock.
  * @param c Borrowed pinned card.
@@ -278,16 +309,19 @@ int audio_stream_open(uint32_t card, uint32_t device, enum audio_direction direc
     struct stream_entry *s = NULL;
     for (uint32_t i = 0; i < STREAM_MAX; ++i) if (!streams[i].live) { s = &streams[i]; break; }
     if (!s || stream_generation == 0xffffffu) { kernel_spin_unlock_irqrestore(&audio_lock, flags); return -28; }
+    if(!try_module_get(c->code_owner)) { kernel_spin_unlock_irqrestore(&audio_lock,flags); return -ENODEV; }
     *s = (struct stream_entry){.id = (++stream_generation << 8) | (uint32_t)(s - streams),
-        .card = card, .device = device, .direction = direction, .live = 1, .calls = 1};
+        .card = card, .device = device, .direction = direction, .live = 1, .calls = 1,.code_owner=c->code_owner};
     __atomic_add_fetch(&c->calls, 1, __ATOMIC_ACQUIRE); ++c->streams;
     kernel_spin_unlock_irqrestore(&audio_lock, flags);
     int ret = c->ops.open(c->opaque, device, direction, &s->hw);
     kernel_spin_lock_irqsave(&audio_lock, &flags);
     __atomic_sub_fetch(&c->calls, 1, __ATOMIC_RELEASE); __atomic_sub_fetch(&s->calls, 1, __ATOMIC_RELEASE);
-    if (ret) { s->live = 0; --c->streams; }
+    struct module *drop=NULL;
+    if (ret) { s->live = 0; --c->streams; drop=s->code_owner; s->code_owner=NULL; }
     else *out_id = s->id;
     kernel_spin_unlock_irqrestore(&audio_lock, flags);
+    module_put(drop);
     return ret;
 }
 /** @brief Query the basic PCM constraints through a pinned card callback. */
@@ -451,7 +485,9 @@ int audio_stream_close(uint32_t id)
         struct card_entry *c = find_card(s->card);
         if (s->detached || !c) {
             if (s->calls) { kernel_spin_unlock_irqrestore(&audio_lock, flags); continue; }
-            s->live = 0; kernel_spin_unlock_irqrestore(&audio_lock, flags); return 0;
+            struct module *drop=s->code_owner; s->code_owner=NULL;
+            s->live = 0; kernel_spin_unlock_irqrestore(&audio_lock, flags);
+            module_put(drop); return 0;
         }
         if (c->closing) {
             if(c->disconnect_pending && !c->disconnecting){
@@ -478,7 +514,9 @@ int audio_stream_close(uint32_t id)
         kernel_spin_lock_irqsave(&audio_lock, &flags);
         --c->streams; __atomic_sub_fetch(&c->calls, 1, __ATOMIC_RELEASE);
         __atomic_sub_fetch(&s->calls, 1, __ATOMIC_RELEASE); s->live = 0;
+        struct module *drop=s->code_owner; s->code_owner=NULL;
         kernel_spin_unlock_irqrestore(&audio_lock, flags);
+        module_put(drop);
         return 0;
     }
 }
@@ -487,7 +525,10 @@ int audio_stream_close(uint32_t id)
  * @return 0 or STOP error. Task context; drains callbacks without registry lock.
  * Closing blocks new service/stream callbacks; detached stream objects stay live
  * for fd/VMA owners. A fatal request keeps admission closed on STOP failure;
- * ordinary unload failures reopen the card for recovery.
+ * ordinary unload failures reopen the card for recovery. Successful disconnect
+ * drops the registration's independent sound-core pin after notifications;
+ * failed STOP retains it. The caller keeps its admitted callback/dependency pin
+ * until returning, and no module put runs under the card registry lock.
  */
 static int disconnect_card(struct card_entry *c)
 {
@@ -512,6 +553,7 @@ static int disconnect_card(struct card_entry *c)
     kernel_spin_lock_irqsave(&audio_lock,&flags);
     c->live=0;c->service=NULL;c->opaque=NULL;c->ops=(struct audio_card_ops){0};
     c->disconnect_pending=0;c->disconnecting=0;
+    struct module *core_owner=c->core_owner;c->core_owner=NULL;
     ++audio_control_epoch;
     ++audio_pcm_epoch;
     audio_pcm_notify_fn notify=audio_pcm_notifier;
@@ -523,6 +565,7 @@ static int disconnect_card(struct card_entry *c)
     (void)kernel_wait_queue_wake_all(&audio_control_waiters);
     if(notify)for(uint32_t i=0;i<count;++i)notify(tokens[i],frames[i],-ENODEV);
     (void)kernel_wait_queue_wake_all(&audio_pcm_waiters);
+    module_put(core_owner);
     return 0;
 }
 /** @brief Disconnect a card before its module is finalized.

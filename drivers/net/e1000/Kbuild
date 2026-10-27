@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Objects are owned by this directory; child modules own their own lists.
-obj-y := e1000.o
+obj-$(CONFIG_E1000) += e1000.o
+e1000-y := e1000_main.o module.o
 
 include $(srctree)/scripts/Makefile.module

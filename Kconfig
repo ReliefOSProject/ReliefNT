@@ -1,7 +1,15 @@
 mainmenu "ReliefNT x86-64 Kernel Configuration"
 
-comment "All implemented kernel subsystems are built in"
-comment "No optional kernel feature symbols are defined"
+config 64BIT
+    bool
+    default y
+
+source "kernel/module/Kconfig"
+source "sound/Kconfig"
+source "drivers/Kconfig"
+source "fs/Kconfig"
+
+comment "Production subsystems default to built-in"
 comment "Build policy: PROFILE=debug|release"
 comment "Show build commands: V=1"
 comment "Toolchain and version suffixes use Make variables"

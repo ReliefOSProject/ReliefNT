@@ -10,7 +10,7 @@ void kernel_spin_unlock_irqrestore(struct kernel_spinlock *lock, uint64_t flags)
 { (void)lock; (void)flags; assert(held-- == 1); }
 void usb_poll(void) { assert(!held); }
 void sched_on_tick(void) { assert(!held); }
-void audio_service_tick(void) { assert(!held); }
+void sound_service_tick(void) { assert(!held); }
 void console_display_tick(void) { assert(!held); ++display_ticks; }
 /* This existing test covers the PIT discipline; the dedicated vDSO fixture
  * exercises trusted TSC interpolation with a controlled counter. */

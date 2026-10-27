@@ -5,3 +5,4 @@
 #include "../../../fs/exfat/exfat_mount.c"
 #include "../../../fs/exfat/exfat_name.c"
 #include "../../../fs/exfat/exfat_namespace.c"
+#include "../../../fs/exfat/native.c"

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Objects are owned by this directory; child modules own their own lists.
-obj-y := usb_uhci.o
+obj-$(CONFIG_USB_UHCI_HCD) += uhci.o
+uhci-y := usb_uhci.o module.o
 
 include $(srctree)/scripts/Makefile.module

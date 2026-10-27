@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+config SND_INTEL8X0
+    tristate "Intel ICH AC97 playback"
+    depends on SND
+    default y
+    help
+      Native legacy OSS playback for Intel 8086:2415 AC97 controllers.
+      With M, build ac97.ko for this kernel. Open OSS descriptions pin the
+      provider; unload requires acknowledged STOP and disabled bus mastering.

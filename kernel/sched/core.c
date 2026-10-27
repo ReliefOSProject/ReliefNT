@@ -1,3 +1,4 @@
+#include <reliefnt/export.h>
 #include "internal.h"
 
 static void sched_request_reschedule_cpu(uint32_t cpu);
@@ -289,7 +290,10 @@ void sched_request_reschedule_current(void)
 }
 
 /**
- * @brief Return the pid of the currently running task (0 before the first switch).
+ * @brief Read the current CPU execution-context task identity.
+ * @return Current pid, including zero before the first task switch or for idle execution.
+ * @par Context
+ * Boot/task/IRQ snapshot without allocation or reference acquisition. Caller must not migrate across a multi-step use of this identity.
  */
 uint32_t sched_current_pid(void)
 {
@@ -343,7 +347,10 @@ int sched_set_task_affinity(uint32_t pid, uint64_t mask)
 }
 
 /**
- * @brief Return the struct task for the currently running pid, or NULL.
+ * @brief Borrow the current CPU task with the historical idle-task lookup fallback.
+ * @return Borrowed current task, idle task, or NULL when no matching task exists.
+ * @par Context
+ * Caller retains the execution transaction or scheduler lifetime protection through use. No task reference is acquired and the pointer must not survive scheduling or task retirement.
  */
 struct task *sched_current_task(void)
 {
@@ -596,3 +603,11 @@ void sched_dump(void)
                        tasks[i]->flags);
     }
 }
+
+/* Native filesystem modules share this core-owned interface; CRC/release
+ * checks bind it to the exact kernel, without a stable cross-release API. */
+EXPORT_SYMBOL(sched_current_task);
+
+EXPORT_SYMBOL(sched_current_pid);
+
+EXPORT_SYMBOL(sched_request_reschedule_current);

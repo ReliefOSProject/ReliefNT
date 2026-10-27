@@ -126,7 +126,10 @@ uint32_t task_allocate_pid(void)
 }
 
 /**
- * @brief Return a zeroed task slot, recycling a reaped EXITED entry or growing the table as needed.
+ * @brief Recycle a fully retired task or allocate a stable zeroed task record.
+ * @return Borrowed unpublished task slot, or NULL on allocation/size failure.
+ * Caller holds scheduler_lock. Retires old PID identities before reuse so held
+ * proc inodes cannot retarget; releases no filesystem or device resources here.
  */
 struct task *alloc_task_slot(void)
 {
@@ -138,6 +141,7 @@ struct task *alloc_task_slot(void)
             (!(tasks[i]->flags & TASK_FLAG_WAITABLE_CHILD) || tasks[i]->parent_pid == 0)) {
             task_release_limits(tasks[i]);
             fair_forget(tasks[i]);
+            sched_task_identity_detach(tasks[i]);
             task_zero(tasks[i]);
             return tasks[i];
         }
@@ -476,7 +480,11 @@ static void sched_release_task_signals(struct task *task)
 }
 
 /**
- * @brief Free a user task's storage, files, and address space once, guarded by a released flag.
+ * @brief Release a quiescent user's owned resources once, including root/cwd.
+ * @param task Non-running task under execution ownership, or NULL.
+ * Drains pending I/O before releasing OFDs, mappings and filesystem paths;
+ * CLONE_FS paths retire only at the final shared holder. Backend cleanup can
+ * perform I/O, so the caller must not hold scheduler_lock across this call.
  */
 void sched_release_task_resources(struct task *task)
 {
@@ -520,9 +528,7 @@ void sched_release_task_resources(struct task *task)
     task->shared_mm = NULL;
     task->address_space = (struct task_address_space_state){0};
     task->fd_table = (struct task_fd_table_state){0};
-    if (task->shared_fs && __atomic_sub_fetch(&task->shared_fs->references, 1, __ATOMIC_SEQ_CST) == 0)
-        kernel_free(task->shared_fs);
-    task->shared_fs = NULL;
+    sched_task_fs_release(task);
     if (task->shared_sighand && __atomic_sub_fetch(&task->shared_sighand->references, 1, __ATOMIC_SEQ_CST) == 0)
         kernel_free(task->shared_sighand);
     task->shared_sighand = NULL;

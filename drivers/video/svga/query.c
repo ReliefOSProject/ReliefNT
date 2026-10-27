@@ -1,3 +1,4 @@
+#include <reliefnt/export.h>
 #include "device.h"
 
 #define SVGA_QUERY_OP_BEGIN 1u
@@ -400,6 +401,9 @@ static int query_batch_wait_locked(struct svga_batch *batch, uint32_t cid,
  * @param context Live SVGA context handle.
  * @param type Supported GB query type.
  * @return Zero when staged or a negative SVGA error for lock/state/capacity.
+ * Task/execution context for module callers; never enter with the SVGA lock held.
+ * Caller retains resources/backing and its independent module call pin through
+ * return, and through the real fence or successful teardown when asynchronous.
  */
 int svga_batch_query_begin(struct svga_batch *batch, svga_handle context,
                            uint32_t type)
@@ -430,6 +434,9 @@ int svga_batch_query_begin(struct svga_batch *batch, svga_handle context,
  * @param result Fully mapped borrowed GMR holding the result.
  * @param offset DWORD-aligned result byte offset.
  * @return Zero when staged or a negative SVGA error for lock/state/capacity.
+ * Task/execution context for module callers; never enter with the SVGA lock held.
+ * Caller retains resources/backing and its independent module call pin through
+ * return, and through the real fence or successful teardown when asynchronous.
  */
 int svga_batch_query_end(struct svga_batch *batch, svga_handle context,
                          uint32_t type, svga_handle result, uint32_t offset)
@@ -460,6 +467,9 @@ int svga_batch_query_end(struct svga_batch *batch, svga_handle context,
  * @param result Fully mapped borrowed GMR holding the result.
  * @param offset DWORD-aligned result byte offset.
  * @return Zero when staged or a negative SVGA error for an unmatched result.
+ * Task/execution context for module callers; never enter with the SVGA lock held.
+ * Caller retains resources/backing and its independent module call pin through
+ * return, and through the real fence or successful teardown when asynchronous.
  */
 int svga_batch_query_wait(struct svga_batch *batch, svga_handle context,
                           uint32_t type, svga_handle result, uint32_t offset)
@@ -887,3 +897,7 @@ bool svga_query_context_busy_locked(uint32_t context)
             return true;
     return false;
 }
+
+EXPORT_SYMBOL(svga_batch_query_begin);
+EXPORT_SYMBOL(svga_batch_query_end);
+EXPORT_SYMBOL(svga_batch_query_wait);

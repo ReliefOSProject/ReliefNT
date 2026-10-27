@@ -1,5 +1,6 @@
 """Verify production FAT directory extension against ASan/UBSan and mtools."""
 from pathlib import Path
+from storage_graph_test_sources import STORAGE_GRAPH_SOURCES
 import subprocess
 import tempfile
 
@@ -15,11 +16,11 @@ def main():
             stream.truncate(128 * 1024**2)
         subprocess.run(["mkfs.fat", "--invariant", "-F", "32", "-s", "1", image], check=True)
         subprocess.run([
-            "cc", "-std=c11", "-O1", "-g", "-fsanitize=address,undefined",
+            "cc", "-std=c11", "-DRELIEFNT_FIXTURE_REAL_DAC", "-O1", "-g", "-fsanitize=address,undefined",
             "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
             "-Iinclude", "-Iinclude", "-Iinclude/uapi",
             "tools/tests/fat_directory_growth_test.c", "fs/tmpfs/core.c",
-            "lib/text_utf16.c", "-o", executable,
+            "lib/text_utf16.c", *STORAGE_GRAPH_SOURCES, "-o", executable,
         ], cwd=ROOT, check=True)
         subprocess.run([executable, image], check=True, timeout=60)
         subprocess.run(["fsck.fat", "-n", image], check=True)

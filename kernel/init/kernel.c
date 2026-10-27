@@ -1,3 +1,4 @@
+#include <reliefnt/moduleparam.h>
 /*
  * ReliefOS kernel bootstrap: coordinates early platform initialization.
  * Starts memory, interrupts, drivers, storage and scheduling.
@@ -6,7 +7,7 @@
 #include <reliefnt/apic.h>
 #include <reliefnt/console.h>
 #include <reliefnt/driver_manager.h>
-#include <reliefnt/drm.h>
+#include <reliefnt/graphics_service.h>
 #include <reliefnt/efi_fs.h>
 #include <reliefnt/framebuffer.h>
 #include <reliefnt/input.h>
@@ -16,6 +17,9 @@
 #include <reliefnt/mm.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/multiboot2.h>
+#include <reliefnt/module.h>
+#include "../../fs/initramfs/boot.h"
+#include <reliefnt/boot_block.h>
 #include <reliefnt/panic.h>
 #include <reliefnt/net.h>
 #include <reliefnt/platform.h>
@@ -168,6 +172,8 @@ static uint32_t boot_load_ui_theme(void)
  * @brief Full boot sequence: parse Multiboot2/EFI info, then initialize every kernel subsystem in order and enter userland.
  * @param magic Multiboot2 bootloader handoff magic.
  * @param multiboot_info Physical address of the bootloader-owned information block.
+ * Builds the shared root namespace before driver/network/debug configuration
+ * consumes filesystem paths. No user task or secondary CPU is running yet.
  */
 static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
 {
@@ -296,7 +302,7 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
     sched_create_idle_task();
     syscall_init();
     syscall_trace_configure(boot.cmdline);
-    drm_faildiag_configure(boot.cmdline);
+    graphics_service_configure(boot.cmdline);
     arch_userland_init(kernel_ring0_stack + sizeof(kernel_ring0_stack));
     /* The kernel GDT and TSS are live now, so the kernel IDT must be loaded
      * before anything else can take a fault or restore IF.  Until this lidt
@@ -323,14 +329,44 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
                     "[svga3d] triangle-test=%d\n", triangle_ret);
     }
     irq_init();
+    driver_manager_init();
     {
+        int parameter_ret=module_parameters_boot(boot.cmdline);
+        if(parameter_ret<0)console_error("[boot] builtin parameter error ret=%d\n",parameter_ret);
+    }
+    {
+        uint64_t memory_device;
+        int memory_ret=block_boot_image_register(&boot,&memory_device);
+        if(memory_ret<0) {
+            console_fatal("[boot] reserved root image invalid ret=%d; boot stopped\n",memory_ret);
+            kernel_idle_loop();
+        }
+    }
+    {
+        uint64_t block_flags;
+        kernel_execution_lock_irqsave(&block_flags);
+        int block_ret=module_run_block_initcalls();
+        kernel_execution_unlock_irqrestore(block_flags);
+        if(block_ret<0)console_error("[boot] block discovery failed ret=%d\n",block_ret);
+    }
+    {
+        int filesystem_ret=module_run_fs_initcalls();
+        if(filesystem_ret<0)
+            console_error("[boot] filesystem registration failed ret=%d\n",filesystem_ret);
+    }
+    {
+        int memory_root=storage_initramfs_boot(&boot);
+        if(memory_root<0) {
+            console_fatal("[boot] initial archive failed ret=%d; boot stopped\n",memory_root);
+            kernel_idle_loop();
+        }
         bool ramdisk_root = cmdline_has(&boot, "mode=installer") ||
                             cmdline_has(&boot, "mode=live");
         console_info("[boot] selecting root source=%s modules=%u\n",
-                     ramdisk_root ? "installer/live ramdisk" : "physical disk",
+                     memory_root ? "initramfs" : ramdisk_root ? "installer/live ramdisk" : "physical disk",
                      boot.module_count);
-        storage_mount_boot_root(&boot, ramdisk_root);
-        if (ramdisk_root && !storage_ready()) {
+        if(!memory_root)storage_mount_boot_root(&boot, ramdisk_root);
+        if (!memory_root && ramdisk_root && !storage_ready()) {
             console_warn("[reliefnt] installer ramdisk root not ready, retrying installer module\n");
             storage_init_installer_root(&boot);
         }
@@ -338,11 +374,16 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
                     "[boot] root_ready=%u filesystem=%s\n", (unsigned)storage_ready(),
                     storage_root_filesystem_name());
     }
+    if(storage_ready()) {
+        int namespace_ret=storage_namespace_bootstrap();
+        if(namespace_ret<0) {
+            console_fatal("[reliefnt] initial mount namespace failed ret=%d\n",namespace_ret);
+            kernel_idle_loop();
+        }
+    }
     console_info("[boot] loading built-in mouse, serial, network and audio drivers\n");
-    driver_manager_init();
     driver_manager_load_builtin();
-    console_info("[boot] discovering USB HID devices and initializing IPv4 networking\n");
-    usb_init();
+    console_info("[boot] input providers initialized; initializing IPv4 networking\n");
     net_init();
     if (kernel_debug_boot_requested()) {
         console_info("[reliefnt] entering kernel debug tool before userland\n");

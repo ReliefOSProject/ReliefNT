@@ -99,6 +99,14 @@ int storage_disk_block_write(uint32_t disk_id, int32_t partition_index,
                              uint64_t offset, const void *buffer, uint32_t length,
                              uint32_t *out_written);
 
+/**
+ * @brief Invalidate a discovered disk's partition cache after excluding active mounts.
+ * @param disk_id Borrowed registered whole-disk identifier.
+ * @return Zero or negative ownership/discovery/protected-root/busy errno.
+ * Storage execution ownership required; no namespace or module lock spans
+ * preparation I/O. Actual volume memberships, including detached held ones,
+ * keep the disk busy. Cache invalidation does not transfer device ownership.
+ */
 int storage_disk_block_reread(uint32_t disk_id);
 
 /**
@@ -123,7 +131,9 @@ int disk_partition_filesystem(struct install_disk_state *disk,
 /**
  * @brief Checks whether an operation may mutate a disk-management partition.
  * @param disk Block-disk state that owns the partition.
- * @return Zero if the disk is not a startup or mounted installer target.
+ * @return Zero or -EINVAL/-EBUSY for an invalid/protected startup disk.
+ * @par Context Execution-owned precheck only; callers separately exclude
+ * actual mounted volume memberships before mutating a partition.
  */
 int disk_partition_mutable(const struct install_disk_state *disk);
 
@@ -134,11 +144,7 @@ int disk_partition_mutable(const struct install_disk_state *disk);
  */
 int storage_disk_has_data_mount(uint32_t disk_id);
 
-/**
- * @brief Checks whether installer-reserved mount slots are occupied.
- * @return Nonzero when /target or /target/boot cannot be reused by the installer.
- */
-int storage_installer_mounts_busy(void);
+
 
 /**
  * @brief Tests a user-visible filesystem selection accepted by the formatter.
@@ -196,40 +202,30 @@ int storage_disk_create_partition(const struct reliefos_disk_partition_create *r
 int storage_disk_partition_volume_id(uint32_t disk_id, uint32_t partition_index,
                                      uint32_t *out_volume_id);
 
+/** @brief Format the partition backend's actual live mountpoint for display.
+ * @param disk_id Inventory disk identifier, unchanged.
+ * @param partition_index Zero-based partition in the volume registry.
+ * @param out_path Required diagnostic output, empty on absent/format error.
+ * @param capacity Bytes including NUL; no truncation is reported as success.
+ * @return Zero or negative errno. Execution-owned pure graph query; no I/O,
+ * ownership transfer, or authority for backend selection/unmount operations.
+ */
 int storage_disk_partition_mount_path(uint32_t disk_id, uint32_t partition_index,
                                       char *out_path, uint32_t capacity);
 
-/** Mount a GPT partition through the standard block-device and mount ABI. */
-int storage_mount_block_partition(uint32_t disk_id, uint32_t partition_index,
-                                  const char *target, const char *filesystem_name,
-                                  uint64_t flags, uint32_t *out_volume_id);
-
-/** Legacy ABI adapter retained until all callers have moved to mount(2). */
-int storage_disk_mount_partition(struct reliefos_disk_partition_mount *request);
-
-int storage_mount_path_volume_id(const char *target, uint32_t *out_volume_id);
-
-int storage_unmount_path(const char *target, uint32_t *out_volume_id);
-
 /**
- * @brief Unmounts a runtime data partition after the kernel has checked task usage.
- * @param request Disk and GPT-entry selector.
- * @return Zero on success or a negative errno-style storage error.
+ * @brief Copy discovered installer disk identities without inventing mount state.
+ * @param disks Writable array of capacity entries; NULL permitted at capacity zero.
+ * @param capacity Maximum records to copy, clamped to the discovered disk count.
+ * @param out_count Required total-count output, including omitted records.
+ * @return Zero or -EINVAL/-EAGAIN. A disk with unknown size may be identified.
+ * @par Context Storage execution ownership; callers retain their output memory.
+ * Actual filesystem attachments are queried through VFS, never a disk flag.
  */
-int storage_disk_unmount_partition(const struct reliefos_disk_partition_unmount *request);
-
 int storage_install_list_disks(struct reliefos_install_disk *disks,
                                uint32_t capacity, uint32_t *out_count);
 
-int storage_install_format_target(uint32_t disk_id);
 
-/**
- * @brief Preserves the historical installer formatting ABI.
- * @param disk_id Installer disk identifier.
- * @return Zero after formatting the ESP plus exFAT root, or a negative error.
- */
-int storage_install_format_esp(uint32_t disk_id);
 
-int storage_install_mount_target(uint32_t disk_id);
 
 #endif

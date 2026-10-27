@@ -6,6 +6,12 @@
 #include <string.h>
 #include "device.h"
 #include "modules/framebuffer.h"
+#ifdef RELIEFNT_SVGA_NATIVE_OWNER_TEST
+#include "../../kernel/module/internal.h"
+#include "audio_fixture.h"
+static struct module svga_test_native_owner;
+void module_memory_free(struct module_memory *memory){assert(!memory);}
+#endif
 
 #if defined(SVGA_BATCH_SUBMIT_FAILURE_SNAPSHOT)
 #define assert_batch_submit_failure(batch, expected_reason, expected_index, \
@@ -3421,13 +3427,51 @@ static void test_old_generation_quiescence_requires_sync_evidence(void)
     assert(!svga3d_shutdown() && !live_pages);
 }
 
-struct borrowed_test_owner { uint64_t phys; uint32_t pages, puts; };
+struct borrowed_test_owner { uint64_t phys; uint32_t pages, puts; struct module *code_owner; };
 static void release_borrowed_test_owner(void *opaque)
 {
     struct borrowed_test_owner *owner = opaque;
+#ifdef RELIEFNT_SVGA_NATIVE_OWNER_TEST
+    if(owner->code_owner) {
+        assert(owner->code_owner->runtime->users==1);
+        assert(module_unload(owner->code_owner->name,0)==-11);
+        assert(owner->code_owner->runtime->state==MODULE_LIVE);
+    }
+#endif
     ++owner->puts;
     deallocate(owner->phys, owner->pages);
 }
+
+#ifdef RELIEFNT_SVGA_NATIVE_OWNER_TEST
+static void test_borrowed_callback_native_code_owner(void)
+{
+    setup(0x1dffc3e2u,0x77fu,0);
+    struct module_runtime runtime={0};
+    strcpy(svga_test_native_owner.name,"svga_callback");strcpy(runtime.name,"svga_callback");
+    svga_test_native_owner.runtime=&runtime;runtime.owner=&svga_test_native_owner;
+    runtime.state=MODULE_COMING;runtime.init_succeeded=true;module_list=&runtime;
+    struct borrowed_test_owner owner={.pages=1,.code_owner=&svga_test_native_owner};
+    owner.phys=allocate(owner.pages);assert(owner.phys);
+    svga_handle attachment=0;unsigned before=heap_live_allocations;
+    assert(svga_gmr_borrowed_attach(owner.phys,4096,&owner,release_borrowed_test_owner,
+        &svga_test_native_owner,&attachment)==SVGA_ENODEV);
+    assert(!attachment && !runtime.users && before==heap_live_allocations);
+    runtime.state=MODULE_LIVE;
+    assert(svga_gmr_borrowed_attach(owner.phys,4096,&owner,release_borrowed_test_owner,
+        &svga_test_native_owner,&attachment)==SVGA_EBUSY);
+    assert(attachment && runtime.users==1);
+    assert(module_unload(runtime.name,0)==-11 && runtime.state==MODULE_LIVE);
+    consume();
+    assert(!svga_gmr_borrowed_attach(owner.phys,4096,&owner,release_borrowed_test_owner,
+        &svga_test_native_owner,&attachment) && runtime.users==1);
+    assert(svga_gmr_borrowed_detach(attachment)==SVGA_EBUSY && runtime.users==1);
+    consume();assert(!svga_gmr_borrowed_detach(attachment));
+    assert(owner.puts==1 && !runtime.users);
+    module_list=NULL;svga_test_native_owner.runtime=NULL;
+    assert(!svga3d_shutdown() && !live_pages);
+    puts("PASS native SVGA callback owner: COMING refusal, fence-delayed pin, busy unload stays LIVE inside callback, final put after return");
+}
+#endif
 
 static void test_borrowed_mapping_queues_before_host_completion(void)
 {
@@ -3439,7 +3483,7 @@ static void test_borrowed_mapping_queues_before_host_completion(void)
     svga_handle attachment = 0;
     stall_command = SVGA_CMD_REMAP_GMR2;
     assert(svga_gmr_borrowed_attach(owner.phys, owner.pages * 4096u,
-        &owner, release_borrowed_test_owner, &attachment) == SVGA_EBUSY);
+        &owner, release_borrowed_test_owner, NULL, &attachment) == SVGA_EBUSY);
     uint32_t mob = UINT32_MAX;
     assert(svga_gmr_borrowed_mob_id(attachment, &mob) == SVGA_EBUSY);
     /* No CPU retry or intermediate fence completion is needed to enqueue
@@ -3450,7 +3494,7 @@ static void test_borrowed_mapping_queues_before_host_completion(void)
     assert(host_gmr_ppn[id][299] == (uint32_t)(owner.phys >> 12) + 299);
     assert(owner.puts == 0);
     assert(!svga_gmr_borrowed_attach(owner.phys, owner.pages * 4096u,
-        &owner, release_borrowed_test_owner, &attachment));
+        &owner, release_borrowed_test_owner, NULL, &attachment));
     assert(!svga_gmr_borrowed_mob_id(attachment, &mob));
     assert(svga_gmr_borrowed_detach(attachment) == SVGA_EBUSY);
     consume();
@@ -3474,7 +3518,7 @@ static void test_borrowed_mapping_partial_fifo_pressure(void)
     svga_handle attachment = 0;
     stalled = true;
     assert(svga_gmr_borrowed_attach(owner.phys, owner.pages * 4096u,
-        &owner, release_borrowed_test_owner, &attachment) == SVGA_EBUSY);
+        &owner, release_borrowed_test_owner, NULL, &attachment) == SVGA_EBUSY);
     uint32_t id = svga_resource_id(attachment);
     struct svga_gmr *gmr = &svga.gmrs[id];
     assert(gmr->map_inflight && gmr->mapped_pages == 0 &&
@@ -3482,7 +3526,7 @@ static void test_borrowed_mapping_partial_fifo_pressure(void)
     svga_handle prefix_fence = gmr->progress_fence;
     uint32_t prefix_end = fifo[SVGA_FIFO_NEXT_CMD];
     assert(svga_gmr_borrowed_attach(owner.phys, owner.pages * 4096u,
-        &owner, release_borrowed_test_owner, &attachment) == SVGA_EBUSY);
+        &owner, release_borrowed_test_owner, NULL, &attachment) == SVGA_EBUSY);
     assert(gmr->map_pending_pages == 256 &&
            gmr->progress_fence == prefix_fence &&
            fifo[SVGA_FIFO_NEXT_CMD] == prefix_end);
@@ -3492,9 +3536,9 @@ static void test_borrowed_mapping_partial_fifo_pressure(void)
     consume();
     assert(host_gmr_ppn[id][255] == (uint32_t)(owner.phys >> 12) + 255u);
     assert(svga_gmr_borrowed_attach(owner.phys, owner.pages * 4096u,
-        &owner, release_borrowed_test_owner, &attachment) == SVGA_EBUSY);
+        &owner, release_borrowed_test_owner, NULL, &attachment) == SVGA_EBUSY);
     assert(!svga_gmr_borrowed_attach(owner.phys, owner.pages * 4096u,
-        &owner, release_borrowed_test_owner, &attachment));
+        &owner, release_borrowed_test_owner, NULL, &attachment));
     for (uint32_t page = 0; page < owner.pages; ++page)
         assert(host_gmr_ppn[id][page] == (uint32_t)(owner.phys >> 12) + page);
     assert(!svga_gmr_borrowed_mob_id(attachment, &mob));
@@ -3519,7 +3563,7 @@ static void test_borrowed_gmr_mob_lifetime(void)
     svga_handle attachment = 0;
     stall_command = SVGA_CMD_REMAP_GMR2;
     assert(svga_gmr_borrowed_attach(owner.phys, owner.pages * 4096u,
-             &owner, release_borrowed_test_owner, &attachment) == SVGA_EBUSY);
+             &owner, release_borrowed_test_owner, NULL, &attachment) == SVGA_EBUSY);
     assert(attachment && live_pages == baseline + owner.pages + 1 && owner.puts == 0);
     assert(svga.mode_leases == 1);
     uint64_t mode_flags;
@@ -3528,14 +3572,14 @@ static void test_borrowed_gmr_mob_lifetime(void)
     uint32_t mapped_mob = UINT32_MAX;
     assert(svga_gmr_borrowed_mob_id(attachment, &mapped_mob) == SVGA_EBUSY);
     assert(svga_gmr_borrowed_attach(owner.phys, owner.pages * 4096u,
-             &owner, release_borrowed_test_owner, &attachment) == SVGA_EBUSY);
+             &owner, release_borrowed_test_owner, NULL, &attachment) == SVGA_EBUSY);
     assert(live_pages == baseline + owner.pages + 1 && owner.puts == 0);
     stalled = false;
     consume();
     int ret = SVGA_EBUSY;
     for (uint32_t attempt = 0; attempt < 8u && ret == SVGA_EBUSY; ++attempt) {
         ret = svga_gmr_borrowed_attach(owner.phys, owner.pages * 4096u,
-                    &owner, release_borrowed_test_owner, &attachment);
+                    &owner, release_borrowed_test_owner, NULL, &attachment);
         consume();
     }
     assert(!ret);
@@ -3587,9 +3631,9 @@ static void test_shutdown_refuses_borrowed_attachment(void)
     assert(owner.phys);
     svga_handle attachment = 0;
     assert(svga_gmr_borrowed_attach(owner.phys, 4096, &owner,
-             release_borrowed_test_owner, &attachment) == SVGA_EBUSY);
+             release_borrowed_test_owner, NULL, &attachment) == SVGA_EBUSY);
     assert(attachment && !svga_gmr_borrowed_attach(owner.phys, 4096, &owner,
-             release_borrowed_test_owner, &attachment));
+             release_borrowed_test_owner, NULL, &attachment));
     uint32_t id = svga_resource_id(attachment), mobid = UINT32_MAX;
     assert(id < SVGA_GMRS && !svga_gmr_borrowed_mob_id(attachment, &mobid));
     assert(host_gmr_pages[id] == 1 && host_mobs[mobid].bytes == 4096);
@@ -3626,9 +3670,9 @@ static void test_vgpu9_occlusion_query_lifetime(void)
     owner.phys = allocate(1);
     svga_handle result = 0;
     assert(svga_gmr_borrowed_attach(owner.phys, 4096, &owner,
-             release_borrowed_test_owner, &result) == SVGA_EBUSY);
+             release_borrowed_test_owner, NULL, &result) == SVGA_EBUSY);
     assert(!svga_gmr_borrowed_attach(owner.phys, 4096, &owner,
-             release_borrowed_test_owner, &result));
+             release_borrowed_test_owner, NULL, &result));
     uint32_t mobid = UINT32_MAX;
     assert(!svga_gmr_borrowed_mob_id(result, &mobid));
 
@@ -3678,9 +3722,9 @@ static void test_many_query_operations_in_one_batch(void)
     owner.phys = allocate(owner.pages);
     assert(owner.phys);
     assert(svga_gmr_borrowed_attach(owner.phys, 4096, &owner,
-             release_borrowed_test_owner, &result) == SVGA_EBUSY);
+             release_borrowed_test_owner, NULL, &result) == SVGA_EBUSY);
     assert(!svga_gmr_borrowed_attach(owner.phys, 4096, &owner,
-             release_borrowed_test_owner, &result));
+             release_borrowed_test_owner, NULL, &result));
     struct svga_batch batch;
     assert(!svga_batch_init(&batch, svga.generation, batch_storage,
                             SVGA_BATCH_MAX_BYTES));
@@ -3732,9 +3776,9 @@ static void test_query_pending_capacity_is_bounded(void)
     owner.phys = allocate(owner.pages);
     assert(owner.phys);
     assert(svga_gmr_borrowed_attach(owner.phys, 4096, &owner,
-             release_borrowed_test_owner, &result) == SVGA_EBUSY);
+             release_borrowed_test_owner, NULL, &result) == SVGA_EBUSY);
     assert(!svga_gmr_borrowed_attach(owner.phys, 4096, &owner,
-             release_borrowed_test_owner, &result));
+             release_borrowed_test_owner, NULL, &result));
     struct svga_batch batch;
     assert(!svga_batch_init(&batch, svga.generation, batch_storage,
                             SVGA_BATCH_MAX_BYTES));
@@ -3772,9 +3816,9 @@ static void test_vgpu9_query_retirement_barrier(bool retire_context_first)
     struct borrowed_test_owner owner = {.pages = 1};
     owner.phys = allocate(1);
     assert(svga_gmr_borrowed_attach(owner.phys, 4096, &owner,
-             release_borrowed_test_owner, &result) == SVGA_EBUSY);
+             release_borrowed_test_owner, NULL, &result) == SVGA_EBUSY);
     assert(!svga_gmr_borrowed_attach(owner.phys, 4096, &owner,
-             release_borrowed_test_owner, &result));
+             release_borrowed_test_owner, NULL, &result));
 
     struct svga_batch batch;
     assert(!svga_batch_init(&batch, svga.generation, batch_storage,
@@ -4024,6 +4068,9 @@ static void test_idle_shader_retirement(void)
 
 int main(void)
 {
+#ifdef RELIEFNT_SVGA_NATIVE_OWNER_TEST
+    test_borrowed_callback_native_code_owner();
+#endif
     test_batch_operation_sidecar_demand_cost();
     test_batch_operation_sidecar_growth_and_failure();
     test_batch_operation_capacity_guards();

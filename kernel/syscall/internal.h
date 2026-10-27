@@ -2,11 +2,13 @@
 #define RELIEFNT_KERNEL_SYSCALL_DISPATCH_C_INTERNAL_H
 
 #include "legacy.h"
+#include "../exec/arguments.h"
 /*
  * ReliefOS kernel system calls: validates and dispatches the user ABI.
  * Implements process, file, memory, IPC, GUI, device, and timing operations.
  */
 #include <reliefnt/console.h>
+#include <reliefnt/chrdev.h>
 #include <reliefnt/arch.h>
 #include <reliefnt/driver_manager.h>
 #include <reliefnt/driver_manager_phase.h>
@@ -92,7 +94,6 @@
 #define STARTUP_DENIAL_MAX 64U
 #define STARTUP_REQUEST_MAX 16U
 #define TASK_EPOLL_INITIAL_ENTRIES 16u
-#define LINUX_RWF_HIPRI 0x00000001u
 
 struct task_timerfd {
     int32_t clockid;
@@ -252,18 +253,6 @@ struct task_snapshot_user {
 
 
 
-struct exec_params_kernel {
-    uint32_t argc;
-    uint32_t envc;
-    char **argv;
-    char **envp;
-    char *data;
-    uint32_t data_cap;
-    uint32_t argv_cap;
-    uint32_t envp_cap;
-    uint32_t limit;
-    uint32_t data_len;
-};
 
 
 
@@ -609,11 +598,15 @@ void task_epoll_remove_pty_description(struct task_pty_description *description)
  */
 void task_epoll_destroy(struct task_epoll *epoll);
 
-uint64_t linux_stat_inode(const char *path, const struct reliefos_stat *st);
-
-int linux_stat_from_legacy(struct linux_stat_abi *out,
-                                   const struct reliefos_stat *st,
-                                   const char *path, const struct storage_node *node);
+/** @brief Encode admitted pathless node metadata without namespace replay.
+ * @param out Required Linux stat output. @param st Optional builtin type/size.
+ * @param node Optional already-held anonymous/backend/device node.
+ * @return Zero or negative metadata errno. Caller keeps descriptor/inode/code
+ * alive under execution ownership without graph/module callback locks. No
+ * ownership transfer; mounted paths use linux_stat_from_path instead.
+ */
+int linux_stat_from_node(struct linux_stat_abi *out,const struct reliefos_stat *st,
+                            const struct storage_node *node);
 
 void linux_stat_fd_type(struct linux_stat_abi *out, const struct task_file *file);
 
@@ -761,6 +754,11 @@ struct task_file *task_file_for_io(struct task *task, int fd);
  */
 void task_fifo_cancel(struct task *task);
 
+/** @brief Cancel pending pathname, snapshot, OFD/PTY and subsystem ownership.
+ * @param task Calling task under execution ownership, nullable.
+ * Detaches ownership first; final backend callbacks may perform I/O, so no
+ * scheduler, graph or module-table spinlock may span this cleanup.
+ */
 void task_release_syscall_file(struct task *task);
 
 /**
@@ -912,11 +910,12 @@ int task_console_materialize_stdio(struct task *task);
  */
 int task_pty_materialize_stdio(struct task *task);
 
-/**
- * Task pty fd available.
- * @param task Value supplied by the caller.
- * @param fd Value supplied by the caller.
- * @return The value or status produced by the operation.
+/** @brief Describe the admitted builtin terminal without namespace lookup.
+ * @param task Borrowed current task under execution ownership.
+ * @param fd Descriptor number with original PTY admission where applicable.
+ * @param node Required caller-owned device identity result.
+ * @param path Required output borrowing a static intrinsic metadata label.
+ * @return Zero or negative errno; no allocation, I/O or reference transfer.
  */
 int task_pty_node_for_fd(struct task *task, int fd, struct storage_node *node,
                                  const char **path);
@@ -1000,6 +999,8 @@ int task_pty_dup2_fd(struct task *task, int old_fd, int new_fd);
  */
 int alloc_task_fd(struct task *task, const struct storage_node *node, uint32_t flags, const char *path);
 
+
+
 /**
  * @brief Replace a descriptor with a retained source description under the execution lock.
  * @param task Descriptor-table owner; required.
@@ -1040,60 +1041,6 @@ int file_can_read(const struct task_file *file);
  * @return The value or status produced by the operation.
  */
 int file_can_write(const struct task_file *file);
-
-/**
- * @brief Read one bounded slice of DRM event data into user memory.
- * @param task Current task used for the DRM event copyout; not retained.
- * @param file Borrowed DRM file description; it must be open for reading.
- * @param buffer User address of the writable destination range.
- * @param length Requested writable byte range; one DRM read is capped at
- *        RELIEFOS_FS_IO_SLICE_BYTES.
- * @return Bytes read, or negative EBADF/EFAULT or the DRM read's errno.
- */
-int64_t syscall_drm_read(struct task *task, struct task_file *file,
-                                uint64_t buffer, uint64_t length);
-
-/**
- * @brief Read DRM event data with a positional syscall's offset validation.
- * @param task Current task used for the DRM event copyout; not retained.
- * @param file Borrowed DRM file description; it must be open for reading.
- * @param buffer User address of the writable destination range.
- * @param length Requested byte count, subject to the shared read slice limit.
- * @param position Signed file offset encoded in the syscall register; DRM event
- *        reads ignore its value after rejecting negative offsets.
- * @return Bytes read, negative EINVAL for a negative offset, or the DRM read's
- *         negative errno.
- */
-int64_t syscall_drm_pread(struct task *task, struct task_file *file,
-                                 uint64_t buffer, uint64_t length,
-                                 uint64_t position);
-
-/**
- * @brief Apply DRM's no-op seek behavior after validating the seek request.
- * @param file Borrowed task file; it must refer to a DRM file description.
- * @param whence Linux seek selector, checked by the existing 32-bit <= 4 rule.
- * @return The unchanged file offset, or negative EBADF/EINVAL on invalid input.
- */
-int64_t syscall_drm_llseek(struct task_file *file, uint64_t whence);
-
-/**
- * @brief Read DRM event data across an already imported iovec array.
- * @param task Current task used for DRM event copyout; not retained.
- * @param file Borrowed DRM file description; it must be open for reading.
- * @param iov Kernel-side iovec copy imported by the vector syscall dispatcher;
- *        each writable user range is checked before any read is issued.
- * @param iovcnt Number of entries in iov; values above UIO_MAXIOV are rejected.
- * @param positional Whether position is a preadv offset that needs validation.
- * @param position Signed file offset encoded in the syscall register; DRM event
- *        reads ignore it after rejecting a negative positional offset.
- * @param flags Vector-read flags; zero and LINUX_RWF_HIPRI are supported.
- * @return Total bytes read, a partial count after a later read error, or
- *         negative EBADF/EINVAL/EFAULT/EOPNOTSUPP or the DRM read's errno.
- */
-int64_t syscall_drm_readv(struct task *task, struct task_file *file,
-                                 const struct iovec *iov, uint64_t iovcnt,
-                                 bool positional, uint64_t position,
-                                 uint64_t flags);
 
 int task_device_is(const struct task_file *file, uint32_t kind);
 
@@ -1189,53 +1136,287 @@ int task_evdev_ioctl(struct task_file *file, uint64_t request,
  */
 int copy_user_path(char *dst, uint32_t cap, uint64_t user_ptr);
 
-/**
- * Resolve user path.
- * @param task Value supplied by the caller.
- * @param user_ptr Value supplied by the caller.
- * @param out Output storage updated by the function.
- * @param cap Maximum number of elements available in the related buffer.
- * @return The value or status produced by the operation.
+/** @brief Copy a bounded user pathname and resolve it to a retained object.
+ * @param ns Shared live namespace under execution ownership.
+ * @param task Borrowed current task with referenced filesystem state.
+ * @param dirfd Linux descriptor or AT_FDCWD; absolute input ignores it.
+ * @param user_ptr User address, checked including its terminating NUL.
+ * @param allow_empty Allow the exact cwd/OFD object for empty input.
+ * @param real_ids Select real rather than filesystem credentials for search.
+ * @param lookup_flags VFS_LOOKUP_FOLLOW/PARENT/MISSING bits.
+ * @param out Empty output receiving one owned path on success.
+ * @return Zero or negative errno. Releases its temporary copy on every path;
+ * an active syscall scope retains its own checked input and directory objects
+ * across EAGAIN. User memory is never retained or reread by a matching retry.
  */
-int resolve_user_path_ids(struct task *task, uint64_t user_ptr, char *out,
-                                  uint32_t cap, bool real_ids);
+int resolve_user_object_at_flags(struct vfs_namespace *ns,struct task *task,int32_t dirfd,
+                                   uint64_t user_ptr,bool allow_empty,bool real_ids,
+                                   uint32_t lookup_flags,struct vfs_lookup_result *out);
 
-int resolve_user_path(struct task *task, uint64_t user_ptr, char *out, uint32_t cap);
-
-int resolve_kernel_path_at_flags(struct task *task, int32_t dirfd, const char *raw,
-                                bool allow_empty, char *path, struct task_file **empty_file,
-                                bool real_ids, uint32_t lookup_flags);
-
-/** @brief Resolves a raw *at pathname with an explicit final-symlink policy. */
-int resolve_user_path_at_flags(struct task *task, int32_t dirfd, uint64_t user_ptr,
-                                bool allow_empty, char *path, struct task_file **empty_file,
-                                bool real_ids, uint32_t lookup_flags);
-
-/**
- * @brief Validates and strips a trailing slash on a parent-resolved mutation path.
- * @param path Mutable resolved pathname.
- * @param creating Nonzero for non-directory creation, which rejects existing names.
- * @return Zero or Linux's trailing slash error without following the last symlink.
+/** @brief Derive authorized creation metadata from the actual parent inode.
+ * @param task Borrowed current task and stable filesystem credentials.
+ * @param parent Borrowed retained directory, never resolved by display name.
+ * @param type Linux S_IF* inode type.
+ * @param mode Requested permissions, subject to umask and set-ID policy.
+ * @param out Required metadata output on success.
+ * @return Zero or negative errno. Checks parent write/search, fsuid/fsgid,
+ * SGID inheritance and capabilities; symlinks keep0777. No graph lock spans I/O.
  */
-int mutation_path_slash(char *path, bool creating);
+int syscall_creation_mode(struct task *task,const struct vfs_path *parent,uint32_t type,
+                             uint32_t mode,struct reliefos_permissions *out);
 
-/**
- * @brief Classifies final dot components before any storage lexical normalization.
- * @param path Absolute parent-resolved path, possibly with a trailing slash.
- * @return 1 for dot, 2 for dot-dot, 3 for root, otherwise 0.
+/** @brief Create a directory/regular/special/link member through its held parent.
+ * @param ns Borrowed shared namespace under execution ownership.
+ * @param task Borrowed current task with retained root/cwd/dirfd state.
+ * @param dirfd Relative base descriptor or AT_FDCWD.
+ * @param pathname User pathname captured by the common retry scope.
+ * @param type Supported Linux S_IF* inode type.
+ * @param mode Requested permissions, with normal umask/inheritance semantics.
+ * @param target Borrowed kernel-owned symlink target, NULL for other types.
+ * @return Zero or negative errno. Existing names return EEXIST before parent
+ * write checks; no fallible inode-open/VFS allocation follows publication.
+ * No diagnostic-name replay or graph/module lock spans provider callbacks.
  */
-int mutation_path_special(const char *path);
+int64_t syscall_create_object(struct vfs_namespace *ns,struct task *task,int32_t dirfd,
+                                uint64_t pathname,uint32_t type,uint32_t mode,const char *target);
 
-/**
- * Storage errno.
- * @param ret Value supplied by the caller.
- * @return The value or status produced by the operation.
+/** @brief Check actual parent write/search and optional sticky target ownership.
+ * @param task Borrowed caller with stable filesystem credentials.
+ * @param parent Held containing directory, retained across provider callbacks.
+ * @param member Held target, NULL for a new name without sticky checks.
+ * @return Zero or negative errno. CAP_FOWNER bypasses only sticky ownership;
+ * no graph/module lock spans metadata I/O and no pathname replay is performed.
+ */
+int syscall_mutation_parent(struct task *task,const struct vfs_path *parent,
+                               const struct vfs_path *member);
+
+/** @brief Unlink or remove a directory through the original retained parent.
+ * @param ns Borrowed shared namespace under execution ownership.
+ * @param task Borrowed caller with retained task/OFD paths and credentials.
+ * @param dirfd Relative directory descriptor or AT_FDCWD.
+ * @param pathname User operand copied once by the retry scope.
+ * @param directory True for rmdir/AT_REMOVEDIR; false for unlink.
+ * @return Zero or negative errno. Final symlinks are not followed; directory,
+ * sticky, mountpoint and readonly checks precede publication. Open inode pins
+ * survive removal. No scheduler/module/graph lock spans provider I/O.
+ */
+int64_t syscall_remove_object(struct vfs_namespace *ns,struct task *task,int32_t dirfd,
+                                 uint64_t pathname,bool directory);
+/** @brief Rename entries using retained original source/destination parents.
+ * @param ns Borrowed shared namespace under execution ownership.
+ * @param task Borrowed caller with stable credentials and filesystem paths.
+ * @param oldfd Source relative base descriptor or AT_FDCWD.
+ * @param oldname Source user pathname copied once by the retry scope.
+ * @param newfd Destination relative base descriptor or AT_FDCWD.
+ * @param newname Destination user pathname, a separate retained operand.
+ * @param flags renameat2 flags; unsupported nonzero atomics fail explicitly.
+ * @return Zero or negative errno. Parent/sticky DAC and trailing/type checks
+ * precede graph/provider mutation; final symlinks are not followed. Original
+ * directories survive retries. No graph/module lock spans provider callbacks.
+ */
+int64_t syscall_rename_object(struct vfs_namespace *ns,struct task *task,int32_t oldfd,uint64_t oldname,
+                                 int32_t newfd,uint64_t newname,uint32_t flags);
+/** @brief Link an exact held source inode into the original destination parent.
+ * @param ns Borrowed shared namespace under execution ownership.
+ * @param task Borrowed caller with stable filesystem credentials and paths.
+ * @param oldfd Relative source descriptor or AT_FDCWD.
+ * @param oldname User source pathname copied once before retryable I/O.
+ * @param newfd Relative destination directory descriptor or AT_FDCWD.
+ * @param newname User destination pathname, copied as a separate operand.
+ * @param flags AT_SYMLINK_FOLLOW and/or AT_EMPTY_PATH, no other bits.
+ * @return Zero or negative errno. Empty-source linking follows the documented
+ * CAP_DAC_READ_SEARCH gate; no directory or zero-link resurrection is allowed.
+ * Caller retains both operands until common cancellation; no graph/module
+ * lock, pathname-display authority or post-publication allocation occurs.
+ */
+int64_t syscall_link_object(struct vfs_namespace *ns,struct task *task,int32_t oldfd,uint64_t oldname,
+                               int32_t newfd,uint64_t newname,uint32_t flags);
+
+/** @brief Capture a symlink target once and create its actual directory member.
+ * @param ns Borrowed shared namespace under execution ownership.
+ * @param task Borrowed current task with optional active retry scope.
+ * @param target User symlink payload, copied before any retryable filesystem I/O.
+ * @param dirfd Relative link-directory descriptor or AT_FDCWD.
+ * @param pathname User link pathname, captured independently by the resolver.
+ * @return Zero or negative errno. The task owns active copies until common
+ * cancellation; unscoped temporaries are freed. No locks span metadata I/O.
+ */
+int64_t syscall_symlink_object(struct vfs_namespace *ns,struct task *task,uint64_t target,
+                                 int32_t dirfd,uint64_t pathname);
+
+/** @brief Dispatch directory operations against retained task root/cwd objects.
+ * @param ns Borrowed published namespace under execution ownership.
+ * @param task Borrowed current task; shared CLONE_FS state is honored.
+ * @param number Linux GETCWD/CHDIR/FCHDIR/CHROOT syscall number.
+ * @param a0 User input/output pointer or FCHDIR directory descriptor.
+ * @param a1 GETCWD buffer capacity; otherwise ignored.
+ * @return Zero for directory changes, raw getcwd bytes including NUL or negative
+ * errno. Errors preserve references; chroot preserves cwd. Backend search may
+ * yield EAGAIN without a graph/scheduler lock; common syscall cleanup retires
+ * the retained resolver state. Unknown operations return ENOSYS.
+ */
+int64_t syscall_directory(struct vfs_namespace *ns,struct task *task,uint64_t number,
+                            uint64_t a0,uint64_t a1);
+
+/** @brief Format the held inode's native stat metadata and device identity.
+ * @param out Required Linux stat output, empty on metadata failure.
+ * @param path Borrowed retained inode; no displayed name is consulted.
+ * @return Zero or negative errno. Caller authorizes traversal and retains the
+ * execution transaction without graph/module locks across provider I/O.
+ */
+int linux_stat_from_path(struct linux_stat_abi *out,const struct vfs_path *path);
+
+/** @brief Dispatch stat/statfs families against retained inode/OFD objects.
+ * @param ns Borrowed shared namespace under execution ownership.
+ * @param task Borrowed current task with stable filesystem references.
+ * @param number Linux STAT/LSTAT/FSTAT/NEWFSTATAT/STATX/STATFS/FSTATFS number.
+ * @param a0 First native ABI argument, pathname or descriptor.
+ * @param a1 Second native ABI argument, output or at-pathname.
+ * @param a2 Third native ABI argument, output or statx flags.
+ * @param a3 Fourth native ABI argument, flags or statx mask.
+ * @param a4 Fifth native ABI argument, statx output.
+ * @return Zero or negative errno. Retains original objects across provider
+ * waits through the common syscall scope; no graph lock spans callbacks.
+ */
+int64_t syscall_metadata(struct vfs_namespace *ns,struct task *task,uint64_t number,
+                           uint64_t a0,uint64_t a1,uint64_t a2,uint64_t a3,uint64_t a4);
+
+/** @brief Dispatch DAC and chmod/chown families using retained inode objects.
+ * @param ns Borrowed shared namespace under execution ownership.
+ * @param task Borrowed current task and stable credentials.
+ * @param number Linux access/chmod/chown family syscall number.
+ * @param a0 First native ABI argument, pathname or descriptor.
+ * @param a1 Second native ABI argument, mode/user ID or at-pathname.
+ * @param a2 Third native ABI argument, group ID or at-mode/user ID.
+ * @param a3 Fourth native ABI argument, group ID or flags.
+ * @param a4 Fifth native ABI argument, fchownat flags.
+ * @return Zero or negative errno. Honors the original admitted OFD and the
+ * common copy-once path scope; no graph/module lock spans metadata I/O.
+ */
+int64_t syscall_permissions(struct vfs_namespace *ns,struct task *task,uint64_t number,
+                              uint64_t a0,uint64_t a1,uint64_t a2,uint64_t a3,uint64_t a4);
+
+/** @brief Read a held symlink without following its final component.
+ * @param ns Borrowed shared namespace under execution ownership.
+ * @param task Borrowed current task with retained root/cwd objects.
+ * @param dirfd Base descriptor or AT_FDCWD.
+ * @param pathname User pathname, copied once across provider waits.
+ * @param output User byte output; no NUL is appended.
+ * @param capacity Signed Linux buffer capacity; must be positive.
+ * @param allow_empty Permit a link descriptor for readlinkat's empty input.
+ * @return Copied byte count or negative errno. Returned path/temporary memory
+ * are released; common retry scope retains original operands without locks.
+ */
+int64_t syscall_readlink_object(struct vfs_namespace *ns,struct task *task,int32_t dirfd,
+                                  uint64_t pathname,uint64_t output,int32_t capacity,bool allow_empty);
+
+/** @brief Truncate an authorized held path or the original admitted OFD.
+ * @param ns Borrowed shared namespace under execution ownership.
+ * @param task Borrowed caller with retained filesystem/OFD state.
+ * @param number Linux TRUNCATE or FTRUNCATE number.
+ * @param operand User pathname or signed descriptor respectively.
+ * @param length Signed Linux logical length encoded in one register.
+ * @return Zero or negative errno. Acquires inode writer admission, preserves
+ * seals/readonly and original OFD access rights, and never resolves a display
+ * name. Common scope/admission retains objects across I/O without spinlocks.
+ */
+int64_t syscall_truncate_object(struct vfs_namespace *ns,struct task *task,uint64_t number,
+                                  uint64_t operand,uint64_t length);
+
+/** @brief Preallocate the original writable OFD's retained inode backing.
+ * @param task Borrowed caller under execution ownership and OFD admission.
+ * @param fd Signed user descriptor.
+ * @param mode Linux allocation flags as a syscall int.
+ * @param offset Signed byte offset encoded in a register.
+ * @param length Positive signed byte count encoded in a register.
+ * @return Zero or negative errno. Writer exclusion, seals, readonly and
+ * allocation guarantees are enforced without replaying diagnostic names;
+ * retained paths protect providers across callbacks, without graph locks.
+ */
+int64_t syscall_fallocate_object(struct task *task,int32_t fd,uint32_t mode,uint64_t offset,uint64_t length);
+/** @brief Flush an actual admitted inode, superblock or shared mount tree.
+ * @param ns Borrowed initialized namespace under execution ownership.
+ * @param task Borrowed caller with original OFD admission.
+ * @param number Linux SYNC/SYNCFS/FSYNC/FDATASYNC number.
+ * @param fd Signed descriptor, ignored by SYNC.
+ * @return Zero or negative errno; SYNC always returns zero after attempting
+ * all providers. Others preserve backing I/O errors; O_PATH supports SYNCFS
+ * only. No name lookup, graph lock or unpinned provider callback is used.
+ */
+int64_t syscall_sync_object(struct vfs_namespace *ns,struct task *task,uint64_t number,int32_t fd);
+/** @brief Implement mount operations in the one actual referenced namespace.
+ * @param ns Borrowed live namespace under execution ownership, required.
+ * @param task Calling task with actual root/cwd, required; CAP_SYS_ADMIN checked.
+ * @param number Linux MOUNT or UMOUNT2 syscall number.
+ * @param a0 User source pathname/label, or UMOUNT2 target pathname.
+ * @param a1 User MOUNT target pathname, or low-32-bit UMOUNT2 flags.
+ * @param a2 User filesystem type, ignored for remount/move/unmount.
+ * @param a3 Native MOUNT flags, ignored for unmount.
+ * @param a4 Optional user mount options, ignored for unmount.
+ * @return Zero or negative capability/lookup/type/unsupported/busy/I/O errno.
+ * Copied inputs and actual operands survive EAGAIN. Completed unmount sync
+ * retires its own scoped lookup before busy checking, while a local path
+ * protects the provider. No diagnostic path replay or lock across callbacks.
+ */
+int64_t syscall_mount_control(struct vfs_namespace *ns,struct task *task,uint64_t number,
+                                 uint64_t a0,uint64_t a1,uint64_t a2,uint64_t a3,uint64_t a4);
+
+/** @brief Open a pathname against the actual task root/cwd/dirfd objects.
+ * @param ns Borrowed system namespace under execution ownership.
+ * @param task Borrowed current task and descriptor table.
+ * @param dirfd Relative directory fd or AT_FDCWD, ignored for absolute paths.
+ * @param pathname User pathname; the active scope retains its checked copy.
+ * @param flags Linux open flags, sanitized before private descriptor flags.
+ * @param mode Creation permission bits; ignored for existing files.
+ * @return New descriptor, negative errno or FIFO blocking sentinel. All OFDs
+ * own their actual paths. DAC, exclusive/dangling-link creation, O_PATH and
+ * writer admission run without graph/module locks across filesystem I/O.
+ */
+int64_t syscall_open_object(struct vfs_namespace *ns,struct task *task,int32_t dirfd,
+                               uint64_t pathname,uint32_t flags,uint32_t mode);
+
+/** @brief Initialize a device open selected by retained inode identity.
+ * @param task Current task under execution ownership.
+ * @param path Borrowed authorized device path, independently retained by fd.
+ * @param flags Sanitized Linux/native status flags; excludes O_PATH.
+ * @param diagnostic Optional display text, never consulted for routing.
+ * @return Descriptor or negative errno with balanced driver/path/PTY ownership.
+ * Driver callbacks may perform I/O; no graph/module registry lock spans them.
+ */
+int task_open_device_path(struct task *task,const struct vfs_path *path,uint32_t flags,
+                             const char *diagnostic);
+
+/** @brief Translate native filesystem statuses to Linux errno aliases.
+ * @param ret Native success/status or negative errno.
+ * @return Known Linux errno alias or unchanged ret. Pure conversion for
+ * syscall and file-backed page-fault callers; no I/O or ownership transfer.
  */
 int storage_errno(int ret);
 
+/** @brief Copy from an original regular OFD to a retained file/stream.
+ * @param out_fd_arg Signed low-32-bit writable descriptor.
+ * @param in_fd_arg Signed low-32-bit readable regular descriptor.
+ * @param offset_arg Optional user signed-off_t input/output pointer.
+ * @param count_arg Native requested byte count, capped to Linux MAX_RW_COUNT.
+ * @return Bytes, negative errno or internal EAGAIN. Execution ownership is
+ * required; both OFDs and staging bytes survive waits without name replay.
+ * No graph/module lock spans callbacks, drain or final puts.
+ */
 int64_t syscall_sendfile(uint64_t out_fd_arg, uint64_t in_fd_arg,
                                 uint64_t offset_arg, uint64_t count_arg);
 
+/** @brief Copy nonoverlapping ranges in one actual filesystem instance.
+ * @param in_fd_arg Signed low-32-bit readable regular descriptor.
+ * @param off_in_arg Optional user signed-off_t source input/output pointer.
+ * @param out_fd_arg Signed low-32-bit writable regular descriptor.
+ * @param off_out_arg Optional user signed-off_t target input/output pointer.
+ * @param len_arg Native requested byte count, capped to Linux MAX_RW_COUNT.
+ * @param flags_arg Low-32-bit flags, currently zero; upper bits ignored.
+ * @return Bytes, negative errno or internal EAGAIN. Original OFDs, offsets and
+ * bytes survive waits. Same inode nonoverlap is permitted; append is EBADF,
+ * directory EISDIR, unsupported cross-filesystem copy EXDEV. Execution-owned
+ * without graph/module spinlocks across I/O or final references.
+ */
 int64_t syscall_copy_file_range(uint64_t in_fd_arg, uint64_t off_in_arg,
                                        uint64_t out_fd_arg, uint64_t off_out_arg,
                                        uint64_t len_arg, uint64_t flags_arg);
@@ -1266,12 +1447,6 @@ uint32_t kernel_string_len_cap(const char *text, uint32_t cap);
  * @return The value or status produced by the operation.
  */
 int copy_exec_params_from_user(uint64_t argv_ptr, uint64_t envp_ptr, struct exec_params_kernel *params);
-/** @brief Free owned exec staging buffers. @param params Initialized staging object. */
-void free_exec_params(struct exec_params_kernel *params);
-
-int exec_resolve_scripts(struct task *task, char *path, struct storage_node *node,
-                                 const char *execfn, bool inaccessible,
-                                 struct exec_params_kernel *params);
 
 /**
  * Stat for fd.
@@ -1405,16 +1580,16 @@ void syscall_init(void);
  */
 int64_t syscall_dispatch(const struct syscall_frame *frame);
 
-/**
- * Syscall dispatch regs legacy.
- * @param number Value supplied by the caller.
- * @param a0 Value supplied by the caller.
- * @param a1 Value supplied by the caller.
- * @param a2 Value supplied by the caller.
- * @param a3 Value supplied by the caller.
- * @param a4 Value supplied by the caller.
- * @param a5 Value supplied by the caller.
- * @return The value or status produced by the operation.
+/** @brief Update the exact retained inode's access/modification timestamps.
+ * @param task Borrowed calling task with stable filesystem credentials.
+ * @param dirfd At-base descriptor, or the inode FD when path_ptr is NULL.
+ * @param path_ptr User pathname copied once, or NULL for a futimens FD.
+ * @param times Borrowed validated pair with UTIME_NOW/UTIME_OMIT semantics.
+ * @param flags AT_SYMLINK_NOFOLLOW/AT_EMPTY_PATH; zero for NULL-path FD mode.
+ * @param times_supplied Whether the caller explicitly provided the pair.
+ * @return Zero or negative errno. Honors fsuid/CAP_FOWNER or NOW-only write
+ * access, preserving the existing backing timestamp resolution. Common scope
+ * owns the exact operand across I/O retries; no graph lock spans callbacks.
  */
 int64_t syscall_update_path_times(struct task *task, int32_t dirfd, uint64_t path_ptr,
                                          const struct linux_timespec times[2], uint32_t flags,
@@ -1445,6 +1620,15 @@ int64_t syscall_io_write(uint64_t a0, uint64_t a1, uint64_t a2);
  */
 int64_t syscall_io_read(uint64_t a0, uint64_t a1, uint64_t a2);
 
+/** @brief Dispatch borrowed raw arguments through the ordinary Linux syscall backends.
+ * @param number Linux x86-64 syscall number.
+ * @param a0 First raw argument; backend validates any user pointer before access.
+ * @param a1 Second raw argument. @param a2 Third raw argument.
+ * @param a3 Fourth raw argument. @param a4 Fifth raw argument.
+ * @param a5 Sixth raw argument.
+ * @return Backend result, negative errno or entry-owned blocking/retry status.
+ * Execution-owned task context; no task/file/provider pin escapes this call.
+ */
 int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5);
 
 /** @brief Parse the optional boot syscall-trace=/path/prefix diagnostic filter. */
@@ -1466,5 +1650,60 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame);
  */
 int64_t syscall_dispatch_regs(struct task *task, uint64_t number, uint64_t a0, uint64_t a1,
                               uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5);
+
+/** @brief Enumerate one directory using the selected native Linux record ABI.
+ * @param task Current execution-owned task with dispatcher-pinned directory OFD.
+ * @param number Linux GETDENTS or GETDENTS64 operation number.
+ * @param fd Signed low-32-bit directory descriptor.
+ * @param buffer User destination, checked before record emission.
+ * @param capacity Low-32-bit available output bytes.
+ * @return Accepted bytes, zero at EOF, or negative fd/type/buffer/provider errno.
+ * The common dispatcher retains the OFD through waits and final cleanup;
+ * no graph/module spinlock spans directory or metadata callbacks.
+ * An entry removed before metadata acquisition is skipped with its next cookie;
+ * other provider errors preserve that entry and are returned to the caller.
+ */
+int64_t syscall_getdents_object(struct task *task,uint64_t number,int32_t fd,uint64_t buffer,uint32_t capacity);
+
+/** @brief Seek a pinned regular inode or directory through its actual provider.
+ * @param task Execution-owned caller retaining the admitted OFD until cleanup.
+ * @param fd Signed low-32-bit descriptor.
+ * @param offset Signed byte offset or opaque backend directory position.
+ * @param whence Linux SEEK_SET/CUR/END/DATA/HOLE selector.
+ * @return New position or negative errno/internal retry; directory cookies are
+ * returned unchanged. Metadata waits preserve the OFD reservation, and common
+ * cancellation drains I/O before final provider release. No graph lock spans I/O.
+ */
+int64_t syscall_seek_object(struct task *task,int32_t fd,int64_t offset,uint32_t whence);
+
+/** @brief Decode one Linux timestamp-vector ABI and update a retained inode.
+ * @param task Execution-owned caller with optional retry operand scope.
+ * @param number UTIME/UTIMES/FUTIMESAT/UTIMENSAT operation number.
+ * @param a0 First native argument, pathname or directory descriptor.
+ * @param a1 Second native argument, time vector or pathname.
+ * @param a2 Third native argument, at-family time vector.
+ * @param a3 Fourth native argument, UTIMENSAT lookup flags.
+ * @return Zero or negative errno/internal retry. The common scope owns copied
+ * binary bytes and exact lookup paths through waits, including user unmap/name
+ * reuse. Unscoped snapshots are freed on every outcome. No graph/module lock
+ * spans copying or actual provider I/O.
+ */
+int64_t syscall_timestamp_object(struct task *task,uint64_t number,uint64_t a0,uint64_t a1,uint64_t a2,uint64_t a3);
+
+/** @brief Dispatch one Linux vectored request through the admitted OFD.
+ * @param task Borrowed execution-owned caller retaining its original OFD.
+ * @param number READV/WRITEV/PREADV/PWRITEV/PREADV2/PWRITEV2 syscall number.
+ * @param a0 Signed low32bit descriptor argument.
+ * @param a1 User vector array address.
+ * @param a2 Vector count, checked against UIO_MAXIOV.
+ * @param a3 Full64bit position for positional variants.
+ * @param a4 Unused x86_64 pos_h argument, ignored.
+ * @param a5 Low32bit v2 RWF flags, ignored by older variants.
+ * @return Accepted bytes, negative errno or internal retry. Ordinary files
+ * retain imported vectors/progress; specialized devices keep their own APIs.
+ * Caller retains the OFD across waits, without graph/module locks across I/O.
+ */
+int64_t syscall_vector_io(struct task *task,uint64_t number,uint64_t a0,uint64_t a1,uint64_t a2,
+                            uint64_t a3,uint64_t a4,uint64_t a5);
 
 #endif

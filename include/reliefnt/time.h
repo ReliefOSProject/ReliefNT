@@ -14,7 +14,19 @@ struct linux_timespec;
 struct linux_timex;
 /** @brief Apply/query the actual clock discipline with privilege checked by the caller. */
 int time_adjust(struct linux_timex *value, bool privileged);
+/** @brief Read a supported wall/monotonic clock atomically across CPUs and IRQs.
+ * @param clock Linux clock ID. @param value Writable caller-owned timespec output.
+ * @return Zero or EINVAL for an unsupported clock; no pointer ownership transfer.
+ * IRQ/task safe short clock lock; no allocation, scheduling or hardware wait.
+ */
 int time_clock_get(int32_t clock, struct linux_timespec *value);
+/**
+ * @brief Validate a supported Linux clock and copy its current resolution.
+ * @param clock Linux clock selector.
+ * @param value Optional writable kernel result; NULL validates without copying.
+ * @return Zero or EINVAL for an unsupported clock, leaving output unchanged on failure.
+ * Task/IRQ-safe query under the clock lock, with no user access, allocation or ownership transfer.
+ */
 int time_clock_getres(int32_t clock, struct linux_timespec *value);
 
 /**
@@ -28,7 +40,10 @@ void time_init(void);
  */
 void time_on_tick(void);
 /**
- * @brief Return the number of ticks since boot.
+ * @brief Read the aligned monotonic boot tick counter.
+ * @return Number of delivered timer ticks since initialization; no wall-clock adjustment.
+ * @par Context
+ * Boot/task/IRQ snapshot on x86_64, without allocation, wait, reference transfer or clock lock.
  */
 uint64_t time_ticks(void);
 /**
@@ -36,7 +51,9 @@ uint64_t time_ticks(void);
  */
 uint64_t time_uptime_ms(void);
 /**
- * @brief Return microseconds elapsed since boot, interpolated within a PIT tick.
+ * @brief Read boot uptime using bounded TSC interpolation with PIT/tick fallback.
+ * @return Best-effort elapsed microseconds from boot, with no wall-clock adjustment.
+ * Task/IRQ context after time setup; no allocation or retained pointer. Retries preserve paired tick anchors; failed interpolation falls back to the existing lower-resolution clock path.
  */
 uint64_t time_uptime_us(void);
 /**
@@ -44,7 +61,11 @@ uint64_t time_uptime_us(void);
  */
 void time_set_pit_divisor(uint16_t divisor);
 /**
- * @brief Fill info with the current wall-clock time; 0 on success.
+ * @brief Copy a consistent wall-clock calendar and uptime snapshot.
+ * @param info Required writable kernel output, updated only when the clock is valid.
+ * @return Zero after a valid snapshot, or internal -1 for NULL output or an invalid wall clock.
+ * @par Context
+ * Acquires the IRQ-safe clock lock; no user-pointer access, allocation or ownership transfer. Timezone conversion is not performed.
  */
 int time_wall_clock(struct reliefos_time_info *info);
 /**

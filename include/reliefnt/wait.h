@@ -27,32 +27,36 @@ struct kernel_wait_queue {
 };
 
 /**
- * @brief Initialize an empty wait queue and its spinlock.
- * @param queue Queue storage owned by the caller.
+ * @brief Initialize unpublished wait-queue storage and its embedded lock.
+ * @param queue Caller-owned unpublished queue, nullable; NULL is ignored.
+ * Boot/task context before publication, or after the caller has drained all prior users. Initializes metadata only; no allocation or lock acquisition.
  */
 void kernel_wait_queue_init(struct kernel_wait_queue *queue);
 
-/**
- * @brief Link a task into a queue, moving it from an earlier queue if needed.
- * @param queue Destination queue protected by its own spinlock.
- * @param task Task whose intrusive wait link is being published.
- * @return Zero on success, or -1 for invalid arguments or count overflow.
- * @note Queue storage must remain alive until this task is removed or woken.
+/** @brief Publish a task's intrusive wait link without allocating queue storage.
+ * @param queue Borrowed live destination queue. @param task Execution-pinned task.
+ * @return Zero or -1 for invalid input/count overflow. Caller keeps queue and
+ * task alive through unlink/wake; execution ownership serializes cross-queue
+ * moves. Short IRQ-safe queue locks, no scheduling, allocation or code pin transfer.
  */
 int kernel_wait_queue_add(struct kernel_wait_queue *queue, struct task *task);
 
-/**
- * @brief Unlink a task if it is still registered on the supplied queue.
- * @param queue Queue that owns the task link.
- * @param task Task to detach; a task linked elsewhere is left unchanged.
- * @note Do not free queue storage until all linked tasks are detached.
+/** @brief Detach a task only from the queue that still owns its wait link.
+ * @param queue Borrowed queue, nullable. @param task Execution-pinned task, nullable.
+ * Execution-owned task/IRQ-safe caller context; queue/task storage stays alive
+ * through return. Short queue lock, no callback, allocation or ownership transfer.
  */
 void kernel_wait_queue_remove(struct kernel_wait_queue *queue, struct task *task);
 
 /** @brief Wake one eligible task, returning one when a task was woken. */
 uint32_t kernel_wait_queue_wake_one(struct kernel_wait_queue *queue);
 
-/** @brief Wake every task currently linked to the queue and return that count. */
+/** @brief Detach and wake every currently linked interruptible queue waiter.
+ * @param queue Borrowed live queue, nullable for no waiters.
+ * @return Number detached and passed to the scheduler. IRQ/task safe with task
+ * storage pinned by its existing wait/exit protocol. No allocation or module
+ * callback; queue locks do not transfer backing or provider references.
+ */
 uint32_t kernel_wait_queue_wake_all(struct kernel_wait_queue *queue);
 
 /**

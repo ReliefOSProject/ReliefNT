@@ -2,8 +2,16 @@
 
 
 
+/** @brief Parse a bounded exFAT extent through its already owned transport.
+ * @return Zero or negative metadata/I/O/cache errno. Caller selects an exclusive
+ * unpublished g_storage context under execution ownership, with nonzero sector
+ * count and a device pin. LBA zero is a valid whole-device start. No callback
+ * lock spans I/O; failed construction is retired by the filesystem factory.
+ */
 int exfat_mount(void)
 {
+    int cache_status=storage_inode_purge_volume(g_storage.volume_id);
+    if(cache_status)return cache_status;
     uint8_t boot[SECTOR_SIZE];
     uint8_t backup_boot[SECTOR_SIZE];
     uint64_t volume_length;
@@ -16,7 +24,7 @@ int exfat_mount(void)
     uint8_t bitmap_found = 0, upcase_found = 0, label_found = 0;
     uint64_t limit;
     int ret;
-    if (!g_storage.exfat_start_lba || !g_storage.exfat_sector_count) return -2;
+    if (!g_storage.exfat_sector_count || g_storage.exfat_start_lba>UINT64_MAX-g_storage.exfat_sector_count) return -2;
     /* A writable root must not be mounted from only one half of the exFAT
      * boot region. Validate both copies and require identical geometry; a
      * damaged backup is otherwise indistinguishable from a later metadata

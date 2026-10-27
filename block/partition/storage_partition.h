@@ -1,8 +1,23 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #ifndef RELIEFNT_STORAGE_PARTITION_H
 #define RELIEFNT_STORAGE_PARTITION_H
-
 #include <stdint.h>
+#include <stdbool.h>
+/** @brief Reuse or initialize a GPT filesystem backend without a target alias.
+ * @param disk_id Standard block disk identifier.
+ * @param partition_index GPT entry index.
+ * @param filesystem_name Requested type, nullable for native detection.
+ * @param flags Supported final mount policy, without operation flags.
+ * @param out_volume_id Optional initialized backend identifier output.
+ * @param created Optional output, true only for a newly initialized backend.
+ * @return Zero or negative validation/busy/I/O/capacity errno. Caller holds
+ * execution ownership. Existing dev_t instances are reused without I/O if
+ * type/readonly state agree; other shared flags stay unchanged. New metadata
+ * I/O is synchronous. Caller retains a VFS membership; only a newly created
+ * backend belongs to its rollback. No target pathname is published.
+ */
+int storage_open_block_partition(uint32_t disk_id,uint32_t partition_index,
+                                  const char *filesystem_name,uint64_t flags,uint32_t *out_volume_id,bool *created);
 
 #include "../core/storage_types.h"
 

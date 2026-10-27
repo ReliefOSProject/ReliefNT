@@ -16,6 +16,6 @@ with tempfile.TemporaryDirectory(prefix="reliefos-poll-wakeup-") as tmp:
         "-Iinclude", "-Iinclude", "-Iinclude/uapi",
         "-Iinclude",
         "tools/tests/poll_wakeup_test.c", *kernel_sources("syscall_dispatch"),
-        "kernel/sync/wait.c", "-o", str(binary),
+        "kernel/sync/wait.c", "fs/vfs/mount_tree.c", "fs/vfs/file.c", "fs/vfs/open.c", "fs/vfs/initial.c", "kernel/syscall/ipc/unix_name.c", "-o", str(binary),
     ], cwd=ROOT, check=True)
     subprocess.run([str(binary)], cwd=ROOT, check=True, timeout=20)

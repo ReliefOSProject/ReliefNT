@@ -1,5 +1,6 @@
 /* Unix-domain sockets backed by the kernel object table. */
 #include <reliefnt/heap.h>
+#include "unix_path.h"
 #include <reliefnt/net.h>
 #include <reliefnt/net_udp.h>
 #include <reliefnt/net_packet.h>
@@ -105,7 +106,7 @@ struct unix_socket {
     uint32_t path_len;
     char peer_path[109];
     uint32_t peer_path_len;
-    char bound_path[RELIEFOS_FS_PATH_LEN];
+    struct vfs_path bound_inode; /* Owned until final socket destruction. */
     struct ucred credentials;
     struct ucred peer_credentials;
     uint8_t rx[UNIX_SOCKET_RX_CAP];
@@ -214,52 +215,21 @@ static struct unix_socket *unix_from_handle(uint32_t handle)
                                                        KERNEL_OBJECT_SOCKET);
 }
 
-static int unix_socket_path(const void *user_addr, uint32_t user_len, char *path,
-                            uint32_t *length, char *resolved, uint32_t lookup_flags)
-{
-    const struct sockaddr_un *address;
-    uint32_t path_len;
-    if (user_len < sizeof(sa_family_t) || user_len > sizeof(struct sockaddr_un)) return -RELIEFOS_EINVAL;
-    if (!user_addr || !user_range_ok((uint64_t)(uintptr_t)user_addr, user_len)) {
-        return -RELIEFOS_EFAULT;
-    }
-    address = (const struct sockaddr_un *)user_addr;
-    if (address->sun_family != AF_UNIX) return -RELIEFOS_EINVAL;
-    path_len = user_len - sizeof(sa_family_t);
-    resolved[0] = 0;
-    for (uint32_t i = 0; i < path_len; ++i) path[i] = address->sun_path[i];
-    path[path_len] = 0;
-    *length = path_len;
-    if (!path_len || !path[0]) return 0;
-    for (uint32_t i = 0; i < path_len; ++i) {
-        if (!path[i]) { *length = i + 1; break; }
-        if (i + 1 == path_len) *length = path_len + 1;
-    }
-    struct task *task = sched_current_task();
-    return fs_permissions_resolve_flags(task, sched_task_cwd(task), path, resolved,
-                                         RELIEFOS_FS_PATH_LEN, false, lookup_flags);
-}
-
-static int unix_text_equal(const char *left, const char *right)
-{
-    while (*left && *left == *right) { ++left; ++right; }
-    return *left == *right;
-}
-
 /**
  * @brief Find a bound AF_UNIX endpoint by abstract or filesystem address.
  * @param path User-visible socket address bytes.
  * @param length Address byte count.
- * @param resolved Resolved filesystem path, empty for an abstract address.
+ * @param object Held filesystem inode, NULL for counted abstract names.
+ * Serialized execution context; compares actual provider identity without I/O.
  * @return Matching live socket, or null when no endpoint is bound.
  */
-static struct unix_socket *unix_find_path(const char *path, uint32_t length, const char *resolved)
+static struct unix_socket *unix_find_path(const char *path, uint32_t length, const struct vfs_path *object)
 {
     for (struct unix_socket *socket = unix_sockets; socket;
          socket = socket->registry_next) {
         if (!socket || !socket->used || !socket->bound || !socket->path_len) continue;
-        if (resolved[0]) {
-            if (socket->bound_path[0] && unix_text_equal(socket->bound_path, resolved)) return socket;
+        if (object && vfs_path_node(object)) {
+            if (vfs_path_same_inode(&socket->bound_inode,object)) return socket;
         } else if (!socket->path[0] && socket->path_len == length) {
             uint32_t j;
             for (j = 0; j < length && path[j] == socket->path[j]; ++j) {}
@@ -269,6 +239,10 @@ static struct unix_socket *unix_find_path(const char *path, uint32_t length, con
     return NULL;
 }
 
+/** @brief Assign a currently unused counted abstract name to an unbound socket.
+ * @param socket Borrowed execution-owned endpoint; existing names stay intact.
+ * No filesystem lookup, allocation or provider reference is involved.
+ */
 static void unix_autobind(struct unix_socket *socket)
 {
     static uint32_t next_autobind;
@@ -278,47 +252,9 @@ static void unix_autobind(struct unix_socket *socket)
         socket->path[0] = 0;
         for (unsigned i = 0; i < 5; ++i)
             socket->path[i + 1] = "0123456789abcdef"[(id >> (4 * i)) & 15];
-    } while (unix_find_path(socket->path, 6, ""));
+    } while (unix_find_path(socket->path, 6, NULL));
     socket->path_len = 6;
     socket->bound = true;
-}
-
-/**
- * @brief Clear filesystem bindings for sockets whose inode path was removed.
- * @param path Removed path.
- */
-void task_socket_unlink_path(const char *path)
-{
-    for (struct unix_socket *socket = unix_sockets; socket;
-         socket = socket->registry_next)
-        if (unix_text_equal(socket->bound_path, path)) socket->bound_path[0] = 0;
-}
-
-/**
- * @brief Update registered filesystem socket paths after a rename.
- * @param old_path Previous path prefix.
- * @param new_path New path prefix.
- */
-void task_socket_rename_path(const char *old_path, const char *new_path)
-{
-    if (unix_text_equal(old_path, new_path)) return;
-    task_socket_unlink_path(new_path);
-    uint32_t length = 0, new_length = 0;
-    while (old_path[length]) ++length;
-    while (new_path[new_length]) ++new_length;
-    for (struct unix_socket *socket = unix_sockets; socket;
-         socket = socket->registry_next) {
-        uint32_t j;
-        for (j = 0; j < length && socket->bound_path[j] == old_path[j]; ++j) {}
-        if (j != length || (socket->bound_path[j] && socket->bound_path[j] != '/')) continue;
-        char moved[RELIEFOS_FS_PATH_LEN];
-        uint32_t n = 0;
-        while (socket->bound_path[length + n]) ++n;
-        if (new_length + n >= sizeof(moved)) continue;
-        for (j = 0; j < new_length; ++j) moved[j] = new_path[j];
-        for (j = 0; j <= n; ++j) moved[new_length + j] = socket->bound_path[length + j];
-        for (j = 0; j <= new_length + n; ++j) socket->bound_path[j] = moved[j];
-    }
 }
 
 static int unix_name_out(const char *path, uint32_t path_len, uint64_t address, uint64_t length)
@@ -393,7 +329,10 @@ static void unix_wake_peer(struct unix_socket *socket)
 
 /**
  * @brief Drop one AF_UNIX socket reference and remove its final object safely.
- * @param handle Stable kernel object handle.
+ * @param handle Stable kernel object handle, ignored when already retired.
+ * Final teardown releases the bound inode and its provider after removing the
+ * endpoint from the registry. Serialized task context; no graph/module lock
+ * spans final backend puts or peer wakeups.
  */
 static void unix_release_handle(uint32_t handle)
 {
@@ -440,6 +379,7 @@ static void unix_release_handle(uint32_t handle)
     struct unix_socket **link = &unix_sockets;
     while (*link && *link != socket) link = &(*link)->registry_next;
     if (*link == socket) *link = socket->registry_next;
+    vfs_path_put(&socket->bound_inode);
     kernel_free(socket);
 }
 
@@ -723,6 +663,14 @@ int task_socket_read(struct task_file *file, void *buffer, uint32_t length)
     return (int)unix_receive_progress(task, file, length, ret, 0, &metadata);
 }
 
+/** @brief Find a datagram/packet peer by held inode or counted abstract name.
+ * @param socket Borrowed sending endpoint under execution ownership.
+ * @param address User sockaddr bytes, NULL to use the connected peer handle.
+ * @param length Counted sockaddr bytes when address is non-NULL.
+ * @param out Borrowed registry endpoint output, NULL on lookup failure.
+ * @return Zero or negative errno; filesystem authorization retains the provider
+ * across I/O and releases temporary paths before returning. No locks span I/O.
+ */
 static int unix_packet_peer(struct unix_socket *socket, const void *address,
                              uint32_t length, struct unix_socket **out)
 {
@@ -733,16 +681,13 @@ static int unix_packet_peer(struct unix_socket *socket, const void *address,
             ? (socket->state == UNIX_SOCKET_CONNECTED ? -LINUX_ECONNREFUSED : -LINUX_EDESTADDRREQ)
             : -LINUX_ENOTCONN;
     }
-    char path[109], resolved[RELIEFOS_FS_PATH_LEN];
-    uint32_t path_len;
-    int result = unix_socket_path(address, length, path, &path_len, resolved, FS_LOOKUP_FOLLOW);
-    if (result < 0) return result;
-    if (!path_len) return -RELIEFOS_EINVAL;
-    if (resolved[0]) {
-        result = fs_permissions_check(sched_current_task(), resolved, FS_ACCESS_WRITE, false);
-        if (result < 0) return result;
-    }
-    *out = unix_find_path(path, path_len, resolved);
+    struct unix_address target={0};
+    int result=syscall_unix_address(vfs_system_namespace(),sched_current_task(),
+        (uintptr_t)address,length,false,&target);
+    if(result)return result;
+    if(!target.length)return -RELIEFOS_EINVAL;
+    *out=unix_find_path(target.path,target.length,&target.object);
+    vfs_path_put(&target.object);
     if (!*out) return -LINUX_ECONNREFUSED;
     if ((*out)->type != socket->type) return -LINUX_EPROTOTYPE;
     return 0;
@@ -948,22 +893,25 @@ int task_socket_ioctl(struct task_file *file, uint64_t request, uint64_t address
 }
 
 /**
- * @brief Read bytes from a packet, datagram, or TCP open file description.
+ * @brief Receive or peek bytes through the original pinned Internet socket.
  * @param file Pinned descriptor for the socket being read.
  * @param buffer Writable destination for the received bytes.
  * @param length Maximum number of bytes requested.
+ * @param flags Linux receive flags; stream PEEK and DONTWAIT are implemented.
  * @return Bytes read, zero for orderly EOF, a negative errno, or the blocking sentinel.
- * @note A blocking TCP read retains its syscall-file pin and parks on the socket
+ * @note Unsupported stream flags return EOPNOTSUPP without consuming data.
+ * A blocking TCP read retains its syscall-file pin and parks on the socket
  * read queue; the network poll tick retries input because this NIC is polled.
  */
-int task_inet_read(struct task_file *file, void *buffer, uint32_t length)
+int task_inet_recv(struct task_file *file, void *buffer, uint32_t length, uint32_t flags)
 {
-    if (file && file->kind == TASK_FILE_KIND_PACKET) return task_packet_recv(file, buffer, length, 0, 0, 0);
-    if (file && file->kind == TASK_FILE_KIND_UDP) return task_udp_recv(file, buffer, length, 0, 0, 0);
+    if (file && file->kind == TASK_FILE_KIND_PACKET) return task_packet_recv(file, buffer, length, flags, 0, 0);
+    if (file && file->kind == TASK_FILE_KIND_UDP) return task_udp_recv(file, buffer, length, flags, 0, 0);
     struct reliefos_net_socket_io request = {0};
     struct task *task = sched_current_task();
     short ready;
     if (!file || !(file->flags & TASK_FILE_FLAG_SOCKET_INET)) return -RELIEFOS_EBADF;
+    if (flags & ~(MSG_PEEK | MSG_DONTWAIT | MSG_CMSG_CLOEXEC)) return -LINUX_EOPNOTSUPP;
     request.socket = (int32_t)file->aux;
     request.buffer = buffer;
     request.length = length;
@@ -971,7 +919,7 @@ int task_inet_read(struct task_file *file, void *buffer, uint32_t length)
     request.timeout_ms = 1;
     ready = net_socket_poll_fd(request.socket, 0, POLLIN | POLLHUP);
     if (!(ready & (POLLIN | POLLHUP | POLLERR))) {
-        if (file->flags & RELIEFOS_O_NONBLOCK) return -RELIEFOS_EAGAIN;
+        if ((file->flags & RELIEFOS_O_NONBLOCK) || (flags & MSG_DONTWAIT)) return -RELIEFOS_EAGAIN;
         if (!task) return -LINUX_ESRCH;
         int wait = net_socket_wait_readable(request.socket);
         if (wait == 1) return KERNEL_SYSCALL_BLOCKED;
@@ -979,12 +927,26 @@ int task_inet_read(struct task_file *file, void *buffer, uint32_t length)
         ready = net_socket_poll_fd(request.socket, 0, POLLIN | POLLHUP);
     }
     if (ready & POLLERR) { int error = net_socket_error(request.socket, true); if (error) return -error; }
-    if (net_socket_recv(&request, 0) < 0) return -RELIEFOS_EIO;
+    if ((flags & MSG_PEEK ? net_socket_peek(&request, 0) : net_socket_recv(&request, 0)) < 0) return -RELIEFOS_EIO;
     if (request.status == RELIEFOS_NET_STATUS_OK) return (int)request.transferred;
     if (request.status == RELIEFOS_NET_STATUS_TCP_RESET) return -LINUX_ECONNRESET;
     if (request.status == RELIEFOS_NET_STATUS_SOCKET_CLOSED) return 0;
-    if (request.status == RELIEFOS_NET_STATUS_TCP_TIMEOUT && (file->flags & RELIEFOS_O_NONBLOCK)) return -RELIEFOS_EAGAIN;
+    if (request.status == RELIEFOS_NET_STATUS_TCP_TIMEOUT &&
+        ((file->flags & RELIEFOS_O_NONBLOCK) || (flags & MSG_DONTWAIT))) return -RELIEFOS_EAGAIN;
     return -RELIEFOS_EIO;
+}
+
+/**
+ * @brief Read available Internet socket bytes with ordinary read semantics.
+ * @param file Original dispatcher-pinned socket description, required.
+ * @param buffer Writable kernel/user-validated length-byte destination.
+ * @param length Maximum bytes, zero allowed without a buffer access.
+ * @return Bytes, zero EOF, negative errno or the blocking sentinel. Retains
+ * existing descriptor nonblocking policy without changing the shared OFD.
+ */
+int task_inet_read(struct task_file *file, void *buffer, uint32_t length)
+{
+    return task_inet_recv(file, buffer, length, 0);
 }
 
 /**
@@ -1573,8 +1535,7 @@ static int64_t inet_message(struct task_file *file, uint64_t user_header,
             (uintptr_t)message.msg_name, (uintptr_t)&destination->msg_namelen);
         else if (datagram) ret = task_udp_recv(file, data, size, (flags & ~MSG_CMSG_CLOEXEC) | MSG_TRUNC,
             (uintptr_t)message.msg_name, (uintptr_t)&destination->msg_namelen);
-        else if (flags & (MSG_PEEK | MSG_TRUNC)) ret = -LINUX_EOPNOTSUPP;
-        else ret = task_inet_read(&local, data, size);
+        else ret = task_inet_recv(file, data, size, flags);
         if (ret < 0) goto done;
         uint32_t copied = (uint64_t)ret < size ? (uint32_t)ret : size;
         offset = 0;
@@ -1598,6 +1559,20 @@ done:
     return ret;
 }
 
+/** @brief Transfer one native message through the original held socket.
+ * @param task Borrowed caller under execution ownership and OFD admission.
+ * @param file Original pinned socket description.
+ * @param message User msghdr input/output address.
+ * @param flags Native MSG flags; unsupported combinations return errno.
+ * @param receiving True for recvmsg; false snapshots outgoing header/iovecs.
+ * @param batch True when sendmmsg/recvmmsg owns progress across messages.
+ * @param result Required requested-byte/result-flag output.
+ * @return Bytes, negative errno or the internal blocking sentinel. Outgoing
+ * header/vector/address/path operands remain task-owned across waits; their
+ * copied pointer metadata is not re-imported from a changed user header.
+ * Backend paths retain providers; no graph/module lock spans socket or I/O
+ * callbacks. Temporary vector copies are freed on every outcome.
+ */
 int64_t task_socket_message(struct task *task, struct task_file *file, uint64_t message,
                             uint32_t flags, bool receiving, bool batch,
                             struct socket_message_result *result)
@@ -1606,9 +1581,15 @@ int64_t task_socket_message(struct task *task, struct task_file *file, uint64_t 
     if (!file) return -LINUX_EBADF;
     if (!(file->flags & TASK_FILE_FLAG_SOCKET)) return -LINUX_ENOTSOCK;
     if (!(file->flags & (TASK_FILE_FLAG_SOCKET_UNIX | TASK_FILE_FLAG_SOCKET_INET))) return -LINUX_EOPNOTSUPP;
-    if (!user_range_ok(message, sizeof(struct msghdr))) return -LINUX_EFAULT;
     struct msghdr imported;
-    __builtin_memcpy(&imported, (const void *)(uintptr_t)message, sizeof(imported));
+    if(receiving) {
+        if(!user_range_ok(message,sizeof(imported)))return -LINUX_EFAULT;
+        __builtin_memcpy(&imported,(const void *)(uintptr_t)message,sizeof(imported));
+    } else {
+        struct task_user_text header={0};
+        int rc=task_lookup_user_bytes(task,message,sizeof(imported),&header);if(rc)return rc;
+        __builtin_memcpy(&imported,header.text,sizeof(imported));kernel_free(header.allocation);
+    }
     if ((int32_t)imported.msg_namelen < 0) return -LINUX_EINVAL;
     if (imported.msg_namelen > 128) imported.msg_namelen = 128;
     if (!receiving && !imported.msg_namelen) imported.msg_name = NULL;
@@ -1620,8 +1601,14 @@ int64_t task_socket_message(struct task *task, struct task_file *file, uint64_t 
         if (!vectors) return -LINUX_ENOMEM;
     }
     int64_t status = -LINUX_EFAULT;
-    if (!size || user_range_ok((uintptr_t)imported.msg_iov, size)) {
-        if (size) __builtin_memcpy(vectors, imported.msg_iov, size);
+    if(!receiving && size) {
+        struct task_user_text copied={0};
+        int rc=task_lookup_user_bytes(task,(uintptr_t)imported.msg_iov,size,&copied);
+        if(rc){if(vectors!=fast)kernel_free(vectors);return rc;}
+        __builtin_memcpy(vectors,copied.text,size);kernel_free(copied.allocation);
+    }
+    if (!size || !receiving || user_range_ok((uintptr_t)imported.msg_iov, size)) {
+        if (receiving && size) __builtin_memcpy(vectors, imported.msg_iov, size);
         imported.msg_iov = vectors;
         uint64_t total;
         status = unix_message_vectors(&imported, &total);
@@ -1742,34 +1729,16 @@ static int64_t unix_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
     socket = unix_from_file(file);
     if (!socket) return -RELIEFOS_EBADF;
     if (number == __NR_bind) {
-        char path[109], resolved[RELIEFOS_FS_PATH_LEN];
-        uint32_t length;
-        if (socket->path_len) return -RELIEFOS_EINVAL;
-        int ret = unix_socket_path((const void *)(uintptr_t)a1, (uint32_t)a2, path, &length, resolved, FS_LOOKUP_PARENT);
-        if (ret < 0) return ret;
-        if (!length) { unix_autobind(socket); return 0; }
-        if (resolved[0]) {
-            struct storage_node node;
-            uint32_t end = 0;
-            while (resolved[end]) ++end;
-            if (end > 1 && resolved[end - 1] == '/') {
-                resolved[end - 1] = 0;
-                ret = storage_lookup_path(resolved, &node);
-                return !ret ? -RELIEFOS_EADDRINUSE : ret;
-            }
-            ret = fs_permissions_parent(task, resolved, false);
-            if (ret < 0) return ret;
-            ret = storage_create_socket(resolved, &node);
-            if (ret < 0) return ret == -RELIEFOS_EEXIST ? -RELIEFOS_EADDRINUSE : ret;
-            ret = fs_permissions_create(task, resolved, &node, 0777);
-            if (ret < 0) { (void)storage_unlink(resolved); return ret; }
-            unsigned i = 0;
-            do { socket->bound_path[i] = resolved[i]; } while (resolved[i++]);
-        } else if (unix_find_path(path, length, resolved)) return -RELIEFOS_EADDRINUSE;
-        for (unsigned i = 0; i < length; ++i) socket->path[i] = path[i];
-        socket->path_len = length;
-        socket->bound = true;
-        return 0;
+        struct unix_address target={0};
+        if(socket->path_len)return -RELIEFOS_EINVAL;
+        int ret=syscall_unix_address(vfs_system_namespace(),task,a1,(uint32_t)a2,true,&target);
+        if(ret)return ret;
+        if(!target.length){unix_autobind(socket);return 0;}
+        if(!vfs_path_node(&target.object) && unix_find_path(target.path,target.length,NULL))
+            return -RELIEFOS_EADDRINUSE;
+        socket->bound_inode=target.object;
+        for(unsigned i=0;i<target.length;++i)socket->path[i]=target.path[i];
+        socket->path_len=target.length;socket->bound=true;return 0;
     }
     if (number == __NR_listen) {
         uint32_t requested_backlog = (uint32_t)(int32_t)a1;
@@ -1806,26 +1775,14 @@ static int64_t unix_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
             kernel_poll_readiness_notify();
             return 0;
         }
-        char path[109], resolved[RELIEFOS_FS_PATH_LEN];
-        uint32_t length;
-        struct unix_socket *listener, *server;
-        if (socket->state != UNIX_SOCKET_OPEN) return -RELIEFOS_EISCONN;
-        int ret = unix_socket_path((const void *)(uintptr_t)a1, (uint32_t)a2, path, &length, resolved, FS_LOOKUP_FOLLOW);
-        if (ret < 0) return ret;
-        if (!length) return -RELIEFOS_EINVAL;
-        if (resolved[0]) {
-            struct reliefos_permissions permissions;
-            ret = fs_permissions_check(task, resolved, FS_ACCESS_WRITE, false);
-            if (ret < 0) return ret;
-            ret = fs_permissions_get(resolved, NULL, &permissions);
-            if (ret < 0) return ret;
-            struct storage_node node;
-            ret = storage_lookup_path(resolved, &node);
-            if (ret < 0) return ret;
-            if (node.type != RELIEFOS_FS_TYPE_SOCKET && (permissions.mode & LINUX_S_IFMT) != LINUX_S_IFSOCK)
-                return -LINUX_ECONNREFUSED;
-        }
-        listener = unix_find_path(path, length, resolved);
+        struct unix_address target={0};
+        struct unix_socket *listener,*server;
+        if(socket->state!=UNIX_SOCKET_OPEN)return -RELIEFOS_EISCONN;
+        int ret=syscall_unix_address(vfs_system_namespace(),task,a1,(uint32_t)a2,false,&target);
+        if(ret)return ret;
+        if(!target.length)return -RELIEFOS_EINVAL;
+        listener=unix_find_path(target.path,target.length,&target.object);
+        vfs_path_put(&target.object);
         if (listener && listener->type != socket->type) return -LINUX_EPROTOTYPE;
         if (!listener || listener->state != UNIX_SOCKET_LISTEN) return -LINUX_ECONNREFUSED;
         kernel_wait_queue_remove(&listener->wait_connect, task);
@@ -2114,7 +2071,7 @@ int64_t syscall_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
                 return task_packet_recv(file, (void *)(uintptr_t)a1, (uint32_t)a2, (uint32_t)a3, a4, a5);
             if (file->kind == TASK_FILE_KIND_UDP)
                 return task_udp_recv(file, (void *)(uintptr_t)a1, (uint32_t)a2, (uint32_t)a3, a4, a5);
-            return task_inet_read(file, (void *)(uintptr_t)a1, (uint32_t)a2);
+            return task_inet_recv(file, (void *)(uintptr_t)a1, (uint32_t)a2, (uint32_t)a3);
         }
         if (!(file->flags & TASK_FILE_FLAG_SOCKET_UNIX)) return -RELIEFOS_EBADF;
         if (a3 & ~(MSG_DONTWAIT | MSG_PEEK | MSG_TRUNC | MSG_WAITALL | MSG_CMSG_CLOEXEC)) return -LINUX_EOPNOTSUPP;

@@ -1,5 +1,22 @@
 #include "internal.h"
 
+/** @brief Map a supported public format selector to its registered native type.
+ * @param filesystem Validated RELIEFOS_DISK_FILESYSTEM selector.
+ * @return Borrowed constant type name, or NULL for unsupported/unformatted.
+ * Pure mapping, no registry lookup or code reference; callers admit separately.
+ */
+static const char *disk_formatter_name(uint32_t filesystem)
+{
+    switch(filesystem) {
+    case RELIEFOS_DISK_FILESYSTEM_FAT32:return "vfat";
+    case RELIEFOS_DISK_FILESYSTEM_EXFAT:return "exfat";
+    case RELIEFOS_DISK_FILESYSTEM_EXT2:return "ext2";
+    case RELIEFOS_DISK_FILESYSTEM_EXT4:return "ext4";
+    default:return NULL;
+    }
+}
+
+
 /**
  * @brief Writes one updated GPT header to a managed disk.
  * @param disk Prepared block-disk state.
@@ -32,6 +49,9 @@ static void disk_gpt_name_to_text(const uint16_t source[36], char *target, uint3
  * @param entry_index GPT entry index.
  * @param entry GPT partition entry.
  * @param out Destination public partition record.
+ * @return Zero or negative validation/filesystem-probe errno. Live namespace
+ * attachment metadata is diagnostic only; an oversized name leaves its field
+ * empty while preserving MOUNTED. Execution-owned, no graph lock across I/O.
  */
 static int disk_partition_export(uint32_t disk_id, struct install_disk_state *disk,
                                  uint32_t entry_index, const struct gpt_entry *entry,
@@ -42,10 +62,12 @@ static int disk_partition_export(uint32_t disk_id, struct install_disk_state *di
  * @param disk Prepared block-disk state.
  * @param entry GPT partition entry defining the data extent.
  * @param filesystem Selected RELIEFOS_DISK_FILESYSTEM value.
- * @return Zero on success or a negative errno-style storage error.
+ * @param provider Borrowed admitted formatter held before any partition writes.
+ * @return Zero or negative validation/native errno. Execution ownership required;
+ * the provider reference spans all writes and no registry/module lock spans I/O.
  */
 static int disk_format_entry(struct install_disk_state *disk, const struct gpt_entry *entry,
-                             uint32_t filesystem);
+                             uint32_t filesystem,const struct fs_type_ref *provider);
 
 /**
  * @brief Assigns a standard GPT type GUID for a selected data filesystem.
@@ -254,6 +276,8 @@ static void disk_gpt_name_to_text(const uint16_t source[36], char *target, uint3
  * @param entry_index GPT entry index.
  * @param entry GPT partition entry.
  * @param out Destination public partition record.
+ * @return Zero or negative filesystem-probe error; no output ownership transfer.
+ * @par Context Storage execution ownership; actual VFS supplies mount diagnostics.
  */
 static int disk_partition_export(uint32_t disk_id, struct install_disk_state *disk,
                                  uint32_t entry_index, const struct gpt_entry *entry,
@@ -276,12 +300,8 @@ static int disk_partition_export(uint32_t disk_id, struct install_disk_state *di
         out->flags |= RELIEFOS_DISK_PARTITION_FLAG_BOOT_ROOT |
                       RELIEFOS_DISK_PARTITION_FLAG_PROTECTED;
     }
-    if (disk->target_mounted) {
-        out->flags |= RELIEFOS_DISK_PARTITION_FLAG_TARGET_MOUNTED |
-                      RELIEFOS_DISK_PARTITION_FLAG_PROTECTED;
-    }
-    if (storage_disk_partition_mount_path(disk_id, entry_index, out->mount_path,
-                                          sizeof(out->mount_path)) == 0) {
+    int mount_status=storage_disk_partition_mount_path(disk_id,entry_index,out->mount_path,sizeof(out->mount_path));
+    if (!mount_status || mount_status==-RELIEFOS_ENAMETOOLONG) {
         out->flags |= RELIEFOS_DISK_PARTITION_FLAG_MOUNTED;
     }
     return disk_partition_filesystem(disk, entry, &out->filesystem);
@@ -290,7 +310,9 @@ static int disk_partition_export(uint32_t disk_id, struct install_disk_state *di
 /**
  * @brief Checks whether an operation may mutate a disk-management partition.
  * @param disk Block-disk state that owns the partition.
- * @return Zero if the disk is not a startup or mounted installer target.
+ * @return Zero or -EINVAL/-EBUSY for an invalid/protected startup disk.
+ * @par Context Execution-owned precheck only; callers separately exclude
+ * actual mounted volume memberships before mutating a partition.
  */
 int disk_partition_mutable(const struct install_disk_state *disk)
 {
@@ -301,8 +323,7 @@ int disk_partition_mutable(const struct install_disk_state *disk)
      * physical disks are installation targets, even if probing them first
      * found an existing ReliefOS root. Keep the boot-disk guard for normal disk
      * boots while allowing the ISO's advanced environment to manage targets. */
-    return ((disk->boot_root && !storage_installer_root_active()) ||
-            disk->target_mounted) ? -16 : 0;
+    return disk->boot_root && !storage_installer_root_active() ? -16 : 0;
 }
 
 /**
@@ -323,10 +344,12 @@ int disk_filesystem_format_supported(uint32_t filesystem)
  * @param disk Prepared block-disk state.
  * @param entry GPT partition entry defining the data extent.
  * @param filesystem Selected RELIEFOS_DISK_FILESYSTEM value.
- * @return Zero on success or a negative errno-style storage error.
+ * @param provider Borrowed admitted formatter held before any partition writes.
+ * @return Zero or negative validation/native errno. Execution ownership required;
+ * the provider reference spans all writes and no registry/module lock spans I/O.
  */
 static int disk_format_entry(struct install_disk_state *disk, const struct gpt_entry *entry,
-                             uint32_t filesystem)
+                             uint32_t filesystem,const struct fs_type_ref *provider)
 {
     uint64_t sector_count;
     if (!disk || !entry || entry->last_lba < entry->first_lba ||
@@ -334,16 +357,7 @@ static int disk_format_entry(struct install_disk_state *disk, const struct gpt_e
         return -22;
     }
     sector_count = entry->last_lba - entry->first_lba + 1u;
-    if (filesystem == RELIEFOS_DISK_FILESYSTEM_FAT32) {
-        return install_format_fat32(disk, entry->first_lba, sector_count);
-    }
-    if (filesystem == RELIEFOS_DISK_FILESYSTEM_EXFAT) {
-        return install_format_exfat(disk, entry->first_lba, sector_count);
-    }
-    if (filesystem == RELIEFOS_DISK_FILESYSTEM_EXT4) {
-        return install_format_ext4(disk, entry->first_lba, sector_count);
-    }
-    return install_format_ext2(disk, entry->first_lba, sector_count);
+    return fs_type_format(provider,disk,entry->first_lba,sector_count);
 }
 
 /**
@@ -467,7 +481,7 @@ static void disk_gpt_set_name(uint16_t destination[36], const char *source)
  * @param out_count Receives the total number of used GPT entries.
  * @return Zero on success or a negative errno-style storage error.
  */
-int storage_disk_list_partitions(uint32_t disk_id,
+static int storage_disk_list_partitions_owned(uint32_t disk_id,
                                  struct reliefos_disk_partition *partitions,
                                  uint32_t capacity, uint32_t *out_count)
 {
@@ -527,7 +541,7 @@ int storage_disk_list_partitions(uint32_t disk_id,
  * requires a valid table, while this operation is the explicit destructive
  * entry point used by the installer ISO's gptinit utility.
  */
-int storage_disk_initialize_gpt(const struct reliefos_disk_gpt_initialize *request)
+static int storage_disk_initialize_gpt_owned(const struct reliefos_disk_gpt_initialize *request)
 {
     struct install_disk_state *disk;
     struct gpt_header *header;
@@ -651,9 +665,11 @@ int storage_disk_initialize_gpt(const struct reliefos_disk_gpt_initialize *reque
  * @brief Formats an existing unprotected GPT partition as FAT32, exFAT, ext4,
  *        or legacy ext2.
  * @param request Validated disk-management format request.
- * @return Zero on success or a negative errno-style storage error.
+ * @param provider Borrowed pre-admitted formatter, empty only for unformatted creation.
+ * @return Zero or negative disk/format errno. Execution ownership required;
+ * provider lifetime spans GPT/data writes and no registry/module lock spans I/O.
  */
-int storage_disk_format_partition(const struct reliefos_disk_partition_format *request)
+static int disk_format_partition_owned(const struct reliefos_disk_partition_format *request,const struct fs_type_ref *provider)
 {
     struct install_disk_state *disk;
     struct disk_gpt_table table;
@@ -689,7 +705,7 @@ int storage_disk_format_partition(const struct reliefos_disk_partition_format *r
         return -RELIEFOS_EBUSY;
     }
     entry = entries[request->partition_index];
-    ret = disk_format_entry(disk, &entry, request->filesystem);
+    ret = disk_format_entry(disk, &entry, request->filesystem,provider);
     if (ret < 0) {
         return ret;
     }
@@ -706,12 +722,29 @@ int storage_disk_format_partition(const struct reliefos_disk_partition_format *r
     return disk_gpt_write(disk, &table);
 }
 
+/** @brief Admit a filesystem provider before any format GPT/data mutation.
+ * @param request Borrowed validated disk-management request, NULL rejected.
+ * @return Zero or validation/absent/unsupported/native errno. Execution
+ * ownership required; a module cannot unload between partition publication
+ * and formatting. The admitted reference is released on every worker return,
+ * including I/O errors; no registry/module lock spans disk operations.
+ */
+static int storage_disk_format_partition_owned(const struct reliefos_disk_partition_format *request)
+{
+    if(!request || !disk_filesystem_format_supported(request->filesystem))return -EINVAL;
+    struct fs_type_ref provider={0};int rc=0;
+    rc=fs_type_get(disk_formatter_name(request->filesystem),&provider);
+    if(!rc && !provider.type->format)rc=-EOPNOTSUPP;
+    if(!rc)rc=disk_format_partition_owned(request,&provider);
+    fs_type_put(&provider);return rc;
+}
+
 /**
  * @brief Deletes an unprotected GPT partition entry while leaving its data intact.
  * @param request Validated disk-management delete request.
  * @return Zero on success or a negative errno-style storage error.
  */
-int storage_disk_delete_partition(const struct reliefos_disk_partition_delete *request)
+static int storage_disk_delete_partition_owned(const struct reliefos_disk_partition_delete *request)
 {
     struct install_disk_state *disk;
     struct disk_gpt_table table;
@@ -750,7 +783,7 @@ int storage_disk_delete_partition(const struct reliefos_disk_partition_delete *r
 }
 
 /** Edit standard GPT type and/or printable partition name in both GPT copies. */
-int storage_disk_edit_partition(const struct reliefos_disk_partition_edit *request)
+static int storage_disk_edit_partition_owned(const struct reliefos_disk_partition_edit *request)
 {
     struct install_disk_state *disk;
     struct disk_gpt_table table;
@@ -801,9 +834,11 @@ int storage_disk_edit_partition(const struct reliefos_disk_partition_edit *reque
 /**
  * @brief Creates and formats a data partition in the first suitable free GPT range.
  * @param request Validated disk-management create request.
- * @return Zero on success or a negative errno-style storage error.
+ * @param provider Borrowed pre-admitted formatter, empty only for unformatted creation.
+ * @return Zero or negative disk/format errno. Execution ownership required;
+ * provider lifetime spans GPT/data writes and no registry/module lock spans I/O.
  */
-int storage_disk_create_partition(const struct reliefos_disk_partition_create *request)
+static int disk_create_partition_owned(const struct reliefos_disk_partition_create *request,const struct fs_type_ref *provider)
 {
     struct install_disk_state *disk;
     struct disk_gpt_table table;
@@ -863,5 +898,118 @@ int storage_disk_create_partition(const struct reliefos_disk_partition_create *r
     if (request->filesystem == RELIEFOS_DISK_FILESYSTEM_UNKNOWN) {
         return 0;
     }
-    return disk_format_entry(disk, &entries[free_index], request->filesystem);
+    return disk_format_entry(disk, &entries[free_index], request->filesystem,provider);
+}
+
+/** @brief Admit a filesystem provider before any create GPT/data mutation.
+ * @param request Borrowed validated disk-management request, NULL rejected.
+ * @return Zero or validation/absent/unsupported/native errno. Execution
+ * ownership required; a module cannot unload between partition publication
+ * and formatting. The admitted reference is released on every worker return,
+ * including I/O errors; no registry/module lock spans disk operations.
+ */
+static int storage_disk_create_partition_owned(const struct reliefos_disk_partition_create *request)
+{
+    if(!request || !request->size_mib || (request->filesystem!=RELIEFOS_DISK_FILESYSTEM_UNKNOWN && !disk_filesystem_format_supported(request->filesystem)))return -EINVAL;
+    struct fs_type_ref provider={0};int rc=0;
+    if(request->filesystem!=RELIEFOS_DISK_FILESYSTEM_UNKNOWN) {
+        rc=fs_type_get(disk_formatter_name(request->filesystem),&provider);
+        if(!rc && !provider.type->format)rc=-EOPNOTSUPP;
+    }
+    if(!rc)rc=disk_create_partition_owned(request,&provider);
+    fs_type_put(&provider);return rc;
+}
+
+/** @brief Retain the exact block/code identity for a complete disk transaction.
+ * @param disk_id Stable inventory identity, never a native pointer.
+ * @param partitions Caller-owned operation argument/output; existing worker validates bounds.
+ * @param capacity Caller-owned operation argument/output; existing worker validates bounds.
+ * @param out_count Caller-owned operation argument/output; existing worker validates bounds.
+ * @return Zero or existing validation/lookup/native errno, including EAGAIN.
+ * Caller holds execution ownership. The token spans every GPT/data/cache step
+ * and all worker exits, with no registry/module lock over native I/O. Failed
+ * writes never release code/backing early or resolve a reloaded device identity.
+ */
+int storage_disk_list_partitions(uint32_t disk_id,
+                                 struct reliefos_disk_partition *partitions,
+                                 uint32_t capacity, uint32_t *out_count)
+{
+    struct block_device_ref ref={0};int rc=storage_disk_block_get(disk_id,&ref);
+    if(!rc)rc=storage_disk_list_partitions_owned(disk_id,partitions,capacity,out_count);
+    block_device_put(&ref);return rc;
+}
+
+/** @brief Retain the exact block/code identity for a complete disk transaction.
+ * @param request Borrowed validated request, NULL rejected.
+ * @return Zero or existing validation/lookup/native errno, including EAGAIN.
+ * Caller holds execution ownership. The token spans every GPT/data/cache step
+ * and all worker exits, with no registry/module lock over native I/O. Failed
+ * writes never release code/backing early or resolve a reloaded device identity.
+ */
+int storage_disk_initialize_gpt(const struct reliefos_disk_gpt_initialize *request)
+{
+    if(!request)return -22;
+    struct block_device_ref ref={0};int rc=storage_disk_block_get(request->disk_id,&ref);
+    if(!rc)rc=storage_disk_initialize_gpt_owned(request);
+    block_device_put(&ref);return rc;
+}
+
+/** @brief Retain the exact block/code identity for a complete disk transaction.
+ * @param request Borrowed validated request, NULL rejected.
+ * @return Zero or existing validation/lookup/native errno, including EAGAIN.
+ * Caller holds execution ownership. The token spans every GPT/data/cache step
+ * and all worker exits, with no registry/module lock over native I/O. Failed
+ * writes never release code/backing early or resolve a reloaded device identity.
+ */
+int storage_disk_format_partition(const struct reliefos_disk_partition_format *request)
+{
+    if(!request)return -22;
+    struct block_device_ref ref={0};int rc=storage_disk_block_get(request->disk_id,&ref);
+    if(!rc)rc=storage_disk_format_partition_owned(request);
+    block_device_put(&ref);return rc;
+}
+
+/** @brief Retain the exact block/code identity for a complete disk transaction.
+ * @param request Borrowed validated request, NULL rejected.
+ * @return Zero or existing validation/lookup/native errno, including EAGAIN.
+ * Caller holds execution ownership. The token spans every GPT/data/cache step
+ * and all worker exits, with no registry/module lock over native I/O. Failed
+ * writes never release code/backing early or resolve a reloaded device identity.
+ */
+int storage_disk_delete_partition(const struct reliefos_disk_partition_delete *request)
+{
+    if(!request)return -22;
+    struct block_device_ref ref={0};int rc=storage_disk_block_get(request->disk_id,&ref);
+    if(!rc)rc=storage_disk_delete_partition_owned(request);
+    block_device_put(&ref);return rc;
+}
+
+/** @brief Retain the exact block/code identity for a complete disk transaction.
+ * @param request Borrowed validated request, NULL rejected.
+ * @return Zero or existing validation/lookup/native errno, including EAGAIN.
+ * Caller holds execution ownership. The token spans every GPT/data/cache step
+ * and all worker exits, with no registry/module lock over native I/O. Failed
+ * writes never release code/backing early or resolve a reloaded device identity.
+ */
+int storage_disk_edit_partition(const struct reliefos_disk_partition_edit *request)
+{
+    if(!request)return -22;
+    struct block_device_ref ref={0};int rc=storage_disk_block_get(request->disk_id,&ref);
+    if(!rc)rc=storage_disk_edit_partition_owned(request);
+    block_device_put(&ref);return rc;
+}
+
+/** @brief Retain the exact block/code identity for a complete disk transaction.
+ * @param request Borrowed validated request, NULL rejected.
+ * @return Zero or existing validation/lookup/native errno, including EAGAIN.
+ * Caller holds execution ownership. The token spans every GPT/data/cache step
+ * and all worker exits, with no registry/module lock over native I/O. Failed
+ * writes never release code/backing early or resolve a reloaded device identity.
+ */
+int storage_disk_create_partition(const struct reliefos_disk_partition_create *request)
+{
+    if(!request)return -22;
+    struct block_device_ref ref={0};int rc=storage_disk_block_get(request->disk_id,&ref);
+    if(!rc)rc=storage_disk_create_partition_owned(request);
+    block_device_put(&ref);return rc;
 }

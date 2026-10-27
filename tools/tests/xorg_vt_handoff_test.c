@@ -10,6 +10,7 @@
  * K_RAW / K_MEDIUMRAW / K_XLATE / K_OFF contract instead of always producing
  * cooked canonical characters.
  */
+#include <reliefnt/graphics_service.h>
 #include <reliefnt/console.h>
 #include <assert.h>
 #include <stdio.h>
@@ -48,7 +49,7 @@ void console_vt_write(uint32_t number, const char *text, size_t count)
 void console_printf(const char *format, ...) { (void)format; }
 
 /* This handoff fixture has no DRM KMS owner to release on a VT switch. */
-void drm_device_kms_vt_release(void) {}
+void graphics_service_kms_vt_release(void) {}
 
 void console_log(enum console_log_level level, const char *format, ...)
 {

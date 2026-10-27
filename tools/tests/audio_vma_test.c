@@ -14,8 +14,16 @@
 #undef mm_virt_to_phys
 #undef RELIEFNT_PAGING_FIXTURE_EXTERNAL_SPINLOCKS
 
+/* This fixture models one BSP and no DRM/file-backed VMAs. Poison those
+ * absent-provider boundaries instead of inventing successful backing refs. */
+uint32_t smp_cpu_count(void){return 1;}
+bool smp_cpu_online(uint32_t cpu){return cpu==0;}
+struct task_file *task_file_get(struct task_file *file){(void)file;assert(0);return NULL;}
+void task_file_put(struct task_file *file){(void)file;assert(0);}
+
 uint64_t mm_virt_to_phys(const void *address);
 #include "modules/user_memory.h"
+#include "../../sound/core/mapping.c"
 
 /** @brief Translate PCM backing or a page allocated by the paging fixture.
  * @param address Host CPU pointer to fixture-owned memory.
@@ -30,6 +38,23 @@ uint64_t mm_virt_to_phys(const void *address)
 
 void storage_inode_retain(struct storage_inode_ref *inode) { assert(!inode); }
 int storage_inode_put(struct storage_inode_ref *inode) { assert(!inode); return 0; }
+void storage_inode_allow_write(struct storage_inode_ref *inode){assert(!inode);}
+int storage_inode_deny_write(struct storage_inode_ref *inode){assert(!inode);return -1;}
+
+/** @brief Compare each retained slice's intrinsic offset with its actual PTE.
+ * @param task Owned fixture task. @param start Original mapping VA.
+ * @param physical Original explicit PCM backing.
+ * Assertions use real production split/trim state; no backing refs are changed.
+ */
+static void check_device_slices(struct task *task,uint64_t start,uint64_t physical)
+{
+    for(unsigned i=0;i<SCHED_TASK_VMA_MAX;++i) {
+        const struct task_vma *vma=&task->vmas[i];if(!vma->used)continue;
+        assert(vma->device_mapping && vma->device_map_offset==vma->start-start);
+        assert(vma->device_physical==physical+vma->start-start);
+        assert(device_mapping_physical(vma->device_mapping,vma->device_map_offset)==physical+vma->start-start);
+    }
+}
 
 int main(void)
 {
@@ -43,6 +68,7 @@ int main(void)
     assert(!audio_pcm_prepare(pcm));
     struct audio_pcm_mmap mapping;
     assert(!audio_pcm_mmap_acquire(pcm, 0, 16384, 3, &mapping));
+    struct device_mapping *backing=NULL;assert(!audio_mapping_adopt(&mapping,&backing));
     struct task parent_storage, child_storage;
     struct task *parent = &parent_storage, *child = &child_storage;
     struct task *entries[] = {parent, child};
@@ -59,25 +85,25 @@ int main(void)
             RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_NOEXEC | RELIEFNT_PAGE_WRITABLE));
     parent->vmas[0] = (struct task_vma){.used = 1, .start = va, .end = va + 16384,
         .prot = 3, .max_prot = 3, .flags = TASK_VMA_FLAG_DEVICE | TASK_VMA_FLAG_SHARED,
-        .audio_pcm = pcm, .audio_mmap_region = mapping.region,
-        .audio_mmap_offset = mapping.offset, .audio_mmap_length = mapping.length,
-        .audio_mmap_prot = mapping.prot, .audio_mmap_generation = mapping.generation};
+        .device_mapping=backing,.device_physical=mapping.backing};
     assert(!syscall_mm_mprotect(va + 4096, 4096, LINUX_PROT_NONE));
     assert(!address_space_user_page_readable(sched_task_as(parent), va + 4096));
-    assert(pcm->mapping_refs == 3);
+    check_device_slices(parent,va,mapping.backing);
+    assert(pcm->mapping_refs == 1);
     assert(!syscall_mm_munmap(va + 8192, 4096));
-    assert(pcm->mapping_refs == 3);
+    check_device_slices(parent,va,mapping.backing);
+    assert(pcm->mapping_refs == 1);
     assert(address_space_clone_cow(sched_task_as(parent), sched_task_as(child)));
     for (unsigned i = 0; i < SCHED_TASK_VMA_MAX; ++i) if (parent->vmas[i].used) {
         child->vmas[i] = parent->vmas[i];
-        assert(!sched_task_vma_retain_audio(&child->vmas[i], &parent->vmas[i]));
+        assert(!sched_task_vma_retain_device(&child->vmas[i], &parent->vmas[i]));
     }
-    assert(pcm->mapping_refs == 6);
+    assert(pcm->mapping_refs == 1);
     audio_pcm_release(pcm);
     assert(pcm->live && !pcm->file_refs);
     assert(!syscall_mm_mprotect(va + 4096, 4096, LINUX_PROT_READ));
     assert(!syscall_mm_munmap(va, 16384));
-    assert(pcm->mapping_refs == 3);
+    assert(pcm->mapping_refs == 1);
     address_space_destroy(sched_task_as(parent));
     assert(address_space_user_page_phys(sched_task_as(child), va) == mapping.backing);
     assert(!audio_unregister_card(card.id, 0));

@@ -43,6 +43,13 @@ def main() -> int:
                 "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
                 *INCLUDES, source, "-Wl,--gc-sections", "-o", str(binary),
             ]
+            if name == "drm-core":
+                command[1:1] = ["kernel/device/service.c", "kernel/device/graphics_service.c",
+                                "drivers/video/drm/services.c", "drivers/video/drm/memory.c"]
+            if name in ("drm-core", "drm-vma-clear"):
+                command[1:1] = ["kernel/device/mapping.c"]
+            if name == "drm-vma-clear":
+                command[1:1] = ["drivers/video/drm/mapping.c"]
             if name in ("framebuffer-drm", "console-replay"):
                 command[1:1] = [f"-I{generated_include}",
                                 "-Idrivers/video/framebuffer"]

@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := boot.o
+include $(srctree)/scripts/Makefile.module

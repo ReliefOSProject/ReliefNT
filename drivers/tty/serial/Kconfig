@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+config SERIAL_8250
+    tristate "16550 COM1 serial provider"
+    default y
+    help
+      Native polled COM1 serial output. M builds serial.ko. The permanent TTY
+      and emergency serial core keep working when the optional provider is
+      absent; its service calls are pinned until the final byte is written.

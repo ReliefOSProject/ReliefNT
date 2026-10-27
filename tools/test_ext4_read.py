@@ -23,7 +23,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="reliefos-ext4-read-") as directory:
         work = Path(directory)
         binary = work / "read-test"
-        sources = [FS / f"ext4/{name}.c" for name in
+        sources = [FS / f"ext_common/{name}.c" for name in
                    ("format", "checksum", "cache", "alloc", "extent", "ops", "xattr", "journal")]
         run(["cc", "-std=c11", "-O1", "-g", "-D_GNU_SOURCE",
              "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
@@ -42,7 +42,7 @@ def main():
                  "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
                  "-Iinclude", "-Iinclude", "-Iinclude/uapi",
                  "-Iinclude", "tools/tests/ext4_vfs_read_test.c",
-                 "fs/tmpfs/core.c",
+                 "fs/tmpfs/core.c", "lib/text_utf16.c",
                  "-o", str(vfs_binary)])
         if args.case in ("all", "unit"):
             run([str(binary)], env=env)

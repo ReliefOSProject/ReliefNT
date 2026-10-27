@@ -144,7 +144,7 @@ int64_t syscall_timerfd_gettime(uint64_t fd_arg, uint64_t value_ptr)
 
 /**
  * @brief Create an anonymous shared file while preserving resource failure errors.
- * @param name_ptr User address of the bounded diagnostic name.
+ * @param name_ptr User address of a diagnostic name, empty or at most 249 bytes.
  * @param flags Supported MFD creation flags.
  * @return A new descriptor or negative validation, descriptor or backing-store errno.
  * Failed attachment or sizing releases the unpublished descriptor under execution ownership.
@@ -158,15 +158,18 @@ int64_t syscall_memfd_create(uint64_t name_ptr, uint32_t flags)
         .first_cluster = STORAGE_DEV_KIND_SHM,
     };
     struct task_file *file;
-    char name[256];
+    char name[250];
     int fd;
     int ret;
-    if (!task || !name_ptr ||
+    if (!task ||
         (flags & ~(LINUX_MFD_CLOEXEC | LINUX_MFD_ALLOW_SEALING)))
         return -RELIEFOS_EINVAL;
-    ret = copy_user_string_fixed(name, sizeof(name), name_ptr, NULL);
-    if (ret < 0) return ret;
-    if (!name[0]) return -RELIEFOS_EINVAL;
+    if(!user_range_ok(name_ptr,1))return -RELIEFOS_EFAULT;
+    size_t length=user_strlen((const char *)(uintptr_t)name_ptr,sizeof(name));
+    if(length==sizeof(name))return user_range_ok(name_ptr,sizeof(name)) ? -RELIEFOS_EINVAL : -RELIEFOS_EFAULT;
+    if(!user_range_ok(name_ptr,length+1))return -RELIEFOS_EFAULT;
+    for(size_t i=0;i<=length;++i)name[i]=((const char *)(uintptr_t)name_ptr)[i];
+    if(name[length])return -RELIEFOS_EFAULT;
     fd = alloc_task_fd(task, &node, RELIEFOS_O_RDWR, NULL);
     if (fd < 0) return fd;
     file = task_file_for_fd(task, fd);
@@ -182,5 +185,7 @@ int64_t syscall_memfd_create(uint64_t name_ptr, uint32_t flags)
         return ret;
     }
     if (flags & LINUX_MFD_CLOEXEC) file->fd_flags = RELIEFOS_FD_CLOEXEC;
+    ret=task_shm_set_name(file,name,length);
+    if(ret){task_discard_file_fd(task,fd);return ret;}
     return fd;
 }

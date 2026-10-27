@@ -2,6 +2,7 @@
  * ReliefOS physical memory manager: tracks usable and reserved page ranges.
  * Allocates, frees, zeroes, and reference-counts physical memory pages.
  */
+#include <reliefnt/export.h>
 #include <reliefnt/console.h>
 #include <reliefnt/framebuffer.h>
 #include <reliefnt/mm.h>
@@ -500,7 +501,9 @@ uint64_t mm_total_memory_kib(void)
 }
 
 /**
- * @brief Sum the current free ranges and report the free byte count in KiB.
+ * @brief Snapshot unallocated physical page-pool capacity under the MM lock.
+ * @return Free physical page bytes divided by 1024; excludes reclaimable cached/heap allocations.
+ * Task/IRQ-safe snapshot after physical allocator setup; no allocation, callbacks or ownership transfer.
  */
 uint64_t mm_free_memory_kib(void)
 {
@@ -528,6 +531,7 @@ void *mm_phys_to_virt(uint64_t phys)
  * @return Physical byte address, or zero outside those two bounded mappings.
  * The low identity interval is limited to the supervisor kernel hole; ordinary
  * low user addresses and other low physical-range integers are not accepted.
+ * Pure IRQ/task-safe translation; no allocation, lock, I/O or ownership transfer.
  */
 uint64_t mm_virt_to_phys(const void *address)
 {
@@ -630,7 +634,11 @@ uint64_t mm_alloc_page(void)
 }
 
 /**
- * @brief Drop one reference per page; a page whose count reaches zero is returned to the free list.
+ * @brief Consume one owned physical-page reference per page and reclaim pages whose count reaches zero.
+ * @param phys Page-aligned base of an owned run; zero, invalid, reserved or out-of-range runs are ignored.
+ * @param page_count Number of consecutive 4 KiB pages; zero is a no-op.
+ * @par Context
+ * IRQ-safe allocator lock; pinned and already-free pages remain unchanged. Caller must first retire every DMA, mapping and callback using the consumed references; no user access or scheduling.
  */
 void mm_free_pages(uint64_t phys, uint32_t page_count)
 {
@@ -690,3 +698,13 @@ void mm_retain_page(uint64_t phys)
     }
     kernel_spin_unlock_irqrestore(&mm_lock, flags);
 }
+
+/* Native filesystem modules share this core-owned interface; CRC/release
+ * checks bind it to the exact kernel, without a stable cross-release API. */
+EXPORT_SYMBOL(mm_alloc_pages);
+EXPORT_SYMBOL(mm_free_pages);
+EXPORT_SYMBOL(mm_phys_to_virt);
+
+EXPORT_SYMBOL(mm_virt_to_phys);
+
+EXPORT_SYMBOL(mm_free_memory_kib);

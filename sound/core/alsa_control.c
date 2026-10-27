@@ -23,6 +23,7 @@ struct audio_control_file {
     uint32_t caller_pid;
     uint32_t opener_pid;
     struct audio_control_event_queue events;
+    struct module *code_owner;
 };
 
 struct audio_control_lock {
@@ -141,20 +142,26 @@ static int audio_control_validate_value(const struct audio_control_info *info,
 int audio_control_open_card(uint32_t card, struct audio_control_file **out)
 {
     if (!out) return -EINVAL;
+    struct module *owner;
+    int ret=audio_card_module_get(card,&owner);
+    if(ret) return ret;
     uint32_t count = 0;
-    int ret = audio_card_control_count(card, &count);
-    if (ret) return ret;
-    if (count > AUDIO_CONTROL_MAX) return -EOVERFLOW;
+    ret = audio_card_control_count(card, &count);
+    if (ret) goto failed;
+    if (count > AUDIO_CONTROL_MAX) { ret=-EOVERFLOW; goto failed; }
     for (uint32_t i = 0; i < AUDIO_CONTROL_FILE_MAX; ++i) {
         struct audio_control_file *file = &audio_control_files[i];
         if (file->used) continue;
-        *file = (struct audio_control_file){.used = 1, .card = card};
+        *file = (struct audio_control_file){.used = 1, .card = card,.code_owner=owner};
         ret = audio_control_queue_open(card, &file->events);
-        if (ret) { file->used = 0; return ret; }
+        if (ret) { *file=(struct audio_control_file){0}; goto failed; }
         *out = file;
         return 0;
     }
-    return -ENFILE;
+    ret=-ENFILE;
+failed:
+    module_put(owner);
+    return ret;
 }
 
 /** @brief Detach an OFD event queue and release its element locks.
@@ -171,7 +178,9 @@ int audio_control_close_file(struct audio_control_file *file)
         if (!audio_control_locks[i].used || audio_control_locks[i].owner != file) continue;
         audio_control_locks[i] = (struct audio_control_lock){0};
     }
+    struct module *owner=file->code_owner;
     *file = (struct audio_control_file){0};
+    module_put(owner);
     return 0;
 }
 

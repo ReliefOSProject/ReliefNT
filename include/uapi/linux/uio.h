@@ -4,6 +4,7 @@
 #include <linux/types.h>
 
 #define UIO_MAXIOV 1024
+#define RWF_HIPRI 0x00000001u
 
 struct iovec {
     void *iov_base;

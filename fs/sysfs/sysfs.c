@@ -1,14 +1,15 @@
-/* Read-only Linux sysfs inventory. Attributes describe measured hardware and
- * actual kernel objects; no writable control files or DRM ioctls are implied. */
+/* Linux sysfs inventory and descriptor-authorized module parameter files. */
 #include <reliefos/fs_abi.h>
 #include <reliefnt/framebuffer.h>
-#include <reliefnt/drm.h>
+#include <reliefnt/graphics_service.h>
 #include <reliefnt/inventory.h>
 #include <reliefnt/pci.h>
 #include <reliefnt/platform.h>
 #include <reliefnt/smp.h>
 #include <reliefnt/storage.h>
 #include <reliefnt/text_stream.h>
+#include <reliefnt/module.h>
+#include <reliefnt/moduleparam.h>
 
 #define SYSFS_PCI_MAX 256u
 static struct pci_device pci_devices[SYSFS_PCI_MAX];
@@ -51,13 +52,17 @@ enum attribute {
     A_DRM_DEV,
     A_DRM_UEVENT,
     A_DRM_RENDER_DEV,
-    A_DRM_RENDER_UEVENT
+    A_DRM_RENDER_UEVENT,
+    A_MODULE_TEXT,
+    A_MODULE_NUMBER,
+    A_MODULE_PARAMETER
 };
 struct sys_node {
     const char *path;
     enum attribute attr;
     uint32_t index;
     const char *target;
+    const char *parameter;
     uint64_t value;
 };
 typedef int (*sys_visit)(const struct sys_node *, void *);
@@ -185,12 +190,17 @@ static int sys_block_fs_info(uint32_t disk, int32_t part, char type[8], char ver
     return 1;
 }
 
-/* Use the same registered disks/GPT extents and dev_t encoding as devfs. */
+/** @brief Visit registered block geometry using the same identity as devfs.
+ * @param visit Borrowed synchronous attribute consumer. @param ctx Consumer context.
+ * @return Zero or enumeration/consumer errno. Execution ownership stabilizes
+ * inventory and native reads; memory images remain visible despite installer
+ * filtering. Scalar metadata escapes only through the visitor's borrowed node.
+ */
 static int sys_blocks(sys_visit visit, void *ctx)
 {
     struct reliefos_install_disk disks[RELIEFOS_INSTALL_MAX_DISKS];
     uint32_t count = 0;
-    int ret = storage_install_list_disks(disks, RELIEFOS_INSTALL_MAX_DISKS, &count);
+    int ret = storage_list_block_disks(disks, RELIEFOS_INSTALL_MAX_DISKS, &count);
     if (ret < 0) return ret;
     if (count > RELIEFOS_INSTALL_MAX_DISKS) return -5;
     for (uint32_t i = 0; i < count; ++i) {
@@ -214,12 +224,14 @@ static int sys_blocks(sys_visit visit, void *ctx)
                 sys_path(path, base, -1, devname);
                 sys_path(base, path, -1, "");
             }
-            uint32_t minor = STORAGE_BLOCK_MINOR(STORAGE_BLOCK_VOLUME_ID(disks[i].id, part));
+            uint64_t device=storage_block_rdev(STORAGE_BLOCK_VOLUME_ID(disks[i].id,part));
+            uint32_t major=(device>>8)&4095u;
+            uint32_t minor=(device&255u)|((device>>12)&0xfffff00u);
             struct text_stream s = {.buffer=number, .capacity=sizeof(number)-1};
-            text_unsigned(&s, STORAGE_BLOCK_MAJOR); text_string(&s, ":"); text_unsigned(&s, minor);
+            text_unsigned(&s, major); text_string(&s, ":"); text_unsigned(&s, minor);
             number[s.written] = 0;
             s = (struct text_stream){.buffer=event, .capacity=sizeof(event)-1};
-            text_string(&s, "MAJOR="); text_unsigned(&s, STORAGE_BLOCK_MAJOR);
+            text_string(&s, "MAJOR="); text_unsigned(&s, major);
             text_string(&s, "\nMINOR="); text_unsigned(&s, minor);
             text_string(&s, "\nDEVNAME="); text_string(&s, devname);
             text_string(&s, "\nDEVTYPE="); text_string(&s, part < 0 ? "disk" : "partition");
@@ -261,6 +273,89 @@ static int sys_blocks(sys_visit visit, void *ctx)
     return 0;
 }
 /** @brief Enumerate the same namespace used by lookup/readlink/readdir. */
+#define SYSFS_MODULE_PATH_LEN (MODULE_NAME_LEN+MODULE_PARAMETER_NAME_LEN+32)
+/** @brief Build a bounded sysfs module path from copied registry names. */
+static void sys_module_path(char out[SYSFS_MODULE_PATH_LEN],const char *name,const char *suffix)
+{
+    struct text_stream text={.buffer=out,.capacity=SYSFS_MODULE_PATH_LEN-1};
+    text_string(&text,"/sys/module/"); text_string(&text,name); text_string(&text,suffix);
+    out[text.written]=0;
+}
+/** @brief Visit visible descriptors without borrowing an unpinned runtime.
+ * @param visit Synchronous visitor, retaining no passed string pointers.
+ * @param context Borrowed visitor context.
+ * @param name Stable module-name snapshot.
+ * @return Visitor status or negative errno. Execution ownership serializes
+ * registry changes; each descriptor snapshot balances its own image pin.
+ */
+static int sys_module_parameters(sys_visit visit,void *context,const char *name)
+{
+    char path[SYSFS_MODULE_PATH_LEN];int rc;
+    for(size_t i=0;;++i) {
+        struct module_parameter_info info;rc=module_parameter_at(name,i,&info);
+        if(rc==-2)break;
+        if(rc)return rc;
+        if(!i) {
+            sys_module_path(path,name,"/parameters");
+            if((rc=sys_emit(visit,context,path,A_DIR,0,NULL)))return rc;
+        }
+        sys_module_path(path,name,"/parameters/");
+        size_t prefix=__builtin_strlen(path),length=__builtin_strlen(info.name);
+        __builtin_memcpy(path+prefix,info.name,length+1);
+        struct sys_node node={.path=path,.attr=A_MODULE_PARAMETER,.target=name,.parameter=info.name};
+        if((rc=visit(&node,context)))return rc;
+    }
+    return 0;
+}
+/** @brief Visit real loaded-module attributes using snapshots, never borrowed image pointers. */
+static int sys_modules_walk(sys_visit visit,void *context)
+{
+    int rc;
+    if((rc=sys_emit(visit,context,"/sys/module",A_DIR,0,NULL))) return rc;
+#ifdef CONFIG_MODULES
+    for(size_t i=0;;++i) {
+        struct module_status status;
+        rc=module_status_at(i,&status);
+        if(rc==-2) break;
+        if(rc) return rc;
+        char path[SYSFS_MODULE_PATH_LEN];
+        sys_module_path(path,status.name,"");
+        if((rc=sys_emit(visit,context,path,A_DIR,0,NULL))) return rc;
+        if((rc=sys_module_parameters(visit,context,status.name)))return rc;
+        const char *state=status.state==MODULE_LIVE ? "live" : status.state==MODULE_COMING ? "coming" : "going";
+        static const char *const names[]={"/initstate","/refcnt","/coresize","/taint"};
+        for(unsigned field=0;field<4;++field) {
+            sys_module_path(path,status.name,names[field]);
+            struct sys_node node={.path=path,.attr=field==0 || field==3 ? A_MODULE_TEXT : A_MODULE_NUMBER,
+                .target=field==0 ? state : "",.value=field==1 ? status.references : status.size};
+            if((rc=visit(&node,context))) return rc;
+        }
+        sys_module_path(path,status.name,"/holders");
+        if((rc=sys_emit(visit,context,path,A_DIR,0,NULL))) return rc;
+        for(size_t holder_index=0;;++holder_index) {
+            char holder[MODULE_NAME_LEN];
+            rc=module_holder_at(status.name,holder_index,holder);
+            if(rc==-2) break;
+            if(rc) return rc;
+            struct text_stream text={.buffer=path,.capacity=SYSFS_MODULE_PATH_LEN-1};
+            text_string(&text,"/sys/module/"); text_string(&text,status.name);
+            text_string(&text,"/holders/"); text_string(&text,holder); path[text.written]=0;
+            char target[MODULE_NAME_LEN+7];
+            text=(struct text_stream){.buffer=target,.capacity=sizeof(target)-1};
+            text_string(&text,"../../"); text_string(&text,holder); target[text.written]=0;
+            if((rc=sys_emit(visit,context,path,A_LINK,0,target))) return rc;
+        }
+    }
+#endif
+    for(size_t i=0;;++i) {
+        char name[MODULE_NAME_LEN],path[SYSFS_MODULE_PATH_LEN];
+        rc=module_parameter_builtin_at(i,name);if(rc==-2)break;if(rc)return rc;
+        sys_module_path(path,name,"");
+        if((rc=sys_emit(visit,context,path,A_DIR,0,NULL)))return rc;
+        if((rc=sys_module_parameters(visit,context,name)))return rc;
+    }
+    return 0;
+}
 static int sys_walk(sys_visit visit, void *ctx)
 {
     static const char *dirs[] = {"/sys",
@@ -291,6 +386,7 @@ static int sys_walk(sys_visit visit, void *ctx)
             return ret;
     if ((ret = sys_emit(visit, ctx, "/sys/class/dmi/id", A_LINK, 0, "../../devices/virtual/dmi/id")))
         return ret;
+    if((ret=sys_modules_walk(visit,ctx))) return ret;
     const struct platform_dmi_info *dmi = platform_dmi();
     char path[RELIEFOS_FS_PATH_LEN], target[RELIEFOS_FS_PATH_LEN];
     for (uint32_t i = 0; i < PLATFORM_DMI_FIELDS; ++i)
@@ -359,7 +455,7 @@ static int sys_walk(sys_visit visit, void *ctx)
         }
     }
     struct pci_device drm_pci;
-    if (drm_device_pci_identity(&drm_pci) == 0) {
+    if (graphics_service_pci_identity(&drm_pci) == 0) {
         for (uint32_t i = 0; i < pci_count; ++i) {
             if (pci_devices[i].bus != drm_pci.bus ||
                 pci_devices[i].slot != drm_pci.slot ||
@@ -402,7 +498,7 @@ static int sys_walk(sys_visit visit, void *ctx)
                          "/drm/card0/card0-Virtual-1");
             if ((ret = sys_emit(visit, ctx, "/sys/class/drm/card0-Virtual-1",
                                 A_LINK, i, target))) return ret;
-            if (drm_device_render_node_ready()) {
+            if (graphics_service_render_node_ready()) {
                 sys_pci_path(path, "/sys/devices/pci0000:00/", i,
                              "/drm/renderD128");
                 if ((ret = sys_emit(visit, ctx, path, A_DIR, i, 0))) return ret;
@@ -499,13 +595,27 @@ static uint32_t sys_pci_subsystem(const struct sys_node *n)
     }
     return 0;
 }
-/** @brief Generate one attribute from real hardware/kernel state; no fixed whole-file buffer. */
+/**
+ * @brief Stream one generated attribute from actual hardware/kernel state.
+ * @param n Borrowed resolved node with stable inventory selector.
+ * @param s Caller-owned bounded text stream tracking the requested byte range.
+ * Task context under namespace/execution ownership; no ownership transfer or
+ * fixed whole-file buffer. PCI modalias fields use Linux uppercase hexadecimal
+ * consistently with the uevent MODALIAS, while ordinary numeric attributes and
+ * BDF paths retain their standard lowercase representations.
+ */
 static void sys_value(const struct sys_node *n, struct text_stream *s)
 {
     const struct cpu_inventory *cpu = cpu_inventory_get(n->index);
     const struct pci_device *pci = &pci_devices[n->index < SYSFS_PCI_MAX ? n->index : 0];
     const struct framebuffer *fb = framebuffer_get();
     switch (n->attr) {
+    case A_MODULE_TEXT:
+        text_string(s,n->target);
+        break;
+    case A_MODULE_NUMBER:
+        text_unsigned(s,n->value);
+        break;
     case A_DMI:
         text_string(s, platform_dmi()->values[n->index]);
         break;
@@ -571,19 +681,19 @@ static void sys_value(const struct sys_node *n, struct text_stream *s)
     case A_PCI_ALIAS: {
         uint32_t sub = sys_pci_subsystem(n);
         text_string(s, "pci:v");
-        text_hex(s, pci->vendor_id, 8);
+        sys_hex_upper(s, pci->vendor_id, 8);
         text_string(s, "d");
-        text_hex(s, pci->device_id, 8);
+        sys_hex_upper(s, pci->device_id, 8);
         text_string(s, "sv");
-        text_hex(s, sub & 65535, 8);
+        sys_hex_upper(s, sub & 65535, 8);
         text_string(s, "sd");
-        text_hex(s, sub >> 16, 8);
+        sys_hex_upper(s, sub >> 16, 8);
         text_string(s, "bc");
-        text_hex(s, pci->class_code, 2);
+        sys_hex_upper(s, pci->class_code, 2);
         text_string(s, "sc");
-        text_hex(s, pci->subclass, 2);
+        sys_hex_upper(s, pci->subclass, 2);
         text_string(s, "i");
-        text_hex(s, pci->prog_if, 2);
+        sys_hex_upper(s, pci->prog_if, 2);
         break;
     }
     case A_PCI_CONFIG:
@@ -650,7 +760,7 @@ static void sys_value(const struct sys_node *n, struct text_stream *s)
         text_string(s, "connected");
         break;
     case A_ENABLED:
-        text_string(s, drm_device_kms_scanout_active() ? "enabled" : "disabled");
+        text_string(s, graphics_service_kms_scanout_active() ? "enabled" : "disabled");
         break;
     case A_BLOCK_NUMBER:
         text_unsigned(s, n->value);
@@ -711,6 +821,10 @@ static int sys_match(const struct sys_node *n, void *context)
             return -21;
         if (n->attr == A_LINK)
             return -22;
+        if(n->attr==A_MODULE_PARAMETER) {
+            int rc=module_parameter_read(n->target,n->parameter,r->stream.offset,r->stream.buffer,r->stream.capacity,&r->stream.written);
+            return rc ? rc : 1;
+        }
         sys_value(n, &r->stream);
     }
     return 1;

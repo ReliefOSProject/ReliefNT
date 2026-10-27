@@ -4,6 +4,8 @@
 #include <reliefnt/pci.h>
 #include <reliefnt/time.h>
 #include <reliefnt/usb.h>
+#include <reliefnt/driver_module.h>
+#include <linux/errno.h>
 
 #include "../../../arch/x86_64/port.h"
 
@@ -15,7 +17,7 @@
 #define USB_UHCI_MAX_HID 8u
 #define USB_UHCI_MAX_PORTS 2u
 #define USB_UHCI_MAX_CONFIG 512u
-#define USB_UHCI_MAX_CONTROL_TDS 20u
+#define USB_UHCI_MAX_CONTROL_TDS (USB_UHCI_MAX_CONFIG / 8u + 2u)
 #define USB_UHCI_MAX_HID_TDS 8u
 #define USB_UHCI_QH_COUNT (USB_UHCI_MAX_HID + 2u)
 #define USB_UHCI_FRAME_COUNT 1024u
@@ -34,6 +36,7 @@
 #define UHCI_CMD_HCRESET 0x0002u
 #define UHCI_CMD_CONFIGURE 0x0040u
 #define UHCI_CMD_MAX_PACKET_64 0x0080u
+#define UHCI_STATUS_HALTED 0x0020u
 
 #define UHCI_PORT_CONNECT 0x0001u
 #define UHCI_PORT_CONNECT_CHANGE 0x0002u
@@ -118,6 +121,19 @@ struct usb_hid_device {
     uint8_t buttons;
 };
 
+/* Every address placed on the UHCI bus belongs to this contiguous masked run.
+ * CPU-only controller/HID metadata remains ordinary module data. */
+struct uhci_dma {
+    uint32_t frame_list[USB_UHCI_FRAME_COUNT] __attribute__((aligned(4096)));
+    struct uhci_qh qhs[USB_UHCI_QH_COUNT] __attribute__((aligned(16)));
+    struct uhci_td control_tds[USB_UHCI_MAX_CONTROL_TDS] __attribute__((aligned(16)));
+    struct uhci_td hid_tds[USB_UHCI_MAX_HID_TDS] __attribute__((aligned(16)));
+    uint8_t control_setup[8] __attribute__((aligned(16)));
+    uint8_t control_data[USB_UHCI_MAX_CONFIG] __attribute__((aligned(16)));
+    uint8_t transfer_data[USB_UHCI_MAX_CONFIG] __attribute__((aligned(16)));
+    uint8_t hid_reports[USB_UHCI_MAX_HID][8] __attribute__((aligned(16)));
+};
+
 struct uhci_controller {
     uint16_t io_base;
     uint8_t bus;
@@ -128,28 +144,31 @@ struct uhci_controller {
     uint8_t qh_count;
     uint8_t qh_tail;
     uint8_t next_address;
+    uint8_t control_failed;
+    uint64_t dma_phys;
+    struct uhci_dma *dma;
+    struct usb_host *host;
 };
 
+static const struct reliefos_driver_kernel_api *kernel_api;
 static struct uhci_controller uhci_controllers[USB_UHCI_MAX_CONTROLLERS];
 static struct usb_hid_device usb_hid_devices[USB_UHCI_MAX_CONTROLLERS][USB_UHCI_MAX_HID];
-static uint32_t uhci_frame_lists[USB_UHCI_MAX_CONTROLLERS][USB_UHCI_FRAME_COUNT]
-    __attribute__((aligned(4096)));
-static struct uhci_qh uhci_qhs[USB_UHCI_MAX_CONTROLLERS][USB_UHCI_QH_COUNT]
-    __attribute__((aligned(16)));
-static struct uhci_td uhci_control_tds[USB_UHCI_MAX_CONTROLLERS][USB_UHCI_MAX_CONTROL_TDS]
-    __attribute__((aligned(16)));
-static struct uhci_td uhci_hid_tds[USB_UHCI_MAX_CONTROLLERS][USB_UHCI_MAX_HID_TDS]
-    __attribute__((aligned(16)));
-static uint8_t uhci_control_setup[USB_UHCI_MAX_CONTROLLERS][8]
-    __attribute__((aligned(16)));
-static uint8_t uhci_control_data[USB_UHCI_MAX_CONTROLLERS][USB_UHCI_MAX_CONFIG]
-    __attribute__((aligned(16)));
-static uint8_t uhci_hid_reports[USB_UHCI_MAX_CONTROLLERS][USB_UHCI_MAX_HID][8]
-    __attribute__((aligned(16)));
 
+/** @brief Translate only bytes of explicitly owned UHCI DMA runs.
+ * @param ptr CPU alias inside a live controller backing object.
+ * @return Exact 32-bit bus address, or zero for stack/module/unrelated memory.
+ * IRQ/task context; caller retains the controller's DMA and callback ownership.
+ */
 static uint32_t usb_phys(const void *ptr)
 {
-    return (uint32_t)(uintptr_t)ptr;
+    uintptr_t address=(uintptr_t)ptr;
+    for(unsigned i=0;i<USB_UHCI_MAX_CONTROLLERS;++i) {
+        const struct uhci_controller *controller=&uhci_controllers[i];
+        uintptr_t base=(uintptr_t)controller->dma;
+        if(base && address>=base && address-base<sizeof(*controller->dma))
+            return (uint32_t)(controller->dma_phys+(address-base));
+    }
+    return 0;
 }
 
 static void usb_memzero(void *ptr, uint32_t length)
@@ -169,6 +188,29 @@ static void usb_memcpy(void *dst, const void *src, uint32_t length)
     }
 }
 
+/** @brief Allocate one page-aligned coherent schedule inside the UHCI 32-bit mask.
+ * @param controller Unpublished controller receiving exclusive DMA ownership.
+ * @return Zero or negative errno, with no run retained on failure.
+ * Task initialization before enabling RUN; no spinlock spans allocation.
+ */
+static int uhci_alloc_dma(struct uhci_controller *controller)
+{
+    if(!controller || controller->dma) return -EINVAL;
+    uint32_t pages=(sizeof(struct uhci_dma)+4095u)/4096u;
+    uint64_t physical=kernel_api->alloc_dma(pages,UINT32_MAX);
+    if(!physical) return -ENOMEM;
+    if((physical&4095u) || physical>UINT32_MAX-(uint64_t)pages*4096u+1u) {
+        kernel_api->free_dma(physical,pages);return -EIO;
+    }
+    struct uhci_dma *dma=kernel_api->phys_to_virt(physical);
+    if(!dma || ((uintptr_t)dma&4095u)) {
+        kernel_api->free_dma(physical,pages);return -EFAULT;
+    }
+    usb_memzero(dma,sizeof(*dma));
+    controller->dma_phys=physical;controller->dma=dma;
+    return 0;
+}
+
 static void uhci_delay(uint32_t loops)
 {
     while (loops--) {
@@ -178,14 +220,26 @@ static void uhci_delay(uint32_t loops)
 
 static uint16_t uhci_read16(const struct uhci_controller *controller, uint16_t offset)
 {
-    return controller ? x86_64_inw((uint16_t)(controller->io_base + offset)) : 0xffffu;
+    if(!controller) return 0xffffu;
+#ifdef UHCI_TESTING
+    return x86_64_inw((uint16_t)(controller->io_base+offset));
+#else
+    uint16_t value,port=(uint16_t)(controller->io_base+offset);
+    __asm__ volatile("inw %1,%0" : "=a"(value) : "Nd"(port));
+    return value;
+#endif
 }
 
 static void uhci_write16(const struct uhci_controller *controller, uint16_t offset,
                          uint16_t value)
 {
     if (controller) {
+#ifdef UHCI_TESTING
         x86_64_outw(value, (uint16_t)(controller->io_base + offset));
+#else
+        uint16_t port=(uint16_t)(controller->io_base+offset);
+        __asm__ volatile("outw %0,%1" :: "a"(value),"Nd"(port));
+#endif
     }
 }
 
@@ -193,16 +247,21 @@ static void uhci_write32(const struct uhci_controller *controller, uint16_t offs
                          uint32_t value)
 {
     if (controller) {
+#ifdef UHCI_TESTING
         x86_64_outl(value, (uint16_t)(controller->io_base + offset));
+#else
+        uint16_t port=(uint16_t)(controller->io_base+offset);
+        __asm__ volatile("outl %0,%1" :: "a"(value),"Nd"(port));
+#endif
     }
 }
 
 static void uhci_schedule_init(uint32_t controller_id)
 {
     struct uhci_controller *controller = &uhci_controllers[controller_id];
-    struct uhci_qh *head = &uhci_qhs[controller_id][0];
-    struct uhci_qh *control = &uhci_qhs[controller_id][1];
-    usb_memzero(uhci_qhs[controller_id], sizeof(uhci_qhs[controller_id]));
+    struct uhci_qh *head = &uhci_controllers[controller_id].dma->qhs[0];
+    struct uhci_qh *control = &uhci_controllers[controller_id].dma->qhs[1];
+    usb_memzero(uhci_controllers[controller_id].dma->qhs, sizeof(uhci_controllers[controller_id].dma->qhs));
     head->link = usb_phys(control) | UHCI_LINK_QH;
     head->element = UHCI_LINK_TERMINATE;
     control->link = usb_phys(head) | UHCI_LINK_QH;
@@ -210,23 +269,23 @@ static void uhci_schedule_init(uint32_t controller_id)
     controller->qh_count = 2;
     controller->qh_tail = 1;
     for (uint32_t frame = 0; frame < USB_UHCI_FRAME_COUNT; ++frame) {
-        uhci_frame_lists[controller_id][frame] = usb_phys(head) | UHCI_LINK_QH;
+        uhci_controllers[controller_id].dma->frame_list[frame] = usb_phys(head) | UHCI_LINK_QH;
     }
-    uhci_write32(controller, UHCI_REG_FLBASEADD, usb_phys(uhci_frame_lists[controller_id]));
+    uhci_write32(controller, UHCI_REG_FLBASEADD, usb_phys(uhci_controllers[controller_id].dma->frame_list));
     uhci_write16(controller, UHCI_REG_FRNUM, 0);
 }
 
 static int uhci_schedule_add(uint32_t controller_id, uint8_t qh_index)
 {
     struct uhci_controller *controller = &uhci_controllers[controller_id];
-    struct uhci_qh *head = &uhci_qhs[controller_id][0];
-    struct uhci_qh *tail = &uhci_qhs[controller_id][controller->qh_tail];
+    struct uhci_qh *head = &uhci_controllers[controller_id].dma->qhs[0];
+    struct uhci_qh *tail = &uhci_controllers[controller_id].dma->qhs[controller->qh_tail];
     struct uhci_qh *qh;
     if (qh_index < 2 || qh_index >= USB_UHCI_QH_COUNT ||
         controller->qh_count >= USB_UHCI_QH_COUNT) {
         return -1;
     }
-    qh = &uhci_qhs[controller_id][qh_index];
+    qh = &uhci_controllers[controller_id].dma->qhs[qh_index];
     qh->link = usb_phys(head) | UHCI_LINK_QH;
     qh->element = UHCI_LINK_TERMINATE;
     tail->link = usb_phys(qh) | UHCI_LINK_QH;
@@ -282,17 +341,17 @@ static int uhci_reset_port(struct uhci_controller *controller, uint8_t port)
         return -2;
     }
     uhci_write16(controller, offset, (uint16_t)(status | UHCI_PORT_RESET));
-    time_sleep_ms(60);
+    kernel_api->sleep_ms(60);
     status = uhci_read16(controller, offset);
     uhci_write16(controller, offset,
                  (uint16_t)((status & (UHCI_PORT_CONNECT | UHCI_PORT_LOW_SPEED)) |
                             UHCI_PORT_CONNECT_CHANGE | UHCI_PORT_ENABLE_CHANGE));
-    time_sleep_ms(10);
+    kernel_api->sleep_ms(10);
     status = uhci_read16(controller, offset);
     if (!(status & UHCI_PORT_ENABLE)) {
         /* Some UHCI implementations need the enable bit written after reset. */
         uhci_write16(controller, offset, (uint16_t)(status | UHCI_PORT_ENABLE));
-        time_sleep_ms(5);
+        kernel_api->sleep_ms(5);
         status = uhci_read16(controller, offset);
     }
     return (status & UHCI_PORT_ENABLE) ? 0 : -1;
@@ -314,23 +373,34 @@ static int uhci_td_failed(const struct uhci_td *td)
     return td && (td->status & UHCI_TD_FATAL) != 0;
 }
 
+/** @brief Wait for the owned status TD without depending on a device interrupt.
+ * @param td Retained final status descriptor in the controller DMA run.
+ * @param out_length Optional completion length output.
+ * @return Zero, -EIO for completion error, or -ETIMEDOUT while DMA may remain live.
+ * Task enumeration only; bounded PIT-assisted waits hold no spin/execution lock.
+ */
 static int uhci_wait_control_td(struct uhci_td *td, uint32_t *out_length)
 {
     if (!td) {
-        return -1;
+        return -EINVAL;
     }
     for (uint32_t spin = 0; spin < 500000u; ++spin) {
+#ifdef UHCI_TESTING
+        extern void uhci_test_control_progress(void);
+        uhci_test_control_progress();
+#endif
         uint32_t status = td->status;
         if (!(status & UHCI_TD_ACTIVE)) {
             uint32_t actual = status & 0x7ffu;
             if (uhci_td_failed(td)) {
-                return -1;
+                return -EIO;
             }
             if (out_length) {
                 *out_length = actual == 0x7ffu ? 0 : actual + 1u;
             }
             return 0;
         }
+#ifndef UHCI_TESTING
         if ((spin & 0x3ffu) == 0) {
             /* UHCI completion does not need an IRQ here; use the PIT to
              * yield while the controller advances its frame schedule. */
@@ -338,10 +408,21 @@ static int uhci_wait_control_td(struct uhci_td *td, uint32_t *out_length)
         } else {
             __asm__ volatile("pause");
         }
+#endif
     }
-    return -1;
+    return -ETIMEDOUT;
 }
 
+/** @brief Execute one control request using controller-owned DMA for every TD/buffer.
+ * @param controller Unpublished controller whose task owns the control queue.
+ * @param address USB device address. @param low_speed Low-speed bus selector.
+ * @param max_packet Endpoint zero packet size (8/16/32/64).
+ * @param setup Borrowed eight-byte request copied before submitting DMA.
+ * @param data Borrowed CPU buffer, copied on OUT or after successful IN completion.
+ * @param length Requested data bytes within the owned transfer capacity.
+ * @return Zero or negative errno; no caller/stack address reaches the bus.
+ * Task enumeration only, no poll registration or spinlock spans the wait.
+ */
 static int uhci_control_transfer(struct uhci_controller *controller, uint8_t address,
                                  uint8_t low_speed, uint8_t max_packet,
                                  const uint8_t setup[8], void *data, uint16_t length)
@@ -355,17 +436,23 @@ static int uhci_control_transfer(struct uhci_controller *controller, uint8_t add
     uint8_t status_pid;
     uint8_t toggle = 0;
     uint32_t actual = 0;
-    if (!controller || !setup || length > USB_UHCI_MAX_CONFIG) {
-        return -1;
+    if (!controller || !controller->dma || !setup || length > USB_UHCI_MAX_CONFIG ||
+        (length && !data) ||
+        (max_packet!=8 && max_packet!=16 && max_packet!=32 && max_packet!=64)) {
+        return -EINVAL;
     }
+    if(controller->control_failed) return -EIO;
     controller_id = (uint32_t)(controller - uhci_controllers);
     if (controller_id >= USB_UHCI_MAX_CONTROLLERS) {
         return -1;
     }
-    qh = &uhci_qhs[controller_id][1];
-    tds = uhci_control_tds[controller_id];
-    usb_memzero(tds, sizeof(uhci_control_tds[controller_id]));
-    usb_memcpy(uhci_control_setup[controller_id], setup, 8);
+    qh = &uhci_controllers[controller_id].dma->qhs[1];
+    tds = uhci_controllers[controller_id].dma->control_tds;
+    uint8_t *transfer=controller->dma->transfer_data;
+    if(setup[0]&0x80u) usb_memzero(transfer,length);
+    else usb_memcpy(transfer,data,length);
+    usb_memzero(tds, sizeof(uhci_controllers[controller_id].dma->control_tds));
+    usb_memcpy(uhci_controllers[controller_id].dma->control_setup, setup, 8);
 
     if (td_count >= USB_UHCI_MAX_CONTROL_TDS) {
         return -1;
@@ -373,7 +460,7 @@ static int uhci_control_transfer(struct uhci_controller *controller, uint8_t add
     tds[td_count].status = UHCI_TD_ACTIVE | UHCI_TD_ERROR_COUNT |
                            (low_speed ? UHCI_TD_LOW_SPEED : 0);
     tds[td_count].token = uhci_token(UHCI_PID_SETUP, address, 0, 0, 8);
-    tds[td_count].buffer = usb_phys(uhci_control_setup[controller_id]);
+    tds[td_count].buffer = usb_phys(uhci_controllers[controller_id].dma->control_setup);
     ++td_count;
 
     if (length) {
@@ -390,7 +477,7 @@ static int uhci_control_transfer(struct uhci_controller *controller, uint8_t add
             tds[td_count].status = UHCI_TD_ACTIVE | UHCI_TD_ERROR_COUNT |
                                    (low_speed ? UHCI_TD_LOW_SPEED : 0);
             tds[td_count].token = uhci_token(data_pid, address, 0, ++toggle, chunk);
-            tds[td_count].buffer = usb_phys((uint8_t *)data + data_offset);
+            tds[td_count].buffer = usb_phys(transfer + data_offset);
             data_offset += chunk;
             ++td_count;
         }
@@ -413,11 +500,14 @@ static int uhci_control_transfer(struct uhci_controller *controller, uint8_t add
     tds[td_count - 1u].link = UHCI_LINK_TERMINATE;
     qh->element = usb_phys(tds);
     __asm__ volatile("mfence" ::: "memory");
-    if (uhci_wait_control_td(&tds[td_count - 1u], &actual) < 0) {
+    int error=uhci_wait_control_td(&tds[td_count - 1u], &actual);
+    if (error) {
         qh->element = UHCI_LINK_TERMINATE;
-        return -1;
+        if(error==-ETIMEDOUT)controller->control_failed=1;
+        return error;
     }
     qh->element = UHCI_LINK_TERMINATE;
+    if(setup[0]&0x80u) usb_memcpy(data,transfer,length);
     return 0;
 }
 
@@ -589,7 +679,7 @@ static void usb_hid_keyboard_report(struct usb_hid_device *device,
 static void usb_hid_mouse_report(struct usb_hid_device *device,
                                  const uint8_t *report, uint32_t length)
 {
-    const struct framebuffer *fb;
+    uint32_t width=0,height=0;
     int32_t dx;
     int32_t dy;
     uint8_t buttons;
@@ -599,19 +689,18 @@ static void usb_hid_mouse_report(struct usb_hid_device *device,
     buttons = report[0] & 0x07u;
     dx = (int8_t)report[1];
     dy = (int8_t)report[2];
-    fb = framebuffer_get();
-    if (fb && fb->available) {
+    if (!kernel_api->framebuffer_size(&width,&height) && width && height) {
         device->x += dx;
         device->y -= dy;
         if (device->x < 0) device->x = 0;
         if (device->y < 0) device->y = 0;
-        if (device->x >= (int32_t)fb->width) device->x = (int32_t)fb->width - 1;
-        if (device->y >= (int32_t)fb->height) device->y = (int32_t)fb->height - 1;
+        if (device->x >= (int32_t)width) device->x = (int32_t)width - 1;
+        if (device->y >= (int32_t)height) device->y = (int32_t)height - 1;
     }
     device->buttons = buttons;
-    input_push_mouse(device->x, device->y, dx, -dy, buttons);
+    kernel_api->input_push_mouse(device->x, device->y, dx, -dy, buttons);
     if (length >= 4 && report[3]) {
-        input_push_mouse_wheel(device->x, device->y, (int8_t)report[3], buttons);
+        kernel_api->input_push_mouse_wheel(device->x, device->y, (int8_t)report[3], buttons);
     }
 }
 
@@ -635,13 +724,13 @@ static int uhci_hub_reset_port(struct uhci_controller *controller,
     (void)usb_control_no_data(controller, hub_address, hub_low_speed,
                               hub_max_packet, 0x23u, USB_REQ_SET_FEATURE,
                               USB_HUB_PORT_POWER, port);
-    time_sleep_ms(20);
+    kernel_api->sleep_ms(20);
     if (usb_control_no_data(controller, hub_address, hub_low_speed,
                             hub_max_packet, 0x23u, USB_REQ_SET_FEATURE,
                             USB_HUB_PORT_RESET, port) < 0) {
         return -1;
     }
-    time_sleep_ms(60);
+    kernel_api->sleep_ms(60);
     if (usb_control_in_type(controller, hub_address, hub_low_speed,
                             hub_max_packet, 0xa3u, USB_REQ_GET_STATUS, 0,
                             port, status_data, sizeof(status_data)) < 0) {
@@ -679,7 +768,7 @@ static int uhci_enumerate_device(uint32_t controller_id, uint8_t root_port,
         uint8_t endpoint;
         uint16_t max_packet;
     } pending[USB_UHCI_MAX_HID];
-    uint8_t *data = uhci_control_data[controller_id];
+    uint8_t *data = uhci_controllers[controller_id].dma->control_data;
     uint8_t low_speed;
     uint8_t max_packet = 8;
     uint8_t address;
@@ -722,7 +811,7 @@ static int uhci_enumerate_device(uint32_t controller_id, uint8_t root_port,
                                         0, USB_REQ_SET_ADDRESS, address, 0) < 0) {
         return -1;
     }
-    time_sleep_ms(2);
+    kernel_api->sleep_ms(2);
     if (usb_control_in(controller, address, low_speed, max_packet,
                        USB_REQ_GET_DESCRIPTOR, (uint16_t)(USB_DESC_DEVICE << 8),
                        0, data, 18) < 0) {
@@ -848,9 +937,10 @@ static int uhci_enumerate_device(uint32_t controller_id, uint8_t root_port,
         device->qh_index = qh_index;
         device->td_index = (uint8_t)(qh_index - 2u);
         if (device->mouse) {
-            const struct framebuffer *fb = framebuffer_get();
-            device->x = fb && fb->available ? (int32_t)(fb->width / 2u) : 0;
-            device->y = fb && fb->available ? (int32_t)(fb->height / 2u) : 0;
+            uint32_t width=0,height=0;
+            if(!kernel_api->framebuffer_size(&width,&height)) {
+                device->x=(int32_t)(width/2u);device->y=(int32_t)(height/2u);
+            }
         }
         console_info("[usb] UHCI HID %s address=%u port=%u endpoint=%u packet=%u speed=%s\n",
                        device->keyboard ? "keyboard" : "mouse", address, port,
@@ -867,15 +957,15 @@ static void uhci_arm_hid(struct usb_hid_device *device)
     if (!device || !device->used) {
         return;
     }
-    td = &uhci_hid_tds[device->controller][device->td_index];
-    qh = &uhci_qhs[device->controller][device->qh_index];
+    td = &uhci_controllers[device->controller].dma->hid_tds[device->td_index];
+    qh = &uhci_controllers[device->controller].dma->qhs[device->qh_index];
     usb_memzero(td, sizeof(*td));
     td->link = UHCI_LINK_TERMINATE;
     td->status = UHCI_TD_ACTIVE | UHCI_TD_ERROR_COUNT | UHCI_TD_INTERRUPT |
                  (device->low_speed ? UHCI_TD_LOW_SPEED : 0);
     td->token = uhci_token(UHCI_PID_IN, device->address, device->endpoint,
                            device->data_toggle, device->max_packet);
-    td->buffer = usb_phys(uhci_hid_reports[device->controller][device->td_index]);
+    td->buffer = usb_phys(uhci_controllers[device->controller].dma->hid_reports[device->td_index]);
     qh->element = usb_phys(td);
     __asm__ volatile("mfence" ::: "memory");
 }
@@ -890,7 +980,7 @@ static void uhci_poll_controller(uint32_t controller_id)
         if (!device->used) {
             continue;
         }
-        td = &uhci_hid_tds[controller_id][i];
+        td = &uhci_controllers[controller_id].dma->hid_tds[i];
         status = td->status;
         if (status & UHCI_TD_ACTIVE) {
             continue;
@@ -902,9 +992,9 @@ static void uhci_poll_controller(uint32_t controller_id)
                 actual = device->max_packet;
             }
             if (device->keyboard) {
-                usb_hid_keyboard_report(device, uhci_hid_reports[controller_id][i], actual);
+                usb_hid_keyboard_report(device, uhci_controllers[controller_id].dma->hid_reports[i], actual);
             } else if (device->mouse) {
-                usb_hid_mouse_report(device, uhci_hid_reports[controller_id][i], actual);
+                usb_hid_mouse_report(device, uhci_controllers[controller_id].dma->hid_reports[i], actual);
             }
             device->data_toggle ^= 1u;
         }
@@ -912,67 +1002,135 @@ static void uhci_poll_controller(uint32_t controller_id)
     }
 }
 
-void usb_init(void)
+/** @brief Disable bus mastering and prove a controller halted before DMA release.
+ * @param controller Retained controller with no admitted input poll callbacks.
+ * @return Zero, -EIO for PCI readback failure, or -ETIMEDOUT retaining all DMA.
+ * Task teardown outside execution/IRQ locks; bounded sleeps require no device IRQ.
+ */
+static int uhci_quiesce_controller(struct uhci_controller *controller)
 {
-    uint32_t found = 0;
-    usb_memzero(uhci_controllers, sizeof(uhci_controllers));
-    usb_memzero(usb_hid_devices, sizeof(usb_hid_devices));
-    for (uint16_t bus = 0; bus < 256 && found < USB_UHCI_MAX_CONTROLLERS; ++bus) {
-        for (uint8_t slot = 0; slot < 32 && found < USB_UHCI_MAX_CONTROLLERS; ++slot) {
-            for (uint8_t function = 0; function < 8 && found < USB_UHCI_MAX_CONTROLLERS; ++function) {
-                uint32_t id = pci_config_read32((uint8_t)bus, slot, function, 0x00);
-                uint32_t class_reg;
-                uint32_t bar;
-                struct uhci_controller *controller;
-                if ((id & 0xffffu) == 0xffffu) {
-                    if (function == 0) break;
-                    continue;
-                }
-                class_reg = pci_config_read32((uint8_t)bus, slot, function, 0x08);
-                if ((class_reg >> 24) != UHCI_PCI_CLASS ||
-                    ((class_reg >> 16) & 0xffu) != UHCI_PCI_SUBCLASS ||
-                    ((class_reg >> 8) & 0xffu) != UHCI_PCI_PROGIF) {
-                    continue;
-                }
-                bar = pci_config_read32((uint8_t)bus, slot, function, 0x20) & ~0x0fu;
-                if (!bar || bar > 0xffffu) {
-                    continue;
-                }
-                controller = &uhci_controllers[found];
-                controller->io_base = (uint16_t)bar;
-                controller->bus = (uint8_t)bus;
-                controller->slot = slot;
-                controller->function = function;
-                controller->port_count = USB_UHCI_MAX_PORTS;
-                controller->next_address = 1;
-                pci_config_write16((uint8_t)bus, slot, function, 0x04,
-                                   (uint16_t)(pci_config_read16((uint8_t)bus, slot,
-                                                                function, 0x04) | 0x0005u));
-                if (uhci_reset_controller(controller) < 0) {
-                    continue;
-                }
-                controller->ready = 1;
-                ++found;
-                for (uint8_t port = 0; port < controller->port_count; ++port) {
-                    if (uhci_enumerate_device(found - 1u, port, 0, 0, 8, 0, 0) < 0) {
-                        continue;
-                    }
-                }
-            }
-        }
+    if(!controller->io_base) return 0;
+    uint16_t command=kernel_api->pci_read16(controller->bus,controller->slot,
+                                           controller->function,0x04);
+    kernel_api->pci_write16(controller->bus,controller->slot,controller->function,
+                            0x04,command&(uint16_t)~4u);
+    if(kernel_api->pci_read16(controller->bus,controller->slot,controller->function,0x04)&4u)
+        return -EIO;
+    uhci_write16(controller,UHCI_REG_INTR,0);
+    uhci_write16(controller,UHCI_REG_CMD,0);
+    for(unsigned attempt=0;attempt<100;++attempt) {
+        if(uhci_read16(controller,UHCI_REG_STATUS)&UHCI_STATUS_HALTED) return 0;
+        kernel_api->sleep_ms(1);
     }
-    if (found) {
-        console_info("[usb] UHCI controllers=%u HID polling enabled\n", found);
-    } else {
-        console_info("[usb] no active UHCI controller; USB HID polling disabled\n");
-    }
+    return -ETIMEDOUT;
 }
 
-void usb_poll(void)
+/** @brief Drain poll sources and all hardware before releasing any owned schedule.
+ * Task teardown via the driver owner ledger. Failed admission/HALT proof reports
+ * an error and preserves the full DMA/controller state for a later retry.
+ */
+static void uhci_driver_fini(void)
 {
-    for (uint32_t i = 0; i < USB_UHCI_MAX_CONTROLLERS; ++i) {
-        if (uhci_controllers[i].ready) {
-            uhci_poll_controller(i);
+    if(!kernel_api) return;
+    for(unsigned i=0;i<USB_UHCI_MAX_CONTROLLERS;++i) {
+        struct uhci_controller *controller=&uhci_controllers[i];
+        if(controller->host) {
+            int error=usb_host_unregister(controller->host);
+            if(error) {kernel_api->report_teardown_failure(error);return;}
+            controller->host=NULL;
         }
     }
+    for(unsigned i=0;i<USB_UHCI_MAX_CONTROLLERS;++i) {
+        int error=uhci_quiesce_controller(&uhci_controllers[i]);
+        if(error) {kernel_api->report_teardown_failure(error);return;}
+    }
+    for(unsigned i=0;i<USB_UHCI_MAX_CONTROLLERS;++i) {
+        for(unsigned n=0;n<USB_UHCI_MAX_HID;++n) {
+            struct usb_hid_device *device=&usb_hid_devices[i][n];
+            if(device->used && device->keyboard) {
+                const uint8_t released[8]={0};
+                usb_hid_keyboard_report(device,released,sizeof(released));
+            }
+            if(device->used && device->mouse && device->buttons)
+                kernel_api->input_push_mouse(device->x,device->y,0,0,0);
+        }
+        if(uhci_controllers[i].dma_phys)
+            kernel_api->free_dma(uhci_controllers[i].dma_phys,
+                                 (sizeof(struct uhci_dma)+4095u)/4096u);
+    }
+    usb_memzero(uhci_controllers,sizeof(uhci_controllers));
+    usb_memzero(usb_hid_devices,sizeof(usb_hid_devices));
 }
+
+/** @brief Poll one stable controller after the permanent USB core pins its LIVE owner.
+ * @param opaque Retained controller metadata from its exclusively owned registration.
+ * IRQ context; bounded HID work, no allocation or wait.
+ */
+static void uhci_host_poll(void *opaque)
+{
+    struct uhci_controller *controller=opaque;
+    if(controller->ready && controller->dma)
+        uhci_poll_controller((uint32_t)(controller-uhci_controllers));
+}
+
+/** @brief Probe cached PCI identities and publish only fully prepared UHCI poll sources.
+ * @param api Borrowed native service table retained through safe hardware fini.
+ * @return Zero, -ENODEV with no controller, or negative init error whose partial
+ * hardware/DMA is retained for the owner ledger's fini. No callbacks or DMA use
+ * module-static buffers. Task initialization outside the module-table lock.
+ */
+static int uhci_driver_init(const struct reliefos_driver_kernel_api *api)
+{
+    if(!api || api->abi_version!=RELIEFOS_DRIVER_ABI_VERSION ||
+       api->struct_size<RELIEFOS_DRIVER_PHYS_MAP_API_SIZE || !api->alloc_dma ||
+       !api->free_dma || !api->phys_to_virt || !api->pci_enumerate ||
+       !api->pci_read16 || !api->pci_read32 || !api->pci_write16 ||
+       !api->sleep_ms || !api->framebuffer_size || !api->input_push_mouse ||
+       !api->input_push_mouse_wheel || !api->report_teardown_failure) return -EINVAL;
+    kernel_api=api;
+    uint32_t found=0;
+    usb_memzero(uhci_controllers,sizeof(uhci_controllers));
+    usb_memzero(usb_hid_devices,sizeof(usb_hid_devices));
+    for(uint32_t index=0;;++index) {
+        struct reliefos_driver_pci_device pci;
+        int error=api->pci_enumerate(index,&pci);
+        if(error==-ENODEV) break;
+        if(error) return error;
+        if(pci.class_code!=UHCI_PCI_CLASS || pci.subclass!=UHCI_PCI_SUBCLASS ||
+           pci.prog_if!=UHCI_PCI_PROGIF) continue;
+        if(found==USB_UHCI_MAX_CONTROLLERS) return -ENOSPC;
+        uint32_t raw_bar=api->pci_read32(pci.bus,pci.slot,pci.function,0x20);
+        uint32_t bar=raw_bar&~3u;
+        if(!(raw_bar&1u) || !bar || bar>0xffe0u) return -ENODEV;
+        struct uhci_controller *controller=&uhci_controllers[found++];
+        controller->io_base=(uint16_t)bar;controller->bus=pci.bus;
+        controller->slot=pci.slot;controller->function=pci.function;
+        controller->port_count=USB_UHCI_MAX_PORTS;controller->next_address=1;
+        /* Retire any firmware/previous schedule before preparing new DMA.
+         * In particular, a failed PCI master-disable must allocate nothing. */
+        error=uhci_quiesce_controller(controller);
+        if(error) return error;
+        error=uhci_alloc_dma(controller);
+        if(error) return error;
+        uint16_t command=api->pci_read16(pci.bus,pci.slot,pci.function,0x04);
+        api->pci_write16(pci.bus,pci.slot,pci.function,0x04,command|0x0005u);
+        error=uhci_reset_controller(controller);
+        if(error) return error;
+        for(uint8_t port=0;port<controller->port_count;++port) {
+            (void)uhci_enumerate_device(found-1u,port,0,0,8,0,0);
+            if(controller->control_failed) return -ETIMEDOUT;
+        }
+        controller->ready=1;
+        error=usb_host_register(uhci_host_poll,controller,THIS_MODULE,&controller->host);
+        if(error) return error;
+    }
+    if(!found) return -ENODEV;
+    console_info("[usb] UHCI controllers=%u HID polling enabled\n",found);
+    return 0;
+}
+
+const struct reliefos_driver_module uhci_driver_module={
+    .magic=RELIEFOS_DRIVER_MODULE_MAGIC,.abi_version=RELIEFOS_DRIVER_ABI_VERSION,
+    .struct_size=sizeof(struct reliefos_driver_module),.kind=RELIEFOS_DRIVER_KIND_INPUT,
+    .name="uhci",.version=1,.init=uhci_driver_init,.fini=uhci_driver_fini,
+};

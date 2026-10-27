@@ -96,7 +96,16 @@ int audio_pcm_live_state(struct audio_pcm *pcm, enum audio_pcm_state *state)
     return 0;
 }
 
-struct audio_pcm *audio_pcm_open(uint32_t card, uint32_t device,
+/** @brief Create a PCM while its caller retains the provider through every failure path.
+ * @param card Stable card generation held by the public wrapper's module reference.
+ * @param device Hardware PCM device index.
+ * @param direction Validated playback/capture direction.
+ * @param error Required kernel-owned error output.
+ * @return Owned PCM or NULL; caller releases its temporary provider on failure.
+ * Metadata pages are explicitly heap-owned before a hardware stream is
+ * opened. Serialized task context, no PCM lock spans allocation or callbacks.
+ */
+static struct audio_pcm *audio_pcm_open_owned(uint32_t card, uint32_t device,
                                  enum audio_direction direction, int *error)
 {
     if (error) *error = -EINVAL;
@@ -110,13 +119,23 @@ struct audio_pcm *audio_pcm_open(uint32_t card, uint32_t device,
     struct audio_caps caps;
     int ret = audio_card_pcm_caps(card, device, direction, &caps);
     if (ret) { *error = ret; return NULL; }
+    struct audio_pcm *pcm = NULL;
+    for (uint32_t i = 0; i < AUDIO_PCM_MAX; ++i)
+        if (!pcm_slots[i].live) { pcm = &pcm_slots[i]; break; }
+    if (!pcm) { *error=-ENOSPC;return NULL; }
+    audio_pcm_free_buffer(pcm);
+    void *metadata=kernel_malloc(3u*AUDIO_PCM_MMAP_PAGE_BYTES-1u);
+    if(!metadata){*error=-ENOMEM;return NULL;}
+    uintptr_t aligned=((uintptr_t)metadata+AUDIO_PCM_MMAP_PAGE_BYTES-1u)&
+        ~(uintptr_t)(AUDIO_PCM_MMAP_PAGE_BYTES-1u);
+    __builtin_memset((void *)aligned,0,2u*AUDIO_PCM_MMAP_PAGE_BYTES);
     uint32_t stream;
     ret = audio_stream_open(card, device, direction, &stream);
-    if (ret) { *error = ret; return NULL; }
+    if (ret) { kernel_free(metadata);*error = ret; return NULL; }
     struct audio_format_caps format_caps = {0};
     int extret = audio_stream_format_caps(card, device, direction, &format_caps);
     if (extret && extret != -EOPNOTSUPP) {
-        audio_stream_close(stream); *error = extret; return NULL;
+        audio_stream_close(stream);kernel_free(metadata); *error = extret; return NULL;
     }
     if (extret) {
         format_caps.pcm = caps;
@@ -127,17 +146,10 @@ struct audio_pcm *audio_pcm_open(uint32_t card, uint32_t device,
             format_caps.subformats[n] = 1u << AUDIO_SUBFORMAT_STD;
         }
     }
-    struct audio_pcm *pcm = NULL;
-    for (uint32_t i = 0; i < AUDIO_PCM_MAX; ++i)
-        if (!pcm_slots[i].live) { pcm = &pcm_slots[i]; break; }
-    if (!pcm) {
-        audio_stream_close(stream);
-        *error = -ENOSPC;
-        return NULL;
-    }
-    /* A retired slot may still own a large DMA ring from its prior generation. */
-    audio_pcm_free_buffer(pcm);
     *pcm = (struct audio_pcm){
+        .metadata_storage=metadata,
+        .status_page=(uint8_t *)aligned,
+        .control_page=(uint8_t *)aligned+AUDIO_PCM_MMAP_PAGE_BYTES,
         .live = 0,
         .file_refs = 1,
         .format_caps = format_caps,
@@ -155,6 +167,29 @@ struct audio_pcm *audio_pcm_open(uint32_t card, uint32_t device,
     audio_pcm_publish_locked(pcm);
     __atomic_store_n(&pcm->live,1,__ATOMIC_RELEASE);
     *error = 0;
+    return pcm;
+}
+
+/** @brief Keep a provider alive until both the PCM file and its final mapping retire.
+ * @param card Generation-tagged card id.
+ * @param device PCM device index.
+ * @param direction Playback/capture selector.
+ * @param error Required writable error output, unchanged only when NULL.
+ * @return Owned PCM or NULL with errno; release file ownership with audio_pcm_release.
+ * Task context. Mapping clones share this object's provider reference and final
+ * retirement releases it after hardware close; no PCM lock spans module lookup.
+ */
+struct audio_pcm *audio_pcm_open(uint32_t card,uint32_t device,
+                                enum audio_direction direction,int *error)
+{
+    if(error) *error=-EINVAL;
+    if(!error || (uint32_t)direction>AUDIO_CAPTURE) return NULL;
+    struct module *owner;
+    int ret=audio_card_module_get(card,&owner);
+    if(ret) { *error=ret; return NULL; }
+    struct audio_pcm *pcm=audio_pcm_open_owned(card,device,direction,error);
+    if(pcm) pcm->code_owner=owner;
+    else module_put(owner);
     return pcm;
 }
 

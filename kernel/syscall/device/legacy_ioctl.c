@@ -40,21 +40,6 @@ int64_t syscall_legacy_ioctl(uint64_t number, uint64_t a0, uint64_t a1, uint64_t
         if (evdev_ret != -RELIEFOS_ENOTTY) {
             return evdev_ret;
         }
-        if (file && (file->node.flags & STORAGE_NODE_FLAG_AUDIO_CONTROL)) {
-            return audio_control_ioctl(task, file, a1, a2);
-        }
-        if (file && (file->node.flags & STORAGE_NODE_FLAG_AUDIO_MIXER)) {
-            return audio_mixer_ioctl(task, file, a1, a2);
-        }
-        if (file && (file->node.flags & STORAGE_NODE_FLAG_AUDIO_PCM)) {
-            return audio_device_ioctl(task, file, a1, a2);
-        }
-        if (file && (file->node.flags & STORAGE_NODE_FLAG_AUDIO_TIMER)) {
-            return audio_timer_ioctl(task, file, a1, a2);
-        }
-        if (file && task_device_is(file, STORAGE_DEV_KIND_AUDIO)) {
-            return audio_oss_ioctl(task, file, a1, a2);
-        }
     }
 
     if (number == LINUX_SYS_IOCTL) {

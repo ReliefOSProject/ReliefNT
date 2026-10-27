@@ -98,12 +98,14 @@ int64_t syscall_mm_munlockall(void)
     return 0;
 }
 
-/**
- * Syscall mm mprotect.
- * @param addr Value supplied by the caller.
- * @param len Maximum number of elements available in the related buffer.
- * @param prot Value supplied by the caller.
- * @return The value or status produced by the operation.
+/** @brief Protect a covered user range while preserving split backing references.
+ * @param addr Page-aligned start in the execution-owned current user MM.
+ * @param len Byte length rounded to pages; zero is a no-op.
+ * @param prot Linux PROT bits bounded by every affected VMA's maximum access.
+ * @return Zero or negative EINVAL/ENOMEM/EACCES/EOPNOTSUPP. Metadata slots are
+ * reserved before PTE changes; device permission changes synchronously flush
+ * remote user TLBs. No graph/module lock spans heap growth or backing release;
+ * successful splits acquire independent core references to the original lease.
  */
 int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
 {
@@ -126,16 +128,15 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
      * VMAs with different attributes, but rejects a range containing a hole. */
     uint64_t cursor = addr;
     uint32_t split_count = 0;
-    bool drm_mapping = false;
+    bool device_tlb = false;
     while (cursor < end) {
         struct task_vma *vma = task_vma_containing(task, cursor, cursor + PAGE_SIZE);
         if (!vma) return -RELIEFOS_ENOMEM;
-        if (vma->drm_bo) drm_mapping = true;
+        if (vma->device_mapping) device_tlb = true;
         if (prot & ~vma->max_prot) return -RELIEFOS_EACCES;
         uint64_t piece_end = vma->end < end ? vma->end : end;
-        /* Non-audio device mappings accept only a whole-VMA no-op change. */
-        if ((vma->flags & TASK_VMA_FLAG_DEVICE) && !vma->audio_pcm &&
-            !vma->drm_bo &&
+        /* Device mappings without split capability accept only a whole-VMA no-op change. */
+        if ((vma->flags & TASK_VMA_FLAG_DEVICE) && (!vma->device_mapping || !device_mapping_info(vma->device_mapping)->can_split) &&
             (cursor != vma->start || piece_end != vma->end || prot != vma->prot)) {
             return -RELIEFOS_EOPNOTSUPP;
         }
@@ -167,8 +168,7 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
         struct task_vma *vma = task_vma_containing(task, cursor, cursor + PAGE_SIZE);
         if (!vma) return -RELIEFOS_ENOMEM;
         uint64_t piece_end = vma->end < end ? vma->end : end;
-        if ((vma->flags & TASK_VMA_FLAG_DEVICE) && !vma->audio_pcm &&
-            !vma->drm_bo) {
+        if ((vma->flags & TASK_VMA_FLAG_DEVICE) && (!vma->device_mapping || !device_mapping_info(vma->device_mapping)->can_split)) {
             /* Validated as a whole-VMA no-op: leave device PTEs untouched. */
             cursor = piece_end;
             continue;
@@ -187,7 +187,7 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
                                                  page_flags)) {
                 /* Earlier pages may already have changed. Revoke stale remote
                  * DRM translations even though the range operation fails. */
-                if (drm_mapping && pte_changed) smp_flush_user_tlb();
+                if (device_tlb && pte_changed) smp_flush_user_tlb();
                 return -RELIEFOS_EACCES;
             }
             pte_changed = true;
@@ -195,10 +195,10 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
         }
         cursor = piece_end;
     }
-    /* The page-table helper invalidates only the current CPU. DRM protection
+    /* The page-table helper invalidates only the current CPU. Device protection
      * changes must not return while a CLONE_VM peer can still write through a
      * stale translation, so synchronously flush remote user TLBs first. */
-    if (drm_mapping && pte_changed) smp_flush_user_tlb();
+    if (device_tlb && pte_changed) smp_flush_user_tlb();
 
     /**
  * @brief A partial protection change needs independent VMA metadata. In particular, PT_GNU_RELRO protects only the GOT page while BSS in the same original load segment must remain writable and lazily mappable.
@@ -213,30 +213,26 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
             struct task_vma *left = task_vma_free_slot(task);
             if (!left) return -RELIEFOS_ENOMEM;
             *left = original;
-            task_vma_retain_drm(left, &original);
+            task_vma_retain_file(left, &original);
             sysv_shm_vma_split(left);
             storage_inode_retain(left->inode);
-            if (left->audio_pcm) (void)audio_pcm_mmap_retain(left->audio_pcm,
-                                 (enum audio_pcm_mmap_region)left->audio_mmap_region);
+            if (left->device_mapping) (void)device_mapping_get(left->device_mapping);
             left->end = cursor;
-            if (left->drm_bo)
-                left->device_physical = original.device_physical;
-            if (left->audio_pcm) left->audio_mmap_length = left->end - left->start;
+            if (left->device_mapping)
+                left->device_physical = device_mapping_physical(left->device_mapping,left->device_map_offset);
         }
         if (piece_end < original.end) {
             struct task_vma *right = task_vma_free_slot(task);
             if (!right) return -RELIEFOS_ENOMEM;
             *right = original;
-            task_vma_retain_drm(right, &original);
+            task_vma_retain_file(right, &original);
             sysv_shm_vma_split(right);
             storage_inode_retain(right->inode);
-            if (right->audio_pcm) (void)audio_pcm_mmap_retain(right->audio_pcm,
-                                  (enum audio_pcm_mmap_region)right->audio_mmap_region);
+            if (right->device_mapping) (void)device_mapping_get(right->device_mapping);
             right->start = piece_end;
-            if (right->drm_bo)
-                right->device_physical = original.device_physical +
-                                         (piece_end - original.start);
-            if (right->audio_pcm) right->audio_mmap_length = right->end - right->start;
+            if(right->device_mapping)right->device_map_offset=original.device_map_offset+piece_end-original.start;
+            if (right->device_mapping)
+                right->device_physical = device_mapping_physical(right->device_mapping,right->device_map_offset);
             if (right->flags & TASK_VMA_FLAG_FILE) {
                 right->file_offset += piece_end - original.start;
             }
@@ -244,27 +240,25 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
         *vma = original;
         vma->start = cursor;
         vma->end = piece_end;
-        if (vma->drm_bo)
-            vma->device_physical = original.device_physical +
-                                   (cursor - original.start);
+        if (vma->device_mapping) {
+            vma->device_map_offset=original.device_map_offset+cursor-original.start;
+            vma->device_physical=device_mapping_physical(vma->device_mapping,vma->device_map_offset);
+        }
         if (vma->flags & TASK_VMA_FLAG_FILE) {
             vma->file_offset += cursor - original.start;
         }
         vma->prot = (uint32_t)prot;
-        if (vma->audio_pcm) {
-            vma->audio_mmap_length = piece_end - cursor;
-            vma->audio_mmap_prot = (uint32_t)prot;
-        }
         cursor = piece_end;
     }
     return 0;
 }
 
-/**
- * Syscall mm munmap.
- * @param addr Value supplied by the caller.
- * @param len Maximum number of elements available in the related buffer.
- * @return The value or status produced by the operation.
+/** @brief Remove user PTEs and release fully retired provider/device references.
+ * @param addr Page-aligned start in the execution-owned current user MM.
+ * @param len Nonzero byte length rounded to pages without aperture overflow.
+ * @return Zero or negative errno. Split-capability and free metadata are checked
+ * before modifying the VMA store; retained slices preserve provider offsets.
+ * Final backing/OFD puts may perform I/O and run without graph/module locks.
  */
 int64_t syscall_mm_munmap(uint64_t addr, uint64_t len)
 {
@@ -288,7 +282,7 @@ int64_t syscall_mm_munmap(uint64_t addr, uint64_t len)
     for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
         struct task_vma *vma = sched_task_vma_at(task, i);
         if (vma && vma->used && (vma->flags & TASK_VMA_FLAG_DEVICE) &&
-            !vma->audio_pcm && !vma->drm_bo &&
+            (!vma->device_mapping || !device_mapping_info(vma->device_mapping)->can_split) &&
             start < vma->end && end > vma->start &&
             (start > vma->start || end < vma->end))
             return -RELIEFOS_EOPNOTSUPP;
@@ -327,9 +321,9 @@ int64_t syscall_mm_munmap(uint64_t addr, uint64_t len)
             task_vma_clear(vma);
         } else if (remove_start == original.start) {
             vma->start = remove_end;
-            if (vma->drm_bo)
-                vma->device_physical = original.device_physical +
-                                       (remove_end - original.start);
+            if(vma->device_mapping)vma->device_map_offset=original.device_map_offset+remove_end-original.start;
+            if (vma->device_mapping)
+                vma->device_physical = device_mapping_physical(vma->device_mapping,vma->device_map_offset);
             if (vma->flags & TASK_VMA_FLAG_FILE) {
                 vma->file_offset += remove_end - original.start;
             }
@@ -341,22 +335,19 @@ int64_t syscall_mm_munmap(uint64_t addr, uint64_t len)
                 return -RELIEFOS_ENOMEM;
             }
             *right = original;
-            task_vma_retain_drm(right, &original);
+            task_vma_retain_file(right, &original);
             sysv_shm_vma_split(right);
             storage_inode_retain(right->inode);
-            if (right->audio_pcm) (void)audio_pcm_mmap_retain(right->audio_pcm,
-                                (enum audio_pcm_mmap_region)right->audio_mmap_region);
+            if (right->device_mapping) (void)device_mapping_get(right->device_mapping);
             right->start = remove_end;
-            if (right->drm_bo)
-                right->device_physical = original.device_physical +
-                                         (remove_end - original.start);
-            if (right->audio_pcm) right->audio_mmap_length = right->end - right->start;
+            if(right->device_mapping)right->device_map_offset=original.device_map_offset+remove_end-original.start;
+            if (right->device_mapping)
+                right->device_physical = device_mapping_physical(right->device_mapping,right->device_map_offset);
             if (right->flags & TASK_VMA_FLAG_FILE) {
                 right->file_offset += remove_end - original.start;
             }
             vma->end = remove_start;
         }
-        if (vma->audio_pcm) vma->audio_mmap_length = vma->end - vma->start;
     }
     return 0;
 }

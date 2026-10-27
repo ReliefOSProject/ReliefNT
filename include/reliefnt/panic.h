@@ -8,7 +8,9 @@
 #include <reliefnt/bugcheck.h>
 
 /**
- * @brief Print message and halt the kernel; never returns.
+ * @brief Enter the full kernel panic/bugcheck path without returning.
+ * @param message Borrowed diagnostic text passed to bugcheck_panic.
+ * Fatal kernel context; stops normal execution and uses the existing panic reporting/display policy. The caller must not expect cleanup or return.
  */
 __attribute__((noreturn)) void panic(const char *message);
 

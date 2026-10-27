@@ -70,6 +70,13 @@ for entry in $products; do
     fi
 done
 for generated_file in built-in.a .built-in.a.cmd \
+	vmlinux.a .vmlinux.a.cmd vmlinux.o .vmlinux.o.cmd \
+	.vmlinux.export.c .vmlinux.export.o ..vmlinux.export.o.cmd \
+	.vmlinux.objs ..vmlinux.objs.cmd .module-common.o ..module-common.o.cmd \
+	Module.symvers .Module.symvers.cmd System.map .System.map.cmd \
+	modules.order .modules.order.cmd modules.builtin .modules.builtin.cmd \
+	modules.builtin.modinfo .modules.builtin.modinfo.cmd modules.manifest \
+	.reliefnt-module-products.manifest \
 	.reliefnt-target-cc.id .reliefnt-target-ar.id .reliefnt-target-ld.id .reliefnt-target-objcopy.id; do
 	if [ -e "$resolved/$generated_file" ] || [ -L "$resolved/$generated_file" ]; then
 		printf '  remove %s\n' "$generated_file"

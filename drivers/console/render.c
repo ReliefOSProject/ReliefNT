@@ -205,7 +205,16 @@ void fb_console_show_tty_cursor(void)
     fb_console_tty_cursor_visible = true;
 }
 
-/** @brief Scroll the active text region on the current rendering surface. */
+/**
+ * @brief Scroll only the active text region with overlap-safe exact row copies.
+ * @par Context
+ * Caller serializes console state and retains the current rendering surface.
+ * Rows move upward, preserving padding and pixels outside the clipped region.
+ * Uses exact forward scalar word copies with a byte tail; no allocation,
+ * SIMD state or cache-attribute change. Full VRAM words avoid a separately
+ * emulated uncached read/write for each byte on hardware-assisted VMs.
+ * Forward reads precede their matching stores; upward row order preserves overlap.
+ */
 void fb_console_scroll(void)
 {
     const struct framebuffer *fb = fb_console_framebuffer();
@@ -244,9 +253,14 @@ void fb_console_scroll(void)
         const uint8_t *src = (const uint8_t *)fb->pixels +
                              (uint64_t)(src_y + y) * fb->pitch +
                              (uint64_t)fb_x * fb->bytes_per_pixel;
-        for (uint32_t byte = 0; byte < width * fb->bytes_per_pixel; ++byte) {
-            dst[byte] = src[byte];
-        }
+        size_t bytes = (size_t)width * fb->bytes_per_pixel;
+        size_t words = bytes / sizeof(uint64_t), tail = bytes % sizeof(uint64_t);
+        /* x86 permits unaligned scalar words; neither operation crosses the
+         * exact clipped extent, including 24-bit/padded framebuffer layouts. */
+        __asm__ volatile("cld; rep movsq"
+                         : "+D"(dst), "+S"(src), "+c"(words) : : "memory", "cc");
+        __asm__ volatile("rep movsb"
+                         : "+D"(dst), "+S"(src), "+c"(tail) : : "memory", "cc");
     }
 
     fb_row = bottom;

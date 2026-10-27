@@ -10,20 +10,17 @@
 #include <reliefnt/time.h>
 #include <reliefnt/audio.h>
 #include <reliefnt/lock.h>
-
-/* Weak allocation services preserve the original no-allocator fallback. */
-extern void *kernel_malloc(size_t size) __attribute__((weak));
-extern void kernel_free(void *memory) __attribute__((weak));
+#include <reliefnt/heap.h>
 
 #define AUDIO_PCM_MAX 32u
 #define AUDIO_PCM_BUFFER_BYTES 524288u
-#define AUDIO_PCM_BASE_BUFFER_BYTES 65536u
 #define AUDIO_PCM_BOUNDARY_BASE (1ULL << 60)
 #define AUDIO_PCM_MMAP_PAGE_BYTES 4096u
 #define AUDIO_PCM_PROT_READ 0x1u
 #define AUDIO_PCM_PROT_WRITE 0x2u
 
 struct audio_pcm {
+    struct module *code_owner;
     uint32_t live;
     uint32_t card;
     uint32_t stream;
@@ -36,7 +33,6 @@ struct audio_pcm {
     struct audio_format_caps format_caps;
     uint32_t explicit_format;
     struct audio_dma dma;
-    uint8_t buffer[AUDIO_PCM_BASE_BUFFER_BYTES] __attribute__((aligned(4096)));
     uint8_t *extended_buffer;
     void *extended_storage;
     uint64_t hw_ptr;
@@ -60,8 +56,9 @@ struct audio_pcm {
     uint32_t mapping_refs;
     uint32_t data_refs;
     uint32_t control_refs;
-    uint8_t status_page[4096] __attribute__((aligned(4096)));
-    uint8_t control_page[4096] __attribute__((aligned(4096)));
+    void *metadata_storage;
+    uint8_t *status_page;
+    uint8_t *control_page;
     uint32_t file_refs;
     uint32_t close_pending;
     int error;
@@ -72,17 +69,28 @@ struct audio_pcm {
 
 
 
-/* Host-side PCM fixtures do not link the kernel heap.  The weak declarations
- * keep their small inline-buffer paths self-contained while the kernel linker
- * resolves these calls to the real page-backed heap implementation. */
-
-
 extern struct audio_pcm pcm_slots[AUDIO_PCM_MAX];
 
+/** @brief Borrow the allocated PCM ring's CPU alias.
+ * @param pcm Stable caller-owned PCM, serialized against reconfiguration.
+ * @return Borrowed pointer or NULL before HW_PARAMS; no locks or ownership change.
+ */
 uint8_t *audio_pcm_buffer(struct audio_pcm *pcm);
 
+/** @brief Free data and metadata backing after all file/VMA/STOP leases retire.
+ * @param pcm Exclusively cleanup-owned PCM; allocations and provider pin cleared.
+ * Task context without the PCM or module registry lock; consumes owned memory.
+ */
 void audio_pcm_free_buffer(struct audio_pcm *pcm);
 
+/** @brief Prepare aligned page-backed data without publishing partial ownership.
+ * @param pcm Stable caller-owned PCM with serialized reconfiguration.
+ * @param bytes Validated nonzero ring bytes, bounded by AUDIO_PCM_BUFFER_BYTES.
+ * @param new_storage Owned allocation output, NULL when existing backing reused.
+ * @param new_buffer Borrowed aligned CPU alias for that owner.
+ * @return Zero or EINVAL/ENOMEM. Task context without locks; caller commits or
+ * frees new_storage on every later failure, leaving existing mappings intact.
+ */
 int audio_pcm_prepare_buffer(struct audio_pcm *pcm, uint32_t bytes,
                                     void **new_storage, uint8_t **new_buffer);
 

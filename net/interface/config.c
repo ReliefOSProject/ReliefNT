@@ -1,3 +1,4 @@
+#include <reliefnt/kernel_file.h>
 #include "../internal.h"
 
 /**
@@ -31,9 +32,10 @@ static int net_value_eq(const char *value, uint32_t len, const char *expected);
 static int net_parse_ipv4(const char *text, uint32_t len, uint32_t *out_ip);
 
 /**
- * Net load dns policy file.
- * @param path NUL-terminated text supplied by the caller.
- * @return The value or status produced by the operation.
+ * @brief Parse bounded DNS policy through one retained namespace/open instance.
+ * @param path Absolute trusted configuration filename, required.
+ * @return Zero or minus one for lookup/type/read failure. Runs synchronously
+ * under execution ownership; no bare inode or pathname escapes the reader.
  */
 static int net_load_dns_policy_file(const char *path);
 
@@ -131,23 +133,18 @@ static int net_parse_ipv4(const char *text, uint32_t len, uint32_t *out_ip)
 }
 
 /**
- * Net load dns policy file.
- * @param path NUL-terminated text supplied by the caller.
- * @return The value or status produced by the operation.
+ * @brief Parse bounded DNS policy through one retained namespace/open instance.
+ * @param path Absolute trusted configuration filename, required.
+ * @return Zero or minus one for lookup/type/read failure. Runs synchronously
+ * under execution ownership; no bare inode or pathname escapes the reader.
  */
 static int net_load_dns_policy_file(const char *path)
 {
-    struct storage_node node;
     char cfg[NET_NETWORK_CONFIG_MAX];
     uint32_t got = 0;
     uint32_t pos = 0;
 
-    if (!path || !storage_ready() ||
-        storage_lookup_path(path, &node) < 0 ||
-        node.type != RELIEFOS_FS_TYPE_FILE) {
-        return -1;
-    }
-    if (storage_read_node(&node, 0, cfg, sizeof(cfg) - 1u, &got) < 0) {
+    if (vfs_kernel_read(vfs_system_namespace(),path,0,cfg,sizeof(cfg)-1u,&got)<0) {
         return -1;
     }
     cfg[got] = 0;

@@ -35,3 +35,6 @@ HOSTLDLIBS_sidecar_directory_runtime_test := -Wl,--gc-sections
 hostprogs += boot_root_runtime_test
 boot_root_runtime_test-objs := boot_root_runtime_test.o boot_root_parser.o boot_root_devlinks.o
 $(foreach item,boot_root_runtime_test boot_root_parser boot_root_devlinks,$(eval HOSTCFLAGS_$(item).o := -std=gnu11 -O2 -g -Wall -Wextra -Werror -I$(srctree)/include -I$(srctree)/include/uapi))
+
+# Native developer modules are enabled only by the opt-in parent tools traversal.
+obj-$(CONFIG_MODULE_TESTS) += kmodules/

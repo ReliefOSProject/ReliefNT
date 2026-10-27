@@ -13,8 +13,11 @@ class ProcfsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="reliefos-procfs-") as directory:
             executable = str(Path(directory) / "procfs")
             subprocess.run(["cc", "-std=c11", "-O1", "-g", "-fsanitize=address,undefined",
+                            "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
                             "-Iinclude", "-Iinclude", "-Iinclude/uapi", "-Iinclude",
-                            "tools/tests/procfs_directories_test.c", "-o", executable],
+                            "tools/tests/procfs_directories_test.c", "fs/vfs/mount_tree.c", "fs/vfs/mount_table.c",
+                            "fs/vfs/path.c", "fs/vfs/file.c", "fs/vfs/open.c", "fs/vfs/pseudo.c", "fs/vfs/attributes.c", "fs/proc/mount.c",
+                            "kernel/sched/identity.c", "fs/security/access.c", "-o", executable],
                            cwd=ROOT, check=True)
             subprocess.run([executable], check=True, timeout=10)
 

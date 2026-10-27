@@ -103,6 +103,21 @@ bool paging_kernel_direct_map_range(uint64_t phys, uint64_t len);
  * @brief Translate a physical address to the supervisor-only shared kernel direct map, or NULL.
  */
 void *paging_kernel_direct_map(uint64_t phys);
+/** @brief Map validated high PCI BAR pages outside the RAM/module virtual windows.
+ * @param physical Page-aligned device base at or beyond the direct-map extent.
+ * @param bytes Nonzero page-aligned device length, entirely representable by PTEs.
+ * @return Owned supervisor UC/RW/NX mapping or NULL, shared by existing and future
+ * process CR3s. Task context after heap/MM initialization, no physical RAM ownership.
+ * Caller validates the BAR and drains device/users before exact unmap.
+ */
+void *paging_ioremap_uc(uint64_t physical, uint64_t bytes);
+/** @brief Remove one exact owned high PCI BAR mapping after device/users stop.
+ * @param pointer Base returned by paging_ioremap_uc; other/stale bases rejected.
+ * @param bytes Original full page-aligned mapping length.
+ * @return True if retired, false for an unknown base/length. Task context, all CPU
+ * TLBs synchronized before owned table pages are freed; no device page is freed.
+ */
+bool paging_iounmap(void *pointer, uint64_t bytes);
 /** @brief Switch later MMIO page-table splits to the physical allocator.
  * @return None. Call once after successful physical allocator initialization;
  * the early page-table reserve then remains pinned in the kernel image.
@@ -145,6 +160,33 @@ bool paging_acquire_mmio(uint64_t phys, uint64_t len);
  * device RAM is never freed.
  */
 void paging_release_mmio(uint64_t phys, uint64_t len);
+
+/** @brief Map an allocator-owned RAM page RW/NX in the shared supervisor module window.
+ * @param address Page-aligned module virtual address.
+ * @param physical Owned aligned RAM page below the direct-map limit.
+ * @param original_alias Required output for original direct-map PTE flags.
+ * @return True on success; task context, synchronizes CPUs, no RAM ownership transfer.
+ */
+bool paging_module_map_page(uint64_t address, uint64_t physical, uint64_t *original_alias);
+/** @brief Query an existing supervisor module mapping under the shared-map lock.
+ * @param address Aligned virtual page in the module window.
+ * @param physical Optional output for physical backing.
+ * @param flags Optional output for leaf flags excluding physical address.
+ * @return True for a mapped page; no allocation or ownership transfer.
+ */
+bool paging_module_page(uint64_t address, uint64_t *physical, uint64_t *flags);
+/** @brief Set module and alias permissions with a globally synchronized RO/NX transition.
+ * @param address Aligned mapped module page; caller excludes execution during transitions.
+ * @param flags Zero for RX, NOEXEC for RO/NX, WRITABLE|NOEXEC for RW/NX.
+ * @return True on success; rejects USER/W+X/unknown flags without modification.
+ */
+bool paging_module_protect_page(uint64_t address, uint64_t flags);
+/** @brief Remove a quiescent module leaf and reclaim empty private branch tables.
+ * @param address Aligned module page with no external users or execution pins.
+ * @param original_alias Flags returned by the matching successful map.
+ * @return Removed physical page or zero; caller retains/frees RAM after TLB synchronization.
+ */
+uint64_t paging_module_unmap_page(uint64_t address, uint64_t original_alias);
 
 /**
  * @brief Allocate and initialize an empty address space; true on success.

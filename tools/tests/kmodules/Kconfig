@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+menuconfig MODULE_TESTS
+    bool "Native module developer tests"
+    depends on MODULES
+    default n
+    help
+      Opt-in test components. Production defconfig does not build them.
+
+if MODULE_TESTS
+config MODULE_TEST_PROVIDER
+    tristate "Composite exported-symbol provider"
+config MODULE_TEST_CONSUMER
+    tristate "Export consumer"
+    depends on MODULE_TEST_PROVIDER
+config MODULE_TEST_INIT_FAIL
+    tristate "Failed initialization test"
+config MODULE_TEST_BUSY
+    tristate "Lifetime test module"
+config MODULE_TEST_STANDALONE
+    tristate "Native address-space test module"
+config MODULE_TEST_PARAMETERS
+    tristate "Typed parameter test module"
+endif

@@ -1,3 +1,4 @@
+#include <reliefnt/export.h>
 /*
  * ReliefOS x86_64 paging: builds kernel and per-process address spaces.
  * Maps user pages, enforces NX/W^X permissions, and handles page protection.
@@ -8,6 +9,7 @@
 #include <reliefnt/smp.h>
 #include <reliefnt/lock.h>
 #include <reliefnt/heap.h>
+#include "internal.h"
 
 #define PAGE_SIZE 4096ULL
 #define PAGE_SIZE_2M 0x200000ULL
@@ -256,12 +258,22 @@ void paging_load_cr3_if_changed(uint64_t cr3)
     paging_load_cr3(value);
 }
 
+/** @brief Check a physical extent against the inherited supervisor RAM window.
+ * @param phys Physical start, not a CPU pointer. @param len Bytes including zero.
+ * @return True iff the complete extent fits, without overflow. Pure metadata
+ * check; does not prove allocation/RAM ownership or admit high MMIO mappings.
+ */
 bool paging_kernel_direct_map_range(uint64_t phys, uint64_t len)
 {
     return phys < RELIEFNT_KERNEL_DIRECT_MAP_SIZE &&
            len <= RELIEFNT_KERNEL_DIRECT_MAP_SIZE - phys;
 }
 
+/** @brief Translate an admitted physical byte into the shared supervisor window.
+ * @param phys Physical address, not an arbitrary CPU or MMIO pointer.
+ * @return Borrowed mapping or NULL outside the window; no allocation/reference
+ * or page ownership transfer. Caller owns physical backing for all accesses.
+ */
 void *paging_kernel_direct_map(uint64_t phys)
 {
     if (!paging_kernel_direct_map_range(phys, 1)) {
@@ -1641,3 +1653,272 @@ bool address_space_handle_cow_fault(struct address_space *as, uint64_t vaddr)
     else mm_free_page(old_phys);
     return true;
 }
+
+/** @brief Find or construct a supervisor leaf in the inherited high-half PDPT under mmio_lock.
+ * @param address Validated aligned reserved high-half virtual page (module/device).
+ * @param create True to allocate missing PD/PT pages from the physical allocator.
+ * @return Borrowed leaf or NULL; failed creation rolls back its new branch.
+ */
+static uint64_t *kernel_shared_leaf(uint64_t address,bool create)
+{
+    uint64_t *pdpte=&kernel_pdpt[(address>>30)&511u];
+    bool new_pd=false;
+    if(!(*pdpte&RELIEFNT_PAGE_PRESENT)) {
+        if(!create) return NULL;
+        uint64_t physical=mm_alloc_page();
+        if(!physical) return NULL;
+        uint64_t *table=mm_phys_to_virt(physical);
+        if(!table) { mm_free_page(physical); return NULL; }
+        zero_table(table);
+        *pdpte=physical|RELIEFNT_PAGE_PRESENT|RELIEFNT_PAGE_WRITABLE|RELIEFNT_PAGE_TABLE_OWNED;
+        new_pd=true;
+    }
+    if(*pdpte&(PAGE_SIZE_FLAG|RELIEFNT_PAGE_USER)) return NULL;
+    uint64_t *pd=mm_phys_to_virt(*pdpte&RELIEFNT_PHYS_ADDR_MASK);
+    if(!pd) return NULL;
+    uint64_t *pde=&pd[(address>>21)&511u];
+    if(!(*pde&RELIEFNT_PAGE_PRESENT)) {
+        if(!create) return NULL;
+        uint64_t physical=mm_alloc_page();
+        uint64_t *table=physical ? mm_phys_to_virt(physical) : NULL;
+        if(!table) {
+            if(physical) mm_free_page(physical);
+            if(new_pd) {
+                uint64_t old=*pdpte&RELIEFNT_PHYS_ADDR_MASK;
+                *pdpte=0; smp_flush_user_tlb(); mm_free_page(old);
+            }
+            return NULL;
+        }
+        zero_table(table);
+        *pde=physical|RELIEFNT_PAGE_PRESENT|RELIEFNT_PAGE_WRITABLE|RELIEFNT_PAGE_TABLE_OWNED;
+    }
+    if(*pde&(PAGE_SIZE_FLAG|RELIEFNT_PAGE_USER)) return NULL;
+    uint64_t *pt=mm_phys_to_virt(*pde&RELIEFNT_PHYS_ADDR_MASK);
+    return pt ? &pt[(address>>12)&511u] : NULL;
+}
+/** @brief Test whether a dynamically owned shared table has any remaining entries.
+ * @param table Stable 512-entry page-table page under mmio_lock.
+ * @return True when entirely empty, allowing reclamation after TLB synchronization.
+ */
+static bool kernel_shared_table_empty(const uint64_t *table)
+{
+    for(uint32_t i=0;i<512;++i) if(table[i]) return false;
+    return true;
+}
+
+/** @brief Validate one complete reserved supervisor-only device virtual page.
+ * @param address Candidate virtual device page.
+ * @return True for an aligned address in the device-only high-half window.
+ */
+static bool io_page_address(uint64_t address)
+{
+    return address >= RELIEFNT_IOREMAP_BASE && address < RELIEFNT_IOREMAP_END &&
+        !(address & (PAGE_SIZE - 1));
+}
+
+/** @brief Install a high device page UC/RW/NX without constructing a RAM alias.
+ * @param address Valid aligned reserved device virtual page, currently absent.
+ * @param physical Aligned representable physical BAR page beyond the direct map.
+ * @return True or false; short map lock spans table allocation. The caller owns
+ * the range and synchronizes all CPU TLBs before publication; no device RAM owner.
+ */
+bool paging_io_map_page(uint64_t address, uint64_t physical)
+{
+    if (!nx_enabled || !io_page_address(address) ||
+        physical < RELIEFNT_KERNEL_DIRECT_MAP_SIZE ||
+        (physical & ~RELIEFNT_PHYS_ADDR_MASK)) return false;
+    kernel_spin_lock(&mmio_lock);
+    uint64_t *pte = kernel_shared_leaf(address, true);
+    if (!pte || *pte) { kernel_spin_unlock(&mmio_lock); return false; }
+    *pte = physical | RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE |
+        RELIEFNT_PAGE_NOEXEC | RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_PWT;
+    kernel_spin_unlock(&mmio_lock);
+    return true;
+}
+
+/** @brief Retire a complete stopped BAR with one CPU-wide TLB synchronization.
+ * @param address Aligned reserved virtual base, all mapping users retired.
+ * @param bytes Nonzero page-aligned extent entirely within the device window.
+ * @return True if removed, false if invalid/partly absent, without mutation on
+ * rejection. Empty owned tables are detached before the single shootdown and
+ * freed only after it; physical device pages are never freed or dereferenced.
+ */
+bool paging_io_unmap_range(uint64_t address, uint64_t bytes)
+{
+    if (!io_page_address(address) || !bytes || (bytes & (PAGE_SIZE - 1)) ||
+        bytes > RELIEFNT_IOREMAP_END - address) return false;
+    kernel_spin_lock(&mmio_lock);
+    for (uint64_t offset = 0; offset < bytes; offset += PAGE_SIZE) {
+        uint64_t *pte = kernel_shared_leaf(address + offset, false);
+        if (!pte || !(*pte & RELIEFNT_PAGE_PRESENT)) {
+            kernel_spin_unlock(&mmio_lock); return false;
+        }
+    }
+    for (uint64_t offset = 0; offset < bytes; offset += PAGE_SIZE)
+        *kernel_shared_leaf(address + offset, false) = 0;
+    uint64_t retired = 0;
+    for (uint64_t at = address; at < address + bytes;) {
+        uint64_t *pdpte = &kernel_pdpt[(at >> 30) & 511u];
+        if (*pdpte & RELIEFNT_PAGE_PRESENT) {
+            uint64_t pd_phys = *pdpte & RELIEFNT_PHYS_ADDR_MASK;
+            uint64_t *pd = mm_phys_to_virt(pd_phys);
+            uint64_t *pde = &pd[(at >> 21) & 511u];
+            if ((*pde & (RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_TABLE_OWNED)) ==
+                (RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_TABLE_OWNED)) {
+                uint64_t pt_phys = *pde & RELIEFNT_PHYS_ADDR_MASK;
+                uint64_t *pt = mm_phys_to_virt(pt_phys);
+                if (kernel_shared_table_empty(pt)) {
+                    *pde = 0;
+                    /* Retired tables form an allocation-free physical list.
+                     * Aligned next-page values have PRESENT=0, so speculative
+                     * old walks cannot interpret list links as valid entries. */
+                    pt[0] = retired; retired = pt_phys;
+                }
+            }
+            if ((*pdpte & RELIEFNT_PAGE_TABLE_OWNED) && kernel_shared_table_empty(pd)) {
+                *pdpte = 0;
+                pd[0] = retired; retired = pd_phys;
+            }
+        }
+        at = (at & ~(PAGE_SIZE_2M - 1)) + PAGE_SIZE_2M;
+    }
+    smp_flush_user_tlb();
+    while (retired) {
+        uint64_t *table = mm_phys_to_virt(retired);
+        uint64_t next = table[0];
+        mm_free_page(retired); retired = next;
+    }
+    kernel_spin_unlock(&mmio_lock);
+    return true;
+}
+
+#ifdef CONFIG_MODULES
+/* The module window lives in the already-shared high-half PDPT, so adding a
+ * module never requires patching existing process PML4s. Physical aliases
+ * share the normal identity/direct-map leaves and are protected together. */
+#include <reliefnt/module_memory.h>
+_Static_assert((RELIEFNT_MODULE_BASE>>39)==(RELIEFNT_KERNEL_DIRECT_MAP_BASE>>39),
+               "module mappings must share the inherited kernel PML4 branch");
+_Static_assert(RELIEFNT_MODULE_BASE>=RELIEFNT_KERNEL_DIRECT_MAP_BASE+RELIEFNT_KERNEL_DIRECT_MAP_SIZE,
+               "module window overlaps physical direct map");
+_Static_assert(((RELIEFNT_MODULE_END-1)>>39)==(RELIEFNT_MODULE_BASE>>39),
+               "module window crosses the inherited branch");
+
+/** @brief Test an aligned virtual page against the reserved module window.
+ * @param address Candidate virtual page.
+ * @return True for an aligned complete page in the window; no locks.
+ */
+static bool module_page_address(uint64_t address)
+{
+    return address>=RELIEFNT_MODULE_BASE && address<RELIEFNT_MODULE_END &&
+           !(address&(PAGE_SIZE-1));
+}
+/** @brief Map one privately owned physical page RW/NX and remove executable aliases.
+ * @param address Aligned virtual module page, not already mapped.
+ * @param physical Allocator-owned RAM page within the supervisor direct map.
+ * @param original_alias Required output retaining original alias flags for release.
+ * @return True on success; does not take ownership of physical RAM. Task context.
+ */
+bool paging_module_map_page(uint64_t address,uint64_t physical,uint64_t *original_alias)
+{
+    if(!nx_enabled || !module_page_address(address) || !physical ||
+       (physical&(PAGE_SIZE-1)) || !paging_kernel_direct_map_range(physical,PAGE_SIZE) ||
+       !original_alias) return false;
+    kernel_spin_lock(&mmio_lock);
+    for(uint32_t i=0;i<mmio_run_count;++i) if(physical>=mmio_runs[i].start && physical<mmio_runs[i].end) {
+        kernel_spin_unlock(&mmio_lock); return false;
+    }
+    uint64_t *alias=mmio_leaf(physical);
+    if(!alias || !(*alias&RELIEFNT_PAGE_PRESENT) ||
+       (*alias&(RELIEFNT_PAGE_USER|RELIEFNT_PAGE_PCD|RELIEFNT_PAGE_PWT))) {
+        kernel_spin_unlock(&mmio_lock); return false;
+    }
+    uint64_t *pte=kernel_shared_leaf(address,true);
+    if(!pte || *pte) { kernel_spin_unlock(&mmio_lock); return false; }
+    *original_alias=*alias&~RELIEFNT_PHYS_ADDR_MASK;
+    *alias|=RELIEFNT_PAGE_NOEXEC|RELIEFNT_PAGE_WRITABLE;
+    *pte=physical|RELIEFNT_PAGE_PRESENT|RELIEFNT_PAGE_WRITABLE|RELIEFNT_PAGE_NOEXEC;
+    smp_flush_user_tlb();
+    kernel_spin_unlock(&mmio_lock); return true;
+}
+/** @brief Query a stable module leaf under the shared map lock.
+ * @param address Aligned module virtual page.
+ * @param physical Optional output for backing page.
+ * @param flags Optional output for complete non-address PTE bits.
+ * @return True only for an existing present supervisor leaf; no ownership transfer.
+ */
+bool paging_module_page(uint64_t address,uint64_t *physical,uint64_t *flags)
+{
+    if(!module_page_address(address)) return false;
+    kernel_spin_lock(&mmio_lock);
+    uint64_t *pte=kernel_shared_leaf(address,false);
+    bool found=pte && (*pte&RELIEFNT_PAGE_PRESENT) && !(*pte&RELIEFNT_PAGE_USER);
+    if(found) {
+        if(physical) *physical=*pte&RELIEFNT_PHYS_ADDR_MASK;
+        if(flags) *flags=*pte&~RELIEFNT_PHYS_ADDR_MASK;
+    }
+    kernel_spin_unlock(&mmio_lock); return found;
+}
+/** @brief Seal module and physical aliases using a globally synchronized RO/NX intermediate state.
+ * @param address Mapped module virtual page whose execution is excluded by caller.
+ * @param flags Final leaf permissions; only W and NX bits are accepted.
+ * @return True on success, false without changes for invalid flags/missing mapping.
+ * Task context; a CPU cannot retain writable aliases when RX becomes visible.
+ */
+bool paging_module_protect_page(uint64_t address,uint64_t flags)
+{
+    if(!module_page_address(address) || flags&~(RELIEFNT_PAGE_WRITABLE|RELIEFNT_PAGE_NOEXEC) ||
+       ((flags&RELIEFNT_PAGE_WRITABLE) && !(flags&RELIEFNT_PAGE_NOEXEC))) return false;
+    kernel_spin_lock(&mmio_lock);
+    uint64_t *pte=kernel_shared_leaf(address,false);
+    uint64_t physical=pte ? *pte&RELIEFNT_PHYS_ADDR_MASK : 0;
+    uint64_t *alias=physical ? mmio_existing_leaf(physical) : NULL;
+    if(!pte || !(*pte&RELIEFNT_PAGE_PRESENT) || !alias) {
+        kernel_spin_unlock(&mmio_lock); return false;
+    }
+    *alias=(*alias|RELIEFNT_PAGE_NOEXEC)&~RELIEFNT_PAGE_WRITABLE;
+    *pte=physical|RELIEFNT_PAGE_PRESENT|RELIEFNT_PAGE_NOEXEC;
+    smp_flush_user_tlb();
+    if(flags!=RELIEFNT_PAGE_NOEXEC) {
+        if(flags&RELIEFNT_PAGE_WRITABLE) *alias|=RELIEFNT_PAGE_WRITABLE;
+        *pte=physical|RELIEFNT_PAGE_PRESENT|flags;
+        smp_flush_user_tlb();
+    }
+    kernel_spin_unlock(&mmio_lock); return true;
+}
+/** @brief Unmap quiescent module RAM before restoring aliases and reclaiming empty tables.
+ * @param address Aligned module virtual page with no admitted users/execution.
+ * @param original_alias Non-address flags saved by successful map.
+ * @return Removed physical page, still caller-owned, or zero for absent input.
+ */
+uint64_t paging_module_unmap_page(uint64_t address,uint64_t original_alias)
+{
+    if(!module_page_address(address)) return 0;
+    kernel_spin_lock(&mmio_lock);
+    uint64_t *pte=kernel_shared_leaf(address,false);
+    if(!pte || !(*pte&RELIEFNT_PAGE_PRESENT)) {
+        kernel_spin_unlock(&mmio_lock); return 0;
+    }
+    uint64_t physical=*pte&RELIEFNT_PHYS_ADDR_MASK;
+    uint64_t *alias=mmio_existing_leaf(physical);
+    uint64_t *pdpte=&kernel_pdpt[(address>>30)&511u];
+    uint64_t pd_phys=*pdpte&RELIEFNT_PHYS_ADDR_MASK;
+    uint64_t *pd=mm_phys_to_virt(pd_phys);
+    uint64_t *pde=&pd[(address>>21)&511u];
+    uint64_t pt_phys=*pde&RELIEFNT_PHYS_ADDR_MASK;
+    uint64_t *pt=mm_phys_to_virt(pt_phys);
+    *pte=0;
+    bool free_pt=kernel_shared_table_empty(pt),free_pd=false;
+    if(free_pt) { *pde=0; free_pd=kernel_shared_table_empty(pd); if(free_pd) *pdpte=0; }
+    smp_flush_user_tlb(); /* Retire executable translations before restoring writable aliases. */
+    if(alias) *alias=physical|(original_alias&~RELIEFNT_PHYS_ADDR_MASK);
+    smp_flush_user_tlb();
+    if(free_pt) mm_free_page(pt_phys);
+    if(free_pd) mm_free_page(pd_phys);
+    kernel_spin_unlock(&mmio_lock); return physical;
+}
+#endif
+
+EXPORT_SYMBOL(paging_kernel_direct_map);
+
+EXPORT_SYMBOL(paging_kernel_direct_map_range);

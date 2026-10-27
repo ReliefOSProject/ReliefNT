@@ -57,60 +57,54 @@ int64_t syscall_openat2(uint64_t dirfd, uint64_t pathname,
 }
 
 /**
- * @brief Set inode timestamps by pathname, empty-path handle, or Linux futimens fd.
- * @param task Caller whose identity controls timestamp permissions.
+ * @brief Set held inode timestamps by pathname, empty-path or futimens FD.
+ * @param task Borrowed caller whose fsuid/capabilities authorize the update.
  * @param dirfd Directory fd or the target fd when path_ptr is NULL.
  * @param path_ptr User pathname, or NULL for an fd-only operation.
  * @param times Validated access/modification times, with UTIME_NOW/UTIME_OMIT.
  * @param flags Lookup flags; fd-only operations require zero.
  * @param times_supplied Caller explicitly supplied the times vector.
- * @return Zero or a negative lookup, descriptor, permission, or storage error.
+ * @return Zero or negative errno. The common scope retains the exact operand
+ * across metadata waits, including a directory renamed while the call waits.
+ * No diagnostic name replay or graph/module lock spans provider I/O; times
+ * are rounded to the existing backend's whole-second timestamp resolution.
  */
 int64_t syscall_update_path_times(struct task *task, int32_t dirfd, uint64_t path_ptr,
                                          const struct linux_timespec times[2], uint32_t flags,
                                          bool times_supplied)
 {
-    struct storage_node node;
-    char path[RELIEFOS_FS_PATH_LEN];
     if (flags & ~(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH))
         return -RELIEFOS_EINVAL;
+    struct vfs_lookup_result found={0};
     int ret;
-    struct task_file *file = NULL;
     if (!path_ptr && dirfd != LINUX_AT_FDCWD) {
         /* Linux do_utimes_fd: futimens uses a NULL pathname, not AT_EMPTY_PATH. */
         if (flags) return -RELIEFOS_EINVAL;
-        file = task_file_for_fd(task, dirfd);
+        struct task_file *file = task_file_for_io(task, dirfd);
         if (!file || (file->flags & TASK_FILE_FLAG_PATH)) return -RELIEFOS_EBADF;
-        copy_text(path, sizeof(path), file->path);
+        ret=resolve_kernel_object_at_flags(vfs_system_namespace(),task,dirfd,"",true,false,0,&found);
     } else {
-        ret = resolve_user_path_at_flags(task, dirfd, path_ptr, flags & LINUX_AT_EMPTY_PATH,
-                                        path, &file, false,
-                                        flags & LINUX_AT_SYMLINK_NOFOLLOW ? 0 : FS_LOOKUP_FOLLOW);
-        if (ret < 0) return ret;
+        ret=resolve_user_object_at_flags(vfs_system_namespace(),task,dirfd,path_ptr,
+            (flags&LINUX_AT_EMPTY_PATH)!=0,false,flags&LINUX_AT_SYMLINK_NOFOLLOW ? 0 : VFS_LOOKUP_FOLLOW,&found);
     }
-    if (file) {
-        node = file->node;
-        ret = storage_inode_refresh(&node);
-    } else ret = storage_lookup_path(path, &node);
     if (ret < 0) return ret;
     struct reliefos_permissions perms;
-    ret = fs_permissions_get(path, &node, &perms);
-    if (ret < 0) return ret;
-    if (task && task->euid != 0 && task->euid != perms.uid) {
+    ret = vfs_path_permissions(&found.path,&perms,false);
+    if (!ret && task && task->fsuid != perms.uid && !(task->cap_effective&(1ULL<<CAP_FOWNER))) {
         bool explicit_time = false;
         if (times_supplied) {
             explicit_time = (times[0].tv_nsec != 1073741823 && times[0].tv_nsec != 1073741822) ||
                             (times[1].tv_nsec != 1073741823 && times[1].tv_nsec != 1073741822);
         }
-        if (explicit_time) return -RELIEFOS_EPERM;
-        ret = fs_permissions_check_node(task, path, &node, FS_ACCESS_WRITE, false);
-        if (ret < 0) return ret;
+        ret=explicit_time ? -RELIEFOS_EPERM : fs_permissions_check_path(task,&found.path,FS_ACCESS_WRITE,false);
     }
     struct reliefos_time_info now;
-    if (time_wall_clock(&now) < 0) return -RELIEFOS_EIO;
-    int64_t atime = times[0].tv_nsec == 1073741823 ? now.unix_seconds : times[0].tv_sec;
-    int64_t mtime = times[1].tv_nsec == 1073741823 ? now.unix_seconds : times[1].tv_sec;
-    bool set_atime = times[0].tv_nsec != 1073741822;
-    bool set_mtime = times[1].tv_nsec != 1073741822;
-    return storage_inode_utimensat(&node, atime, mtime, set_atime, set_mtime);
+    bool need_now=times[0].tv_nsec==1073741823 || times[1].tv_nsec==1073741823;
+    if (!ret && need_now && time_wall_clock(&now)<0)ret=-RELIEFOS_EIO;
+    if (!ret) {
+        int64_t atime = times[0].tv_nsec == 1073741823 ? now.unix_seconds : times[0].tv_sec;
+        int64_t mtime = times[1].tv_nsec == 1073741823 ? now.unix_seconds : times[1].tv_sec;
+        ret=vfs_path_utimens(&found.path,atime,mtime,times[0].tv_nsec!=1073741822,times[1].tv_nsec!=1073741822);
+    }
+    vfs_path_put(&found.path);return ret;
 }

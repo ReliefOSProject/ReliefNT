@@ -1,3 +1,4 @@
+#include <reliefnt/export.h>
 #include "device.h"
 #include <reliefnt/heap.h>
 
@@ -527,6 +528,9 @@ int svga_batch_operation_reserve(struct svga_batch *batch,
  * @param source_bytes Accepted source size in bytes, at most 64 KiB.
  * @return Zero on success, SVGA_EINVAL for invalid bounds, or SVGA_ENOMEM for
  *         metadata reservation/allocation failure.
+ * Task/execution context for module callers; never enter with the SVGA lock held.
+ * Caller retains resources/backing and its independent module call pin through
+ * return, and through the real fence or successful teardown when asynchronous.
  */
 int svga_batch_init_sized(struct svga_batch *batch, uint32_t generation,
                           uint32_t *storage, uint32_t output_capacity,
@@ -639,6 +643,9 @@ int svga_batch_init(struct svga_batch *batch, uint32_t generation,
  * @param bytes Payload length in bytes.
  * @return Zero on append, SVGA_ENOMEM for output exhaustion, or SVGA_EINVAL
  *         for malformed batch/payload state.
+ * Task/execution context for module callers; never enter with the SVGA lock held.
+ * Caller retains resources/backing and its independent module call pin through
+ * return, and through the real fence or successful teardown when asynchronous.
  */
 int svga_batch_append(struct svga_batch *batch, uint32_t command, bool three_d,
                       const void *payload, uint32_t bytes)
@@ -1081,6 +1088,9 @@ int svga_batch_submit_locked(struct svga_batch *batch, svga_handle *fence)
  * @param fence Writable output for the issued fence token.
  * @return Zero after commit, SVGA_EBUSY for retryable pressure, or a negative
  *         SVGA error; an unsubmitted batch remains available for retry/abort.
+ * Task/execution context for module callers; never enter with the SVGA lock held.
+ * Caller retains resources/backing and its independent module call pin through
+ * return, and through the real fence or successful teardown when asynchronous.
  */
 int svga_batch_submit(struct svga_batch *batch, svga_handle *fence)
 {
@@ -1120,6 +1130,9 @@ int svga_batch_submit(struct svga_batch *batch, svga_handle *fence)
  * @brief Abort staged work and reclaim all unpublished shader backing.
  * @param batch Open unsubmitted batch to discard.
  * @return Zero after release or SVGA_EBUSY if the first lock attempt fails.
+ * Task/execution context for module callers; never enter with the SVGA lock held.
+ * Caller retains resources/backing and its independent module call pin through
+ * return, and through the real fence or successful teardown when asynchronous.
  */
 int svga_batch_abort(struct svga_batch *batch)
 {
@@ -1168,6 +1181,9 @@ bool svga_fence_reached_locked(svga_handle fence)
  * @param signaled Writable completion output, false for an unfinished token.
  * @return Zero on a valid issued token, SVGA_EINVAL for an unissued token,
  *         SVGA_EIO for stale generation, or a negative SVGA error.
+ * Task/execution context for module callers; never enter with the SVGA lock held.
+ * Caller retains resources/backing and its independent module call pin through
+ * return, and through the real fence or successful teardown when asynchronous.
  */
 int svga_fence_status(svga_handle fence, bool *signaled)
 {
@@ -1189,6 +1205,9 @@ int svga_fence_status(svga_handle fence, bool *signaled)
  * @brief Read generation and raw issued/passed fence progress under svga_lock.
  * @param out Writable snapshot output.
  * @return Zero on success or a negative SVGA error for lock/FIFO state.
+ * Task/execution context for module callers; never enter with the SVGA lock held.
+ * Caller retains resources/backing and its independent module call pin through
+ * return, and through the real fence or successful teardown when asynchronous.
  */
 int svga_fence_progress_snapshot(struct svga_fence_progress *out)
 {
@@ -1210,6 +1229,12 @@ int svga_fence_progress_snapshot(struct svga_fence_progress *out)
     return ret;
 }
 
+/**
+ * @brief Test recorded reset-era hardware quiescence for a generation-tagged fence.
+ * @param fence Original nonzero generation/sequence token.
+ * @return True only for a covered quiescence record; false for invalid tokens, missing proof or lock contention.
+ * Task context for module callers; try-lock only, no wait or allocation. False never authorizes releasing DMA backing.
+ */
 bool svga_fence_is_quiesced(svga_handle fence)
 {
     uint32_t generation = (uint32_t)(fence >> 32);
@@ -1235,6 +1260,9 @@ bool svga_fence_is_quiesced(svga_handle fence)
  * @param out Writable generation-tagged token for the newly issued fence.
  * @return Zero on commit, SVGA_EBUSY for transient lock/FIFO pressure, or a
  *         negative SVGA error. A failed call publishes no FIFO words.
+ * Task/execution context for module callers; never enter with the SVGA lock held.
+ * Caller retains resources/backing and its independent module call pin through
+ * return, and through the real fence or successful teardown when asynchronous.
  */
 int svga_fence_try_insert(svga_handle *out)
 {
@@ -1339,6 +1367,13 @@ void svga_batch_rollback_references(struct svga_batch *batch,
         SVGA_BATCH_GMR_HASH_CAPACITY, metadata->gmrs, gmrs);
 }
 
+/**
+ * @brief Record a deduplicated context handle for submit-time validation.
+ * @param batch Exclusively owned open batch with allocated metadata.
+ * @param context Borrowed nonzero handle, externally kept alive through submission/completion.
+ * @return Zero, EINVAL for malformed batch/input, or ENOMEM for metadata capacity exhaustion.
+ * Execution-owned task context, exclusive batch mutation. This records a handle; the caller separately retains backing/code ownership through the real GPU fence.
+ */
 int svga_batch_retain_context(struct svga_batch *batch, svga_handle context)
 {
     struct svga_batch_metadata *metadata = batch ? batch->metadata : NULL;
@@ -1349,6 +1384,13 @@ int svga_batch_retain_context(struct svga_batch *batch, svga_handle context)
                         SVGA_BATCH_CONTEXT_HASH_CAPACITY);
 }
 
+/**
+ * @brief Record a deduplicated surface handle for submit-time validation.
+ * @param batch Exclusively owned open batch with allocated metadata.
+ * @param surface Borrowed nonzero surface, externally retained through completion.
+ * @return Zero, EINVAL for malformed batch/input, or ENOMEM for metadata capacity exhaustion.
+ * Execution-owned task context, exclusive batch mutation. Caller retains the native surface and backing through the actual submission fence.
+ */
 int svga_batch_retain_surface(struct svga_batch *batch, svga_handle surface)
 {
     struct svga_batch_metadata *metadata = batch ? batch->metadata : NULL;
@@ -1359,6 +1401,13 @@ int svga_batch_retain_surface(struct svga_batch *batch, svga_handle surface)
                         SVGA_BATCH_SURFACE_HASH_CAPACITY);
 }
 
+/**
+ * @brief Record a deduplicated GMR handle for submit-time validation.
+ * @param batch Exclusively owned open batch with allocated metadata.
+ * @param buffer Borrowed nonzero GMR, externally retained through completion.
+ * @return Zero, EINVAL for malformed batch/input, or ENOMEM for metadata capacity exhaustion.
+ * Execution-owned task context, exclusive batch mutation. No independent GMR/backing/code reference is acquired by this metadata operation.
+ */
 int svga_batch_retain_gmr(struct svga_batch *batch, svga_handle buffer)
 {
     struct svga_batch_metadata *metadata = batch ? batch->metadata : NULL;
@@ -1478,3 +1527,15 @@ int svga_fence_wait(svga_handle fence)
     svga_unlock(flags);
     return ret;
 }
+
+EXPORT_SYMBOL(svga_batch_abort);
+EXPORT_SYMBOL(svga_batch_append);
+EXPORT_SYMBOL(svga_batch_init_sized);
+EXPORT_SYMBOL(svga_batch_retain_context);
+EXPORT_SYMBOL(svga_batch_retain_gmr);
+EXPORT_SYMBOL(svga_batch_retain_surface);
+EXPORT_SYMBOL(svga_batch_submit);
+EXPORT_SYMBOL(svga_fence_is_quiesced);
+EXPORT_SYMBOL(svga_fence_progress_snapshot);
+EXPORT_SYMBOL(svga_fence_status);
+EXPORT_SYMBOL(svga_fence_try_insert);

@@ -1,14 +1,33 @@
 /*
- * ReliefOS USB bootstrap interface: declares HID keyboard and mouse support.
- * Provides initialization and polling hooks for early USB input handling.
+ * ReliefNT USB host publication and bounded input polling interface.
  */
 #ifndef RELIEFNT_USB_H
 #define RELIEFNT_USB_H
 
-/**
- * @brief Bootstrap USB host support for standard HID keyboard and mouse devices.
+#include <reliefnt/module.h>
+
+struct usb_host;
+
+/** @brief Publish one host controller's bounded input poll callback.
+ * @param poll IRQ-safe callback; never blocks, allocates, or changes registration.
+ * @param context Borrowed controller state retained through unregister return.
+ * @param owner COMING/LIVE native code owner, or NULL for permanent code.
+ * @param out Required result receiving an exclusively owned registration handle.
+ * @return Zero or negative errno, leaving out NULL on failure. Task context;
+ * the registration has no external self-reference. COMING/GOING is not polled.
  */
-void usb_init(void);
+int usb_host_register(void (*poll)(void *), void *context, struct module *owner,
+                      struct usb_host **out);
+
+/** @brief Close callback admission and synchronously drain one owned host handle.
+ * @param host Exclusive registration handle returned by usb_host_register.
+ * @return Zero after the handle is freed, -ENOENT for an unknown handle, or
+ * -EBUSY if a concurrent unregister already owns it. NULL is an idempotent no-op.
+ * Task teardown without IRQ/execution locks needed by the callback. The caller
+ * stops hardware separately before freeing DMA or controller context.
+ */
+int usb_host_unregister(struct usb_host *host);
+
 /**
  * @brief Pump the USB host controller and deliver any pending HID key/mouse events.
  */

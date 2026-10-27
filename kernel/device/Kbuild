@@ -1,4 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-obj-y := api.o driver_manager_phase.o driver_resources.o early_serial.o registry.o services.o
+obj-y := api.o audio_work.o character.o driver_manager_phase.o driver_resources.o early_serial.o graphics_service.o mapping.o registry.o service.o services.o sound_service.o
 
 include $(srctree)/scripts/Makefile.module

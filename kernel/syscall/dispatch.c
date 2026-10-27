@@ -37,14 +37,6 @@ static int64_t syscall_ioctl_descriptor_flags(struct task *task, uint64_t fd_arg
 
 static int64_t syscall_ioctl_nonblock(struct task *task, int fd, uint64_t argument);
 
-/**
- * Syscall dispatch regs.
- * @param frame Value supplied by the caller.
- */
-int64_t syscall_dispatch_regs(struct task *task, uint64_t number, uint64_t a0, uint64_t a1,
-                                     uint64_t a2, uint64_t a3, uint64_t a4,
-                                     uint64_t a5);
-
 struct reliefos_flock_entry reliefos_flocks[RELIEFOS_FLOCK_MAX];
 
 /**
@@ -128,9 +120,12 @@ void syscall_init(void)
 }
 
 /**
- * Syscall dispatch.
- * @param frame Value supplied by the caller.
- * @return The value or status produced by the operation.
+ * @brief Route a normalized Linux syscall request to its owning implementation.
+ * @param frame Kernel-owned number/argument snapshot, nullable; never a user pointer.
+ * @return The backend result, negative errno, or ENOSYS for an unknown number.
+ * @note Task context; each backend validates privileges and user ranges before
+ * access. Module operations retain the same capability and ABI checks as the
+ * register entry and do not materialize unrelated file descriptions.
  */
 int64_t syscall_dispatch(const struct syscall_frame *frame)
 {
@@ -139,6 +134,10 @@ int64_t syscall_dispatch(const struct syscall_frame *frame)
     }
 
     switch (frame->number) {
+    case LINUX_SYS_INIT_MODULE:
+    case LINUX_SYS_DELETE_MODULE:
+    case LINUX_SYS_FINIT_MODULE:
+        return syscall_modules(frame->number,frame->args[0],frame->args[1],frame->args[2]);
     case LINUX_SYS_READ:
     case LINUX_SYS_WRITE:
     case LINUX_SYS_OPEN:
@@ -373,6 +372,19 @@ int64_t syscall_dispatch(const struct syscall_frame *frame)
     }
 }
 
+/**
+ * @brief Route ordinary register arguments through the retained syscall backends.
+ * @param number Linux x86-64 syscall number.
+ * @param a0 First raw ABI argument; user pointers are validated by the backend.
+ * @param a1 Second raw ABI argument.
+ * @param a2 Third raw ABI argument.
+ * @param a3 Fourth raw ABI argument.
+ * @param a4 Fifth raw ABI argument.
+ * @param a5 Sixth raw ABI argument.
+ * @return Backend result, negative errno or an entry-owned blocking/retry status.
+ * @note Called by the execution-owned dispatcher; this function does not retain
+ * task, file or provider references beyond the selected backend's contract.
+ */
 int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
 {
     if (number == LINUX_SYS_UTIME || number == LINUX_SYS_UTIMES ||
@@ -483,23 +495,23 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
     if (number == LINUX_SYS_READAHEAD)
         return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
     if (number == LINUX_SYS_FALLOCATE)
-        return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
+        return syscall_fallocate_object(sched_current_task(), (int32_t)a0, (uint32_t)a1, a2, a3);
     if (number == LINUX_SYS_SYNC_FILE_RANGE)
         return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
     if (number == LINUX_SYS_SYNC)
-        return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
+        return syscall_sync_object(vfs_system_namespace(), sched_current_task(), number, (int32_t)a0);
     if (number == LINUX_SYS_SYNCFS)
-        return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
+        return syscall_sync_object(vfs_system_namespace(), sched_current_task(), number, (int32_t)a0);
     if (number == LINUX_SYS_FCHMODAT || number == LINUX_SYS_FCHMODAT2 ||
         number == LINUX_SYS_FCHOWNAT || number == LINUX_SYS_FACCESSAT ||
         number == LINUX_SYS_FACCESSAT2)
-        return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
+        return syscall_permissions(vfs_system_namespace(), sched_current_task(), number, a0, a1, a2, a3, a4);
     if (number == LINUX_SYS_GETGROUPS || number == LINUX_SYS_SETGROUPS)
         return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
     if (number == LINUX_SYS_CHMOD || number == LINUX_SYS_CHOWN || number == LINUX_SYS_LCHOWN)
-        return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
+        return syscall_permissions(vfs_system_namespace(), sched_current_task(), number, a0, a1, a2, a3, a4);
     if (number == LINUX_SYS_FCHMOD || number == LINUX_SYS_FCHOWN)
-        return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
+        return syscall_permissions(vfs_system_namespace(), sched_current_task(), number, a0, a1, a2, a3, a4);
     if (number == LINUX_SYS_WRITE)
         return syscall_legacy_io(number, a0, a1, a2, a3, a4, a5);
     if (number == LINUX_SYS_READ)
@@ -512,12 +524,24 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
         return syscall_legacy_process(number, a0, a1, a2, a3, a4, a5);
     if (number == LINUX_SYS_VFORK)
         return syscall_legacy_process(number, a0, a1, a2, a3, a4, a5);
-    if (number == __NR_mknod || number == __NR_mknodat)
-        return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
+    if (number == __NR_mknod || number == __NR_mknodat) {
+        uint32_t mode=(uint32_t)(number==__NR_mknodat ? a2 : a1);
+        uint32_t type=mode&LINUX_S_IFMT;if(!type)type=LINUX_S_IFREG;
+        if(type!=LINUX_S_IFREG && type!=LINUX_S_IFIFO && type!=LINUX_S_IFSOCK)
+            return type==LINUX_S_IFCHR || type==LINUX_S_IFBLK ? -RELIEFOS_EOPNOTSUPP : -RELIEFOS_EINVAL;
+        return syscall_create_object(vfs_system_namespace(),sched_current_task(),
+            number==__NR_mknodat ? (int32_t)a0 : LINUX_AT_FDCWD,
+            number==__NR_mknodat ? a1 : a0,type,mode,NULL);
+    }
     if (number == LINUX_SYS_CREAT)
-        return syscall_legacy_descriptors(number, a0, a1, a2, a3, a4, a5);
+        return syscall_open_object(vfs_system_namespace(), sched_current_task(), LINUX_AT_FDCWD,
+                                   a0, LINUX_O_CREAT | LINUX_O_WRONLY | LINUX_O_TRUNC, a1);
     if (number == LINUX_SYS_OPEN || number == LINUX_SYS_OPENAT)
-        return syscall_legacy_descriptors(number, a0, a1, a2, a3, a4, a5);
+        return syscall_open_object(vfs_system_namespace(), sched_current_task(),
+                    number == LINUX_SYS_OPENAT ? (int32_t)a0 : LINUX_AT_FDCWD,
+                    number == LINUX_SYS_OPENAT ? a1 : a0,
+                    number == LINUX_SYS_OPENAT ? a2 : a1,
+                    number == LINUX_SYS_OPENAT ? a3 : a2);
     if (number == LINUX_SYS_PIPE)
         return syscall_legacy_descriptors(number, a0, a1, a2, a3, a4, a5);
     if (number == LINUX_SYS_PIPE2)
@@ -525,7 +549,7 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
     if (number == LINUX_SYS_CLOSE)
         return syscall_legacy_descriptors(number, a0, a1, a2, a3, a4, a5);
     if (number == LINUX_SYS_FTRUNCATE)
-        return syscall_legacy_descriptors(number, a0, a1, a2, a3, a4, a5);
+        return syscall_truncate_object(vfs_system_namespace(), sched_current_task(), number, a0, a1);
     if (number == LINUX_SYS_DUP3)
         return syscall_legacy_descriptors(number, a0, a1, a2, a3, a4, a5);
     if (number == LINUX_SYS_DUP || number == LINUX_SYS_DUP2 || number == LINUX_SYS_FCNTL)
@@ -533,30 +557,42 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
     if (number == LINUX_SYS_FLOCK)
         return syscall_legacy_descriptors(number, a0, a1, a2, a3, a4, a5);
     if (number == LINUX_SYS_STATFS || number == LINUX_SYS_FSTATFS)
-        return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
+        return syscall_metadata(vfs_system_namespace(), sched_current_task(), number, a0, a1, a2, a3, a4);
     if (number == LINUX_SYS_STAT || number == LINUX_SYS_LSTAT || number == LINUX_SYS_NEWFSTATAT)
-        return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
+        return syscall_metadata(vfs_system_namespace(), sched_current_task(), number, a0, a1, a2, a3, a4);
     if (number == LINUX_SYS_STATX)
-        return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
+        return syscall_metadata(vfs_system_namespace(), sched_current_task(), number, a0, a1, a2, a3, a4);
     if (number == LINUX_SYS_SENDFILE)
         return syscall_legacy_io(number, a0, a1, a2, a3, a4, a5);
     if (number == LINUX_SYS_COPY_FILE_RANGE)
         return syscall_legacy_io(number, a0, a1, a2, a3, a4, a5);
     if (number == LINUX_SYS_FSTAT)
-        return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
+        return syscall_metadata(vfs_system_namespace(), sched_current_task(), number, a0, a1, a2, a3, a4);
     if (number == LINUX_SYS_ACCESS)
-        return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
-    if (number == LINUX_SYS_LINK || number == LINUX_SYS_LINKAT ||
-        number == LINUX_SYS_SYMLINK || number == LINUX_SYS_SYMLINKAT)
-        return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
+        return syscall_permissions(vfs_system_namespace(), sched_current_task(), number, a0, a1, a2, a3, a4);
+    if (number == LINUX_SYS_SYMLINK || number == LINUX_SYS_SYMLINKAT)
+        return syscall_symlink_object(vfs_system_namespace(),sched_current_task(),a0,
+            number==LINUX_SYS_SYMLINKAT ? (int32_t)a1 : LINUX_AT_FDCWD,
+            number==LINUX_SYS_SYMLINKAT ? a2 : a1);
+    if (number == LINUX_SYS_LINK || number == LINUX_SYS_LINKAT)
+        return syscall_link_object(vfs_system_namespace(),sched_current_task(),
+            number==LINUX_SYS_LINK ? LINUX_AT_FDCWD : (int32_t)a0,
+            number==LINUX_SYS_LINK ? a0 : a1,
+            number==LINUX_SYS_LINK ? LINUX_AT_FDCWD : (int32_t)a2,
+            number==LINUX_SYS_LINK ? a1 : a3,
+            number==LINUX_SYS_LINKAT ? (uint32_t)a4 : 0);
     if (number == LINUX_SYS_READLINK || number == LINUX_SYS_READLINKAT)
-        return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
+        return syscall_readlink_object(vfs_system_namespace(), sched_current_task(),
+            number == LINUX_SYS_READLINKAT ? (int32_t)a0 : LINUX_AT_FDCWD,
+            number == LINUX_SYS_READLINKAT ? a1 : a0,
+            number == LINUX_SYS_READLINKAT ? a2 : a1,
+            (int32_t)(number == LINUX_SYS_READLINKAT ? a3 : a2), number == LINUX_SYS_READLINKAT);
     if (number == LINUX_SYS_FCHDIR)
-        return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
+        return syscall_directory(vfs_system_namespace(), sched_current_task(), number, a0, a1);
     if (number == LINUX_SYS_TRUNCATE)
-        return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
+        return syscall_truncate_object(vfs_system_namespace(), sched_current_task(), number, a0, a1);
     if (number == LINUX_SYS_FSYNC || number == LINUX_SYS_FDATASYNC)
-        return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
+        return syscall_sync_object(vfs_system_namespace(), sched_current_task(), number, (int32_t)a0);
     if (number == LINUX_SYS_UMASK)
         return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
     if (number == LINUX_SYS_PREAD64 || number == LINUX_SYS_PWRITE64)
@@ -576,16 +612,28 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
     if (number == LINUX_SYS_LSEEK)
         return syscall_legacy_io(number, a0, a1, a2, a3, a4, a5);
     if (number == LINUX_SYS_GETCWD)
-        return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
+        return syscall_directory(vfs_system_namespace(), sched_current_task(), number, a0, a1);
     if (number == LINUX_SYS_CHDIR || number == LINUX_SYS_CHROOT)
-        return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
+        return syscall_directory(vfs_system_namespace(), sched_current_task(), number, a0, a1);
     if (number == LINUX_SYS_MKDIR || number == LINUX_SYS_MKDIRAT)
-        return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
-    if (number == LINUX_SYS_UNLINK || number == LINUX_SYS_RMDIR || number == LINUX_SYS_UNLINKAT)
-        return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
-    if (number == LINUX_SYS_RENAME || number == LINUX_SYS_RENAMEAT ||
-        number == LINUX_SYS_RENAMEAT2)
-        return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
+        return syscall_create_object(vfs_system_namespace(),sched_current_task(),
+            number==LINUX_SYS_MKDIRAT ? (int32_t)a0 : LINUX_AT_FDCWD,
+            number==LINUX_SYS_MKDIRAT ? a1 : a0,LINUX_S_IFDIR,
+            (uint32_t)(number==LINUX_SYS_MKDIRAT ? a2 : a1),NULL);
+    if (number == LINUX_SYS_UNLINK || number == LINUX_SYS_RMDIR || number == LINUX_SYS_UNLINKAT) {
+        if(number==LINUX_SYS_UNLINKAT && ((uint32_t)a2&~LINUX_AT_REMOVEDIR))return -RELIEFOS_EINVAL;
+        return syscall_remove_object(vfs_system_namespace(),sched_current_task(),
+            number==LINUX_SYS_UNLINKAT ? (int32_t)a0 : LINUX_AT_FDCWD,
+            number==LINUX_SYS_UNLINKAT ? a1 : a0,
+            number==LINUX_SYS_RMDIR || (number==LINUX_SYS_UNLINKAT && ((uint32_t)a2&LINUX_AT_REMOVEDIR)));
+    }
+    if (number == LINUX_SYS_RENAME || number == LINUX_SYS_RENAMEAT || number == LINUX_SYS_RENAMEAT2)
+        return syscall_rename_object(vfs_system_namespace(),sched_current_task(),
+            number==LINUX_SYS_RENAME ? LINUX_AT_FDCWD : (int32_t)a0,
+            number==LINUX_SYS_RENAME ? a0 : a1,
+            number==LINUX_SYS_RENAME ? LINUX_AT_FDCWD : (int32_t)a2,
+            number==LINUX_SYS_RENAME ? a1 : a3,
+            number==LINUX_SYS_RENAMEAT2 ? (uint32_t)a4 : 0);
     if (number == LINUX_SYS_MOUNT)
         return syscall_legacy_filesystem(number, a0, a1, a2, a3, a4, a5);
     if (number == LINUX_SYS_UMOUNT2)
@@ -662,13 +710,25 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
 }
 
 /**
- * Syscall dispatch regs.
- * @param frame Value supplied by the caller.
+ * @brief Dispatch registers under the entry's task execution transaction.
+ * @param task Current execution-owned task; descriptor entry pins remain borrowed.
+ * @param number Linux x86-64 syscall number.
+ * @param a0 First raw ABI argument, validated by the selected backend.
+ * @param a1 Second raw ABI argument.
+ * @param a2 Third raw ABI argument.
+ * @param a3 Fourth raw ABI argument.
+ * @param a4 Fifth raw ABI argument.
+ * @param a5 Sixth raw ABI argument.
+ * @return Backend result, negative errno, or internal blocking/retry status.
+ * @note Module syscalls enter their capability-checked implementation directly;
+ * other paths preserve existing stdio materialization and owner scanning rules.
  */
 int64_t syscall_dispatch_regs(struct task *task, uint64_t number, uint64_t a0, uint64_t a1,
                                      uint64_t a2, uint64_t a3, uint64_t a4,
                                      uint64_t a5)
 {
+    if(number==LINUX_SYS_INIT_MODULE || number==LINUX_SYS_DELETE_MODULE || number==LINUX_SYS_FINIT_MODULE)
+        return syscall_modules(number,a0,a1,a2);
     /* Identity/time calls and exact entry-pinned READ/WRITE descriptions need
      * neither stdio materialization nor a subsystem ownership scan. Keep their
      * existing legacy route; scalar backends are shared with the vector loop.
@@ -737,8 +797,8 @@ int64_t syscall_dispatch_regs(struct task *task, uint64_t number, uint64_t a0, u
     if (number == LINUX_SYS_IOCTL) {
         struct task *task = sched_current_task();
         struct task_file *file = task_file_for_io(task, (int)a0);
-        if (file && (file->drm_file || file->drm_prime_file))
-            return drm_fd_ioctl(task, file, (uint32_t)a1, a2);
+        if (file && file->character_file)
+            return character_file_ioctl(file->character_file,task,file,(uint32_t)a1,a2);
     }
 
     if (syscall_fs_owns(number)) {

@@ -13,7 +13,7 @@ def build(work):
          "-DRELIEFOS_STORAGE_STANDALONE_TU", "-Iinclude", "-Iinclude",
          "-Iinclude/uapi", "-Iinclude",
          "-include", str(STORAGE / "core/storage_internal.h"), "tools/tests/ext4_write_test.c",
-         *[str(FS / f"ext4/{n}.c") for n in
+         *[str(FS / f"ext_common/{n}.c") for n in
            ("format", "checksum", "cache", "alloc", "extent", "ops", "xattr", "journal")], "-o", str(binary)])
     return binary
 

@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# Objects are owned by this directory; child modules own their own lists.
-obj-y := storage_ahci.o
-
+obj-$(CONFIG_SATA_AHCI) += ahci.o
+ahci-y := storage_ahci.o dma.o probe.o
 include $(srctree)/scripts/Makefile.module

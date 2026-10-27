@@ -13,6 +13,7 @@
 #define AUDIO_MIXER_NONE UINT32_MAX
 
 struct audio_mixer_file {
+    struct module *code_owner;
     uint32_t used;
     uint32_t card;
     uint32_t playback;
@@ -132,26 +133,35 @@ static int audio_mixer_select_controls(struct audio_mixer_file *file)
 int audio_mixer_open_card(uint32_t card, struct audio_mixer_file **out)
 {
     if (!out) return -EINVAL;
+    struct module *owner;
+    int ret=audio_card_module_get(card,&owner);
+    if(ret) return ret;
     for (uint32_t i = 0; i < AUDIO_MIXER_FILE_MAX; ++i) {
         struct audio_mixer_file *file = &audio_mixer_files[i];
         if (file->used) continue;
         *file = (struct audio_mixer_file){.used = 1, .card = card,
+                                          .code_owner=owner,
                                           .playback = AUDIO_MIXER_NONE,
                                           .capture = AUDIO_MIXER_NONE,
                                           .mute = AUDIO_MIXER_NONE,
                                           .source = AUDIO_MIXER_NONE};
-        int ret = audio_mixer_select_controls(file);
-        if (ret) { *file = (struct audio_mixer_file){0}; return ret; }
+        ret = audio_mixer_select_controls(file);
+        if (ret) { *file = (struct audio_mixer_file){0}; goto failed; }
         *out = file;
         return 0;
     }
-    return -ENFILE;
+    ret=-ENFILE;
+failed:
+    module_put(owner);
+    return ret;
 }
 
 int audio_mixer_close_file(struct audio_mixer_file *file)
 {
     if (!file || !file->used) return -EBADF;
+    struct module *owner=file->code_owner;
     *file = (struct audio_mixer_file){0};
+    module_put(owner);
     return 0;
 }
 

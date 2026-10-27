@@ -25,6 +25,7 @@ int main(int argc, char **argv)
     assert(!fseek(disk, 0, SEEK_END));
     g_storage.ext2_sector_count = ftell(disk) / 512;
     assert(ext2_mount() == 0);
+    g_storage.fs_ops=&storage_ext_ops;
     assert(ext2_write_file("/large", NULL, 0) == 0);
     struct storage_node node;
     assert(ext2_lookup_path("/large", &node) == 0);

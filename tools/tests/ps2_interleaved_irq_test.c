@@ -5,7 +5,7 @@
 #include <stdio.h>
 
 #include "../../arch/x86_64/port.h"
-#include "../../drivers/input/mouse/mouse.c"
+#include "../../drivers/input/mouse/mouse_main.c"
 #include "../../arch/x86_64/interrupt/irq.c"
 
 struct controller_byte {

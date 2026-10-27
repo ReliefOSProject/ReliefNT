@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 void *kernel_memcpy(void *dst, const void *src, size_t len);
+void *kernel_memmove(void *dst, const void *src, size_t len);
 void *kernel_memset(void *dst, int value, size_t len);
 
 enum {
@@ -161,6 +162,8 @@ static void test_zero_length_guard_pointers(void)
     void *copy_result = kernel_memcpy(destination, source, 0);
     assert_result_pointer("zero-length memcpy return", 0, destination,
                           copy_result);
+    assert_result_pointer("zero-length memmove guard", 0, destination,
+                          kernel_memmove(destination, source, 0));
     void *set_result = kernel_memset(destination, 0x1ff, 0);
     assert_result_pointer("zero-length memset return", 0, destination,
                           set_result);
@@ -449,14 +452,48 @@ static void test_large_blocks(void)
     printf("large blocks: %zu-byte memcpy and memset passed\n", length);
 }
 
+static void test_overlapping_move(void)
+{
+    uint8_t actual[4352], before[4352], expected[4352];
+    static const size_t lengths[]={0,1,2,7,16,31,128,1024,4096};
+    for(size_t n=0;n<sizeof(lengths)/sizeof(lengths[0]);++n) {
+        size_t length=lengths[n];
+        for(size_t source=0;source<128;source+=17) for(size_t destination=0;destination<128;destination+=19) {
+            fill_pattern(before,sizeof(before),(unsigned)(source+destination+n));
+            copy_bytes(actual,before,sizeof(actual));copy_bytes(expected,before,sizeof(expected));
+            /* The oracle reads from a separate, untouched source snapshot. */
+            copy_bytes(expected+destination,before+source,length);
+            assert_result_pointer("memmove return",n,actual+destination,
+                                  kernel_memmove(actual+destination,actual+source,length));
+            assert_bytes_equal("overlap memmove and sentinels",n,expected,actual,sizeof(actual));
+            unsigned long flags;__asm__ volatile("pushfq; popq %0":"=r"(flags));
+            if(flags&(1ul<<10))fail("memmove left direction flag set");
+        }
+    }
+    GuardedRegion region=guarded_region_create();
+    fill_pattern(region.data,region.data_size,123);
+    assert_result_pointer("in-place memmove",0,region.data,
+                          kernel_memmove(region.data,region.data,region.data_size));
+    for(size_t direction=0;direction<2;++direction) {
+        size_t from=direction ? region.data_size-1024 : 0;
+        size_t to=direction ? region.data_size-1025 : 1;
+        copy_bytes(before,region.data+from,1024);
+        assert_result_pointer("guarded overlap memmove",direction,region.data+to,
+                              kernel_memmove(region.data+to,region.data+from,1024));
+        assert_bytes_equal("guarded overlap memmove",direction,before,region.data+to,1024);
+    }
+    guarded_region_destroy(&region);
+}
+
 int main(void)
 {
+    test_overlapping_move();
     test_zero_length_guard_pointers();
     test_alignment_and_length_sweep();
     test_all_lengths_with_offset_variation();
     test_random_cases();
     test_guard_pages();
     test_large_blocks();
-    puts("kernel memcpy/memset safety tests passed");
+    puts("kernel memcpy/memmove/memset safety tests passed");
     return 0;
 }

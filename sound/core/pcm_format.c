@@ -127,12 +127,12 @@ static int audio_pcm_hw_params_selected(struct audio_pcm *pcm,
     if (pcm->dma.kernel == buffer && pcm->dma.bus) dma_bus = pcm->dma.bus;
     if (!dma_bus) {
         kernel_spin_unlock_irqrestore(&pcm->lock, flags);
-        if (new_storage && kernel_free) kernel_free(new_storage);
+        kernel_free(new_storage);
         return -EFAULT;
     }
     if (!audio_pcm_connected_locked(pcm)) {
         kernel_spin_unlock_irqrestore(&pcm->lock, flags);
-        if (new_storage && kernel_free) kernel_free(new_storage);
+        kernel_free(new_storage);
         return -ENODEV;
     }
     if (new_storage) {

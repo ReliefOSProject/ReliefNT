@@ -1,3 +1,4 @@
+#include <reliefnt/graphics_service.h>
 #include <reliefnt/console.h>
 #include <assert.h>
 #include <stdio.h>
@@ -63,7 +64,7 @@ const struct framebuffer *framebuffer_get(void) { return NULL; }
 void console_printf(const char *format, ...) { (void)format; }
 
 /* This PTY fixture has no DRM KMS owner to release on a VT switch. */
-void drm_device_kms_vt_release(void) {}
+void graphics_service_kms_vt_release(void) {}
 
 void console_log(enum console_log_level level, const char *format, ...)
 {

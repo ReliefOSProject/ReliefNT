@@ -13,6 +13,7 @@ PRODUCTION = ('arch', 'block', 'drivers', 'firmware', 'fs', 'kernel', 'lib', 'mm
 def main():
     errors, objects, visited = [], [], set()
     inputs = set()
+    generated_sources = set()
 
     def visit(directory):
         if directory in visited:
@@ -25,32 +26,100 @@ def main():
             return
         inputs.add(path.relative_to(ROOT).as_posix())
         content = path.read_text().replace('\\\n', ' ')
-        entries = []
+        lists = {}
+        included_objects = set()
+        # Configuration selects the actual build. This inventory deliberately
+        # covers every eligible branch, including currently disabled options.
+        assignment = r'^([A-Za-z0-9_.-]+-(?:y|m|objs|\$\(CONFIG_[A-Z0-9_]+\)))\s*([:+]?=)\s*(.*?)\s*(?:#.*)?$'
         for line in content.splitlines():
-            match = re.match(r'^(?:obj|always)-y\s*([:+]?=)\s*(.*?)\s*(?:#.*)?$', line)
+            child = re.fullmatch(r'include (?:\$\(srctree\)/)?\$\(src\)/([A-Za-z0-9_-]+)/Kbuild', line)
+            if child:
+                child_directory = directory / child[1]
+                child_path = ROOT / child_directory / 'Kbuild'
+                if child_directory in visited or not child_path.is_file():
+                    errors.append(f'invalid/duplicate included child: {child_directory}')
+                    continue
+                visited.add(child_directory)
+                inputs.add(child_path.relative_to(ROOT).as_posix())
+                for child_line in child_path.read_text().replace('\\\n', ' ').splitlines():
+                    item = re.match(assignment, child_line)
+                    if not item:
+                        if child_line.strip() and not child_line.lstrip().startswith('#'):
+                            errors.append(f'unsupported child member expression: {child_directory}: {child_line}')
+                        continue
+                    key, operation, value = item.groups()
+                    entries = value.split()
+                    if key.startswith(('obj-', 'always-')) or any('/' in entry or not entry.endswith('.o') for entry in entries):
+                        errors.append(f'included child must own only local composite members: {child_directory}')
+                        continue
+                    if operation in ('=', ':='):
+                        lists[key] = []
+                    lists.setdefault(key, []).extend(entries)
+                    included_objects.update(child[1] + '/' + entry for entry in entries)
+                continue
+            match = re.match(assignment, line)
             if not match:
                 continue
-            if line.startswith('obj-y') and match[1] in ('=', ':='):
-                entries = []
-            entries.extend(e for e in match[2].split() if e.endswith(('.o', '/')))
-        for entry in entries:
-            if entry.endswith('/'):
-                if '/' in entry[:-1] or entry.startswith('.'):
-                    errors.append(f'{path.relative_to(ROOT)}: non-local subdirectory {entry}')
-                else:
-                    visit(directory / entry)
-            elif entry.endswith('.o'):
-                if '/' in entry:
-                    errors.append(f'{path.relative_to(ROOT)}: non-local object {entry}')
+            key, operation, value = match.groups()
+            # Standard Kbuild may assemble a composite from a child-owned local
+            # list. Accept only explicitly included members, never a root list
+            # of source paths or a filesystem inventory used for compilation.
+            prefix = re.fullmatch(r'\$\(addprefix ([A-Za-z0-9_-]+/),\$\(([A-Za-z0-9_.-]+)\)\)', value)
+            if prefix:
+                entries = [prefix[1] + entry for entry in lists.get(prefix[2], [])]
+                if not entries or any(entry not in included_objects for entry in entries):
+                    errors.append(f'composite references unowned child members: {value}')
+                value = ' '.join(entries)
+            if operation in ('=', ':='):
+                lists[key] = []
+            lists.setdefault(key, []).extend(value.split())
+
+        def members(stem):
+            return [entry for key, entries in lists.items()
+                    if key in (stem + '-y', stem + '-m', stem + '-objs')
+                    or key.startswith(stem + '-$(CONFIG_') for entry in entries]
+
+        def object_entry(entry, ancestry=()):
+            if entry in included_objects:
                 objects.append((directory / entry).as_posix().removeprefix('./'))
+                return
+            if '/' in entry or not entry.endswith('.o'):
+                errors.append(f'{path.relative_to(ROOT)}: non-local/invalid object {entry}')
+                return
+            stem = entry[:-2]
+            if stem in ancestry:
+                errors.append(f'{path.relative_to(ROOT)}: recursive composite {entry}')
+                return
+            children = members(stem)
+            if children:
+                for child in children:
+                    object_entry(child, (*ancestry, stem))
             else:
-                errors.append(f'{path.relative_to(ROOT)}: invalid object entry {entry}')
+                objects.append((directory / entry).as_posix().removeprefix('./'))
+
+        for key, entries in lists.items():
+            if not key.startswith(('obj-', 'always-')):
+                continue
+            for entry in entries:
+                if entry.endswith('/'):
+                    if '/' in entry[:-1] or entry.startswith('.'):
+                        errors.append(f'{path.relative_to(ROOT)}: non-local subdirectory {entry}')
+                    else:
+                        visit(directory / entry)
+                elif entry.endswith('.o'):
+                    object_entry(entry)
+                elif key.startswith('always-') and entry.endswith('.lds'):
+                    linker = ROOT / directory / (entry + '.S')
+                    if not linker.is_file():
+                        errors.append(f'{path.relative_to(ROOT)}: missing linker source {entry}.S')
+                    else:
+                        generated_sources.add(linker.relative_to(ROOT).as_posix())
 
     visit(Path('.'))
     visit(Path('debug'))
     if len(objects) != len(set(objects)):
         errors.append('duplicate production object')
-    built_sources = set()
+    built_sources = set(generated_sources)
     for name in objects:
         stem = name[:-2]
         sources = [stem + extension for extension in ('.c', '.S') if (ROOT / (stem + extension)).is_file()]

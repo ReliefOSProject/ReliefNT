@@ -65,7 +65,7 @@
       "kernel/syscall/fd/pty_descriptor.c",
       "kernel/syscall/dispatch.c",
       "kernel/syscall/event/timerfd.c",
-      "kernel/syscall/io/drm_io.c",
+      "drivers/video/drm/event_io.c",
       "kernel/syscall/device/device_io.c",
       "kernel/syscall/device/input_ioctl.c",
       "kernel/syscall/fs/path.c",
@@ -440,46 +440,46 @@
       "fs/exfat/exfat_upcase_data.h"
     ],
     "fs/storage_ext2.c": [
-      "fs/ext2/ext2.c"
+      "fs/ext_common/ext2.c"
     ],
     "fs/storage_ext2_cache.c": [
-      "fs/ext2/ext2_cache.c"
+      "fs/ext_common/ext2_cache.c"
     ],
     "fs/storage_ext2_write.c": [
-      "fs/ext2/ext2_write.c"
+      "fs/ext_common/ext2_write.c"
     ],
     "fs/storage_ext4_alloc.c": [
-      "fs/ext4/alloc.c"
+      "fs/ext_common/alloc.c"
     ],
     "fs/storage_ext4_cache.c": [
-      "fs/ext4/cache.c"
+      "fs/ext_common/cache.c"
     ],
     "fs/storage_ext4_checksum.c": [
-      "fs/ext4/checksum.c"
+      "fs/ext_common/checksum.c"
     ],
     "fs/storage_ext4_dir.c": [
-      "fs/ext4/dir.c"
+      "fs/ext_common/dir.c"
     ],
     "fs/storage_ext4_extent.c": [
-      "fs/ext4/extent.c"
+      "fs/ext_common/extent.c"
     ],
     "fs/storage_ext4_format.c": [
-      "fs/ext4/format.c"
+      "fs/ext_common/format.c"
     ],
     "fs/storage_ext4_journal.c": [
-      "fs/ext4/journal.c"
+      "fs/ext_common/journal.c"
     ],
     "fs/storage_ext4_mount.c": [
-      "fs/ext4/mount.c"
+      "fs/ext_common/mount.c"
     ],
     "fs/storage_ext4_ops.c": [
-      "fs/ext4/ops.c"
+      "fs/ext_common/ops.c"
     ],
     "fs/storage_ext4_vfs.c": [
-      "fs/ext4/vfs.c"
+      "fs/ext_common/vfs.c"
     ],
     "fs/storage_ext4_xattr.c": [
-      "fs/ext4/xattr.c"
+      "fs/ext_common/xattr.c"
     ],
     "fs/storage_fat32.c": [
       "fs/fat/fat32_alloc.c",
@@ -515,12 +515,8 @@
     ],
     "fs/storage_vfs.c": [
       "fs/vfs/vfs_dir.c",
-      "fs/vfs/vfs_namespace.c",
-      "fs/vfs/vfs_path.c",
-      "fs/vfs/vfs_read.c",
-      "fs/vfs/vfs_special.c",
-      "fs/vfs/vfs_stat.c",
-      "fs/vfs/vfs_write.c"
+      "fs/vfs/storage_status.c",
+      "fs/vfs/vfs_read.c"
     ],
     "fs/sysfs.c": [
       "fs/sysfs/sysfs.c"
@@ -547,16 +543,19 @@
       "block/install/storage_installer.c"
     ],
     "block/storage_internal.h": [
-      "block/core/storage_hardware.h",
+      "drivers/storage/ata.h",
+      "drivers/storage/ahci/hardware.h",
+      "drivers/storage/ide/hardware.h",
       "block/core/storage_types.h",
       "block/core/storage_core_api.h",
-      "block/core/storage_driver.h",
+      "drivers/storage/ahci/ahci.h",
+      "drivers/storage/ide/storage_ide.h",
+      "drivers/storage/nvme/storage_nvme.h",
       "block/core/storage_internal.h",
       "block/partition/storage_partition.h",
       "fs/fs_internal.h",
-      "fs/fs_mount_api.h",
-      "fs/ext4/storage_ext4_types.h",
-      "fs/ext4/internal.h"
+      "fs/ext_common/storage_ext4_types.h",
+      "fs/ext_common/internal.h"
     ],
     "block/storage_state.c": [
       "block/core/storage_state.c"

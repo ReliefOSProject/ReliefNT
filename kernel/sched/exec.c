@@ -1,3 +1,4 @@
+#include <reliefnt/graphics_service.h>
 #include "internal.h"
 
 
@@ -107,6 +108,12 @@ int sched_set_task_exec_params(uint32_t pid, uint32_t argc, char *const argv[],
     return sched_copy_task_exec_params(sched_find(pid), argc, argv, envc, envp, data, data_len);
 }
 
+/** @brief Retire sibling threads and detach execution state before image commit.
+ * @param task Current task under exclusive execution ownership; required.
+ * @return Zero when ready, negative file-table error, or EAGAIN while a remote
+ * sibling is retiring. Preserves native private-FS-on-exec behavior, including
+ * root/cwd object pins. Called without scheduler_lock; takes it for signals.
+ */
 int sched_prepare_exec_current(struct task *task)
 {
     int result = syscall_unshare_task_files(task);
@@ -156,6 +163,7 @@ int sched_prepare_exec_current(struct task *task)
         leader->process_pending_signals = 0;
         leader->alarm_deadline = 0;
         leader->alarm_interval_ns = leader->alarm_last_expiry = 0;
+        sched_task_identity_swap(task,leader);
         leader->pid = old_tid;
         task->pid = group;
         for (uint32_t i = 0; i < task_count; ++i)
@@ -170,26 +178,28 @@ int sched_prepare_exec_current(struct task *task)
         task->shared_sighand = NULL;
         if (!--old->references) kernel_free(old);
     }
-    if (task->shared_fs) {
-        struct task_fs_state *old = task->shared_fs;
-        task->shared_fs = NULL;
-        task_copy_cwd(task, old->cwd);
-        task_copy_identity_text(task->root_dir, sizeof(task->root_dir), old->root_dir);
-        *sched_task_umask(task) = old->umask;
-        if (!--old->references) kernel_free(old);
-    }
+    sched_task_fs_unshare(task);
     task->fs_base = 0;
     return 0;
 }
 
+/**
+ * @brief Commit an exec address space and release the task's previous mappings.
+ * @param task Execution-owned current task, after exec's last fallible check.
+ * @param replacement Prepared address space whose ownership transfers to task.
+ * @return None; this commit cannot fail or return to the replaced user image.
+ * @note Task context. Cancel saved graphics user pointers, release a vfork
+ * parent, activate the kernel CR3 and drop the old mm/VMA owner references
+ * before installing the replacement. No provider callback spans a scheduler lock.
+ */
 void sched_exec_replace_mm(struct task *task, const struct address_space *replacement)
 {
     /* A committed exec has replaced the user's address-space contract. Drop
      * any saved ioctl user pointers before releasing the previous mm. */
-    drm_vmwgfx_cancel_task_continuation(task);
+    graphics_service_cancel_task_continuation(task);
     struct task_address_space_state *old = task->shared_mm;
     /* exec_mmap() calls exec_mm_release() before the new mm is activated.
-     * At this point userland_exec_current_node() cannot fail any more, so a
+     * At this point userland_exec_current_path() cannot fail any more, so a
      * vfork parent must be released even though the child is still loading
      * the new image lazily.  A failing execve returns before this function
      * and therefore never wakes the parent early. */

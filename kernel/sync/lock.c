@@ -2,6 +2,7 @@
  * ReliefOS kernel synchronization implementation.
  * Implements compact x86_64 spin locks and interrupt state preservation.
  */
+#include <reliefnt/export.h>
 #include <reliefnt/lock.h>
 #include <reliefnt/smp.h>
 
@@ -24,6 +25,10 @@ static uint32_t execution_cpu_index(void)
     return cpu < SMP_MAX_CPUS ? cpu : 0;
 }
 
+/** @brief Initialize an exclusively owned, unpublished lock to unlocked.
+ * @param lock Caller-owned lock storage; NULL is ignored. No wait/allocation;
+ * must not reset an active lock or one reachable by another CPU/IRQ.
+ */
 void kernel_spin_init(struct kernel_spinlock *lock)
 {
     if (lock) {
@@ -31,6 +36,11 @@ void kernel_spin_init(struct kernel_spinlock *lock)
     }
 }
 
+/** @brief Acquire CPU-wide exclusion while polling required TLB progress.
+ * @param lock Stable shared lock, nullable no-op. Nonrecursive; caller controls
+ * IRQ exclusion and lock order, never waits on an IRQ that needs this lock.
+ * No scheduling/allocation or ownership transfer; release on the same path.
+ */
 void kernel_spin_lock(struct kernel_spinlock *lock)
 {
     uint32_t busy = 1;
@@ -49,6 +59,10 @@ void kernel_spin_lock(struct kernel_spinlock *lock)
     }
 }
 
+/** @brief Publish prior protected accesses before relinquishing lock ownership.
+ * @param lock Stable lock owned by this execution context, NULL accepted.
+ * No wait/allocation/IRQ change; does not release unrelated lifetime references.
+ */
 void kernel_spin_unlock(struct kernel_spinlock *lock)
 {
     if (lock) {
@@ -56,6 +70,12 @@ void kernel_spin_unlock(struct kernel_spinlock *lock)
     }
 }
 
+/** @brief Disable local interrupts and acquire one nonrecursive spinlock.
+ * @param lock Stable shared lock, nullable no-op. @param flags Optional saved IRQ output.
+ * IRQ/task safe; preserves the caller's original IRQ state and never schedules
+ * or allocates. Caller controls lock order, holds no recursive instance and
+ * releases on the same context with kernel_spin_unlock_irqrestore.
+ */
 void kernel_spin_lock_irqsave(struct kernel_spinlock *lock, uint64_t *flags)
 {
     uint64_t saved = kernel_irq_save();
@@ -65,12 +85,24 @@ void kernel_spin_lock_irqsave(struct kernel_spinlock *lock, uint64_t *flags)
     kernel_spin_lock(lock);
 }
 
+/** @brief Release a spinlock before restoring the matching caller IRQ state.
+ * @param lock Borrowed lock held by this context, nullable.
+ * @param flags Exact IRQ state from its matching acquisition.
+ * IRQ/task safe, no allocation, wait or resource-reference transfer. Restoring
+ * enabled IRQs occurs only after protected accesses have been published.
+ */
 void kernel_spin_unlock_irqrestore(struct kernel_spinlock *lock, uint64_t flags)
 {
     kernel_spin_unlock(lock);
     kernel_irq_restore(flags);
 }
 
+/**
+ * @brief Acquire recursive execution ownership with FIFO admission and local IRQs masked.
+ * @param flags Optional writable original IRQ-state output, paired with the matching unlock.
+ * @par Context
+ * Boot/task context; recursion is valid only in the same execution context. Spins without scheduling, polls membarrier rendezvous, and excludes execution readers. Never hold across a scheduler wait; release every recursion level on the same context.
+ */
 void kernel_execution_lock_irqsave(uint64_t *flags)
 {
     /* Recursion belongs to an execution context, not merely to a CPU. A
@@ -225,3 +257,20 @@ void kernel_execution_read_unlock_irqrestore(uint64_t flags)
     __atomic_fetch_sub(&execution_readers, 1, __ATOMIC_SEQ_CST);
     kernel_irq_restore(flags);
 }
+
+/* Native filesystem modules share this core-owned interface; CRC/release
+ * checks bind it to the exact kernel, without a stable cross-release API. */
+EXPORT_SYMBOL(kernel_execution_lock_irqsave);
+EXPORT_SYMBOL(kernel_execution_unlock_irqrestore);
+
+EXPORT_SYMBOL(kernel_spin_init);
+
+EXPORT_SYMBOL(kernel_spin_lock);
+
+EXPORT_SYMBOL(kernel_spin_unlock);
+
+EXPORT_SYMBOL(kernel_spin_lock_irqsave);
+EXPORT_SYMBOL(kernel_spin_unlock_irqrestore);
+
+EXPORT_SYMBOL(kernel_execution_resume_irqsave);
+EXPORT_SYMBOL(kernel_execution_suspend_irqrestore);

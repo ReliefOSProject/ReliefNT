@@ -1,3 +1,4 @@
+#include <reliefnt/export.h>
 /*
  * ReliefOS user-copy implementation: performs checked Ring-3 buffer access.
  * Validates pointers and transfers strings or bytes without kernel overreach.
@@ -17,8 +18,14 @@ static uint64_t align_down_page(uint64_t value)
     return value & ~(PAGE_SIZE - 1ULL);
 }
 
-/**
- * @brief Return true if [ptr, ptr+len) is a valid user range with every page mapped, faulting pages in for the current user task on demand.
+/** @brief Validate readable user pages, resolving lazy faults for the current task.
+ * @param ptr Inclusive user virtual address. @param len Exact byte length.
+ * @return True for an accessible range, false for aperture/overflow/fault errors;
+ * zero length succeeds. Execution-owned task context; lazy faults may allocate
+ * or synchronously read a retained file provider, so no graph/module lock may
+ * span the call. Missing pages are resolved as user data reads, including
+ * untouched stack gaps; ordinary stack/VMA permissions and resource limits
+ * still apply. The caller owns all buffers/OFDs and performs the copy.
  */
 bool user_range_ok(uint64_t ptr, uint64_t len)
 {
@@ -41,7 +48,7 @@ bool user_range_ok(uint64_t ptr, uint64_t len)
     }
     for (page = align_down_page(ptr); page < end; page += PAGE_SIZE) {
         if (!address_space_user_page_readable(sched_task_as(task), page)) {
-            if (!syscall_handle_user_page_fault(page, 0) ||
+            if (!syscall_handle_user_page_fault(page, 0x4ULL) ||
                 !address_space_user_page_readable(sched_task_as(task), page)) {
                 return false;
             }
@@ -50,11 +57,12 @@ bool user_range_ok(uint64_t ptr, uint64_t len)
     return true;
 }
 
-/**
- * @brief Resolve lazy/COW output pages before a kernel copy under the execution lock.
- * @param ptr Start of the current user's output range.
- * @param len Byte length; zero succeeds for a current user task.
- * @return True for writable pages, false for invalid memory or allocation failure.
+/** @brief Prepare current user pages for output, resolving lazy/COW backing.
+ * @param ptr User virtual destination. @param len Byte count, zero allowed.
+ * @return True for writable pages, false without a user task or on bounds/fault/
+ * allocation failure. Execution-owned task context; may allocate/fault backing
+ * without a graph/module lock. No buffer/OFD ownership transfers; copyout is
+ * performed separately only after the complete range has been validated.
  */
 bool user_range_writable(uint64_t ptr, uint64_t len)
 {
@@ -94,3 +102,6 @@ size_t user_strlen(const char *s, size_t max)
     }
     return n;
 }
+
+EXPORT_SYMBOL(user_range_ok);
+EXPORT_SYMBOL(user_range_writable);

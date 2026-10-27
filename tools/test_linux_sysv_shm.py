@@ -18,7 +18,7 @@ with tempfile.TemporaryDirectory(prefix="reliefos-sysv-shm-") as directory:
     subprocess.run(["cc", "-std=c11", "-O1", "-g", "-fsanitize=address,undefined",
                     "-fno-sanitize-recover=all", "-ffunction-sections", "-fdata-sections",
                     "-Wl,--gc-sections", "-fno-pie", "-no-pie", *COMMON,
-                    "tools/tests/sysv_shm_test.c", "-o", output], cwd=ROOT, check=True)
+                    "tools/tests/sysv_shm_test.c", "kernel/device/mapping.c", "fs/security/access.c", "-o", output], cwd=ROOT, check=True)
     subprocess.run([output], cwd=ROOT, check=True, timeout=20)
     layouts = []
     for name, includes in [('target', COMMON), ('reference', ['-I' + str(FIXTURE), *COMMON])]:
