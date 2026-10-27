@@ -14,6 +14,7 @@
 #include <reliefnt/sched.h>
 #include <reliefnt/smp.h>
 #include <reliefnt/inventory.h>
+#include <reliefnt/lock.h>
 #include <reliefnt/userland.h>
 
 #include "../idt.h"

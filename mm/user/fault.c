@@ -62,20 +62,16 @@ static void zero_phys_page(uint64_t phys)
 }
 
 /**
- * Task map anonymous pages.
- * @param task Value supplied by the caller.
- * @param start Value supplied by the caller.
- * @param end Value supplied by the caller.
- * @param page_flags Value supplied by the caller.
- * @return The value or status produced by the operation.
+ * @brief Populate an admitted anonymous interval with its requested permissions.
+ * @param task User task owning the mapping and its page tables.
+ * @param start Page-aligned inclusive first user virtual byte.
+ * @param end Page-aligned exclusive interval end.
+ * @param page_flags VMA-validated PTE flags, including NX unless EXEC was requested.
+ * @return Zero on success or negative ENOMEM after releasing a partial mapping.
  */
 int task_map_anonymous_pages(struct task *task, uint64_t start, uint64_t end,
                                     uint64_t page_flags)
 {
-    /* Anonymous mappings have no executable provenance.  An application that
-     * needs JIT code must explicitly map RX after producing it; W+X is never
-     * accepted by the syscall. */
-    page_flags |= RELIEFNT_PAGE_NOEXEC;
     for (uint64_t page = start; page < end; page += PAGE_SIZE) {
         uint64_t phys = mm_alloc_page();
         if (!phys || !address_space_map_user_page(sched_task_as(task), page, phys, page_flags)) {

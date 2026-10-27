@@ -16,6 +16,7 @@ compatibility	tools/tests/installer_ramdisk_test.c	验证旧 leonos-installer-ro
 compatibility	tools/tests/linux_inventory_test.c	sysfs 冻结 leonos-block 接口值的 Linux 清单探针
 compatibility	include/uapi/README.rst	公开旧 libleonos.so.2 独立兼容 SONAME 的使用限制
 history	configs/kernel-source-map.json	源码拆分映射保留基线名称，仅作审计不进入生产编译
+history	Documentation/releases/5.1.0.rst	已发布 5.1.0 说明的 RST 归档，迁移指引保留已删除的旧标识和兼容路径
 history	Documentation/releases/5.1.2.rst	已发布 5.1.2 说明的 RST 归档，保留版本事实
 compatibility	tools/test_brand_identity.py	旧标识审计规则本身
 compatibility	tools/test_security_regressions.py	审计并拒绝旧私有 ioctl 名称

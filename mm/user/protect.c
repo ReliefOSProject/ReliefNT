@@ -118,9 +118,7 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
     if (!len) return 0;
     if (align_user_len(len, &mapped_len) < 0 || addr >= RELIEFNT_USER_TOP ||
         mapped_len > RELIEFNT_USER_TOP - addr) return -RELIEFOS_ENOMEM;
-    if ((prot & ~(uint64_t)(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC)) ||
-        (prot & (LINUX_PROT_WRITE | LINUX_PROT_EXEC)) ==
-                     (LINUX_PROT_WRITE | LINUX_PROT_EXEC)) {
+    if (prot & ~(uint64_t)(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC)) {
         return -RELIEFOS_EINVAL;
     }
     end = addr + mapped_len;

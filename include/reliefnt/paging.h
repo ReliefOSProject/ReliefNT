@@ -213,12 +213,22 @@ void address_space_destroy(struct address_space *as);
 bool address_space_prepare_user_range(struct address_space *as, uint64_t start,
                                       uint64_t end);
 /**
- * @brief Map user vaddr to phys with the given present/writable/user/noexec flags; true on success.
+ * @brief Map a user page with VMA-validated independent write/NX permissions.
+ * @param as Address space receiving the owned leaf mapping.
+ * @param vaddr User address, aligned down to a page.
+ * @param phys Aligned physical backing page; ownership transfers on success.
+ * @param flags PTE protection/ownership flags; explicit W|X is permitted.
+ * @return True on success; false for invalid addresses, NX absence, allocation
+ *         failure or an existing mapping, leaving backing ownership to caller.
  */
 bool address_space_map_user_page(struct address_space *as, uint64_t vaddr,
                                  uint64_t phys, uint64_t flags);
 /**
- * @brief Replace the protection flags of the user mapping at vaddr; true on success.
+ * @brief Replace user protection flags while preserving backing ownership/COW.
+ * @param as Address space containing the existing backed leaf.
+ * @param vaddr User address within the mapping.
+ * @param flags VMA-validated protection bits with independent write/NX state.
+ * @return True on success; false for invalid or unbacked addresses.
  */
 bool address_space_protect_user_page(struct address_space *as, uint64_t vaddr,
                                      uint64_t flags);

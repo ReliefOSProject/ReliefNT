@@ -43,6 +43,9 @@ uint64_t mm_alloc_page(void)
 void *mm_phys_to_virt(uint64_t physical) { return (void *)(uintptr_t)physical; }
 uint64_t mm_virt_to_phys(const void *address) { return (uint64_t)(uintptr_t)address; }
 void mm_free_page(uint64_t page) { assert(pages); --pages; free((void *)(uintptr_t)page); }
+uint64_t mm_free_memory_kib(void) { return UINT64_MAX; }
+void console_log(enum console_log_level level, const char *format, ...)
+{ (void)level; (void)format; }
 int page_cache_owns(uint64_t page) { (void)page; return 0; }
 void page_cache_release(uint64_t page) { (void)page; abort(); }
 void x86_64_invlpg(uint64_t page) { (void)page; }
@@ -66,9 +69,6 @@ void sysv_shm_vma_release(struct task *task, struct task_vma *vma)
 void sysv_shm_vma_split(struct task_vma *vma) { (void)vma; }
 /* mremap also links its anonymous/file alternatives. Those providers are
  * absent here and must never be entered by the actual device-remap test. */
-void console_log(enum console_log_level level,const char *format,...)
-{(void)level;(void)format;abort();}
-uint64_t mm_free_memory_kib(void){abort();}
 struct task_file *task_file_for_io(struct task *task,int fd)
 {(void)task;(void)fd;abort();}
 int file_can_read(const struct task_file *file){(void)file;abort();}
@@ -298,8 +298,52 @@ static void test_device_remap_preserves_actual_pages_and_shared_lease(void)
     puts("PASS generic device mremap resolves each actual PFN, preserves source on invalid move, forbids expansion and shares final backing through cloned/split VMAs");
 }
 
+/* Catch a syscall/PTE rejection of HotSpot's W -> W|X transition, and an
+ * eager/lazy anonymous mapper silently restoring NX after explicit EXEC. */
+static void test_explicit_executable_anonymous_memory(void)
+{
+    setup(1);
+    struct task_vma *vma = task_vma_containing(current, base, base + 4096);
+    assert(vma);
+    vma->prot = LINUX_PROT_WRITE;
+    assert(syscall_handle_private_anon_fault(current, base, 6));
+    uint64_t physical = address_space_user_page_phys(sched_task_as(current), base);
+    *(unsigned char *)mm_phys_to_virt(physical) = 42;
+    assert(address_space_user_page_flags(sched_task_as(current), base) & RELIEFNT_PAGE_NOEXEC);
+    assert(syscall_mm_mprotect(base, 4096, LINUX_PROT_WRITE | LINUX_PROT_EXEC) == 0);
+    assert(address_space_user_page_writable(sched_task_as(current), base));
+    assert(!(address_space_user_page_flags(sched_task_as(current), base) & RELIEFNT_PAGE_NOEXEC));
+    assert(*(unsigned char *)mm_phys_to_virt(physical) == 42);
+
+    assert(syscall_mm_mprotect(base, 4096, LINUX_PROT_READ | LINUX_PROT_EXEC) == 0);
+    assert(!address_space_user_page_writable(sched_task_as(current), base));
+    assert(syscall_mm_mprotect(base, 4096, LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) == 0);
+    assert(address_space_handle_cow_fault(sched_task_as(current), base));
+    assert(address_space_user_page_writable(sched_task_as(current), base));
+    assert(!(address_space_user_page_flags(sched_task_as(current), base) & RELIEFNT_PAGE_NOEXEC));
+
+    assert(syscall_mm_mprotect(base + 4096, 4096, LINUX_PROT_WRITE | LINUX_PROT_EXEC) == 0);
+    assert(syscall_handle_private_anon_fault(current, base + 4096, 20));
+    assert(address_space_user_page_writable(sched_task_as(current), base + 4096));
+    assert(!(address_space_user_page_flags(sched_task_as(current), base + 4096) & RELIEFNT_PAGE_NOEXEC));
+    assert(task_map_anonymous_pages(current, base + 8192, base + 12288,
+                                    RELIEFNT_PAGE_WRITABLE) == 0);
+    assert(!(address_space_user_page_flags(sched_task_as(current), base + 8192) & RELIEFNT_PAGE_NOEXEC));
+
+    assert(syscall_mm_mprotect(base, 4096, LINUX_PROT_READ | LINUX_PROT_WRITE) == 0);
+    assert(address_space_user_page_flags(sched_task_as(current), base) & RELIEFNT_PAGE_NOEXEC);
+    uint64_t saved = address_space_user_page_flags(sched_task_as(current), base);
+    vma = task_vma_containing(current, base, base + 4096);
+    vma->max_prot = LINUX_PROT_READ | LINUX_PROT_WRITE;
+    assert(syscall_mm_mprotect(base, 4096, LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) == -RELIEFOS_EACCES);
+    assert(address_space_user_page_flags(sched_task_as(current), base) == saved);
+    assert(syscall_mm_mprotect(base, 4096, 0x80) == -RELIEFOS_EINVAL);
+    teardown();
+}
+
 int main(void)
 {
+    test_explicit_executable_anonymous_memory();
     for (unsigned extra = 1; extra <= 17; ++extra) {
         test_split(extra, 1, 5); /* musl stack guard: prefix split */
         test_split(extra, 0, 4); /* suffix split */

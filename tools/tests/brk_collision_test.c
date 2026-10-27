@@ -12,6 +12,7 @@
 #include <reliefnt/audio.h>
 #include <reliefnt/console.h>
 #include <reliefnt/drm.h>
+#include <reliefnt/syscall.h>
 #include <reliefnt/framebuffer.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/mm.h>
@@ -41,6 +42,7 @@ static uint64_t mmap_provider_flags,mmap_provider_size=16384;
 static bool mmap_numeric_replaced;
 static bool mmap_async_requested=true;
 static uint64_t last_device_mapping_phys;
+static int file_writable = 1;
 struct task *sched_current_task(void) { return current_task; }
 
 uint32_t sched_task_vma_capacity(const struct task *task)
@@ -100,7 +102,7 @@ struct task_file *task_file_for_fd(struct task *task, int fd)
 struct task_file *task_file_for_io(struct task *task,int fd)
 {return task->syscall_file && task->syscall_fd==fd ? task->syscall_file : task_file_for_fd(task,fd);}
 int file_can_read(const struct task_file *file) { return file == &framebuffer_file || file == &second_file; }
-int file_can_write(const struct task_file *file) { return file == &framebuffer_file || file == &second_file; }
+int file_can_write(const struct task_file *file) { return (file == &framebuffer_file || file == &second_file) && file_writable; }
 int task_shm_mmap_check(const struct task_file *file, uint32_t flags, uint32_t prot, uint32_t *maximum)
 { (void)file; (void)flags; (void)prot; (void)maximum; return -1; }
 const struct framebuffer *framebuffer_get(void) { return &framebuffer_device; }
@@ -242,6 +244,36 @@ int main(void)
         .flags = TASK_VMA_FLAG_ANON, .prot = LINUX_PROT_READ,
     };
     current_task = &task;
+
+    /* Linux permits an explicit anonymous W|X reservation for JIT runtimes.
+     * Admission remains lazy and unknown protection bits remain invalid. */
+    const uint64_t jit_start = 0x0000000040000000ULL;
+    assert(syscall_mm_mmap(jit_start, page,
+        LINUX_PROT_WRITE | LINUX_PROT_EXEC,
+        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED_NOREPLACE,
+        UINT64_MAX, 0) == (int64_t)jit_start);
+    assert(!eager_range_prepares && !page_alloc_attempts);
+    assert(syscall_mm_munmap(jit_start, page) == 0);
+    assert(syscall_mm_mmap(jit_start, page, 0x80,
+        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED_NOREPLACE,
+        UINT64_MAX, 0) == -RELIEFOS_EINVAL);
+
+    framebuffer_file = (struct task_file){.used=1,.references=1,.flags=LINUX_O_RDWR,
+        .node={.type=RELIEFOS_FS_TYPE_FILE,.size=page}};
+    bind_mmap_provider(&framebuffer_file);
+    assert(!vfs_mount_set_flags(framebuffer_file.path_ref.mount, MS_NOEXEC));
+    assert(syscall_mm_mmap(jit_start, page, LINUX_PROT_WRITE | LINUX_PROT_EXEC,
+        LINUX_MAP_PRIVATE | LINUX_MAP_FIXED_NOREPLACE, 7, 0) == -RELIEFOS_EPERM);
+    assert(!vfs_mount_set_flags(framebuffer_file.path_ref.mount, MS_RDONLY));
+    assert(syscall_mm_mmap(jit_start, page, LINUX_PROT_WRITE | LINUX_PROT_EXEC,
+        LINUX_MAP_SHARED | LINUX_MAP_FIXED_NOREPLACE, 7, 0) == -RELIEFOS_EROFS);
+    assert(!vfs_mount_set_flags(framebuffer_file.path_ref.mount, 0));
+    file_writable = 0;
+    assert(syscall_mm_mmap(jit_start, page, LINUX_PROT_WRITE | LINUX_PROT_EXEC,
+        LINUX_MAP_SHARED | LINUX_MAP_FIXED_NOREPLACE, 7, 0) == -RELIEFOS_EACCES);
+    file_writable = 1;
+    task_file_put(&framebuffer_file);
+    assert(!mmap_provider_pins);
 
     /* Linux brk(2) returns the old break when an existing VMA blocks growth. */
     int64_t result = syscall_mm_brk(start + 2 * page);

@@ -1,7 +1,7 @@
 #include <reliefnt/export.h>
 /*
  * ReliefOS x86_64 paging: builds kernel and per-process address spaces.
- * Maps user pages, enforces NX/W^X permissions, and handles page protection.
+ * Maps user pages, applies explicit NX/write permissions, and handles protection.
  */
 #include <reliefnt/mm.h>
 #include <reliefnt/page_cache.h>
@@ -1365,11 +1365,12 @@ rollback:
     return false;
 }
 
-/** @brief Install one owned user leaf with validated W^X and backing flags.
+/** @brief Install one owned user leaf with caller-validated protection flags.
  * @param as Address space receiving the mapping.
  * @param vaddr User byte address; page-aligned internally.
  * @param phys Aligned physical backing page.
- * @param flags Mapping protection and software ownership flags.
+ * @param flags Mapping protection and ownership flags; writable/executable
+ *              combinations are permitted after the VMA policy checks.
  * @return True when an empty leaf is installed; false leaves caller ownership.
  */
 bool address_space_map_user_page(struct address_space *as, uint64_t vaddr,
@@ -1379,7 +1380,6 @@ bool address_space_map_user_page(struct address_space *as, uint64_t vaddr,
     uint64_t *pte;
     if (!as || !phys || (phys & ~RELIEFNT_PHYS_ADDR_MASK) ||
         (phys & (PAGE_SIZE - 1)) || !user_address_valid(page) ||
-        ((flags & RELIEFNT_PAGE_WRITABLE) && !(flags & RELIEFNT_PAGE_NOEXEC)) ||
         !nx_enabled) return false;
     if (!address_space_prepare_user_range(as, page, page + PAGE_SIZE)) return false;
     pte = address_space_pte(as, page);
@@ -1395,7 +1395,8 @@ bool address_space_map_user_page(struct address_space *as, uint64_t vaddr,
 /** @brief Change permissions while retaining the current mapping's ownership.
  * @param as Address space with the mapped leaf.
  * @param vaddr Address within the leaf page.
- * @param flags New protection and software permission bits.
+ * @param flags New protection and software permission bits, validated against
+ *              the VMA limits; NX is controlled independently of write access.
  * @return True after an existing backed mapping changes; false on invalid input.
  */
 bool address_space_protect_user_page(struct address_space *as, uint64_t vaddr,
@@ -1404,8 +1405,7 @@ bool address_space_protect_user_page(struct address_space *as, uint64_t vaddr,
     uint64_t page = align_down(vaddr, PAGE_SIZE);
     uint64_t *pte;
     uint64_t entry;
-    if (!as || !user_address_valid(page) ||
-        ((flags & RELIEFNT_PAGE_WRITABLE) && !(flags & RELIEFNT_PAGE_NOEXEC)))
+    if (!as || !user_address_valid(page))
         return false;
     pte = address_space_pte(as, page);
     if (!pte || !(*pte & RELIEFNT_PAGE_BACKED)) return false;
