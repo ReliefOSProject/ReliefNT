@@ -140,4 +140,5 @@ int main(void)
     assert(strstr(vt_text[0].bytes, service_output) != NULL);
     assert(strstr(vt_text[0].bytes, graphical_output) != NULL);
     puts("VT boot continuity, terminal/diagnostic separation, serial mirror, graphics isolation and text cursor passed");
+    return 0;
 }

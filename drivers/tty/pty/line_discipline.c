@@ -1,5 +1,15 @@
 #include "internal.h"
 
+/** @brief Queue terminal query traffic without turning it into keyboard echo. */
+void pty_vt_reply(uint32_t number, const char *bytes, size_t len)
+{
+    struct pty_session *session=find_session(number);
+    if (number<1 || number>VT_COUNT || !session || !session->console || session->hungup || !bytes || !len) return;
+    if (len>64) len=64;
+    if (ring_push(session->input,PTY_INPUT_CAP,&session->input_head,&session->input_tail,bytes,(uint32_t)len))
+        kernel_poll_readiness_notify();
+}
+
 /**
  * @brief Return 1 if the session is in ICANON line mode.
  */

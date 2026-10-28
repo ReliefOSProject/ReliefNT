@@ -31,6 +31,10 @@ int pty_vt_init(void)
         struct pty_session *session = pty_session_slot_at(number - 1u);
         if (!session) return -12;
         session->console = 1;
+        if (console_vga_text_mode) {
+            session->winsize.ws_row=25;
+            session->winsize.ws_col=80;
+        }
         session->locked = 0;
         vt_modes[number - 1u] = (struct vt_mode){ .mode = VT_AUTO };
         vt_keyboard_modes[number - 1u] = K_XLATE;
@@ -128,6 +132,10 @@ int pty_vt_reset_mode(uint32_t pty_id)
     index = pty_id - 1u;
     owned_handoff = vt_release_pending[index];
     was_graphical = vt_graphical[index];
+    if (console_vga_text_mode && was_graphical && active_vt==pty_id) {
+        int ret=console_prepare_vt(false);
+        if (ret) return ret;
+    }
     vt_modes[index] = (struct vt_mode){ .mode = VT_AUTO };
     vt_release_pending[index] = 0;
     vt_acquire_pending[index] = 0;
@@ -210,6 +218,10 @@ int pty_vt_open_query(void)
 static int pty_vt_commit_switch(uint32_t number)
 {
     if (!pty_vt_id(number)) return -22;
+    if (console_vga_text_mode) {
+        int ret=console_prepare_vt(vt_graphical[number-1]!=0);
+        if (ret) return ret;
+    }
     if (active_vt && active_vt <= VT_COUNT) vt_release_pending[active_vt - 1u] = 0;
     vt_switch_target = 0;
     ++vt_display_generation;
@@ -272,6 +284,9 @@ int pty_vt_release_display(uint32_t pty_id, int request)
     }
     /* VT_TRUE: the controller has finished using its display. */
     target = vt_switch_target;
+    /* A failed opt-in hardware transition must remain retryable: commit
+     * clears the pending grant only after its prepare step succeeds. */
+    if (console_vga_text_mode) return pty_vt_commit_switch(target);
     vt_release_pending[index] = 0;
     return pty_vt_commit_switch(target);
 }
@@ -370,6 +385,10 @@ int64_t pty_vt_wait_active(uint32_t number)
 int pty_vt_set_graphics(uint32_t pty_id, int enabled)
 {
     if (!pty_vt_number(pty_id) || (enabled != 0 && enabled != 1)) return -22;
+    if (console_vga_text_mode && active_vt==pty_id) {
+        int ret=console_prepare_vt(enabled!=0);
+        if (ret) return ret;
+    }
     console_info("[reliefnt] VT graphics vt=%u enabled=%d\n", pty_id, enabled);
     vt_graphical[pty_id - 1u] = (uint8_t)enabled;
     if (active_vt == pty_id) {

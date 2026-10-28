@@ -29,7 +29,7 @@ FIXTURES = [
 CASES = {
     "xorg-vt-handoff": ["controller", "reldisp", "occupancy", "bitmap", "death", "detach",
                          "nonleader-death", "keyboard", "raw-modifier", "graphics-keyboard",
-                         "modifier-transition", "auto-graphics", "raw-termios", "missing-controller"],
+                         "modifier-transition", "auto-graphics", "raw-termios", "missing-controller", "vga-prepare"],
     "evdev-grab": ["scalar", "repeat", "release", "console", "publication", "ofd", "ioctl-query", "vt-bind"],
 }
 

@@ -9,5 +9,6 @@
 
    boot
    boot-logo
+   vga-text
    panic
    limitations

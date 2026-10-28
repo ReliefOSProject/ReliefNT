@@ -5,6 +5,7 @@ apic_timer tools/test_apic_timer.py
 audio_pcm_directmap tools/test_audio_pcm_directmap.py
 block_exclusive tools/test_block_exclusive.py
 console tools/test_console.py
+vga_text tools/test_vga_text.py
 cpu_accounting tools/test_cpu_accounting.py
 drm tools/test_drm.py
 e1000 tools/test_e1000.py

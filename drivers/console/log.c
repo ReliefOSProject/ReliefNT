@@ -118,7 +118,8 @@ static void console_log_control(const char *sequence)
     for (const char *cursor = sequence; *cursor; ++cursor) {
         log_store(*cursor);
         if (!console_service_logs_only) {
-            fb_console_ansi_feed(*cursor);
+            if (console_vga_text_mode) vga_console_boot_byte(*cursor);
+            else fb_console_ansi_feed(*cursor);
         }
     }
 }

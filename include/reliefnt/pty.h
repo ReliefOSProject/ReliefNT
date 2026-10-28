@@ -25,6 +25,10 @@ int pty_inode_permissions(const struct storage_node *node,
  * @brief Initialize the pseudo-terminal subsystem and its backing storage.
  */
 void pty_init(void);
+/** @brief Deliver a bounded terminal-generated response directly to a fixed VT.
+ * @param number Console 1..6. @param bytes Response bytes. @param len Byte count.
+ * Execution-owned output context; bypasses echo, canonical editing and signals. */
+void pty_vt_reply(uint32_t number, const char *bytes, size_t len);
 /** @brief Reserve tty1 through tty6 before user processes start.
  * @return Zero on success, negative ENOMEM if allocation fails. */
 int pty_vt_init(void);

@@ -48,6 +48,14 @@ struct console_panic_context console_panic_begin(void)
     struct console_panic_context context = {
         .vt = console_active_vt, .graphical = console_vt_graphical,
     };
+    if (console_vga_text_mode) {
+        vga_console_panic_begin();
+        console_vt_graphical=false;
+        console_boot_logo_active=false;
+        fb_console_enabled=false;
+        serial_write_emergency("\n",1);
+        return context;
+    }
     fb_console_panic_overlay = context.graphical;
     fb_console_panic_clipped = false;
     bool reset = context.graphical || fb_console_render_target ||
@@ -107,6 +115,10 @@ void console_panic_write(const char *text, size_t length, uint32_t foreground)
     serial_write_emergency(text, length);
     fb_console_fg_color = foreground;
     fb_console_bg_color = 0;
+    if (console_vga_text_mode) {
+        vga_console_panic_write(text,length,vga_foreground);
+        return;
+    }
     for (size_t i = 0; i < length; ++i) {
         if (fb_console_enabled) fb_console_putc(text[i]);
         else vga_panic_putc(text[i], vga_foreground);

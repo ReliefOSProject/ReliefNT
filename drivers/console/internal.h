@@ -12,6 +12,7 @@
 #include <reliefnt/lock.h>
 #include <reliefnt/smp.h>
 #include <reliefnt/time.h>
+#include "vga_console.h"
 
 #define CONSOLE_LOG_CAP 65536
 #define CONSOLE_MAX_COLS 512u

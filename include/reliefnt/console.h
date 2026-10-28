@@ -36,6 +36,21 @@ void console_serial_write_len(const char *s, size_t len);
 void console_vt_write(uint32_t number, const char *s, size_t len);
 /** @brief Present the active text VT or yield the framebuffer to graphics. */
 void console_vt_activate(uint32_t number, bool graphical);
+/** @brief True only when the opt-in hardware VGA terminal was successfully bound. */
+extern bool console_vga_text_mode;
+/** @brief Prepare an opt-in VGA display transaction before committing VT ownership.
+ * @param graphical New ownership. @return Zero or a negative error; default
+ * framebuffer consoles are a no-op. Caller holds the execution transaction. */
+int console_prepare_vt(bool graphical);
+/** @brief Configure a requested VGA backend before creating fixed terminal sessions.
+ * @param cmdline Boot command line. @param legacy_boot Non-EFI firmware handoff. */
+void vga_console_configure(const char *cmdline, bool legacy_boot);
+/** @brief Encode VGA terminal navigation/function keys using its DEC cursor mode.
+ * @param vt Fixed console 1..6. @param keycode Normalized keyboard make code.
+ * @param modifiers xterm modifier value, 1..8. @param bytes Eight writable bytes.
+ * @return Encoded length, or zero to use the unchanged ordinary key translator.
+ * Caller holds TTY execution ownership. */
+unsigned vga_console_key(uint32_t vt, uint8_t keycode, unsigned modifiers, char *bytes);
 /** @brief Refresh the active graphical VT's framebuffer scanout. */
 void console_display_tick(void);
 

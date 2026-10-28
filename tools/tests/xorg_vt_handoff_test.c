@@ -17,6 +17,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include "modules/pty.h"
+bool console_vga_text_mode;
+static int prepare_error;
+int console_prepare_vt(bool graphics) { (void)graphics; return prepare_error; }
+unsigned vga_console_key(uint32_t v,uint8_t k,unsigned m,char *b)
+{ (void)v;(void)k;(void)m;(void)b;return 0; }
 
 #define SIG_RELEASE 10
 #define SIG_ACQUIRE 12
@@ -159,7 +164,27 @@ static void regression(const char *name)
     current = &owners[2];
     pty_init();
     assert(pty_vt_init() == 0);
-    if (!strcmp(name, "controller")) {
+    if (!strcmp(name,"vga-prepare")) {
+        console_vga_text_mode=true;
+        prepare_error=-16;
+        assert(pty_vt_set_graphics(1,1)==-16 && !pty_vt_graphical(1));
+        assert(pty_vt_switch(2)==-16 && pty_vt_active()==1);
+        prepare_error=0;
+        assert(!pty_vt_set_graphics(1,1) && pty_vt_graphical(1));
+        assert(!pty_vt_set_mode(1,&mode));
+        assert(!pty_vt_switch(2) && pty_vt_active()==1);
+        prepare_error=-16;
+        assert(pty_vt_release_display(1,1)==-16 && pty_vt_active()==1);
+        assert(vt_release_pending[0] && vt_switch_target==2);
+        prepare_error=0;
+        assert(!pty_vt_release_display(1,1) && pty_vt_active()==2);
+        assert(!pty_vt_switch(1) && pty_vt_active()==1);
+        prepare_error=-5;
+        assert(pty_vt_set_graphics(1,0)==-5 && pty_vt_graphical(1));
+        assert(pty_vt_reset_mode(1)==-5 && pty_vt_graphical(1));
+        prepare_error=0;
+        assert(!pty_vt_reset_mode(1) && !pty_vt_graphical(1));
+    } else if (!strcmp(name, "controller")) {
         assert(pty_vt_set_mode(1, &mode) == 0);
         assert(pty_vt_switch(2) == 0 && pty_vt_active() == 1);
         assert(signal_count == 1 && signal_log[0].pid == 100 && !signal_log[0].group);

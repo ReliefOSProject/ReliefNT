@@ -290,12 +290,13 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
     kernel_objects_init();
     time_init();
     input_init();
+    vga_console_configure(boot.cmdline, !boot.efi_system_table);
     pty_init();
     console_set_ui_theme(boot_theme);
     console_enable_framebuffer();
     console_enable_vga_fallback();
     console_info("[boot] kernel_console=%s theme=%s serial=%s\n",
-                 framebuffer_get()->available ? "framebuffer" : "VGA",
+                 console_vga_text_mode ? "VGA-text" : framebuffer_get()->available ? "framebuffer" : "VGA",
                  boot_theme == 0u ? "win95" : "metro",
                  serial_is_ready() ? "driver" : "early-COM1");
     sched_init();

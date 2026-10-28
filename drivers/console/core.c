@@ -27,6 +27,7 @@ bool fb_console_panic_clipped;
 bool console_boot_logo_active = true;
 
 bool vga_console_enabled;
+bool console_vga_text_mode;
 
 uint32_t fb_x;
 
@@ -100,6 +101,13 @@ static void vga_console_ansi_feed(char character)
 void console_emit_raw(char ch)
 {
     char s[2] = {ch, 0};
+    if (console_vga_text_mode) {
+        log_store(ch);
+        serial_write(s);
+        if (!console_service_logs_only) vga_console_boot_byte(ch);
+        console_line_start = ch == '\n';
+        return;
+    }
     if (!console_service_logs_only) fb_console_hide_tty_cursor();
     log_store(ch);
     serial_write(s);
@@ -115,6 +123,7 @@ void console_emit_raw(char ch)
 /** @brief Draw the cursor and publish an active text grid when not staging. */
 void console_present(void)
 {
+    if (console_vga_text_mode) { vga_console_present(); return; }
     const struct framebuffer *fb = fb_console_framebuffer();
     if (console_presenting || console_vt_graphical || !fb_console_enabled ||
         !fb->available) {
@@ -207,6 +216,7 @@ void console_printf(const char *fmt, ...)
 
 void console_enable_framebuffer(void)
 {
+    if (console_vga_text_mode) return;
     if (!framebuffer_get()->available) {
         return;
     }
@@ -243,6 +253,7 @@ void console_boot_complete(void)
 
 void console_enable_vga_fallback(void)
 {
+    if (console_vga_text_mode) return;
     if (framebuffer_get()->available) {
         return;
     }

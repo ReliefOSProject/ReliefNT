@@ -116,6 +116,7 @@ static bool console_restore_graphic_frame(uint32_t number)
 void console_vt_write(uint32_t number, const char *s, size_t len)
 {
     if (!s || number < 1u || number > CONSOLE_VT_COUNT) return;
+    if (console_vga_text_mode) { vga_console_write(number,s,len); return; }
     if (number == console_active_vt && !console_vt_graphical)
         fb_console_hide_tty_cursor();
     struct console_vt_text *screen = &vt_text[number - 1u];
@@ -143,6 +144,18 @@ void console_vt_activate(uint32_t number, bool graphical)
 {
     bool restored = false;
     if (number < 1u || number > CONSOLE_VT_COUNT) return;
+    if (console_vga_text_mode) {
+        console_active_vt=number;
+        console_vt_graphical=graphical;
+        console_service_logs_only=true;
+        if (graphical) {
+            if (!console_restore_graphic_frame(number)) {
+                framebuffer_clear(0);
+                framebuffer_present();
+            }
+        } else vga_console_activate();
+        return;
+    }
     bool preserve_text = !graphical && !console_vt_graphical &&
         (console_active_vt == number || (!console_active_vt && number == 1u));
     if (!console_active_vt) {
@@ -199,4 +212,12 @@ void console_vt_activate(uint32_t number, bool graphical)
         framebuffer_present();
         kernel_free(replay_pixels);
     }
+}
+
+/** @brief Leave a failed VGA transition uncommitted by the VT ownership layer. */
+int console_prepare_vt(bool graphical)
+{
+    if (!console_vga_text_mode) return 0;
+    if (console_vt_graphical && !graphical) console_save_graphic_frame();
+    return vga_console_switch(graphical);
 }

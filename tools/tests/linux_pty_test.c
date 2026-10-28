@@ -5,6 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include "modules/pty.h"
+bool console_vga_text_mode;
+int console_prepare_vt(bool graphics) { (void)graphics; return 0; }
+unsigned vga_console_key(uint32_t v,uint8_t k,unsigned m,char *b)
+{ (void)v;(void)k;(void)m;(void)b;return 0; }
 
 static struct task owner;
 static unsigned signals;
@@ -157,6 +161,15 @@ int main(void)
     pty_init();
     assert(pty_vt_init() == 0);
     id = 1;
+    {
+        char response_bytes[8];
+        size_t echoed_before=vt_written_len;
+        pty_vt_reply(1,"\033[0n",4);
+        assert(pty_read_input(1,response_bytes,sizeof(response_bytes))==4);
+        assert(!memcmp(response_bytes,"\033[0n",4) && vt_written_len==echoed_before);
+        assert(!find_session(1)->canonical_length);
+        pty_vt_reply(7,"ignored",7);
+    }
     assert(pty_slave_open_allowed(id));
     assert(pty_read_input(id, &ch, 1) == -11);
     const uint8_t keys[] = {23, 49, 31, 20, 30, 38, 38};
@@ -198,7 +211,13 @@ int main(void)
     assert(find_session(id) == NULL);
     assert(pty_transfer_get(id, TASK_PTY_ENDPOINT_SLAVE) == -9);
     pty_init();
+    console_vga_text_mode=true;
     assert(pty_vt_init() == 0);
+    for(unsigned vt=1;vt<=6;++vt) {
+        struct linux_winsize size;
+        assert(!pty_get_linux_winsize(vt,&size) && size.ws_row==25 && size.ws_col==80);
+    }
+    console_vga_text_mode=false;
     /* kernel_start activates tty1 after boot diagnostics, not in pty_vt_init. */
     assert(pty_vt_active() == 1 && shown_vt == 0);
     console_vt_activate(1, false);
