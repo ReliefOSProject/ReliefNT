@@ -17,6 +17,7 @@ FIXTURES = [
     ("tools/tests/drm_execbuf_test.c", "drm-execbuf"),
     ("tools/tests/drm_core_test.c", "drm-core"),
     ("tools/tests/drm_vma_clear_test.c", "drm-vma-clear"),
+    ("tools/tests/drm_runtime_sysfs_test.c", "drm-runtime-sysfs"),
     ("tools/tests/framebuffer_drm_test.c", "framebuffer-drm"),
     ("tools/tests/console_replay_test.c", "console-replay"),
 ]
@@ -44,7 +45,8 @@ def main() -> int:
                 *INCLUDES, source, "-Wl,--gc-sections", "-o", str(binary),
             ]
             if name == "drm-core":
-                command[1:1] = ["kernel/device/service.c", "kernel/device/graphics_service.c",
+                command[1:1] = ['-DKBUILD_MODNAME="drm"', "kernel/params/value.c", "kernel/params/arguments.c",
+                                "kernel/device/service.c", "kernel/device/graphics_service.c",
                                 "drivers/video/drm/services.c", "drivers/video/drm/memory.c"]
             if name in ("drm-core", "drm-vma-clear"):
                 command[1:1] = ["kernel/device/mapping.c"]

@@ -22,6 +22,9 @@ static const struct modversion_info versions[] __attribute__((section("__version
 #ifdef TEST_CONSUMER
     {0x12345678u,"provided_value"},
 #endif
+#ifdef TEST_WEAK_CRC
+    {TEST_WEAK_CRC,__RN_STRING(TEST_WEAK_SYMBOL)},
+#endif
 };
 #ifdef TEST_PROVIDER
 static const struct module_export_symbol exports[] __attribute__((section("__ksymtab"),used)) = {

@@ -328,7 +328,7 @@ def run_abi() -> int:
 
 
 def build_guest(output: Path, sdk: Path, period_frames: int = 512,
-                buffer_frames: int = 2048) -> int:
+                buffer_frames: int = 2048, channels: int = 2) -> int:
     """Compile one source against Linux reference, production UAPI and musl.
 
     Run only ABI and invalid arguments on the host. Real sound operations are
@@ -337,19 +337,22 @@ def build_guest(output: Path, sdk: Path, period_frames: int = 512,
     output = output.resolve()
     if not output.is_relative_to(ROOT / "out"):
         raise SystemExit("guest output must be in this worktree's build directory")
+    if not 1 <= channels <= 16:
+        raise SystemExit("guest channels must be between 1 and 16")
     if period_frames < 32 or period_frames % 32:
         raise SystemExit("guest period must be a multiple of 32 frames and at least 32")
     if buffer_frames < period_frames * 2 or buffer_frames % period_frames:
         raise SystemExit("guest buffer must contain an integral number of at least two periods")
-    if buffer_frames > 16384:
-        raise SystemExit("guest buffer exceeds the 64 KiB S16 stereo PCM limit")
+    if buffer_frames * channels * 2 > 65536:
+        raise SystemExit("guest buffer exceeds the 64 KiB S16 PCM probe limit")
     output.parent.mkdir(parents=True, exist_ok=True)
     for path, digest in PINNED.items():
         if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
             raise SystemExit(f"fixture hash mismatch: {path}")
     common = ["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
               f"-DAUDIO_GUEST_PERIOD_FRAMES={period_frames}",
-              f"-DAUDIO_GUEST_BUFFER_FRAMES={buffer_frames}"]
+              f"-DAUDIO_GUEST_BUFFER_FRAMES={buffer_frames}",
+              f"-DAUDIO_GUEST_CHANNELS={channels}"]
     host, reference = Path(str(output) + "-host"), Path(str(output) + "-linux-v6.14")
     commands = [
         ["cc", *common, "-I", str(ROOT / "include/uapi"),
@@ -391,7 +394,8 @@ def build_guest(output: Path, sdk: Path, period_frames: int = 512,
         "source_sha256": hashlib.sha256(GUEST_PROBE.read_bytes()).hexdigest(),
         "pcm_geometry": {"period_frames": period_frames,
                          "buffer_frames": buffer_frames,
-                         "buffer_bytes": buffer_frames * 4},
+                         "channels": channels,
+                         "buffer_bytes": buffer_frames * channels * 2},
         "binaries": [{"path": str(p.relative_to(ROOT)) if p.is_relative_to(ROOT) else str(p),
                       "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in binaries],
         "evidence": "host ABI/invalid arguments/transport fixture and musl build only",
@@ -410,6 +414,8 @@ def main() -> int:
     parser.add_argument("--build-guest", action="store_true")
     parser.add_argument("--guest-period-frames", type=int, default=512)
     parser.add_argument("--guest-buffer-frames", type=int, default=2048)
+    parser.add_argument("--guest-channels", type=int, default=2,
+                        help="exact channel count from the target PCM HW_REFINE result")
     parser.add_argument("--output", type=Path, default=ROOT / "out/audio-hda/qa/audio-guest")
     parser.add_argument("--sdk", type=Path, default=ROOT / "out/audio-hda/sdk/reliefos-musl-sdk")
     args = parser.parse_args()
@@ -423,7 +429,7 @@ def main() -> int:
         if result:
             return result
     return build_guest(args.output, args.sdk, args.guest_period_frames,
-                       args.guest_buffer_frames) if args.build_guest else 0
+                       args.guest_buffer_frames, args.guest_channels) if args.build_guest else 0
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ static int stop_ready=1,nested;
 static int block_init,entered_init,proceed_init;
 static pthread_mutex_t gate=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t condition=PTHREAD_COND_INITIALIZER;
-static struct { void *bytes; size_t size; } images[8];
+static struct { void *bytes; size_t size; } images[16];
 static int stop_resource(void *p) { assert(p==&released);++stopped;return stop_ready ? 0 : -16; }
 static void free_resource(void *p) { assert(p==&released);++released; }
 int test_control(struct module *owner,int stage);
@@ -33,11 +33,21 @@ int test_control(struct module *owner,int stage)
 }
 struct module_parameter;
 extern void module_layout(struct module *,const struct module_parameter *,const struct module_export_symbol *);
+/** @brief Return an independently expected value from each optional host export.
+ * @return Literal 42, checked by the loaded ELF fixture's real entry point.
+ */
+static int weak_fixture_value(void) { return 42; }
 static const struct module_export_symbol kernel_exports[] __attribute__((section("__ksymtab"),used)) = {
     {(uintptr_t)test_control,"test_control",""},
     {(uintptr_t)module_layout,"module_layout",""},
+    {(uintptr_t)weak_fixture_value,"weak_value",""},
+    {(uintptr_t)weak_fixture_value,"weak_namespaced","RELIEFNT_WEAK_TEST"},
 };
-static const uint32_t kernel_crcs[] __attribute__((section("__kcrctab"),used)) = {0x11223344u,0x55667788u};
+static const uint32_t kernel_crcs[] __attribute__((section("__kcrctab"),used)) = {0x11223344u,0x55667788u,0x12345678u,0x12345678u};
+static const struct module_export_symbol kernel_gpl_exports[] __attribute__((section("__ksymtab_gpl"),used)) = {
+    {(uintptr_t)weak_fixture_value,"weak_gpl",""},
+};
+static const uint32_t kernel_gpl_crcs[] __attribute__((section("__kcrctab_gpl"),used)) = {0x12345678u};
 static void read_image(unsigned i,const char *path)
 {
     FILE *f=fopen(path,"rb");assert(f);assert(!fseek(f,0,SEEK_END));long n=ftell(f);assert(n>0);rewind(f);
@@ -46,9 +56,23 @@ static void read_image(unsigned i,const char *path)
 }
 static int load(unsigned i) { return module_load_image(images[i].bytes,images[i].size,"",0); }
 static void *concurrent_loader(void *unused){(void)unused;return (void *)(intptr_t)load(0);}
+/** @brief Exercise actual ELF linking, import policy, retirement and rollback.
+ * @param argc Program plus the sixteen independently compiled module paths.
+ * @param argv Borrowed host fixture paths; no host modules are loaded.
+ * @return Zero after all real loader/owner assertions, abort on a broken contract.
+ */
 int main(int argc,char **argv)
 {
-    assert(argc==9);for(unsigned i=0;i<8;++i)read_image(i,argv[i+1]);
+    assert(argc==17);for(unsigned i=0;i<16;++i)read_image(i,argv[i+1]);
+    assert(!load(8));assert(!module_unload("weak_absent",0));
+    assert(!load(9));assert(!module_unload("weak_valid",0));
+    assert(load(10)==-ENOEXEC);
+    assert(load(11)==-ENOEXEC);
+    assert(load(12)==-EINVAL);
+    assert(load(13)==-EPERM);
+    assert(!load(14));assert(!module_unload("weak_ns_valid",0));
+    assert(!load(15));assert(!module_unload("weak_gpl_valid",0));
+    assert(!host_live_heap && !host_live_maps);
     assert(try_module_get(NULL));module_put(NULL);assert(module_execution_get(NULL));module_execution_put(NULL);
     assert(module_unload("absent",0)==-2);
     assert(!load(0));assert(initialized[0]==1);
@@ -146,6 +170,6 @@ int main(int argc,char **argv)
     assert(!module_unload("provider",0) && !module_identity_alive(retired));
     module_identity_put(retired);module_identity_put(NULL);
     assert(!host_live_heap && !host_live_maps);
-    for(unsigned i=0;i<8;++i)free(images[i].bytes);
+    for(unsigned i=0;i<16;++i)free(images[i].bytes);
     puts("PASS modules: dependency pins, duplicate/concurrent load, exact ABI/CRC, failed init, nested init, external busy, callback drain, safe STOP retention, rollback");
 }

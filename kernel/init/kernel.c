@@ -302,7 +302,6 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
     sched_create_idle_task();
     syscall_init();
     syscall_trace_configure(boot.cmdline);
-    graphics_service_configure(boot.cmdline);
     arch_userland_init(kernel_ring0_stack + sizeof(kernel_ring0_stack));
     /* The kernel GDT and TSS are live now, so the kernel IDT must be loaded
      * before anything else can take a fault or restore IF.  Until this lidt

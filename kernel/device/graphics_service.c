@@ -3,7 +3,6 @@
 #include <reliefnt/export.h>
 #include <linux/errno.h>
 static struct kernel_service_slot graphics_service_slot;
-static bool graphics_faildiag_enabled;
 /** @brief Publish one graphics table without taking a permanent self-reference.
  * @param provider Persistent immutable table and owner descriptor.
  * @return Zero or generic registration errno. Init/task context; the core ledger
@@ -17,36 +16,6 @@ int graphics_service_register(const struct kernel_service_descriptor *provider)
  */
 int graphics_service_unregister(const struct kernel_service_descriptor *provider)
 {return kernel_service_unregister(&graphics_service_slot,provider);}
-/** @brief Recognize only standard ASCII command-line token separators.
- * @param value One input byte.
- * @return True for the six ASCII whitespace characters; pure boot parsing.
- */
-static bool graphics_boot_space(char value)
-{return value==' ' || value=='\t' || value=='\r' || value=='\n' || value=='\v' || value=='\f';}
-/** @brief Retain only the exact DRM failure-diagnostic boot option as core state.
- * @param cmdline Borrowed boot command line, nullable; no pointer is retained.
- * Boot task context before provider initialization; exact tokens only, no I/O.
- */
-void graphics_service_configure(const char *cmdline)
-{
-    static const char option[]="drm.faildiag=1";bool enabled=false;
-    for(const char *cursor=cmdline;cursor && *cursor;) {
-        while(*cursor && graphics_boot_space(*cursor))++cursor;
-        const char *start=cursor;
-        while(*cursor && !graphics_boot_space(*cursor))++cursor;
-        if((size_t)(cursor-start)==sizeof(option)-1) {
-            size_t i=0;while(i<sizeof(option)-1 && start[i]==option[i])++i;
-            if(i==sizeof(option)-1){enabled=true;break;}
-        }
-    }
-    __atomic_store_n(&graphics_faildiag_enabled,enabled,__ATOMIC_RELEASE);
-}
-/** @brief Read the permanent diagnostic preference during late provider init.
- * @return True only for the exact boot token drm.faildiag=1.
- * Task context; atomic copied state, no provider or boot-buffer reference escapes.
- */
-bool graphics_service_faildiag_enabled(void)
-{return __atomic_load_n(&graphics_faildiag_enabled,__ATOMIC_ACQUIRE);}
 /** @brief Report whether a graphics provider owns a discovered primary node.
  * @return Backend result or false when no method is available.
  * Execution-owned task context; no registry lock spans the callback or wait.
@@ -169,4 +138,3 @@ bool graphics_service_task_signal_busy(const struct task *task)
 }
 EXPORT_SYMBOL(graphics_service_register);
 EXPORT_SYMBOL(graphics_service_unregister);
-EXPORT_SYMBOL(graphics_service_faildiag_enabled);

@@ -1380,6 +1380,77 @@ static void kernel_boot_control(struct vfs_namespace *ns,const struct vfs_path *
     assert(!vfs_kernel_unlink(ns,"/outside-control"));
     puts("PASS kernel boot controls: actual ESP attachment, no text labels, escape rejection, literal unlink and overmount rejection");
 }
+/** @brief Verify default and explicit access policy on actual boot attachments.
+ * @return None. Uses the production bootstrap/tmpfs graph, restores raw volume
+ * flags and wall clock, and retires every new namespace and volatile shm.
+ */
+static void initial_root_access_policy(void)
+{
+    static const struct {
+        uint64_t input, policy;
+        unsigned forced_readonly;
+    } cases[]={
+        {0,MS_RELATIME,0},
+        {MS_NOATIME,MS_NOATIME,0},
+        {MS_STRICTATIME,0,0},
+        {MS_STRICTATIME|MS_NOATIME|MS_RELATIME,0,0},
+        {MS_NODIRATIME|MS_NOSUID|MS_NODEV|MS_NOEXEC|MS_SYNCHRONOUS|MS_DIRSYNC|MS_LAZYTIME,
+         MS_NODIRATIME|MS_NOSUID|MS_NODEV|MS_NOEXEC|MS_RELATIME,0},
+        {0,MS_RDONLY|MS_RELATIME,1},
+        {0,MS_RDONLY|MS_RELATIME,2}
+    };
+    uint64_t saved_flags=g_volumes[0].mount_flags,saved_clock=test_wall_seconds;
+    uint32_t saved_readonly=g_volumes[0].read_only_reason;
+    const struct storage_filesystem_ops *saved_ops=g_volumes[0].fs_ops;
+    struct storage_filesystem_ops readonly_ops=*saved_ops;readonly_ops.flags|=STORAGE_FS_READONLY;
+    for(size_t i=0;i<sizeof(cases)/sizeof(cases[0]);++i) {
+        g_volumes[0].mount_flags=cases[i].input;
+        g_volumes[0].fs_ops=cases[i].forced_readonly==1 ? &readonly_ops : saved_ops;
+        g_volumes[0].read_only_reason=cases[i].forced_readonly==2 ? STORAGE_EXT4_READ_ONLY_JOURNAL_CORRUPT : saved_readonly;
+        assert(!storage_namespace_bootstrap());
+        struct vfs_namespace *ns=vfs_system_namespace();assert(ns);
+        struct vfs_path root={0},file={0};assert(!vfs_namespace_root(ns,&root));
+        assert((vfs_path_mount_flags(&root)&VFS_MOUNT_POLICY_MASK)==cases[i].policy);
+        assert(g_volumes[0].mount_flags==cases[i].input);
+        struct linux_statfs_abi filesystem;assert(!vfs_path_statfs(&root,&filesystem));
+        assert(!!(filesystem.f_flags&LINUX_ST_RELATIME)==!!(cases[i].policy&MS_RELATIME));
+        if(!cases[i].forced_readonly)assert(!vfs_kernel_write_file(ns,"/initial-atime","x",1));
+        assert(!vfs_path_lookup(ns,&root,&root,"/initial-atime",0,&file));
+        if(cases[i].forced_readonly) {
+            char table[4096];uint32_t length=0,written=99;
+            assert(!vfs_read_mount_table(ns,&root,true,0,table,sizeof(table)-1,&length));table[length]=0;
+            assert(strstr(table," / / ro,relatime - "));
+            assert(vfs_path_write(&file,0,"x",1,&written)==-EROFS && !written);
+        } else {
+            test_wall_seconds=saved_clock+i*10;
+            int64_t initial=(int64_t)test_wall_seconds+1;
+            /* A future atime is strictly newer than both mtime and ctime, so a
+             * relatime read must retain it while strict reads advance each second. */
+            assert(!vfs_path_utimens(&file,initial,1,true,true));
+            for(unsigned second=2;second<5;++second) {
+                test_wall_seconds=saved_clock+i*10+second;
+                char byte=0;uint32_t got=0;struct linux_stat_abi status;
+                assert(!vfs_path_read(&file,0,&byte,1,&got) && got==1 && byte=='x');
+                assert(!vfs_path_stat(&file,&status));
+                assert(status.atime_sec==((cases[i].policy&(MS_RELATIME|MS_NOATIME)) ? initial : (int64_t)test_wall_seconds));
+            }
+            if(cases[i].policy&MS_RELATIME) {
+                test_wall_seconds=(uint64_t)initial+86400;
+                char byte;uint32_t got;struct linux_stat_abi status;
+                assert(!vfs_path_read(&file,0,&byte,1,&got) && got==1);
+                assert(!vfs_path_stat(&file,&status) && status.atime_sec==(int64_t)test_wall_seconds);
+            }
+        }
+        vfs_path_put(&file);vfs_path_put(&root);assert(!vfs_namespace_destroy(ns));
+        assert(g_volumes[3].ready && g_volumes[3].tmpfs && !storage_inode_volume_busy(3));
+        tmpfs_destroy(g_volumes[3].tmpfs);g_volumes[3]=(struct storage_volume){0};
+    }
+    g_volumes[0].mount_flags=saved_flags;g_volumes[0].fs_ops=saved_ops;
+    g_volumes[0].read_only_reason=saved_readonly;test_wall_seconds=saved_clock;
+    assert(!tmpfs_unlink(g_volumes[0].tmpfs,"/initial-atime",false));
+    puts("PASS boot root default relatime, explicit noatime/strictatime, statfs, cross-second reads and unchanged volume flags");
+}
+
 static void production_initial_namespace(struct tmpfs_super *rootfs)
 {
     assert(!tmpfs_create(rootfs,"/boot",LINUX_S_IFDIR|0755,NULL,NULL));
@@ -1441,6 +1512,7 @@ static void production_initial_namespace(struct tmpfs_super *rootfs)
         for(unsigned slot=0;slot<STORAGE_MAX_VOLUMES;++slot)assert(!storage_inode_volume_busy(slot));
     }
     assert(success);
+    initial_root_access_policy();
     for(unsigned slot=4;slot<=5;++slot){tmpfs_destroy(g_volumes[slot].tmpfs);g_volumes[slot]=(struct storage_volume){0};}
     puts("PASS storage initial namespace adapter: explicit root/devfs/providers/volume/shm, sticky volatile storage,80 allocation budgets and failed-provider rollback");
 }
@@ -1771,6 +1843,58 @@ static void disk_access_policy(struct vfs_namespace *ns,const struct vfs_path *r
     puts("PASS real disk atime: noatime/relatime/strictatime, nodiratime, shared readonly and alias isolation");
 }
 
+/** @brief Read a real ext inode through the production boot root attachment.
+ * @param existing Borrowed manually assembled namespace, retained throughout.
+ * @param volume Borrowed real ext2/ext4 instance and its unchanged raw flags.
+ * @return None. Providers are fixture tmpfs instances; root lookup, read,
+ * access-time metadata and journal are production code. All temporary boot
+ * attachments retire before restoring fixture roles and wall clock.
+ */
+static void initial_disk_root_access(struct vfs_namespace *existing,struct storage_volume *volume)
+{
+    static const char *directories[]={"/dev","/proc","/sys"};
+    for(size_t i=0;i<sizeof(directories)/sizeof(directories[0]);++i)
+        assert(!vfs_kernel_mkdir(existing,directories[i],0755));
+    assert(!(volume->mount_flags&(MS_NOATIME|MS_RELATIME|MS_STRICTATIME)));
+    uint64_t original_flags=volume->mount_flags,saved_clock=test_wall_seconds;
+    struct vfs_path existing_root={0};assert(!vfs_namespace_root(existing,&existing_root));
+    uint64_t existing_policy=vfs_path_mount_flags(&existing_root);
+    struct storage_volume saved_boot=g_volumes[STORAGE_VOLUME_BOOT];
+    g_volumes[STORAGE_VOLUME_BOOT]=(struct storage_volume){0};
+    for(unsigned slot=4;slot<=5;++slot) {
+        assert(!g_volumes[slot].ready);
+        struct tmpfs_super *fs=NULL;assert(!tmpfs_new(slot,0,"size=0,nr_inodes=0",0,0,&fs));
+        g_volumes[slot]=(struct storage_volume){.volume_id=slot,.kind=STORAGE_VOLUME_ANONYMOUS,
+            .ready=true,.filesystem=STORAGE_FILESYSTEM_TMPFS,.fs_ops=&storage_tmpfs_ops,.tmpfs=fs};
+    }
+    assert(!g_volumes[3].ready && !storage_namespace_bootstrap());
+    struct vfs_namespace *ns=vfs_system_namespace();assert(ns);
+    struct vfs_path root={0},file={0};assert(!vfs_namespace_root(ns,&root));
+    assert(vfs_path_context(&root)==volume && (vfs_path_mount_flags(&root)&MS_RELATIME));
+    struct linux_statfs_abi filesystem;assert(!vfs_path_statfs(&root,&filesystem));
+    assert(filesystem.f_flags&LINUX_ST_RELATIME);
+    assert(!vfs_path_lookup(ns,&root,&root,"/kept/file",0,&file));
+    int64_t initial=(int64_t)test_wall_seconds+1;
+    assert(!vfs_path_utimens(&file,initial,1,true,true));
+    for(unsigned second=2;second<5;++second) {
+        test_wall_seconds=saved_clock+second;
+        char data[8]={0};uint32_t got;struct linux_stat_abi status;
+        assert(!vfs_path_read(&file,0,data,sizeof(data),&got) && got==sizeof(data) && !memcmp(data,"retained",8));
+        assert(!vfs_path_stat(&file,&status) && status.atime_sec==initial);
+    }
+    assert(volume->mount_flags==original_flags);
+    assert(vfs_path_mount_flags(&existing_root)==existing_policy);vfs_path_put(&existing_root);
+    vfs_path_put(&file);vfs_path_put(&root);assert(!vfs_namespace_destroy(ns));
+    for(unsigned slot=3;slot<=5;++slot) {
+        assert(g_volumes[slot].ready && g_volumes[slot].tmpfs && !storage_inode_volume_busy(slot));
+        tmpfs_destroy(g_volumes[slot].tmpfs);g_volumes[slot]=(struct storage_volume){0};
+    }
+    g_volumes[STORAGE_VOLUME_BOOT]=saved_boot;test_wall_seconds=saved_clock;
+    for(size_t i=0;i<sizeof(directories)/sizeof(directories[0]);++i)
+        assert(!storage_ext4_ops.rmdir(volume,directories[i]));
+    puts("PASS real ext boot root defaults to relatime without repeated cross-second atime changes or shared-volume mutation");
+}
+
 static void ext_family(const char *input,const char *output)
 {
     load_volume(input,0);
@@ -1806,6 +1930,7 @@ static void ext_family(const char *input,const char *output)
         puts("PASS real ext4 metadata admission cannot yield during prior-journal commit or latch false readonly");
     }
     disk_access_policy(&ns,&root,&file,volume);
+    initial_disk_root_access(&ns,volume);
     writer_leases(vfs_path_node(&file));
     assert(!storage_ext4_ops.unlink(volume,"/kept/file"));
     char content[16]={0};

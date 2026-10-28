@@ -29,16 +29,6 @@ int graphics_service_register(const struct kernel_service_descriptor *provider);
  * @return Zero or ENOENT/EBUSY/EINVAL. Task context; active calls preserve binding.
  */
 int graphics_service_unregister(const struct kernel_service_descriptor *provider);
-/** @brief Retain only the exact DRM failure-diagnostic boot option as core state.
- * @param cmdline Borrowed boot command line, nullable; no pointer is retained.
- * Boot task context before provider initialization; exact tokens only, no I/O.
- */
-void graphics_service_configure(const char *cmdline);
-/** @brief Read the permanent diagnostic preference during late provider init.
- * @return True only for the exact boot token drm.faildiag=1.
- * Task context; atomic copied state, no provider or boot-buffer reference escapes.
- */
-bool graphics_service_faildiag_enabled(void);
 /** @brief Report whether a graphics provider owns a discovered primary node.
  * @return Backend result or false when no method is available.
  * Execution-owned task context; no registry lock spans the callback or wait.

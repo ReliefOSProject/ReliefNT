@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "storage_backend.h"
 #include "internal.h"
+#include "mount_internal.h"
 #include "../../block/core/storage_internal.h"
 #include <reliefnt/devfs.h>
 #include <reliefnt/procfs.h>
@@ -13,6 +14,32 @@
  * factories acquire code ownership before constructing an attachment. */
 static int storage_initial_volume(void *context,struct vfs_mount **out)
 {return storage_create_vfs_mount(context,NULL,out);}
+/** @brief Apply Linux's default access policy to the initial root attachment.
+ * @param context Borrowed ready root volume; its raw flags remain unchanged.
+ * @param out Required empty output receiving one owned detached mount on success.
+ * @return Zero or negative input/provider/policy errno; failure leaves out empty.
+ * Exclusive boot execution is required. Read selectors from the raw volume
+ * before mount construction consumes STRICTATIME. Match ordinary mount's
+ * relatime default and explicit noatime/strictatime priority without changing
+ * shared backend state or the policy of boot ESP, optical, or shm attachments.
+ * No graph/module lock spans construction; failure retires the temporary mount.
+ */
+static int storage_initial_root(void *context,struct vfs_mount **out)
+{
+    if(!out)return -EINVAL;*out=NULL;
+    const struct storage_volume *volume=context;if(!volume)return -EINVAL;
+    uint64_t flags=volume->mount_flags;
+    if(!(flags&MS_NOATIME))flags|=MS_RELATIME;
+    if(flags&MS_STRICTATIME)flags&=~(MS_NOATIME|MS_RELATIME);
+    int rc=storage_initial_volume(context,out);
+    if(!rc) {
+        const uint64_t atime=MS_NOATIME|MS_RELATIME;
+        uint64_t policy=((*out)->policy&~atime)|(flags&atime);
+        rc=vfs_mount_set_flags(*out,policy);
+    }
+    if(rc){vfs_mount_put(*out);*out=NULL;}
+    return rc;
+}
 static int storage_initial_devfs(void *context,struct vfs_mount **out)
 {(void)context;return devfs_create_vfs_mount(out);}
 static int storage_initial_procfs(void *context,struct vfs_mount **out)
@@ -72,7 +99,7 @@ int storage_namespace_bootstrap(void)
         ++optical_count;
     }
     mounts[count++]=(struct vfs_boot_mount){"/dev/shm",storage_initial_volume,created,false};
-    rc=vfs_system_bootstrap(storage_initial_volume,&g_volumes[0],mounts,count);
+    rc=vfs_system_bootstrap(storage_initial_root,&g_volumes[0],mounts,count);
     if(rc && created) {
         /* Assembly retired every owned path before returning an error. Refuse
          * destructive cleanup if a provider violated that lifetime contract. */

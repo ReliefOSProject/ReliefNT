@@ -57,7 +57,8 @@ malformed:
  * @param index Symbol-table index.
  * @param lookup Optional external resolver.
  * @param context Resolver-owned context.
- * @return Zero or negative errno; resolved addresses remain owned by their providers.
+ * @return Zero or negative errno; only an absent weak import becomes address zero.
+ * ABI, permission and provider-state errors remain fatal for every binding.
  */
 static int resolve_symbol(const struct module_elf *view,struct module_layout *layout,
                            size_t index,module_symbol_lookup_fn lookup,void *context)
@@ -69,7 +70,7 @@ static int resolve_symbol(const struct module_elf *view,struct module_layout *la
         uint64_t address=0;
         const char *name=module_elf_symbol_name(view,&symbol);
         int rc=lookup ? lookup(name,&address,context) : -ENOENT;
-        if(rc && (symbol.info>>4)!=2) return rc;
+        if(rc && (rc!=-ENOENT || (symbol.info>>4)!=2)) return rc;
         layout->symbols[index]=rc ? 0 : address;
     } else if(symbol.section==MODULE_ELF_ABS) layout->symbols[index]=symbol.value;
     else {

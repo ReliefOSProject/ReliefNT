@@ -185,7 +185,7 @@ int svga3d_shader_define(svga_handle context, uint32_t local_id, uint32_t type,
         ret = SVGA_ENOMEM;
         goto done;
     }
-    const uint32_t mobid = SVGA_SHADER_MOB_BASE + slot;
+    const uint32_t mobid = svga.shader_mob_base + slot;
     struct svga_mob code = {0};
     ret = svga_gb_backing_alloc_locked(&code, bytes);
     if (ret) goto done;
@@ -615,9 +615,7 @@ int svga_batch_shader_define(struct svga_batch *batch, svga_handle context,
     uint32_t pages = (bytes + 4095u) / 4096u;
     uint32_t tables = shader_backing_table_pages(pages);
     uint32_t reserved_pages = pages + tables;
-    if (svga.pages > svga.page_limit ||
-        svga.shader_reserved_pages > svga.page_limit - svga.pages ||
-        reserved_pages > svga.page_limit - svga.pages - svga.shader_reserved_pages) {
+    if (!svga_page_budget_allows(reserved_pages)) {
         ret = SVGA_ENOMEM;
         goto unlock_reserve;
     }
@@ -641,7 +639,7 @@ int svga_batch_shader_define(struct svga_batch *batch, svga_handle context,
         batch->metadata->reserved_shader_count++] = slot;
     svga.shaders[slot] = (struct svga_shader){.context = context,
         .local_id = local_id, .host_id = slot,
-        .mobid = SVGA_SHADER_MOB_BASE + slot, .type = type, .bytes = bytes,
+        .mobid = svga.shader_mob_base + slot, .type = type, .bytes = bytes,
         .reserved_pages = reserved_pages,
         .reserved_by = batch->metadata->transaction_id,
         .allocator = svga.ops, .reserved = true};
@@ -656,10 +654,10 @@ int svga_batch_shader_define(struct svga_batch *batch, svga_handle context,
         svga_unlock(flags);
         return ret;
     }
-    SVGA3dCmdDefineGBMob mob = {SVGA_SHADER_MOB_BASE + slot, code.depth,
+    SVGA3dCmdDefineGBMob mob = {svga.shader_mob_base + slot, code.depth,
         svga_gb_backing_root(&code), bytes};
     SVGA3dCmdDefineGBShader define = {slot, type, bytes};
-    SVGA3dCmdBindGBShader bind = {slot, SVGA_SHADER_MOB_BASE + slot, 0};
+    SVGA3dCmdBindGBShader bind = {slot, svga.shader_mob_base + slot, 0};
     uint32_t old_bytes = batch->bytes;
     ret = svga_batch_append(batch, SVGA_3D_CMD_DEFINE_GB_MOB, true,
                             &mob, sizeof(mob));

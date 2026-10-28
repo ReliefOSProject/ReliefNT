@@ -86,3 +86,37 @@ flag 仍返回 EINVAL。非 ALLOW_CS grab 保留原来的 writer 排斥与关闭
 真实 VMware 验证还需检查 Xorg 日志确实启用 SVGA3D/glamor、正确像素、
 重复会话、资源反复创建/销毁和并发负载。QEMU 的 VMware 型号设备不能替代
 真实 VMware 3D 验证。未复现某次 panic 不等于已经证明其原因或修复。
+
+资源预算
+--------
+
+GB 对象使用本驱动的有界页预算，初值来自设备报告的内存寄存器：支持
+``CAP2.GB_MEMSIZE_2`` 时使用 ``GBOBJECT_MEM_SIZE_KB``，否则使用
+``SUGGESTED_GBOBJECT_MEM_SIZE_KB``。这与 Linux vmwgfx 对相同硬件接口的
+选择一致。这是来宾分配策略；Linux vmwgfx 将对应容量视为可扩大的软上限，
+不能据此声称硬件必然拒绝超出该值的对象。旧 GMR 的后备预算不截断 GB 内存；单个 MOB 仍受
+``MOB_MAX_SIZE``、32 位线协议长度和 PPN32 两级页表容量约束。
+字节数向上取整为页数时使用 64 位中间值，避免 ``UINT32_MAX`` 回绕。
+
+GMR2 的注册页数独立受 ``GMRS_MAX_PAGES`` 限制。自有与借用的 GMR 共享此
+注册预算；已经发布但尚在映射或退休的对象，在最终解除之前仍计费。
+GB 预算包含自有物理页、借用 MOB 的完整后备页、页表和尚未提交的 shader
+预留。批处理 shader 与普通 MOB 分配使用相同的预算检查。借用后备页
+直到最终拆除 fence 完成才解除计费，但这些页始终由调用方 owner 释放。
+自有物理页和页表还受分配器实际可用内存约束；分配失败
+仍返回 ``ENOMEM``，不会通过关闭加速或吞掉错误隐藏失败。
+
+表面 ID 存储支持协议规定的 32768 项，并接受设备更低的
+``MAX_SURFACE_IDS`` 上限；零号保留。对象表按协商后的容量分配，并进一步
+受单个 MOB 可容纳的表项数限制；context、surface、shader 和外部 MOB 的
+编号范围保持互不重叠。surface 快照使用在发布和最终释放时更新的计数，
+仍包含正在创建或退休的句柄，避免每次提交都持锁扫描全部 32768 项。
+资源句柄、代际验证、fence 退休与
+模块 owner 生命周期规则保持不变。非 GB 设备继续使用既有的后备内存策略。
+
+对应上游接口见 `Linux v6.12 vmwgfx 初始化
+<https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c>`_
+和 `SVGA 寄存器定义
+<https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/vmwgfx/device_include/svga_reg.h>`_。
+预算策略对照见 `Linux v6.12 vmwgfx 内存管理器
+<https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/vmwgfx/vmwgfx_gmrid_manager.c>`_。

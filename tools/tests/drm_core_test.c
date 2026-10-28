@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include "../../kernel/params/internal.h"
 
 #include <reliefnt/sched.h>
 #include <reliefnt/syscall.h>
@@ -5755,6 +5756,32 @@ static void test_idle_retirement_and_reactivation(void)
     assert(maintenance_lock_acquisitions == locks);
 }
 
+extern const struct module_parameter __start___param[] __attribute__((weak));
+extern const struct module_parameter __stop___param[] __attribute__((weak));
+
+/** @brief Exercise the production DRM parameter before driver initialization.
+ * The same descriptor is prefixed by Kbuild for builtins and unprefixed for
+ * modules. BusyBox passes drm.faildiag from /proc/cmdline to modprobe; a missing
+ * descriptor must fail this fixture rather than silently bypass that path.
+ */
+static void test_faildiag_parameter_bootstrapping(void)
+{
+    const struct module_parameter *parameter = NULL;
+    assert(__start___param && __stop___param);
+    for (const struct module_parameter *p = __start___param; p < __stop___param; ++p)
+        if (!strcmp(p->name, "drm.faildiag")) parameter = p;
+    assert(parameter && parameter->type == MODULE_PARAMETER_bool);
+    assert(parameter->permissions == 0400 && !*(bool *)parameter->value);
+    struct parameter_values values = {.records = parameter, .count = 1};
+    assert(!parameter_arguments(&values, "drm.faildiag=1", false));
+    assert(*(bool *)parameter->value);
+    assert(parameter_arguments(&values, "drm.faildiag=invalid", false) == -LINUX_EINVAL);
+    assert(*(bool *)parameter->value);
+    assert(!parameter_arguments(&values, "drm.faildiag=0", false));
+    assert(!*(bool *)parameter->value);
+    assert(!parameter_arguments(&values, "drm.faildiag=Y", false));
+}
+
 int main(void)
 {
 #ifdef RELIEFNT_DRM_NATIVE_OWNER_TEST
@@ -5770,7 +5797,10 @@ int main(void)
     assert(module_unload("drm",0)==-LINUX_EWOULDBLOCK && runtime->state==MODULE_LIVE);
     drm_async_free(owned);assert(!runtime->users && allocations==heap_before);
 #endif
+    test_faildiag_parameter_bootstrapping();
     assert(!drm_character_init());
+    assert(drm_faildiag_is_enabled());
+    drm_faildiag_configure(NULL);
     drm_test_permanent_allocations=allocations;
     test_idle_retirement_and_reactivation();
     test_faildiag_real_bo_failures();

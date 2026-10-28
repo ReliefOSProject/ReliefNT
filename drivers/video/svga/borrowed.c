@@ -92,14 +92,18 @@ int svga_gmr_borrowed_attach(uint64_t phys, uint32_t bytes, void *owner,
             !(svga.caps & SVGA_CAP_GMR2)) goto done;
         if (!phys || (phys & 4095u) || !bytes || !owner || !owner_put ||
             (phys >> 12) > UINT32_MAX) goto done;
-        uint32_t pages = (bytes + 4095u) / 4096u;
-        if (!pages || pages > SVGA_MAX_GUEST_PAGES ||
+        uint32_t pages = svga_bytes_to_pages(bytes);
+        if (!pages || pages > SVGA_MOB_MAX_PAGES ||
             (phys >> 12) > UINT32_MAX - pages || bytes > svga.mob_max_bytes) {
             ret = SVGA_EINVAL;
             goto done;
         }
         for (id = 0; id < svga.gmr_limit && svga.gmrs[id].handle; ++id) {}
         if (id == svga.gmr_limit || id >= SVGA_GMRS) {
+            ret = SVGA_ENOMEM;
+            goto done;
+        }
+        if (!svga_gmr_page_budget_allows(pages)) {
             ret = SVGA_ENOMEM;
             goto done;
         }
@@ -115,7 +119,7 @@ int svga_gmr_borrowed_attach(uint64_t phys, uint32_t bytes, void *owner,
         }
         g = &svga.gmrs[id];
         *g = (struct svga_gmr){.handle = handle, .phys = phys, .bytes = bytes,
-            .pages = pages, .mobid = SVGA_EXTERNAL_MOB_BASE + id,
+            .pages = pages, .mobid = svga.external_mob_base + id,
             .owner = owner, .owner_put = owner_put, .code_owner = code_owner, .borrowed = true,
             .mode_lease = true};
         /* Retain the PTable root and ownership bit in the reserved context-sized

@@ -32,9 +32,6 @@ int main(void)
     assert(graphics_service_pci_identity(&pci)==-19 && pci.vendor_id==42);
     assert(!graphics_service_process_retirements(2));
     graphics_service_kms_vt_release();graphics_service_cancel_task_continuation(NULL);
-    graphics_service_configure("otherdrm.faildiag=1 drm.faildiag=10");assert(!graphics_service_faildiag_enabled());
-    graphics_service_configure("other=1\tdrm.faildiag=1\r");assert(graphics_service_faildiag_enabled());
-    graphics_service_configure(NULL);assert(!graphics_service_faildiag_enabled());
     struct module_runtime *runtime=kernel_malloc(sizeof(*runtime));assert(runtime);
     strcpy(owner.name,"graphics_provider");strcpy(runtime->name,owner.name);
     owner.runtime=runtime;runtime->owner=&owner;runtime->state=MODULE_COMING;
@@ -50,5 +47,5 @@ int main(void)
     assert(!graphics_service_task_uninterruptible(NULL));
     assert(!module_unload(owner.name,0) && !allocated && !module_list);
     assert(!graphics_service_is_registered() && graphics_service_pci_identity(&pci)==-19);
-    puts("PASS graphics service broker: absent/partial callbacks, exact LIVE owner pins, reentrant busy unload, boot diagnostics and ledger teardown");
+    puts("PASS graphics service broker: absent/partial callbacks, exact LIVE owner pins, reentrant busy unload and ledger teardown");
 }

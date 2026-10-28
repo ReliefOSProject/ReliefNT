@@ -59,6 +59,7 @@ poll_wakeup tools/test_poll_wakeup.py
 power tools/test_power.py
 procfs tools/test_procfs.py
 task_identity tools/test_task_identity.py
+tcp_runtime_peer tools/test_tcp_runtime_peer.py
 record_locks tools/test_record_locks.py
 regular_file_io tools/test_regular_file_io.py
 rootfs tools/test_rootfs.py

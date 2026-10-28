@@ -28,7 +28,12 @@
 #ifndef AUDIO_GUEST_BUFFER_FRAMES
 #define AUDIO_GUEST_BUFFER_FRAMES 2048
 #endif
-enum { RATE = 48000, CHANNELS = 2,
+#ifndef AUDIO_GUEST_CHANNELS
+#define AUDIO_GUEST_CHANNELS 2
+#endif
+_Static_assert(AUDIO_GUEST_CHANNELS >= 1 && AUDIO_GUEST_CHANNELS <= 16,
+               "guest PCM probe supports 1 through 16 channels");
+enum { RATE = 48000, CHANNELS = AUDIO_GUEST_CHANNELS,
        PERIOD = AUDIO_GUEST_PERIOD_FRAMES, BUFFER = AUDIO_GUEST_BUFFER_FRAMES };
 static volatile sig_atomic_t interrupted;
 static struct timespec deadline;
@@ -161,8 +166,11 @@ static void tone(int16_t *out, unsigned first, unsigned frames)
 {
     const double tau = 6.2831853071795864769;
     for (unsigned i = 0; i < frames; ++i) {
-        out[i * 2] = (int16_t)(12000 * sin(tau * ((first + i) % RATE) * 1000 / RATE));
-        out[i * 2 + 1] = (int16_t)(12000 * sin(tau * ((first + i) % RATE) * 2000 / RATE));
+        out[i * CHANNELS] = (int16_t)(12000 * sin(tau * ((first + i) % RATE) * 1000 / RATE));
+        if (CHANNELS > 1)
+            out[i * CHANNELS + 1] = (int16_t)(12000 * sin(tau * ((first + i) % RATE) * 2000 / RATE));
+        for (unsigned channel = 2; channel < CHANNELS; ++channel)
+            out[i * CHANNELS + channel] = 0;
     }
 }
 
@@ -255,8 +263,9 @@ static int play(unsigned card, unsigned device, int oss, unsigned total_frames)
         }
     }
     result = finish_playback(fd, oss);
-    if (!result) printf("PASS backend=%s submitted_frames=%u tone_left=1000 tone_right=2000 seconds=%.3f\n",
-                        oss ? "OSS" : "ALSA", total_frames, (double)total_frames / RATE);
+    if (!result) printf("PASS backend=%s submitted_frames=%u tone_left=1000 tone_right=%s seconds=%.3f\n",
+                        oss ? "OSS" : "ALSA", total_frames,
+                        CHANNELS > 1 ? "2000" : "none", (double)total_frames / RATE);
 done:
     if (result) ioctl(fd, oss ? SNDCTL_DSP_RESET : SNDRV_PCM_IOCTL_DROP, NULL);
     close(fd);

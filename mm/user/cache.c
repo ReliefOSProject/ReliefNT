@@ -4,6 +4,13 @@ static int mm_validate_range(struct task *task, uint64_t addr, uint64_t len,
                              uint64_t *end_out);
 
 
+/** @brief Revoke complete pages beyond EOF from every alias of a backing inode.
+ * @param task User task whose retained file VMAs are protected by execution ownership.
+ * @param node Backing inode identity, which may omit anonymous-path decoration.
+ * @param size Committed nonnegative file size in bytes.
+ * Includes shared and private COW pages. MEMFD describes the anonymous path,
+ * not a separate tmpfs inode; volume, inode number and other flags still match.
+ */
 void syscall_mm_truncate_file(struct task *task, const struct storage_node *node, uint64_t size)
 {
     uint64_t hole = align_up_page(size);
@@ -12,7 +19,7 @@ void syscall_mm_truncate_file(struct task *task, const struct storage_node *node
         if (!vma || !vma->used || !(vma->flags & TASK_VMA_FLAG_FILE) ||
             vma->file_node.volume_id != node->volume_id ||
             vma->file_node.first_cluster != node->first_cluster ||
-            vma->file_node.flags != node->flags) continue;
+            ((vma->file_node.flags ^ node->flags) & ~STORAGE_NODE_FLAG_MEMFD)) continue;
         uint64_t skip = hole > vma->file_offset ? hole - vma->file_offset : 0;
         if (skip < vma->end - vma->start)
             task_unmap_pages(task, vma->start + skip, vma->end);

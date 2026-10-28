@@ -447,21 +447,43 @@ int svga_negotiate_locked(void)
         svga.surface_limit = svga.cap_values[SVGA3D_DEVCAP_MAX_SURFACE_IDS];
     svga.gmr_limit = svga.ops.read(SVGA_REG_GMR_MAX_IDS);
     if (svga.gmr_limit > SVGA_GMRS) svga.gmr_limit = SVGA_GMRS;
-    svga.page_limit = SVGA_MAX_GUEST_PAGES;
-    svga.surface_limit_bytes = SVGA_MAX_SURFACE_BYTES;
+    svga.gmr_page_limit = SVGA_LEGACY_GUEST_PAGES;
+    svga.page_limit = SVGA_LEGACY_GUEST_PAGES;
+    svga.surface_limit_bytes = SVGA_LEGACY_SURFACE_BYTES;
     if (svga.caps & SVGA_CAP_GMR2) {
-        uint32_t pages = svga.ops.read(SVGA_REG_GMRS_MAX_PAGES);
-        if (pages < svga.page_limit) svga.page_limit = pages;
+        svga.gmr_page_limit = svga.ops.read(SVGA_REG_GMRS_MAX_PAGES);
+        if (svga.gmr_page_limit < svga.page_limit)
+            svga.page_limit = svga.gmr_page_limit;
     } else if (svga.ops.read(SVGA_REG_GMR_MAX_DESCRIPTOR_LENGTH) < 2)
         return probe_result("gmr-descriptors", SVGA_ENOTSUP);
     if (svga.probe.gb_objects) {
-        uint32_t pages = svga.ops.read(SVGA_REG_SUGGESTED_GBOBJECT_MEM_SIZE_KB) / 4;
+        uint32_t memory_reg = SVGA_REG_SUGGESTED_GBOBJECT_MEM_SIZE_KB;
+        if ((svga.caps & SVGA_CAP_CAP2_REGISTER) &&
+            (svga.ops.read(SVGA_REG_CAP2) & SVGA_CAP2_GB_MEMSIZE_2))
+            memory_reg = SVGA_REG_GBOBJECT_MEM_SIZE_KB;
+        uint32_t pages = svga.ops.read(memory_reg) / 4u;
         svga.mob_max_bytes = svga.ops.read(SVGA_REG_MOB_MAX_SIZE);
         if (!pages || svga.mob_max_bytes < SVGA_GB_CONTEXT_BYTES)
             return probe_result("mob-limits", SVGA_ENOTSUP);
-        if (pages < svga.page_limit) svga.page_limit = pages;
-        uint64_t bytes = (uint64_t)svga.page_limit * 4096u;
-        if (bytes < svga.surface_limit_bytes) svga.surface_limit_bytes = bytes;
+        /* OTable backings are MOBs too. Fit both the surface table and the
+         * complete disjoint MOB namespace into this device's per-MOB limit. */
+        uint32_t table_bytes = svga.mob_max_bytes & ~4095u;
+        uint32_t fixed_mobs = SVGA_CONTEXTS + SVGA_GB_SHADER_SLOTS + svga.gmr_limit;
+        uint32_t mob_entries = table_bytes / SVGA_GB_MOB_ENTRY_BYTES;
+        if (mob_entries <= fixed_mobs)
+            return probe_result("mob-limits", SVGA_ENOTSUP);
+        uint32_t surface_entries = table_bytes / SVGA_GB_SURFACE_ENTRY_BYTES;
+        if (surface_entries > mob_entries - fixed_mobs)
+            surface_entries = mob_entries - fixed_mobs;
+        if (svga.surface_limit > surface_entries)
+            svga.surface_limit = surface_entries;
+        svga.shader_mob_base = SVGA_CONTEXTS + svga.surface_limit;
+        svga.external_mob_base = svga.shader_mob_base + SVGA_GB_SHADER_SLOTS;
+        svga.mob_limit = svga.external_mob_base + svga.gmr_limit;
+        /* GMR2 and GB MOBs are distinct device memory pools. A legacy GMR
+         * fallback must not truncate the host's advertised GB capacity. */
+        svga.page_limit = pages;
+        svga.surface_limit_bytes = (uint64_t)pages * 4096u;
     } else if (svga.caps & SVGA_CAP_GMR2) {
         uint32_t memory = svga.ops.read(SVGA_REG_MEMORY_SIZE);
         uint32_t vram = svga.ops.read(SVGA_REG_VRAM_SIZE);
@@ -547,13 +569,13 @@ void svga_get_info(struct svga_info *out)
     *out = (struct svga_info){ .device_caps = svga.caps, .fifo_caps = svga.fifo_caps,
         .host_version = svga.host_version, .guest_version = SVGA3D_HWVERSION_WS8_B1,
         .generation = svga.generation, .guest_pages = svga.pages,
+        .surfaces = svga.live_surface_count,
         .surface_bytes = svga.surface_bytes,
         .surface_limit_bytes = svga.surface_limit_bytes,
         .compat_surface_limit_bytes = svga.compat_surface_limit_bytes,
         .fifo_ready = svga.fifo_ready,
         .available = svga.available, .probe = svga.probe };
     for (uint32_t i = 0; i < SVGA_CONTEXTS; ++i) out->contexts += !!svga.contexts[i].handle;
-    for (uint32_t i = 0; i < SVGA_SURFACES; ++i) out->surfaces += !!svga.surfaces[i].handle;
     for (uint32_t i = 0; i < SVGA_GMRS; ++i) out->gmrs += !!svga.gmrs[i].handle;
     svga_unlock(flags);
 }

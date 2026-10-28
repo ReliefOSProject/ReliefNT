@@ -61,6 +61,9 @@ static void corrupt_rejected(const void *source, size_t size, size_t offset,
     assert(module_elf_validate(p,size,&view) == -8);
     free(p);
 }
+/** @brief Check RELA values, signed boundaries and unchanged bytes on rejection.
+ * Exercises the real relocator with independent literal x86-64 expectations.
+ */
 static void relocation_tests(void)
 {
     unsigned char bytes[16];
@@ -73,6 +76,13 @@ static void relocation_tests(void)
     assert(!module_apply_relocation(bytes,4,10,UINT32_MAX,0,0));
     assert(module_apply_relocation(bytes,4,10,UINT32_MAX,1,0)==-8);
     assert(!module_apply_relocation(bytes,4,11,UINT64_MAX,0,0));
+    assert(!module_apply_relocation(bytes,4,11,0,-1,0));
+    memcpy(&i32,bytes,4);assert(i32==-1);
+    assert(!module_apply_relocation(bytes,4,11,0,INT32_MIN,0));
+    memcpy(&i32,bytes,4);assert(i32==INT32_MIN);
+    unsigned char signed_original[16];memcpy(signed_original,bytes,16);
+    assert(module_apply_relocation(bytes,4,11,0,(int64_t)INT32_MIN-1,0)==-8);
+    assert(!memcmp(bytes,signed_original,16));
     assert(module_apply_relocation(bytes,4,11,0x80000000,0,0)==-8);
     assert(!module_apply_relocation(bytes,8,24,0x1000,0,0x1008));
     memcpy(&u64,bytes,8); assert(u64==UINT64_MAX-7);

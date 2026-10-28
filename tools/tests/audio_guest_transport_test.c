@@ -11,6 +11,10 @@
 #include <sys/stat.h>
 #include <sound/asound.h>
 
+#ifndef AUDIO_GUEST_CHANNELS
+#define AUDIO_GUEST_CHANNELS 2
+#endif
+
 static ssize_t scripted_write(int, const void *, size_t);
 static ssize_t scripted_pwrite(int, const void *, size_t, off_t);
 static int scripted_poll(struct pollfd *, nfds_t, int);
@@ -53,6 +57,7 @@ static size_t capture_file_bytes;
 static int load_scenario, load_calls;
 static int drain_scenario, drain_calls;
 static uint64_t load_bytes;
+static unsigned configured_channels, hw_params_calls, prepare_calls;
 
 static int scripted_open(const char *path, int flags, ...)
 {
@@ -142,6 +147,20 @@ static int scripted_ioctl(int fd, unsigned long request, ...)
 {
     assert(fd == 99);
     va_list args; va_start(args, request); void *argument = va_arg(args, void *); va_end(args);
+    if (configured_channels) {
+        if (request == SNDRV_PCM_IOCTL_HW_REFINE || request == SNDRV_PCM_IOCTL_HW_PARAMS) {
+            const struct snd_pcm_hw_params *p = argument;
+            const struct snd_interval *i = &p->intervals[
+                SNDRV_PCM_HW_PARAM_CHANNELS - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL];
+            assert(i->min == CHANNELS && i->max == CHANNELS && i->integer);
+            if (configured_channels != CHANNELS) { errno = EINVAL; return -1; }
+            if (request == SNDRV_PCM_IOCTL_HW_PARAMS) ++hw_params_calls;
+            return 0;
+        }
+        if (request == SNDRV_PCM_IOCTL_PREPARE) { ++prepare_calls; return 0; }
+        assert(request == SNDRV_PCM_IOCTL_SW_PARAMS);
+        return 0;
+    }
     if (drain_scenario) {
         if (request == SNDRV_PCM_IOCTL_STATUS) {
             struct snd_pcm_status *status = argument;
@@ -215,13 +234,33 @@ static void script(const int *values, int count)
 
 int main(void)
 {
+    volatile unsigned expected_channels = AUDIO_GUEST_CHANNELS;
+    assert(CHANNELS == expected_channels);
+    int16_t wave[7 * CHANNELS];
+    memset(wave, 0x5a, sizeof(wave));
+    tone(wave, 1, 7);
+    for (unsigned frame = 0; frame < 7; ++frame) {
+        const double tau = 6.2831853071795864769;
+        assert(wave[frame * CHANNELS] == (int16_t)(12000 * sin(tau * (frame + 1) * 1000 / RATE)));
+        if (CHANNELS > 1)
+            assert(wave[frame * CHANNELS + 1] == (int16_t)(12000 * sin(tau * (frame + 1) * 2000 / RATE)));
+        for (unsigned channel = 2; channel < CHANNELS; ++channel)
+            assert(wave[frame * CHANNELS + channel] == 0);
+    }
+    interrupted = 0; deadline = (struct timespec){.tv_sec = 10};
+    configured_channels = CHANNELS;
+    assert(!configure(99, 0) && hw_params_calls == 1 && prepare_calls == 1);
+    configured_channels = CHANNELS == 2 ? 8 : 2;
+    assert(configure(99, 0) == -1 && errno == EINVAL);
+    assert(hw_params_calls == 1 && prepare_calls == 1);
+    configured_channels = 0;
     const int short_bytes[] = {1, -EINTR, -EAGAIN, 3, 3};
     script(short_bytes, 5);
     assert(!write_all_nonblocking(99, bytes, sizeof(bytes)));
     assert(consumed == 7 && cursor == 5 && polls == 1);
     const int zero[] = {0}; script(zero, 1);
     assert(write_all_nonblocking(99, bytes, sizeof(bytes)) == -1 && errno == EIO && cursor == 1);
-    int16_t samples[14]; frame_base = samples;
+    int16_t samples[7 * CHANNELS]; frame_base = samples;
     const int short_frames[] = {2, -EINTR, -1000 - EINTR, -EAGAIN, 1, 4}; script(short_frames, 6);
     assert(!transfer(99, samples, 7, 0));
     assert(consumed == 7 && cursor == 6 && polls == 1);
@@ -250,7 +289,7 @@ int main(void)
     script(zero, 1);
     capture_scenario = 1;
     assert(!capture(0, 0, 4096, "fixture.raw"));
-    assert(capture_consumed == 4096 && capture_file_bytes == 16384 && capture_dropped);
+    assert(capture_consumed == 4096 && capture_file_bytes == 4096 * CHANNELS * sizeof(int16_t) && capture_dropped);
     capture_scenario = 0;
     interrupted = 0;
     load_scenario = 1;

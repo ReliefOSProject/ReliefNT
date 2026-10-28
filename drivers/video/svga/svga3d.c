@@ -284,7 +284,7 @@ static int surface_validate_locked(const struct svga_surface_desc *desc,
     }
     *bytes = surface_size(desc, *bw, *bh, *bpp);
     if (!*bytes || *bytes > svga.surface_limit_bytes ||
-        *bytes > SVGA_MAX_SURFACE_BYTES || *bytes > UINT32_MAX)
+        *bytes > UINT32_MAX)
         return SVGA_EINVAL;
     if (svga.surface_bytes > svga.surface_limit_bytes - *bytes) return SVGA_ENOMEM;
     return 0;
@@ -647,6 +647,7 @@ int svga_surface_create_locked(const struct svga_surface_desc *desc,
             .block_w = bw, .block_h = bh, .block_bytes = bpp,
             .faces = (desc->flags & SVGA3D_SURFACE_CUBEMAP) ? 6u : 1u, .bytes = bytes};
         svga.surface_bytes += bytes;
+        ++svga.live_surface_count;
         ret = svga_gb_surface_create_locked(id);
         if (ret) svga.surfaces[id].gb.retiring = true;
         if (!ret || svga_surface_destroy_locked(id)) *out = handle;
@@ -680,6 +681,7 @@ int svga_surface_create_locked(const struct svga_surface_desc *desc,
             .block_w = bw, .block_h = bh, .block_bytes = bpp,
             .faces = (desc->flags & SVGA3D_SURFACE_CUBEMAP) ? 6u : 1u, .bytes = bytes};
         svga.surface_bytes += bytes;
+        ++svga.live_surface_count;
         *out = handle;
     }
 done:
@@ -712,6 +714,7 @@ int svga_surface_destroy_locked(uint32_t id)
     if (!ret) {
         if (svga.surface_bytes >= svga.surfaces[id].bytes) svga.surface_bytes -= svga.surfaces[id].bytes;
         svga.surfaces[id] = (struct svga_surface){0};
+        --svga.live_surface_count;
     }
     return ret;
 }
@@ -817,6 +820,7 @@ int svga3d_surface_try_create(const struct svga_surface_desc *desc,
         .gb = {.mob = mob, .defined = svga.gb_active, .bound = svga.gb_active,
                .mode_lease = true}};
     svga.surface_bytes += bytes;
+    ++svga.live_surface_count;
     *out = handle;
     ret = 0;
 done:
@@ -849,6 +853,7 @@ int svga3d_surface_try_destroy(svga_handle handle)
         svga_gb_backing_free_locked(&surface->gb.mob);
         if (svga.surface_bytes >= surface->bytes) svga.surface_bytes -= surface->bytes;
         *surface = (struct svga_surface){0};
+        --svga.live_surface_count;
         ret = 0;
         goto done;
     }

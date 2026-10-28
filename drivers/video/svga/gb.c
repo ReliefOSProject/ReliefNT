@@ -1,10 +1,16 @@
 #include "device.h"
 
+/** @brief Release backing after device retirement and return both page charges.
+ * @param m Exclusive backing record, cleared on return. Caller holds svga_lock
+ *        and has fenced every published hardware reference. Borrowed payload
+ *        pages are uncharged here but remain owned by the external caller.
+ */
 static void backing_free(struct svga_mob *m)
 {
     if (m->pt_phys) svga.ops.free(m->pt_phys, m->pt_pages);
     if (m->phys && !m->borrowed) svga.ops.free(m->phys, m->pages);
     svga.pages -= m->pt_pages + (m->borrowed ? 0u : m->pages);
+    if (m->borrowed) svga.borrowed_mob_pages -= m->pages;
     *m = (struct svga_mob){0};
 }
 
@@ -22,9 +28,9 @@ static uint64_t backing_alloc_pages(uint32_t pages)
 
 static int backing_alloc(struct svga_mob *m, uint32_t bytes)
 {
-    if (!bytes || bytes > svga.mob_max_bytes || bytes > SVGA_MAX_GUEST_PAGES * 4096u)
+    if (!bytes || bytes > svga.mob_max_bytes)
         return SVGA_ENOMEM;
-    uint32_t pages = (bytes + 4095u) / 4096u;
+    uint32_t pages = svga_bytes_to_pages(bytes);
     uint32_t tables = pages <= 1 ? 0 : pages <= 1024 ? 1 : 1 + (pages + 1023u) / 1024u;
     if (!svga_page_budget_allows(pages + tables))
         return SVGA_ENOMEM;
@@ -55,15 +61,24 @@ int svga_gb_backing_alloc_locked(struct svga_mob *m, uint32_t bytes)
     return !m ? SVGA_EINVAL : backing_alloc(m, bytes);
 }
 
+/** @brief Reserve a borrowed MOB's complete budget and allocate its page tables.
+ * @param m Required exclusive output record; populated only on success.
+ * @param phys Caller-owned page-aligned PPN32 physical backing, retained by its owner.
+ * @param pages Nonzero backing page count within the MOB page-table format.
+ * @param bytes Nonzero accessible byte count, at most pages * 4096 and MOB_MAX_SIZE.
+ * @return Zero, EINVAL for invalid backing, or ENOMEM for budget/allocation failure.
+ * Caller holds svga_lock. Both owned page-table and borrowed payload charges stay
+ * reserved until fenced backing_free; this function never frees caller payload.
+ */
 int svga_gb_backing_borrow_locked(struct svga_mob *m, uint64_t phys,
                                   uint32_t pages, uint32_t bytes)
 {
     if (!m || !phys || (phys & 4095u) || !pages || !bytes ||
-        bytes > (uint64_t)pages * 4096u || pages > SVGA_MAX_GUEST_PAGES ||
+        bytes > (uint64_t)pages * 4096u || pages > SVGA_MOB_MAX_PAGES || bytes > svga.mob_max_bytes ||
         (phys >> 12) > UINT32_MAX - pages)
         return SVGA_EINVAL;
     uint32_t tables = pages <= 1 ? 0 : pages <= 1024 ? 1 : 1 + (pages + 1023u) / 1024u;
-    if (!svga_page_budget_allows(tables))
+    if (!svga_page_budget_allows(pages + tables))
         return SVGA_ENOMEM;
     uint64_t pt_phys = tables ? backing_alloc_pages(tables) : 0;
     if (tables && !pt_phys) return SVGA_ENOMEM;
@@ -81,6 +96,7 @@ int svga_gb_backing_borrow_locked(struct svga_mob *m, uint64_t phys,
             leaves[i] = (uint32_t)(phys >> 12) + i;
     }
     svga.pages += tables;
+    svga.borrowed_mob_pages += pages;
     svga_barrier();
     return 0;
 }
@@ -102,7 +118,7 @@ uint32_t svga_gb_backing_root(const struct svga_mob *m)
 
 static int mob_create(struct svga_mob *m, uint32_t id, uint32_t bytes)
 {
-    if (id >= SVGA_MOBS) return SVGA_EINVAL;
+    if (id >= svga.mob_limit) return SVGA_EINVAL;
     int ret = backing_alloc(m, bytes);
     if (ret) return ret;
     SVGA3dCmdDefineGBMob cmd = {id, m->depth, backing_root(m), m->bytes};
@@ -114,10 +130,10 @@ static int mob_create(struct svga_mob *m, uint32_t id, uint32_t bytes)
 
 int svga_gb_init_locked(void)
 {
-    static const uint32_t sizes[SVGA_OTABLE_DX9_MAX] = {
-        SVGA_MOBS * SVGA_GB_MOB_ENTRY_BYTES,
-        SVGA_SURFACES * SVGA_GB_SURFACE_ENTRY_BYTES,
-        SVGA_CONTEXTS * SVGA_GB_CONTEXT_ENTRY_BYTES,
+    const uint32_t sizes[SVGA_OTABLE_DX9_MAX] = {
+        svga.mob_limit * SVGA_GB_MOB_ENTRY_BYTES,
+        svga.surface_limit * SVGA_GB_SURFACE_ENTRY_BYTES,
+        svga.context_limit * SVGA_GB_CONTEXT_ENTRY_BYTES,
         SVGA_GB_SHADER_SLOTS * SVGA_GB_SHADER_ENTRY_BYTES, 0
     };
     _Static_assert(SVGA_MOBS * SVGA_GB_MOB_ENTRY_BYTES <= 4194304u &&

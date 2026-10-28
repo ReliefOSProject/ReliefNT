@@ -122,9 +122,12 @@ static int read_attribute(const char *name, const char *path,
     return (int)count;
 }
 
-static int check_sysfs_identity(void)
+static int check_sysfs_identity(int fd)
 {
     struct stat st;
+    struct drm_vmw_getparam_arg rendering = {.param = DRM_VMW_PARAM_3D};
+    if (ioctl(fd, DRM_IOCTL_VMW_GET_PARAM, &rendering) < 0 || rendering.value > 1)
+        return 10;
     char link[32] = {0};
     char subsystem[128] = {0};
     char uevent[512] = {0};
@@ -161,11 +164,27 @@ static int check_sysfs_identity(void)
         return 6;
     errno = 0;
     sysfs_step("render-stat.begin");
-    if (stat("/dev/dri/renderD128", &st) == 0 || errno != ENOENT)
+    int render_stat = stat("/dev/dri/renderD128", &st);
+    if (rendering.value) {
+        if (render_stat < 0 || !S_ISCHR(st.st_mode) ||
+            linux_major(st.st_rdev) != 226 || linux_minor(st.st_rdev) != 128)
+            return 7;
+        if (read_attribute("render-dev", "/sys/class/drm/renderD128/dev",
+                           device_number, sizeof(device_number)) < 0 ||
+            strcmp(device_number, "226:128\n"))
+            return 11;
+        int render = open("/dev/dri/renderD128", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (render < 0) return 12;
+        int valid = !fstat(render, &st) && S_ISCHR(st.st_mode) &&
+                    linux_major(st.st_rdev) == 226 && linux_minor(st.st_rdev) == 128;
+        int closed = close(render);
+        if (!valid || closed) return 12;
+    } else if (!render_stat || errno != ENOENT) {
         return 7;
+    }
     sysfs_step("render-stat.returned");
-    printf("DRM_SYSFS device=%s PCI_ID=15AD:0405 primary=226:0 render=absent\n",
-           link);
+    printf("DRM_SYSFS device=%s PCI_ID=15AD:0405 primary=226:0 render=%s\n",
+           link, rendering.value ? "226:128" : "absent");
     return 0;
 }
 
@@ -430,7 +449,7 @@ static int expect_present(void)
         close(fd);
         return 12;
     }
-    int sysfs_result = check_sysfs_identity();
+    int sysfs_result = check_sysfs_identity(fd);
     if (sysfs_result) {
         printf("DRM_PRESENT sysfs identity check failed step=%d errno=%d\n",
                sysfs_result, errno);

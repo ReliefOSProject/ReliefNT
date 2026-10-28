@@ -27,6 +27,7 @@ class GuestGuards(unittest.TestCase):
                 ("drm", "module_drm_probe.c", ["-Iinclude/uapi"]),
                 ("hda", "module_hda_probe.c", ["-Iinclude/uapi"]),
                 ("drm_contract", "drm_runtime_probe.c", ["-Iinclude/uapi"]),
+                ("rejection", "module_rejection_probe.c", []),
                 ("filesystems", "module_filesystem_owner_probe.c", []),
                 ("nvme", "module_block_owner_probe.c", []),
                 ("ide", "module_block_owner_probe.c", ["-DMODULE_BLOCK_TRANSPORT_IDE=1"]),

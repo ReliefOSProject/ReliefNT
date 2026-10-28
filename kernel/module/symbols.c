@@ -116,19 +116,20 @@ static int check_import(const struct module_runtime *runtime,const struct module
  * @param name Validated terminated ELF symbol name.
  * @param address Required resolved address.
  * @param context Private importing module runtime.
- * @return Zero or negative errno; provider pins become runtime-owned dependencies.
+ * @return Zero or negative errno; -ENOENT means no actual export exists. Missing
+ * version metadata for an existing export is -ENOEXEC, including weak imports.
+ * Provider pins become runtime-owned dependencies only after all checks pass.
  */
 int module_resolve_symbol(const char *name,uint64_t *address,void *context)
 {
     struct module_runtime *runtime=context;
     uint32_t expected=0;
-    int rc=expected_crc(runtime,name,&expected);
-    if(rc) return rc;
+    int version_rc=expected_crc(runtime,name,&expected),rc;
     for(unsigned t=0;t<2;++t) {
         struct module_export_table table=builtin_table(t);
         size_t i=table_find(&table,name);
         if(i!=SIZE_MAX) {
-            rc=check_import(runtime,&table,i,expected);
+            rc=version_rc ? version_rc : check_import(runtime,&table,i,expected);
             if(!rc) *address=table.symbols[i].value;
             return rc;
         }
@@ -141,7 +142,7 @@ int module_resolve_symbol(const char *name,uint64_t *address,void *context)
         for(unsigned t=0;t<2;++t) {
             size_t i=table_find(&r->exports[t],name);
             if(i==SIZE_MAX) continue;
-            rc=check_import(runtime,&r->exports[t],i,expected);
+            rc=version_rc ? version_rc : check_import(runtime,&r->exports[t],i,expected);
             if(!rc && r==runtime) rc=-ELOOP;
             if(!rc && r->state!=MODULE_LIVE) rc=-EBUSY;
             if(!rc && r->users==UINT64_MAX) rc=-EOVERFLOW;

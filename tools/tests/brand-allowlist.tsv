@@ -1,5 +1,8 @@
 # category<TAB>kernel-relative path<TAB>reason
 compatibility	block/core/storage_block.c	识别已有磁盘 GPT 名 LEONOS4_ROOT
+compatibility	block/ramdisk/boot.c	内存块设备接收已有 leonos-installer-root Multiboot 模块标签，保留旧引导器兼容
+compatibility	include/reliefnt/boot_block.h	声明相同历史引导模块标签的兼容接收契约
+compatibility	tools/tests/boot_block_test.c	验证历史引导标签与当前标签双接受，并拒绝重复载荷
 compatibility	drivers/video/framebuffer/fbdev.c	从 ioctl 分派迁移的 leonos-fb 设备 ID，保持既有 fbdev ABI 值
 compatibility	fs/vfs/mount.c	旧 leonos-installer-root 引导 module tag 双接受
 compatibility	fs/proc/procfs.c	冻结 LeonOSRole/LeonOSFlags 与 /proc/leonos-drivers 接口值

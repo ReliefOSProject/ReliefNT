@@ -19,7 +19,15 @@ class ModuleLifecycle(unittest.TestCase):
                                         ("wrong_version", "provider", ['-DTEST_VERMAGIC="other-kernel"']),
                                         ("wrong_crc", "provider", ['-DTEST_IMPORT_CRC=0x99']),
                                         ("parameters", "parameters", []),
-                                        ("wrong_layout", "provider", ['-DTEST_LAYOUT_CRC=0xdeadbeefu'])):
+                                        ("wrong_layout", "provider", ['-DTEST_LAYOUT_CRC=0xdeadbeefu']),
+                                        ("weak_absent", "weak_import", []),
+                                        ("weak_valid", "weak_import", ['-DTEST_WEAK_SYMBOL=weak_value', '-DTEST_WEAK_CRC=0x12345678u']),
+                                        ("weak_wrong_crc", "weak_import", ['-DTEST_WEAK_SYMBOL=weak_value', '-DTEST_WEAK_CRC=0x99u']),
+                                        ("weak_no_crc", "weak_import", ['-DTEST_WEAK_SYMBOL=weak_value']),
+                                        ("weak_namespace", "weak_import", ['-DTEST_WEAK_SYMBOL=weak_namespaced', '-DTEST_WEAK_CRC=0x12345678u']),
+                                        ("weak_gpl", "weak_import", ['-DTEST_WEAK_SYMBOL=weak_gpl', '-DTEST_WEAK_CRC=0x12345678u']),
+                                        ("weak_ns_valid", "weak_import", ['-DTEST_WEAK_SYMBOL=weak_namespaced', '-DTEST_WEAK_CRC=0x12345678u', '-DTEST_WEAK_IMPORT_NS=1']),
+                                        ("weak_gpl_valid", "weak_import", ['-DTEST_WEAK_SYMBOL=weak_gpl', '-DTEST_WEAK_CRC=0x12345678u', '-DTEST_WEAK_LICENSE="GPL"'])):
                 obj = work / (name + ".o")
                 subprocess.run(["clang", "--target=x86_64-elf", "-std=c11", "-O1", "-ffreestanding",
                                 "-fno-pic", "-fno-pie", "-fno-common", "-mno-red-zone", "-mcmodel=large",

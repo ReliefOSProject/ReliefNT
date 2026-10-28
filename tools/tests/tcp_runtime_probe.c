@@ -1,5 +1,7 @@
 /* Native Linux socket ABI probe; the host harness supplies a local TCP peer. */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -168,30 +170,67 @@ int main(int argc, char **argv)
     CHECK(!shutdown(fd, SHUT_WR));
     CHECK(!close(fd));
     puts("PASS tcp-runtime: peer write-half-close permits a complete local reply");
-    /* A normal final close/exit must leave accepted data owned by the network
-     * stack. The parent deliberately makes no further networking calls. The
-     * external peer is the delivery oracle, independently of this PASS line. */
+    /* The peer gates guest output before sending G. The child reports how much
+     * a nonblocking writer actually queued; only waitpid success permits the
+     * parent receipt. The independent peer releases its gate after that receipt
+     * and verifies delivery. A pipe carries metadata without using this TCP flow. */
+    int report[2];
+    CHECK(!pipe(report));
+    struct { uint32_t bytes; uint16_t port; } queued = {0};
     pid_t child = fork();
     CHECK(child >= 0);
     if (!child) {
+        CHECK(!close(report[0]));
         int output = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
         CHECK(output >= 0);
+        timeout = (struct timeval){.tv_sec = 5};
+        CHECK(!setsockopt(output, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)));
+        CHECK(!setsockopt(output, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)));
         CHECK(!connect(output, (struct sockaddr *)&peer, sizeof(peer)));
+        struct sockaddr_in local = {0};
+        socklen_t local_size = sizeof(local);
+        CHECK(!getsockname(output, (struct sockaddr *)&local, &local_size));
+        CHECK(local_size == sizeof(local) && local.sin_family == AF_INET);
+        queued.port = ntohs(local.sin_port);
+        CHECK(queued.port);
+        printf("TCP_CLOSED_OWNER_READY port=%u child=%ld\n",
+               (unsigned)queued.port, (long)getpid());
+        unsigned char go = 0;
+        CHECK(read(output, &go, 1) == 1 && go == 'G');
+        CHECK(queued.port && !fcntl(output, F_SETFL, O_NONBLOCK));
         for (size_t i = 0; i < sizeof(data); ++i) data[i] = (unsigned char)(i * 29 + 7);
         size_t done = 0;
         while (done < 65535) {
             ssize_t count = write(output, data + done, 65535 - done);
+            if (count < 0) {
+                if (errno == EINTR) continue;
+                CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+                break;
+            }
             CHECK(count > 0);
             done += (size_t)count;
         }
+        CHECK(done > 0);
+        queued.bytes = (uint32_t)done;
         CHECK(!close(output));
+        CHECK(write(report[1], &queued, sizeof(queued)) == sizeof(queued));
+        CHECK(!close(report[1]));
         _exit(0);
     }
+    CHECK(!close(report[1]));
     int status;
     CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
-    puts("TCP_CLOSED_OWNER_EXITED bytes=65535; awaiting independent peer verification");
-    struct timespec grace = {.tv_sec = 1, .tv_nsec = 500000000};
-    while (nanosleep(&grace, &grace)) CHECK(errno == EINTR);
+    size_t metadata = 0;
+    while (metadata < sizeof(queued)) {
+        ssize_t count = read(report[0], (unsigned char *)&queued + metadata,
+                             sizeof(queued) - metadata);
+        if (count < 0 && errno == EINTR) continue;
+        CHECK(count > 0);
+        metadata += (size_t)count;
+    }
+    CHECK(!close(report[0]) && queued.bytes && queued.bytes <= 65535 && queued.port);
+    printf("TCP_CLOSED_OWNER_EXITED bytes=%u port=%u child=%ld\n",
+           queued.bytes, (unsigned)queued.port, (long)child);
     puts("PASS TCP Linux ABI runtime probe");
     return 0;
 }

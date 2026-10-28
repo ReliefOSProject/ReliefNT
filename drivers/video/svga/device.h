@@ -4,10 +4,13 @@
 #include "svga_protocol.h"
 
 #define SVGA_CONTEXTS 64u
-#define SVGA_SURFACES 256u
+#define SVGA_SURFACES SVGA3D_MAX_SURFACE_IDS
 #define SVGA_GMRS 128u
-#define SVGA_MAX_GUEST_PAGES 16384u
-#define SVGA_MAX_SURFACE_BYTES (128ULL * 1024 * 1024)
+/* Legacy hosts have no GB memory register. Preserve their fallback budget. */
+#define SVGA_LEGACY_GUEST_PAGES 16384u
+#define SVGA_LEGACY_SURFACE_BYTES (128ULL * 1024 * 1024)
+/* A PPN32 PT_2 root has 1024 leaves, each containing 1024 page numbers. */
+#define SVGA_MOB_MAX_PAGES (1024u * 1024u)
 #define SVGA_MAX_MIPS 16u
 #define SVGA_POLL_LIMIT 4000u
 #define SVGA_KIND_CONTEXT 1u
@@ -17,8 +20,6 @@
 #define SVGA_GPU_CONTEXTS 16u
 #define SVGA_GB_SHADER_SLOTS 64u
 #define SVGA_MOBS (SVGA_CONTEXTS + SVGA_SURFACES + SVGA_GB_SHADER_SLOTS + SVGA_GMRS)
-#define SVGA_SHADER_MOB_BASE (SVGA_CONTEXTS + SVGA_SURFACES)
-#define SVGA_EXTERNAL_MOB_BASE (SVGA_SHADER_MOB_BASE + SVGA_GB_SHADER_SLOTS)
 #define SVGA_QUERY_PENDING_MAX 256u
 #define SVGA_BATCH_SHADER_KEY_CAPACITY (SVGA_GB_SHADER_SLOTS * 4u)
 #define SVGA_BATCH_QUERY_KEY_CAPACITY 1024u
@@ -221,12 +222,18 @@ struct svga_device {
     bool fifo_busy_present;
     uint32_t cap_values[SVGA3D_DEVCAP_MAX];
     bool cap_valid[SVGA3D_DEVCAP_MAX];
-    uint32_t context_limit, surface_limit, gmr_limit, page_limit, pages;
+    uint32_t context_limit, surface_limit, gmr_limit, gmr_page_limit, page_limit, pages;
+    /* Caller-owned MOB payload stays charged until fenced backing release. */
+    uint32_t borrowed_mob_pages;
+    /* Includes published creation and retirement until the handle is cleared. */
+    uint32_t live_surface_count;
     uint64_t surface_bytes, surface_limit_bytes, compat_surface_limit_bytes;
     bool bound, fifo_ready, available, memory_ready, transitioning;
     bool traces_enabled;
     bool gb_active;
     uint32_t mob_max_bytes;
+    /* Negotiated MOB namespaces remain fixed while the object tables are live. */
+    uint32_t shader_mob_base, external_mob_base, mob_limit;
     struct svga_mob otables[SVGA_OTABLE_DX9_MAX];
     struct svga_probe_info probe;
     struct svga_context contexts[SVGA_CONTEXTS];
@@ -250,7 +257,7 @@ struct svga_cache_report {
 };
 extern struct svga_device svga;
 
-/** @brief Check allocation against live pages and shader staging reservations.
+/** @brief Check owned/borrowed backing and shader staging against the GB budget.
  * Caller holds svga_lock.
  * @param pages Additional pages the resource would consume.
  * @return True only when the total remains within the negotiated page limit.
@@ -258,9 +265,35 @@ extern struct svga_device svga;
 static inline bool svga_page_budget_allows(uint32_t pages)
 {
     if (svga.pages > svga.page_limit ||
-        svga.shader_reserved_pages > svga.page_limit - svga.pages)
+        svga.borrowed_mob_pages > svga.page_limit - svga.pages ||
+        svga.shader_reserved_pages >
+            svga.page_limit - svga.pages - svga.borrowed_mob_pages)
         return false;
-    return pages <= svga.page_limit - svga.pages - svga.shader_reserved_pages;
+    return pages <= svga.page_limit - svga.pages - svga.borrowed_mob_pages -
+                    svga.shader_reserved_pages;
+}
+
+/** @brief Round a 32-bit wire byte count up without wrapping at UINT32_MAX.
+ * @param bytes Byte count, including zero.
+ * @return Number of 4096-byte pages needed to contain the byte range.
+ */
+static inline uint32_t svga_bytes_to_pages(uint32_t bytes)
+{
+    return (uint32_t)(((uint64_t)bytes + 4095u) / 4096u);
+}
+
+/** @brief Reserve GMR registration capacity independently of owned MOB pages.
+ * Caller holds svga_lock. Published, partially mapped and retiring attachments
+ * remain charged until final detach, including caller-owned borrowed backing.
+ * @param pages Additional registered GMR pages.
+ * @return True when the host's GMR2 page budget can contain the new attachment.
+ */
+static inline bool svga_gmr_page_budget_allows(uint32_t pages)
+{
+    uint64_t used = pages;
+    for (uint32_t i = 0; i < svga.gmr_limit; ++i)
+        if (svga.gmrs[i].handle) used += svga.gmrs[i].pages;
+    return used <= svga.gmr_page_limit;
 }
 
 /* Callers hold the shared device lock for every _locked helper. */
@@ -350,6 +383,15 @@ int svga_gb_context_create_locked(uint32_t id);
 int svga_gb_surface_create_locked(uint32_t id);
 int svga_gb_destroy_locked(struct svga_gb_resource *resource, uint32_t id, bool context);
 int svga_gb_backing_alloc_locked(struct svga_mob *mob, uint32_t bytes);
+/** @brief Reserve borrowed payload and owned page tables against the GB budget.
+ * @param mob Required exclusive output record, populated only on success.
+ * @param phys Caller-owned page-aligned PPN32 backing, retained through retirement.
+ * @param pages Nonzero number of physically contiguous caller-owned pages.
+ * @param bytes Nonzero accessible length bounded by backing and MOB_MAX_SIZE.
+ * @return Zero, EINVAL for invalid input, or ENOMEM for budget/allocation failure.
+ * Caller holds svga_lock; final fenced backing_free releases the budget charge
+ * without freeing caller-owned payload pages.
+ */
 int svga_gb_backing_borrow_locked(struct svga_mob *mob, uint64_t phys,
                                   uint32_t pages, uint32_t bytes);
 void svga_gb_backing_free_locked(struct svga_mob *mob);

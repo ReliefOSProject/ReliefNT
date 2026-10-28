@@ -16,14 +16,15 @@ static int define_gmr2(uint32_t id, uint32_t pages)
 
 int svga_gmr_create_locked(uint32_t bytes, svga_handle *out)
 {
-    if (!out || !bytes || bytes > SVGA_MAX_GUEST_PAGES * 4096u) return SVGA_EINVAL;
+    if (!out || !bytes) return SVGA_EINVAL;
     *out = 0;
     int ret = SVGA_ENODEV;
-    uint32_t pages = (bytes + 4095u) / 4096u, id;
+    uint32_t pages = svga_bytes_to_pages(bytes), id;
     if (!svga.available || !svga.memory_ready) goto done;
     for (id = 0; id < svga.gmr_limit && svga.gmrs[id].handle; ++id) {}
     ret = SVGA_ENOMEM;
-    if (id == svga.gmr_limit || !svga_page_budget_allows(pages)) goto done;
+    if (id == svga.gmr_limit || !svga_page_budget_allows(pages) ||
+        !svga_gmr_page_budget_allows(pages)) goto done;
     svga_handle handle = svga_new_handle(SVGA_KIND_GMR, id);
     if (!handle) goto done;
     uint64_t phys = svga.ops.alloc(pages);

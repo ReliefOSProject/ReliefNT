@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "device.h"
 #include "modules/framebuffer.h"
 #ifdef RELIEFNT_SVGA_NATIVE_OWNER_TEST
@@ -45,14 +46,20 @@ _Static_assert(SVGA3D_SURFACE_BIND_DEPTH_STENCIL == SVGA_TEST_SURFACE_BIND_DEPTH
 _Static_assert(SVGA3D_SURFACE_BIND_STREAM_OUTPUT == SVGA_TEST_SURFACE_BIND_STREAM_OUTPUT, "SVGA stream-output bind bit");
 
 #define FIFO_BYTES 65536u
-static uint32_t fifo[FIFO_BYTES / 4], regs[64];
+/* Host limits are independent of the backend's implementation capacities. */
+#define HOST_SURFACES 32768u
+#define HOST_MOBS (SVGA_CONTEXTS + HOST_SURFACES + SVGA_GB_SHADER_SLOTS + SVGA_GMRS)
+#define HOST_GMR_PAGES 16384u
+#define HOST_ALLOCATIONS 4096u
+static uint32_t fifo[FIFO_BYTES / 4], regs[128];
 static uint32_t wide_fifo[(512u * 1024u) / 4u];
 static uint32_t wide_batch_storage[SVGA_BATCH_MAX_OUTPUT_BYTES / 4u];
 static uint32_t wide_payload[SVGA_BATCH_MAX_OUTPUT_BYTES / 4u];
 static uint32_t capabilities, host_version, fifo_caps, selected_gmr;
 static uint32_t host_devcap_3d, devcap_queries;
+static uint32_t last_allocation_pages;
 static uint32_t host_context_cap = SVGA_CONTEXTS;
-static uint32_t host_surface_cap = SVGA_SURFACES;
+static uint32_t host_surface_cap = HOST_SURFACES;
 static uint32_t host_texture_width_cap = 4096;
 static uint32_t host_texture_height_cap = 4096;
 static uint32_t host_render_targets_cap = UINT32_MAX;
@@ -68,7 +75,7 @@ static uint32_t host_targets[SVGA_CONTEXTS][SVGA3D_RT_MAX];
 static uint32_t host_depth_enabled[SVGA_CONTEXTS], host_fill[SVGA_CONTEXTS];
 static uint32_t host_projection[SVGA_CONTEXTS][16];
 struct host_backing { uint32_t root, depth, bytes; };
-static struct host_backing host_mobs[SVGA_MOBS], host_otables[5], retired_backings[512];
+static struct host_backing host_mobs[HOST_MOBS], host_otables[5], retired_backings[512];
 static uint32_t retired_count, host_context_mobs[SVGA_CONTEXTS];
 static bool host_contexts[SVGA_CONTEXTS];
 struct host_shader { uint32_t type, bytes, mobid; bool defined; };
@@ -77,14 +84,14 @@ static uint32_t host_shaders_bound[SVGA_CONTEXTS][2];
 struct host_query { uint32_t mobid, offset; bool active, pending; };
 static struct host_query host_queries[SVGA_CONTEXTS];
 struct host_surface { uint32_t width, height, format, mobid; uint8_t *data; bool gb; };
-static struct host_surface host_surfaces[SVGA_SURFACES];
+static struct host_surface host_surfaces[HOST_SURFACES];
 static bool stalled, invalid_caps_record, host_busy_supported;
 static bool expect_guest_fifo_busy;
 struct allocation { uint64_t phys; void *ptr; uint32_t pages; };
-static struct allocation allocations[512];
+static struct allocation allocations[HOST_ALLOCATIONS];
 static uint64_t next_phys = 0x10000000;
 static uint32_t live_pages, fail_after = UINT32_MAX, allocation_calls;
-static uint32_t host_gmr_pages[SVGA_GMRS], host_gmr_ppn[SVGA_GMRS][SVGA_MAX_GUEST_PAGES];
+static uint32_t host_gmr_pages[SVGA_GMRS], host_gmr_ppn[SVGA_GMRS][HOST_GMR_PAGES];
 static uint32_t selected_port_reg, port_busy_reads, port_sync_writes;
 static uint32_t batch_storage[SVGA_BATCH_MAX_BYTES / sizeof(uint32_t)];
 static uint32_t heap_alloc_calls, heap_fail_after = UINT32_MAX, heap_live_allocations;
@@ -226,7 +233,7 @@ void console_log(enum console_log_level level, const char *format, ...)
 static void *physical_pointer(uint64_t phys)
 {
     device_ticks += 10000;
-    for (uint32_t i = 0; i < 512; ++i)
+    for (uint32_t i = 0; i < HOST_ALLOCATIONS; ++i)
         if (allocations[i].ptr && phys >= allocations[i].phys &&
             phys - allocations[i].phys < allocations[i].pages * 4096ULL)
             return (uint8_t *)allocations[i].ptr + phys - allocations[i].phys;
@@ -239,7 +246,7 @@ void *mm_phys_to_virt(uint64_t phys)
 uint64_t mm_virt_to_phys(const void *address)
 {
     uintptr_t pointer = (uintptr_t)address;
-    for (uint32_t i = 0; i < 512; ++i) {
+    for (uint32_t i = 0; i < HOST_ALLOCATIONS; ++i) {
         if (!allocations[i].ptr) continue;
         uintptr_t start = (uintptr_t)allocations[i].ptr;
         uint64_t bytes = (uint64_t)allocations[i].pages * 4096ULL;
@@ -318,8 +325,9 @@ static uint32_t *table_entry(uint32_t type, uint32_t id, uint32_t stride)
 }
 static uint64_t allocate(uint32_t pages)
 {
+    last_allocation_pages = pages;
     if (allocation_calls++ == fail_after) return 0;
-    for (uint32_t i = 0; i < 512; ++i) if (!allocations[i].ptr) {
+    for (uint32_t i = 0; i < HOST_ALLOCATIONS; ++i) if (!allocations[i].ptr) {
         void *p = calloc(pages, 4096);
         assert(p);
         uint64_t phys = next_phys;
@@ -339,12 +347,12 @@ static void deallocate(uint64_t phys, uint32_t pages)
         ++unlocked_free_checks;
         assert_unlocked_free_phys = 0;
     }
-    for (uint32_t i = 0; i < 512; ++i) if (allocations[i].ptr && allocations[i].phys == phys) {
+    for (uint32_t i = 0; i < HOST_ALLOCATIONS; ++i) if (allocations[i].ptr && allocations[i].phys == phys) {
         assert(allocations[i].pages == pages);
         for (uint32_t id = 0; id < SVGA_GMRS; ++id)
             for (uint32_t p = 0; p < host_gmr_pages[id]; ++p)
                 assert(host_gmr_ppn[id][p] < phys / 4096 || host_gmr_ppn[id][p] >= phys / 4096 + pages);
-        for (uint32_t id = 0; id < SVGA_MOBS; ++id) check_not_referenced(host_mobs[id], phys, pages);
+        for (uint32_t id = 0; id < HOST_MOBS; ++id) check_not_referenced(host_mobs[id], phys, pages);
         for (uint32_t id = 0; id < 5; ++id) check_not_referenced(host_otables[id], phys, pages);
         for (uint32_t id = 0; id < retired_count; ++id) check_not_referenced(retired_backings[id], phys, pages);
         free(allocations[i].ptr);
@@ -386,7 +394,7 @@ static void consume_gb(uint32_t stop, uint32_t id, uint32_t size)
         break;
     }
     case 1093: {
-        assert(size == 16 && object < SVGA_MOBS && !host_mobs[object].bytes);
+        assert(size == 16 && object < HOST_MOBS && !host_mobs[object].bytes);
         host_mobs[object] = (struct host_backing){peek(stop, 4), peek(stop, 3), peek(stop, 5)};
         validate_backing(host_mobs[object]);
         uint32_t *entry = table_entry(0, object, 16);
@@ -395,7 +403,7 @@ static void consume_gb(uint32_t stop, uint32_t id, uint32_t size)
         break;
     }
     case 1094:
-        assert(size == 4 && object < SVGA_MOBS && host_mobs[object].bytes);
+        assert(size == 4 && object < HOST_MOBS && host_mobs[object].bytes);
         for (uint32_t i = 0; i < SVGA_CONTEXTS; ++i)
             assert(!host_contexts[i] || host_context_mobs[i] != object);
         for (uint32_t i = 0; i < SVGA_SURFACES; ++i)
@@ -415,7 +423,7 @@ static void consume_gb(uint32_t stop, uint32_t id, uint32_t size)
     case 1109: {
         assert(size == 12 && object < SVGA_CONTEXTS && host_contexts[object] && !peek(stop, 4));
         uint32_t mob = peek(stop, 3);
-        if (mob != UINT32_MAX) assert(mob < SVGA_MOBS && host_mobs[mob].bytes >= 16384);
+        if (mob != UINT32_MAX) assert(mob < HOST_MOBS && host_mobs[mob].bytes >= 16384);
         host_context_mobs[object] = mob;
         table_entry(2, object, 8)[1] = mob;
         break;
@@ -447,7 +455,7 @@ static void consume_gb(uint32_t stop, uint32_t id, uint32_t size)
         if (mob == UINT32_MAX) {
             assert(!offset && host_shaders[object].mobid != UINT32_MAX);
         } else {
-            assert(mob < SVGA_MOBS && host_mobs[mob].bytes &&
+            assert(mob < HOST_MOBS && host_mobs[mob].bytes &&
                    offset <= host_mobs[mob].bytes &&
                    host_shaders[object].bytes <= host_mobs[mob].bytes - offset);
         }
@@ -476,7 +484,7 @@ static void consume_gb(uint32_t stop, uint32_t id, uint32_t size)
                host_queries[object].active &&
                peek(stop, 3) == SVGA_GB_QUERY_TYPE_OCCLUSION);
         uint32_t mobid = peek(stop, 4), offset = peek(stop, 5);
-        assert(mobid < SVGA_MOBS && host_mobs[mobid].bytes >= SVGA_GB_QUERY_RESULT_BYTES &&
+        assert(mobid < HOST_MOBS && host_mobs[mobid].bytes >= SVGA_GB_QUERY_RESULT_BYTES &&
                offset <= host_mobs[mobid].bytes - SVGA_GB_QUERY_RESULT_BYTES);
         uint32_t ppn = backing_page(host_mobs[mobid], offset / 4096u);
         SVGA3dQueryResult *result = physical_pointer((uint64_t)ppn * 4096 + offset % 4096u);
@@ -501,7 +509,7 @@ static void consume_gb(uint32_t stop, uint32_t id, uint32_t size)
         break;
     }
     case 1097: {
-        assert(size == 36 && object < SVGA_SURFACES && !host_surfaces[object].data);
+        assert(size == 36 && object < HOST_SURFACES && !host_surfaces[object].data);
         struct host_surface *s = &host_surfaces[object];
         s->format = peek(stop, 4); s->width = peek(stop, 8); s->height = peek(stop, 9);
         assert(peek(stop, 5) && !peek(stop, 6) && !peek(stop, 7) && peek(stop, 10));
@@ -513,20 +521,20 @@ static void consume_gb(uint32_t stop, uint32_t id, uint32_t size)
         break;
     }
     case 1099: {
-        assert(size == 8 && object < SVGA_SURFACES && host_surfaces[object].gb);
+        assert(size == 8 && object < HOST_SURFACES && host_surfaces[object].gb);
         uint32_t mob = peek(stop, 3);
-        if (mob != UINT32_MAX) assert(mob < SVGA_MOBS && host_mobs[mob].bytes);
+        if (mob != UINT32_MAX) assert(mob < HOST_MOBS && host_mobs[mob].bytes);
         host_surfaces[object].mobid = mob;
         table_entry(1, object, 64)[8] = mob;
         break;
     }
     case 1102:
     case 1106:
-        assert(size == 4 && object < SVGA_SURFACES && host_surfaces[object].gb);
+        assert(size == 4 && object < HOST_SURFACES && host_surfaces[object].gb);
         assert(host_surfaces[object].mobid != UINT32_MAX);
         break;
     case 1098:
-        assert(size == 4 && object < SVGA_SURFACES && host_surfaces[object].gb);
+        assert(size == 4 && object < HOST_SURFACES && host_surfaces[object].gb);
         assert(host_surfaces[object].mobid == UINT32_MAX);
         free(host_surfaces[object].data);
         host_surfaces[object] = (struct host_surface){0};
@@ -762,7 +770,7 @@ static void consume(void)
         else if (id == SVGA_CMD_DEFINE_GMR2) {
             words = 3;
             uint32_t gmr = peek(stop, 1), pages = peek(stop, 2);
-            assert(gmr < SVGA_GMRS && pages <= SVGA_MAX_GUEST_PAGES);
+            assert(gmr < SVGA_GMRS && pages <= HOST_GMR_PAGES);
             host_gmr_pages[gmr] = pages;
             memset(host_gmr_ppn[gmr], 0, sizeof(host_gmr_ppn[gmr]));
         } else if (id == SVGA_CMD_REMAP_GMR2) {
@@ -880,7 +888,7 @@ static void write_reg(uint32_t reg, uint32_t value)
         else {
             SVGAGuestMemDescriptor *desc = physical_pointer((uint64_t)value * 4096);
             assert(desc && desc[1].ppn == 0 && desc[1].numPages == 0);
-            assert(desc[0].numPages <= SVGA_MAX_GUEST_PAGES);
+            assert(desc[0].numPages <= HOST_GMR_PAGES);
             host_gmr_pages[selected_gmr] = desc[0].numPages;
             for (uint32_t i = 0; i < desc[0].numPages; ++i)
                 host_gmr_ppn[selected_gmr][i] = desc[0].ppn + i;
@@ -903,7 +911,7 @@ static void setup(uint32_t caps, uint32_t fc, uint32_t version)
     regs[SVGA_REG_MEM_REGS] = SVGA_FIFO_NUM_REGS;
     regs[SVGA_REG_GMR_MAX_IDS] = SVGA_GMRS;
     regs[SVGA_REG_GMR_MAX_DESCRIPTOR_LENGTH] = 512;
-    regs[SVGA_REG_GMRS_MAX_PAGES] = SVGA_MAX_GUEST_PAGES;
+    regs[SVGA_REG_GMRS_MAX_PAGES] = HOST_GMR_PAGES;
     regs[SVGA_REG_VRAM_SIZE] = 16 * 1024 * 1024;
     regs[SVGA_REG_MEMORY_SIZE] = 256 * 1024 * 1024;
     regs[SVGA_REG_SUGGESTED_GBOBJECT_MEM_SIZE_KB] = 256 * 1024;
@@ -1386,17 +1394,221 @@ static void test_effective_surface_limit_snapshot(void)
            info.compat_surface_limit_bytes == 64u * 1024u * 1024u);
     assert(svga3d_shutdown() == 0);
 
-    /* A GB host's non-GB compatibility profile is half the effective MOB
-     * page budget, and that budget respects the backend's 64 MiB page cap. */
+    /* GB MOB memory and GMR2 registration have independent host budgets. */
     setup(0x1dffc3e2u, 0x77fu, 0);
     regs[SVGA_REG_SUGGESTED_GBOBJECT_MEM_SIZE_KB] = 256u * 1024u;
     assert(svga3d_init() == 0);
     svga_get_info(&info);
     assert(info.available && info.probe.gb_objects &&
-           info.surface_limit_bytes == 64u * 1024u * 1024u &&
-           info.compat_surface_limit_bytes == 32u * 1024u * 1024u);
+           info.surface_limit_bytes == 256u * 1024u * 1024u &&
+           info.compat_surface_limit_bytes == 128u * 1024u * 1024u);
     assert(svga3d_shutdown() == 0);
 }
+static void test_gb_host_resource_budgets(void)
+{
+    setup(0x1dffc3e2u, 0x77fu, 0);
+    regs[SVGA_REG_GMRS_MAX_PAGES] = 2;
+    /* CAP2_REGISTER, CAP2.GB_MEMSIZE_2, GBOBJECT_MEM_SIZE_KB. */
+    regs[SVGA_REG_CAPABILITIES] |= 0x80000000u;
+    regs[59] = 8u;
+    regs[76] = 512u * 1024u;
+    assert(!svga3d_init());
+    struct svga_info info;
+    svga_get_info(&info);
+    assert(info.surface_limit_bytes == 512ULL * 1024u * 1024u);
+    assert(info.compat_surface_limit_bytes == 256ULL * 1024u * 1024u);
+    struct svga_mob mob = {0};
+    uint32_t baseline = live_pages;
+    assert(!svga_gb_backing_alloc_locked(&mob, 3u * 4096u));
+    svga_gb_backing_free_locked(&mob);
+    assert(live_pages == baseline);
+    svga_handle a = 0, b = 0;
+    assert(!svga_gmr_create(2u * 4096u, &a));
+    assert(svga_gmr_create(4096u, &b) == SVGA_ENOMEM && !b);
+    assert(!svga_gmr_destroy(a));
+    assert(!svga_gmr_create(4096u, &b));
+    assert(!svga_gmr_destroy(b));
+    /* No allocation is attempted when a MOB exceeds the host's per-object cap. */
+    uint32_t calls = allocation_calls;
+    assert(svga_gb_backing_alloc_locked(&mob, 129u * 1024u * 1024u) == SVGA_ENOMEM);
+    assert(allocation_calls == calls && live_pages == baseline);
+    /* UINT32_MAX bytes rounds up to 1048576 pages, never zero. The fake
+     * allocator refuses before allocating any payload, so this is bounded. */
+    svga.mob_max_bytes = UINT32_MAX;
+    svga.page_limit = 2u * 1024u * 1024u;
+    fail_after = allocation_calls;
+    assert(svga_gb_backing_alloc_locked(&mob, UINT32_MAX) == SVGA_ENOMEM);
+    assert(last_allocation_pages == 1048576u && live_pages == baseline);
+    fail_after = UINT32_MAX;
+    assert(!svga3d_shutdown());
+    puts("GB host memory, GMR2 pages and per-MOB limits remain independent");
+}
+
+static void test_borrowed_backing_reserves_gb_budget(void)
+{
+    setup(0x1dffc3e2u, 0x77fu, 0);
+    uint32_t baseline = svga.pages, limit = svga.page_limit;
+    uint64_t physical = allocate(2);
+    assert(physical);
+    struct svga_mob borrowed = {0}, owned = {0};
+    svga.page_limit = baseline + 2;
+    uint32_t calls = allocation_calls;
+    assert(svga_gb_backing_borrow_locked(&borrowed, physical, 2, 8192) == SVGA_ENOMEM);
+    assert(!borrowed.phys && svga.pages == baseline && allocation_calls == calls);
+    svga.page_limit = baseline + 3;
+    assert(!svga_gb_backing_borrow_locked(&borrowed, physical, 2, 8192));
+    /* The diagnostic remains allocator-owned pages; the two caller-owned
+     * backing pages must nevertheless consume the device's GB budget. */
+    assert(svga.pages == baseline + 1);
+    assert(svga_gb_backing_alloc_locked(&owned, 4096) == SVGA_ENOMEM);
+    svga_gb_backing_free_locked(&borrowed);
+    assert(physical_pointer(physical) && svga.pages == baseline);
+    assert(!svga_gb_backing_alloc_locked(&owned, 8192));
+    svga_gb_backing_free_locked(&owned);
+    svga.page_limit = limit;
+    deallocate(physical, 2);
+    assert(!svga3d_shutdown() && !live_pages);
+    puts("borrowed MOB backing retains the complete GB budget without freeing caller pages");
+}
+
+static void test_borrowed_backing_bounds_shader_reservations(void)
+{
+    setup(0x1dffc3e2u, 0x77fu, 0);
+    uint32_t limit = svga.page_limit;
+    svga_handle context = 0;
+    assert(!svga3d_context_create(&context));
+    uint64_t physical = allocate(1);
+    struct svga_mob borrowed = {0};
+    assert(!svga_gb_backing_borrow_locked(&borrowed, physical, 1, 4096));
+    const uint32_t code[] = {0xfffe0200u, 0x0000ffffu};
+    struct svga_batch batch;
+    assert(!svga_batch_init(&batch, svga.generation, batch_storage,
+                           SVGA_BATCH_MAX_BYTES));
+    svga.page_limit = svga.pages + svga.borrowed_mob_pages;
+    uint32_t calls = allocation_calls, owned = svga.pages;
+    assert(svga_batch_shader_define(&batch, context, 7,
+        SVGA3D_SHADERTYPE_VS, code, sizeof(code)) == SVGA_ENOMEM);
+    assert(!svga.shader_reserved_pages && allocation_calls == calls);
+    ++svga.page_limit;
+    assert(!svga_batch_shader_define(&batch, context, 7,
+        SVGA3D_SHADERTYPE_VS, code, sizeof(code)));
+    assert(svga.shader_reserved_pages == 1 && svga.pages == owned);
+    struct svga_mob denied = {0};
+    assert(svga_gb_backing_alloc_locked(&denied, 4096) == SVGA_ENOMEM);
+    assert(!svga_batch_abort(&batch));
+    assert(!svga.shader_reserved_pages && svga.pages == owned);
+    svga.page_limit = limit;
+    svga_gb_backing_free_locked(&borrowed);
+    deallocate(physical, 1);
+    assert(!svga3d_context_destroy(context));
+    assert(!svga3d_shutdown() && !live_pages);
+    puts("borrowed MOB and staged shader pages share one complete GB budget");
+}
+
+static void test_gb_tables_follow_small_host_limits(void)
+{
+    uint32_t previous = host_surface_cap;
+    host_surface_cap = 256;
+    setup(0x1dffc3e2u, 0x77fu, 0);
+    assert(!svga3d_shutdown());
+    regs[SVGA_REG_MOB_MAX_SIZE] = 1024u * 1024u;
+    regs[SVGA_REG_SUGGESTED_GBOBJECT_MEM_SIZE_KB] = 64u * 1024u;
+    assert(!svga3d_init());
+    assert(svga.available && svga.gb_active && svga.surface_limit == 256);
+    for (uint32_t i = 0; i < SVGA_OTABLE_DX9_MAX; ++i)
+        assert(svga.otables[i].bytes <= regs[SVGA_REG_MOB_MAX_SIZE]);
+    svga_handle context = 0, surface = 0;
+    struct svga_surface_desc desc = {SVGA3D_X8R8G8B8,
+        SVGA3D_SURFACE_HINT_RENDERTARGET, 8, 8, 1, 1};
+    assert(!svga3d_context_create(&context));
+    assert(!svga3d_surface_create(&desc, &surface));
+    assert(!svga3d_surface_destroy(surface));
+    assert(!svga3d_context_destroy(context));
+    assert(!svga3d_shutdown() && !live_pages);
+    host_surface_cap = previous;
+    puts("GB tables fit negotiated smaller host ID and per-MOB limits");
+}
+
+static void test_snapshot_cost(void)
+{
+    setup(0x1dffc3e2u, 0x77fu, 0);
+    struct svga_info info;
+    struct timespec begin, end;
+    for (uint32_t i = 0; i < 32; ++i) svga_get_info(&info);
+    assert(timespec_get(&begin, TIME_UTC) == TIME_UTC);
+    for (uint32_t i = 0; i < 8192; ++i) svga_get_info(&info);
+    assert(timespec_get(&end, TIME_UTC) == TIME_UTC);
+    uint64_t ns = (uint64_t)(end.tv_sec - begin.tv_sec) * 1000000000u +
+                  (uint64_t)end.tv_nsec - (uint64_t)begin.tv_nsec;
+    assert(!info.surfaces && !info.contexts && !info.gmrs);
+    printf("SVGA_SNAPSHOT_BENCH loops=8192 nanoseconds=%llu\n", (unsigned long long)ns);
+    fflush(stdout);
+    const char *budget = getenv("SVGA_SNAPSHOT_BUDGET_NS");
+    if (budget) assert(ns < strtoull(budget, NULL, 10));
+    assert(!svga3d_shutdown() && !live_pages);
+}
+
+static void test_more_than_255_live_surfaces(void)
+{
+    uint32_t previous = host_surface_cap;
+    host_surface_cap = 384u;
+    setup(0x1dffc3e2u, 0x77fu, 0);
+    assert(svga.surface_limit == 384u);
+    struct svga_surface_desc desc = {SVGA3D_X8R8G8B8,
+        SVGA3D_SURFACE_HINT_RENDERTARGET, 1, 1, 1, 1};
+    svga_handle handles[300] = {0};
+    for (uint32_t i = 0; i < 300u; ++i)
+        assert(!svga3d_surface_create(&desc, &handles[i]) && handles[i]);
+    struct svga_info info;
+    svga_get_info(&info);
+    assert(info.surfaces == 300u);
+    for (uint32_t i = 0; i < 300u; ++i)
+        assert(!svga3d_surface_destroy(handles[i]));
+    svga_get_info(&info);
+    assert(!info.surfaces);
+    assert(!svga3d_shutdown() && !live_pages);
+    host_surface_cap = previous;
+    puts("300 concurrent surfaces honor the host's advertised ID capacity");
+}
+
+static void test_surface_snapshot_retirement_counts(void)
+{
+    for (uint32_t gb = 0; gb < 2; ++gb) {
+        setup(gb ? 0x1dffc3e2u : SVGA_CAP_3D | SVGA_CAP_EXTENDED_FIFO | SVGA_CAP_GMR,
+              gb ? 0x77fu : SVGA_FIFO_CAP_FENCE | SVGA_FIFO_CAP_RESERVE,
+              gb ? 0 : SVGA3D_HWVERSION_WS8_B1);
+        struct svga_surface_desc desc = {SVGA3D_X8R8G8B8,
+            SVGA3D_SURFACE_HINT_RENDERTARGET, 8, 8, 1, 1};
+        svga_handle a = 0, b = 0;
+        assert(!svga3d_surface_create(&desc, &a));
+        assert(!svga3d_surface_try_create(&desc, &b));
+        struct svga_info info;
+        svga_get_info(&info);
+        assert(info.surfaces == 2);
+        assert(svga3d_surface_try_destroy(b) == SVGA_EBUSY);
+        svga_get_info(&info);
+        assert(info.surfaces == 2);
+        consume();
+        assert(!svga3d_surface_try_destroy(b));
+        svga_get_info(&info);
+        assert(info.surfaces == 1);
+        assert(!svga3d_surface_destroy(a));
+        svga_get_info(&info);
+        assert(!info.surfaces);
+        if (gb) {
+            fail_after = allocation_calls;
+            assert(svga3d_surface_create(&desc, &a) == SVGA_ENOMEM && !a);
+            fail_after = allocation_calls;
+            assert(svga3d_surface_try_create(&desc, &b) == SVGA_ENOMEM && !b);
+            svga_get_info(&info);
+            assert(!info.surfaces);
+            fail_after = UINT32_MAX;
+        }
+        assert(!svga3d_shutdown() && !live_pages);
+    }
+    puts("surface snapshots retain creating/retiring handles and roll back failed publications");
+}
+
 static void test_present_try(void)
 {
     for (unsigned gb = 0; gb < 2; ++gb) {
@@ -2286,12 +2498,12 @@ static void test_vgpu9_shader_backend(void)
         if (svga.shaders[i].defined && svga.shaders[i].context == first &&
             svga.shaders[i].local_id == 7) global = i;
     assert(global < SVGA_GB_SHADER_SLOTS);
-    assert(host_mobs[SVGA_SHADER_MOB_BASE + global].bytes == sizeof(code));
-    assert(host_mobs[SVGA_SHADER_MOB_BASE + global].depth == 0);
+    assert(host_mobs[svga.shader_mob_base + global].bytes == sizeof(code));
+    assert(host_mobs[svga.shader_mob_base + global].depth == 0);
     uint32_t *entry = table_entry(SVGA_OTABLE_SHADER, global,
                                   SVGA_GB_SHADER_ENTRY_BYTES);
     assert(entry[0] == SVGA3D_SHADERTYPE_VS && entry[1] == sizeof(code) &&
-           entry[2] == 0 && entry[3] == SVGA_SHADER_MOB_BASE + global);
+           entry[2] == 0 && entry[3] == svga.shader_mob_base + global);
     assert(svga3d_shader_define(first, 7, SVGA3D_SHADERTYPE_VS,
                                 code, sizeof(code)) == SVGA_EINVAL);
     assert(svga3d_shader_define(second, 7, SVGA3D_SHADERTYPE_VS,
@@ -2322,7 +2534,7 @@ static void test_vgpu9_shader_backend(void)
     assert(!svga_fence_status(fence, &signaled) && signaled);
     assert(svga3d_shader_destroy(first, 7, SVGA3D_SHADERTYPE_VS) == SVGA_EBUSY);
     assert(!svga3d_shader_destroy(first, 7, SVGA3D_SHADERTYPE_VS));
-    assert(!host_mobs[SVGA_SHADER_MOB_BASE + global].bytes);
+    assert(!host_mobs[svga.shader_mob_base + global].bytes);
     assert(svga3d_shader_destroy(second, 7, SVGA3D_SHADERTYPE_VS) == SVGA_EBUSY);
     assert(!svga3d_shader_destroy(second, 7, SVGA3D_SHADERTYPE_VS));
     assert(!svga3d_context_destroy(first));
@@ -3473,6 +3685,35 @@ static void test_borrowed_callback_native_code_owner(void)
 }
 #endif
 
+static void test_borrowed_gmr_shares_registration_budget(void)
+{
+    setup(0x1dffc3e2u, 0x77fu, 0);
+    regs[SVGA_REG_GMRS_MAX_PAGES] = 2u;
+    assert(!svga3d_init());
+    struct borrowed_test_owner owner = {.pages = 1};
+    owner.phys = allocate(1);
+    svga_handle owned = 0, attachment = 0, extra = 0;
+    assert(!svga_gmr_create(8192u, &owned));
+    assert(svga_gmr_borrowed_attach(owner.phys, 4096u, &owner,
+        release_borrowed_test_owner, NULL, &attachment) == SVGA_ENOMEM);
+    assert(!attachment && !owner.puts);
+    assert(!svga_gmr_destroy(owned));
+    assert(svga_gmr_borrowed_attach(owner.phys, 4096u, &owner,
+        release_borrowed_test_owner, NULL, &attachment) == SVGA_EBUSY);
+    assert(attachment);
+    /* The partially published borrowed mapping already consumes one page. */
+    assert(svga_gmr_create(8192u, &extra) == SVGA_ENOMEM && !extra);
+    consume();
+    assert(!svga_gmr_borrowed_attach(owner.phys, 4096u, &owner,
+        release_borrowed_test_owner, NULL, &attachment));
+    assert(svga_gmr_borrowed_detach(attachment) == SVGA_EBUSY);
+    consume();
+    assert(!svga_gmr_borrowed_detach(attachment) && owner.puts == 1u);
+    assert(!svga_gmr_create(8192u, &extra));
+    assert(!svga_gmr_destroy(extra));
+    assert(!svga3d_shutdown() && !live_pages);
+}
+
 static void test_borrowed_mapping_queues_before_host_completion(void)
 {
     setup(0x1dffc3e2u, 0x77fu, 0);
@@ -3585,7 +3826,7 @@ static void test_borrowed_gmr_mob_lifetime(void)
     assert(!ret);
     assert(!svga_gmr_borrowed_mob_id(attachment, &mapped_mob));
     uint32_t gmr_id = svga_resource_id(attachment);
-    assert(mapped_mob == SVGA_EXTERNAL_MOB_BASE + gmr_id);
+    assert(mapped_mob == svga.external_mob_base + gmr_id);
     assert(host_gmr_pages[gmr_id] == owner.pages);
     assert(host_mobs[mapped_mob].bytes == owner.pages * 4096u);
     for (uint32_t page = 0; page < owner.pages; ++page)
@@ -3608,17 +3849,75 @@ static void test_borrowed_gmr_mob_lifetime(void)
     stall_command = SVGA_CMD_DEFINE_GMR2;
     assert(svga_gmr_borrowed_detach(attachment) == SVGA_EBUSY);
     assert(owner.puts == 0 && host_mobs[mapped_mob].bytes);
+    assert(svga.borrowed_mob_pages == owner.pages);
+    uint32_t limit = svga.page_limit;
+    svga.page_limit = svga.pages + svga.borrowed_mob_pages;
+    assert(!svga_page_budget_allows(1));
+    svga.page_limit = limit;
     assert(svga_gmr_borrowed_detach(attachment) == SVGA_EBUSY);
     assert(owner.puts == 0 && host_mobs[mapped_mob].bytes);
     stalled = false;
     consume();
     assert(!svga_gmr_borrowed_detach(attachment));
     assert(owner.puts == 1 && live_pages == baseline);
+    assert(!svga.borrowed_mob_pages);
     assert(!svga.mode_leases);
     assert(!host_gmr_pages[gmr_id] && !host_mobs[mapped_mob].bytes);
     assert(!svga_mode_begin(&mode_flags));
     svga_mode_end(mode_flags);
     assert(!svga3d_shutdown() && !live_pages);
+}
+
+static void test_gb_table_capacity_namespace_edges(void)
+{
+    uint32_t previous = host_surface_cap;
+    host_surface_cap = 512;
+    setup(0x1dffc3e2u, 0x77fu, 0);
+    assert(!svga3d_shutdown());
+    regs[SVGA_REG_MOB_MAX_SIZE] = 16384;
+    assert(!svga3d_init());
+    assert(svga.surface_limit == 256 && svga.shader_mob_base == 320 &&
+           svga.external_mob_base == 384 && svga.mob_limit == 384 + svga.gmr_limit);
+    for (uint32_t i = 0; i < SVGA_OTABLE_DX9_MAX; ++i)
+        assert(svga.otables[i].bytes <= 16384);
+    svga_handle context = 0, surfaces[255], gmrs[SVGA_GMRS] = {0};
+    struct svga_surface_desc desc = {SVGA3D_X8R8G8B8,
+        SVGA3D_SURFACE_HINT_RENDERTARGET, 8, 8, 1, 1};
+    assert(!svga3d_context_create(&context));
+    for (uint32_t i = 0; i < 255; ++i)
+        assert(!svga3d_surface_create(&desc, &surfaces[i]));
+    svga_handle extra = 0;
+    assert(svga3d_surface_create(&desc, &extra) == SVGA_ENOMEM && !extra);
+    const uint32_t code[] = {0xfffe0200u, 0x0000ffffu};
+    for (uint32_t i = 0; i < SVGA_GB_SHADER_SLOTS; ++i)
+        assert(!svga3d_shader_define(context, i, SVGA3D_SHADERTYPE_VS,
+                                    code, sizeof(code)));
+    assert(host_mobs[svga.shader_mob_base - 1].bytes &&
+           host_mobs[svga.external_mob_base - 1].bytes);
+    for (uint32_t i = 0; i + 1 < svga.gmr_limit; ++i)
+        assert(!svga_gmr_create(4096, &gmrs[i]));
+    struct borrowed_test_owner owner = {.pages = 1};
+    owner.phys = allocate(1);
+    svga_handle attachment = 0;
+    assert(svga_gmr_borrowed_attach(owner.phys, 4096, &owner,
+        release_borrowed_test_owner, NULL, &attachment) == SVGA_EBUSY);
+    consume();
+    assert(!svga_gmr_borrowed_attach(owner.phys, 4096, &owner,
+        release_borrowed_test_owner, NULL, &attachment));
+    uint32_t mob = UINT32_MAX;
+    assert(!svga_gmr_borrowed_mob_id(attachment, &mob));
+    assert(mob == svga.mob_limit - 1 && host_mobs[mob].bytes == 4096);
+    assert(svga_gmr_borrowed_detach(attachment) == SVGA_EBUSY);
+    consume();
+    assert(!svga_gmr_borrowed_detach(attachment) && owner.puts == 1);
+    for (uint32_t i = 0; i + 1 < svga.gmr_limit; ++i)
+        assert(!svga_gmr_destroy(gmrs[i]));
+    for (uint32_t i = 0; i < 255; ++i)
+        assert(!svga3d_surface_destroy(surfaces[i]));
+    assert(!svga3d_context_destroy(context));
+    assert(!svga3d_shutdown() && !live_pages);
+    host_surface_cap = previous;
+    puts("16-KiB MOB tables bound all three adjacent namespace edges");
 }
 
 static void test_shutdown_refuses_borrowed_attachment(void)
@@ -3867,7 +4166,7 @@ static void test_vgpu9_query_retirement_barrier(bool retire_context_first)
 static void test_nonblocking_typed_resource_lifecycle(void)
 {
     host_context_cap = SVGA_CONTEXTS;
-    host_surface_cap = SVGA_SURFACES;
+    host_surface_cap = HOST_SURFACES;
     host_texture_width_cap = UINT32_MAX;
     host_texture_height_cap = 4096;
     setup(0x1dffc3e2u, 0x77fu, 0);
@@ -3960,7 +4259,7 @@ static void test_nonblocking_typed_resource_lifecycle(void)
     assert(!svga3d_context_try_destroy(context));
     assert(svga.mode_leases == 1);
     assert(!host_contexts[context_id] && !host_shaders[shader_id].defined);
-    assert(!host_mobs[SVGA_SHADER_MOB_BASE + shader_id].bytes);
+    assert(!host_mobs[svga.shader_mob_base + shader_id].bytes);
     assert(svga3d_surface_try_destroy(second_surface) == SVGA_EBUSY);
     assert(!svga3d_surface_try_destroy(second_surface));
     assert(!svga.mode_leases);
@@ -3974,7 +4273,7 @@ static void test_nonblocking_typed_resource_lifecycle(void)
 static void test_nonblocking_legacy_resource_lifecycle(void)
 {
     host_context_cap = SVGA_CONTEXTS;
-    host_surface_cap = SVGA_SURFACES;
+    host_surface_cap = HOST_SURFACES;
     host_texture_width_cap = 4096;
     host_texture_height_cap = 4096;
     setup(SVGA_CAP_3D | SVGA_CAP_EXTENDED_FIFO | SVGA_CAP_GMR,
@@ -4068,6 +4367,17 @@ static void test_idle_shader_retirement(void)
 
 int main(void)
 {
+    const char *review_case = getenv("SVGA_REVIEW_TEST");
+    if (review_case) {
+        if (!strcmp(review_case, "borrowed-budget"))
+            test_borrowed_backing_reserves_gb_budget();
+        else if (!strcmp(review_case, "small-host"))
+            test_gb_tables_follow_small_host_limits();
+        else if (!strcmp(review_case, "snapshot-cost"))
+            test_snapshot_cost();
+        else assert(!"unknown SVGA review regression case");
+        return 0;
+    }
 #ifdef RELIEFNT_SVGA_NATIVE_OWNER_TEST
     test_borrowed_callback_native_code_owner();
 #endif
@@ -4092,6 +4402,12 @@ int main(void)
     test_cache_policy_reports_with_svga_lock_released();
     test_fifo_reservation_matches_physical_alias();
     test_effective_surface_limit_snapshot();
+    test_gb_host_resource_budgets();
+    test_borrowed_backing_reserves_gb_budget();
+    test_borrowed_backing_bounds_shader_reservations();
+    test_gb_tables_follow_small_host_limits();
+    test_more_than_255_live_surfaces();
+    test_surface_snapshot_retirement_counts();
     test_present_try(); test_resources(); test_surface_size_rejects_mip_sum_overflow();
     test_gpu(); test_gpu_diagnostic_skips_unadvertised_fifo_busy();
     test_gb_recovery();
@@ -4106,6 +4422,8 @@ int main(void)
     test_borrowed_mapping_queues_before_host_completion();
     test_borrowed_mapping_partial_fifo_pressure();
     test_borrowed_gmr_mob_lifetime();
+    test_gb_table_capacity_namespace_edges();
+    test_borrowed_gmr_shares_registration_budget();
     test_shutdown_refuses_borrowed_attachment();
     test_vgpu9_occlusion_query_lifetime();
     test_many_query_operations_in_one_batch();
