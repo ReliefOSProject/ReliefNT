@@ -33,6 +33,7 @@ def main():
         ("user_return_body.inc", "kernel/exec/userland.c", "userland_schedule_from_frame"),
         ("network_maintenance_body.inc", "kernel/exec/userland.c", "sched_network_maintenance"),
         ("network_maintenance_runner_body.inc", "kernel/exec/userland.c", "sched_run_network_maintenance"),
+        ("idle_service_body.inc", "kernel/exec/userland.c", "sched_idle_service_wait"),
         ("int80_return_body.inc", "arch/x86_64/interrupt/idt.c", "int80_dispatch"),
     ]
     temporary = Path(os.environ.get("TMPDIR", str(ROOT / "out" / "tmp")))
@@ -40,7 +41,13 @@ def main():
     with tempfile.TemporaryDirectory(prefix="user-return-", dir=temporary) as directory:
         work = Path(directory)
         for target, source, name in bodies:
-            (work / target).write_text(function(kernel / source, name))
+            body = function(kernel / source, name)
+            if name == "sched_idle_service_wait":
+                wait = '__asm__ volatile("sti; hlt; cli" ::: "memory");'
+                if wait not in body:
+                    raise RuntimeError("scheduler idle wait instruction not found")
+                body = body.replace(wait, "test_idle_wait();")
+            (work / target).write_text(body)
         source = module_text("syscall_dispatch")
         start = source.index("    if (number == LINUX_SYS_PSELECT6) {")
         end = source.index("\n    }\n", start) + 6
@@ -55,7 +62,9 @@ def main():
                 "-Wl,--gc-sections", "-I" + str(work), "-Iinclude", "-Iinclude",
                 "-Iinclude/uapi", "-Iinclude",
                 "tools/tests/" + fixture + ".c",
-                *(["kernel/syscall/fs/lookup_state.c", "kernel/syscall/io/vector.c", "fs/vfs/mount_tree.c", "fs/vfs/path.c"]
+                *(["kernel/syscall/fs/lookup_state.c", "kernel/syscall/io/vector.c", "fs/vfs/mount_tree.c", "fs/vfs/path.c",
+                   "drivers/usb/core/registry.c", "drivers/usb/core/work.c", "kernel/device/driver_manager_phase.c",
+                   "block/device/registry.c"]
                   if fixture == "user_return_gate_test" else []), "-o", str(executable),
             ], cwd=ROOT, env=env, check=True)
             subprocess.run([str(executable)], cwd=ROOT, env=env, check=True, timeout=30)

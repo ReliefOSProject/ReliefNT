@@ -26,7 +26,18 @@ struct disk_block_partition_cache {
     struct disk_block_partition_range entries[RELIEFOS_DISK_MAX_PARTITIONS];
     int32_t status;
     uint8_t valid;
+    uint8_t mbr;
 };
+
+/** @brief Resolve one GPT or DOS partition into a validated filesystem extent.
+ * @param disk_id Stable inventory slot. @param disk Held native disk context.
+ * @param sectors Actual512-byte sector count. @param index Zero-based Linux slot.
+ * @param entry Required snapshot; MBR extents carry no fabricated unique GUID.
+ * @return Zero or negative parse/lookup/I/O errno. Execution/storage ownership;
+ * no graph lock spans metadata reads and no cache pointer escapes.
+ */
+int disk_partition_read_entry(uint32_t disk_id,struct install_disk_state *disk,
+                               uint64_t sectors,uint32_t index,struct gpt_entry *entry);
 
 
 

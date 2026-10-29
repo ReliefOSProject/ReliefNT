@@ -29,6 +29,7 @@ void kernel_poll_readiness_notify(void) { }
 static unsigned descriptor_refs = 1;
 static uint8_t keyboard_caps;
 uint8_t input_caps_lock_active(void) { return keyboard_caps; }
+uint8_t input_num_lock_active(void) { return 0; }
 void input_set_graphical_vt(uint32_t number) { (void)number; }
 static uint32_t shown_vt;
 static uint32_t shown_graphical;

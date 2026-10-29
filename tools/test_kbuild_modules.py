@@ -275,6 +275,9 @@ class KbuildModules(unittest.TestCase):
         self.assertIn("CONFIG_USB_UHCI_HCD=m", all_config)
         self.assertTrue((allmods / "drivers/usb/uhci/uhci.ko").is_file())
         self.assertNotIn(" uhci_driver_module", symbols)
+        self.assertIn("CONFIG_USB_EHCI_HCD=m", all_config)
+        self.assertTrue((allmods / "drivers/usb/ehci/ehci.ko").is_file())
+        self.assertNotIn(" ehci_driver", symbols)
         filesystems = {
             "EXT_FS_COMMON": "fs/ext_common/ext_common.ko",
             "EXT2_FS": "fs/ext2/ext2.ko", "EXT4_FS": "fs/ext4/ext4.ko",

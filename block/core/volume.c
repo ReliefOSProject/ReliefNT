@@ -12,6 +12,7 @@ const char *storage_transport_name(uint8_t transport)
     if(transport==STORAGE_TRANSPORT_IDE_PIO)return "ide-pio";
     if(transport==STORAGE_TRANSPORT_NVME)return "nvme";
     if(transport==STORAGE_TRANSPORT_MEMORY)return "ram";
+    if(transport==STORAGE_TRANSPORT_USB)return "usb";
     return transport==STORAGE_TRANSPORT_AHCI ? "ahci" : "block";
 }
 
@@ -52,17 +53,17 @@ void storage_volume_put_device(struct storage_volume *volume)
 
 /** @brief Validate an inventory device using registered immutable geometry.
  * @param disk Borrowed discovered scalar record, required.
- * @return Zero for an admitted writable 512-byte disk, -EROFS for optical/RO,
- * -EOPNOTSUPP for incompatible sector geometry, or lookup errno. Task context;
+ * @return Zero for an admitted 512-byte disk, -EOPNOTSUPP for incompatible
+ * sector geometry, or lookup errno. Read-only disks permit metadata queries
+ * and mounts; the block registry rejects every write with -EROFS. Task context;
  * temporary reference spans the check, no native callback or hardware reset.
  */
-int storage_prepare_install_disk(struct install_disk_state *disk)
+int storage_prepare_block_disk(struct install_disk_state *disk)
 {
     if(!disk || !disk->present)return -EINVAL;
     struct block_device_ref ref={0};int rc=block_device_get(disk->device,&ref);
     if(rc)return rc;
     struct block_device_info info;rc=block_device_info(&ref,&info);
-    if(!rc && (info.flags&BLOCK_DEVICE_READ_ONLY))rc=-EROFS;
     if(!rc && info.block_size!=512u)rc=-EOPNOTSUPP;
     block_device_put(&ref);return rc;
 }

@@ -113,4 +113,16 @@ void pci_unmap_mmio(void *ptr, uint64_t bytes);
  * exact claims share a pointer. Caller drains device/users before exact unmap.
  */
 void *pci_map_mmio(uint64_t phys, uint64_t bytes);
+/** @brief Map firmware's assigned BAR0 page without probing or changing decode.
+ * @param device Exact present PCI identity retained by the caller.
+ * @param phys Expected page-aligned memory BAR0 base, never a caller-chosen range.
+ * @return Owned 4096-byte UC/NX lease or NULL. Before firmware handoff the
+ * caller may only read its device's architected capability header within the
+ * first 16 bytes. No BAR sizing, decode changes or DMA start occurs here.
+ * After handoff, only architected registers required to STOP that device may
+ * be used until pci_device_bar_contains validates its full used aperture.
+ * Complete that validation before preparing or enabling DMA. Release
+ * using pci_unmap_mmio(pointer,4096) after hardware/users drain.
+ */
+void *pci_map_firmware_bar0(const struct pci_device *device, uint64_t phys);
 #endif

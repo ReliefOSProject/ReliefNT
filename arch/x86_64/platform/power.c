@@ -123,6 +123,8 @@ bool power_acpi_pm_timer_read(uint32_t *count, uint32_t *mask)
     *count = x86_64_inl(acpi_pm_timer_port) & acpi_pm_timer_mask;
     return true;
 }
+#include <reliefnt/export.h>
+EXPORT_SYMBOL(power_acpi_pm_timer_read);
 
 /**
  * Acpi guid equal.

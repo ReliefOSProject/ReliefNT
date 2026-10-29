@@ -24,5 +24,16 @@ class BlockRegistry(unittest.TestCase):
             subprocess.run([str(binary)], check=True, timeout=15)
 
 
+    def test_physical_disconnect_and_publication_race(self):
+        with tempfile.TemporaryDirectory(prefix="reliefnt-block-disconnect-") as directory:
+            binary=Path(directory)/"disconnect"
+            subprocess.run(["clang","-std=c11","-O1","-g","-Wall","-Wextra","-Werror",
+                "-DCONFIG_MODULES=1","-ffunction-sections","-fdata-sections","-Wl,--gc-sections",
+                "-fno-pie","-no-pie","-fsanitize=address,undefined","-fno-sanitize-recover=all",
+                "-Iinclude","-Iinclude/uapi","tools/tests/block_disconnect_test.c",
+                "block/device/registry.c","-o",str(binary)],cwd=ROOT,check=True)
+            subprocess.run([str(binary)],check=True,timeout=10)
+
+
 if __name__ == "__main__":
     unittest.main()

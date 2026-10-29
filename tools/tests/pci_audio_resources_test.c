@@ -37,6 +37,7 @@ static unsigned shootdowns;
 void x86_64_invlpg(uint64_t a) {(void)a;}
 void smp_flush_user_tlb(void) {++shootdowns;}
 static uint32_t cfg[64], cfg2[64], bar_masks[64], config_address;
+static unsigned configuration_writes;
 static uint32_t *selected_config(void) {
     if ((config_address & 0x00ffff00u)==0) return cfg;
     if ((config_address & 0x00ffff00u)==0x100 && cfg2[0]) return cfg2;
@@ -50,10 +51,12 @@ uint32_t x86_64_inl(uint16_t port) {
 }
 void x86_64_outl(uint32_t value,uint16_t port) {
     if(port==0xcf8){config_address=value;return;}assert(port==0xcfc);
+    ++configuration_writes;
     uint32_t *p=selected_config();if(p)__atomic_store_n(&p[(config_address & 0xfc)/4],value,__ATOMIC_RELEASE);
 }
 void x86_64_outw(uint16_t value,uint16_t port) {
     assert(port==0xcfc || port==0xcfe);uint32_t *p=selected_config();assert(p);
+    ++configuration_writes;
     uint32_t i=(config_address & 0xfc)/4,shift=(port & 2)*8;
     uint32_t old=__atomic_load_n(&p[i],__ATOMIC_ACQUIRE);
     __atomic_store_n(&p[i],(old&~(0xffffu<<shift))|((uint32_t)value<<shift),__ATOMIC_RELEASE);
@@ -558,6 +561,16 @@ int main(void) {
     mmio_validation_and_page_table_oom_roll_back();
     kernel_pd[3][0]=0xc0000000ULL|0x83;
     cfg[0x10/4]=0xc0000004;cfg[0x14/4]=0;bar_masks[0x10/4]=0xffffc004;
+    struct pci_device firmware_device={.vendor_id=0x8086,.device_id=0x2668};
+    unsigned before_config_writes=configuration_writes;
+    void *firmware_page=pci_map_firmware_bar0(&firmware_device,0xc0000000);
+    assert(firmware_page && configuration_writes==before_config_writes);
+    assert(!pci_map_firmware_bar0(&firmware_device,0xc0001000));
+    firmware_device.device_id^=1;
+    assert(!pci_map_firmware_bar0(&firmware_device,0xc0000000));
+    assert(configuration_writes==before_config_writes);
+    pci_unmap_mmio(firmware_page,4096);
+    puts("firmware_BAR0_capability_mapping_has_no_PCI_config_writes PASS");
     void *mmio=pci_map_mmio(0xc0000000,8192); assert(mmio);
     assert(cfg[0x10/4]==0xc0000004 && cfg[0x14/4]==0);
     assert(!pci_map_mmio(0xc0000000,32768));

@@ -189,10 +189,10 @@ static int storage_existing_block_partition(uint32_t disk,uint32_t partition,uin
  */
 static int storage_open_block_partition_owned(uint32_t disk_id, uint32_t partition_index,
                                   const char *filesystem_name,
-                                  uint64_t flags, uint32_t *out_volume_id,bool *created)
+                                  uint64_t flags, uint32_t *out_volume_id,bool *created,
+                                  const struct block_device_ref *reference)
 {
     struct install_disk_state *disk;
-    struct disk_gpt_table table;
     struct gpt_entry entry;
     struct storage_volume *volume;
     struct storage_volume *old_volume;
@@ -220,6 +220,11 @@ static int storage_open_block_partition_owned(uint32_t disk_id, uint32_t partiti
     }
     if(disk_id>=g_install_disk_count || !g_install_disks[disk_id].present)return -ENODEV;
     if(partition_index>=RELIEFOS_DISK_MAX_PARTITIONS)return -EINVAL;
+    /* The retained physical identity determines whether a writable mount may
+     * be created or reused, before any partition or filesystem reads. */
+    struct block_device_info info;
+    ret=block_device_info(reference,&info);if(ret)return ret;
+    if((info.flags&BLOCK_DEVICE_READ_ONLY) && !(flags&MS_RDONLY))return -EROFS;
     ret=storage_existing_block_partition(disk_id,partition_index,requested_filesystem,flags,out_volume_id);
     if(ret!=-ENOENT)return ret;
     ret = storage_acquire_task_io();
@@ -234,25 +239,8 @@ static int storage_open_block_partition_owned(uint32_t disk_id, uint32_t partiti
     }
     ret=storage_disk_block_busy(disk_id,(int32_t)partition_index);
     if(ret)return ret<0 ? ret : -16;
-    ret = disk_gpt_load(disk, sector_count, &table);
-    if (ret < 0 || partition_index >= table.primary.partition_entry_count) {
-        console_error("[storage] mount gpt load failed disk=%u part=%u ret=%d\n",
-                       disk_id, partition_index, ret < 0 ? ret : -22);
-        return ret < 0 ? ret : -22;
-    }
-    ret = disk_gpt_entries_valid(&table);
-    if (ret < 0) {
-        console_error("[storage] mount gpt entries invalid disk=%u part=%u ret=%d\n",
-                       disk_id, partition_index, ret);
-        return ret;
-    }
-    {
-        const struct gpt_entry *entries = (const struct gpt_entry *)(const void *)storage_cluster_buf;
-        if (!disk_gpt_entry_used(&entries[partition_index])) {
-            return -2;
-        }
-        entry = entries[partition_index];
-    }
+    ret=disk_partition_read_entry(disk_id,disk,sector_count,partition_index,&entry);
+    if(ret)return ret;
     ret = disk_partition_filesystem(disk, &entry, &filesystem);
     if (ret < 0) {
         console_error("[storage] mount filesystem probe failed disk=%u part=%u ret=%d\n",
@@ -349,6 +337,6 @@ int storage_open_block_partition(uint32_t disk_id, uint32_t partition_index,
                                   uint64_t flags, uint32_t *out_volume_id,bool *created)
 {
     struct block_device_ref ref={0};int rc=storage_disk_block_get(disk_id,&ref);
-    if(!rc)rc=storage_open_block_partition_owned(disk_id,partition_index,filesystem_name,flags,out_volume_id,created);
+    if(!rc)rc=storage_open_block_partition_owned(disk_id,partition_index,filesystem_name,flags,out_volume_id,created,&ref);
     block_device_put(&ref);return rc;
 }

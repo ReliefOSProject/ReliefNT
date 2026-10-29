@@ -22,6 +22,36 @@ static int console_key_to_bytes(uint8_t keycode, char *buffer, uint32_t *length)
         return 0;
     }
     *length = 0;
+    if (keycode >= INPUT_KEY_KP1 && keycode <= INPUT_KEY_KPDOT) {
+        static const char digits[] = "1234567890.";
+        if (input_num_lock_active()) {
+            buffer[0]=digits[keycode-INPUT_KEY_KP1];*length=1;return 1;
+        }
+        switch(keycode) {
+        case INPUT_KEY_KP1: keycode=79; break;
+        case INPUT_KEY_KP2: keycode=80; break;
+        case INPUT_KEY_KP4: keycode=75; break;
+        case INPUT_KEY_KP6: keycode=77; break;
+        case INPUT_KEY_KP7: keycode=71; break;
+        case INPUT_KEY_KP8: keycode=72; break;
+        case INPUT_KEY_KP3: case INPUT_KEY_KP9:
+        case INPUT_KEY_KP0: case INPUT_KEY_KPDOT:
+            buffer[0]='\033';buffer[1]='[';
+            buffer[2]=keycode==INPUT_KEY_KP3 ? '6' : keycode==INPUT_KEY_KP9 ? '5' :
+                keycode==INPUT_KEY_KP0 ? '2' : '3';
+            buffer[3]='~';*length=4;return 1;
+        default: return 0;
+        }
+    }
+    switch(keycode) {
+    case INPUT_KEY_KPSLASH: ch='/'; break;
+    case INPUT_KEY_KPASTERISK: ch='*'; break;
+    case INPUT_KEY_KPMINUS: ch='-'; break;
+    case INPUT_KEY_KPPLUS: ch='+'; break;
+    default: break;
+    }
+    if(ch) {buffer[0]=ch;*length=1;return 1;}
+    if(keycode==INPUT_KEY_KPENTER)keycode=28;
     switch (keycode) {
     case 1: buffer[0] = '\033'; *length = 1; return 1;
     case 72: buffer[0] = '\033'; buffer[1] = '['; buffer[2] = 'A'; *length = 3; return 1;
@@ -103,7 +133,7 @@ static void console_update_modifier(uint32_t held, uint8_t pressed)
 
 /**
  * @brief Offer one physical keyboard event to the console terminal.
- * @param keycode Set-1 make/break code after 0xe0 extension normalization.
+ * @param keycode Normalized Set-1 or distinct keypad identity.
  * @param pressed Non-zero for a make code, zero for a break code.
  * @return Nothing.
  *
@@ -149,8 +179,13 @@ void pty_console_key_event(uint8_t keycode, uint8_t pressed)
     if (keyboard_mode == K_RAW || keyboard_mode == K_MEDIUMRAW) {
         uint8_t code = keycode;
         uint8_t extended = 0;
+        uint8_t keypad = input_keypad_linux_code(keycode);
         if (keyboard_mode == K_RAW) {
-            switch (keycode) {
+            if(keypad) {
+                code=keypad;
+                if(keycode==INPUT_KEY_KPSLASH) {code=0x35;extended=1;}
+                if(keycode==INPUT_KEY_KPENTER) {code=0x1c;extended=1;}
+            } else switch (keycode) {
             case 112: code = 0x5b; extended = 1; break;
             case 113: code = 0x5c; extended = 1; break;
             case 114: code = 0x5d; extended = 1; break;
@@ -163,7 +198,8 @@ void pty_console_key_event(uint8_t keycode, uint8_t pressed)
             default: break;
             }
         } else {
-            switch (keycode) {
+            if(keypad)code=keypad;
+            else switch (keycode) {
             case 71: code = KEY_HOME; break; case 72: code = KEY_UP; break;
             case 73: code = KEY_PAGEUP; break; case 75: code = KEY_LEFT; break;
             case 77: code = KEY_RIGHT; break; case 79: code = KEY_END; break;
@@ -204,7 +240,7 @@ void pty_console_key_event(uint8_t keycode, uint8_t pressed)
         if (keycode == 14) {
             static const char erase[] = "\b \b";
             console_vt_write(active_vt, erase, sizeof(erase) - 1U);
-        } else if (keycode == 28) {
+        } else if (keycode == 28 || keycode == INPUT_KEY_KPENTER) {
             static const char newline[] = "\r\n";
             console_vt_write(active_vt, newline, sizeof(newline) - 1U);
         } else if (length == 1 && (uint8_t)bytes[0] >= 32U) {

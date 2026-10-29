@@ -18,7 +18,7 @@ class BlockExclusiveTests(unittest.TestCase):
                 "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
                 "-Wno-address-of-packed-member", "-Iinclude",
                 "-Iinclude", "-Iinclude/uapi",
-                "tools/tests/block_exclusive_mount_test.c", "fs/tmpfs/core.c",
+                "tools/tests/block_exclusive_mount_test.c", "fs/tmpfs/core.c", "block/partition/mbr.c",
                 "lib/text_utf16.c", "fs/vfs/filesystems.c", "fs/vfs/filesystem_instance.c", "-o", executable,
             ], cwd=ROOT, check=True)
             subprocess.run([executable], cwd=ROOT, check=True, timeout=20)

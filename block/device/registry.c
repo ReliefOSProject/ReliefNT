@@ -10,7 +10,7 @@ struct block_device {
     struct block_device *next;
     const struct block_device_registration *registration;
     uint64_t references,users,serial;
-    bool linked,active;
+    bool linked,active,revoked;
 };
 static struct block_device *devices,*last_device;
 static uint64_t last_serial;
@@ -121,8 +121,10 @@ int register_block_device(const struct block_device_registration *registration)
     if(result){device_put(device);(void)device_close(device);}
     else {
         kernel_spin_lock_irqsave(&device_lock,&flags);
-        if(device->linked)device->active=true;else result=-EBUSY;
+        if(device->linked && !device->revoked)device->active=true;
+        else result=device->revoked ? -ENODEV : -EBUSY;
         kernel_spin_unlock_irqrestore(&device_lock,flags);
+        if(result)(void)device_close(device);
     }
     device_put(device);return result;
 }
@@ -143,6 +145,24 @@ int unregister_block_device(const struct block_device_registration *registration
     device_unlink_locked(device);kernel_spin_unlock_irqrestore(&device_lock,flags);
     device_put(device);return 0;
 }
+
+/** @brief Close I/O admission for a physically removed exact block registration.
+ * @param registration Stable provider descriptor retained until idle unregister.
+ * @return Zero or EINVAL/ENOENT. Task context; existing references retain their
+ * original metadata/code, but cannot invoke new transport I/O. No callback or
+ * allocation occurs under the lock, and removal never reuses the device number.
+ */
+int disconnect_block_device(const struct block_device_registration *registration)
+{
+    if(!registration)return -EINVAL;
+    uint64_t flags;kernel_spin_lock_irqsave(&device_lock,&flags);
+    struct block_device *device=devices;
+    while(device && device->registration!=registration)device=device->next;
+    if(device){device->active=false;device->revoked=true;}
+    kernel_spin_unlock_irqrestore(&device_lock,flags);
+    return device ? 0 : -ENOENT;
+}
+EXPORT_SYMBOL(disconnect_block_device);
 
 /** @brief Pin a published identity and its LIVE code under registry exclusion.
  * @param device Stable candidate under device_lock.
@@ -226,6 +246,10 @@ static int device_transfer(const struct block_device_ref *reference,uint64_t fir
                             uint32_t count,void *buffer,bool write)
 {
     if(!reference || !reference->device || !buffer)return -EINVAL;
+    uint64_t flags;kernel_spin_lock_irqsave(&device_lock,&flags);
+    bool active=reference->device->active;
+    kernel_spin_unlock_irqrestore(&device_lock,flags);
+    if(!active)return -ENODEV;
     const struct block_device_registration *registration=reference->device->registration;
     const struct block_device_info *info=&registration->info;
     if(!count || count>info->max_blocks || first>=info->blocks || count>info->blocks-first ||
@@ -261,6 +285,10 @@ int block_device_write(const struct block_device_ref *reference,uint64_t first,u
 int block_device_flush(const struct block_device_ref *reference)
 {
     if(!reference || !reference->device)return -EINVAL;
+    uint64_t flags;kernel_spin_lock_irqsave(&device_lock,&flags);
+    bool active=reference->device->active;
+    kernel_spin_unlock_irqrestore(&device_lock,flags);
+    if(!active)return -ENODEV;
     const struct block_device_registration *registration=reference->device->registration;
     if(!registration->operations->flush)return 0; /* Validated read-only/write-through. */
     if(!module_execution_get(registration->owner))return -ENODEV;

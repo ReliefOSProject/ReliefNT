@@ -176,6 +176,7 @@ static int64_t descriptor_dispatch_fork(const struct trap_frame *frame)
 static int64_t descriptor_dispatch_vfork(const struct trap_frame *frame)
 { (void)frame; abort(); }
 
+void usb_process_work(void) { }
 void driver_manager_process_audio_faults(void) { }
 void input_process_pending(void) { }
 /* No task in this descriptor fixture owns a live CPU return reservation. */

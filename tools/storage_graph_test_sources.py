@@ -4,6 +4,7 @@ This is a host-fixture composition, not a production source inventory. The
 kernel's Kbuild directories remain the owners of production objects.
 """
 STORAGE_GRAPH_SOURCES = [
+    "block/partition/mbr.c",
     'kernel/dma/buffer.c',
     'drivers/storage/ahci/dma.c',
     'fs/vfs/mount_tree.c',

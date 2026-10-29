@@ -24,6 +24,7 @@
 #include <reliefnt/permissions.h>
 #include <reliefnt/graphics_service.h>
 #include <reliefnt/net.h>
+#include <reliefnt/usb.h>
 #include <reliefnt/mount.h>
 #include "runtime.h"
 #include "pending.h"
@@ -48,7 +49,7 @@ struct sched_idle_service_state {
  * @brief Wait on the scheduler-owned ring-0 stack, then perform bounded maintenance.
  * @param opaque Scheduler idle state containing execution-lock IRQ flags.
  * @note Called with execution ownership held. The wait releases ownership;
- *       network and resource maintenance run only after it is reacquired.
+ *       USB, network and resource maintenance run only after it is reacquired.
  */
 static void sched_idle_service_wait(void *opaque)
 {
@@ -57,6 +58,7 @@ static void sched_idle_service_wait(void *opaque)
     __asm__ volatile("sti; hlt; cli" ::: "memory");
     kernel_execution_lock_irqsave(&state->execution_flags);
     net_tcp_maintenance();
+    usb_process_work();
     vfs_reclaim_mounts(2);
     uint32_t retired = graphics_service_process_retirements(2);
     if (retired)
@@ -64,7 +66,7 @@ static void sched_idle_service_wait(void *opaque)
 }
 
 /**
- * @brief Run bounded TCP maintenance on the scheduler-owned kernel stack.
+ * @brief Run deferred TCP and USB maintenance on the scheduler-owned kernel stack.
  * @param opaque Unused stack-call context.
  * @note Caller holds kernel execution ownership; network polling stays out of
  *       the timer's device-IRQ top half.
@@ -73,18 +75,19 @@ static void sched_network_maintenance(void *opaque)
 {
     (void)opaque;
     net_tcp_maintenance();
+    usb_process_work();
 }
 
 /**
- * @brief Switch to the scheduler-owned stack when a TCP maintenance tick is due.
- * @note Caller holds kernel execution ownership. The no-work and same-tick
- *       paths return without a stack switch.
+ * @brief Switch to the scheduler-owned stack when TCP or USB work is pending.
+ * @note Caller holds kernel execution ownership. When neither service has
+ *       work, the path returns without a stack switch.
  */
 static void sched_run_network_maintenance(void)
 {
     uint32_t cpu;
     void *stack_top;
-    if (!net_tcp_maintenance_due()) return;
+    if (!net_tcp_maintenance_due() && !usb_service_pending()) return;
     cpu = smp_current_cpu();
     if (cpu >= SMP_MAX_CPUS) cpu = 0;
     stack_top = &sched_idle_service_stacks[cpu][SCHED_IDLE_SERVICE_STACK_BYTES];

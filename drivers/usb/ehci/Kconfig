@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+config USB_EHCI_HCD
+    tristate "EHCI USB 2.0 storage and HID host controller"
+    default y
+    help
+      PCI EHCI high-speed USB2, Bulk-Only SCSI flash storage and boot HID
+      keyboard/mouse, including USB2 hub transaction translators.
+      Low/full-speed root-port devices require a UHCI companion controller;
+      enable USB_UHCI_HCD for VMware's USB2 controller. M builds ehci.ko.
+      This is an EHCI driver, not support for USB2 ports owned by xHCI.

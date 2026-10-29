@@ -6,7 +6,7 @@
 ====
 
 drivers/ 按 console、tty、video、storage、net、input、usb、sound 等设备族
-组织；sound/core 实现 PCM、mixer 及 ALSA/OSS 路线。block/ 负责块 I/O、GPT 与
+组织；sound/core 实现 PCM、mixer 及 ALSA/OSS 路线。block/ 负责块 I/O、GPT/MBR 与
 设备身份，fs/ 各文件系统负责自己的元数据、缓存和同步。
 默认生产配置全部内置；下表中的部件可选择 ``m``，使用相同的原生注册、
 探测和撤销入口。模块针对匹配的 ReliefNT 构建，不兼容 Linux 原版二进制
@@ -31,6 +31,10 @@ drivers/ 按 console、tty、video、storage、net、input、usb、sound 等设�
    * - ``MOUSE_PS2`` / ``USB_UHCI_HCD``
      - ``mouse`` / ``uhci``
      - PS/2、VMware 鼠标与 UHCI HID；键盘基础输入和分发入口内置。
+   * - ``USB_EHCI_HCD``
+     - ``ehci``
+     - USB 2.0 高速主机、BOT/SCSI 存储与 boot HID；挂载或打开的块设备固定模块。
+       低速/全速根端口设备使用 UHCI companion，详见 :doc:`usb`。
    * - ``SERIAL_8250``
      - ``serial``
      - COM1 终端提供者；早期诊断与 panic 输出不依赖模块。

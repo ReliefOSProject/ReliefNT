@@ -702,6 +702,7 @@ void mm_retain_page(uint64_t phys)
 /* Native filesystem modules share this core-owned interface; CRC/release
  * checks bind it to the exact kernel, without a stable cross-release API. */
 EXPORT_SYMBOL(mm_alloc_pages);
+EXPORT_SYMBOL(mm_alloc_pages_below);
 EXPORT_SYMBOL(mm_free_pages);
 EXPORT_SYMBOL(mm_phys_to_virt);
 

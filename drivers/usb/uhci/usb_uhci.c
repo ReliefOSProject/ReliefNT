@@ -4,6 +4,7 @@
 #include <reliefnt/pci.h>
 #include <reliefnt/time.h>
 #include <reliefnt/usb.h>
+#include <reliefnt/usb_hid.h>
 #include <reliefnt/driver_module.h>
 #include <linux/errno.h>
 
@@ -114,11 +115,7 @@ struct usb_hid_device {
     uint8_t qh_index;
     uint8_t td_index;
     uint8_t data_toggle;
-    uint8_t modifier;
-    uint8_t keys[6];
-    int32_t x;
-    int32_t y;
-    uint8_t buttons;
+    struct usb_hid_state input;
 };
 
 /* Every address placed on the UHCI bus belongs to this contiguous masked run.
@@ -145,6 +142,7 @@ struct uhci_controller {
     uint8_t qh_tail;
     uint8_t next_address;
     uint8_t control_failed;
+    uint8_t port_work;
     uint64_t dma_phys;
     struct uhci_dma *dma;
     struct usb_host *host;
@@ -556,153 +554,15 @@ static int usb_control_in(struct uhci_controller *controller, uint8_t address,
                                0x80u, request, value, index, data, length);
 }
 
-static uint8_t usb_hid_usage_to_keycode(uint8_t usage)
-{
-    static const uint8_t letters[26] = {
-        0x1e, 0x30, 0x2e, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24,
-        0x25, 0x26, 0x32, 0x31, 0x18, 0x19, 0x10, 0x13, 0x1f, 0x14,
-        0x16, 0x2f, 0x11, 0x2d, 0x15, 0x2c,
-    };
-    if (usage >= 0x04u && usage <= 0x1du) {
-        return letters[usage - 0x04u];
-    }
-    if (usage >= 0x1eu && usage <= 0x27u) {
-        static const uint8_t digits[10] = {0x02, 0x03, 0x04, 0x05, 0x06,
-                                           0x07, 0x08, 0x09, 0x0a, 0x0b};
-        return digits[usage - 0x1eu];
-    }
-    switch (usage) {
-    case 0x28: return 0x1cu;
-    case 0x29: return 0x01u;
-    case 0x2a: return 0x0eu;
-    case 0x2b: return 0x0fu;
-    case 0x2c: return 0x39u;
-    case 0x2d: return 0x0cu;
-    case 0x2e: return 0x0du;
-    case 0x2f: return 0x1au;
-    case 0x30: return 0x1bu;
-    case 0x31: return 0x2bu;
-    case 0x33: return 0x27u;
-    case 0x34: return 0x28u;
-    case 0x35: return 0x29u;
-    case 0x36: return 0x33u;
-    case 0x37: return 0x34u;
-    case 0x38: return 0x35u;
-    case 0x39: return 0x3au;
-    case 0x3a: return 0x3bu;
-    case 0x3b: return 0x3cu;
-    case 0x3c: return 0x3du;
-    case 0x3d: return 0x3eu;
-    case 0x3e: return 0x3fu;
-    case 0x3f: return 0x40u;
-    case 0x40: return 0x41u;
-    case 0x41: return 0x42u;
-    case 0x42: return 0x43u;
-    case 0x43: return 0x44u;
-    case 0x44: return 0x57u;
-    case 0x45: return 0x58u;
-    case 0x49: return 0x52u;
-    case 0x4a: return 0x47u;
-    case 0x4b: return 0x49u;
-    case 0x4c: return 0x53u;
-    case 0x4d: return 0x4fu;
-    case 0x4e: return 0x51u;
-    case 0x4f: return 0x4du;
-    case 0x50: return 0x4bu;
-    case 0x51: return 0x50u;
-    case 0x52: return 0x48u;
-    case 0x53: return 0x47u;
-    case 0x54: return 0x49u;
-    case 0x55: return 0x52u;
-    case 0x56: return 0x53u;
-    case 0x57: return 0x4fu;
-    case 0x58: return 0x35u;
-    default: return 0;
-    }
-}
-
-static uint8_t usb_hid_modifier_keycode(uint8_t bit)
-{
-    static const uint8_t codes[8] = {29u, 42u, 56u, 112u, 116u, 54u, 115u, 113u};
-    return bit < 8u ? codes[bit] : 0;
-}
-
-static int usb_hid_contains(const uint8_t keys[6], uint8_t usage)
-{
-    for (uint32_t i = 0; i < 6; ++i) {
-        if (keys[i] == usage) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
+/** @brief Deliver UHCI boot keyboard reports through the common HID decoder. */
 static void usb_hid_keyboard_report(struct usb_hid_device *device,
                                     const uint8_t *report, uint32_t length)
-{
-    uint8_t modifier;
-    uint8_t keys[6] = {0};
-    if (!device || !report || length < 2) {
-        return;
-    }
-    modifier = report[0];
-    for (uint32_t i = 0; i < 6 && i + 2u < length; ++i) {
-        keys[i] = report[i + 2u];
-    }
-    for (uint8_t bit = 0; bit < 8; ++bit) {
-        uint8_t old_state = (uint8_t)((device->modifier >> bit) & 1u);
-        uint8_t new_state = (uint8_t)((modifier >> bit) & 1u);
-        if (old_state != new_state) {
-            input_handle_scancode(usb_hid_modifier_keycode(bit), new_state);
-        }
-    }
-    for (uint32_t i = 0; i < 6; ++i) {
-        if (device->keys[i] && !usb_hid_contains(keys, device->keys[i])) {
-            uint8_t code = usb_hid_usage_to_keycode(device->keys[i]);
-            if (code) {
-                input_handle_scancode(code, 0);
-            }
-        }
-    }
-    for (uint32_t i = 0; i < 6; ++i) {
-        if (keys[i] && !usb_hid_contains(device->keys, keys[i])) {
-            uint8_t code = usb_hid_usage_to_keycode(keys[i]);
-            if (code) {
-                input_handle_scancode(code, 1);
-            }
-        }
-    }
-    device->modifier = modifier;
-    usb_memcpy(device->keys, keys, sizeof(device->keys));
-}
+{ usb_hid_boot_keyboard(&device->input, report, length); }
 
+/** @brief Deliver USB mouse coordinates with USB's positive-down Y convention. */
 static void usb_hid_mouse_report(struct usb_hid_device *device,
                                  const uint8_t *report, uint32_t length)
-{
-    uint32_t width=0,height=0;
-    int32_t dx;
-    int32_t dy;
-    uint8_t buttons;
-    if (!device || !report || length < 3) {
-        return;
-    }
-    buttons = report[0] & 0x07u;
-    dx = (int8_t)report[1];
-    dy = (int8_t)report[2];
-    if (!kernel_api->framebuffer_size(&width,&height) && width && height) {
-        device->x += dx;
-        device->y -= dy;
-        if (device->x < 0) device->x = 0;
-        if (device->y < 0) device->y = 0;
-        if (device->x >= (int32_t)width) device->x = (int32_t)width - 1;
-        if (device->y >= (int32_t)height) device->y = (int32_t)height - 1;
-    }
-    device->buttons = buttons;
-    kernel_api->input_push_mouse(device->x, device->y, dx, -dy, buttons);
-    if (length >= 4 && report[3]) {
-        kernel_api->input_push_mouse_wheel(device->x, device->y, (int8_t)report[3], buttons);
-    }
-}
+{ usb_hid_boot_mouse(&device->input, report, length); }
 
 static int uhci_enumerate_device(uint32_t controller_id, uint8_t root_port,
                                  uint8_t parent_address, uint8_t parent_low_speed,
@@ -939,7 +799,7 @@ static int uhci_enumerate_device(uint32_t controller_id, uint8_t root_port,
         if (device->mouse) {
             uint32_t width=0,height=0;
             if(!kernel_api->framebuffer_size(&width,&height)) {
-                device->x=(int32_t)(width/2u);device->y=(int32_t)(height/2u);
+                device->input.x=(int32_t)(width/2u);device->input.y=(int32_t)(height/2u);
             }
         }
         console_info("[usb] UHCI HID %s address=%u port=%u endpoint=%u packet=%u speed=%s\n",
@@ -1047,12 +907,7 @@ static void uhci_driver_fini(void)
     for(unsigned i=0;i<USB_UHCI_MAX_CONTROLLERS;++i) {
         for(unsigned n=0;n<USB_UHCI_MAX_HID;++n) {
             struct usb_hid_device *device=&usb_hid_devices[i][n];
-            if(device->used && device->keyboard) {
-                const uint8_t released[8]={0};
-                usb_hid_keyboard_report(device,released,sizeof(released));
-            }
-            if(device->used && device->mouse && device->buttons)
-                kernel_api->input_push_mouse(device->x,device->y,0,0,0);
+            if(device->used) usb_hid_boot_release(&device->input);
         }
         if(uhci_controllers[i].dma_phys)
             kernel_api->free_dma(uhci_controllers[i].dma_phys,
@@ -1069,8 +924,45 @@ static void uhci_driver_fini(void)
 static void uhci_host_poll(void *opaque)
 {
     struct uhci_controller *controller=opaque;
-    if(controller->ready && controller->dma)
-        uhci_poll_controller((uint32_t)(controller-uhci_controllers));
+    if(!controller->ready || !controller->dma)return;
+    for(unsigned port=0;port<controller->port_count;++port)
+        if(uhci_read16(controller,UHCI_REG_PORTSC1+port*2u)&UHCI_PORT_CONNECT_CHANGE)
+            controller->port_work=1;
+    if(controller->port_work) {
+        usb_host_request_service(controller->host);return;
+    }
+    uhci_poll_controller((uint32_t)(controller-uhci_controllers));
+}
+
+/** @brief Re-enumerate a changed companion controller outside IRQ context.
+ * @param opaque Retained controller under non-overlapping USB service admission.
+ * No global execution lock spans reset/debounce. Hardware is halted before its
+ * old descriptors are rewritten; held input is released before republishing.
+ */
+static void uhci_host_service(void *opaque)
+{
+    struct uhci_controller *controller=opaque;
+    if(!controller->port_work || !controller->dma)return;
+    controller->port_work=0;controller->ready=0;
+    uhci_write16(controller,UHCI_REG_CMD,0);
+    for(unsigned waited=0;!(uhci_read16(controller,UHCI_REG_STATUS)&UHCI_STATUS_HALTED);++waited) {
+        if(waited==100) { controller->control_failed=1;return; }
+        kernel_api->sleep_ms(1);
+    }
+    unsigned id=(unsigned)(controller-uhci_controllers);
+    for(unsigned i=0;i<USB_UHCI_MAX_HID;++i)
+        if(usb_hid_devices[id][i].used)usb_hid_boot_release(&usb_hid_devices[id][i].input);
+    usb_memzero(usb_hid_devices[id],sizeof(usb_hid_devices[id]));
+    controller->next_address=1;controller->control_failed=0;
+    if(uhci_reset_controller(controller)) { controller->control_failed=1;return; }
+    for(uint8_t port=0;port<controller->port_count;++port) {
+        uint16_t offset=UHCI_REG_PORTSC1+port*2u;
+        uint16_t status=uhci_read16(controller,offset);
+        uhci_write16(controller,offset,status|UHCI_PORT_CONNECT_CHANGE|UHCI_PORT_ENABLE_CHANGE);
+        (void)uhci_enumerate_device(id,port,0,0,8,0,0);
+        if(controller->control_failed)return;
+    }
+    controller->ready=1;
 }
 
 /** @brief Probe cached PCI identities and publish only fully prepared UHCI poll sources.
@@ -1119,9 +1011,12 @@ static int uhci_driver_init(const struct reliefos_driver_kernel_api *api)
         for(uint8_t port=0;port<controller->port_count;++port) {
             (void)uhci_enumerate_device(found-1u,port,0,0,8,0,0);
             if(controller->control_failed) return -ETIMEDOUT;
+            uint16_t offset=UHCI_REG_PORTSC1+port*2u;
+            uint16_t status=uhci_read16(controller,offset);
+            uhci_write16(controller,offset,status|UHCI_PORT_CONNECT_CHANGE|UHCI_PORT_ENABLE_CHANGE);
         }
         controller->ready=1;
-        error=usb_host_register(uhci_host_poll,controller,THIS_MODULE,&controller->host);
+        error=usb_host_register_service(uhci_host_poll,uhci_host_service,controller,THIS_MODULE,&controller->host);
         if(error) return error;
     }
     if(!found) return -ENODEV;

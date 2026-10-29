@@ -521,19 +521,18 @@ bool pci_device_bar_contains(const struct pci_device *device, uint8_t bar,
 struct pci_mmio_mapping { uint64_t phys, bytes, aligned, length; void *ptr; uint32_t refs; bool high; };
 static struct pci_mmio_mapping pci_mappings[PCI_MMIO_MAX];
 static struct kernel_spinlock pci_mapping_lock = KERNEL_SPINLOCK_INIT;
-/** @brief Map validated BAR pages UC/RW/NX, including high physical PCI space.
+/** @brief Retain already-admitted MMIO pages UC/RW/NX without touching PCI config.
  * @param phys Page-aligned BAR base of an exclusively controlled PCI function.
  * @param bytes Nonzero requested bytes; covering pages must fit the actual BAR.
  * @return Owned mapping lease or NULL. Task context under execution ownership;
  * repeated exact claims share a pointer/reference, high BARs use the inherited
  * device virtual window, and low BARs keep precise direct-map attribute leases.
  */
-void *pci_map_mmio(uint64_t phys, uint64_t bytes)
+static void *pci_map_mmio_lease(uint64_t phys, uint64_t bytes)
 {
     if ((phys & 4095u) || !bytes || bytes > UINT64_MAX - 4095u) return NULL;
     uint64_t length = (bytes + 4095u) & ~4095ull;
-    if (phys > UINT64_MAX - length || !pci_bar_contains(phys, bytes) ||
-        !pci_bar_contains(phys, length)) return NULL;
+    if (phys > UINT64_MAX - length) return NULL;
     bool high = !paging_kernel_direct_map_range(phys, length);
     /* A high UC alias must never overlap a still-WB part of the RAM direct map. */
     if (high && phys < RELIEFNT_KERNEL_DIRECT_MAP_SIZE) return NULL;
@@ -562,6 +561,39 @@ void *pci_map_mmio(uint64_t phys, uint64_t bytes)
     kernel_spin_unlock(&pci_mapping_lock);
     return result;
 }
+/** @brief Size a drained device's aperture, then map only fully covered pages. */
+void *pci_map_mmio(uint64_t phys, uint64_t bytes)
+{
+    if ((phys & 4095u) || !bytes || bytes > UINT64_MAX-4095u) return NULL;
+    uint64_t length=(bytes+4095u)&~4095ull;
+    if (phys>UINT64_MAX-length || !pci_bar_contains(phys,bytes) ||
+        !pci_bar_contains(phys,length)) return NULL;
+    return pci_map_mmio_lease(phys,bytes);
+}
+
+/** @brief Read firmware's assigned BAR0 identity without writes or sizing probes.
+ * Only capability-header reads are admitted before handoff. A normal memory
+ * BAR implements at least16 bytes; the containing page is a mapping granule,
+ * not evidence that all4096 bytes are implemented. After handoff, the caller
+ * may use its architected STOP registers, then must size the drained aperture
+ * before any larger access or DMA start.
+ */
+void *pci_map_firmware_bar0(const struct pci_device *device,uint64_t phys)
+{
+    if (!device || !phys || (phys&4095u) || phys>UINT64_MAX-4096u) return NULL;
+    uint64_t flags;kernel_spin_lock_irqsave(&pci_config_lock,&flags);
+    uint32_t identity=pci_raw_read32(device->bus,device->slot,device->function,0);
+    uint32_t header=pci_raw_read32(device->bus,device->slot,device->function,0x0c);
+    uint32_t low=pci_raw_read32(device->bus,device->slot,device->function,0x10);
+    uint32_t type=(low>>1)&3u;
+    uint32_t high=type==2u ? pci_raw_read32(device->bus,device->slot,device->function,0x14) : 0;
+    bool valid=(uint16_t)identity==device->vendor_id && (uint16_t)(identity>>16)==device->device_id &&
+        device->vendor_id!=0xffffu && ((header>>16)&0x7fu)<=1u && low && low!=UINT32_MAX &&
+        !(low&1u) && (type==0u || type==2u) && high!=UINT32_MAX &&
+        (((uint64_t)high<<32)|(low&~15u))==phys;
+    kernel_spin_unlock_irqrestore(&pci_config_lock,flags);
+    return valid ? pci_map_mmio_lease(phys,4096) : NULL;
+}
 /** @brief Release one exact PCI MMIO lease after the device/users have stopped.
  * @param ptr Owned original pointer; wrong/stale pointers are ignored.
  * @param bytes Original requested byte count, must match the lease.
@@ -589,10 +621,12 @@ EXPORT_SYMBOL(pci_config_read16);
 EXPORT_SYMBOL(pci_config_read32);
 
 EXPORT_SYMBOL(pci_config_write16);
+EXPORT_SYMBOL(pci_config_write32);
 
 EXPORT_SYMBOL(pci_device_bar_contains);
 
 EXPORT_SYMBOL(pci_map_mmio);
+EXPORT_SYMBOL(pci_map_firmware_bar0);
 
 EXPORT_SYMBOL(pci_read_device);
 

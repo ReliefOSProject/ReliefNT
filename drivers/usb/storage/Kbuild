@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Shared class implementation is built in; host owners retain block registrations.
+obj-y := bulk_only.o scsi.o
+
+include $(srctree)/scripts/Makefile.module

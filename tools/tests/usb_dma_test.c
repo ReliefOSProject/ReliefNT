@@ -50,6 +50,14 @@ static void mouse_wheel(int32_t x,int32_t y,int32_t wheel,uint8_t buttons)
 int usb_host_unregister(struct usb_host *host) { assert(!host);return 0; }
 int usb_host_register(void (*poll)(void *),void *context,struct module *owner,struct usb_host **out)
 { (void)poll;(void)context;(void)owner;(void)out;abort(); }
+int usb_host_register_service(void (*poll)(void *),void (*service)(void *),void *context,struct module *owner,struct usb_host **out)
+{ (void)service;return usb_host_register(poll,context,owner,out); }
+void usb_host_request_service(struct usb_host *host) { (void)host;abort(); }
+const struct framebuffer *framebuffer_get(void) { abort(); }
+void input_push_mouse(int32_t x,int32_t y,int32_t dx,int32_t dy,uint8_t buttons)
+{ mouse_motion(x,y,dx,dy,buttons); }
+void input_push_mouse_wheel(int32_t x,int32_t y,int32_t wheel,uint8_t buttons)
+{ mouse_wheel(x,y,wheel,buttons); }
 void console_log(enum console_log_level level,const char *format,...)
 { (void)level;(void)format; }
 void input_handle_scancode(uint8_t code,uint8_t pressed) { (void)code;(void)pressed;abort(); }

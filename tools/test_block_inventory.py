@@ -15,7 +15,8 @@ class Inventory(unittest.TestCase):
                 "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections", "-fsanitize=address,undefined",
                 "-fno-sanitize-recover=all", "-Iinclude", "-Iinclude/uapi", "tools/tests/block_inventory_test.c",
                 "block/device/registry.c", "block/device/inventory.c", "block/core/device_number.c",
-                "block/core/storage_state_data.c", "block/partition/partition_install.c", "-o", str(binary)], cwd=ROOT,
+                "block/core/storage_state_data.c", "block/partition/partition_install.c", "fs/vfs/mount.c",
+                "fs/devfs/devfs.c", "-o", str(binary)], cwd=ROOT,
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             self.assertEqual(result.returncode, 0, result.stdout)
             subprocess.run([str(binary)], check=True, timeout=10)

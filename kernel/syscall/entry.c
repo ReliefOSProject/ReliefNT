@@ -1,6 +1,7 @@
 #include <reliefnt/graphics_service.h>
 #include "internal.h"
 #include <reliefnt/module.h>
+#include <reliefnt/usb.h>
 
 /** @brief Distinguish a nonblocking stream result from an internal I/O wait.
  * @param task Current task under execution ownership, nullable.
@@ -226,6 +227,7 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
     vfs_reclaim_mounts(2);
     graphics_service_process_retirements(2);
     driver_manager_process_audio_faults();
+    usb_process_work();
     input_process_pending();
     number = frame->rax;
     struct task *calling_task = sched_current_task();

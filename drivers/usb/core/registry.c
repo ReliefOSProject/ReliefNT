@@ -9,14 +9,18 @@ struct usb_host {
     struct usb_host *next;
     struct module *owner;
     void (*poll)(void *);
+    void (*service)(void *);
     void *context;
     uint64_t id;
     bool closing;
     bool active;
+    bool pending;
 };
 static struct kernel_spinlock usb_hosts_lock=KERNEL_SPINLOCK_INIT;
 static struct usb_host *usb_hosts;
 static uint64_t usb_host_sequence, usb_poll_cursor;
+static uint64_t usb_service_cursor;
+static bool usb_queued;
 
 /** @brief Allocate a self-owned host registration before publishing its poll source.
  * @param poll IRQ-safe bounded callback, forbidden from unregistering itself.
@@ -29,12 +33,24 @@ static uint64_t usb_host_sequence, usb_poll_cursor;
 int usb_host_register(void (*poll)(void *),void *context,struct module *owner,
                       struct usb_host **out)
 {
+    return usb_host_register_service(poll,NULL,context,owner,out);
+}
+
+/** @brief Publish a host's non-overlapping IRQ and optional deferred callbacks.
+ * @param poll Bounded IRQ callback. @param service Optional task callback.
+ * @param context Retained controller. @param owner Borrowed native code owner.
+ * @param out Required exclusive handle result. @return Zero or negative errno.
+ * Initialization context; no callback/allocator runs under the registry lock.
+ */
+int usb_host_register_service(void (*poll)(void *),void (*service)(void *),
+                               void *context,struct module *owner,struct usb_host **out)
+{
     if(!out) return -EINVAL;
     *out=NULL;
     if(!poll) return -EINVAL;
     struct usb_host *host=kernel_malloc(sizeof(*host));
     if(!host) return -ENOMEM;
-    *host=(struct usb_host){.poll=poll,.context=context,.owner=owner};
+    *host=(struct usb_host){.poll=poll,.service=service,.context=context,.owner=owner};
     uint64_t flags;kernel_spin_lock_irqsave(&usb_hosts_lock,&flags);
     int error=0;
     struct usb_host **tail=&usb_hosts;
@@ -49,6 +65,65 @@ int usb_host_register(void (*poll)(void *),void *context,struct module *owner,
     return error;
 }
 EXPORT_SYMBOL(usb_host_register);
+EXPORT_SYMBOL(usb_host_register_service);
+
+/** @brief Coalesce one host's maintenance request while its handle remains owned.
+ * @param host Borrowed live host, nullable. IRQ/task safe; no callback or wait.
+ */
+void usb_host_request_service(struct usb_host *host)
+{
+    if(!host)return;
+    uint64_t flags;kernel_spin_lock_irqsave(&usb_hosts_lock,&flags);
+    if(!host->closing && host->service) {
+        host->pending=true;
+        __atomic_store_n(&usb_queued,true,__ATOMIC_RELEASE);
+    }
+    kernel_spin_unlock_irqrestore(&usb_hosts_lock,flags);
+}
+EXPORT_SYMBOL(usb_host_request_service);
+
+/** @brief Query queued work without entering a callback or pinning an owner. */
+bool usb_service_pending(void)
+{ return __atomic_load_n(&usb_queued,__ATOMIC_ACQUIRE); }
+
+/** @brief Fairly service up to four queued hosts with stable callback/code pins.
+ * Waitable task context under manager admission; the registry lock never spans
+ * hardware, allocation or I/O. Active pollers retain their pending request.
+ */
+void usb_service_run(void)
+{
+    uint64_t flags;kernel_spin_lock_irqsave(&usb_hosts_lock,&flags);
+    uint64_t start=usb_service_cursor,cursor=start,limit=usb_host_sequence;
+    kernel_spin_unlock_irqrestore(&usb_hosts_lock,flags);
+    bool wrapped=false;
+    for(unsigned visited=0;visited<4;++visited) {
+        kernel_spin_lock_irqsave(&usb_hosts_lock,&flags);
+        struct usb_host *host=usb_hosts;
+        while(host && (host->id<=cursor || host->id>(wrapped ? start : limit)))host=host->next;
+        if(!host && !wrapped && start) {
+            wrapped=true;cursor=0;host=usb_hosts;
+            while(host && host->id>start)host=host->next;
+        }
+        if(!host){kernel_spin_unlock_irqrestore(&usb_hosts_lock,flags);break;}
+        cursor=host->id;usb_service_cursor=cursor;
+        bool admitted=host->pending && host->service && !host->closing &&
+            !__atomic_load_n(&host->active,__ATOMIC_RELAXED) && module_execution_get(host->owner);
+        if(admitted) { host->pending=false;__atomic_store_n(&host->active,true,__ATOMIC_RELEASE); }
+        kernel_spin_unlock_irqrestore(&usb_hosts_lock,flags);
+        if(!admitted)continue;
+        host->service(host->context);
+        kernel_spin_lock_irqsave(&usb_hosts_lock,&flags);
+        module_execution_put(host->owner);
+        __atomic_store_n(&host->active,false,__ATOMIC_RELEASE);
+        kernel_spin_unlock_irqrestore(&usb_hosts_lock,flags);
+    }
+    kernel_spin_lock_irqsave(&usb_hosts_lock,&flags);
+    bool pending=false;
+    for(struct usb_host *host=usb_hosts;host;host=host->next)
+        if(!host->closing && host->pending)pending=true;
+    __atomic_store_n(&usb_queued,pending,__ATOMIC_RELEASE);
+    kernel_spin_unlock_irqrestore(&usb_hosts_lock,flags);
+}
 
 /** @brief Revoke a host's poll source, then drain code pins before releasing its handle.
  * @param host Exclusive live handle or NULL for no-op.

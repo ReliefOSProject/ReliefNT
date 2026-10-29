@@ -135,6 +135,11 @@ static int storage_vfs_remount(void *context,uint64_t flags)
     const uint64_t supported=VFS_SUPER_POLICY_MASK;
     if(flags&~supported)return -EOPNOTSUPP;
     if(!(flags&MS_RDONLY) && ((volume->fs_ops && (volume->fs_ops->flags&STORAGE_FS_READONLY)) || volume->read_only_reason))return -EROFS;
+    if(!(flags&MS_RDONLY) && volume->device_ref.device) {
+        struct block_device_info info;
+        int rc=block_device_info(&volume->device_ref,&info);if(rc)return rc;
+        if(info.flags&BLOCK_DEVICE_READ_ONLY)return -EROFS;
+    }
     if((flags&MS_RDONLY) && !(volume->mount_flags&MS_RDONLY) && storage_inode_volume_writers(volume->volume_id))return -EBUSY;
     volume->mount_flags=flags;if(volume->tmpfs)tmpfs_set_flags(volume->tmpfs,flags);return 0;
 }

@@ -508,7 +508,18 @@ static int storage_disk_list_partitions_owned(uint32_t disk_id,
     ret = disk_gpt_load(disk, sector_count, &table);
     if (ret < 0) {
         if (ret == -2) {
-            *out_count = 0;
+            for(uint32_t i=0;i<RELIEFOS_DISK_MAX_PARTITIONS;++i) {
+                struct gpt_entry entry;
+                ret=disk_partition_read_entry(disk_id,disk,sector_count,i,&entry);
+                if(ret==-2)continue;
+                if(ret)return ret;
+                if(count<capacity) {
+                    ret=disk_partition_export(disk_id,disk,i,&entry,&partitions[count]);
+                    if(ret)return ret;
+                }
+                ++count;
+            }
+            *out_count = count;
             return 0;
         }
         return ret;

@@ -13,4 +13,5 @@
    memory
    resource-limits
    drivers
+   usb
    svga

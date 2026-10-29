@@ -67,7 +67,7 @@ static int input_vt_chord_key(uint8_t keycode)
 
 /**
  * @brief Deliver one physical-key event from a keyboard driver to the kernel.
- * @param keycode Set-1 make/break code after 0xe0 extension normalization.
+ * @param keycode Normalized Set-1 or distinct keypad identity.
  * @param pressed Non-zero for a make code, zero for a break code.
  *
  * Shared entry point for PS/2 and USB HID so the hardware paths cannot
@@ -204,11 +204,19 @@ static uint32_t evdev_device_index(uint32_t device_kind)
     return INPUT_EVDEV_DEVICES;
 }
 
-static uint8_t caps_lock_active;
+static uint8_t caps_lock_active, num_lock_active;
 
 uint8_t input_caps_lock_active(void)
 {
     return __atomic_load_n(&caps_lock_active, __ATOMIC_RELAXED);
+}
+
+/** @brief Read the keyboard NumLock state for cooked terminal input.
+ * @return Nonzero while NumLock is active, otherwise zero.
+ */
+uint8_t input_num_lock_active(void)
+{
+    return __atomic_load_n(&num_lock_active, __ATOMIC_RELAXED);
 }
 
 static void evdev_set_key(uint16_t code, int32_t value)
@@ -261,6 +269,8 @@ static void evdev_publish(uint32_t device_kind, uint16_t type, uint16_t code,
 
 static uint16_t evdev_keycode(uint8_t keycode)
 {
+    uint8_t keypad=input_keypad_linux_code(keycode);
+    if(keypad)return keypad;
     /* The legacy GUI uses set-1 scan codes for cursor keys and extended
      * modifiers. Convert those exceptional values to Linux input codes; the
      * ordinary PC set-1 keyboard range already matches Linux key codes. */
@@ -376,6 +386,7 @@ void input_init(void)
     pending_key_head = pending_key_tail = 0;
     evdev_mouse_buttons = 0;
     __atomic_store_n(&caps_lock_active, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&num_lock_active, 0, __ATOMIC_RELAXED);
     evdev_mouse_x = 0;
     evdev_mouse_y = 0;
     evdev_next_grab_token = 1;
@@ -464,6 +475,8 @@ void input_push_key(uint8_t keycode, uint8_t pressed)
     if (code == KEY_CAPSLOCK && pressed && !down) {
         __atomic_store_n(&caps_lock_active, !caps_lock_active, __ATOMIC_RELAXED);
     }
+    if (code == 69 && pressed && !down) /* Linux KEY_NUMLOCK */
+        __atomic_store_n(&num_lock_active, !num_lock_active, __ATOMIC_RELAXED);
     event.modifiers = caps_lock_active ? 1U : 0U;
     push_event(&event);
     /* Repeat the absolute LED state before each key so readers opening late

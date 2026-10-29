@@ -43,6 +43,7 @@ uint32_t kernel_wait_queue_wake_all(struct kernel_wait_queue *q) { (void)q; retu
 /* This fixture covers VT handoff, not poll waiter wakeups. */
 void kernel_poll_readiness_notify(void) {}
 uint8_t input_caps_lock_active(void) { return 0; }
+uint8_t input_num_lock_active(void) { return 0; }
 
 static uint32_t shown_vt;
 static uint32_t shown_graphical;

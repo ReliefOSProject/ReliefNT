@@ -71,7 +71,8 @@ static int storage_append_sd_suffix(char *out, uint32_t capacity, uint32_t *posi
  * @param out Writable capacity-byte output. @param capacity Nonzero bytes.
  * @return Zero or -ENOENT/-EINVAL. Execution ownership; observes scalar records
  * without allocation, provider callback, hardware access or code reference.
- * Reloaded physical endpoints reuse names while old inode dev_t stays unchanged.
+ * Legacy endpoint hints may reuse unused names; USB replug receives a new
+ * dynamic name, while old inode dev_t stays unchanged.
  */
 int storage_disk_device_name(uint32_t disk_id, int32_t partition_index,
                              char *out, uint32_t capacity)

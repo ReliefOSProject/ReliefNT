@@ -1608,6 +1608,66 @@ static void cluster_access_persisted(struct storage_volume *volume,int64_t expec
     assert(!vfs_namespace_destroy(&ns) && !storage_inode_purge_volume(volume->volume_id));
 }
 
+struct readonly_fat_image {
+    const uint8_t *bytes;
+    uint32_t sectors,reads;
+    bool partitioned;
+    uint8_t mbr[512];
+};
+static int readonly_fat_read(void *context,uint64_t first,uint32_t count,void *buffer)
+{
+    struct readonly_fat_image *image=context;uint8_t *out=buffer;
+    uint64_t blocks=image->sectors+(image->partitioned ? 1u : 0u);
+    if(first>blocks || count>blocks-first)return -EIO;
+    ++image->reads;
+    for(uint32_t i=0;i<count;++i) {
+        uint64_t sector=first+i;
+        const uint8_t *source=image->partitioned && !sector ? image->mbr :
+            image->bytes+(sector-(image->partitioned ? 1u : 0u))*512u;
+        memcpy(out+i*512u,source,512);
+    }
+    return 0;
+}
+static uint32_t readonly_disk_slot(uint64_t device)
+{
+    assert(!storage_refresh_disks());
+    for(uint32_t i=0;i<g_install_disk_count;++i)if(g_install_disks[i].device==device)return i;
+    abort();
+}
+/* Use a real generated FAT filesystem and registered readonly transports to
+ * exercise both native creation paths, rather than only geometry admission. */
+static void readonly_fat_mounts(const uint8_t *bytes,uint32_t sectors)
+{
+    static const struct block_device_operations operations={.read=readonly_fat_read};
+    struct readonly_fat_image image={.bytes=bytes,.sectors=sectors,.partitioned=true};
+    image.mbr[510]=0x55;image.mbr[511]=0xaa;
+    uint8_t *entry=image.mbr+446;entry[4]=0x0c;entry[8]=1;
+    for(unsigned i=0;i<4;++i)entry[12+i]=(uint8_t)(sectors>>(i*8));
+    struct block_device_registration device={.info={.device=block_device_allocate_number(false),
+        .blocks=(uint64_t)sectors+1,.block_size=512,.max_blocks=128,.flags=BLOCK_DEVICE_READ_ONLY,
+        .transport=BLOCK_TRANSPORT_USB},.operations=&operations,.context=&image};
+    assert(!register_block_device(&device));uint32_t disk=readonly_disk_slot(device.info.device);
+    uint32_t slot=UINT32_MAX;bool created=true;
+    assert(storage_open_block_partition(disk,0,"vfat",0,&slot,&created)==-EROFS && !image.reads);
+    assert(!storage_open_block_partition(disk,0,"vfat",MS_RDONLY,&slot,&created) && created && image.reads);
+    struct storage_volume *volume=&g_volumes[slot];
+    assert(volume->ready && volume->filesystem==STORAGE_FILESYSTEM_FAT32 && (volume->mount_flags&MS_RDONLY));
+    uint8_t sector[512]={0};assert(block_device_write(&volume->device_ref,0,1,sector)==-EROFS);
+    storage_destroy_volume(volume);*volume=(struct storage_volume){0};
+    assert(!unregister_block_device(&device));
+
+    image.partitioned=false;image.reads=0;
+    device.info.device=block_device_allocate_number(false);device.info.blocks=sectors;
+    assert(!register_block_device(&device));disk=readonly_disk_slot(device.info.device);
+    struct storage_volume whole={.volume_id=STORAGE_MAX_VOLUMES-1};
+    assert(storage_mount_whole_filesystem(&whole,disk,"vfat")==-EROFS && !image.reads);
+    whole.mount_flags=MS_RDONLY;
+    assert(!storage_mount_whole_filesystem(&whole,disk,"vfat") && image.reads);
+    assert(whole.ready && whole.filesystem==STORAGE_FILESYSTEM_FAT32 && (whole.mount_flags&MS_RDONLY));
+    storage_destroy_volume(&whole);assert(!unregister_block_device(&device));
+    puts("PASS native read-only FAT partition and whole-device mounts; writable admission and raw writes rejected");
+}
+
 static void cluster_filesystem(const char *input,const char *output,bool extended)
 {
     FILE *file=fopen(input,"rb");assert(file && !fseek(file,0,SEEK_END));
@@ -1619,6 +1679,7 @@ static void cluster_filesystem(const char *input,const char *output,bool extende
     uint8_t *image=calloc(1,(size_t)bytes+512);assert(image);
     test_memory_bind(volume,image,(uint64_t)bytes+512);
     assert(fread(test_memory_bytes(volume)+512,1,(size_t)bytes,file)==(size_t)bytes && !fclose(file));
+    if(!extended)readonly_fat_mounts(image+512,(uint32_t)((uint64_t)bytes/512));
     g_active_volume=volume;assert(!(extended ? exfat_mount() : fat32_mount()));
     volume->fs_ops=extended ? &storage_exfat_ops : &storage_fat_ops;
     struct storage_filesystem_ops traced_filesystem=*volume->fs_ops;
@@ -2031,6 +2092,20 @@ static void runtime_mount_objects(struct vfs_namespace *ns,const struct vfs_path
     assert(!vfs_path_remount(&mounted,MS_RDONLY|MS_NOSUID|MS_NODEV));
     uint32_t written=99;
     assert(vfs_path_write(&file,0,"x",1,&written)==-EROFS && !written);
+    /* The backend's original held physical identity still governs remounts,
+     * including after disconnect; reject before changing either policy. */
+    struct block_device_registration physical={.info={.device=block_device_allocate_number(false),
+        .blocks=8,.block_size=512,.max_blocks=1,.flags=BLOCK_DEVICE_READ_ONLY},
+        .operations=&lookup_block_ops,.context=&lookup_completed_port};
+    assert(!register_block_device(&physical));
+    assert(!block_device_get(physical.info.device,&volume->device_ref));
+    uint64_t old_policy=vfs_path_mount_flags(&mounted),old_shared=volume->mount_flags;
+    assert(vfs_path_remount(&mounted,MS_NOEXEC)==-EROFS);
+    assert(vfs_path_mount_flags(&mounted)==old_policy && volume->mount_flags==old_shared);
+    assert(!disconnect_block_device(&physical));
+    assert(vfs_path_remount(&mounted,MS_NOEXEC)==-EROFS);
+    assert(vfs_path_mount_flags(&mounted)==old_policy && volume->mount_flags==old_shared);
+    block_device_put(&volume->device_ref);assert(!unregister_block_device(&physical));
     assert(!vfs_path_remount(&mounted,MS_NOSUID|MS_NODEV|MS_NOEXEC));
     assert(!vfs_path_write(&file,0,"kept",4,&written) && written==4);
     assert(vfs_path_remount(&file,0)==-EINVAL);

@@ -11,6 +11,7 @@ struct block_device;
 #define BLOCK_DEVICE_WRITE_THROUGH 8u
 /* Scalar inventory transport for reserved boot-image backing, not a pointer. */
 #define BLOCK_TRANSPORT_MEMORY 4u
+#define BLOCK_TRANSPORT_USB 5u
 
 struct block_device_info {
     uint64_t device, blocks;
@@ -87,6 +88,13 @@ int register_block_device(const struct block_device_registration *registration);
  * admission before quiesce. Controller STOP/free belongs to the driver's ledger.
  */
 int unregister_block_device(const struct block_device_registration *registration);
+/** @brief Revoke a physically removed device while retaining its held identities.
+ * @param registration Persistent exact descriptor, held until idle unregister.
+ * @return Zero or -EINVAL/-ENOENT. Task context; no hardware call or wait.
+ * New gets/enumeration and held read/write/flush fail ENODEV. Existing tokens
+ * still retain immutable metadata and owner code until their normal put.
+ */
+int disconnect_block_device(const struct block_device_registration *registration);
 /** @brief Resolve dev_t and acquire both core identity and LIVE module ownership.
  * @param device Nonzero native dev_t identity.
  * @param out Required empty output, unchanged on error.

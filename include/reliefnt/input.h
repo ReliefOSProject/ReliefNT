@@ -11,6 +11,27 @@
 #define INPUT_EVENT_KEYBOARD 2
 #define INPUT_EVENT_MOUSE_WHEEL 3
 
+/* Distinct normalized identities for USB keypad keys. Legacy 71..83 remain
+ * navigation keys, including the existing PS/2 normalization contract. */
+enum input_keypad_code {
+    INPUT_KEY_NUMLOCK = 128, INPUT_KEY_KPSLASH, INPUT_KEY_KPASTERISK,
+    INPUT_KEY_KPMINUS, INPUT_KEY_KPPLUS, INPUT_KEY_KPENTER,
+    INPUT_KEY_KP1, INPUT_KEY_KP2, INPUT_KEY_KP3, INPUT_KEY_KP4,
+    INPUT_KEY_KP5, INPUT_KEY_KP6, INPUT_KEY_KP7, INPUT_KEY_KP8,
+    INPUT_KEY_KP9, INPUT_KEY_KP0, INPUT_KEY_KPDOT
+};
+
+/** @brief Translate a normalized keypad identity to its Linux key code.
+ * @param keycode Normalized physical key identity.
+ * @return Linux keypad key code, or zero when keycode is not a keypad identity.
+ */
+static inline uint8_t input_keypad_linux_code(uint8_t keycode)
+{
+    static const uint8_t codes[] = {69,98,55,74,78,96,79,80,81,75,76,77,71,72,73,82,83};
+    return keycode>=INPUT_KEY_NUMLOCK && keycode<=INPUT_KEY_KPDOT ?
+        codes[keycode-INPUT_KEY_NUMLOCK] : 0;
+}
+
 struct input_raw_event {
     uint32_t type;
     int32_t x;
@@ -41,7 +62,7 @@ void input_push_mouse_wheel(int32_t x, int32_t y, int32_t wheel, uint8_t buttons
 void input_push_key(uint8_t keycode, uint8_t pressed);
 /**
  * @brief Deliver one physical-key event from a keyboard driver to the kernel.
- * @param keycode Set-1 make/break code after 0xe0 extension normalization.
+ * @param keycode Normalized Set-1 or distinct keypad identity.
  * @param pressed Non-zero for a make code, zero for a break code.
  *
  * Shared entry point for PS/2 and USB HID so the hardware paths cannot
@@ -55,6 +76,10 @@ void input_handle_scancode(uint8_t keycode, uint8_t pressed);
  */
 void input_process_pending(void);
 uint8_t input_caps_lock_active(void);
+/** @brief Read the keyboard NumLock state for cooked terminal input.
+ * @return Nonzero while NumLock is active, otherwise zero.
+ */
+uint8_t input_num_lock_active(void);
 /**
  * @brief Dequeue the oldest event into event; returns non-zero when one was available.
  */

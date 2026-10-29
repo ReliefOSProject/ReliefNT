@@ -55,6 +55,7 @@ enum storage_transport {
     STORAGE_TRANSPORT_IDE_PIO = 2,
     STORAGE_TRANSPORT_NVME = 3,
     STORAGE_TRANSPORT_MEMORY = BLOCK_TRANSPORT_MEMORY,
+    STORAGE_TRANSPORT_USB = BLOCK_TRANSPORT_USB,
 };
 
 enum storage_filesystem_kind {

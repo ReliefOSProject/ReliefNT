@@ -144,7 +144,8 @@ int storage_is_acl_metadata_name(const char *name);
  * Caller supplies stable kernel buffers; no user-pointer access, locks, allocation or ownership transfer.
  */
 int storage_memcmp(const void *a, const void *b, size_t len);
-int storage_prepare_install_disk(struct install_disk_state *disk);
+/** @brief Validate registered 512-byte geometry without requiring write access. */
+int storage_prepare_block_disk(struct install_disk_state *disk);
 int storage_read_install_disk(const struct install_disk_state *disk,
                               uint64_t lba, uint32_t sector_count,
                               void *buffer);

@@ -6,6 +6,20 @@
 
 static uint32_t next_sd_name;
 
+/** @brief Check whether an earlier live sd-style disk owns a candidate name.
+ * @param name Candidate sd name index. @param before Exclusive inventory limit.
+ * @return True if a live disk owns the name, otherwise false. Execution-owned.
+ */
+static bool storage_sd_name_used(uint32_t name,uint32_t before)
+{
+    for(uint32_t i=0;i<before;++i) {
+        const struct install_disk_state *disk=&g_install_disks[i];
+        if(disk->present && disk->transport!=STORAGE_TRANSPORT_MEMORY &&
+           disk->transport!=STORAGE_TRANSPORT_NVME && disk->name_index==name)return true;
+    }
+    return false;
+}
+
 /** @brief Grow permanent scalar identity slots without copying native ownership.
  * @return Zero, -ENOMEM or -ENOSPC at the encoded node-ID namespace boundary.
  * Execution ownership; no record pointer may escape its transaction. Allocation
@@ -30,8 +44,9 @@ static int storage_grow_inventory(void)
 
 /** @brief Refresh scalar disk inventory from independent admitted block devices.
  * Execution ownership required; no registration self-pins or driver callbacks.
- * Old slots/names are never reused or reordered after publication. Absence
- * clears only present, preserving stale-node identity without aliasing reload.
+ * Old slots are never reused or reordered after publication. Absence clears
+ * only present, preserving stale-node identity without aliasing reload. Legacy
+ * physical-name hints can be reused only when no live disk holds that name.
  * Optical devices are enumerated directly in their major-11 namespace.
  * @return Zero or first metadata-allocation/namespace errno; prior identities
  * remain intact on failure and temporary block references are always consumed.
@@ -64,10 +79,14 @@ int storage_refresh_disks(void)
                 if(info.transport==STORAGE_TRANSPORT_MEMORY)disk->name_index=info.controller;
                 else if(info.transport!=STORAGE_TRANSPORT_NVME) {
                     bool known=false;
-                    for(uint32_t old=0;old<i;++old) {
+                    for(uint32_t old=0;info.transport!=STORAGE_TRANSPORT_USB && old<i;++old) {
                         const struct install_disk_state *previous=&g_install_disks[old];
                         if(!previous->present && previous->transport==info.transport && previous->bus==info.bus &&
-                           previous->slot==info.slot && previous->function==info.function && previous->port==info.port) {
+                           previous->slot==info.slot && previous->function==info.function && previous->port==info.port &&
+                           previous->nvme_controller_index==info.controller && previous->nvme_nsid==info.namespace_id &&
+                           previous->sector_count==info.blocks &&
+                           !__builtin_strncmp(previous->device_model,info.model,sizeof(previous->device_model)) &&
+                           !storage_sd_name_used(previous->name_index,i)) {
                             disk->name_index=previous->name_index;known=true;break;
                         }
                     }
@@ -122,6 +141,7 @@ int storage_inventory_snapshot(struct reliefos_install_disk *disks,uint32_t capa
             storage_copy_text(out->name,sizeof(out->name),disk->transport==STORAGE_TRANSPORT_MEMORY ? "Memory Disk" :
                 disk->transport==STORAGE_TRANSPORT_IDE_PIO ? "IDE/PATA Disk" :
                 disk->transport==STORAGE_TRANSPORT_NVME ? "NVMe Namespace" :
+                disk->transport==STORAGE_TRANSPORT_USB ? "USB Mass Storage" :
                 disk->transport==STORAGE_TRANSPORT_AHCI ? "SATA/AHCI Disk" : "Block Disk");
         }
         ++count;

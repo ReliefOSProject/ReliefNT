@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 menu "USB host drivers"
+source "drivers/usb/ehci/Kconfig"
 source "drivers/usb/uhci/Kconfig"
 endmenu

@@ -75,5 +75,17 @@ int main(void)
     for(unsigned n=0;n<12;++n)usb_poll();
     for(unsigned i=0;i<40;++i)assert(counts[i] && !usb_host_unregister(builtins[i]));
     saved=calls;usb_poll();assert(calls==saved && !allocations);
+    for(unsigned i=0;i<40;++i) {
+        assert(!usb_host_register_service(counted_poll,counted_poll,&counts[i],NULL,&builtins[i]));
+        usb_host_request_service(builtins[i]);
+        usb_host_request_service(builtins[i]);
+    }
+    assert(usb_service_pending());
+    unsigned before[40];memcpy(before,counts,sizeof(before));
+    for(unsigned i=0;i<12;++i)usb_service_run();
+    for(unsigned i=0;i<40;++i)assert(counts[i]==before[i]+1);
+    assert(!usb_service_pending());
+    for(unsigned i=0;i<40;++i)assert(!usb_host_unregister(builtins[i]));
+    puts("PASS USB deferred work coalescing, fair bounded batches and idle queue clearing");
     puts("PASS USB host lifetime: COMING closed, no self-pin, callback drain before actual unload, dynamic fair polling, builtin and allocation rollback");
 }

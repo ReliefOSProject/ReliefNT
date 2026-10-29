@@ -1,5 +1,28 @@
 #include "internal.h"
 #include <reliefnt/heap.h>
+#include "mbr.h"
+
+/** @brief Read one512-byte DOS metadata sector through the held block transport. */
+static int disk_mbr_read(void *context,uint64_t sector,uint8_t bytes[512])
+{ return install_read_sectors(context,sector,1,bytes); }
+
+/** @brief Fill an unpublished partition cache from a bounded MBR/EBR snapshot. */
+static int disk_mbr_cache_load(struct install_disk_state *disk,uint64_t sectors,
+                                struct disk_block_partition_cache *cache)
+{
+    struct mbr_partition *entries=kernel_malloc(MBR_PARTITION_CAPACITY*sizeof(*entries));
+    if(!entries)return -12;
+    int rc=mbr_read_partitions(disk_mbr_read,disk,sectors,entries);
+    if(!rc) {
+        storage_memzero(cache,sizeof(*cache));cache->disk_sectors=sectors;cache->mbr=1;
+        for(unsigned i=0;i<MBR_PARTITION_CAPACITY;++i)if(entries[i].type) {
+            cache->entries[i].first_lba=entries[i].first;
+            cache->entries[i].sector_count=entries[i].count;cache->entries[i].present=1;
+        }
+        cache->valid=1;
+    }
+    kernel_free(entries);return rc;
+}
 
 static int disk_block_cache_load(uint32_t disk_id, struct install_disk_state *disk,
                                  uint64_t sector_count);
@@ -75,6 +98,10 @@ static int disk_block_cache_load(uint32_t disk_id, struct install_disk_state *di
         return cache->status;
     }
     ret = disk_gpt_load(disk, sector_count, &table);
+    if(ret==-2) {
+        ret=disk_mbr_cache_load(disk,sector_count,cache);
+        if(!ret)return 0;
+    }
     if (ret < 0) {
         /* Only content errors are stable enough to cache. Transport failures
          * such as EIO may be transient (especially on AHCI after reset); a
@@ -109,6 +136,28 @@ static int disk_block_cache_load(uint32_t disk_id, struct install_disk_state *di
         __builtin_memcpy(cache->entries[i].unique_guid, entries[i].unique_guid, 16);
     }
     cache->valid = 1;
+    return 0;
+}
+
+/** @brief Resolve a data partition while preserving GPT metadata and DOS numbering. */
+int disk_partition_read_entry(uint32_t disk_id,struct install_disk_state *disk,
+                               uint64_t sectors,uint32_t index,struct gpt_entry *entry)
+{
+    if(!entry || index>=RELIEFOS_DISK_MAX_PARTITIONS)return -22;
+    int rc=disk_block_cache_load(disk_id,disk,sectors);if(rc)return rc;
+    const struct disk_block_partition_range *range=&disk->block_cache->entries[index];
+    if(!range->present)return -2;
+    if(disk->block_cache->mbr) {
+        *entry=(struct gpt_entry){.first_lba=range->first_lba,
+            .last_lba=range->first_lba+range->sector_count-1u};
+        storage_memcpy(entry->type_guid,basic_data_guid,16);
+        return 0;
+    }
+    struct disk_gpt_table table;
+    rc=disk_gpt_load(disk,sectors,&table);if(rc)return rc;
+    rc=disk_gpt_entries_valid(&table);if(rc)return rc;
+    if(index>=table.primary.partition_entry_count)return -2;
+    *entry=((const struct gpt_entry *)(const void *)storage_cluster_buf)[index];
     return 0;
 }
 
@@ -231,7 +280,7 @@ int disk_manage_prepare(uint32_t disk_id, struct install_disk_state **out_disk,
         return -2;
     }
     disk = &g_install_disks[disk_id];
-    ret = storage_prepare_install_disk(disk);
+    ret = storage_prepare_block_disk(disk);
     if (ret < 0) {
         return ret;
     }
@@ -376,6 +425,7 @@ static int storage_disk_partition_uuid_owned(uint32_t disk_id, uint32_t partitio
     int ret = storage_disk_block_info(disk_id, (int32_t)partition_index, &first, &sectors);
     if (ret < 0) return ret;
     const uint8_t *guid = g_install_disks[disk_id].block_cache->entries[partition_index].unique_guid;
+    if(disk_gpt_guid_empty(guid))return -2;
     storage_partition_guid_text(guid, uuid);
     return 0;
 }

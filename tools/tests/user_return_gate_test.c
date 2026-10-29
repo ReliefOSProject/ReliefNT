@@ -13,6 +13,9 @@
 #include <reliefnt/sched.h>
 #include <reliefnt/smp.h>
 #include <reliefnt/net.h>
+#include <reliefnt/usb.h>
+#include <reliefnt/blkdev.h>
+#include <reliefnt/driver_manager_phase.h>
 #include <reliefnt/signal.h>
 #include <reliefnt/userland.h>
 #include <reliefnt/syscall.h>
@@ -40,6 +43,8 @@ static unsigned network_stack_calls;
 #define SCHED_IDLE_SERVICE_STACK_BYTES (16u * 1024u)
 static uint8_t sched_idle_service_stacks[SMP_MAX_CPUS]
     [SCHED_IDLE_SERVICE_STACK_BYTES] __attribute__((aligned(16)));
+struct sched_idle_service_state { uint64_t execution_flags; };
+static void test_idle_wait(void);
 static bool exclusive(void) { return execution_owner==cpu && execution_depth[cpu]==1; }
 static struct task current, replacement;
 static struct task *selected;
@@ -119,6 +124,7 @@ static struct task *wait_for_runnable_task(uint64_t *flags)
  * The real scheduler's eligibility rules have separate sched_resume coverage. */
 #include "network_maintenance_body.inc"
 #include "network_maintenance_runner_body.inc"
+#include "idle_service_body.inc"
 #include "user_return_body.inc"
 
 static void reset(void)
@@ -215,6 +221,71 @@ static void test_timer_user_return_network_maintenance_stack(void)
     assert(network_stack_calls==1 && !network_stack_active);
     assert(!irq_state);
 }
+static struct usb_host *hotplug_host;
+static struct block_device_registration hotplug_disk;
+static unsigned hotplug_visible,hotplug_polls;
+static bool polling_irq,idle_poll,hotplug_gate_busy;
+static int fake_usb_read(void *context,uint64_t first,uint32_t count,void *buffer)
+{(void)context;(void)first;(void)count;(void)buffer;return 0;}
+static const struct block_device_operations hotplug_ops={.read=fake_usb_read};
+static void hotplug_poll(void *context)
+{
+    assert(context==&hotplug_host && !hotplug_visible);
+    polling_irq=true;++hotplug_polls;usb_host_request_service(hotplug_host);
+    assert(!hotplug_visible);polling_irq=false;
+}
+static void hotplug_service(void *context)
+{
+    assert(context==&hotplug_host && !polling_irq && network_stack_active && !exclusive());
+    assert(irq_state&(1u<<9));
+    assert(driver_manager_phase_try_enter()==-EBUSY);
+    if(hotplug_gate_busy) {usb_host_request_service(hotplug_host);return;}
+    assert(!register_block_device(&hotplug_disk));++hotplug_visible;
+}
+static void test_idle_wait(void)
+{
+    assert(!exclusive() && idle_poll);
+    irq_state|=1u<<9;usb_poll();irq_state=0;
+    assert(!hotplug_visible && usb_service_pending());
+}
+static void make_hotplug(void)
+{
+    hotplug_visible=hotplug_polls=0;hotplug_host=NULL;hotplug_gate_busy=false;
+    hotplug_disk=(struct block_device_registration){.info={.device=block_device_allocate_number(false),
+        .blocks=100,.block_size=512,.max_blocks=1,.flags=BLOCK_DEVICE_READ_ONLY},.operations=&hotplug_ops};
+    assert(!usb_host_register_service(hotplug_poll,hotplug_service,&hotplug_host,NULL,&hotplug_host));
+}
+static void test_usb_work_without_syscall(void)
+{
+    struct trap_frame frame=prepare(LINUX_SYS_GETPID);make_hotplug();
+    usb_poll();assert(hotplug_polls==1 && !hotplug_visible && usb_service_pending());
+    assert(!driver_manager_phase_try_enter());
+    assert(userland_schedule_from_frame(&frame)==&current);
+    assert(!hotplug_visible && usb_service_pending());driver_manager_phase_leave();
+    hotplug_gate_busy=true;assert(userland_schedule_from_frame(&frame)==&current);
+    assert(!hotplug_visible && usb_service_pending());hotplug_gate_busy=false;
+    assert(userland_schedule_from_frame(&frame)==&current);
+    struct block_device_ref ref={0};
+    assert(hotplug_visible==1 && !usb_service_pending() && !block_device_get(hotplug_disk.info.device,&ref));
+    block_device_put(&ref);usb_host_request_service(hotplug_host);
+    assert(!usb_host_unregister(hotplug_host));hotplug_host=NULL;
+    assert(userland_schedule_from_frame(&frame)==&current);
+    assert(hotplug_visible==1 && !usb_service_pending());
+    assert(!unregister_block_device(&hotplug_disk));
+}
+static void test_idle_usb_work_without_syscall(void)
+{
+    reset();make_hotplug();idle_poll=true;uint64_t flags;
+    kernel_execution_lock_irqsave(&flags);
+    struct sched_idle_service_state state={.execution_flags=flags};
+    arch_call_on_stack(&sched_idle_service_stacks[cpu][SCHED_IDLE_SERVICE_STACK_BYTES],
+                       sched_idle_service_wait,&state);
+    assert(exclusive());kernel_execution_unlock_irqrestore(state.execution_flags);idle_poll=false;
+    struct block_device_ref ref={0};
+    assert(hotplug_visible==1 && !usb_service_pending() && !block_device_get(hotplug_disk.info.device,&ref));
+    block_device_put(&ref);assert(!usb_host_unregister(hotplug_host));hotplug_host=NULL;
+    assert(!unregister_block_device(&hotplug_disk));
+}
 static void test_signal_input_and_retry(void)
 {
     struct trap_frame frame=prepare(LINUX_SYS_GETPID);
@@ -249,6 +320,8 @@ int main(void)
 {
     test_one_transaction_for_completed_syscall();
     test_timer_user_return_network_maintenance_stack();
+    test_idle_usb_work_without_syscall();
+    test_usb_work_without_syscall();
     test_signal_input_and_retry();
     test_restored_context_and_fallback();
     puts("PASS syscall user return: one transaction, result/TLS, signal, deferred input, retry, exec/sigreturn and retirement");
