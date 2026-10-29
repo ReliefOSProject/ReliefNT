@@ -31,6 +31,37 @@ MODULE_ALIAS("reliefnt:test");
 
 
 class ModuleHeaders(unittest.TestCase):
+    def test_final_exports_keep_linux_tool_visible_symbols(self):
+        # Removing the per-export labels breaks depmod's symbol index even
+        # though the kernel can still load the same pointer-table bytes.
+        with tempfile.TemporaryDirectory(prefix="reliefnt-export-metadata-") as directory:
+            work = Path(directory)
+            source = work / "exports.mod.c"
+            source.write_text('''#include <linux/export-internal.h>
+int ordinary_function(void) { return 42; }
+int restricted_function(void) { return 7; }
+int ordinary_data = 3;
+int restricted_data = 5;
+KSYMTAB_FUNC(ordinary_function, "", "");
+KSYMTAB_FUNC(restricted_function, "_gpl", "test_namespace");
+KSYMTAB_DATA(ordinary_data, "", "");
+KSYMTAB_DATA(restricted_data, "_gpl", "test_namespace");
+''')
+            target = work / "exports.mod.o"
+            subprocess.run(["clang", "--target=x86_64-elf", "-ffreestanding",
+                            "-fno-pic", "-fno-pie", "-mcmodel=large",
+                            "-I" + str(ROOT / "scripts/module-include"),
+                            "-c", str(source), "-o", str(target)], check=True)
+            symbols = subprocess.check_output(["readelf", "-sW", str(target)], text=True)
+            names = {line.split()[-1] for line in symbols.splitlines() if line.split()}
+            for name in ("ordinary_function", "restricted_function",
+                         "ordinary_data", "restricted_data"):
+                with self.subTest(export=name):
+                    self.assertIn("__ksymtab_" + name, names,
+                                  "depmod must be able to identify every exported function/data item")
+                    self.assertIn("__kstrtab_" + name, names)
+                    self.assertIn("__kstrtabns_" + name, names)
+
     def test_builtin_owner_operations_without_modules(self):
         with tempfile.TemporaryDirectory(prefix="reliefnt-module-disabled-") as directory:
             work=Path(directory)

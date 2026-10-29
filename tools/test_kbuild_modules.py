@@ -158,6 +158,9 @@ class KbuildModules(unittest.TestCase):
         consumer = self.output / "tools/tests/kmodules/consumer.ko"
         self.assertTrue(provider.is_file())
         self.assertTrue(consumer.is_file())
+        exports = subprocess.check_output(["nm", str(provider)], text=True)
+        self.assertIn(" __ksymtab_provided_value\n", exports,
+                      "the final linked .ko must retain depmod's export marker")
         self.check_replaced_linker()
         self.check_relocated_linker()
         info = subprocess.check_output(["readelf", "-p", ".modinfo", str(consumer)], text=True)

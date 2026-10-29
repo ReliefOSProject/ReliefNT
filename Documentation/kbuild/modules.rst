@@ -35,6 +35,25 @@ O/include/config/module.abi。安装目录为 /lib/modules/<release>/kernel/，
 和用户模块。覆盖已修改的受管文件会导致明确错误；不再生成的旧文件若被
 用户修改则予以保留，不将它作为陈旧产物删除。
 
+模块元数据
+==========
+
+默认构建的最终 ``.ko`` 导出表保留 Linux 风格的 ``__ksymtab_<符号名>``、
+``__kstrtab_<符号名>`` 与 ``__kstrtabns_<符号名>`` 标签，供模块工具建立
+符号索引。普通和 GPL 导出、函数和数据导出都使用这些标签；原生表项仍为
+地址、名称和命名空间三个指针。``Module.symvers`` 记录类型 CRC，不能用
+普通全局符号表代替实际导出清单。
+
+依赖这些标签的模块工具需要保留本地符号。安装时 ``INSTALL_MOD_STRIP=1``
+仅剥除调试信息，保留这些标签；自定义 ``--strip-unneeded`` 或
+``--strip-all`` 会移除标签，不适用于依赖标签扫描的 ``depmod``。
+
+``modules.builtin`` 列出内置模块路径；``modules.builtin.modinfo`` 保存
+以模块名加点号为前缀、以 NUL 分隔的元数据。模块工具需要读取这些文件
+才能查询内置模块及其别名。内置模块不写入动态 ``/proc/modules`` 列表，
+也不生成用于冒充可加载模块的 ``.ko`` 文件。文件约定见
+`Linux Kbuild 输出文件 <https://docs.kernel.org/kbuild/kbuild.html#output-files>`_。
+
 树外模块
 ========
 
