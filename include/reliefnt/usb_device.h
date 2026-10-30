@@ -6,12 +6,16 @@
 
 struct module;
 struct usb_device;
-/* These speed encodings also match EHCI queue-head EPS. */
-enum usb_speed { USB_SPEED_FULL, USB_SPEED_LOW, USB_SPEED_HIGH };
+/* The first three speed encodings also match EHCI queue-head EPS. */
+enum usb_speed { USB_SPEED_FULL, USB_SPEED_LOW, USB_SPEED_HIGH, USB_SPEED_SUPER,
+                 USB_SPEED_SUPER_PLUS };
 
 struct usb_endpoint {
     uint8_t address, interval, toggle, ping;
     uint16_t max_packet;
+    /* SuperSpeed endpoint companion fields; zero for USB2 endpoints. */
+    uint8_t max_burst, companion_attributes;
+    uint16_t bytes_per_interval;
 };
 
 /* Caller owns the host's transaction gate across a complete class command.
@@ -37,7 +41,8 @@ struct usb_device {
     const struct usb_device_operations *operations;
     void *host_context;
     struct module *owner;
-    uint8_t address, speed, ep0_max_packet, root_port;
+    uint8_t address, speed, root_port;
+    uint16_t ep0_max_packet;
     uint8_t hub_address, hub_port;
     uint8_t bus, slot, function;
     uint16_t vendor, product;

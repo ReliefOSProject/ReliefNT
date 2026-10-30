@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-$(CONFIG_USB_XHCI_HCD) += xhci.o
+xhci-y := controller.o startup.o clock.o mmio.o ring.o context.o firmware.o lifecycle.o protocol.o \
+	completion.o trb.o transfer.o events.o devices.o ports.o classes.o
+
+include $(srctree)/scripts/Makefile.module

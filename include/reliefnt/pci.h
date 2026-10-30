@@ -125,4 +125,22 @@ void *pci_map_mmio(uint64_t phys, uint64_t bytes);
  * using pci_unmap_mmio(pointer,4096) after hardware/users drain.
  */
 void *pci_map_firmware_bar0(const struct pci_device *device, uint64_t phys);
+
+/** @brief Map a page containing an advertised xHCI extended capability.
+ * @param device Exact PCI xHCI identity. @param phys Assigned aligned BAR0 base.
+ * @param offset Dword-aligned xHCI field at or above 0x10.
+ * @param limit Conservative minimum BAR size, rounded to a PCI BAR power of
+ * two. Bootstrap uses the mandatory port set only for the HCCPARAMS1, DBOFF
+ * and RTSOFF dwords; an extended-capability walk requires the validated full
+ * operational, port, doorbell and all-interrupter geometry. This inference
+ * assumes those mandatory fields truthfully describe a conforming controller.
+ * @return Owned 4096-byte UC/NX page lease, or NULL. The caller must bound the
+ * chain and only access the dword within limit; mapping a page is not a BAR-size
+ * proof. A capability beyond limit is declined even if it might be legitimate.
+ * Do not probe a live BAR. After firmware handoff, HALT and bus-master
+ * disable, size and validate the full mandatory and used BAR before other
+ * accesses or DMA. Unmap the returned page with pci_unmap_mmio(page,4096).
+ */
+void *pci_map_xhci_firmware_cap_page(const struct pci_device *device,
+                                      uint64_t phys, uint32_t offset, uint32_t limit);
 #endif

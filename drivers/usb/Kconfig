@@ -2,4 +2,5 @@
 menu "USB host drivers"
 source "drivers/usb/ehci/Kconfig"
 source "drivers/usb/uhci/Kconfig"
+source "drivers/usb/xhci/Kconfig"
 endmenu

@@ -594,6 +594,33 @@ void *pci_map_firmware_bar0(const struct pci_device *device,uint64_t phys)
     kernel_spin_unlock_irqrestore(&pci_config_lock,flags);
     return valid ? pci_map_mmio_lease(phys,4096) : NULL;
 }
+
+/* Caller proves a conservative BAR minimum from mandatory xHCI registers,
+ * not the mapping granule or an untrusted advertised capability offset. */
+void *pci_map_xhci_firmware_cap_page(const struct pci_device *device,
+                                      uint64_t phys,uint32_t offset,uint32_t limit)
+{
+    uint64_t page=(uint64_t)offset&~4095ull;
+    if (!device || device->class_code!=0x0c || device->subclass!=3 ||
+        device->prog_if!=0x30 || !phys || (phys&4095u) || offset<0x10 ||
+        (offset&3u) || limit<0x800u || limit>0x1000000u || (limit&(limit-1u)) ||
+        (phys&(limit-1u)) || phys>UINT64_MAX-limit || offset>limit-4u ||
+        phys>UINT64_MAX-page-4096u) return NULL;
+    uint64_t flags;kernel_spin_lock_irqsave(&pci_config_lock,&flags);
+    uint32_t identity=pci_raw_read32(device->bus,device->slot,device->function,0);
+    uint32_t class_reg=pci_raw_read32(device->bus,device->slot,device->function,8);
+    uint32_t header=pci_raw_read32(device->bus,device->slot,device->function,0x0c);
+    uint32_t low=pci_raw_read32(device->bus,device->slot,device->function,0x10);
+    uint32_t type=(low>>1)&3u;
+    uint32_t high=type==2u ? pci_raw_read32(device->bus,device->slot,device->function,0x14) : 0;
+    bool valid=(uint16_t)identity==device->vendor_id && (uint16_t)(identity>>16)==device->device_id &&
+        device->vendor_id!=0xffffu && (class_reg>>8)==0x0c0330u &&
+        ((header>>16)&0x7fu)==0u && low && low!=UINT32_MAX && !(low&1u) &&
+        (type==0u || type==2u) && high!=UINT32_MAX &&
+        (((uint64_t)high<<32)|(low&~15u))==phys;
+    kernel_spin_unlock_irqrestore(&pci_config_lock,flags);
+    return valid ? pci_map_mmio_lease(phys+page,4096) : NULL;
+}
 /** @brief Release one exact PCI MMIO lease after the device/users have stopped.
  * @param ptr Owned original pointer; wrong/stale pointers are ignored.
  * @param bytes Original requested byte count, must match the lease.
@@ -627,6 +654,7 @@ EXPORT_SYMBOL(pci_device_bar_contains);
 
 EXPORT_SYMBOL(pci_map_mmio);
 EXPORT_SYMBOL(pci_map_firmware_bar0);
+EXPORT_SYMBOL(pci_map_xhci_firmware_cap_page);
 
 EXPORT_SYMBOL(pci_read_device);
 

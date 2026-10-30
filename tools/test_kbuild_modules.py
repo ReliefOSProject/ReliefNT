@@ -278,6 +278,12 @@ class KbuildModules(unittest.TestCase):
         self.assertIn("CONFIG_USB_EHCI_HCD=m", all_config)
         self.assertTrue((allmods / "drivers/usb/ehci/ehci.ko").is_file())
         self.assertNotIn(" ehci_driver", symbols)
+        self.assertIn("CONFIG_USB_XHCI_HCD=m", all_config)
+        self.assertTrue((allmods / "drivers/usb/xhci/xhci.ko").is_file())
+        self.assertNotIn(" xhci_driver", symbols)
+        xhci_metadata = subprocess.check_output(
+            ["readelf", "-p", ".modinfo", str(allmods / "drivers/usb/xhci/xhci.ko")], text=True)
+        self.assertIn("alias=pci:v*d*sv*sd*bc0Csc03i30*", xhci_metadata)
         filesystems = {
             "EXT_FS_COMMON": "fs/ext_common/ext_common.ko",
             "EXT2_FS": "fs/ext2/ext2.ko", "EXT4_FS": "fs/ext4/ext4.ko",

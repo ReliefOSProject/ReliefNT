@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 obj-$(CONFIG_USB_EHCI_HCD) += ehci.o
-ehci-y := controller.o clock.o transfer.o descriptors.o devices.o ports.o periodic.o bandwidth.o
+ehci-y := controller.o clock.o transfer.o devices.o ports.o periodic.o bandwidth.o
 
 include $(srctree)/scripts/Makefile.module

@@ -3,6 +3,7 @@
 #define RELIEFNT_EHCI_INTERNAL_H
 #include <reliefnt/usb.h>
 #include <reliefnt/usb_device.h>
+#include <reliefnt/usb_descriptor.h>
 #include <reliefnt/usb_hid.h>
 #include <reliefnt/pci.h>
 #include <reliefnt/driver_module.h>
@@ -10,9 +11,9 @@
 
 #define EHCI_FRAME_COUNT 1024u
 #define EHCI_MAX_HID 32u
-#define EHCI_MAX_INTERFACES 32u
+#define EHCI_MAX_INTERFACES USB_MAX_INTERFACES
 #define EHCI_MAX_PORTS 15u
-#define EHCI_MAX_CONFIG 4096u
+#define EHCI_MAX_CONFIG USB_MAX_CONFIG
 #define EHCI_TRANSFER_BYTES 65536u
 #define EHCI_QTD_COUNT 8u
 #define EHCI_TERMINATE 1u
@@ -67,14 +68,6 @@ struct ehci_dma {
     uint8_t reports[EHCI_MAX_HID][1024] __attribute__((aligned(4096)));
     uint8_t setup[8] __attribute__((aligned(64)));
     uint8_t data[EHCI_TRANSFER_BYTES] __attribute__((aligned(4096)));
-};
-struct usb_config_interface {
-    uint8_t number, class_code, subclass, protocol;
-    struct usb_endpoint in, out, interrupt;
-};
-struct usb_config {
-    uint8_t value, count;
-    struct usb_config_interface interfaces[EHCI_MAX_INTERFACES];
 };
 struct ehci_device {
     struct usb_device usb;
@@ -137,9 +130,6 @@ int ehci_qtd_prepare(struct ehci_controller *controller, struct ehci_qtd *td,
 /** @brief Initialize a detached endpoint QH with speed/TT routing and DATA0. */
 void ehci_qh_prepare(struct ehci_qh *qh, const struct usb_device *device,
                      uint8_t endpoint, uint16_t packet, bool control);
-/** @brief Decode one validated configuration into alternate-zero interfaces. */
-int usb_parse_configuration(const uint8_t *bytes, uint32_t length,
-                             uint8_t speed, struct usb_config *out);
 /** @brief Stop/start a hardware schedule and prove the matching status first. */
 int ehci_schedule_enable(struct ehci_controller *controller, bool periodic, bool enabled);
 extern const struct usb_device_operations ehci_device_operations;

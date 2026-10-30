@@ -1,4 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-obj-y := registry.o work.o hid.o
+obj-y := registry.o work.o hid.o descriptors.o
 
 include $(srctree)/scripts/Makefile.module

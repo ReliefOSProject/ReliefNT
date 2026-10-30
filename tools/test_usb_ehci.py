@@ -18,7 +18,7 @@ class USBEnhancedHost(unittest.TestCase):
                 "-fno-pie", "-no-pie", "-fsanitize=address,undefined",
                 "-fno-sanitize-recover=all", "-Iinclude", "-Iinclude/uapi",
                 "tools/tests/usb_ehci_test.c", "drivers/usb/ehci/transfer.c",
-                "drivers/usb/ehci/descriptors.c", "drivers/usb/ehci/clock.c", "drivers/usb/core/hid.c",
+                "drivers/usb/core/descriptors.c", "drivers/usb/ehci/clock.c", "drivers/usb/core/hid.c",
                 "-o", str(binary),
             ], cwd=ROOT, check=True)
             subprocess.run([str(binary)], check=True, timeout=20)

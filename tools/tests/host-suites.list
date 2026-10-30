@@ -117,6 +117,7 @@ module_audio_owner tools/test_module_audio_owner.py
 module_usb_owner tools/test_module_usb_owner.py
 usb_dma tools/test_usb_dma.py
 usb_ehci tools/test_usb_ehci.py
+usb_xhci tools/test_usb_xhci.py
 usb_storage tools/test_usb_storage.py
 mbr_partitions tools/test_mbr_partitions.py
 mount_tree tools/test_mount_tree.py
