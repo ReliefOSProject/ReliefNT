@@ -1,5 +1,5 @@
 #include <reliefnt/sound_service.h>
-/* Read-only procfs implementation for the Unix migration. */
+/* Generated procfs with a narrowly scoped optional diagnostic control. */
 #include <reliefnt/mm.h>
 #include <reliefnt/module.h>
 #include <reliefnt/driver_manager.h>
@@ -14,10 +14,13 @@
 #include <reliefnt/uts.h>
 #include <reliefnt/inventory.h>
 #include <reliefnt/text_stream.h>
+#include <reliefnt/lock_profile.h>
+#include <reliefnt/permissions.h>
 #include <reliefnt/pty.h>
 #include <reliefos/fs_abi.h>
 #include <linux/capability.h>
 #include <linux/errno.h>
+#include <linux/fcntl.h>
 #include "internal.h"
 
 #define PROCFS_PATH_MAX RELIEFOS_FS_PATH_LEN
@@ -407,20 +410,39 @@ static int proc_mount_view(const char *path,struct task **target)
     return view;
 }
 
-struct proc_open_view {struct vfs_namespace *ns;struct vfs_path root;bool mountinfo;};
+struct proc_open_view {
+    struct vfs_namespace *ns; struct vfs_path root; bool mountinfo;
+#ifdef CONFIG_LOCK_STAT
+    void *lock_stats;
+#endif
+};
 
-/** @brief Capture the selected task's mount namespace and root at open time.
+/** @brief Capture a selected task mount view or diagnostic snapshot at open.
  * @param name Intrinsic authorized proc inode key, independent of attachment.
  * @param flags Sanitized status flags, borrowed and unchanged.
  * @param out Required owned output; ordinary generated files return NULL.
- * @return Zero or negative errno with empty output on failure. Captures a root
- * path rather than generated text, so later mount changes remain visible.
+ * @return Zero or negative errno with empty output on failure. Mount views
+ * retain a root path; diagnostic readers capture a stable counter snapshot.
  * Namespace ownership outlives its retained paths; final release drops this
  * path even after task exit. Nonblocking, execution-owned, without graph locks.
  */
 int proc_file_open(const char *name,uint32_t flags,void **out)
 {
     (void)flags;if(!out)return -RELIEFOS_EINVAL;*out=NULL;
+#ifdef CONFIG_LOCK_STAT
+    if (proc_text_eq(name, "/proc/reliefnt/lock_stats")) {
+        /* Controls need no view and must remain usable under memory pressure. */
+        if ((flags & LINUX_O_ACCMODE) == LINUX_O_WRONLY) return 0;
+        struct proc_open_view *state=kernel_malloc(sizeof(*state));
+        if (!state) return -RELIEFOS_ENOMEM;
+        *state=(struct proc_open_view){0};
+        int rc=lock_profile_view_new(&state->lock_stats);
+        if (rc) { kernel_free(state); return rc; }
+        *out=state; return 0;
+    }
+    if ((flags & LINUX_O_ACCMODE) != LINUX_O_RDONLY || (flags & LINUX_O_TRUNC))
+        return -RELIEFOS_EROFS;
+#endif
     struct task *task=NULL;int view=proc_mount_view(name,&task);if(!view)return 0;
     const struct vfs_path *root=&sched_task_paths(task)->root;
     struct vfs_namespace *ns=vfs_path_namespace(root);if(!ns)return -RELIEFOS_ENOENT;
@@ -428,24 +450,27 @@ int proc_file_open(const char *name,uint32_t flags,void **out)
     *state=(struct proc_open_view){.ns=ns,.mountinfo=view==2};vfs_path_get(root,&state->root);*out=state;return 0;
 }
 
-/** @brief Read a mount view using its open-time namespace/root references.
- * @param value Borrowed captured state, independent of target PID liveness.
- * @param offset Byte position in the currently rendered mount graph.
+/** @brief Read a captured mount view or diagnostic snapshot.
+ * @param value Required borrowed capture, independent of target PID liveness.
+ * @param offset Byte position in the mount graph or fixed diagnostic view.
  * @param buffer Kernel-accessible destination, nullable at zero capacity.
  * @param capacity Available output bytes.
  * @param read Required output count, cleared before validation.
  * @return Renderer status or negative EINVAL. Does not look up a PID, change
- * captured root, or transfer ownership. Execution-owned, no graph locks
- * across renderer allocation or filesystem policy callbacks.
+ * the captured root or diagnostic data, or transfer ownership. Execution-owned,
+ * no graph locks across renderer allocation or filesystem policy callbacks.
  */
 int proc_file_read(void *value,uint64_t offset,void *buffer,uint32_t capacity,uint32_t *read)
 {
     if(!read)return -RELIEFOS_EINVAL;*read=0;
     struct proc_open_view *state=value;if(!state)return -RELIEFOS_EINVAL;
+#ifdef CONFIG_LOCK_STAT
+    if (state->lock_stats) return lock_profile_view_read(state->lock_stats,offset,buffer,capacity,read);
+#endif
     return vfs_read_mount_table(state->ns,&state->root,state->mountinfo,offset,buffer,capacity,read);
 }
 
-/** @brief Release the open-time root after the final shared OFD reference.
+/** @brief Release an open view after the final shared OFD reference.
  * @param value Owned optional captured state; NULL is ignored.
  * @return None. Root/provider release can perform I/O; caller holds execution
  * ownership without a graph, scheduler or module-table spinlock.
@@ -453,6 +478,9 @@ int proc_file_read(void *value,uint64_t offset,void *buffer,uint32_t capacity,ui
 void proc_file_close(void *value)
 {
     struct proc_open_view *state=value;if(!state)return;
+#ifdef CONFIG_LOCK_STAT
+    if (state->lock_stats) { lock_profile_view_free(state->lock_stats); kernel_free(state); return; }
+#endif
     vfs_path_put(&state->root);kernel_free(state);
 }
 
@@ -638,10 +666,9 @@ static void proc_task_stat(struct task *task, struct text_stream *s)
 }
 
 /** @brief Look up proc node types without following the last symbolic link.
- * @param path Absolute kernel pathname.
- * @param out Optional returned node.
- * @return Zero or negative ENOENT.
- */
+ * @param path Borrowed absolute intrinsic pathname, NULL is rejected.
+ * @param out Optional caller-owned writable node metadata.
+ * @return Zero or negative ENOENT. Execution-owned; no reference transfers. */
 int proc_lookup(const char *path, struct storage_node *out)
 {
     char content[PROCFS_CONTENT_MAX];
@@ -653,9 +680,19 @@ int proc_lookup(const char *path, struct storage_node *out)
             .flags = STORAGE_NODE_FLAG_PROC, .size = 11};
         return 0;
     }
+#ifdef CONFIG_LOCK_STAT
+    if (proc_text_eq(path, "/proc/reliefnt/lock_stats")) {
+        if (out) *out = (struct storage_node){.type = RELIEFOS_FS_TYPE_FILE, .flags = STORAGE_NODE_FLAG_PROC};
+        return 0;
+    }
+#endif
     if (proc_text_eq(path, "/proc") || proc_text_eq(path, "/proc/sys") ||
         proc_text_eq(path, "/proc/sys/kernel") ||
-        proc_text_eq(path, "/proc/asound")) {
+        proc_text_eq(path, "/proc/asound")
+#ifdef CONFIG_LOCK_STAT
+        || proc_text_eq(path, "/proc/reliefnt")
+#endif
+       ) {
         if (out) {
             *out = (struct storage_node){
                 .type = RELIEFOS_FS_TYPE_DIR,
@@ -779,17 +816,23 @@ int proc_lookup(const char *path, struct storage_node *out)
 }
 
 /** @brief Read a bounded range from a current proc view.
- * @param path Resolved absolute kernel pathname.
+ * @param path Borrowed resolved intrinsic pathname.
  * @param offset Byte offset, including positions past EOF.
- * @param buffer Kernel destination, nullable for zero length.
+ * @param buffer Writable validated destination, nullable for zero length.
  * @param length Maximum bytes to copy.
- * @param out_read Optional actual byte count.
- * @return Zero or negative errno, preserving mount backend failures.
- */
+ * @param out_read Optional caller-owned writable actual byte count.
+ * @return Zero or negative errno, preserving backend failures. Execution-owned;
+ * retains no caller memory and live generated views can change between reads. */
 int proc_read(const char *path, uint64_t offset, void *buffer, uint32_t length,
               uint32_t *out_read)
 {
     if (path && !__builtin_strncmp(path,"/sys",4) && (!path[4] || path[4]=='/')) return sysfs_read(path,offset,buffer,length,out_read);
+#ifdef CONFIG_LOCK_STAT
+    if (proc_text_eq(path, "/proc/reliefnt/lock_stats")) {
+        uint32_t ignored;
+        return lock_profile_read(offset, buffer, length, out_read ? out_read : &ignored);
+    }
+#endif
 #ifdef CONFIG_MODULES
     if(proc_text_eq(path,"/proc/modules")) return module_proc_read(offset,buffer,length,out_read);
 #endif
@@ -918,9 +961,21 @@ int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *
 #ifdef CONFIG_MODULES
         , "modules"
 #endif
+#ifdef CONFIG_LOCK_STAT
+        , "reliefnt"
+#endif
     };
     if (!path || !offset || !entry) return -22;
     if (!__builtin_strncmp(path,"/sys",4) && (!path[4] || path[4]=='/')) return sysfs_readdir(path,offset,entry);
+#ifdef CONFIG_LOCK_STAT
+    if (proc_text_eq(path, "/proc/reliefnt")) {
+        if (*offset) return 0;
+        entry->type = RELIEFOS_FS_TYPE_FILE;
+        proc_copy(entry->name, sizeof(entry->name), "lock_stats");
+        *offset = 1;
+        return 1;
+    }
+#endif
     if (proc_text_eq(path, "/proc/sys") || proc_text_eq(path, "/proc/sys/kernel")) {
         static const char *values[] = {"hostname", "domainname", "ostype", "osrelease", "version"};
         int parent = proc_text_eq(path, "/proc/sys");
@@ -992,7 +1047,7 @@ int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *
     if (*offset < fixed_count) {
         index=(uint32_t)*offset;
         entry->type = index == 5 || index == 6 ? RELIEFOS_FS_TYPE_SYMLINK :
-            (index == 7 || index == 11) ? RELIEFOS_FS_TYPE_DIR : RELIEFOS_FS_TYPE_FILE;
+            (index == 7 || index == 11 || proc_text_eq(files[index], "reliefnt")) ? RELIEFOS_FS_TYPE_DIR : RELIEFOS_FS_TYPE_FILE;
         proc_copy(entry->name, sizeof(entry->name), files[index]);
         *offset = index + 1u;
         return 1;
@@ -1017,3 +1072,55 @@ int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *
     }
     return 0;
 }
+
+#ifdef CONFIG_LOCK_STAT
+/** @brief Expose write mode only on the diagnostic control inode.
+ * @param name Required borrowed intrinsic proc key.
+ * @param node Required borrowed retained node.
+ * @param value Required writable metadata or proposed value.
+ * @param write True for a metadata mutation request.
+ * @return Zero or negative errno; generated metadata cannot be changed.
+ * Execution-owned context; no allocation or ownership transfer. */
+int proc_lock_stats_permissions(const char *name, const struct storage_node *node,
+                                struct reliefos_permissions *value, bool write)
+{
+    int rc = fs_virtual_permissions(name, node, value, write);
+    if (!rc && !write && proc_text_eq(name, "/proc/reliefnt/lock_stats")) value->mode = 0644;
+    return rc;
+}
+
+/** @brief Accept shell redirection's zero-size truncate without resetting data.
+ * @param name Required borrowed intrinsic proc key.
+ * @param length Requested file size, only zero is accepted.
+ * @return Zero or negative errno; VFS enforces the live read-only mount.
+ * Execution-owned task context; current CAP_SYS_ADMIN is required. */
+int proc_lock_stats_truncate(const char *name, uint64_t length)
+{
+    if (!proc_text_eq(name, "/proc/reliefnt/lock_stats")) return -EROFS;
+    struct task *task = sched_current_task();
+    if (!task || !(task->cap_effective & (1ULL << CAP_SYS_ADMIN))) return -EPERM;
+    return length ? -EINVAL : 0;
+}
+
+/** @brief Accept one privileged whole-value diagnostic command at offset zero.
+ * @param name Required borrowed intrinsic proc key.
+ * @param offset File position, which must be zero.
+ * @param buffer Required validated readable command bytes.
+ * @param length Exact byte length including optional newline, at most six.
+ * @param written Required writable byte count, zero on failure.
+ * @return Zero or negative errno. Execution-owned task context; VFS checks
+ * the live read-only mount and this callback checks current CAP_SYS_ADMIN. */
+int proc_lock_stats_write(const char *name, uint64_t offset, const void *buffer,
+                          uint32_t length, uint32_t *written)
+{
+    if (!written) return -EINVAL;
+    *written = 0;
+    if (!proc_text_eq(name, "/proc/reliefnt/lock_stats")) return -EROFS;
+    struct task *task = sched_current_task();
+    if (!task || !(task->cap_effective & (1ULL << CAP_SYS_ADMIN))) return -EPERM;
+    if (offset || !buffer || !length || length > 6) return -EINVAL;
+    int rc = lock_profile_control(buffer, length);
+    if (!rc) *written = length;
+    return rc;
+}
+#endif

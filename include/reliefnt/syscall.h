@@ -359,11 +359,38 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame);
  */
 int64_t syscall_clone3(const struct trap_frame *frame, uint64_t arguments, uint64_t size);
 /**
- * @brief Resolve a user page fault at fault_addr with the given error code; 0 if handled.
+ * @brief Resolve a current task's fault under exclusive execution ownership.
+ * @param fault_addr Faulting virtual byte address.
+ * @param error x86 page-fault error bits.
+ * @return One if resolved; zero if not. May perform synchronous backing I/O.
  */
 int syscall_handle_user_page_fault(uint64_t fault_addr, uint64_t error);
-/* Requires an execution read transaction; never performs file I/O. */
+/** @brief Resolve an unshared task's private demand-zero VMA fault.
+ * @param task Borrowed live user task under read or exclusive execution ownership.
+ * @param fault_addr Faulting virtual byte address.
+ * @param error x86 page-fault error bits.
+ * @return One if resolved; zero if unsupported or allocation fails. Never
+ * performs backing I/O, usercopy or scheduling; caller keeps task/MM alive.
+ */
 int syscall_handle_private_anon_fault(struct task *task, uint64_t fault_addr, uint64_t error);
+/* Internal dispatcher result: no ABI layout or exported syscall is changed. */
+enum syscall_private_fault_result {
+    SYSCALL_PRIVATE_FAULT_UNHANDLED = 0,
+    SYSCALL_PRIVATE_FAULT_ANON,
+    SYSCALL_PRIVATE_FAULT_RESIDENT,
+};
+/** @brief Resolve non-I/O faults belonging to one unshared user MM.
+ * @param task Borrowed current user task under read or exclusive execution ownership.
+ * @param fault_addr Faulting virtual byte address.
+ * @param error x86 user page-fault error bits.
+ * @return ANON for demand-zero, RESIDENT for present COW or cached executable
+ * pages, or UNHANDLED for fallback without a user-visible error.
+ * Task/fault context with IRQs masked; no usercopy, scheduling, source
+ * reference changes or backing/provider callbacks. A retained executable
+ * source and the task/MM are kept alive by execution ownership.
+ */
+enum syscall_private_fault_result syscall_handle_private_page_fault(
+    struct task *task, uint64_t fault_addr, uint64_t error);
 int syscall_handle_task_page_fault(struct task *task, uint64_t fault_addr, uint64_t error);
 int syscall_page_fault_signal_code(struct task *task, uint64_t address);
 void syscall_mm_truncate_file(struct task *task, const struct storage_node *node, uint64_t size);

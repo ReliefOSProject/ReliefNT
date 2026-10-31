@@ -15,6 +15,7 @@
 #include <reliefnt/uts.h>
 #include <reliefnt/syscall.h>
 #include <reliefnt/lock.h>
+#include <reliefnt/lock_profile.h>
 #include <reliefnt/smp.h>
 #include <reliefnt/userland.h>
 #include <reliefnt/kernel_debug.h>
@@ -56,7 +57,7 @@ static void sched_idle_service_wait(void *opaque)
     struct sched_idle_service_state *state = opaque;
     kernel_execution_unlock_irqrestore(state->execution_flags);
     __asm__ volatile("sti; hlt; cli" ::: "memory");
-    kernel_execution_lock_irqsave(&state->execution_flags);
+    kernel_execution_lock_scoped_irqsave(&state->execution_flags, LOCK_SCOPE_SCHED);
     net_tcp_maintenance();
     usb_process_work();
     vfs_reclaim_mounts(2);
@@ -822,7 +823,7 @@ static struct task *wait_for_runnable_task(uint64_t *execution_flags)
 struct task *userland_schedule_from_frame(struct trap_frame *frame)
 {
     uint64_t execution_flags;
-    kernel_execution_lock_irqsave(&execution_flags);
+    kernel_execution_lock_scoped_irqsave(&execution_flags, LOCK_SCOPE_SCHED);
     /* Pure-CPU user tasks reach this scheduler boundary from timer return. */
     sched_run_network_maintenance();
     input_process_pending();

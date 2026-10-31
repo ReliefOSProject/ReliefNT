@@ -318,6 +318,13 @@ int vfs_path_fallocate(const struct vfs_path *path,uint32_t mode,uint64_t offset
  * Execution ownership required; no graph/module lock spans callbacks.
  */
 int vfs_path_sync(const struct vfs_path *path,bool filesystem,bool data_only);
+/** @brief Complete an implicit synchronous write to the retained inode.
+ * @param path Required borrowed held file path retaining its provider.
+ * @param data_only True for data-only synchronization.
+ * @return Zero or negative provider errno. An immediately committed proc
+ * diagnostic needs no second flush; explicit fsync keeps its own semantics.
+ * Execution ownership required; no namespace replay or graph lock across I/O. */
+int vfs_path_sync_after_write(const struct vfs_path *path, bool data_only);
 /** @brief Flush every attached filesystem in the shared namespace.
  * @param ns Borrowed initialized namespace under exclusive execution ownership.
  * @return First provider error after attempting all mounts, or zero. Backend

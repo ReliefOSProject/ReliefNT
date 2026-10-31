@@ -328,14 +328,21 @@ int syscall_page_fault_signal_code(struct task *task, uint64_t address)
     return LINUX_SEGV_MAPERR;
 }
 
+/** @brief Populate a private anonymous demand-zero page without backing I/O.
+ * @param task Borrowed user task under execution read or exclusive ownership.
+ * @param fault_addr Faulting virtual byte address.
+ * @param error x86 page-fault error bits.
+ * @return One on success, zero when ineligible or allocation fails. The
+ * execution gate pins the unshared MM; allocator/page-table locks are nested
+ * under it. A successfully allocated page transfers to the MM; no usercopy,
+ * backing callback or scheduling occurs.
+ */
 int syscall_handle_private_anon_fault(struct task *task, uint64_t fault_addr, uint64_t error)
 {
-    /* The execution read gate keeps fork/exec/munmap and remote memory
-     * operations out. An unshared MM has exactly one running owner, so its
-     * VMA/page tables need no additional lock here. CLONE_VM (including
-     * vfork) and all file/shared mappings retain the exclusive slow path.
-     * The physical allocator has its own lock. No usercopy or VFS calls are
-     * permitted here: they could recursively acquire the exclusive gate. */
+    /* Execution ownership excludes fork/exec/munmap and remote memory
+     * operations. An unshared MM has one running owner. This anonymous-only
+     * helper rejects file/shared mappings; the separate cache-only fast path
+     * below handles eligible immutable executable pages without VFS calls. */
     if (!task || task->kind != TASK_KIND_USER || task->shared_mm || (error & 0x8ULL))
         return 0;
     uint64_t page = align_down_page(fault_addr);
@@ -348,6 +355,108 @@ int syscall_handle_private_anon_fault(struct task *task, uint64_t fault_addr, ui
         ((error & 0x2ULL) && !(vma->prot & LINUX_PROT_WRITE)) ||
         ((error & 0x10ULL) && !(vma->prot & LINUX_PROT_EXEC))) return 0;
     return task_map_anonymous_page(task, vma, page) == 0;
+}
+
+/** @brief Resolve a present private COW leaf belonging to a writable mapping.
+ * @param task Borrowed unshared user task protected by execution ownership.
+ * @param vma Covering VMA, or NULL for the initial stack interval.
+ * @param page Page-aligned fault address within the user range.
+ * @return One if the existing COW copy succeeds; zero otherwise. Uses the
+ * normal physical/cache reference operations without usercopy or callbacks.
+ */
+static int task_private_cow_fault(struct task *task, const struct task_vma *vma,
+                                  uint64_t page)
+{
+    uint64_t flags = address_space_user_page_flags(sched_task_as(task), page);
+    uint64_t needed = RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_USER | RELIEFNT_PAGE_COW;
+    if ((flags & needed) != needed ||
+        (flags & (RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_SHARED | RELIEFNT_PAGE_PROTNONE)))
+        return 0;
+    if (vma) {
+        if (!(vma->prot & LINUX_PROT_WRITE) ||
+            (vma->flags & (TASK_VMA_FLAG_SHARED | TASK_VMA_FLAG_DEVICE |
+                           TASK_VMA_FLAG_SYSV_SHM | TASK_VMA_FLAG_VDSO | TASK_VMA_FLAG_VVAR)))
+            return 0;
+    } else {
+        const struct task_address_space_state *mm = sched_task_mm(task);
+        uint64_t low = mm->initial_stack_low ? mm->initial_stack_low : task->stack_low;
+        uint64_t top = mm->initial_stack_top ? mm->initial_stack_top : task->stack_top;
+        if (!low || page < low || page >= top) return 0;
+    }
+    return address_space_handle_cow_fault(sched_task_as(task), page);
+}
+
+/** @brief Install an already-resident immutable executable cache page.
+ * @param task Borrowed unshared user task protected by execution ownership.
+ * @param vma Covering file VMA and retained executable source, nullable.
+ * @param page Aligned user page in the VMA.
+ * @param error x86 page-fault error bits.
+ * @return One after mapping, zero on ineligibility, miss or mapping failure.
+ * The cache lookup retains its frame under the cache lock; failed mapping
+ * releases it. No provider/source operation or usercopy runs under the gate.
+ */
+static int task_private_exec_cache_fault(struct task *task, const struct task_vma *vma,
+                                        uint64_t page, uint64_t error)
+{
+    const uint32_t required = TASK_VMA_FLAG_FILE | TASK_VMA_FLAG_LAZY |
+                              TASK_VMA_FLAG_SHARED_FILE;
+    const uint32_t excluded = TASK_VMA_FLAG_ANON | TASK_VMA_FLAG_SHARED |
+                              TASK_VMA_FLAG_DEVICE | TASK_VMA_FLAG_SYSV_SHM |
+                              TASK_VMA_FLAG_VDSO | TASK_VMA_FLAG_VVAR;
+    if (!vma || !vma->exec_source || (vma->flags & required) != required ||
+        (vma->flags & excluded) || vma->file_node.type != RELIEFOS_FS_TYPE_FILE ||
+        (vma->file_node.flags & STORAGE_NODE_FLAG_TMPFS) ||
+        vma->prot == LINUX_PROT_NONE || (vma->prot & LINUX_PROT_WRITE) ||
+        (error & 0x2ULL) || ((error & 0x10ULL) && !(vma->prot & LINUX_PROT_EXEC)))
+        return 0;
+    uint64_t delta = page - vma->start;
+    if (vma->file_offset > UINT64_MAX - delta) return 0;
+    uint64_t offset = vma->file_offset + delta;
+    if ((offset & (PAGE_SIZE - 1ULL)) || offset >= vma->file_node.size ||
+        vma->file_limit < offset) return 0;
+    uint64_t available = vma->file_node.size - offset;
+    uint64_t bytes = available < PAGE_SIZE ? available : PAGE_SIZE;
+    if (vma->file_limit - offset < bytes) return 0;
+    uint64_t phys = 0;
+    if (page_cache_lookup(&vma->file_node, offset, &phys) != 0) return 0;
+    uint64_t flags = (vma->prot & LINUX_PROT_EXEC) ? 0 : RELIEFNT_PAGE_NOEXEC;
+    if (!address_space_map_user_page(sched_task_as(task), page, phys, flags)) {
+        page_cache_release(phys);
+        return 0;
+    }
+    return 1;
+}
+
+/** @brief Resolve a private fault without I/O under reader or writer ownership.
+ * @param task Borrowed current user task; unshared MM remains live under gate.
+ * @param fault_addr Faulting virtual byte address.
+ * @param error x86 user page-fault error bits.
+ * @return ANON for demand-zero, RESIDENT for present COW or cached executable
+ * pages, or UNHANDLED to let the exclusive slow path handle it.
+ * Task/fault context, IRQs masked. No provider callbacks, source ref changes,
+ * usercopy or scheduling; allocator and page-cache locks nest below the gate.
+ */
+enum syscall_private_fault_result syscall_handle_private_page_fault(
+    struct task *task, uint64_t fault_addr, uint64_t error)
+{
+    if (!task || task->kind != TASK_KIND_USER || task->shared_mm ||
+        !(error & 0x4ULL) || (error & 0x8ULL) || (error & ~0x1fULL))
+        return SYSCALL_PRIVATE_FAULT_UNHANDLED;
+    uint64_t page = align_down_page(fault_addr);
+    if (page < RELIEFNT_USER_BASE || page >= RELIEFNT_USER_TOP)
+        return SYSCALL_PRIVATE_FAULT_UNHANDLED;
+    struct task_vma *vma = task_vma_containing(task, page, page + PAGE_SIZE);
+    if (address_space_user_page_phys(sched_task_as(task), page)) {
+        if ((error & 0x3ULL) == 0x3ULL && !(error & 0x10ULL))
+            return task_private_cow_fault(task, vma, page) ?
+                SYSCALL_PRIVATE_FAULT_RESIDENT : SYSCALL_PRIVATE_FAULT_UNHANDLED;
+        return SYSCALL_PRIVATE_FAULT_UNHANDLED;
+    }
+    if (vma && (vma->flags & TASK_VMA_FLAG_ANON))
+        return syscall_handle_private_anon_fault(task, fault_addr, error) ?
+            SYSCALL_PRIVATE_FAULT_ANON : SYSCALL_PRIVATE_FAULT_UNHANDLED;
+    return task_private_exec_cache_fault(task, vma, page, error) ?
+        SYSCALL_PRIVATE_FAULT_RESIDENT : SYSCALL_PRIVATE_FAULT_UNHANDLED;
 }
 
 int syscall_handle_task_page_fault(struct task *task, uint64_t fault_addr, uint64_t error)

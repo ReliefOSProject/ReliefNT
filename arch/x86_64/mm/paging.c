@@ -208,37 +208,44 @@ uint64_t paging_kernel_cr3(void)
     return (uint64_t)(uintptr_t)kernel_pml4;
 }
 
-/**
- * Paging load cr3.
- * @param cr3 Value supplied by the caller.
- */
-static volatile uint64_t mm_change_seq;
+/* CPU-local CR3 observations and the globally published change sequence. */
+static uint64_t mm_change_seq;
 static uint64_t cr3_loaded[SMP_MAX_CPUS];
 static uint64_t cr3_loaded_seq[SMP_MAX_CPUS];
 
+/** @brief Load CR3 after snapshotting the globally published mapping sequence.
+ * @param cr3 Physical root, or zero to select the kernel root.
+ * @return None. Caller owns the local CPU's CR3/cache state. An update during
+ * the load remains newer than the saved snapshot and causes another reload.
+ */
 void paging_load_cr3(uint64_t cr3)
 {
     uint64_t value = cr3 ? cr3 : paging_kernel_cr3();
+    /* A concurrent update after this snapshot must trigger the next reload. */
+    uint64_t sequence = __atomic_load_n(&mm_change_seq, __ATOMIC_ACQUIRE);
     x86_64_load_cr3(value);
     uint32_t cpu = smp_current_cpu();
     cr3_loaded[cpu] = value;
-    cr3_loaded_seq[cpu] = mm_change_seq;
+    cr3_loaded_seq[cpu] = sequence;
 }
 
 /**
- * @brief Record that a mapping changed so the next user return reloads CR3.
+ * @brief Publish a mapping change so the next user return reloads CR3.
+ * @return None. Safe for concurrent mapping owners; release ordering publishes
+ * preceding page-table changes to acquiring sequence readers.
  */
 void paging_note_mm_change(void)
 {
-    ++mm_change_seq;
+    __atomic_fetch_add(&mm_change_seq, 1, __ATOMIC_RELEASE);
 }
 
 /**
- * @brief Current mm-change sequence, for the conditional CR3 reload check.
+ * @brief Read the globally published mapping-change sequence.
+ * @return Acquired sequence value; wraps modulo 2^64 and does not own a page.
  */
 uint64_t paging_mm_change_seq(void)
 {
-    return mm_change_seq;
+    return __atomic_load_n(&mm_change_seq, __ATOMIC_ACQUIRE);
 }
 
 /**
@@ -248,12 +255,15 @@ uint64_t paging_mm_change_seq(void)
  * translation; a return to the same task that mapped nothing keeps its live
  * TLB.  The sequence check reloads conservatively after any mapping change,
  * preserving the full non-global flush the lazy loader and munmap rely on.
+ * @param cr3 Physical root, or zero for the kernel root.
+ * @return None. Caller owns this CPU's CR3 observations; the sequence is global.
  */
 void paging_load_cr3_if_changed(uint64_t cr3)
 {
     uint64_t value = cr3 ? cr3 : paging_kernel_cr3();
     uint32_t cpu = smp_current_cpu();
-    if (value == cr3_loaded[cpu] && mm_change_seq == cr3_loaded_seq[cpu])
+    if (value == cr3_loaded[cpu] &&
+        paging_mm_change_seq() == cr3_loaded_seq[cpu])
         return;
     paging_load_cr3(value);
 }

@@ -1,4 +1,5 @@
 #include <reliefnt/graphics_service.h>
+#include <reliefnt/lock_profile.h>
 #include "internal.h"
 #include <reliefnt/module.h>
 #include <reliefnt/usb.h>
@@ -219,7 +220,7 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
         return NULL;
     }
     /* Several storage and GUI services still own global scratch buffers. */
-    kernel_execution_lock_irqsave(&lock_flags);
+    kernel_execution_lock_scoped_irqsave(&lock_flags, lock_profile_syscall_scope(frame->rax));
     net_tcp_maintenance();
     /* Drain small fair batches after taking execution ownership. Failed
      * filesystem cleanup retains its provider until a later successful flush;

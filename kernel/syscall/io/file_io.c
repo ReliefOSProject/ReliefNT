@@ -20,9 +20,10 @@
  * A vector retains the OFD reservation between completed elements until its
  * common parent completion/cancellation, so another caller cannot interleave.
  * Execution ownership is required. Ordinary files use their retained provider
- * and optional OFD-local provider capture/cursor, never a diagnostic filename; genuine block nodes use the
- * block service. No graph/module lock spans callbacks. O_APPEND stats the
- * actual inode; sync flags complete through the same retained provider.
+ * and optional OFD-local provider capture/cursor, never a diagnostic filename;
+ * genuine block nodes use the block service. No graph/module lock spans
+ * callbacks. O_APPEND stats the actual inode; sync flags flush the retained
+ * provider, except for the immediately committed proc diagnostic control.
  */
 int64_t syscall_regular_io(struct task *task, struct task_file *file, uint64_t buffer, uint64_t count,
                            uint64_t position, bool writing, bool positional)
@@ -132,7 +133,7 @@ int64_t syscall_regular_io(struct task *task, struct task_file *file, uint64_t b
         task->regular_io.active = false;
     if (writing && done && (file->flags & LINUX_O_DSYNC)) {
         int sync = block ? storage_sync_disk(STORAGE_BLOCK_DISK_ID(file->node.volume_id))
-                         : vfs_path_sync(&file->path_ref,false,
+                         : vfs_path_sync_after_write(&file->path_ref,
                              (file->flags&LINUX_O_SYNC)==LINUX_O_DSYNC);
         if (sync < 0) return sync;
     }

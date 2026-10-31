@@ -1,4 +1,5 @@
 #include "internal.h"
+#include <reliefnt/lock_profile.h>
 
 static uint64_t user_task_count_locked(uint32_t uid);
 
@@ -462,7 +463,7 @@ void sched_exit(uint32_t pid, uint64_t code)
     }
     if (gpu_owner_quiescent) {
         uint64_t execution_flags;
-        kernel_execution_lock_irqsave(&execution_flags);
+        kernel_execution_lock_scoped_irqsave(&execution_flags, LOCK_SCOPE_SCHED);
         sched_release_task_resources(exiting);
         kernel_execution_unlock_irqrestore(execution_flags);
     }

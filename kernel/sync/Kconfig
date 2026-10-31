@@ -1,0 +1,6 @@
+config LOCK_STAT
+    bool "ReliefNT execution gate profiling"
+    default n
+    help
+      Build the optional /proc/reliefnt/lock_stats diagnostic. Collection
+      remains disabled until explicitly enabled by an administrator.

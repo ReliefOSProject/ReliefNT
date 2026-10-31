@@ -54,6 +54,12 @@ struct vfs_rename {
 /* All helpers require the caller's execution transaction. No internal spinlock
  * or backend callback is hidden behind a mount graph lock. */
 bool vfs_path_valid(const struct vfs_path *path);
+#ifdef CONFIG_LOCK_STAT
+/** @brief Recognize the immediate-commit proc control by retained provider/key.
+ * @param path Borrowed valid inode path, protected by execution ownership.
+ * @return True only for the live lock_stats control; no lookup or allocation. */
+bool vfs_pseudo_lock_stats_control(const struct vfs_path *path);
+#endif
 bool vfs_path_covered(const struct vfs_namespace *ns,const struct vfs_path *path);
 void vfs_follow_mounts(const struct vfs_namespace *ns,struct vfs_path *path);
 /* Bind metadata returned by a completed native creation without re-looking up

@@ -84,9 +84,14 @@ int kernel_execution_suspend_irqrestore(struct kernel_execution_suspend_token *t
  */
 int kernel_execution_resume_irqsave(struct kernel_execution_suspend_token *token);
 
-/* Try a private-memory transaction. No nesting, upgrades, or scheduling.
- * On failure, no lock is held and the original IRQ state is restored. */
+/** @brief Try a private-memory transaction without nesting or upgrade.
+ * @param flags Optional writable original IRQ-state output for matching unlock.
+ * @return True if held, false with no lock and original IRQ state restored.
+ * Task/fault context; no scheduling or transfer of reader ownership. */
 bool kernel_execution_try_read_lock_irqsave(uint64_t *flags);
+/** @brief Release a successful private-memory reader and restore local IRQs.
+ * @param flags IRQ state returned by matching successful reader admission.
+ * The same context owns the reader; no scheduling or allocation. */
 void kernel_execution_read_unlock_irqrestore(uint64_t flags);
 
 #endif

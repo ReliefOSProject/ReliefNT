@@ -79,20 +79,28 @@ void paging_init_cpu(void);
  * @brief Return the physical address of the kernel page-table root (the CR3 value).
  */
 uint64_t paging_kernel_cr3(void);
-/**
- * @brief Switch the CPU's page table to the root given by cr3.
+/** @brief Load a page-table root and remember the prior mapping sequence.
+ * @param cr3 Physical page-table root, or zero to select the kernel root.
+ * @return None. Caller must remain on this CPU and serialize its CR3/cache
+ * state through the load; no page ownership or reference is transferred.
+ * The acquired sequence snapshot precedes the load, so concurrent later
+ * mapping changes remain visible to the next conditional reload.
  */
 void paging_load_cr3(uint64_t cr3);
-/**
- * @brief Reload CR3 on return-to-user only when the address space changed since the last load.
+/** @brief Reload CR3 when the root or global mapping sequence has changed.
+ * @param cr3 Physical page-table root, or zero to select the kernel root.
+ * @return None. Caller must remain on this CPU and serialize its local
+ * CR3/cache state; the global sequence is read with acquire ordering.
  */
 void paging_load_cr3_if_changed(uint64_t cr3);
-/**
- * @brief Record that a mapping changed so the next user return reloads CR3.
+/** @brief Publish a mapping change for conservative CR3 invalidation.
+ * @return None. Concurrent mapping owners may call this after their page-table
+ * writes; a release atomic increment publishes those writes to readers.
  */
 void paging_note_mm_change(void);
-/**
- * @brief Current mm-change sequence, for the conditional CR3 reload check.
+/** @brief Read the globally published mapping-change sequence.
+ * @return Sequence acquired atomically, wrapping modulo 2^64. Pure read;
+ * it transfers no page ownership and does not itself reload or invalidate.
  */
 uint64_t paging_mm_change_seq(void);
 /**

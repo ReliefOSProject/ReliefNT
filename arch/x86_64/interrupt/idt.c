@@ -6,6 +6,7 @@
 #include <reliefnt/arch.h>
 #include <reliefnt/console.h>
 #include <reliefnt/lock.h>
+#include <reliefnt/lock_profile.h>
 #include <reliefnt/paging.h>
 #include <reliefnt/pty.h>
 #include <reliefnt/sched.h>
@@ -31,10 +32,8 @@ struct __attribute__((packed)) idt_ptr {
 };
 
 static struct idt_entry idt[256];
-/* Lazy executable pages and user-copy faults share storage/page-cache
- * scratch state. Serialize that transaction without disabling local timer
- * interrupts, so another CPU can continue scheduling while one CPU reads a
- * backing page. */
+/* Backing-I/O and shared-MM fault handling retain their serialized slow path.
+ * Private non-I/O faults can complete under execution ownership alone. */
 static struct kernel_spinlock user_page_fault_lock = KERNEL_SPINLOCK_INIT;
 
 extern void x86_64_lidt(const struct idt_ptr *ptr);
@@ -488,10 +487,12 @@ static void signal_user_page_fault(struct trap_frame *frame, uint64_t cr2)
     kernel_signal_force_fault(task, signal, syscall_page_fault_signal_code(task, cr2), cr2);
 }
 
-/**
- * Page fault dispatch.
- * @param frame Value supplied by the caller.
- * @return The value or status produced by the operation.
+/** @brief Resolve or signal a fault with execution ownership and safe fallback.
+ * @param frame Borrowed interrupted trap frame, nullable for fatal diagnostics.
+ * @return NULL to resume directly or the task selected by the scheduler.
+ * IRQ/fault context: private non-I/O user faults use a read gate when available
+ * or the FIFO writer when queued; shared and backing-I/O faults retain the
+ * exclusive fault lock. Kernel usercopy faults use recursive writer ownership.
  */
 struct task *page_fault_dispatch(struct trap_frame *frame)
 {
@@ -504,16 +505,18 @@ struct task *page_fault_dispatch(struct trap_frame *frame)
         (cr2 < RELIEFNT_USER_BASE || cr2 >= RELIEFNT_USER_TOP))
         bugcheck_trap("Unhandled Page Fault", frame, cr2);
 
-    /* Independent demand-zero faults do not touch VFS/device scratch state.
-     * Only user-mode faults may take the non-nesting read gate; kernel-mode
-     * usercopy faults can already own the recursive exclusive transaction.
-     * Returning NULL resumes the faulting instruction without an artificial
-     * context switch on every anonymous page. Timer preemption still applies. */
+    /* An unshared MM can resolve private demand-zero/COW and resident immutable
+     * executable pages without VFS or device callbacks. Kernel usercopy can
+     * already own the recursive writer and must not take a nested read gate. */
     if (frame && (frame->cs & 3ULL) == 3ULL &&
-        kernel_execution_try_read_lock_irqsave(&execution_flags)) {
-        int handled = syscall_handle_private_anon_fault(sched_current_task(), cr2, frame->error);
+        kernel_execution_try_read_lock_scoped_irqsave(&execution_flags, LOCK_SCOPE_FAULT)) {
+        enum syscall_private_fault_result handled =
+            syscall_handle_private_page_fault(sched_current_task(), cr2, frame->error);
+        bool resume = handled == SYSCALL_PRIVATE_FAULT_ANON &&
+                      sched_try_resume_current_user_frame(frame);
         kernel_execution_read_unlock_irqrestore(execution_flags);
-        if (handled) return NULL;
+        if (handled != SYSCALL_PRIVATE_FAULT_UNHANDLED)
+            return resume ? NULL : userland_schedule_from_frame(frame);
     }
 
     /* A lazy page-in touches the same VFS and device state as a filesystem
@@ -521,7 +524,16 @@ struct task *page_fault_dispatch(struct trap_frame *frame)
      * cannot reprogram AHCI or mutate filesystem caches midway through an
      * ordinary operation.  The execution lock is reentrant for a fault that
      * occurs while the same CPU copies user memory inside a syscall. */
-    kernel_execution_lock_irqsave(&execution_flags);
+    kernel_execution_lock_scoped_irqsave(&execution_flags, LOCK_SCOPE_FAULT);
+
+    /* A queued writer may have denied reader admission. Resolve the same
+     * non-I/O work under its FIFO successor, then take the normal checkpoint. */
+    if (frame && (frame->cs & 3ULL) == 3ULL &&
+        syscall_handle_private_page_fault(sched_current_task(), cr2, frame->error) !=
+            SYSCALL_PRIVATE_FAULT_UNHANDLED) {
+        kernel_execution_unlock_irqrestore(execution_flags);
+        return userland_schedule_from_frame(frame);
+    }
     kernel_spin_lock(&user_page_fault_lock);
 
     if (frame && syscall_handle_user_page_fault(cr2, frame->error)) {

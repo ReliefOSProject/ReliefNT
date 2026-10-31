@@ -15,6 +15,7 @@ evdev_overflow tools/test_evdev_overflow.py
 exec_limits tools/test_exec_limits.py
 exec_script tools/test_exec_script.py
 execution_lock tools/test_execution_lock.py
+lock_profile tools/test_lock_profile.py
 exit_logging tools/test_exit_logging.py
 ext2_cache tools/test_ext2_cache.py
 ext2_performance tools/test_ext2_performance.py --output {output}/ext2-performance.json
@@ -55,6 +56,7 @@ loadavg tools/test_loadavg.py
 network tools/test_network.py
 openrc_network tools/test_openrc_network.py
 page_cache_growth tools/test_page_cache_growth.py
+private_fault_transactions tools/test_private_fault_transactions.py
 pipe_wake tools/test_pipe_wake.py
 poll_wakeup tools/test_poll_wakeup.py
 power tools/test_power.py
@@ -68,6 +70,7 @@ sched_resume tools/test_sched_resume.py
 service_roles tools/test_service_roles.py
 signal_address_space tools/test_signal_address_space.py
 smp_cpu_id tools/test_smp_cpu_id.py
+smp_latency_probe tools/test_smp_latency_probe.py
 smp_trampoline_nxe tools/test_smp_trampoline_nxe.py
 storage_metadata tools/test_storage_metadata.py
 storage_mkdir_mount tools/test_storage_mkdir_mount.py

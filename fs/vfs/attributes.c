@@ -97,6 +97,21 @@ int vfs_path_sync(const struct vfs_path *path,bool filesystem,bool data_only)
         &path->dentry->node,filesystem,data_only) : filesystem ? 0 : -EINVAL;
 }
 
+/** @brief Complete a successful synchronous write through its retained inode.
+ * @param path Required borrowed file path whose provider accepted the data.
+ * @param data_only True for data-only synchronization.
+ * @return Zero or the normal sync error. The exact proc diagnostic commits
+ * its whole value during write and has no deferred data to flush. Explicit
+ * fsync remains vfs_path_sync. Execution-owned, no graph lock across I/O. */
+int vfs_path_sync_after_write(const struct vfs_path *path, bool data_only)
+{
+    if (!vfs_path_valid(path)) return -EINVAL;
+#ifdef CONFIG_LOCK_STAT
+    if (vfs_pseudo_lock_stats_control(path)) return 0;
+#endif
+    return vfs_path_sync(path, false, data_only);
+}
+
 int vfs_namespace_sync(struct vfs_namespace *ns)
 {
     if(!ns || !ns->root)return -EINVAL;

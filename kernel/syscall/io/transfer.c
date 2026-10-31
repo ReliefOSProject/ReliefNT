@@ -179,15 +179,16 @@ int64_t task_transfer_interrupt(struct task *task)
 /** @brief Publish final offset outputs and release a completed copy exactly once.
  * @param task Current execution-owned task retaining its transfer state.
  * @return Completed bytes or negative errno; synchronous-file sync EAGAIN
- * retains state for its flush only. User output addresses are revalidated
- * before writing and never reread for new input. Final puts run without locks.
+ * retains state for its flush only. An immediately committed proc diagnostic
+ * has no deferred flush. User output addresses are revalidated before writing
+ * and never reread for new input. Final puts run without locks.
  */
 static int64_t transfer_complete(struct task *task)
 {
     struct task_transfer_state *state=task->transfer_io;
     int64_t result=state->total ? (int64_t)state->total : state->error;
     if(state->total && state->output->node.type==RELIEFOS_FS_TYPE_FILE && (state->output->flags&LINUX_O_DSYNC)) {
-        int rc=vfs_path_sync(&state->output->path_ref,false,(state->output->flags&LINUX_O_SYNC)==LINUX_O_DSYNC);
+        int rc=vfs_path_sync_after_write(&state->output->path_ref,(state->output->flags&LINUX_O_SYNC)==LINUX_O_DSYNC);
         if(rc==-EAGAIN){state->waiting_io=true;return rc;}
         if(rc)result=rc;
     }

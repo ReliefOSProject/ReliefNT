@@ -4,6 +4,7 @@
  */
 #include <reliefnt/export.h>
 #include <reliefnt/lock.h>
+#include <reliefnt/lock_profile.h>
 #include <reliefnt/smp.h>
 
 /* The execution lock may be entered again while the owning CPU resolves a
@@ -19,9 +20,12 @@ static uint32_t execution_readers;
 static uint32_t execution_depth[SMP_MAX_CPUS];
 static uint64_t execution_outer_flags[SMP_MAX_CPUS];
 
-static uint32_t execution_cpu_index(void)
+/** @brief Clamp the CPU index used by the existing gate state arrays.
+ * @param cpu Raw CPU index returned by the platform, possibly out of range.
+ * @return The index or zero as the gate's established fallback. No state,
+ * allocation or IRQ changes; callers may retain the raw ID for profiling. */
+static uint32_t execution_cpu_index(uint32_t cpu)
 {
-    uint32_t cpu = smp_current_cpu();
     return cpu < SMP_MAX_CPUS ? cpu : 0;
 }
 
@@ -97,13 +101,20 @@ void kernel_spin_unlock_irqrestore(struct kernel_spinlock *lock, uint64_t flags)
     kernel_irq_restore(flags);
 }
 
-/**
- * @brief Acquire recursive execution ownership with FIFO admission and local IRQs masked.
- * @param flags Optional writable original IRQ-state output, paired with the matching unlock.
- * @par Context
- * Boot/task context; recursion is valid only in the same execution context. Spins without scheduling, polls membarrier rendezvous, and excludes execution readers. Never hold across a scheduler wait; release every recursion level on the same context.
- */
+#ifdef CONFIG_LOCK_STAT
+/** @brief Acquire recursive FIFO execution ownership and label its outer scope.
+ * @param flags Optional writable original IRQ-state output, paired with unlock.
+ * @param scope Fixed profiling ID; an invalid ID drops only the measurement.
+ * Boot/task context; spins with IRQs masked, polls membarrier and excludes
+ * readers. Recursion is same-context only; never hold over a scheduler wait. */
+void kernel_execution_lock_scoped_irqsave(uint64_t *flags, uint32_t scope)
+#else
+/** @brief Acquire recursive FIFO execution ownership with local IRQs masked.
+ * @param flags Optional writable original IRQ-state output, paired with unlock.
+ * Boot/task context; spins with IRQs masked, polls membarrier and excludes
+ * readers. Recursion is same-context only; never hold over a scheduler wait. */
 void kernel_execution_lock_irqsave(uint64_t *flags)
+#endif
 {
     /* Recursion belongs to an execution context, not merely to a CPU. A
      * timer-driven task switch while this lock is held would otherwise let
@@ -116,23 +127,46 @@ void kernel_execution_lock_irqsave(uint64_t *flags)
     if (flags) {
         *flags = saved;
     }
-    uint32_t cpu = execution_cpu_index();
+    uint32_t raw_cpu = smp_current_cpu();
+    uint32_t cpu = execution_cpu_index(raw_cpu);
     if (__atomic_load_n(&execution_owner, __ATOMIC_RELAXED) == cpu && execution_depth[cpu] != 0) {
         ++execution_depth[cpu];
         return;
     }
+#ifdef CONFIG_LOCK_STAT
+    struct lock_profile_sample sample;
+    lock_profile_begin(&sample, raw_cpu, scope);
+    bool contended = false;
+#endif
     uint32_t ticket = __atomic_fetch_add(&execution_next_ticket, 1, __ATOMIC_SEQ_CST);
     while (__atomic_load_n(&execution_serving_ticket, __ATOMIC_SEQ_CST) != ticket ||
            __atomic_load_n(&execution_readers, __ATOMIC_SEQ_CST) != 0) {
         /* IRQs are masked here. A membarrier owner must still be able to
          * rendezvous with CPUs waiting for this lock. */
+#ifdef CONFIG_LOCK_STAT
+        contended = true;
+#endif
         smp_membarrier_poll();
         __asm__ volatile("pause" : : : "memory");
     }
+#ifdef CONFIG_LOCK_STAT
+    lock_profile_acquired(&sample, contended);
+#endif
     __atomic_store_n(&execution_owner, cpu, __ATOMIC_RELAXED);
     execution_depth[cpu] = 1;
     execution_outer_flags[cpu] = saved;
 }
+
+#ifdef CONFIG_LOCK_STAT
+/** @brief Acquire the exported FIFO gate with generic profiling attribution.
+ * @param flags Optional writable original IRQ-state output, paired with unlock.
+ * Boot/task context; spins with IRQs masked, allows same-context recursion and
+ * excludes readers. Never retain ownership across a scheduler wait. */
+void kernel_execution_lock_irqsave(uint64_t *flags)
+{
+    kernel_execution_lock_scoped_irqsave(flags, LOCK_SCOPE_GENERIC);
+}
+#endif
 
 /** @brief Release one recursive execution ownership level and restore IRQ state.
  * @param flags IRQ flags captured by the matching lock call; a final outer unlock
@@ -141,7 +175,8 @@ void kernel_execution_lock_irqsave(uint64_t *flags)
  */
 void kernel_execution_unlock_irqrestore(uint64_t flags)
 {
-    uint32_t cpu = execution_cpu_index();
+    uint32_t raw_cpu = smp_current_cpu();
+    uint32_t cpu = execution_cpu_index(raw_cpu);
     if (__atomic_load_n(&execution_owner, __ATOMIC_RELAXED) == cpu && execution_depth[cpu] > 1) {
         --execution_depth[cpu];
         kernel_irq_restore(flags);
@@ -149,6 +184,9 @@ void kernel_execution_unlock_irqrestore(uint64_t flags)
     }
     if (__atomic_load_n(&execution_owner, __ATOMIC_RELAXED) == cpu && execution_depth[cpu] == 1) {
         uint64_t outer_flags = execution_outer_flags[cpu];
+#ifdef CONFIG_LOCK_STAT
+        lock_profile_release(raw_cpu);
+#endif
         execution_depth[cpu] = 0;
         execution_outer_flags[cpu] = 0;
         __atomic_store_n(&execution_owner, UINT32_MAX, __ATOMIC_RELAXED);
@@ -171,7 +209,8 @@ int kernel_execution_suspend_irqrestore(struct kernel_execution_suspend_token *t
         return -22;
     }
     uint64_t saved = kernel_irq_save();
-    uint32_t cpu = execution_cpu_index();
+    uint32_t raw_cpu = smp_current_cpu();
+    uint32_t cpu = execution_cpu_index(raw_cpu);
     if (__atomic_load_n(&execution_owner, __ATOMIC_RELAXED) != cpu) {
         kernel_irq_restore(saved);
         return -1;
@@ -186,6 +225,9 @@ int kernel_execution_suspend_irqrestore(struct kernel_execution_suspend_token *t
     token->wait_exit_irq_flags = 0;
     token->suspended_cpu = cpu;
     token->active = 1;
+#ifdef CONFIG_LOCK_STAT
+    lock_profile_release(raw_cpu);
+#endif
     execution_depth[cpu] = 0;
     execution_outer_flags[cpu] = 0;
     __atomic_store_n(&execution_owner, UINT32_MAX, __ATOMIC_RELAXED);
@@ -208,16 +250,17 @@ int kernel_execution_resume_irqsave(struct kernel_execution_suspend_token *token
         return -22;
     }
     uint64_t saved = kernel_irq_save();
-    token->wait_exit_irq_flags = saved;
-    uint32_t cpu = execution_cpu_index();
+    uint32_t raw_cpu = smp_current_cpu();
+    uint32_t cpu = execution_cpu_index(raw_cpu);
     if (__atomic_load_n(&execution_owner, __ATOMIC_RELAXED) == cpu ||
         execution_depth[cpu] != 0) {
         kernel_irq_restore(saved);
         return -35;
     }
 
+    token->wait_exit_irq_flags = saved;
     uint64_t resume_flags;
-    kernel_execution_lock_irqsave(&resume_flags);
+    kernel_execution_lock_scoped_irqsave(&resume_flags, LOCK_SCOPE_RESUMED);
     (void)resume_flags;
     execution_outer_flags[cpu] = token->original_irq_flags;
     token->active = 0;
@@ -233,10 +276,27 @@ int kernel_execution_resume_irqsave(struct kernel_execution_suspend_token *token
  * writer observes this reader, or the reader observes the queued writer and
  * backs out before accessing protected data. Queuing a writer closes admission
  * immediately, so a stream of faults cannot starve an exclusive transaction. */
+#ifdef CONFIG_LOCK_STAT
+/** @brief Attempt private-memory reader admission with a fixed profiling scope.
+ * @param flags Optional writable original IRQ-state output for matching unlock.
+ * @param scope Fixed profiling ID; invalid values drop only the sample.
+ * @return True if held, false with the caller's original IRQ state restored.
+ * Task/fault context; no recursion, upgrade, scheduling or ownership transfer. */
+bool kernel_execution_try_read_lock_scoped_irqsave(uint64_t *flags, uint32_t scope)
+#else
+/** @brief Attempt private-memory reader admission without nesting or upgrade.
+ * @param flags Optional writable original IRQ-state output for matching unlock.
+ * @return True if held, false with the caller's original IRQ state restored.
+ * Task/fault context; no recursion, scheduling or ownership transfer. */
 bool kernel_execution_try_read_lock_irqsave(uint64_t *flags)
+#endif
 {
     uint64_t saved = kernel_irq_save();
     if (flags) *flags = saved;
+#ifdef CONFIG_LOCK_STAT
+    struct lock_profile_sample sample = {0};
+    if (lock_profile_enabled()) lock_profile_begin(&sample, smp_current_cpu(), scope);
+#endif
     if (__atomic_load_n(&execution_next_ticket, __ATOMIC_SEQ_CST) !=
         __atomic_load_n(&execution_serving_ticket, __ATOMIC_SEQ_CST)) {
         kernel_irq_restore(saved);
@@ -249,11 +309,31 @@ bool kernel_execution_try_read_lock_irqsave(uint64_t *flags)
         kernel_irq_restore(saved);
         return false;
     }
+#ifdef CONFIG_LOCK_STAT
+    lock_profile_acquired(&sample, false);
+#endif
     return true;
 }
 
+#ifdef CONFIG_LOCK_STAT
+/** @brief Attempt a nonrecursive reader gate with generic attribution.
+ * @param flags Optional writable original IRQ-state output for matching unlock.
+ * @return True if held, false with the caller's IRQ state restored.
+ * Task/fault context; do not nest, upgrade, schedule or transfer ownership. */
+bool kernel_execution_try_read_lock_irqsave(uint64_t *flags)
+{
+    return kernel_execution_try_read_lock_scoped_irqsave(flags, LOCK_SCOPE_GENERIC);
+}
+#endif
+
+/** @brief Release a successful reader and restore its original IRQ state.
+ * @param flags IRQ state from the matching successful reader admission.
+ * The current context owns the reader; no scheduling, allocation or upgrade. */
 void kernel_execution_read_unlock_irqrestore(uint64_t flags)
 {
+#ifdef CONFIG_LOCK_STAT
+    if (lock_profile_enabled()) lock_profile_release(smp_current_cpu());
+#endif
     __atomic_fetch_sub(&execution_readers, 1, __ATOMIC_SEQ_CST);
     kernel_irq_restore(flags);
 }

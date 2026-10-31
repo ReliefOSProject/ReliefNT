@@ -4,6 +4,9 @@
 #include <reliefnt/module.h>
 #include <linux/errno.h>
 #include "mount_internal.h"
+#ifdef CONFIG_LOCK_STAT
+#include "../proc/internal.h"
+#endif
 
 struct pseudo_key {
     struct pseudo_key *next;
@@ -151,6 +154,21 @@ static int pseudo_node_write(void *value,struct storage_node *node,uint64_t offs
     if(!pseudo_key_live(context,key))return -ENOENT;
     return context->provider->write ? context->provider->write(key->name,offset,buffer,length,written) : -EROFS;
 }
+#ifdef CONFIG_LOCK_STAT
+/** @brief Identify the immediate diagnostic control through its held provider.
+ * @param path Borrowed valid path with a retained inode and provider context.
+ * @return True only for the live proc lock_stats key, never an alias in a
+ * different provider. Execution-owned; no lookup, allocation, or I/O. */
+bool vfs_pseudo_lock_stats_control(const struct vfs_path *path)
+{
+    if (!vfs_path_valid(path) || path->mount->ops->write != pseudo_node_write) return false;
+    struct pseudo_mount *context = path->mount->context;
+    struct pseudo_key *key = pseudo_key_find(context, path->dentry->node.entry_id);
+    return pseudo_key_live(context, key) && context->provider->write == proc_lock_stats_write &&
+           !__builtin_strcmp(key->name, "/proc/reliefnt/lock_stats");
+}
+#endif
+
 /** @brief Forward truncation only to the exact live generated provider.
  * @param value Pinned pseudo context.
  * @param node Retained intrinsic inode with original identity.
@@ -232,6 +250,26 @@ static int pseudo_node_permissions(void *value,const struct vfs_path *path,
 static uint64_t pseudo_mount_flags(void *value)
 {return ((const struct pseudo_mount *)value)->provider->mount_flags;}
 
+/** @brief Admit proc diagnostic readonly changes without altering providers.
+ * @param value Required borrowed pinned pseudo mount context.
+ * @param flags Requested shared policy bits.
+ * @return Zero or unsupported/readonly errno. Other pseudo filesystems retain
+ * their prior remount restrictions; VFS publishes attachment policy under
+ * execution ownership, without allocation or graph locks across callbacks. */
+static int pseudo_remount(void *value, uint64_t flags)
+{
+    const struct pseudo_mount *mount = value;
+#ifdef CONFIG_LOCK_STAT
+    if (mount->provider->filesystem && !__builtin_strcmp(mount->provider->filesystem, "proc")) {
+        if (flags & ~MS_RDONLY) return -EOPNOTSUPP;
+        return 0;
+    }
+#endif
+    uint64_t current = mount->provider->mount_flags & VFS_SUPER_POLICY_MASK;
+    if (flags == current) return 0;
+    return (current & MS_RDONLY) && !(flags & MS_RDONLY) ? -EROFS : -EOPNOTSUPP;
+}
+
 static int pseudo_node_getattr(void *value,const struct vfs_path *path,struct linux_stat_abi *out)
 {
     struct pseudo_mount *context=value;const struct storage_node *node=vfs_path_node(path);
@@ -261,6 +299,11 @@ static int pseudo_node_statfs(void *value,const struct storage_node *node,struct
     return 0;
 }
 
+/** @brief Build a generated-file mount with retained provider and inode keys.
+ * @param provider Required borrowed persistent descriptor with root and lookup.
+ * @param out Required empty output receiving one owned detached mount.
+ * @return Zero or negative errno with context, keys and provider pins balanced.
+ * Execution-owned task context; callbacks run without graph/module spinlocks. */
 int vfs_pseudo_mount_new(const struct vfs_pseudo_provider *provider,struct vfs_mount **out)
 {
     if(!out)return -EINVAL;
@@ -276,7 +319,7 @@ int vfs_pseudo_mount_new(const struct vfs_pseudo_provider *provider,struct vfs_m
         .read=pseudo_node_read,.write=pseudo_node_write,.truncate=pseudo_node_truncate,
         .readdir=pseudo_node_readdir,.permissions=pseudo_node_permissions,
         .file_open=pseudo_file_open,.file_read=pseudo_file_read,.file_close=pseudo_file_close,
-        .mount_flags=pseudo_mount_flags,.getattr=pseudo_node_getattr,.statfs=pseudo_node_statfs};
+        .mount_flags=pseudo_mount_flags,.remount=pseudo_remount,.getattr=pseudo_node_getattr,.statfs=pseudo_node_statfs};
     struct pseudo_mount *context=kernel_malloc(sizeof(*context));int rc=-ENOMEM;
     if(context) {
         *context=(struct pseudo_mount){.provider=provider,.next_id=1};struct storage_node root;
