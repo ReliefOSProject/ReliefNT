@@ -624,6 +624,19 @@ static void test_unix_listener_backlog_boundaries(void)
         (uintptr_t)&address, address_length, 0, 0, 0) == 0);
     assert(syscall_socket_dispatch(__NR_listen, listener_fd, 0, 0, 0, 0, 0) == 0);
     struct unix_socket *listener = unix_from_file(task_file_for_fd(task, listener_fd));
+    char proc[1024] = {0}, identity[64];
+    struct text_stream stream = {.buffer = proc, .capacity = sizeof(proc) - 1};
+    unix_proc_emit(&stream);
+    struct task_file *socket_file = task_file_for_fd(task, listener_fd);
+    snprintf(identity, sizeof(identity), " %llu ", (unsigned long long)socket_file->socket_ino);
+    assert(strstr(proc, "0000000000000000:") && strstr(proc, identity));
+    assert(socket_file->socket_ino == ((1ULL << 60) | listener->handle));
+    struct linux_stat_abi metadata;
+    metadata = (struct linux_stat_abi){0};
+    linux_stat_fd_type(&metadata, socket_file);
+    assert(metadata.st_ino == socket_file->socket_ino &&
+           (metadata.st_mode & LINUX_S_IFMT) == LINUX_S_IFSOCK);
+
     assert(listener->backlog == 0 && listener->pending_limit == 1);
     int zero_clients[2];
     for (unsigned i = 0; i < 2; ++i) {
@@ -1370,12 +1383,14 @@ static void test_nonblocking_drm_read_dispatch(void)
     assert(frame.rip == 0x4002);
     assert(descriptor_dispatch_sleep_count == 0);
     assert(task->syscall_file == NULL);
+    assert(task->proc_read_calls == 1 && !task->proc_read_chars);
 
     struct iovec vector = {.iov_base = &byte, .iov_len = 1};
     frame = (struct trap_frame){.rax = LINUX_SYS_READV, .rdi = (uint64_t)fd,
         .rsi = (uintptr_t)&vector, .rdx = 1, .rip = 0x5002, .rsp = 0x8000};
     syscall_dispatch_frame(&frame);
     assert(descriptor_drm_read_count == 2);
+    assert(task->proc_read_calls == 2 && !task->proc_read_chars);
     assert((int64_t)frame.rax == -RELIEFOS_EAGAIN);
     assert(frame.rip == 0x5002);
     assert(descriptor_dispatch_sleep_count == 0);
@@ -2902,8 +2917,35 @@ static void test_regular_stage_common_cancel(void)
     puts("PASS common cancellation drains queued provider before releasing staged aliases and OFD");
 }
 
+/** @brief Count OFDs across aliases, retained I/O and final release. */
+static void test_proc_ofd_lifetime(void)
+{
+    uint64_t before = proc_open_file_count();
+    struct task *task = calloc(1, sizeof(*task));
+    assert(task);
+    task->limits.nofile.rlim_cur = 32;
+    struct task_file *file;
+    int fd = task_allocate_fd(task, 3, &file);
+    assert(fd == 3);
+    assert(proc_open_file_count() == before + 1);
+    struct task_file *held = task_file_get(file);
+    assert(held);
+    int alias = task_duplicate_file_fd(task, fd, 4, 0);
+    assert(alias == 4);
+    assert(proc_open_file_count() == before + 1);
+    task_discard_file_fd(task, fd);
+    task_discard_file_fd(task, alias);
+    assert(proc_open_file_count() == before + 1);
+    task_file_put(held);
+    assert(proc_open_file_count() == before);
+    sched_task_file_release(task);
+    free(task);
+    puts("PASS proc file-nr counts OFDs across dup, close and retained I/O");
+}
+
 int main(void)
 {
+    test_proc_ofd_lifetime();
     assert(!audio_character_init());
     assert(!drm_character_init());
     test_block_description_lifetime();

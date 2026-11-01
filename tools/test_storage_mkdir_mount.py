@@ -14,7 +14,7 @@ with tempfile.TemporaryDirectory(prefix="reliefos-mkdir-mount-") as directory:
     subprocess.run(["cc", "-std=c11", "-DRELIEFNT_FIXTURE_REAL_DAC", "-DRELIEFNT_FIXTURE_REGISTER_TYPES", "-O1", "-g", "-fsanitize=address,undefined",
                     "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
                     "-Iinclude", "-Iinclude", "-Iinclude/uapi", "-Iinclude",
-                    "tools/tests/storage_mkdir_mount_test.c", "fs/tmpfs/core.c",
+                    "tools/tests/storage_mkdir_mount_test.c", "fs/tmpfs/core.c", "mm/physical/proc.c",
                     "lib/text_utf16.c", *STORAGE_GRAPH_SOURCES, "-o", executable],
                    cwd=ROOT, check=True)
     subprocess.run([executable, image], cwd=ROOT, check=True, timeout=30)

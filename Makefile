@@ -371,6 +371,7 @@ test-panic-console: panic-console-runtime-test
 
 test-abi:
 	$(Q)$(RELIEFNT_TEST_PYTHON) $(RELIEFNT_SRC)/tools/test_abi_layout.py
+	$(Q)$(RELIEFNT_TEST_PYTHON) $(RELIEFNT_SRC)/tools/test_abi_layout_checks.py
 
 test-header-export: headers_install
 	$(Q)$(RELIEFNT_TEST_PYTHON) $(RELIEFNT_SRC)/tools/test_header_export.py --out $(O)

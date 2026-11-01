@@ -6,10 +6,13 @@
 #include "../../kernel/syscall/memory/swap_area.c"
 #include "../../fs/proc/internal.h"
 #include <reliefnt/memory_stats.h>
+#include <reliefnt/proc_stats.h>
 
 struct task *sched_current_task(void) { return NULL; }
 void memory_snapshot_get(struct memory_snapshot *out) { *out=(struct memory_snapshot){0}; }
 void memory_events_get(struct memory_events *out) { *out=(struct memory_events){0}; }
+void mm_proc_snapshot(struct mm_proc_stats *out) { *out=(struct mm_proc_stats){0}; }
+uint64_t tmpfs_memory_kib(void) { return 0; }
 
 /** @brief Consume one immutable proc view in small positional fragments. */
 static size_t read_fragments(void *view,char *buffer,size_t capacity)

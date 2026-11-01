@@ -3,6 +3,8 @@
 #include <reliefnt/usb_device.h>
 #include <reliefnt/blkdev.h>
 #include <reliefnt/console.h>
+#include <reliefnt/sched.h>
+#include <reliefnt/time.h>
 #ifdef REAL_REGISTRY
 #include <reliefnt/module.h>
 #include <reliefnt/lock.h>
@@ -75,6 +77,10 @@ int unregister_block_device(const struct block_device_registration *r)
     return -ENOENT;
 }
 #else
+/* Scripted USB transfers run without a scheduled task or advancing clock. */
+uint64_t time_uptime_ms(void) { return 0; }
+uint32_t sched_current_pid(void) { return 0; }
+struct task *sched_current_task(void) { return NULL; }
 static int (*ledger_quiesce[MAX_REG])(void *);
 static void (*ledger_release[MAX_REG])(void *);
 static void *ledger_context[MAX_REG];

@@ -13,6 +13,8 @@ static volatile uint32_t sched_resched_pending[SMP_MAX_CPUS];
 uint32_t task_capacity;
 
 uint32_t next_pid = 1;
+uint64_t proc_created, proc_switches;
+uint32_t proc_last_pid;
 
 uint32_t current_pid[SMP_MAX_CPUS];
 
@@ -111,6 +113,8 @@ void sched_init(void)
     task_count = 0;
     task_capacity = 0;
     next_pid = 1;
+    proc_created = proc_switches = 0;
+    proc_last_pid = 0;
     for (uint32_t i = 0; i < SMP_MAX_CPUS; ++i) {
         current_pid[i] = 0;
         current_task[i] = NULL;
@@ -192,6 +196,8 @@ void sched_set_running(uint32_t pid)
     }
     fair_stop_cpu(cpu);
     cpu_accounting_settle(cpu);
+    if (current_pid[cpu] != pid)
+        ++proc_switches;
     current_pid[cpu] = pid;
     current_task[cpu] = selected;
     for (uint32_t i = 0; i < task_count; ++i) {
@@ -423,6 +429,8 @@ bool sched_try_resume_current_user_frame(const struct trap_frame *frame)
         !__atomic_load_n(&sched_resched_pending[cpu], __ATOMIC_ACQUIRE) &&
         task_cpu_allowed(current, cpu) && task_frame_valid(current, frame)) {
         current->frame = *frame;
+        cpu_accounting_settle(cpu);
+        cpu_accounting[cpu].kernel_mode = false;
         resume = true;
     }
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
@@ -451,6 +459,7 @@ void sched_quiesce_exited_current(void)
             if (tasks[i]->running_cpu == cpu ||
                 tasks[i]->running_cpu == SCHED_CPU_NONE) {
                 tasks[i]->running_cpu = SCHED_CPU_NONE;
+                ++proc_switches;
                 current_pid[cpu] = 0;
                 current_task[cpu] = NULL;
                 gpu_owner = pid;
@@ -478,6 +487,9 @@ struct task *sched_select_next_user(void)
     fair_stop_cpu(cpu);
     best = fair_select(cpu);
     cpu_accounting_settle(cpu);
+    if (best != old)
+        ++proc_switches;
+    cpu_accounting[cpu].kernel_mode = true;
     if (!best || best != old) {
         /* The execution transaction pins task metadata around this handoff.
          * Switch CR3 before publishing the old task to remote CPUs/reapers,

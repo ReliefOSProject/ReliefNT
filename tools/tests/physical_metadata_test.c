@@ -14,6 +14,7 @@
 #include <reliefnt/heap.h>
 #include <reliefnt/lock.h>
 #include <reliefnt/memory_topology.h>
+#include <reliefnt/proc_stats.h>
 #include <reliefnt/mm.h>
 #include <reliefnt/paging.h>
 #include "../../mm/physical/metadata_internal.h"
@@ -304,6 +305,9 @@ static void ownership(void)
     struct multiboot2_mmap_entry e[] = {{.addr=LOW, .len=2048*PAGE, .type=1},
                                         {.addr=HIGH, .len=66*PAGE, .type=1}};
     boot_memory(e, 2, reserved);
+    struct mm_proc_stats events_before, events_after;
+    mm_proc_snapshot(&events_before);
+    mm_proc_fault();
     assert(mm_phys_is_ram(reserved + 17, PAGE - 17));
     assert(mm_phys_is_ram(LOW, 2048 * PAGE));
     assert(!mm_phys_is_ram(LOW + 2048 * PAGE - 1, 2));
@@ -315,6 +319,9 @@ static void ownership(void)
     assert(adjacent == reserved - PAGE);
     mm_free_pages(adjacent, 2); /* A run containing reserved RAM is wholly rejected. */
     assert(mm_page_refcount(adjacent) == 1);
+    mm_proc_snapshot(&events_after);
+    assert(events_after.allocated == events_before.allocated + 1 &&
+           events_after.freed == events_before.freed);
     mm_free_page(adjacent);
     mm_free_page(reserved); mm_retain_page(reserved);
     assert(mm_free_memory_kib() == before && mm_page_refcount(reserved) == 0);
@@ -332,16 +339,30 @@ static void ownership(void)
     assert(!mm_free_page_reclaimed(page));
     assert(!mm_free_page_reclaimed(reserved));
     assert(mm_page_refcount(page) == 0 && mm_free_memory_kib() == before);
+    mm_proc_snapshot(&events_after);
+    assert(events_after.allocated == events_before.allocated + 2 &&
+           events_after.freed == events_before.freed + 2);
 
     uint64_t block = mm_alloc_pages(8);
     assert(block == HIGH + 58 * PAGE);
     memset(paging_kernel_direct_map(block), 0xa5, 8 * PAGE);
     mm_free_pages(block, 8);
+    mm_proc_snapshot(&events_after);
+    assert(events_after.allocated == events_before.allocated + 10 &&
+           events_after.freed == events_before.freed + 10);
     clear_watch = block;
     assert(mm_alloc_pages(8) == block && clear_checks == 1 && !clear_watch);
+    /* The unlock hook also allocates and frees one page before zeroing. */
+    mm_proc_snapshot(&events_after);
+    assert(events_after.allocated == events_before.allocated + 19 &&
+           events_after.freed == events_before.freed + 11);
     for (unsigned i = 0; i < 8 * PAGE; ++i) assert(!((unsigned char *)paging_kernel_direct_map(block))[i]);
     mm_free_pages(block, 8);
     assert(mm_free_memory_kib() == before);
+    mm_proc_snapshot(&events_after);
+    assert(events_after.allocated == events_before.allocated + 19 &&
+           events_after.freed == events_before.freed + 19 &&
+           events_after.faults == events_before.faults + 1);
     puts("holes, reservations, refcounts, double free and private zeroing: PASS");
 }
 /**

@@ -22,6 +22,6 @@ with tempfile.TemporaryDirectory(prefix="reliefos-installer-ramdisk-", dir=TEMP_
         "cc", "-std=c11", "-O1", "-g", "-fsanitize=address,undefined",
         "-fno-sanitize-recover=all", "-ffunction-sections", "-fdata-sections",
         "-Wl,--gc-sections", "-Iinclude", "-Iinclude/uapi", "-Iinclude",
-        "tools/tests/installer_ramdisk_test.c", "block/ramdisk/boot.c", *STORAGE_GRAPH_SOURCES, "-o", str(executable),
+        "tools/tests/installer_ramdisk_test.c", "mm/physical/proc.c", "block/ramdisk/boot.c", *STORAGE_GRAPH_SOURCES, "-o", str(executable),
     ], cwd=ROOT, check=True)
     subprocess.run([str(executable), str(image)], cwd=ROOT, check=True, timeout=30)

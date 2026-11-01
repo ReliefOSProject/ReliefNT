@@ -1,6 +1,5 @@
 #include "../internal.h"
-
-
+#include <reliefnt/proc_stats.h>
 
 /**
  * @brief Find the PTY alias that represents one Linux descriptor.
@@ -50,6 +49,7 @@ int task_pty_promote(struct task_pty_fd *entry)
     }
     *description = (struct task_pty_description){.references = 1,
         .status_flags = entry->status_flags, .pty_id = entry->pty_id, .endpoint = entry->endpoint};
+    proc_account_file(1);
     entry->description = description;
     return 0;
 }
@@ -74,6 +74,7 @@ void task_pty_release_entry(struct task_pty_fd *entry)
         task_epoll_remove_pty_description(description);
         if (description->pty_id) pty_transfer_put(description->pty_id, description->endpoint);
         vfs_path_put(&description->path_ref);
+        proc_account_file(-1);
         kernel_free(description);
     }
     if (pty_id) {
@@ -251,10 +252,13 @@ int task_console_materialize_stdio(struct task *task)
         return ret;
     }
     *description = (struct task_file){.used = 1,
-        .flags = TASK_FILE_FLAG_DEV_NODE | RELIEFOS_O_RDWR,
-        .node = {.type = RELIEFOS_FS_TYPE_DEVICE, .flags = STORAGE_NODE_FLAG_DEV_NODE,
-                 .first_cluster = STORAGE_DEV_KIND_CONSOLE},
-        .aux = terminal};
+                                      .proc_counted = true,
+                                      .flags = TASK_FILE_FLAG_DEV_NODE | RELIEFOS_O_RDWR,
+                                      .node = {.type = RELIEFOS_FS_TYPE_DEVICE,
+                                               .flags = STORAGE_NODE_FLAG_DEV_NODE,
+                                               .first_cluster = STORAGE_DEV_KIND_CONSOLE},
+                                      .aux = terminal};
+    proc_account_file(1);
     copy_text(description->path, sizeof(description->path), "/dev/console");
     for (int fd = 0; fd < 3; ++fd) {
         if (!(missing & (1u << fd))) continue;

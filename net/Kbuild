@@ -1,4 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-obj-y := interface/ ipv4/ link/ services/ socket/ tcp/ core.o input.o utility.o
+obj-y := interface/ ipv4/ link/ services/ socket/ tcp/ core.o input.o utility.o proc.o
 
 include $(srctree)/scripts/Makefile.module

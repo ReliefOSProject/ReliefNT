@@ -19,7 +19,7 @@ def main():
             "cc", "-std=c11", "-DRELIEFNT_FIXTURE_REAL_DAC", "-O1", "-g", "-fsanitize=address,undefined",
             "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
             "-Iinclude", "-Iinclude", "-Iinclude/uapi",
-            "tools/tests/fat_directory_growth_test.c", "fs/tmpfs/core.c",
+            "tools/tests/fat_directory_growth_test.c", "fs/tmpfs/core.c", "mm/physical/proc.c",
             "lib/text_utf16.c", *STORAGE_GRAPH_SOURCES, "-o", executable,
         ], cwd=ROOT, check=True)
         subprocess.run([executable, image], check=True, timeout=60)

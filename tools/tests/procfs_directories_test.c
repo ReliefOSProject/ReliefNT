@@ -17,7 +17,14 @@ int proc_memory_read(void *view, uint64_t offset, void *buffer, uint32_t capacit
 {
     if (!view || !read || (!buffer && capacity)) return -22;
     struct text_stream stream={.offset=offset,.buffer=buffer,.capacity=capacity};
-    text_string(&stream,"fixture\n"); *read=stream.written; return 0;
+    const char *name = view;
+    if (!strcmp(name, "/proc/meminfo"))
+        text_string(&stream, "MemTotal: 1024 kB\nMemFree: 512 kB\nCached: 16 kB\nShmem: 4 kB\n");
+    else if (!strcmp(name, "/proc/vmstat"))
+        text_string(&stream, "pgalloc_normal 10\npgfault 2\n");
+    else
+        text_string(&stream, "Filename\tType\tSize\tUsed\tPriority\n");
+    *read=stream.written; return 0;
 }
 void proc_memory_close(void *view) { (void)view; }
 int oom_proc_score_for_task(struct task *task) { (void)task; return 0; }
@@ -30,10 +37,6 @@ int oom_adj_set(struct task *task, int value, struct task *caller)
 #include "../../kernel/sched/internal.h"
 void page_cache_report(struct page_cache_report *out) { *out=(struct page_cache_report){0}; }
 void page_cache_note_write(uint64_t physical) { (void)physical; }
-bool address_space_user_page_next(const struct address_space *as, uint64_t start,
-                                  uint64_t end, uint64_t *page, uint64_t *physical,
-                                  uint64_t *flags)
-{ (void)as; (void)start; (void)end; (void)page; (void)physical; (void)flags; return false; }
 uint64_t mm_emergency_reserve_pages(void) { return 0; }
 uint64_t mm_swap_count_existing(const struct address_space *as) { (void)as; return 0; }
 bool kernel_execution_is_outermost(void) { return true; }
@@ -69,7 +72,9 @@ struct task_file *task_file_for_fd(struct task *t, int fd)
     task_file_description(&t->files[fd-3]) : NULL; }
 uint32_t pty_vt_number(uint32_t id) { return id >= 1 && id <= 6 ? id : 0; }
 uint64_t address_space_user_resident_kib(const struct address_space *as)
-{ assert(as == sched_task_as(&current)); return 12; }
+{
+    return as == sched_task_as(&current) ? 12 : 0;
+}
 struct task *sched_current_task(void) { return &current; }
 uint32_t sched_current_pid(void) { return current.pid; }
 struct task *sched_task_at(uint32_t index)
@@ -94,6 +99,10 @@ uint32_t sched_snapshot(struct task_snapshot_info *out, uint32_t capacity, uint6
 uint64_t time_uptime_ms(void) { return 1234; }
 static uint64_t fixture_total_kib = 1024;
 uint64_t mm_total_memory_kib(void) { return fixture_total_kib; }
+uint64_t time_ticks(void)
+{
+    return 123;
+}
 uint64_t mm_free_memory_kib(void) { return 512; }
 #ifndef TEST_REAL_INVENTORY
 uint32_t smp_cpu_count(void) { return 1; }
@@ -110,6 +119,113 @@ void sched_cpu_runtime_snapshot(uint64_t *busy, uint64_t *idle,
   } }
 uint64_t sched_task_cpu_ticks(const struct task *task, bool process)
 { (void)process; return task->cpu_ticks; }
+/* Subsystem boundaries supply deterministic real-state snapshots; all proc,
+ * namespace, access and streaming implementations are linked production units. */
+void sched_task_cpu_times(const struct task *t, bool process, uint64_t *u, uint64_t *k)
+{
+    (void)process;
+    *u = t->cpu_ticks;
+    *k = 0;
+}
+void sched_cpu_times(uint64_t *u, uint64_t *k, uint64_t *idle, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; ++i) {
+        u[i] = 10;
+        k[i] = 0;
+        idle[i] = 20;
+    }
+}
+void sched_load_averages(uint64_t loads[3])
+{
+    loads[0] = 65536;
+    loads[1] = 32768;
+    loads[2] = 65535;
+}
+void sched_proc_snapshot(struct sched_proc_stats *out)
+{
+    *out = (struct sched_proc_stats){
+        .created = 123, .switches = 456, .last_pid = 42, .tasks = visible_tasks, .running = 1};
+}
+uint64_t irq_proc_total(void)
+{
+    return 123;
+}
+void irq_proc_emit(struct text_stream *s)
+{
+    text_string(s, "           CPU0\n 32: 123 timer\n");
+}
+int net_proc_emit(struct text_stream *s, const char *leaf)
+{
+    (void)leaf;
+    text_string(s, "fixture network snapshot\n");
+    return 0;
+}
+int block_proc_emit(struct text_stream *s, bool statistics)
+{
+    (void)statistics;
+    text_string(s, "fixture block snapshot\n");
+    return 0;
+}
+void mm_proc_snapshot(struct mm_proc_stats *out)
+{
+    *out = (struct mm_proc_stats){10, 5, 2};
+}
+void page_cache_memory_kib(uint64_t *resident, uint64_t *reclaimable)
+{
+    *resident = 16;
+    *reclaimable = 8;
+}
+uint64_t tmpfs_memory_kib(void)
+{
+    return 4;
+}
+uint64_t proc_open_file_count(void)
+{
+    return 2;
+}
+uint64_t proc_pipe_policy(unsigned index)
+{
+    return index == 0 ? 1048576 : index == 1 ? 16384 : 0;
+}
+int time_clock_get(int clock, struct linux_timespec *out)
+{
+    (void)clock;
+    out->tv_sec = 100;
+    out->tv_nsec = 0;
+    return 0;
+}
+static struct fixture_pte {
+    const struct address_space *as;
+    uint64_t page, phys, flags;
+} fixture_ptes[32];
+static unsigned fixture_pte_count;
+static uint64_t fixture_cached_phys;
+bool address_space_user_page_next(const struct address_space *as, uint64_t start, uint64_t end,
+                                  uint64_t *page, uint64_t *phys, uint64_t *flags)
+{
+    struct fixture_pte *selected = NULL;
+    for (unsigned i = 0; i < fixture_pte_count; ++i) {
+        struct fixture_pte *p = &fixture_ptes[i];
+        if (p->as == as && p->page >= start && p->page < end &&
+            (!selected || p->page < selected->page))
+            selected = p;
+    }
+    if (!selected)
+        return false;
+    *page = selected->page;
+    *phys = selected->phys;
+    *flags = selected->flags;
+    return true;
+}
+int page_cache_owns(uint64_t phys)
+{
+    return phys && phys == fixture_cached_phys;
+}
+struct task_file *task_descriptor_for_fd(struct task *t, int fd)
+{
+    return fd >= 3 && fd < 3 + SCHED_TASK_FILE_MAX && t->files[fd - 3].used ? &t->files[fd - 3]
+                                                                            : NULL;
+}
 /* All release interfaces must use this record, including its suffix. */
 static const struct reliefos_system_info fixture_system = {
     .kernel_name = "ReliefNT", .kernel_version = "9.8.7-0123",
@@ -349,6 +465,12 @@ int main(void)
     struct storage_node node;
     assert(proc_lookup("/proc/42", &node) == 0 && node.type == RELIEFOS_FS_TYPE_DIR);
     assert(proc_lookup("/proc/self", &node) == 0 && node.type == RELIEFOS_FS_TYPE_SYMLINK);
+    struct task_identity *dynamic_identity = NULL;
+    bool dynamic_magic = true;
+    assert(!proc_mount_node_identity("/proc/self", &dynamic_identity, &dynamic_magic) &&
+           !dynamic_identity && !dynamic_magic);
+    assert(!proc_mount_node_identity("/proc/thread-self", &dynamic_identity, &dynamic_magic) &&
+           !dynamic_identity && !dynamic_magic);
     assert(proc_lookup("/proc/43", &node) == -2);
     assert(proc_lookup("/proc/4294967338", &node) == -2);
     assert(proc_lookup("/proc/42unknown/stat", &node) == -2);
@@ -438,6 +560,13 @@ int main(void)
     assert(proc_readdir("/proc/42", &offset, &entry) == 1 && !strcmp(entry.name, "comm"));
     assert(proc_readdir("/proc/42", &offset, &entry) == 1 && !strcmp(entry.name, "environ"));
     assert(proc_readdir("/proc/42", &offset, &entry) == 1 && !strcmp(entry.name, "fd") && entry.type == RELIEFOS_FS_TYPE_DIR);
+    const char *new_leaves[] = {"task",  "fdinfo",       "limits", "statm", "maps",
+                                "smaps", "smaps_rollup", "auxv",   "io"};
+    for (unsigned i = 0; i < sizeof(new_leaves) / sizeof(*new_leaves); ++i) {
+        assert(proc_readdir("/proc/42", &offset, &entry) == 1 &&
+               !strcmp(entry.name, new_leaves[i]));
+        assert(entry.type == (i < 2 ? RELIEFOS_FS_TYPE_DIR : RELIEFOS_FS_TYPE_FILE));
+    }
     assert(proc_readdir("/proc/42", &offset, &entry) == 1 && !strcmp(entry.name, "oom_score") && entry.type == RELIEFOS_FS_TYPE_FILE);
     assert(proc_readdir("/proc/42", &offset, &entry) == 1 && !strcmp(entry.name, "oom_score_adj") && entry.type == RELIEFOS_FS_TYPE_FILE);
     assert(proc_readdir("/proc/42", &offset, &entry) == 0);
@@ -503,8 +632,11 @@ int main(void)
     unsigned numeric_entries = 0;
     while (proc_readdir("/proc", &offset, &entry) > 0)
         if (entry.name[0] >= '0' && entry.name[0] <= '9') ++numeric_entries;
-    if (numeric_entries != 101)
-        fprintf(stderr, "proc only exposed %u of 101 tasks\n", numeric_entries);
+    assert(numeric_entries == 1);
+    offset = 0;
+    numeric_entries = 0;
+    while (proc_readdir("/proc/42/task", &offset, &entry) > 0)
+        ++numeric_entries;
     assert(numeric_entries == 101);
     assert(proc_read("/proc/42/stat", 0, contents, sizeof(contents) - 1, &got) == 0);
     contents[got] = 0;

@@ -115,7 +115,7 @@ def run_pcm() -> int:
         binary = Path(directory) / "pcm"
         subprocess.run([
             "cc", "-std=c11", "-D_GNU_SOURCE", "-O1", "-g", "-no-pie", "-pthread",
-            "-fsanitize=address,undefined", "-ffunction-sections", "-fdata-sections",
+            "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-ffunction-sections", "-fdata-sections",
             "-Wl,--gc-sections", "-Iinclude",
             "-Iinclude/uapi", "-Iinclude",
             str(PCM_PROBE), "kernel/device/mapping.c", "-o", str(binary),
@@ -133,7 +133,7 @@ def run_device() -> int:
         binary = Path(directory) / "device"
         subprocess.run([
             "cc", "-std=c11", "-D_GNU_SOURCE", "-O1", "-g", "-no-pie", "-pthread",
-            "-fsanitize=address,undefined", "-ffunction-sections", "-fdata-sections",
+            "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-ffunction-sections", "-fdata-sections",
             "-Wl,--gc-sections", "-Iinclude",
             "-Iinclude/uapi", "-Iinclude",
             str(DEVICE_PROBE), "kernel/device/mapping.c", "-o", str(binary),
@@ -144,7 +144,7 @@ def run_device() -> int:
         binary = Path(directory) / "devfs"
         subprocess.run([
             "cc", "-std=c11", "-D_GNU_SOURCE", "-O1", "-g", "-no-pie", "-pthread",
-            "-fsanitize=address,undefined", "-ffunction-sections", "-fdata-sections",
+            "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-ffunction-sections", "-fdata-sections",
             "-Wl,--gc-sections", "-Iinclude",
             "-Iinclude/uapi", "-Iinclude",
             "tools/tests/audio_devfs_test.c", "-o", str(binary),
@@ -161,7 +161,7 @@ def run_vma() -> int:
         binary = Path(directory) / "device"
         subprocess.run([
             "cc", "-std=c11", "-D_GNU_SOURCE", "-O1", "-g", "-no-pie", "-pthread",
-            "-fsanitize=address,undefined", "-ffunction-sections", "-fdata-sections",
+            "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-ffunction-sections", "-fdata-sections",
             "-Wl,--gc-sections", "-Iinclude",
             "-Iinclude/uapi", "-Iinclude",
             str(VMA_PROBE), "kernel/device/mapping.c", "-o", str(binary),
@@ -179,7 +179,7 @@ def run_params() -> int:
         binary = Path(directory) / "params"
         subprocess.run([
             "cc", "-std=c11", "-D_GNU_SOURCE", "-O1", "-g", "-no-pie", "-pthread",
-            "-fsanitize=address,undefined", "-ffunction-sections", "-fdata-sections",
+            "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-ffunction-sections", "-fdata-sections",
             "-Wl,--gc-sections", "-Iinclude",
             "-Iinclude/uapi", "-Iinclude",
             str(PARAMS_PROBE), "-o", str(binary),
@@ -197,7 +197,7 @@ def run_ioctl() -> int:
         binary = Path(directory) / "ioctl"
         subprocess.run([
             "cc", "-std=c11", "-D_GNU_SOURCE", "-O1", "-g", "-no-pie", "-pthread",
-            "-fsanitize=address,undefined", "-ffunction-sections", "-fdata-sections",
+            "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-ffunction-sections", "-fdata-sections",
             "-Wl,--gc-sections", "-Iinclude",
             "-Iinclude/uapi", "-Iinclude",
             str(IOCTL_PROBE), "-o", str(binary),
@@ -215,7 +215,7 @@ def run_mmap() -> int:
         binary = Path(directory) / "mmap"
         subprocess.run([
             "cc", "-std=c11", "-D_GNU_SOURCE", "-O1", "-g", "-no-pie", "-pthread",
-            "-fsanitize=address,undefined", "-ffunction-sections", "-fdata-sections",
+            "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-ffunction-sections", "-fdata-sections",
             "-Wl,--gc-sections", "-Iinclude",
             "-Iinclude/uapi", "-Iinclude",
             str(MMAP_PROBE), "kernel/device/mapping.c", "-o", str(binary),
@@ -233,7 +233,7 @@ def run_control() -> int:
         binary = Path(directory) / "control"
         subprocess.run([
             "cc", "-std=c11", "-D_GNU_SOURCE", "-O1", "-g", "-no-pie", "-pthread",
-            "-fsanitize=address,undefined", "-ffunction-sections", "-fdata-sections",
+            "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-ffunction-sections", "-fdata-sections",
             "-Wl,--gc-sections", "-Iinclude",
             "-Iinclude/uapi", "-Iinclude",
             str(CONTROL_PROBE), "-o", str(binary),
@@ -251,7 +251,7 @@ def run_oss() -> int:
         binary = Path(directory) / "oss"
         subprocess.run([
             "cc", "-std=c11", "-D_GNU_SOURCE", "-O1", "-g", "-no-pie", "-pthread",
-            "-fsanitize=address,undefined", "-ffunction-sections", "-fdata-sections",
+            "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-ffunction-sections", "-fdata-sections",
             "-Wl,--gc-sections", "-Iinclude",
             "-Iinclude/uapi", "-Iinclude",
             str(OSS_PROBE), "-o", str(binary),
@@ -260,7 +260,7 @@ def run_oss() -> int:
         wait_binary = Path(directory) / "oss_wait"
         subprocess.run([
             "cc", "-std=c11", "-D_GNU_SOURCE", "-O1", "-g", "-no-pie", "-pthread",
-            "-fsanitize=address,undefined", "-ffunction-sections", "-fdata-sections",
+            "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-ffunction-sections", "-fdata-sections",
             "-Wl,--gc-sections", "-Iinclude",
             "-Iinclude/uapi", "-Iinclude",
             str(OSS_WAIT_PROBE), "kernel/device/mapping.c", "-o", str(wait_binary),
@@ -284,7 +284,7 @@ def run_mixer() -> int:
         binary = Path(directory) / "mixer"
         subprocess.run([
             "cc", "-std=c11", "-D_GNU_SOURCE", "-O1", "-g", "-no-pie", "-pthread",
-            "-fsanitize=address,undefined", "-ffunction-sections", "-fdata-sections",
+            "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-ffunction-sections", "-fdata-sections",
             "-Wl,--gc-sections", "-Iinclude",
             "-Iinclude/uapi", "-Iinclude",
             str(MIXER_PROBE), "-o", str(binary),
@@ -376,7 +376,7 @@ def build_guest(output: Path, sdk: Path, period_frames: int = 512,
                 raise SystemExit(f"invalid arguments not rejected: {binary}: {invalid}")
     Path(str(output) + "-linux-v6.14-abi.txt").write_text(reference_layout)
     fixture = Path(str(output) + "-transport-test")
-    subprocess.run(["cc", *common, "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
+    subprocess.run(["cc", *common, "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-fno-pie", "-no-pie",
                     "-I", str(ROOT / "include/uapi"),
                     str(ROOT / "tools/tests/audio_guest_transport_test.c"),
                     "-lm", "-o", str(fixture)], cwd=ROOT, check=True, timeout=30)

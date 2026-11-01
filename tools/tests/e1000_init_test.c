@@ -181,7 +181,7 @@ int main(void)
     uint32_t length;
     g_e1000.rx[0].length = 65535;
     g_e1000.rx[0].status = E1000_RX_STATUS_DD | E1000_RX_STATUS_EOP;
-    assert(e1000_poll(frame, sizeof(frame), &length) == 0 && length == 0);
+    assert(e1000_poll(frame, sizeof(frame), &length) == -90 && length == 0);
     /* A full TCP window arrives before the next poll, including ring wrap. */
     for (unsigned burst = 0; burst < 5; ++burst) {
         unsigned queued = 0;

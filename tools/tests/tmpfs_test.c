@@ -4,6 +4,7 @@
 #include <string.h>
 #include <reliefnt/tmpfs.h>
 #include <reliefnt/time.h>
+#include <reliefnt/proc_stats.h>
 #include <linux/mount.h>
 #include <linux/limits.h>
 static struct {
@@ -228,9 +229,11 @@ int main(void)
     assert(!tmpfs_page_resident(fs, a.first_cluster, 0));
     assert(!tmpfs_page_resident(fs, a.first_cluster, 4096));
     uint64_t first, second;
+    assert(tmpfs_memory_kib() == 0);
     assert(tmpfs_get_page(fs, a.first_cluster, 0, &first) == 0);
     assert(tmpfs_page_resident(fs, a.first_cluster, 0));
     assert(!tmpfs_page_resident(fs, a.first_cluster, 4096));
+    assert(tmpfs_memory_kib() == 4);
     assert(tmpfs_get_page(fs, a.first_cluster, 0, &second) == 0 && first == second);
     assert(tmpfs_get_page(fs, a.first_cluster, 4096, &second) == -28);
     assert(tmpfs_get_page(fs, a.first_cluster, 8192, &second) == -22);
@@ -240,6 +243,7 @@ int main(void)
     assert(!strcmp((char *)(uintptr_t)first, "direct"));
     unsigned before = invalidations;
     assert(tmpfs_truncate(fs, a.first_cluster, 0) == 0 && invalidations == before + 1);
+    assert(tmpfs_memory_kib() == 0);
     tmpfs_statfs(fs, &space);
     assert(space.f_bfree == 1);
     /* Mapping references outlive removal of the inode's ownership. */

@@ -141,6 +141,10 @@ uint32_t smp_cpu_count(void) { return 1; }
 struct task *sched_current_task(void) { return NULL; }
 /** @brief Provide the host fixture's synthetic current pid. */
 uint32_t sched_current_pid(void) { return 1; }
+uint64_t time_uptime_ms(void)
+{
+    return 0;
+} /* Synchronous fixture clock. */
 /** @brief Ignore page-cache invalidation for non-page-backed test nodes. */
 void page_cache_invalidate_node(const struct storage_node *node) { (void)node; }
 /** @brief Report no cache entries in the installer fixture.

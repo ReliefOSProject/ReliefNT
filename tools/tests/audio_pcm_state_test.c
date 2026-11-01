@@ -18,6 +18,27 @@ void audio_timer_period_elapsed(uint32_t card, uint32_t device,
     (void)card; (void)device; (void)direction; (void)frames; (void)error;
 }
 
+static void drop_without_dma_backing(void)
+{
+    for (unsigned direction = AUDIO_PLAYBACK; direction <= AUDIO_CAPTURE; ++direction) {
+        struct audio_test_card card;
+        audio_test_card_init(&card);
+        int error = 0;
+        struct audio_pcm *pcm = audio_pcm_open(card.id, 0, direction, &error);
+        assert(pcm && !error && !audio_pcm_buffer(pcm) && !pcm->dma.bytes);
+        assert(!audio_pcm_drop(pcm));
+        assert(pcm->state == AUDIO_PCM_SETUP && !pcm->appl_ptr && !pcm->hw_ptr);
+        struct audio_params params = {48000, 2, 16, 4, 512, 2048};
+        assert(!audio_pcm_hw_params(pcm, &params) && !audio_pcm_prepare(pcm));
+        assert(!audio_pcm_hw_free(pcm) && !pcm->dma.bytes);
+        assert(!audio_pcm_drop(pcm));
+        audio_pcm_release(pcm);
+        assert(card.close_count == 1);
+        assert(!audio_unregister_card(card.id, 0));
+    }
+    puts("PCM DROP before HW_PARAMS and after HW_FREE without DMA PASS");
+}
+
 static void playback_state_and_xrun(void)
 {
     struct audio_test_card card;
@@ -604,6 +625,7 @@ static void hwsync_reads_progress_between_irqs(void)
 
 int main(void)
 {
+    drop_without_dma_backing();
     drain_unsubmitted_ring_is_silent();
     hwsync_failure_quiesces_without_revival();
     hwsync_reads_progress_between_irqs();

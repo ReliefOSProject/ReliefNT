@@ -21,7 +21,7 @@ with tempfile.TemporaryDirectory(prefix='futimens-', dir=TMP) as directory:
         if name == 'futimens_test':
             sources = [
                 'kernel/syscall/fs/filesystem.c', 'kernel/syscall/fs/timestamps.c', 'fs/vfs/mount_tree.c', 'fs/vfs/path.c',
-                'fs/vfs/attributes.c', 'fs/vfs/file.c', 'fs/vfs/initial.c', 'fs/tmpfs/core.c',
+                'fs/vfs/attributes.c', 'fs/vfs/file.c', 'fs/vfs/initial.c', 'fs/tmpfs/core.c', 'mm/physical/proc.c',
                 'fs/security/access.c', 'kernel/syscall/fs/path.c', 'kernel/syscall/fs/lookup_state.c',
                 'kernel/syscall/fd/descriptor.c', 'kernel/device/character.c', 'kernel/syscall/io/vector.c', 'kernel/syscall/fd/pty_descriptor.c',
                 'kernel/sched/tables.c', 'kernel/device/mapping.c', 'kernel/sched/fs.c',

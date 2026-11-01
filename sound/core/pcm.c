@@ -16,6 +16,10 @@ static void audio_pcm_drain_tail_locked(struct audio_pcm *pcm);
 struct audio_pcm pcm_slots[AUDIO_PCM_MAX];
 
 static uint32_t pending_releases;
+/** @brief Reset stream pointers and silence an allocated DMA ring.
+ * @param pcm Locked live PCM; OPEN streams may have no data backing yet.
+ * @return None. Publishes reset control metadata even when no DMA bytes exist.
+ */
 void audio_pcm_reset_locked(struct audio_pcm *pcm)
 {
     pcm->hw_ptr = 0;
@@ -26,8 +30,9 @@ void audio_pcm_reset_locked(struct audio_pcm *pcm)
     pcm->silence_covered = 0;
     pcm->error = 0;
     pcm->wake_seq++;
-    __builtin_memset(audio_pcm_buffer(pcm), pcm->selected.format == AUDIO_FORMAT_U8 ? 0x80 : 0,
-           pcm->dma.bytes);
+    if (pcm->dma.bytes)
+        __builtin_memset(audio_pcm_buffer(pcm), pcm->selected.format == AUDIO_FORMAT_U8 ? 0x80 : 0,
+               pcm->dma.bytes);
     audio_pcm_publish_control_locked(pcm);
 }
 

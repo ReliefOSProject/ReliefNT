@@ -477,6 +477,7 @@ static int e1000_poll(void *frame, uint32_t capacity, uint32_t *out_len)
     uint32_t index;
     uint32_t len;
     uint8_t status;
+    int receive_error = 0;
     if (out_len) {
         *out_len = 0;
     }
@@ -492,6 +493,7 @@ static int e1000_poll(void *frame, uint32_t capacity, uint32_t *out_len)
     len = g_e1000.rx[index].length;
     if ((status & E1000_RX_STATUS_EOP) == 0 || g_e1000.rx[index].errors ||
         len > E1000_BUFFER_SIZE || len > capacity) {
+        receive_error = len > capacity ? -90 : -74;
         len = 0;
     }
     if (len > capacity) {
@@ -511,7 +513,7 @@ static int e1000_poll(void *frame, uint32_t capacity, uint32_t *out_len)
     if (out_len) {
         *out_len = len;
     }
-    return len ? 1 : 0;
+    return receive_error ? receive_error : len ? 1 : 0;
 }
 
 static void e1000_get_info(struct module_e1000_info *info)

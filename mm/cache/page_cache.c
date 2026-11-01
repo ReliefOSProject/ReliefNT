@@ -1,5 +1,6 @@
 /* File-page cache. Only proven reloadable, unmodified pages may be discarded. */
 #include <reliefnt/export.h>
+#include <reliefnt/proc_stats.h>
 #include <reliefnt/lock.h>
 #include <reliefnt/console.h>
 #include <reliefnt/heap.h>
@@ -1195,3 +1196,15 @@ EXPORT_SYMBOL(page_cache_forget_node);
 EXPORT_SYMBOL(page_cache_forget_volume);
 EXPORT_SYMBOL(page_cache_resize_node);
 EXPORT_SYMBOL(page_cache_zero_range);
+
+/** @brief Snapshot cached and safely reclaimable frame counts in KiB.
+ * @param resident Required resident output. @param reclaimable Required output.
+ * The maintained counts are sampled together under the cache lock.
+ */
+void page_cache_memory_kib(uint64_t *resident, uint64_t *reclaimable)
+{
+    struct page_cache_report report;
+    page_cache_report(&report);
+    *resident = report.resident > UINT64_MAX / 4 ? UINT64_MAX : report.resident * 4;
+    *reclaimable = report.reclaimable > UINT64_MAX / 4 ? UINT64_MAX : report.reclaimable * 4;
+}

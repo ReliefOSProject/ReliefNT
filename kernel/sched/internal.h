@@ -438,6 +438,8 @@ struct cpu_runtime_accounting {
     uint64_t last_tick;
     uint64_t busy_ticks;
     uint64_t idle_ticks;
+    uint64_t user_ticks, system_ticks;
+    bool kernel_mode;
     bool started;
 };
 
@@ -445,6 +447,8 @@ extern struct task **tasks;
 extern uint32_t task_count;
 extern uint32_t task_capacity;
 extern uint32_t next_pid;
+extern uint64_t proc_created, proc_switches;
+extern uint32_t proc_last_pid;
 extern uint32_t current_pid[SMP_MAX_CPUS];
 extern struct task *current_task[SMP_MAX_CPUS];
 extern uint32_t next_session_id;

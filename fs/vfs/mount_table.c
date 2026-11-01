@@ -151,3 +151,10 @@ int vfs_read_mount_table(const struct vfs_namespace *ns,const struct vfs_path *r
         rc=mount_line(ns,root,mount,mountinfo,&text,workspace);
     kernel_free(workspace);if(!rc && read)*read=text.count;return rc;
 }
+
+/** @brief Return the retained attachment identity, not its display name.
+ * @param path Borrowed path or NULL. @return ID or zero; execution-owned metadata only. */
+uint64_t vfs_path_mount_id(const struct vfs_path *path)
+{
+    return path && path->mount ? path->mount->id : 0;
+}

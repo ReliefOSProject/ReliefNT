@@ -34,7 +34,8 @@ static void memory_fields(void)
     assert(strstr(output, "MemTotal: 1024 kB\n") && strstr(output, "MemFree: 512 kB\n"));
     assert(strstr(output, "MemAvailable:") && strstr(output, "Cached:") &&
            strstr(output, "Dirty:") && strstr(output, "SwapCached:") &&
-           strstr(output, "SwapTotal: 0 kB\n") && strstr(output, "SwapFree: 0 kB\n"));
+           strstr(output, "Shmem: 4 kB\n") && strstr(output, "SwapTotal: 0 kB\n") &&
+           strstr(output, "SwapFree: 0 kB\n"));
     puts("PASS /proc/meminfo emits RAM, cache, dirty and swap domains");
 }
 
@@ -44,7 +45,9 @@ static void vm_fields(void)
     struct storage_node node; char output[1024];
     assert(!proc_lookup("/proc/vmstat", &node) && node.type == RELIEFOS_FS_TYPE_FILE);
     read_text("/proc/vmstat", output, sizeof(output));
-    assert(strstr(output, "pgfault ") && strstr(output, "pgmajfault ") &&
+    assert(strstr(output, "nr_free_pages 128\n") && strstr(output, "nr_shmem 1\n") &&
+           strstr(output, "pgalloc_normal 10\n") && strstr(output, "pgfree 5\n") &&
+           strstr(output, "pgfault ") && strstr(output, "pgmajfault ") &&
            strstr(output, "pswpin ") && strstr(output, "pswpout ") &&
            strstr(output, "pgscan_direct ") && strstr(output, "pgsteal_direct ") &&
            strstr(output, "oom_kill "));

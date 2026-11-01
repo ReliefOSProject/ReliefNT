@@ -148,6 +148,7 @@ uint32_t task_allocate_pid(void)
             }
         }
         if (!used) {
+            proc_last_pid = candidate;
             return candidate;
         }
     }
@@ -367,6 +368,7 @@ uint32_t sched_create_kernel_task(const char *name, uint64_t entry)
     sched_request_reschedule_all_online();
     console_debug("[reliefnt] task pid=%u name=%s entry=0x%llx\n",
                    task->pid, task->name, (unsigned long long)task->entry);
+    ++proc_created;
     kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
     return task->pid;
 }
@@ -484,6 +486,7 @@ uint32_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack
                    (unsigned long long)task->entry,
                    (unsigned long long)task->stack_top,
                    task->flags);
+    ++proc_created;
     kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
     /* The task is still unpublished to its caller; prepare the root identity
      * after dropping scheduler_lock. Reclaim can use its reserve fallback if

@@ -13,7 +13,7 @@
 
 module-layout 检查本地 Kbuild、重复/遗漏对象、生产实现包含和上游引擎摘要。
 宿主工具/ASan/UBSan、头导出、自包含 C/C++、ELF 和真实运行是不同层次。
-总测试中的已知 ABI golden 差异不得静默更新期望值。
+ABI 变化必须明确审查，不通过重生成历史 golden 消除差异。
 
 测试归属
 ========
@@ -37,6 +37,23 @@ module-layout 检查本地 Kbuild、重复/遗漏对象、生产实现包含和�
 ABI golden、导出头、启动、vDSO、徽标、panic、Kconfig 和模块布局检查。
 仅有 Linux 参考探针通过，不表示相同接口已在 ReliefNT 来宾运行通过。
 
+``procfs`` 套件执行真实 proc/VFS/fdinfo 的 ASan/UBSan 夹具，并在宿主 Linux
+编译运行 ``tools/tests/procfs_probe.c`` 作为 ABI 参考。探针检查系统/进程节点、
+seek、maps、二进制 auxv、描述符和多线程 thread-self；来宾验证应由操作系统
+使用其 SDK 编译该探针后实际运行，并与宿主结果分别记录。
+
+同套件还运行无需 libc 的 ``tools/tests/procfs_raw_probe.c``。该探针可编译为
+initramfs 的 ``/init``，通过 ``rdinit=/init`` 在真实挂载的 procfs 上验收；
+PID 1 将结果写入串口并等待。编译示例::
+
+    cc -std=c11 -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin \
+       -fno-stack-protector -nostdlib -static -no-pie -Wl,-e,_start \
+       -Wl,-Ttext-segment=0x400000 -Iinclude/uapi \
+       tools/tests/procfs_raw_probe.c -o <initramfs-root>/init
+
+来宾验收分别记录单核和多核启动的完整串口日志、内核与探针摘要；
+出现 PASS 后仍需检查没有 FAIL 或 panic，不能只以启动完成代替 syscall 验证。
+
 ``service_roles`` 套件检查旧内核桌面实现未恢复、旧窗口服务权限标志未恢复，
 以及 exec 只保留允许的任务标志；这些内核源码检查由本仓持有，父仓不再重复。
 
@@ -56,11 +73,23 @@ POSIX I/O 检查。宿主 Linux 参考运行与 ReliefNT 来宾执行分别记�
 兼容性基线
 ==========
 
-``tools/tests/abi_layout_golden.json`` 是当前布局校验的基线；
+``tools/tests/abi_layout_golden.json`` 保留原始布局基线；
 ``tools/tests/fixtures/legacy-abi-layout.json`` 保存旧导出面的原始布局记录，
 迁移时逐字保留，两份均不能通过重生成来掩盖布局变化。
+驱动服务表版本 2 的 17 个追加字段在
+``tools/tests/fixtures/driver-api-v2.json`` 单独冻结：168 字节旧前缀的类型与
+偏移仍与原始基线比较，当前服务表总长为 304 字节、对齐为 8。
+``make test-abi`` 同时检查旧前缀与追加字段，版本、大小、偏移和类型变化
+均需显式审查。``abi_layout_checks`` 套件包含对应的失败反例；驱动管理器的
+``driver_modules`` 套件验证旧版本、未知版本和错误描述符大小在 init 前被拒绝。
+这不表示版本 1 驱动二进制能在版本 2 内核运行。
+
 音频 ioctl 支持清单为 ``configs/audio-abi-support.json``。
-验证范围和标志保持原值，断言与清单的既有分歧必须作为失败报告。
+宿主门禁检查标志类型、构建前提、证据路径和验证范围；来宾、上游 ALSA 与
+硬件声明必须有对应说明，缺少证据声明的反例应失败。清单保留已有的验证标志
+和未解决项；这些静态检查不重新执行历史来宾测试，不构成新的运行验收。
+``linux_audio`` 的 ASan/UBSan 探针遇到未定义行为立即失败，不将带有
+sanitizer 错误的零退出状态计为通过；PCM 回归覆盖尚无 DMA 缓冲区时的 DROP。
 
 
 目标运行

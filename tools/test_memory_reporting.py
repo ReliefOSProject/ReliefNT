@@ -73,6 +73,7 @@ def run_cases(output, cases):
         proc_sources = ["tools/tests/memory_reporting_proc_test.c", "fs/vfs/mount_tree.c",
                         "fs/vfs/mount_table.c", "fs/vfs/path.c", "fs/vfs/file.c", "fs/vfs/open.c",
                         "fs/vfs/pseudo.c", "fs/vfs/attributes.c", "fs/proc/mount.c",
+                        "fs/proc/views.c", "kernel/syscall/fd/proc.c", "fs/vfs/exec_file.c",
                         "kernel/sched/identity.c", "kernel/sched/oom.c", "fs/security/access.c",
                         "fs/proc/memory.c", "mm/reclaim/stats.c", "mm/reclaim/oom.c"]
         proc_command = [clang, "-std=c11", "-O1", "-g", "-fsanitize=address,undefined",

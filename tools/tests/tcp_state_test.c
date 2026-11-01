@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include "modules/network.h"
 #include "../../kernel/syscall/ipc/socket.c"
+#include "../../net/proc.c"
 
 static uint64_t now_ms;
 static uint8_t sent_frame[2048];
@@ -84,6 +85,56 @@ int task_packet_recv(struct task_file *file, void *buffer, uint32_t length,
 int task_udp_recv(struct task_file *file, void *buffer, uint32_t length,
                   uint32_t flags, uint64_t address, uint64_t address_length)
 { (void)file; (void)buffer; (void)length; (void)flags; (void)address; (void)address_length; return -LINUX_EOPNOTSUPP; }
+
+/* UDP and NIC counters are separate owners; this fixture only supplies their
+ * boundaries. TCP, route, ARP and UNIX emitters execute production bodies. */
+void net_udp_proc_emit(struct text_stream *stream)
+{
+    (void)stream;
+    abort();
+}
+void net_loopback_proc_emit(struct text_stream *stream)
+{
+    (void)stream;
+    abort();
+}
+void net_device_counters(struct net_proc_counters *out)
+{
+    (void)out;
+    abort();
+}
+
+static void test_proc_network(struct net_socket *socket)
+{
+    char text[4096] = {0}, identity[64];
+    struct text_stream stream = {.buffer = text, .capacity = sizeof(text) - 1};
+    assert(!net_proc_emit(&stream, "tcp"));
+    snprintf(identity, sizeof(identity), " 1000 0 %llu\n",
+             (unsigned long long)((2ULL << 60) | (uint32_t)socket->handle));
+    assert(strstr(text, "0f00250a:c738 0200250a:1f40 01"));
+    assert(strstr(text, "00000000:00000002") && strstr(text, identity));
+    assert(net_proc_emit(&stream, "absent") == -LINUX_ENOENT);
+    struct reliefos_net_config saved = net_config;
+    bool was_up = net_interface_up;
+    net_config.local_ip = 0x0a25000f;
+    net_config.subnet_mask = 0xffffff00;
+    net_config.gateway_ip = 0x0a250002;
+    net_interface_up = true;
+    memset(text, 0, sizeof(text));
+    stream = (struct text_stream){.buffer = text, .capacity = sizeof(text) - 1};
+    assert(!net_proc_emit(&stream, "route"));
+    assert(strstr(text, "eth0\t0000250a\t00000000\t0001") && strstr(text, "00ffffff"));
+    assert(strstr(text, "eth0\t00000000\t0200250a\t0003"));
+    const uint8_t mac[] = {2, 3, 4, 5, 6, 7};
+    net_arp_cache_store(0x0a250002, mac);
+    memset(text, 0, sizeof(text));
+    stream = (struct text_stream){.buffer = text, .capacity = sizeof(text) - 1};
+    assert(!net_proc_emit(&stream, "arp") && strstr(text, "10.37.0.2"));
+    assert(strstr(text, "02:03:04:05:06:07") && strstr(text, "eth0"));
+    net_config = saved;
+    net_interface_up = was_up;
+    net_arp_cache_clear();
+}
 
 static void test_tcp_peek(struct net_socket *s)
 {
@@ -918,6 +969,7 @@ int main(void)
     net_socket_handle_tcp(s->remote_ip, s->remote_port, s->local_port,
                           500, 100, 65535, TCP_FLAG_ACK, bytes, sizeof(bytes));
     assert(s->rx_len == 2 && s->remote_seq == 504 && s->rx[0] == 3 && s->rx[1] == 4);
+    test_proc_network(s);
     test_tcp_peek(s);
     test_small_reads(s);
     test_window_edges(s);

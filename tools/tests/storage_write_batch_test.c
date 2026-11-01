@@ -3,6 +3,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+/* No task scheduling or clock advancement is modeled by batch I/O. */
+struct task *sched_current_task(void)
+{
+    return NULL;
+}
+uint32_t sched_current_pid(void)
+{
+    return 0;
+}
+uint64_t time_uptime_ms(void)
+{
+    return 0;
+}
 #include "../../block/core/storage_internal.h"
 #include "../../block/core/storage_state.c"
 #include "../../block/core/device_number.c"

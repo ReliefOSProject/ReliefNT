@@ -1,5 +1,6 @@
 /* Unix-domain sockets backed by the kernel object table. */
 #include <reliefnt/heap.h>
+#include <reliefnt/proc_stats.h>
 #include "unix_path.h"
 #include <reliefnt/net.h>
 #include <reliefnt/net_udp.h>
@@ -542,6 +543,7 @@ static int unix_alloc_fd(struct task *task, struct unix_socket *socket)
     file->flags = TASK_FILE_FLAG_SOCKET | TASK_FILE_FLAG_SOCKET_UNIX | RELIEFOS_O_RDWR;
     file->node = (struct storage_node){.type = RELIEFOS_FS_TYPE_SOCKET};
     file->aux = socket->handle;
+    file->socket_ino = (1ULL << 60) | socket->handle;
     ++socket->refs;
     return fd;
 }
@@ -555,6 +557,8 @@ static int unix_clone_fd_to_task(struct task *target, struct task_file *source)
     struct task_file *file;
     int fd = task_allocate_fd(target, 0, &file);
     if (fd < 0) { clear_task_file(&retained); return fd; }
+    if (file->proc_counted)
+        proc_account_file(-1);
     *file = retained;
     return fd;
 }
@@ -1335,6 +1339,7 @@ static int64_t inet_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
             file->node = (struct storage_node){.type = RELIEFOS_FS_TYPE_DEVICE};
             file->offset = 0;
             file->aux = (uint64_t)(uint32_t)request.socket;
+            file->socket_ino = (2ULL << 60) | (uint32_t)request.socket;
             file->path[0] = 0;
             net_socket_pin_fd(request.socket);
             return fd;
@@ -2990,4 +2995,41 @@ int64_t syscall_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
         return inet_socket_dispatch(number, a0, a1, a2, a3, a4);
     }
     return unix_socket_dispatch(number, a0, a1, a2, a3);
+}
+
+/** @brief Render live UNIX socket metadata with no kernel pointer disclosure.
+ * @param s Required slice; caller holds execution ownership over registry.
+ * References, type, state and names come from actual live socket objects.
+ */
+void unix_proc_emit(struct text_stream *s)
+{
+    text_string(s, "Num       RefCount Protocol Flags    Type St Inode Path\n");
+    for (struct unix_socket *u = unix_sockets; u; u = u->registry_next) {
+        if (!u->used)
+            continue;
+        text_string(s, "0000000000000000: ");
+        text_hex(s, u->refs, 8);
+        text_string(s, " 00000000 ");
+        text_hex(s, u->state == UNIX_SOCKET_LISTEN ? 0x10000 : 0, 8);
+        text_string(s, " ");
+        text_hex(s, u->type, 4);
+        text_string(s, u->state == UNIX_SOCKET_CONNECTED ? " 03 " : " 01 ");
+        text_unsigned(s, (1ULL << 60) | u->handle);
+        if (u->path_len) {
+            text_string(s, " ");
+            for (uint32_t i = 0; i < u->path_len; ++i) {
+                char c = u->path[i];
+                if (!c) {
+                    if (i == 0)
+                        text_string(s, "@");
+                    else if (i + 1 < u->path_len)
+                        text_string(s, "@");
+                } else if (c == '\n')
+                    text_string(s, "\\n");
+                else
+                    text_bytes(s, &c, 1);
+            }
+        }
+        text_string(s, "\n");
+    }
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Host-side contract checks for the native x86-64 Linux syscall ABI."""
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import json
 import re
 
@@ -67,6 +67,37 @@ def test_audio_export_closure() -> None:
         assert needed <= exported, f"{path}: missing sound closure {needed - exported}"
 
 
+def check_audio_validation(validation) -> None:
+    """Validate bounded evidence declarations; this does not rerun guest tests."""
+    for category in ("source_host_fixture", "guest_binary_build", "guest_runtime",
+                     "upstream_alsa", "physical_hardware"):
+        assert isinstance(validation.get(category), bool), category
+
+    def evidence(field):
+        text = validation.get(field)
+        assert isinstance(text, str) and text.strip(), f"missing {field}"
+        for item in text.split(";"):
+            path = PurePosixPath(item.strip())
+            assert path.parts and path.parts[0] == "out" and ".." not in path.parts, field
+            assert path.suffix == ".json", field
+
+    def scope(field):
+        text = validation.get(field)
+        assert isinstance(text, str) and text.strip(), f"missing {field}"
+
+    if validation["guest_runtime"]:
+        assert validation["source_host_fixture"] and validation["guest_binary_build"], "guest prerequisites"
+        scope("guest_probe_modes_verified")
+        evidence("guest_probe_evidence")
+    if validation["upstream_alsa"]:
+        assert validation["guest_runtime"], "upstream ALSA requires guest validation"
+        scope("upstream_alsa_scope")
+    if validation["physical_hardware"]:
+        assert validation["guest_runtime"], "hardware requires runtime validation"
+        scope("physical_hardware_scope")
+        evidence("physical_hardware_evidence")
+
+
 def test_audio_support_manifest() -> None:
     manifest = json.loads(read("configs/audio-abi-support.json"))
     assert manifest["uapi"] == "Linux v6.14 native x86-64"
@@ -81,17 +112,37 @@ def test_audio_support_manifest() -> None:
             assert entry[field], (name, field)
     for path in re.findall(r"tools/(?:test_\w+\.py|tests/\w+\.c)", json.dumps(manifest)):
         assert (ROOT / path).is_file(), f"manifest evidence file missing: {path}"
-    for category in ("guest_runtime", "upstream_alsa", "physical_hardware"):
-        assert manifest["validation"][category] is False, category
+    check_audio_validation(manifest["validation"])
     assert manifest["ioctls"]["SNDRV_PCM_IOCTL_WRITEN_FRAMES"]["supported"] is False
     assert manifest["ioctls"]["SNDRV_CTL_IOCTL_RAWMIDI_INFO"]["supported"] is False
+
+
+def test_audio_validation_rejects_unsubstantiated_claims() -> None:
+    valid = {"source_host_fixture": True, "guest_binary_build": True,
+             "guest_runtime": True, "upstream_alsa": True, "physical_hardware": False,
+             "guest_probe_modes_verified": "Fixture playback only",
+             "guest_probe_evidence": "out/audio-fixture/result.json",
+             "upstream_alsa_scope": "Fixture playback only"}
+    check_audio_validation(valid)
+    for field, value in (("guest_runtime", "true"), ("source_host_fixture", False),
+                         ("guest_binary_build", False), ("guest_probe_evidence", ""),
+                         ("guest_probe_evidence", "out/../untrusted/result.json"),
+                         ("guest_probe_modes_verified", ""), ("upstream_alsa_scope", ""),
+                         ("physical_hardware", True)):
+        invalid = dict(valid)
+        invalid[field] = value
+        try:
+            check_audio_validation(invalid)
+        except AssertionError:
+            continue
+        raise AssertionError(f"unsupported audio validation claim accepted: {field}={value!r}")
 
 
 if __name__ == "__main__":
     tests = [test_linux_numbers_and_flags,
              test_native_syscall_entry_and_stack_protocol,
              test_contract_fixes_are_present, test_audio_export_closure,
-             test_audio_support_manifest]
+             test_audio_support_manifest, test_audio_validation_rejects_unsubstantiated_claims]
     for test in tests:
         test()
         print(f"PASS {test.__name__}")

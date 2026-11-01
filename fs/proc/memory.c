@@ -2,6 +2,7 @@
 #include "internal.h"
 #include <reliefnt/heap.h>
 #include <reliefnt/memory_stats.h>
+#include <reliefnt/proc_stats.h>
 #include <reliefnt/swap_report.h>
 #include <reliefnt/text_stream.h>
 #include <linux/errno.h>
@@ -11,6 +12,8 @@ struct proc_memory_view {
     enum memory_view_kind kind;
     struct memory_snapshot memory;
     struct memory_events events;
+    struct mm_proc_stats physical;
+    uint64_t shmem_kib;
     struct swap_report *swap;
 };
 
@@ -36,8 +39,12 @@ int proc_memory_open(const char *name, void **out)
     *view = (struct proc_memory_view){0}; int rc = 0;
     if (!__builtin_strcmp(name, "/proc/meminfo")) {
         view->kind = MEMORY_VIEW_INFO; memory_snapshot_get(&view->memory);
+        view->shmem_kib = tmpfs_memory_kib();
     } else if (!__builtin_strcmp(name, "/proc/vmstat")) {
         view->kind = MEMORY_VIEW_VMSTAT; memory_events_get(&view->events);
+        memory_snapshot_get(&view->memory);
+        mm_proc_snapshot(&view->physical);
+        view->shmem_kib = tmpfs_memory_kib();
     } else {
         view->kind = MEMORY_VIEW_SWAPS; rc = swap_report_capture(&view->swap);
     }
@@ -100,11 +107,17 @@ int proc_memory_read(void *value, uint64_t offset, void *buffer, uint32_t capaci
         memory_field(&s, "MemFree", m->free_kib);
         memory_field(&s, "MemAvailable", m->available_kib);
         memory_field(&s, "Cached", m->cached_kib);
+        memory_field(&s, "Shmem", view->shmem_kib);
         memory_field(&s, "Dirty", m->dirty_kib);
         memory_field(&s, "SwapCached", 0);
         memory_field(&s, "SwapTotal", m->swap_total_kib);
         memory_field(&s, "SwapFree", m->swap_free_kib);
     } else if (view->kind == MEMORY_VIEW_VMSTAT) {
+        event_field(&s, "nr_free_pages", view->memory.free_kib / 4);
+        event_field(&s, "nr_file_pages", view->memory.cached_kib / 4);
+        event_field(&s, "nr_shmem", view->shmem_kib / 4);
+        event_field(&s, "pgalloc_normal", view->physical.allocated);
+        event_field(&s, "pgfree", view->physical.freed);
         static const char *const names[MEMORY_EVENT_COUNT] = {"pgfault", "pgmajfault", "pswpin",
             "pswpout", "pgscan_direct", "pgscan_kswapd", "pgsteal_direct", "pgsteal_kswapd", "oom_kill"};
         for (unsigned i = 0; i < MEMORY_EVENT_COUNT; ++i) event_field(&s, names[i], view->events.value[i]);

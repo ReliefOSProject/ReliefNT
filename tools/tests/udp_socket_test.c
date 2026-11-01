@@ -41,6 +41,7 @@ static int open_socket(void)
 int main(void)
 {
     current.cap_effective = 1ULL << CAP_NET_BIND_SERVICE;
+    current.euid = 1234;
     int a = open_socket(), b = open_socket();
     assert(a >= 0 && b >= 0 && a != b);
     assert(files[a].fd_flags == 1 && (files[a].flags & RELIEFOS_O_NONBLOCK));
@@ -52,6 +53,16 @@ int main(void)
     char text[16] = {0};
     assert(task_udp_recv(&files[b], text, sizeof(text), 0, 0, 0) == -LINUX_EAGAIN);
     assert(task_udp_send(&files[a], "hello", 5, 0, 0, 0) == 5);
+    char proc[2048] = {0}, identity[64];
+    struct text_stream stream = {.buffer = proc, .capacity = sizeof(proc) - 1};
+    net_udp_proc_emit(&stream);
+    snprintf(identity, sizeof(identity), " 1234 0 %llu\n", (unsigned long long)files[b].socket_ino);
+    assert(strstr(proc, "0100007f:d6d8") && strstr(proc, "00000000:00000005"));
+    assert(files[b].socket_ino && strstr(proc, identity));
+    memset(proc, 0, sizeof(proc));
+    stream = (struct text_stream){.buffer = proc, .capacity = sizeof(proc) - 1};
+    net_loopback_proc_emit(&stream);
+    assert(!strcmp(proc, "    lo: 33 1 0 0 0 0 0 0 33 1 0 0 0 0 0 0\n"));
     assert(task_udp_poll(&files[b], POLLIN | POLLOUT) == (POLLIN | POLLOUT));
     assert(task_udp_recv(&files[b], text, 2, MSG_PEEK | MSG_TRUNC, 0, 0) == 5);
     assert(!memcmp(text, "he", 2));

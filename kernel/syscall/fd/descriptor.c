@@ -7,6 +7,26 @@ extern void memory_wait_cancel(struct task *) __attribute__((weak));
 #include <reliefnt/graphics_service.h>
 #include "../internal.h"
 #include <reliefnt/module.h>
+#include <reliefnt/proc_stats.h>
+
+static uint64_t proc_files;
+
+/** @brief Snapshot allocated OFDs, including queued and mapping-only references.
+ * @return Live descriptions; caller holds execution ownership. */
+uint64_t proc_open_file_count(void)
+{
+    return proc_files;
+}
+
+/** @brief Account a separately owned terminal description allocation/release.
+ * @param delta Plus/minus one, serialized by execution ownership. */
+void proc_account_file(int delta)
+{
+    if (delta > 0)
+        ++proc_files;
+    else
+        --proc_files;
+}
 
 static struct task_file *task_file_promote(struct task_file *source);
 
@@ -42,6 +62,10 @@ int clear_task_file_result(struct task_file *file)
         }
         task_socket_collect();
         return result;
+    }
+    if (file->proc_counted) {
+        --proc_files;
+        file->proc_counted = false;
     }
     if (file->references == 0) task_epoll_remove_file_description(file);
     syscall_flock_release_owner(file);
@@ -145,6 +169,7 @@ static struct task_file *task_file_promote(struct task_file *source)
         }
     }
     source->block_ref=(struct block_device_ref){0}; /* Move token into canonical OFD. */
+    source->proc_counted = false;
     source->description = description;
     return description;
 }
@@ -161,6 +186,8 @@ int task_file_reference(struct task_file *destination, struct task_file *source)
     if (!source || !source->used || !destination) return -RELIEFOS_EBADF;
     struct task_file *description = task_file_promote(source);
     if (!description) return -RELIEFOS_ENOMEM;
+    if (destination->proc_counted)
+        --proc_files;
     *destination = (struct task_file){.used = 1, .description = description};
     ++description->references;
     return 0;
@@ -298,6 +325,7 @@ int syscall_clone_task_files(const struct task *parent, struct task *child)
             if (!pass) {
                 if (!task_file_promote(source)) {  return -RELIEFOS_ENOMEM; }
             } else {
+                destination->proc_counted = false;
                 task_file_reference(destination, source);
                 destination->fd_flags = source->fd_flags;
             }
@@ -372,6 +400,7 @@ int syscall_unshare_task_files(struct task *task)
                     return -RELIEFOS_ENOMEM;
                 }
             } else {
+                destination->proc_counted = false;
                 task_file_reference(destination, source);
                 destination->fd_flags = source->fd_flags;
             }
@@ -453,6 +482,8 @@ void task_fifo_cancel(struct task *task)
     if (!task || !task->fifo_open_file) return;
     struct task_file *file = task->fifo_open_file;
     task->fifo_open_file = NULL;
+    if (file->proc_counted)
+        proc_account_file(-1);
     task_pipe_release(file);
     (void)storage_inode_put(file->inode);
     vfs_path_put(&file->path_ref);
@@ -622,7 +653,8 @@ int task_allocate_fd(struct task *task, int minimum, struct task_file **slot)
     struct task_file *file = fd < 3 ? &sched_task_fds(task)->stdio_files[fd] :
         sched_task_file_at(task, (uint32_t)fd - 3);
     if (!file) return -RELIEFOS_ENOMEM;
-    *file = (struct task_file){.used = 1};
+    *file = (struct task_file){.used = 1, .proc_counted = true};
+    ++proc_files;
     if (fd < 3) {
         sched_task_fds(task)->closed_stdio_mask &= ~(1u << fd);
         sched_task_fds(task)->cloexec_stdio_mask &= ~(1u << fd);
@@ -748,6 +780,8 @@ int task_duplicate_file_fd(struct task *task, int old_fd, int minimum_fd,
     struct task_file *target;
     int fd = task_allocate_fd(task, minimum_fd, &target);
     if (fd < 0) { clear_task_file(&retained); return fd; }
+    if (target->proc_counted)
+        proc_account_file(-1);
     *target = retained;
     target->fd_flags = fd_flags;
     return fd;

@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <reliefnt/sched.h>
+#include <reliefnt/smp.h>
 
 #define AUDIO_FIXTURE_REAL_WAIT
 #define AUDIO_FIXTURE_NO_PTHREAD
@@ -38,6 +39,9 @@ void *kernel_malloc(uint64_t size)
     return malloc(size);
 }
 void kernel_free(void *pointer) { free(pointer); }
+/* The host fixture models one online CPU; wait and reschedule logic is real. */
+uint32_t smp_cpu_count(void) { return 1; }
+bool smp_cpu_online(uint32_t cpu) { return cpu == 0; }
 
 static struct audio_test_card *wait_card;
 static int wake_before_sleep, wake_after_sleep;

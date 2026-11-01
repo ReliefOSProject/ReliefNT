@@ -134,6 +134,10 @@ void audio_pcm_progress_locked(struct audio_pcm *pcm, uint64_t frames);
  */
 void audio_pcm_notify(uint32_t stream, uint64_t frames, int error);
 
+/** @brief Reset stream pointers and silence an allocated DMA ring.
+ * @param pcm Locked live PCM; OPEN streams may have no data backing yet.
+ * @return None. Publishes reset control metadata even when no DMA bytes exist.
+ */
 void audio_pcm_reset_locked(struct audio_pcm *pcm);
 
 /** @brief Test whether an operation may commit to this PCM generation.

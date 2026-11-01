@@ -130,6 +130,14 @@ uint64_t time_ticks(void)
     return 0;
 #endif
 }
+/* The fixture owns physical pages; count the dispatch boundary independently. */
+static atomic_uint_fast64_t user_faults;
+void mm_proc_fault(void)
+{
+    atomic_fetch_add(&user_faults, 1);
+}
+/* Some narrow fault fixtures do not link the scheduler accounting unit. */
+__attribute__((weak)) void sched_account_mode(bool kernel) { (void)kernel; }
 #ifdef PRESSURE_REPORTING_FIXTURE
 static unsigned fixture_tlb_flushes;
 static uint64_t fixture_invlpg_count, fixture_invlpg_last;

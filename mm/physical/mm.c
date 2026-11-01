@@ -6,6 +6,7 @@
 #include <reliefnt/mm.h>
 #include <reliefnt/panic.h>
 #include <reliefnt/paging.h>
+#include <reliefnt/proc_stats.h>
 #include <linux/errno.h>
 
 #define MM_REF_PINNED UINT32_MAX
@@ -20,6 +21,7 @@ static struct mm_metadata memory;
 static const struct mm_topology *trusted_topology;
 static struct mm_hint low_hint, high_hint;
 static uint64_t free_page_count, total_kib, emergency_reserve_pages;
+static uint64_t proc_allocated, proc_freed, proc_faults;
 static bool runtime_ready;
 static struct kernel_spinlock mm_lock = KERNEL_SPINLOCK_INIT;
 
@@ -71,6 +73,7 @@ int mm_runtime_init(const struct mm_topology *topology)
     int rc = mm_metadata_prepare(topology, &prepared);
     if (rc) return rc;
     kernel_spin_init(&mm_lock);
+    proc_allocated = proc_freed = proc_faults = 0;
     memory = prepared;
     free_page_count = prepared.free_pages;
     total_kib = prepared.free_pages * (MM_PHYS_PAGE_SIZE / 1024);
@@ -197,6 +200,7 @@ static void claim(struct mm_page_section *first_section, uint64_t first, uint32_
         --s->free_count;
     }
     free_page_count -= count;
+    proc_allocated += count;
     lower_hint(&low_hint, first_section, first, first + count - 1);
     lower_hint(&high_hint, first_section, first, first + count - 1);
 }
@@ -401,6 +405,7 @@ static bool release_page_locked(struct mm_page_section *section, uint64_t pfn)
     if (!*refs || *refs == MM_REF_PINNED || --*refs) return false;
     section->free[offset / 64] |= 1ULL << (offset % 64);
     ++section->free_count; ++free_page_count;
+    ++proc_freed;
     note_free(section, pfn);
     return true;
 }
@@ -477,3 +482,20 @@ EXPORT_SYMBOL(mm_free_pages);
 EXPORT_SYMBOL(mm_phys_to_virt);
 EXPORT_SYMBOL(mm_virt_to_phys);
 EXPORT_SYMBOL(mm_free_memory_kib);
+
+/** @brief Snapshot allocator events under its IRQ-safe lock.
+ * @param out Required kernel output; no memory or reference ownership changes.
+ */
+void mm_proc_snapshot(struct mm_proc_stats *out)
+{
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&mm_lock, &flags);
+    *out = (struct mm_proc_stats){proc_allocated, proc_freed,
+                                  __atomic_load_n(&proc_faults, __ATOMIC_RELAXED)};
+    kernel_spin_unlock_irqrestore(&mm_lock, flags);
+}
+/** @brief Count a user fault without acquiring execution or allocator locks. */
+void mm_proc_fault(void)
+{
+    __atomic_fetch_add(&proc_faults, 1, __ATOMIC_RELAXED);
+}

@@ -65,3 +65,10 @@ int vfs_exec_source_read(const struct vfs_exec_source *source,uint64_t offset,
     if(*read>capacity){*read=0;return -EIO;}
     return rc;
 }
+
+/** @brief Borrow an immutable executable path without acquiring references.
+ * @param source Live retained source or NULL. @return Path valid through source lifetime. */
+const struct vfs_path *vfs_exec_source_path(const struct vfs_exec_source *source)
+{
+    return source ? &source->path : NULL;
+}

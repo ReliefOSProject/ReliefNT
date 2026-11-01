@@ -1,3 +1,4 @@
+#include <reliefnt/proc_stats.h>
 #include "manager_internal.h"
 
 /**
@@ -407,6 +408,8 @@ const uint8_t *e1000_mac(void)
     return e1000_mac_cache;
 }
 
+static struct net_proc_counters proc_nic;
+
 /**
  * @brief Send an Ethernet frame through the driver, or -19 when no driver is ready.
  * @param frame Kernel-owned frame borrowed through send callback return.
@@ -420,6 +423,11 @@ int e1000_send(const void *frame, uint32_t len)
     if (!ops) return -19;
     int ret = ops->is_ready && ops->send && ops->is_ready()
                   ? ops->send(frame, len) : -19;
+    if (!ret) {
+        proc_nic.tx_bytes += len;
+        ++proc_nic.tx_packets;
+    } else
+        ++proc_nic.tx_errors;
     driver_manager_service_unpin(owner);
     return ret;
 }
@@ -436,8 +444,19 @@ int e1000_poll(void *frame, uint32_t capacity, uint32_t *out_len)
     uint32_t owner;
     const struct reliefos_driver_e1000_ops *ops = driver_e1000_service_pin(&owner);
     if (!ops) return -19;
-    int ret = ops->is_ready && ops->poll && ops->is_ready()
-                  ? ops->poll(frame, capacity, out_len) : -19;
+    uint32_t received = 0;
+    int ret =
+        ops->is_ready && ops->poll && ops->is_ready() ? ops->poll(frame, capacity, &received) : -19;
+    if (ret > 0) {
+        proc_nic.rx_bytes += received;
+        ++proc_nic.rx_packets;
+    } else if (ret < 0) {
+        ++proc_nic.rx_errors;
+        if (ret == -90 || ret == -74)
+            ++proc_nic.rx_drops;
+    }
+    if (out_len)
+        *out_len = received;
     driver_manager_service_unpin(owner);
     return ret;
 }
@@ -472,4 +491,12 @@ void e1000_get_info(struct e1000_info *info)
     for (uint32_t index = 0; index < 6; ++index) {
         info->mac[index] = source.mac[index];
     }
+}
+
+/** @brief Read core-observed Ethernet transport completions.
+ * @param out Required scalar output; execution ownership, no provider callbacks.
+ */
+void net_device_counters(struct net_proc_counters *out)
+{
+    *out = proc_nic;
 }

@@ -4,10 +4,16 @@
 #include <stdlib.h>
 #include <reliefnt/console.h>
 #include <reliefnt/blkdev.h>
+#include <reliefnt/sched.h>
+#include <reliefnt/time.h>
 #include "../../drivers/usb/xhci/internal.h"
 #include "../../drivers/usb/storage/internal.h"
 
 static unsigned allocations, commands, releases;
+/* Failure/revocation callbacks run without a scheduled I/O owner. */
+uint64_t time_uptime_ms(void){return 0;}
+uint32_t sched_current_pid(void){return 0;}
+struct task *sched_current_task(void){return NULL;}
 uint64_t time_ticks(void){return 0;}
 void *kernel_malloc(size_t bytes){void *p=calloc(1,bytes);if(p)++allocations;return p;}
 void kernel_free(void *p){if(p){assert(allocations);--allocations;free(p);}}

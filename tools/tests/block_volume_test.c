@@ -6,6 +6,19 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+/* This transport-only fixture has no scheduled caller or elapsed clock. */
+struct task *sched_current_task(void)
+{
+    return NULL;
+}
+uint32_t sched_current_pid(void)
+{
+    return 0;
+}
+uint64_t time_uptime_ms(void)
+{
+    return 0;
+}
 void console_log(enum console_log_level level,const char *format,...) {(void)level;(void)format;}
 static unsigned allocations,reads,writes,cancels;
 static int pending;

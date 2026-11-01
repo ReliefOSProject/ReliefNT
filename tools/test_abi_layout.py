@@ -4,12 +4,12 @@
 The golden file records, for every struct/union defined in the exported
 UAPI surface: sizeof, align and every member offset, plus the numeric
 value of the load-bearing constants (ioctl numbers, magics, versions).
-Run with --update after an INTENTIONAL ABI change; an accidental change
-must fail this test.
+The original golden is immutable. Reviewed driver ABI v2 additions are recorded
+separately, so both the v1 prefix and the exact v2 extension remain checked.
 
 Layout data comes from clang's record-layout dump of a probe TU that
 instantiates every discovered wire struct, so new structs are picked up
-automatically (and require a golden update to pass).
+automatically (and require explicit ABI review to pass).
 """
 from pathlib import Path
 import argparse
@@ -21,6 +21,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 GOLDEN = ROOT / "tools/tests/abi_layout_golden.json"
+DRIVER_V2 = ROOT / "tools/tests/fixtures/driver-api-v2.json"
 
 # Headers that hold user/kernel wire contracts (pre- and post-split).
 WIRE_HEADERS = [
@@ -115,7 +116,10 @@ _DECL_PATH = re.compile(r"/[^() ]*/include/")
 
 
 def normalize_decl(decl):
-    return _DECL_PATH.sub("include/", decl)
+    decl = _DECL_PATH.sub("include/", decl)
+    # Clang versions differ in whether an anonymous union enclosing an
+    # anonymous struct appears in that struct's qualified display name.
+    return re.sub(r"::\(unnamed (?:struct|union)\)(?=::\(unnamed at )", "", decl)
 
 
 def parse_record_layouts(dump, wanted):
@@ -175,41 +179,37 @@ def collect(structs):
         return {"consts": consts, "layout": layout}
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--update", action="store_true",
-                        help="rewrite the golden file after an intentional change")
-    args = parser.parse_args()
-    paths = wire_header_paths()
-    structs = discover_structs(paths)
-    current = collect(structs)
-    if args.update:
-        GOLDEN.parent.mkdir(parents=True, exist_ok=True)
-        GOLDEN.write_text(json.dumps(current, indent=1, sort_keys=True) + "\n")
-        print(f"updated {GOLDEN.relative_to(ROOT)}: "
-              f"{len(current['layout'])} records, {len(current['consts'])} constants")
-        return
-    if not GOLDEN.is_file():
-        raise SystemExit(f"missing golden {GOLDEN}; run with --update first")
-    golden = json.loads(GOLDEN.read_text())
-    # The golden was recorded under a different absolute source path; the
-    # normalization makes both sides comparable regardless of checkout location.
-    for record in golden.get("layout", {}).values():
-        record["members"] = [[offset, normalize_decl(decl)]
-                             for offset, decl in record["members"]]
+def expected_baseline():
+    """Keep the original wire ABI and append only the reviewed v2 services."""
+    baseline = json.loads(GOLDEN.read_text())
+    extension = json.loads(DRIVER_V2.read_text())
+    api = baseline["layout"]["reliefos_driver_kernel_api"]
+    assert baseline["consts"]["RELIEFOS_DRIVER_ABI_VERSION"] == 1, "v1 golden changed"
+    assert api["size"] == extension["prefix_size"] == 168, "v1 prefix changed"
+    assert api["align"] == extension["align"], "driver API alignment changed"
+    assert [offset for offset, _ in extension["members"]] == list(
+        range(extension["prefix_size"], extension["size"], 8)), "invalid v2 extension"
+    api["members"].extend(extension["members"])
+    api["size"] = extension["size"]
+    baseline["consts"]["RELIEFOS_DRIVER_ABI_VERSION"] = extension["abi_version"]
+    return baseline
+
+
+def compare_abi(golden, current):
+    """Report all wire changes, ignoring only compiler display-name trivia."""
     failures = []
     for record in sorted(set(golden["layout"]) | set(current["layout"])):
         want, have = golden["layout"].get(record), current["layout"].get(record)
         if want is None:
-            failures.append(f"{record}: new record (run --update after review)")
+            failures.append(f"{record}: new record (requires ABI review)")
         elif have is None:
             failures.append(f"{record}: disappeared")
         elif want != have:
             for key in ("size", "align"):
                 if want.get(key) != have.get(key):
                     failures.append(f"{record}: {key} {want.get(key)} -> {have.get(key)}")
-            want_members = {tuple(m) for m in want["members"]}
-            have_members = {tuple(m) for m in have["members"]}
+            want_members = {(offset, normalize_decl(decl)) for offset, decl in want["members"]}
+            have_members = {(offset, normalize_decl(decl)) for offset, decl in have["members"]}
             for offset, decl in sorted(want_members - have_members):
                 failures.append(f"{record}: member lost/moved: {offset} {decl}")
             for offset, decl in sorted(have_members - want_members):
@@ -218,13 +218,21 @@ def main():
         want, have = golden["consts"].get(const), current["consts"].get(const)
         if want != have:
             failures.append(f"constant {const}: {want} -> {have}")
+    return failures
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.parse_args()
+    current = collect(discover_structs(wire_header_paths()))
+    failures = compare_abi(expected_baseline(), current)
     if failures:
         print("ABI DRIFT detected (this is what the test is for):")
         for line in failures:
             print("  " + line)
         raise SystemExit(1)
     print(f"PASS ABI layout: {len(current['layout'])} records, "
-          f"{len(current['consts'])} constants unchanged")
+          f"{len(current['consts'])} constants; v1 prefix and reviewed driver ABI v2")
 
 
 if __name__ == "__main__":
