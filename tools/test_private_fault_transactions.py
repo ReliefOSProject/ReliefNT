@@ -24,7 +24,8 @@ class PrivateFaultTransactions(unittest.TestCase):
         cls.dispatch = str(Path(cls.temp.name) / "dispatch")
         cls.sequence = str(Path(cls.temp.name) / "sequence")
         subprocess.run([*common, "tools/tests/private_fault_dispatch_test.c",
-                        "arch/x86_64/interrupt/idt.c", "kernel/sched/core.c", "mm/cache/page_cache.c",
+                        "arch/x86_64/interrupt/idt.c", "kernel/sched/core.c",
+                        "kernel/sched/accounting.c", "mm/cache/page_cache.c",
                         "fs/vfs/mount_tree.c", "fs/vfs/file.c", "fs/vfs/open.c",
                         "fs/vfs/attributes.c", "fs/vfs/exec_file.c",
                         "-Wl,--wrap=vfs_exec_source_get", "-Wl,--wrap=vfs_exec_source_put",

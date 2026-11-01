@@ -10,3 +10,4 @@
    abi
    exec
    descriptors
+   procfs

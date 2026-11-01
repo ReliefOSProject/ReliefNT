@@ -1,4 +1,5 @@
 #include <reliefnt/tmpfs.h>
+#include <reliefnt/proc_stats.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/mm.h>
 #include <reliefnt/time.h>
@@ -94,6 +95,7 @@ static void tmpfs_free_inode(struct tmpfs_super *fs, struct tmpfs_inode *n)
             kernel_free(p);
             p = next;
             --fs->used_pages;
+            tmpfs_account_pages(-1);
         }
     }
     struct tmpfs_entry *e = n->entries;
@@ -552,7 +554,9 @@ static int tmpfs_page_allocate(struct tmpfs_super *fs,struct tmpfs_inode *n,uint
     if (!p->phys) {kernel_free(p);return -12;}
     __builtin_memset(mm_phys_to_virt(p->phys),0,TMPFS_PAGE);
     p->index=index;p->next=NULL;
-    ++fs->used_pages;n->stat.st_blocks+=TMPFS_PAGE/512;
+    ++fs->used_pages;
+    tmpfs_account_pages(1);
+    n->stat.st_blocks += TMPFS_PAGE / 512;
     *out=p;return 0;
 }
 /** @brief Find or publish one quota-accounted file page.
@@ -607,7 +611,9 @@ int tmpfs_fallocate(struct tmpfs_super *fs,uint32_t ino,uint32_t mode,uint64_t o
         struct tmpfs_page *page=pending;pending=page->next;
         if(rc) {
             mm_free_page(page->phys);kernel_free(page);
-            --fs->used_pages;n->stat.st_blocks-=TMPFS_PAGE/512;
+            --fs->used_pages;
+            tmpfs_account_pages(-1);
+            n->stat.st_blocks -= TMPFS_PAGE / 512;
         } else {
             page->next=n->pages[page->index%TMPFS_HASH];n->pages[page->index%TMPFS_HASH]=page;
         }
@@ -770,6 +776,7 @@ int tmpfs_truncate(struct tmpfs_super *fs, uint32_t ino, uint64_t length)
                     mm_free_page(p->phys);
                     kernel_free(p);
                     --fs->used_pages;
+                    tmpfs_account_pages(-1);
                     n->stat.st_blocks -= TMPFS_PAGE / 512;
                 } else {
                     if (p->index == length / TMPFS_PAGE && length % TMPFS_PAGE)

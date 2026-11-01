@@ -5,6 +5,7 @@
 
 struct module;
 struct block_device;
+struct block_device_ref;
 #define BLOCK_DEVICE_READ_ONLY 1u
 #define BLOCK_DEVICE_REMOVABLE 2u
 #define BLOCK_DEVICE_OPTICAL 4u
@@ -12,6 +13,15 @@ struct block_device;
 /* Scalar inventory transport for reserved boot-image backing, not a pointer. */
 #define BLOCK_TRANSPORT_MEMORY 4u
 #define BLOCK_TRANSPORT_USB 5u
+
+struct block_io_stats {
+    uint64_t reads, writes, read_sectors, write_sectors;
+    uint64_t read_ms, write_ms, in_flight, io_ms, weighted_ms;
+};
+/** @brief Snapshot successful complete block operations, with a short registry lock.
+ * @param ref Live owned reference. @param out Required output.
+ * @return Zero or EINVAL; no native callback or lifetime transfer. */
+int block_device_statistics(const struct block_device_ref *ref, struct block_io_stats *out);
 
 struct block_device_info {
     uint64_t device, blocks;

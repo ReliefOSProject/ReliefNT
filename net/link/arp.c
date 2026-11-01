@@ -1,4 +1,5 @@
 #include "../internal.h"
+#include <reliefnt/proc_stats.h>
 
 /**
  * Net arp cache lookup.
@@ -223,4 +224,30 @@ int net_resolve_mac(uint32_t ip, uint32_t timeout_ms, uint8_t *out_mac)
         net_cpu_relax();
     }
     return -2;
+}
+
+/** @brief Emit only populated ARP cache entries without resolving neighbours.
+ * @param s Required output slice, serialized by execution ownership.
+ */
+void net_arp_proc_emit(struct text_stream *s)
+{
+    text_string(s,
+                "IP address       HW type     Flags       HW address            Mask     Device\n");
+    for (uint32_t i = 0; i < NET_ARP_CACHE_SIZE; ++i) {
+        const struct net_arp_cache_entry *a = &net_arp_cache[i];
+        if (!a->ip)
+            continue;
+        for (int byte = 3; byte >= 0; --byte) {
+            text_unsigned(s, (a->ip >> (byte * 8)) & 255);
+            if (byte)
+                text_string(s, ".");
+        }
+        text_string(s, " 0x1 0x2 ");
+        for (unsigned b = 0; b < 6; ++b) {
+            if (b)
+                text_string(s, ":");
+            text_hex(s, a->mac[b], 2);
+        }
+        text_string(s, " * eth0\n");
+    }
 }

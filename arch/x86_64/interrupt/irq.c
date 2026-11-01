@@ -3,6 +3,7 @@
  * Routes timer, input, storage, and device interrupts to kernel subsystems.
  */
 #include <reliefnt/console.h>
+#include <reliefnt/proc_stats.h>
 #include <reliefnt/apic.h>
 #include <reliefnt/driver_manager.h>
 #include <reliefnt/input.h>
@@ -28,6 +29,7 @@
 /* PS/2 set-1 make code; repeated make codes implement press-and-hold. */
 #define KEYCODE_BACKSPACE 14U
 
+static uint64_t proc_irq_counts[SMP_MAX_CPUS][256];
 static uint8_t key_states[128];
 static uint8_t e0_prefix;
 static struct keyboard_led_command keyboard_led = {.applied = 0xff};
@@ -182,6 +184,9 @@ struct task *irq_dispatch(struct trap_frame *frame)
 {
     uint64_t vector = frame ? frame->vector : 0;
     bool from_user = frame && ((frame->cs & 3ULL) == 3ULL);
+    uint32_t cpu = smp_current_cpu();
+    if (frame && vector < 256 && cpu < SMP_MAX_CPUS)
+        __atomic_fetch_add(&proc_irq_counts[cpu][vector], 1, __ATOMIC_RELAXED);
     if (vector >= 0x50 && vector <= 0x5f) {
         pci_irq_dispatch((uint32_t)vector);
         apic_eoi();
@@ -303,5 +308,52 @@ void kernel_irq_restore(uint64_t flags)
         __asm__ volatile("sti" : : : "memory");
     } else {
         __asm__ volatile("cli" : : : "memory");
+    }
+}
+
+/** @brief Sum delivered hardware vectors without taking IRQ-shared locks.
+ * @return Approximate monotonic total; no allocation or ownership change.
+ */
+uint64_t irq_proc_total(void)
+{
+    uint64_t total = 0;
+    for (unsigned c = 0; c < SMP_MAX_CPUS; ++c)
+        for (unsigned v = 32; v < 256; ++v)
+            total += __atomic_load_n(&proc_irq_counts[c][v], __ATOMIC_RELAXED);
+    return total;
+}
+/** @brief Emit per-CPU actual interrupt deliveries using vector identities.
+ * @param s Required slice. Atomic observations, no callback/code addresses.
+ */
+void irq_proc_emit(struct text_stream *s)
+{
+    uint32_t count = smp_cpu_count();
+    if (count > SMP_MAX_CPUS)
+        count = SMP_MAX_CPUS;
+    text_string(s, "           ");
+    for (unsigned c = 0; c < count; ++c) {
+        text_string(s, " CPU");
+        text_unsigned(s, c);
+    }
+    text_string(s, "\n");
+    for (unsigned v = 32; v < 256; ++v) {
+        uint64_t sum = 0;
+        for (unsigned c = 0; c < count; ++c)
+            sum += __atomic_load_n(&proc_irq_counts[c][v], __ATOMIC_RELAXED);
+        if (!sum)
+            continue;
+        text_unsigned(s, v);
+        text_string(s, ":");
+        for (unsigned c = 0; c < count; ++c) {
+            text_string(s, " ");
+            text_unsigned(s, __atomic_load_n(&proc_irq_counts[c][v], __ATOMIC_RELAXED));
+        }
+        text_string(s, "  x86-vector ");
+        text_string(s, v == 0x20                ? "timer"
+                       : v == 0x21              ? "keyboard"
+                       : v == 0x2c              ? "mouse"
+                       : v >= 0x50 && v <= 0x5f ? "PCI-MSI"
+                                                : "interrupt");
+        text_string(s, "\n");
     }
 }

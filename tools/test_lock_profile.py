@@ -23,7 +23,7 @@ with tempfile.TemporaryDirectory(prefix="reliefnt-lock-proc-") as directory:
     binary = str(Path(directory) / "proc")
     sources = ["tools/tests/lock_profile_proc_test.c", "fs/vfs/mount_tree.c", "fs/vfs/mount_table.c",
                "fs/vfs/path.c", "fs/vfs/file.c", "fs/vfs/open.c", "fs/vfs/pseudo.c", "fs/vfs/attributes.c",
-               "fs/proc/mount.c", "kernel/sched/identity.c", "fs/security/access.c"]
+               "fs/proc/mount.c", "fs/proc/views.c", "kernel/syscall/fd/proc.c", "fs/vfs/exec_file.c", "kernel/sched/identity.c", "fs/security/access.c"]
     if (ROOT / "kernel/sync/profile.c").exists():
         sources.append("kernel/sync/profile.c")
     subprocess.run(["cc", "-std=c11", "-O1", "-g", "-fsanitize=address,undefined",
@@ -50,7 +50,7 @@ with tempfile.TemporaryDirectory(prefix="reliefnt-lock-sync-") as directory:
                     "-DCONFIG_LOCK_STAT", "-DRELIEFNT_LOCK_PROFILE_TEST",
                     "-Iinclude", "-Iinclude/uapi", "tools/tests/lock_profile_sync_io_test.c",
                     "fs/vfs/mount_tree.c", "fs/vfs/mount_table.c", "fs/vfs/path.c", "fs/vfs/file.c",
-                    "fs/vfs/open.c", "fs/vfs/pseudo.c", "fs/vfs/attributes.c", "fs/proc/mount.c",
+                    "fs/vfs/open.c", "fs/vfs/pseudo.c", "fs/vfs/attributes.c", "fs/proc/mount.c", "fs/proc/views.c", "kernel/syscall/fd/proc.c", "fs/vfs/exec_file.c",
                     "kernel/sched/identity.c", "fs/security/access.c", "kernel/sync/profile.c",
                     "-o", binary], cwd=ROOT, check=True)
     subprocess.run([binary], cwd=ROOT, check=True, timeout=10)

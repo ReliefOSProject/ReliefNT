@@ -41,7 +41,7 @@ def main():
              "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
              "-Iinclude", "-Iinclude", "-Iinclude/uapi",
              "-Iinclude", "tools/tests/ext4_vfs_read_test.c",
-             "fs/tmpfs/core.c", "lib/text_utf16.c", "-o", str(vfs)])
+             "fs/tmpfs/core.c", "mm/physical/proc.c", "lib/text_utf16.c", "-o", str(vfs)])
         stage = work / "stage"
         stage.mkdir()
         (stage / "payload").write_bytes(b"original" * 1024)

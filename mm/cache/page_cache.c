@@ -3,6 +3,7 @@
  * Entries retain physical pages until invalidated or replaced while idle.
  */
 #include <reliefnt/export.h>
+#include <reliefnt/proc_stats.h>
 #include <reliefnt/lock.h>
 #include <reliefnt/console.h>
 #include <reliefnt/heap.h>
@@ -308,3 +309,30 @@ void page_cache_stats(uint32_t *count, uint32_t *hits)
 /* Native filesystem modules share this core-owned interface; CRC/release
  * checks bind it to the exact kernel, without a stable cross-release API. */
 EXPORT_SYMBOL(page_cache_invalidate_node);
+
+/** @brief Count actual cached physical frames including overflow chunks.
+ * @param resident Required KiB output. @param reclaimable Required idle KiB output.
+ * IRQ-safe cache lock; does not release pages or call filesystem providers.
+ */
+void page_cache_memory_kib(uint64_t *resident, uint64_t *reclaimable)
+{
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&cache_lock, &flags);
+    uint64_t live = 0, idle = 0;
+    for (uint32_t i = 0; i < PAGE_CACHE_MAX; ++i)
+        if (entries[i].used) {
+            ++live;
+            if (!entries[i].refs)
+                ++idle;
+        }
+    for (struct page_cache_overflow *c = overflow; c; c = c->next)
+        for (uint32_t i = 0; i < PAGE_CACHE_OVERFLOW_ENTRIES; ++i)
+            if (c->entries[i].used) {
+                ++live;
+                if (!c->entries[i].refs)
+                    ++idle;
+            }
+    kernel_spin_unlock_irqrestore(&cache_lock, flags);
+    *resident = live * 4;
+    *reclaimable = idle * 4;
+}

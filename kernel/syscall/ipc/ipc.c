@@ -10,6 +10,7 @@
 #include <reliefnt/wait.h>
 #include <reliefnt/futex.h>
 #include <reliefnt/sysv_shm.h>
+#include <reliefnt/proc_stats.h>
 #include <reliefos/fs_abi.h>
 
 /* Linux's default is sixteen pages. Capacity is per pipe, not a global pool. */
@@ -417,6 +418,8 @@ int task_fifo_open(struct task *task, const struct storage_node *node,
             file->path[i] = 0;
         }
         task_pipe_retain(file);
+        file->proc_counted = true;
+        proc_account_file(1);
         task->fifo_open_file = file;
         (void)kernel_wait_queue_wake_all(&pipe->wait_read);
     }
@@ -433,6 +436,8 @@ int task_fifo_open(struct task *task, const struct storage_node *node,
     struct task_file *destination;
     int fd = task_allocate_fd(task, 0, &destination);
     if (fd < 0) { task_fifo_cancel(task); return fd; }
+    if (destination->proc_counted)
+        proc_account_file(-1);
     *destination = *file;
     task->fifo_open_file = NULL;
     kernel_free(file);
@@ -538,4 +543,13 @@ int64_t syscall_ipc_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
     if (number >= LINUX_SYS_MSGGET && number <= LINUX_SYS_MSGCTL)
         return syscall_sysv_msg(number, a0, a1, a2, a3, a4);
     return syscall_dispatch_regs_legacy(number, a0, a1, a2, a3, a4, a5);
+}
+
+/** @brief Snapshot enforced per-pipe and per-UID page policy.
+ * @param index Zero=max bytes, one=soft pages, two=hard pages (no hard limit).
+ * @return Configured scalar; execution-owned, no allocations or mutations.
+ */
+uint64_t proc_pipe_policy(unsigned index)
+{
+    return index == 0 ? TASK_PIPE_USER_MAX : index == 1 ? TASK_PIPE_USER_SOFT_PAGES : 0;
 }

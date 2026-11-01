@@ -131,6 +131,10 @@ int audio_card_pcm_caps(uint32_t card, uint32_t device,
 void kernel_execution_lock_irqsave(uint64_t *flags) { *flags = 0; }
 void kernel_execution_unlock_irqrestore(uint64_t flags) { (void)flags; }
 uint32_t sched_current_pid(void) { return 1; }
+uint64_t time_uptime_ms(void)
+{
+    return 0;
+} /* Synchronous fixture clock. */
 struct task *sched_current_task(void) { return NULL; }
 #ifndef RELIEFNT_FIXTURE_REAL_DAC
 bool task_in_group(const struct task *task, uint32_t gid, bool real)

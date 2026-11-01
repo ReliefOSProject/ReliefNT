@@ -5,6 +5,7 @@
 #include <reliefnt/bugcheck.h>
 #include <reliefnt/arch.h>
 #include <reliefnt/console.h>
+#include <reliefnt/proc_stats.h>
 #include <reliefnt/lock.h>
 #include <reliefnt/lock_profile.h>
 #include <reliefnt/paging.h>
@@ -496,6 +497,10 @@ static void signal_user_page_fault(struct trap_frame *frame, uint64_t cr2)
  */
 struct task *page_fault_dispatch(struct trap_frame *frame)
 {
+    if (frame && (frame->cs & 3u) == 3u) {
+        mm_proc_fault();
+        sched_account_mode(true);
+    }
     uint64_t cr2 = x86_64_read_cr2();
     uint64_t execution_flags;
 

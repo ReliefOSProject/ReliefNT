@@ -435,6 +435,11 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
         parent->wake_tick = 0;
         parent->state = TASK_BLOCKED;
     }
+    child->proc_read_chars = child->proc_write_chars = 0;
+    child->proc_read_calls = child->proc_write_calls = 0;
+    child->proc_read_bytes = child->proc_write_bytes = 0;
+    child->cpu_user_ticks = child->cpu_system_ticks = 0;
+    ++proc_created;
     child->state = TASK_READY;
     sched_request_reschedule_all_online();
     kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);

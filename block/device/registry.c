@@ -5,11 +5,23 @@
 #include <reliefnt/lock.h>
 #include <reliefnt/export.h>
 #include <linux/errno.h>
+#include <reliefnt/time.h>
+#include <reliefnt/sched.h>
+
+struct block_io_request {
+    struct block_io_request *next;
+    uint64_t first, started;
+    uint32_t count, pid;
+    bool write;
+};
 
 struct block_device {
     struct block_device *next;
     const struct block_device_registration *registration;
     uint64_t references,users,serial;
+    struct block_io_stats statistics;
+    struct block_io_request *requests;
+    uint64_t statistics_at;
     bool linked,active,revoked;
 };
 static struct block_device *devices,*last_device;
@@ -17,6 +29,19 @@ static uint64_t last_serial;
 static struct kernel_spinlock device_lock=KERNEL_SPINLOCK_INIT;
 
 static uint32_t disk_numbers,optical_numbers;
+
+/** @brief Settle real in-flight wall time while holding the device metadata lock.
+ * @param device Live core identity. @param now Current monotonic milliseconds.
+ * No callbacks or allocation; pending EAGAIN requests remain in flight.
+ */
+static void statistics_settle(struct block_device *device, uint64_t now)
+{
+    uint64_t delta = now - device->statistics_at;
+    device->statistics_at = now;
+    if (device->statistics.in_flight)
+        device->statistics.io_ms += delta;
+    device->statistics.weighted_ms += delta * device->statistics.in_flight;
+}
 
 /** @brief Reserve stable Linux identities independently of registry admission.
  * @param optical Select standard optical major 11 or dynamic block major 259.
@@ -41,7 +66,14 @@ static void device_put(struct block_device *device)
     uint64_t flags;kernel_spin_lock_irqsave(&device_lock,&flags);
     bool last=!--device->references;
     kernel_spin_unlock_irqrestore(&device_lock,flags);
-    if(last)kernel_free(device);
+    if (last) {
+        while (device->requests) {
+            struct block_io_request *r = device->requests;
+            device->requests = r->next;
+            kernel_free(r);
+        }
+        kernel_free(device);
+    }
 }
 
 /** @brief Unlink an exact core identity while the caller holds the registry lock.
@@ -256,8 +288,83 @@ static int device_transfer(const struct block_device_ref *reference,uint64_t fir
        (uint64_t)count*info->block_size>SIZE_MAX)return -EINVAL;
     if(write && (info->flags&BLOCK_DEVICE_READ_ONLY))return -EROFS;
     if(!module_execution_get(registration->owner))return -ENODEV;
+    struct block_device *device = reference->device;
+    uint32_t pid = sched_current_pid();
+    uint64_t now = time_uptime_ms();
+    struct block_io_request local = {
+        .first = first, .count = count, .pid = pid, .write = write, .started = now};
+    kernel_spin_lock_irqsave(&device_lock, &flags);
+    struct block_io_request *request = device->requests;
+    while (request && (request->pid != pid || request->first != first || request->count != count ||
+                       request->write != write))
+        request = request->next;
+    bool retained = request != NULL;
+    if (!request) {
+        request = &local;
+        statistics_settle(device, now);
+        ++device->statistics.in_flight;
+        request->next = device->requests;
+        device->requests = request;
+    }
+    kernel_spin_unlock_irqrestore(&device_lock, flags);
     int result=write ? registration->operations->write(registration->context,first,count,buffer) :
         registration->operations->read(registration->context,first,count,buffer);
+    if (result == -EAGAIN && !retained) {
+        /* Synchronous I/O needs no accounting allocation. Preserve asynchronous
+         * timing when possible; telemetry OOM must not change transport results. */
+        struct block_io_request *pending = kernel_malloc(sizeof(*pending));
+        if (pending)
+            *pending = local;
+        now = time_uptime_ms();
+        kernel_spin_lock_irqsave(&device_lock, &flags);
+        statistics_settle(device, now);
+        struct block_io_request **link = &device->requests;
+        while (*link && *link != request)
+            link = &(*link)->next;
+        if (pending) {
+            pending->next = request->next;
+            *link = pending;
+        } else {
+            *link = request->next;
+            --device->statistics.in_flight;
+        }
+        kernel_spin_unlock_irqrestore(&device_lock, flags);
+    } else if (result != -EAGAIN) {
+        now = time_uptime_ms();
+        kernel_spin_lock_irqsave(&device_lock, &flags);
+        statistics_settle(device, now);
+        --device->statistics.in_flight;
+        struct block_io_request **link = &device->requests;
+        while (*link && *link != request)
+            link = &(*link)->next;
+        if (*link)
+            *link = request->next;
+        if (!result) {
+            struct block_io_stats *st = &device->statistics;
+            uint64_t elapsed = now - request->started;
+            if (write) {
+                ++st->writes;
+                st->write_sectors += (uint64_t)count * (info->block_size / 512);
+                st->write_ms += elapsed;
+            } else {
+                ++st->reads;
+                st->read_sectors += (uint64_t)count * (info->block_size / 512);
+                st->read_ms += elapsed;
+            }
+        }
+        kernel_spin_unlock_irqrestore(&device_lock, flags);
+        if (retained)
+            kernel_free(request);
+        if (!result) {
+            struct task *task = sched_current_task();
+            if (task) {
+                if (write)
+                    task->proc_write_bytes += (uint64_t)count * info->block_size;
+                else
+                    task->proc_read_bytes += (uint64_t)count * info->block_size;
+            }
+        }
+    }
     module_execution_put(registration->owner);return result;
 }
 
@@ -320,8 +427,42 @@ void block_device_cancel_all(uint32_t pid)
         if(r->operations->cancel && module_execution_get(r->owner)) {
             r->operations->cancel(r->context,pid);module_execution_put(r->owner);
         }
+        for (;;) {
+            uint64_t flags;
+            kernel_spin_lock_irqsave(&device_lock, &flags);
+            struct block_device *device = ref.device;
+            struct block_io_request **link = &device->requests;
+            while (*link && (*link)->pid != pid)
+                link = &(*link)->next;
+            struct block_io_request *request = *link;
+            if (request) {
+                statistics_settle(device, time_uptime_ms());
+                --device->statistics.in_flight;
+                *link = request->next;
+            }
+            kernel_spin_unlock_irqrestore(&device_lock, flags);
+            if (!request)
+                break;
+            kernel_free(request);
+        }
         block_device_put(&ref);
     }
 }
 EXPORT_SYMBOL(block_device_allocate_number);
 EXPORT_SYMBOL(block_device_cancel_all);
+
+/** @brief Read successful complete-transfer counters from a retained registration.
+ * @param ref Required live reference. @param out Required output.
+ * @return Zero or EINVAL, IRQ-safe metadata lock and no provider callbacks.
+ */
+int block_device_statistics(const struct block_device_ref *ref, struct block_io_stats *out)
+{
+    if (!ref || !ref->device || !out)
+        return -EINVAL;
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&device_lock, &flags);
+    statistics_settle(ref->device, time_uptime_ms());
+    *out = ref->device->statistics;
+    kernel_spin_unlock_irqrestore(&device_lock, flags);
+    return 0;
+}

@@ -6,9 +6,26 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <reliefnt/sched.h>
+static uint64_t fixture_ms;
+static struct task fixture_task = {.pid = 42};
+uint64_t time_uptime_ms(void)
+{
+    return fixture_ms++;
+}
+uint32_t sched_current_pid(void)
+{
+    return fixture_task.pid;
+}
+struct task *sched_current_task(void)
+{
+    return &fixture_task;
+}
+
 static struct module owner;
 static size_t allocations;
 static int budget=-1;
+static bool probe_registration=true;
 static unsigned reads,writes,flushes,stops,releases,exits;
 static int read_result,flush_result;
 static bool stop_ready=true;
@@ -43,7 +60,9 @@ static int read_blocks(void *context,uint64_t first,uint32_t count,void *output)
     assert(context==media && owner.runtime->users && owner.runtime->executing);
     assert(module_unload("test_block",0)==-EWOULDBLOCK);
     /* Real registration from inside I/O proves the registry lock is not held. */
-    assert(!register_block_device(&builtin));assert(!unregister_block_device(&builtin));
+    if(probe_registration) {
+        assert(!register_block_device(&builtin));assert(!unregister_block_device(&builtin));
+    }
     ++reads;if(read_result)return read_result;
     memcpy(output,media+first*512,count*512);return 0;
 }
@@ -105,7 +124,40 @@ int main(void)
     for(unsigned i=0;i<sizeof(bytes);++i)assert(bytes[i]==0x42);
     memset(bytes,0x73,512);assert(!block_device_write(&ref,2,1,bytes) && writes==1);
     assert(media[1023]==0x42 && media[1024]==0x73 && media[1535]==0x73 && media[1536]==0x42);
+    struct block_io_stats stats;
+    assert(!block_device_statistics(&ref, &stats));
+    assert(stats.reads == 1 && stats.read_sectors == 4 && stats.writes == 1 &&
+           stats.write_sectors == 1);
+    assert(stats.read_ms && stats.write_ms && !stats.in_flight);
+    assert(fixture_task.proc_read_bytes == 2048 && fixture_task.proc_write_bytes == 512);
+    read_result = -EIO;
+    assert(block_device_read(&ref, 0, 1, bytes) == -EIO);
+    assert(!block_device_statistics(&ref, &stats) && stats.reads == 1 && !stats.in_flight);
     read_result=-EAGAIN;assert(block_device_read(&ref,0,1,bytes)==-EAGAIN && !runtime->executing);read_result=0;
+    assert(!block_device_statistics(&ref, &stats) && stats.in_flight == 1 && stats.reads == 1);
+    assert(!block_device_read(&ref, 0, 1, bytes));
+    assert(!block_device_statistics(&ref, &stats) && !stats.in_flight && stats.reads == 2 &&
+           stats.read_sectors == 5);
+    assert(fixture_task.proc_read_bytes == 2560);
+    read_result = -EAGAIN;
+    assert(block_device_read(&ref, 1, 1, bytes) == -EAGAIN);
+    block_device_cancel_all(fixture_task.pid);
+    read_result = 0;
+    assert(!block_device_statistics(&ref, &stats) && !stats.in_flight && stats.reads == 2);
+    /* Statistics must not make synchronous I/O allocate or replace EAGAIN
+     * with ENOMEM when an asynchronous timing record cannot be retained. */
+    /* This callback's independent registry-lock probe allocates a device.
+     * Disable that fixture action while faulting the I/O telemetry allocator. */
+    probe_registration = false;
+    budget = 0;
+    read_result = -EAGAIN;
+    assert(block_device_read(&ref, 1, 1, bytes) == -EAGAIN);
+    assert(!block_device_statistics(&ref, &stats) && !stats.in_flight);
+    read_result = 0;
+    assert(!block_device_read(&ref, 1, 1, bytes));
+    budget = -1;
+    probe_registration = true;
+    assert(!block_device_statistics(&ref, &stats) && stats.reads == 3 && !stats.in_flight);
     assert(!block_device_flush(&ref) && flushes==1);
     flush_result=-EIO;assert(block_device_flush(&ref)==-EIO && !runtime->executing);flush_result=0;
     block_device_put(&ref);block_device_put(&ref);assert(!runtime->users);

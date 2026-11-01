@@ -72,6 +72,8 @@ int task_file_reference(struct task_file *destination, struct task_file *source)
 { *destination = (struct task_file){.used = 1, .description = task_file_get(source)}; return 0; }
 int task_allocate_fd(struct task *task, int minimum, struct task_file **slot)
 { assert(minimum == 0); *slot = &task->files[0]; return 6; }
+/* This fixture does not reserve real OFDs; accounting is covered by descriptors. */
+void proc_account_file(int delta) { (void)delta; abort(); }
 struct task_file *task_descriptor_for_fd(struct task *task, int fd) { assert(fd == 6); return &task->files[0]; }
 void clear_task_file(struct task_file *file) { task_file_put(file->description); *file = (struct task_file){0}; }
 int kernel_wait_queue_add(struct kernel_wait_queue *queue, struct task *task)

@@ -22,7 +22,7 @@ with tempfile.TemporaryDirectory(prefix="reliefos-storage-") as directory:
     subprocess.run(["cc", "-std=c11", "-O1", "-g", "-fsanitize=address,undefined",
                     "-fno-omit-frame-pointer", "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
                     "-Iinclude", "-Iinclude", "-Iinclude/uapi", "-Iinclude",
-                    "tools/tests/storage_metadata_test.c", "fs/tmpfs/core.c", "-o", executable], cwd=ROOT, check=True)
+                    "tools/tests/storage_metadata_test.c", "fs/tmpfs/core.c", "mm/physical/proc.c", "-o", executable], cwd=ROOT, check=True)
     subprocess.run([executable, disk, inode], cwd=ROOT, check=True)
     after = subprocess.check_output(["debugfs", "-R", "stat /probe", disk], text=True)
     assert re.search(r"Mode:\s*06750", after), after

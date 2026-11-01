@@ -26,7 +26,7 @@ def main():
              "-fno-sanitize-recover=all", "-ffunction-sections", "-fdata-sections",
              "-Wl,--gc-sections", "-Iinclude", "-Iinclude",
              "-Iinclude/uapi", "-Iinclude",
-             "tools/tests/storage_posix_paths_test.c", "fs/tmpfs/core.c",
+             "tools/tests/storage_posix_paths_test.c", "fs/tmpfs/core.c", "mm/physical/proc.c",
              "lib/text_utf16.c", *STORAGE_GRAPH_SOURCES, "-o", str(binary)])
         for filesystem in filesystems:
             image = work / (filesystem + ".img")

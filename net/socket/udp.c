@@ -1,6 +1,7 @@
 /* IPv4 datagrams share the task_file open-description lifetime. All entry
  * points run under the kernel execution lock, including packet delivery. */
 #include <reliefnt/net_udp.h>
+#include <reliefnt/proc_stats.h>
 #include <reliefnt/net.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/sched.h>
@@ -26,6 +27,8 @@ struct udp_packet {
 };
 struct udp_socket {
     uint32_t local, remote;
+    uint32_t uid;
+    uint64_t ino;
     uint16_t port, remote_port;
     bool bound, connected, broadcast, reuse;
     bool receive_timeout_immediate;
@@ -36,6 +39,7 @@ struct udp_socket {
     struct udp_socket *registry_next;
 };
 static struct udp_socket *sockets;
+static uint64_t proc_udp_ino, loopback_bytes, loopback_packets;
 static uint16_t next_port = 49152;
 static uint16_t swap16(uint16_t x) { return __builtin_bswap16(x); }
 static uint32_t swap32(uint32_t x) { return __builtin_bswap32(x); }
@@ -149,6 +153,8 @@ int task_udp_send(struct task_file *file, const void *data, uint32_t length,
     net_get_config(&config);
     if ((ip >> 24) == 127 || (ip && ip == config.local_ip)) {
         if (s->ifindex && s->ifindex != 1) return -LINUX_ENETUNREACH;
+        loopback_bytes += length + 28;
+        ++loopback_packets;
         net_udp_input(s->local ? s->local : ip, ip, s->port, port, data, length, 1);
         return (int)length;
     }
@@ -266,7 +272,7 @@ int64_t syscall_udp(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
         struct task_file *file;
         int fd = task_allocate_fd(task, 0, &file);
         if (fd < 0) { kernel_free(s); return fd; }
-        *s = (struct udp_socket){0};
+        *s = (struct udp_socket){.uid = task->euid, .ino = (3ULL << 60) | ++proc_udp_ino};
         if (!sockets) sockets = s;
         else {
             struct udp_socket *tail = sockets;
@@ -277,6 +283,7 @@ int64_t syscall_udp(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
             (a1 & SOCK_NONBLOCK ? RELIEFOS_O_NONBLOCK : 0);
         file->fd_flags = (a1 & SOCK_CLOEXEC) != 0;
         file->kind = TASK_FILE_KIND_UDP;
+        file->socket_ino = s->ino;
         file->aux = (uintptr_t)s;
         file->node.type = RELIEFOS_FS_TYPE_DEVICE;
         return fd;
@@ -389,4 +396,53 @@ int64_t syscall_udp(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
         return 0;
     }
     return -LINUX_EOPNOTSUPP;
+}
+
+/** @brief Render registered UDP endpoints and their actual queued payloads.
+ * @param s Output, execution-owned; stable numeric IDs never expose pointers.
+ */
+void net_udp_proc_emit(struct text_stream *s)
+{
+    text_string(s, "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   "
+                   "uid  timeout inode\n");
+    uint32_t index = 0;
+    for (struct udp_socket *u = sockets; u; u = u->registry_next) {
+        if (!u->bound)
+            continue;
+        uint64_t queued = 0;
+        for (struct udp_packet *p = u->head; p; p = p->next)
+            queued += p->length;
+        text_unsigned(s, index++);
+        text_string(s, ": ");
+        text_hex(s, __builtin_bswap32(u->local), 8);
+        text_string(s, ":");
+        text_hex(s, u->port, 4);
+        text_string(s, " ");
+        text_hex(s, __builtin_bswap32(u->remote), 8);
+        text_string(s, ":");
+        text_hex(s, u->remote_port, 4);
+        text_string(s, u->connected ? " 01 " : " 07 ");
+        text_string(s, "00000000:");
+        text_hex(s, queued, 8);
+        text_string(s, " 00:00000000 00000000 ");
+        text_unsigned(s, u->uid);
+        text_string(s, " 0 ");
+        text_unsigned(s, u->ino);
+        text_string(s, "\n");
+    }
+}
+/** @brief Emit loopback datagram packet/byte counters in net/dev format.
+ * @param s Required output; execution ownership, no polling or allocation.
+ */
+void net_loopback_proc_emit(struct text_stream *s)
+{
+    text_string(s, "    lo: ");
+    text_unsigned(s, loopback_bytes);
+    text_string(s, " ");
+    text_unsigned(s, loopback_packets);
+    text_string(s, " 0 0 0 0 0 0 ");
+    text_unsigned(s, loopback_bytes);
+    text_string(s, " ");
+    text_unsigned(s, loopback_packets);
+    text_string(s, " 0 0 0 0 0 0\n");
 }

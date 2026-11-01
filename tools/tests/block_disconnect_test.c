@@ -7,6 +7,22 @@
 #include <reliefnt/lock.h>
 #include <linux/errno.h>
 
+#include <reliefnt/sched.h>
+static uint64_t fixture_ms;
+static struct task fixture_task = {.pid = 42};
+uint64_t time_uptime_ms(void)
+{
+    return fixture_ms++;
+}
+uint32_t sched_current_pid(void)
+{
+    return fixture_task.pid;
+}
+struct task *sched_current_task(void)
+{
+    return &fixture_task;
+}
+
 static unsigned allocations,callbacks;
 static const struct block_device_registration *during_registration;
 static int (*quiesce)(void *);

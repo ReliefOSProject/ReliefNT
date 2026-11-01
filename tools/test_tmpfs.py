@@ -9,7 +9,7 @@ with tempfile.TemporaryDirectory(prefix="reliefnt-tmpfs-") as directory:
     out = pathlib.Path(directory)
     subprocess.run(["clang", "-g", "-O1", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                     "-Iinclude", "-Iinclude", "-Iinclude/uapi", "-Iinclude",
-                    "tools/tests/tmpfs_test.c", "fs/tmpfs/core.c", "-o", str(out / "tmpfs-test")],
+                    "tools/tests/tmpfs_test.c", "fs/tmpfs/core.c", "mm/physical/proc.c", "-o", str(out / "tmpfs-test")],
                    cwd=ROOT, check=True)
     subprocess.run([str(out / "tmpfs-test")], cwd=ROOT, check=True)
     subprocess.run(["cc", "-O2", "-Wall", "-Wextra", "-DTMPFS_MMAP_STANDALONE",

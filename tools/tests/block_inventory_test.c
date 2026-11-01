@@ -7,6 +7,20 @@
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
+#include <reliefnt/proc_stats.h>
+/* This transport-only fixture has no scheduled caller or elapsed clock. */
+struct task *sched_current_task(void)
+{
+    return NULL;
+}
+uint32_t sched_current_pid(void)
+{
+    return 0;
+}
+uint64_t time_uptime_ms(void)
+{
+    return 0;
+}
 static unsigned allocations;
 static bool fail_allocation;
 int storage_acquire_task_io(void){return 0;}
@@ -134,6 +148,14 @@ int main(void)
     struct block_device_registration next=root;next.info.device=block_device_allocate_number(false);next.info.port=1;
     assert(!register_block_device(&next) && !storage_refresh_disks());
     assert(g_install_disks[66].name_index==2); /* ram0 did not consume an sd name. */
+    char proc[2048] = {0};
+    struct text_stream stream = {.buffer = proc, .capacity = sizeof(proc) - 1};
+    assert(!block_proc_emit(&stream, false) && strstr(proc, " 2048 sda\n") &&
+           strstr(proc, " ram0\n"));
+    assert(!strstr(proc, "/dev/"));
+    memset(proc, 0, sizeof(proc));
+    stream = (struct text_stream){.buffer = proc, .capacity = sizeof(proc) - 1};
+    assert(!block_proc_emit(&stream, true) && strstr(proc, "sda 0 0 0 0 0 0 0 0 0 0 0\n"));
     assert(!unregister_block_device(&next) && !unregister_block_device(&ram));
     assert(!unregister_block_device(&root));storage_refresh_disks();
     uint32_t remaining=99;assert(!storage_install_list_disks(NULL,0,&remaining) && !remaining);

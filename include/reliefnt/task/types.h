@@ -114,6 +114,8 @@ struct task_file {
     uint32_t used;
     uint32_t scm_references;
     uint32_t scm_gc_seen;
+    bool proc_counted;
+    uint64_t socket_ino; /* Numeric socket identity, never a pointer. */
     uint32_t flags;
     uint32_t fd_flags;
     uint32_t flock_type;
@@ -270,6 +272,7 @@ struct task_process_state {
     enum task_kind kind;
     uint32_t flags;
     uint64_t cpu_ticks;
+    uint64_t cpu_user_ticks, cpu_system_ticks;
     int32_t priority;
     /* CPUs on which this task may execute. A zero mask is treated as all
      * discovered CPUs for compatibility with older task initializers. */
@@ -299,6 +302,8 @@ struct task_address_space_state {
     struct vfs_path executable_path;
     /* Linux membarrier registration commands are process/MM scoped. */
     uint32_t membarrier_registrations;
+    uint64_t saved_auxv[34];
+    uint32_t saved_auxv_bytes;
 };
 
 struct task_fd_table_state {
@@ -508,6 +513,8 @@ struct task_lookup_scope {
 struct task {
     /* Lazily allocated PID identity, retained independently by proc inodes. */
     struct task_identity *identity_token;
+    uint64_t proc_read_chars, proc_write_chars, proc_read_calls, proc_write_calls;
+    uint64_t proc_read_bytes, proc_write_bytes;
     struct eevdf_entity fair;
     uint64_t start_uptime_ms;
     bool no_new_privs;
@@ -624,6 +631,7 @@ struct task {
             enum task_kind kind;
             uint32_t flags;
             uint64_t cpu_ticks;
+            uint64_t cpu_user_ticks, cpu_system_ticks;
             int32_t priority;
             uint64_t affinity_mask;
             uint32_t mlockall_flags;

@@ -47,4 +47,7 @@ const struct storage_node *vfs_exec_source_node(const struct vfs_exec_source *so
  */
 int vfs_exec_source_read(const struct vfs_exec_source *source,uint64_t offset,
                             void *buffer,uint32_t capacity,uint32_t *read);
+/** @brief Borrow the retained source path for mapping diagnostics.
+ * @param source Live source or NULL. @return Borrowed path or NULL, execution-owned. */
+const struct vfs_path *vfs_exec_source_path(const struct vfs_exec_source *source);
 #endif

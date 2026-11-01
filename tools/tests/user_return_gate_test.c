@@ -11,6 +11,7 @@
 #include <reliefnt/console.h>
 #include <reliefnt/input.h>
 #include <reliefnt/sched.h>
+#include <reliefnt/proc_stats.h>
 #include <reliefnt/smp.h>
 #include <reliefnt/net.h>
 #include <reliefnt/usb.h>
@@ -51,6 +52,11 @@ static struct task *selected;
 static atomic_bool key_pending;
 static unsigned drained, delivered, released, fpu_saved, fpu_restored;
 static uint64_t installed_fs;
+static bool accounting_kernel;
+void sched_account_mode(bool kernel)
+{
+    accounting_kernel = kernel;
+}
 
 uint32_t smp_current_cpu(void) { return cpu; }
 bool net_tcp_maintenance_due(void)
@@ -85,6 +91,7 @@ bool sched_try_resume_current_user_frame(const struct trap_frame *frame)
         current.flags&TASK_FLAG_PENDING_LOAD ||
         sched_task_pending(&current)&~current.blocked_signals) return false;
     current.frame=*frame;
+    sched_account_mode(false);
     return true;
 }
 bool sched_capture_current_user_frame(const struct trap_frame *frame)
@@ -141,6 +148,7 @@ static void reset(void)
     network_due=false;network_stack_active=false;
     network_maintenance_calls=network_stack_maintenance_calls=network_stack_calls=0;
     installed_fs=0;
+    accounting_kernel = false;
     atomic_store(&key_pending,false);
 }
 static bool async_io, inject_input;
@@ -167,6 +175,10 @@ void kernel_wait_queue_remove(struct kernel_wait_queue *queue,struct task *task)
 {(void)queue;(void)task;abort();} /* No device wait is published in this fixture. */
 void storage_set_io_async_context(bool enabled) { assert(exclusive()); async_io=enabled; }
 uint64_t time_ticks(void) { return 100; }
+uint64_t time_uptime_ms(void)
+{
+    return 1000;
+}
 void sched_sleep_current_until(uint64_t tick)
 { assert(exclusive() && tick==101); current.state=TASK_BLOCKED; ++slept; }
 int64_t kernel_signal_rt_sigreturn(struct task *task, struct trap_frame *frame)
@@ -184,7 +196,7 @@ static int64_t backend(struct task *task, uint64_t nr, uint64_t a0,
     uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
 {
     (void)nr;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;
-    assert(exclusive() && async_io && task==&current);
+    assert(exclusive() && async_io && task == &current && accounting_kernel);
     if (inject_input) atomic_store(&key_pending,true);
     return backend_result;
 }
@@ -203,6 +215,7 @@ static void test_one_transaction_for_completed_syscall(void)
     uint32_t before=execution_next_ticket;
     assert(int80_dispatch(&frame)==&current);
     assert(frame.rax==123 && current.frame.rax==123);
+    assert(!accounting_kernel);
     assert(installed_fs==current.fs_base && io_releases==1 && !async_io);
     assert(network_maintenance_calls==1 && network_stack_maintenance_calls==0 &&
            network_stack_calls==0);

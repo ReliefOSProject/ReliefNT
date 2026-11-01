@@ -13,7 +13,7 @@ def main():
         run(["cc","-std=c11","-DRELIEFNT_FIXTURE_REAL_DAC","-O1","-g","-fsanitize=address,undefined","-fno-sanitize-recover=all",
              "-ffunction-sections","-fdata-sections","-Wl,--gc-sections","-Iinclude",
              "-Iinclude","-Iinclude/uapi","-Iinclude",
-             "tools/tests/ext4_vfs_test.c","fs/tmpfs/core.c",
+             "tools/tests/ext4_vfs_test.c","fs/tmpfs/core.c", "mm/physical/proc.c",
              "lib/text_utf16.c",*STORAGE_GRAPH_SOURCES,"-o",str(binary)])
         features="none,filetype,large_file,dir_index"
         if args.filesystem=="ext4": features+=",extents,64bit,metadata_csum,extra_isize,flex_bg,has_journal"

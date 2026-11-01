@@ -42,7 +42,7 @@ def main():
                  "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
                  "-Iinclude", "-Iinclude", "-Iinclude/uapi",
                  "-Iinclude", "tools/tests/ext4_vfs_read_test.c",
-                 "fs/tmpfs/core.c", "lib/text_utf16.c",
+                 "fs/tmpfs/core.c", "mm/physical/proc.c", "lib/text_utf16.c",
                  "-o", str(vfs_binary)])
         if args.case in ("all", "unit"):
             run([str(binary)], env=env)

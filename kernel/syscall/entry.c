@@ -1,6 +1,7 @@
 #include <reliefnt/graphics_service.h>
 #include <reliefnt/lock_profile.h>
 #include "internal.h"
+#include <reliefnt/proc_stats.h>
 #include <reliefnt/module.h>
 #include <reliefnt/usb.h>
 
@@ -219,6 +220,7 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
     if (!frame) {
         return NULL;
     }
+    sched_account_mode(true);
     /* Several storage and GUI services still own global scratch buffers. */
     kernel_execution_lock_scoped_irqsave(&lock_flags, lock_profile_syscall_scope(frame->rax));
     net_tcp_maintenance();
@@ -350,6 +352,25 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
         storage_release_task_io(sched_current_pid());
     }
     storage_set_io_async_context(false);
+    if (calling_task && result != KERNEL_SYSCALL_BLOCKED &&
+        (result != -RELIEFOS_EAGAIN || eagain_from_nonblocking) && !restored_signal_frame) {
+        bool reading = number == LINUX_SYS_READ || number == LINUX_SYS_PREAD64 ||
+                       number == LINUX_SYS_READV || number == LINUX_SYS_PREADV ||
+                       number == LINUX_SYS_PREADV2;
+        bool writing = number == LINUX_SYS_WRITE || number == LINUX_SYS_PWRITE64 ||
+                       number == LINUX_SYS_WRITEV || number == LINUX_SYS_PWRITEV ||
+                       number == LINUX_SYS_PWRITEV2;
+        if (reading) {
+            if (result > 0)
+                calling_task->proc_read_chars += (uint64_t)result;
+            ++calling_task->proc_read_calls;
+        }
+        if (writing) {
+            if (result > 0)
+                calling_task->proc_write_chars += (uint64_t)result;
+            ++calling_task->proc_write_calls;
+        }
+    }
     if (restored_signal_frame) {
         /* sigreturn and successful exec already supplied the user context. */
     } else if (result == KERNEL_SYSCALL_BLOCKED ||
@@ -382,5 +403,7 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
         arch_set_user_fs(resume->fs_base);
     }
     kernel_execution_unlock_irqrestore(lock_flags);
+    if (resume)
+        sched_account_mode(false);
     return resume;
 }

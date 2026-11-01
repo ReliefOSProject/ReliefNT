@@ -189,12 +189,43 @@ static void test_offline_and_slot_reuse(void)
     discard_fixture();
 }
 
+static void test_user_kernel_modes(void)
+{
+    fixture_cpu = 0;
+    fixture_us = 0;
+    fixture_online_mask = 1;
+    sched_init();
+    struct task *t = start_task(0, 71);
+    sched_account_mode(false);
+    advance_ticks(20);
+    sched_account_mode(true);
+    advance_ticks(7);
+    sched_account_mode(false);
+    advance_ticks(3);
+    uint64_t user[2] = {0}, system[2] = {0}, idle[2] = {0}, u, k;
+    sched_cpu_times(user, system, idle, 2);
+    assert(user[0] == 23 && system[0] == 7 && !idle[0]);
+    assert(t->cpu_ticks == 30 && t->cpu_user_ticks == 23 && t->cpu_system_ticks == 7);
+    sched_task_cpu_times(t, false, &u, &k);
+    assert(u == 23 && k == 7);
+    sched_account_mode(true);
+    advance_ticks(2);
+    assert(sched_try_resume_current_user_frame(&t->frame) == false); /* tick requires scheduling */
+    assert(sched_capture_current_user_frame(&t->frame));
+    assert(sched_select_next_user() == t);
+    sched_account_mode(false);
+    sched_task_cpu_times(t, true, &u, &k);
+    assert(u == 23 && k == 9);
+    discard_fixture();
+}
+
 int main(void)
 {
     test_time_does_not_depend_on_interrupt_count(25);
     test_time_does_not_depend_on_interrupt_count(1);
     test_idle_reservation_and_migration();
     test_offline_and_slot_reuse();
+    test_user_kernel_modes();
     puts("PASS CPU accounting: BSP USER_HZ, AP cadence, idle, reservations, migration, snapshots and reuse");
     return 0;
 }

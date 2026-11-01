@@ -22,6 +22,7 @@
 #include <linux/errno.h>
 #include <linux/fcntl.h>
 #include "internal.h"
+#include <reliefnt/proc_stats.h>
 
 #define PROCFS_PATH_MAX RELIEFOS_FS_PATH_LEN
 #define PROCFS_CONTENT_MAX 1024u
@@ -99,35 +100,115 @@ static int proc_asound_card_exists(uint32_t ordinal)
     return sound_service_card_snapshot(ordinal, &token, NULL) == 0;
 }
 
-static int proc_path_kind(const char *path, const char **file_name,
-                          uint32_t *pid)
+/** @brief Identify an explicit per-thread directory without libc substring calls.
+ * @param path Required intrinsic key. @return True for task/TID or thread-self paths.
+ */
+static bool proc_thread_path(const char *path)
 {
-    const char *prefix = "/proc/";
-    if (!path) return 0;
-    for (uint32_t i = 0; prefix[i]; ++i)
-        if (path[i] != prefix[i]) return 0;
+    if (!__builtin_strncmp(path, "/proc/thread-self", 17))
+        return true;
+    for (const char *p = path; *p; ++p)
+        if (!__builtin_strncmp(p, "/task/", 6))
+            return true;
+    return false;
+}
+
+/** @brief Parse process/thread keys and validate thread-group membership.
+ * @param path Nullable intrinsic proc pathname. @param file_name Optional leaf output.
+ * @param pid Optional resolved PID/TID output, cleared on failure.
+ * @return Two for a valid task-shaped key, zero otherwise; no lifetime transfer.
+ */
+static int proc_path_kind(const char *path, const char **file_name, uint32_t *pid)
+{
+    if (pid)
+        *pid = 0;
+    if (file_name)
+        *file_name = NULL;
+    if (!path || __builtin_strncmp(path, "/proc/", 6))
+        return 0;
     const char *p = path + 6;
-    const char *slash = p;
+    struct task *task = NULL;
     uint32_t value = 0;
-    if (pid) *pid = 0;
-    if (file_name) *file_name = 0;
-    while (*slash && *slash != '/') ++slash;
-    if (file_name && *slash) *file_name = slash + 1;
-    while (p < slash && *p >= '0' && *p <= '9') {
-        uint32_t digit = (uint32_t)(*p - '0');
-        if (value > (UINT32_MAX - digit) / 10u) return 0;
-        value = value * 10u + digit;
-        ++p;
+    bool thread_view = false;
+    if (!__builtin_strncmp(p, "self", 4) && (!p[4] || p[4] == '/')) {
+        task = sched_current_task();
+        if (task)
+            value = sched_task_tgid(task);
+        p += 4;
+    } else if (!__builtin_strncmp(p, "thread-self", 11) && (!p[11] || p[11] == '/')) {
+        task = sched_current_task();
+        if (task)
+            value = task->pid;
+        p += 11;
+        thread_view = true;
+    } else {
+        if (*p < '1' || *p > '9')
+            return 0;
+        while (*p >= '0' && *p <= '9') {
+            uint32_t digit = (uint32_t)(*p++ - '0');
+            if (value > (UINT32_MAX - digit) / 10)
+                return 0;
+            value = value * 10 + digit;
+        }
+        if (*p && *p != '/')
+            return 0;
     }
-    if (p == slash && value && path[6] != '0') {
-        if (pid) *pid = value;
-        return 2;
+    if (!value)
+        return 0;
+    task = sched_find(value);
+    if (task && task->pid != sched_task_tgid(task))
+        thread_view = true;
+    if (thread_view &&
+        (*p && (!__builtin_strcmp(p, "/task") || !__builtin_strncmp(p, "/task/", 6))))
+        return 0;
+    if (*p == '/' && !__builtin_strncmp(p + 1, "task/", 5)) {
+        struct task *leader = sched_find(value);
+        p += 6;
+        uint32_t tid = 0;
+        if (!leader || *p < '1' || *p > '9')
+            return 0;
+        while (*p >= '0' && *p <= '9') {
+            uint32_t d = *p++ - '0';
+            if (tid > (UINT32_MAX - d) / 10)
+                return 0;
+            tid = tid * 10 + d;
+        }
+        if (*p && *p != '/')
+            return 0;
+        task = sched_find(tid);
+        if (!task || sched_task_tgid(task) != sched_task_tgid(leader))
+            return 0;
+        value = tid;
+        if (*p && (!__builtin_strcmp(p, "/task") || !__builtin_strncmp(p, "/task/", 6)))
+            return 0;
     }
-    if (p == path + 6 && p < slash && (uint32_t)(slash - p) == 4u &&
-        p[0] == 's' && p[1] == 'e' && p[2] == 'l' && p[3] == 'f') {
-        return 3;
-    }
-    return 0;
+    if (pid)
+        *pid = value;
+    if (file_name && *p == '/')
+        *file_name = p + 1;
+    return 2;
+}
+
+/** @brief Borrow a validated task and leaf while execution prevents reaping.
+ * @param path Proc key. @param leaf Required output. @return Task or NULL.
+ */
+struct task *proc_view_task(const char *path, const char **leaf)
+{
+    uint32_t pid = 0;
+    return proc_path_kind(path, leaf, &pid) ? sched_find(pid) : NULL;
+}
+
+/** @brief Preserve the established private status fields alongside Linux fields.
+ * @param task Borrowed live task. @param stream Required output stream.
+ * Execution-owned metadata only; no allocation or retained references.
+ */
+void proc_task_identity_fields(const struct task *task, struct text_stream *stream)
+{
+    text_string(stream, "LeonOSRole:\t");
+    text_unsigned(stream, task->role);
+    text_string(stream, "\nLeonOSFlags:\t");
+    text_unsigned(stream, task->flags);
+    text_string(stream, "\n");
 }
 
 /**
@@ -165,18 +246,6 @@ static int proc_fill_content(const char *path, char *buffer, uint32_t capacity)
         if (fraction < 10) proc_append_text(buffer, &pos, capacity, "0");
         proc_append_u64(buffer, &pos, capacity, fraction);
         proc_append_text(buffer, &pos, capacity, "\n");
-        return 0;
-    }
-    if (proc_text_eq(path, "/proc/meminfo")) {
-        proc_append_text(buffer, &pos, capacity, "MemTotal: ");
-        proc_append_u64(buffer, &pos, capacity, mm_total_memory_kib());
-        proc_append_text(buffer, &pos, capacity, " kB\nMemFree: ");
-        proc_append_u64(buffer, &pos, capacity, mm_free_memory_kib());
-        /* There is no swap or reclaimable page-cache pool yet. All memory
-         * currently available for new allocations is in the free-page pool. */
-        proc_append_text(buffer, &pos, capacity, " kB\nMemAvailable: ");
-        proc_append_u64(buffer, &pos, capacity, mm_free_memory_kib());
-        proc_append_text(buffer, &pos, capacity, " kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n");
         return 0;
     }
     if (proc_text_eq(path, "/proc/version")) {
@@ -236,86 +305,6 @@ static int proc_fill_content(const char *path, char *buffer, uint32_t capacity)
         proc_append_text(buffer, &pos, capacity, "65534\n");
         return 0;
     }
-    if (proc_text_eq(path, "/proc/stat")) {
-        uint64_t busy = 0;
-        uint64_t idle = 0;
-        uint64_t per_cpu_busy[SMP_MAX_CPUS] = {0};
-        uint64_t per_cpu_idle[SMP_MAX_CPUS] = {0};
-        uint32_t cpu_count = smp_cpu_count();
-        if (cpu_count > SMP_MAX_CPUS) cpu_count = SMP_MAX_CPUS;
-        sched_cpu_runtime_snapshot(per_cpu_busy, per_cpu_idle, NULL, NULL, cpu_count);
-        for (uint32_t cpu = 0; cpu < cpu_count; ++cpu) {
-            busy += per_cpu_busy[cpu];
-            idle += per_cpu_idle[cpu];
-        }
-        proc_append_text(buffer, &pos, capacity, "cpu ");
-        proc_append_u64(buffer, &pos, capacity, busy);
-        proc_append_text(buffer, &pos, capacity, " 0 0 ");
-        proc_append_u64(buffer, &pos, capacity, idle);
-        proc_append_text(buffer, &pos, capacity, " 0 0 0 0 0 0\n");
-        for (uint32_t cpu = 0; cpu < cpu_count; ++cpu) {
-            proc_append_text(buffer, &pos, capacity, "cpu");
-            proc_append_u64(buffer, &pos, capacity, cpu);
-            proc_append_text(buffer, &pos, capacity, " ");
-            proc_append_u64(buffer, &pos, capacity, per_cpu_busy[cpu]);
-            proc_append_text(buffer, &pos, capacity, " 0 0 ");
-            proc_append_u64(buffer, &pos, capacity, per_cpu_idle[cpu]);
-            proc_append_text(buffer, &pos, capacity, " 0 0 0 0 0 0\n");
-        }
-        return 0;
-    }
-    {
-        const char *file = 0;
-        uint32_t pid = 0;
-        int kind = proc_path_kind(path, &file, &pid);
-        if (kind == 3) {
-            pid = sched_current_pid();
-            kind = 2;
-        }
-        if (kind == 2 && file && pid) {
-            struct task *task = sched_find(pid);
-            if (proc_text_eq(file, "status")) {
-                if (!task) return -2;
-                proc_append_text(buffer, &pos, capacity, "Name:\t");
-                const char *name = task->name ? task->name : "?";
-                for (uint32_t i = 0; name[i] && i < 15; ++i) {
-                    char letter[2] = {name[i], 0};
-                    if (name[i] == '\n') proc_append_text(buffer, &pos, capacity, "\\n");
-                    else if (name[i] == '\\') proc_append_text(buffer, &pos, capacity, "\\\\");
-                    else proc_append_text(buffer, &pos, capacity, letter);
-                }
-                const char *state = task->state == TASK_EXITED ? "Z (zombie)" :
-                    task->state == TASK_STOPPED ? "T (stopped)" :
-                    task->state == TASK_BLOCKED ? "S (sleeping)" : "R (running)";
-                proc_append_text(buffer, &pos, capacity, "\nState:\t");
-                proc_append_text(buffer, &pos, capacity, state);
-                proc_append_text(buffer, &pos, capacity, "\nTgid:\t");
-                proc_append_u64(buffer, &pos, capacity, sched_task_tgid(task));
-                proc_append_text(buffer, &pos, capacity, "\nPid:\t");
-                proc_append_u64(buffer, &pos, capacity, task->pid);
-                proc_append_text(buffer, &pos, capacity, "\nPPid:\t");
-                proc_append_u64(buffer, &pos, capacity, task->parent_pid);
-                const uint32_t ids[] = {task->uid, task->euid, task->suid, task->fsuid,
-                                        task->gid, task->egid, task->sgid, task->fsgid};
-                for (uint32_t i = 0; i < 8; ++i) {
-                    proc_append_text(buffer, &pos, capacity, i == 0 ? "\nUid:\t" : i == 4 ? "\nGid:\t" : "\t");
-                    proc_append_u64(buffer, &pos, capacity, ids[i]);
-                }
-                if (sched_task_as(task)->cr3) {
-                    proc_append_text(buffer, &pos, capacity, "\nVmRSS:\t");
-                    proc_append_u64(buffer, &pos, capacity, address_space_user_resident_kib(sched_task_as(task)));
-                    proc_append_text(buffer, &pos, capacity, " kB");
-                }
-                proc_append_text(buffer, &pos, capacity, "\nLeonOSRole:\t");
-                proc_append_u64(buffer, &pos, capacity, task->role);
-                proc_append_text(buffer, &pos, capacity, "\nLeonOSFlags:\t");
-                proc_append_u64(buffer, &pos, capacity, task->flags);
-                proc_append_text(buffer, &pos, capacity, "\n");
-                return 0;
-            }
-
-        }
-    }
     return -2;
 }
 
@@ -342,7 +331,7 @@ static int proc_fd_number(const char *file)
  * @return Zero or negative errno, without namespace lookup or I/O. Execution
  * ownership protects the caller root; temporary path references are balanced.
  */
-static int proc_object_target(const struct vfs_path *object,char *target,uint32_t capacity)
+int proc_object_target(const struct vfs_path *object, char *target, uint32_t capacity)
 {
     struct vfs_namespace *ns=vfs_path_namespace(object);
     if(!ns)return vfs_path_format_link(NULL,NULL,object,target,capacity);
@@ -381,6 +370,14 @@ static int proc_fd_target(struct task *task, int fd, char *target,uint32_t capac
         return 0;
     }
     struct task_file *file = task_file_for_fd(task, fd);
+    if (file && file->socket_ino) {
+        uint32_t pos = 0;
+        target[0] = 0;
+        proc_append_text(target, &pos, capacity, "socket:[");
+        proc_append_u64(target, &pos, capacity, file->socket_ino);
+        proc_append_text(target, &pos, capacity, "]");
+        return 0;
+    }
     if(file && vfs_path_node(&file->path_ref)) {
         int rc=proc_object_target(&file->path_ref,target,capacity);
         if(rc!=-EOPNOTSUPP)return rc;
@@ -412,19 +409,22 @@ static int proc_mount_view(const char *path,struct task **target)
 
 struct proc_open_view {
     struct vfs_namespace *ns; struct vfs_path root; bool mountinfo;
+    char *text;
+    uint64_t text_size;
 #ifdef CONFIG_LOCK_STAT
     void *lock_stats;
 #endif
 };
 
-/** @brief Capture a selected task mount view or diagnostic snapshot at open.
+/** @brief Capture a mount view, generated leaf or diagnostic snapshot at open.
  * @param name Intrinsic authorized proc inode key, independent of attachment.
  * @param flags Sanitized status flags, borrowed and unchanged.
- * @param out Required owned output; ordinary generated files return NULL.
+ * @param out Required owned output; legacy stateless files return NULL.
  * @return Zero or negative errno with empty output on failure. Mount views
- * retain a root path; diagnostic readers capture a stable counter snapshot.
+ * retain a root path; generated leaves and diagnostic readers capture bytes.
  * Namespace ownership outlives its retained paths; final release drops this
- * path even after task exit. Nonblocking, execution-owned, without graph locks.
+ * path even after task exit. Execution-owned, without graph locks across
+ * renderers; partition metadata may perform I/O and return its native errno.
  */
 int proc_file_open(const char *name,uint32_t flags,void **out)
 {
@@ -443,6 +443,40 @@ int proc_file_open(const char *name,uint32_t flags,void **out)
     if ((flags & LINUX_O_ACCMODE) != LINUX_O_RDONLY || (flags & LINUX_O_TRUNC))
         return -RELIEFOS_EROFS;
 #endif
+    if (proc_extra_kind(name) == 1) {
+        struct proc_open_view *state = kernel_malloc(sizeof(*state));
+        if (!state)
+            return -RELIEFOS_ENOMEM;
+        *state = (struct proc_open_view){0};
+        uint32_t capacity = 4096;
+        for (;;) {
+            state->text = kernel_malloc(capacity);
+            if (!state->text) {
+                kernel_free(state);
+                return -RELIEFOS_ENOMEM;
+            }
+            struct text_stream stream = {.buffer = state->text, .capacity = capacity};
+            int rc = proc_extra_emit(name, &stream);
+            if (rc) {
+                kernel_free(state->text);
+                kernel_free(state);
+                return rc;
+            }
+            if (stream.position <= capacity) {
+                state->text_size = stream.written;
+                break;
+            }
+            kernel_free(state->text);
+            state->text = NULL;
+            if (stream.position > UINT32_MAX / 2) {
+                kernel_free(state);
+                return -RELIEFOS_ENOMEM;
+            }
+            capacity = (uint32_t)stream.position * 2;
+        }
+        *out = state;
+        return 0;
+    }
     struct task *task=NULL;int view=proc_mount_view(name,&task);if(!view)return 0;
     const struct vfs_path *root=&sched_task_paths(task)->root;
     struct vfs_namespace *ns=vfs_path_namespace(root);if(!ns)return -RELIEFOS_ENOENT;
@@ -467,6 +501,17 @@ int proc_file_read(void *value,uint64_t offset,void *buffer,uint32_t capacity,ui
 #ifdef CONFIG_LOCK_STAT
     if (state->lock_stats) return lock_profile_view_read(state->lock_stats,offset,buffer,capacity,read);
 #endif
+    if (state->text) {
+        if (!buffer && capacity)
+            return -RELIEFOS_EINVAL;
+        uint64_t n = offset < state->text_size ? state->text_size - offset : 0;
+        if (n > capacity)
+            n = capacity;
+        if (n)
+            __builtin_memcpy(buffer, state->text + offset, n);
+        *read = (uint32_t)n;
+        return 0;
+    }
     return vfs_read_mount_table(state->ns,&state->root,state->mountinfo,offset,buffer,capacity,read);
 }
 
@@ -481,7 +526,9 @@ void proc_file_close(void *value)
 #ifdef CONFIG_LOCK_STAT
     if (state->lock_stats) { lock_profile_view_free(state->lock_stats); kernel_free(state); return; }
 #endif
-    vfs_path_put(&state->root);kernel_free(state);
+    kernel_free(state->text);
+    vfs_path_put(&state->root);
+    kernel_free(state);
 }
 
 /** @brief Map scheduler states to Linux proc characters, never expose private enums. */
@@ -529,7 +576,7 @@ static int proc_mm_strings(struct task *task, struct text_stream *s, bool enviro
     return 0;
 }
 /** @brief Linux PTRACE_MODE_READ_FSCREDS gate for stat address fields. */
-static bool proc_stat_mm_visible(struct task *caller, struct task *target)
+bool proc_stat_mm_visible(struct task *caller, struct task *target)
 {
     if (!caller)
         return false;
@@ -596,8 +643,11 @@ int proc_mount_magic_target(const char *name,struct vfs_path *out)
 }
 /** @brief Emit Linux's ordered 52 stat fields using available task accounting.
  * Legacy private uid/role fields belong in status rather than Linux stat positions.
+ * @param task Borrowed live target. @param s Required output stream.
+ * @param process Sum CPU times across the group; false selects a thread.
+ * Execution ownership protects task/VMA metadata; CPU counters use their lock.
  */
-static void proc_task_stat(struct task *task, struct text_stream *s)
+static void proc_task_stat(struct task *task, struct text_stream *s, bool process)
 {
     uint64_t values[53] = {0};
     struct task_address_space_state *mm = sched_task_mm(task);
@@ -615,7 +665,7 @@ static void proc_task_stat(struct task *task, struct text_stream *s)
     values[5] = task->process_group;
     values[6] = task->process_session;
     values[8] = values[7] ? foreground : (uint64_t)-1;
-    values[14] = sched_task_cpu_ticks(task, true);
+    sched_task_cpu_times(task, process, &values[14], &values[15]);
     values[18] = 20 + task->priority;
     values[19] = task->priority;
     values[20] = threads;
@@ -671,6 +721,15 @@ static void proc_task_stat(struct task *task, struct text_stream *s)
  * @return Zero or negative ENOENT. Execution-owned; no reference transfers. */
 int proc_lookup(const char *path, struct storage_node *out)
 {
+    int extra = proc_extra_kind(path);
+    if (extra) {
+        if (out)
+            *out = (struct storage_node){.type = extra == 2   ? RELIEFOS_FS_TYPE_DIR
+                                                 : extra == 3 ? RELIEFOS_FS_TYPE_SYMLINK
+                                                              : RELIEFOS_FS_TYPE_FILE,
+                                         .flags = STORAGE_NODE_FLAG_PROC};
+        return 0;
+    }
     char content[PROCFS_CONTENT_MAX];
     if (path && !__builtin_strncmp(path,"/sys",4) && (!path[4] || path[4]=='/')) return sysfs_lookup(path,out);
     if (!path || (path[0] != '/' || path[1] != 'p' || path[2] != 'r' ||
@@ -731,11 +790,8 @@ int proc_lookup(const char *path, struct storage_node *out)
         };
         return 0;
     }
-    if (proc_text_eq(path, "/proc/cmdline") ||
-        proc_text_eq(path, "/proc/uptime") ||
-        proc_text_eq(path, "/proc/meminfo") ||
-        proc_text_eq(path, "/proc/version") ||
-        proc_text_eq(path, "/proc/filesystems") ||
+    if (proc_text_eq(path, "/proc/cmdline") || proc_text_eq(path, "/proc/uptime") ||
+        proc_text_eq(path, "/proc/version") || proc_text_eq(path, "/proc/filesystems") ||
         proc_text_eq(path, "/proc/asound/cards") ||
         proc_text_eq(path, "/proc/sys/kernel/hostname") ||
         proc_text_eq(path, "/proc/sys/kernel/domainname") ||
@@ -743,8 +799,7 @@ int proc_lookup(const char *path, struct storage_node *out)
         proc_text_eq(path, "/proc/sys/kernel/osrelease") ||
         proc_text_eq(path, "/proc/sys/kernel/version") ||
         proc_text_eq(path, "/proc/sys/kernel/overflowuid") ||
-        proc_text_eq(path, "/proc/sys/kernel/overflowgid") ||
-        proc_text_eq(path, "/proc/stat")) {
+        proc_text_eq(path, "/proc/sys/kernel/overflowgid")) {
         uint32_t len = 0;
         int ret = proc_fill_content(path, content, sizeof(content));
         if (ret < 0) return ret;
@@ -826,6 +881,17 @@ int proc_lookup(const char *path, struct storage_node *out)
 int proc_read(const char *path, uint64_t offset, void *buffer, uint32_t length,
               uint32_t *out_read)
 {
+    if (out_read)
+        *out_read = 0;
+    if (!path || (!buffer && length))
+        return -RELIEFOS_EINVAL;
+    if (proc_extra_kind(path) == 1) {
+        struct text_stream stream = {.offset = offset, .buffer = buffer, .capacity = length};
+        int rc = proc_extra_emit(path, &stream);
+        if (!rc && out_read)
+            *out_read = stream.written;
+        return rc;
+    }
     if (path && !__builtin_strncmp(path,"/sys",4) && (!path[4] || path[4]=='/')) return sysfs_read(path,offset,buffer,length,out_read);
 #ifdef CONFIG_LOCK_STAT
     if (proc_text_eq(path, "/proc/reliefnt/lock_stats")) {
@@ -864,7 +930,9 @@ int proc_read(const char *path, uint64_t offset, void *buffer, uint32_t length,
             ret=proc_mm_strings(task,&stream,true);
         }
         else if(proc_text_eq(file,"cmdline")) ret=proc_mm_strings(task,&stream,false);
-        else if(proc_text_eq(file,"stat")) proc_task_stat(task,&stream);
+        else if (proc_text_eq(file, "stat"))
+            proc_task_stat(task, &stream,
+                           sched_task_tgid(task) == task->pid && !proc_thread_path(path));
         else { const char *name=task->name?task->name:"?"; uint32_t n=0; while(name[n] && n<15) ++n;
             text_bytes(&stream,name,n); text_string(&stream,"\n"); }
         if (out_read) *out_read = stream.written;
@@ -916,6 +984,17 @@ int proc_readlink(const char *path, char *buffer, uint32_t capacity)
         for (uint32_t i = 0; i < length; ++i) buffer[i] = target[i];
         return (int)length;
     }
+    if (proc_text_eq(path, "/proc/self") || proc_text_eq(path, "/proc/thread-self")) {
+        if (!caller)
+            return -RELIEFOS_ENOENT;
+        struct text_stream stream = {.buffer = buffer, .capacity = capacity};
+        text_unsigned(&stream, sched_task_tgid(caller));
+        if (proc_text_eq(path, "/proc/thread-self")) {
+            text_string(&stream, "/task/");
+            text_unsigned(&stream, caller->pid);
+        }
+        return stream.written;
+    }
     int kind = proc_path_kind(path, &file, &pid);
     if (kind != 2 && kind != 3) return -RELIEFOS_ENOENT;
     if (kind == 3 && !file) {
@@ -957,15 +1036,39 @@ int proc_readlink(const char *path, char *buffer, uint32_t capacity)
 int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *entry)
 {
     uint32_t index;
-    static const char *files[] = {"uptime", "meminfo", "version", "filesystems", "stat", "mounts", "self", "sys", "cpuinfo", "leonos-drivers", "cmdline", "asound"
+    static const char *files[] = {"uptime",
+                                  "meminfo",
+                                  "version",
+                                  "filesystems",
+                                  "stat",
+                                  "mounts",
+                                  "self",
+                                  "sys",
+                                  "cpuinfo",
+                                  "leonos-drivers",
+                                  "cmdline",
+                                  "asound",
+                                  "loadavg",
+                                  "net",
+                                  "partitions",
+                                  "diskstats",
+                                  "interrupts",
+                                  "vmstat",
+                                  "swaps",
+                                  "thread-self"
 #ifdef CONFIG_MODULES
-        , "modules"
+                                  ,
+                                  "modules"
 #endif
 #ifdef CONFIG_LOCK_STAT
-        , "reliefnt"
+                                  ,
+                                  "reliefnt"
 #endif
     };
     if (!path || !offset || !entry) return -22;
+    int extra = proc_extra_readdir(path, offset, entry);
+    if (extra != -20)
+        return extra;
     if (!__builtin_strncmp(path,"/sys",4) && (!path[4] || path[4]=='/')) return sysfs_readdir(path,offset,entry);
 #ifdef CONFIG_LOCK_STAT
     if (proc_text_eq(path, "/proc/reliefnt")) {
@@ -977,11 +1080,14 @@ int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *
     }
 #endif
     if (proc_text_eq(path, "/proc/sys") || proc_text_eq(path, "/proc/sys/kernel")) {
-        static const char *values[] = {"hostname", "domainname", "ostype", "osrelease", "version"};
+        static const char *values[] = {"hostname", "domainname",  "ostype",      "osrelease",
+                                       "version",  "overflowuid", "overflowgid", "pid_max"};
         int parent = proc_text_eq(path, "/proc/sys");
-        if (*offset >= (parent ? 1 : sizeof(values) / sizeof(values[0]))) return 0;
+        if (*offset >= (parent ? 2 : sizeof(values) / sizeof(values[0])))
+            return 0;
         entry->type = parent ? RELIEFOS_FS_TYPE_DIR : RELIEFOS_FS_TYPE_FILE;
-        proc_copy(entry->name, sizeof(entry->name), parent ? "kernel" : values[*offset]);
+        proc_copy(entry->name, sizeof(entry->name),
+                  parent ? (*offset ? "fs" : "kernel") : values[*offset]);
         ++*offset;
         return 1;
     }
@@ -1036,9 +1142,18 @@ int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *
         }
         if ((kind != 2 && kind != 3) || file) return -20;
         if (!sched_find(pid)) return -2;
-        static const char *task_files[] = {"stat", "cmdline", "status", "mounts", "mountinfo", "exe", "cwd", "root", "comm", "environ", "fd"};
+        static const char *task_files[] = {"stat", "cmdline", "status",       "mounts", "mountinfo",
+                                           "exe",  "cwd",     "root",         "comm",   "environ",
+                                           "fd",   "task",    "fdinfo",       "limits", "statm",
+                                           "maps", "smaps",   "smaps_rollup", "auxv",   "io"};
+        if (*offset == 11 && (proc_thread_path(path) || sched_task_tgid(sched_find(pid)) != pid ||
+                              !__builtin_strncmp(path, "/proc/thread-self", 17)))
+            ++*offset;
         if (*offset >= sizeof(task_files) / sizeof(task_files[0])) return 0;
-        *entry = (struct reliefos_dir_entry){.type = *offset == 10 ? RELIEFOS_FS_TYPE_DIR : *offset >= 5 && *offset <= 7 ? RELIEFOS_FS_TYPE_SYMLINK : RELIEFOS_FS_TYPE_FILE};
+        *entry = (struct reliefos_dir_entry){
+            .type = (*offset == 10 || *offset == 11 || *offset == 12) ? RELIEFOS_FS_TYPE_DIR
+                    : *offset >= 5 && *offset <= 7                    ? RELIEFOS_FS_TYPE_SYMLINK
+                                                                      : RELIEFOS_FS_TYPE_FILE};
         proc_copy(entry->name, sizeof(entry->name), task_files[(*offset)++]);
         return 1;
     }
@@ -1046,8 +1161,14 @@ int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *
     const uint64_t fixed_count=sizeof(files)/sizeof(files[0]);
     if (*offset < fixed_count) {
         index=(uint32_t)*offset;
-        entry->type = index == 5 || index == 6 ? RELIEFOS_FS_TYPE_SYMLINK :
-            (index == 7 || index == 11 || proc_text_eq(files[index], "reliefnt")) ? RELIEFOS_FS_TYPE_DIR : RELIEFOS_FS_TYPE_FILE;
+        entry->type = proc_text_eq(files[index], "self") || proc_text_eq(files[index], "mounts") ||
+                              proc_text_eq(files[index], "thread-self")
+                          ? RELIEFOS_FS_TYPE_SYMLINK
+                      : proc_text_eq(files[index], "sys") || proc_text_eq(files[index], "asound") ||
+                              proc_text_eq(files[index], "net") ||
+                              proc_text_eq(files[index], "reliefnt")
+                          ? RELIEFOS_FS_TYPE_DIR
+                          : RELIEFOS_FS_TYPE_FILE;
         proc_copy(entry->name, sizeof(entry->name), files[index]);
         *offset = index + 1u;
         return 1;
@@ -1057,8 +1178,9 @@ int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *
         if(minimum>UINT32_MAX)return 0;
         struct task *task=NULL,*candidate;
         for(uint32_t slot=0;(candidate=sched_task_at(slot));++slot)
-            if(candidate->pid && candidate->pid>=minimum &&
-               (!task || candidate->pid<task->pid))task=candidate;
+            if (candidate->pid && sched_task_tgid(candidate) == candidate->pid &&
+                candidate->pid >= minimum && (!task || candidate->pid < task->pid))
+                task = candidate;
         if(task) {
             *offset=fixed_count+(uint64_t)task->pid+1u;
             char name[16];

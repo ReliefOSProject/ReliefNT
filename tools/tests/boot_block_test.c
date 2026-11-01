@@ -9,6 +9,19 @@
 #include <reliefnt/blkdev.h>
 #include <reliefnt/multiboot2.h>
 #include "../../kernel/module/internal.h"
+/* Boot image transfers run before scheduling in this fixture. */
+struct task *sched_current_task(void)
+{
+    return NULL;
+}
+uint32_t sched_current_pid(void)
+{
+    return 0;
+}
+uint64_t time_uptime_ms(void)
+{
+    return 0;
+}
 
 static unsigned char *source;
 static const uint64_t physical=0x18000000,source_bytes=1536ULL*1024*1024;

@@ -11,6 +11,7 @@
 #include <reliefnt/pty.h>
 #include <reliefnt/random.h>
 #include <reliefnt/sched.h>
+#include <reliefnt/proc_stats.h>
 #include <reliefnt/storage.h>
 #include <reliefnt/uts.h>
 #include <reliefnt/syscall.h>
@@ -430,6 +431,8 @@ static int prepare_user_exec_stack(struct task *task, const char *execfn, uint64
             AT_SYSINFO_EHDR, vdso_ehdr,
             AT_NULL, 0,
         };
+        __builtin_memcpy(sched_task_mm(task)->saved_auxv, auxv, sizeof(auxv));
+        sched_task_mm(task)->saved_auxv_bytes = sizeof(auxv);
         for (uint32_t i = 0; i < sizeof(auxv) / sizeof(auxv[0]); ++i) {
             if (write_user_u64(sched_task_as(task), auxv_base + (uint64_t)i * sizeof(uint64_t), auxv[i]) < 0) {
                 return -12;
@@ -823,6 +826,7 @@ static struct task *wait_for_runnable_task(uint64_t *execution_flags)
 struct task *userland_schedule_from_frame(struct trap_frame *frame)
 {
     uint64_t execution_flags;
+    sched_account_mode(true);
     kernel_execution_lock_scoped_irqsave(&execution_flags, LOCK_SCOPE_SCHED);
     /* Pure-CPU user tasks reach this scheduler boundary from timer return. */
     sched_run_network_maintenance();
@@ -922,6 +926,7 @@ retry:
             arch_fpu_save(current->fpu_state);
         arch_fpu_restore(next->fpu_state);
     }
+    sched_account_mode(false);
     kernel_execution_unlock_irqrestore(execution_flags);
     return next;
 }

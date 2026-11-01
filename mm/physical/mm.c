@@ -3,6 +3,7 @@
  * Allocates, frees, zeroes, and reference-counts physical memory pages.
  */
 #include <reliefnt/export.h>
+#include <reliefnt/proc_stats.h>
 #include <reliefnt/console.h>
 #include <reliefnt/framebuffer.h>
 #include <reliefnt/mm.h>
@@ -14,6 +15,7 @@ extern char __kernel_start[];
 extern char __kernel_end[];
 
 static uint64_t total_kib;
+static uint64_t proc_allocated, proc_freed, proc_faults;
 static uint64_t unsupported_ram_bytes;
 static uint32_t unsupported_ram_ranges;
 
@@ -435,6 +437,7 @@ static void print_memory_map(void)
 void mm_init(const struct boot_info *boot)
 {
     kernel_spin_init(&mm_lock);
+    proc_allocated = proc_freed = proc_faults = 0;
     total_kib = 0;
     unsupported_ram_bytes = 0;
     unsupported_ram_ranges = 0;
@@ -577,6 +580,7 @@ uint64_t mm_alloc_pages_below(uint32_t page_count, uint64_t mask)
             free_pages[page / 64] &= ~(1ULL << (page % 64)); page_refs[page] = 1;
         }
         free_page_count -= page_count;
+        proc_allocated += page_count;
         if (first == allocation_hint) allocation_hint = i + 1;
         result = phys;
         break;
@@ -613,6 +617,7 @@ uint64_t mm_alloc_pages(uint32_t page_count)
             page_refs[page] = 1;
         }
         free_page_count -= page_count;
+        proc_allocated += page_count;
         /* A multi-page search can skip smaller holes; retain those for later. */
         if (page_count == 1 || first == allocation_hint) allocation_hint = i + 1;
         result = (uint64_t)first * PAGE_SIZE;
@@ -664,6 +669,7 @@ void mm_free_pages(uint64_t phys, uint32_t page_count)
         uint32_t index = page_index(current);
         free_pages[index / 64] |= 1ULL << (index % 64);
         ++free_page_count;
+        ++proc_freed;
         if (index < allocation_hint) allocation_hint = index;
     }
     kernel_spin_unlock_irqrestore(&mm_lock, flags);
@@ -709,3 +715,20 @@ EXPORT_SYMBOL(mm_phys_to_virt);
 EXPORT_SYMBOL(mm_virt_to_phys);
 
 EXPORT_SYMBOL(mm_free_memory_kib);
+
+/** @brief Snapshot allocator events under its IRQ-safe lock.
+ * @param out Required kernel output; no memory or reference ownership changes.
+ */
+void mm_proc_snapshot(struct mm_proc_stats *out)
+{
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&mm_lock, &flags);
+    *out = (struct mm_proc_stats){proc_allocated, proc_freed,
+                                  __atomic_load_n(&proc_faults, __ATOMIC_RELAXED)};
+    kernel_spin_unlock_irqrestore(&mm_lock, flags);
+}
+/** @brief Count a user fault without acquiring execution or allocator locks. */
+void mm_proc_fault(void)
+{
+    __atomic_fetch_add(&proc_faults, 1, __ATOMIC_RELAXED);
+}

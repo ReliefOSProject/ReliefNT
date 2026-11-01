@@ -1,4 +1,5 @@
 #include "internal.h"
+#include <reliefnt/proc_stats.h>
 
 static uint64_t cpu_accounting_add(uint64_t value, uint64_t delta);
 
@@ -33,6 +34,15 @@ void cpu_accounting_settle(uint32_t cpu)
     if (owner && owner->pid && owner->pid == current_pid[cpu] && owner->running_cpu == cpu) {
         cpu_accounting[cpu].busy_ticks = cpu_accounting_add(cpu_accounting[cpu].busy_ticks, delta);
         owner->cpu_ticks = cpu_accounting_add(owner->cpu_ticks, delta);
+        if (cpu_accounting[cpu].kernel_mode) {
+            cpu_accounting[cpu].system_ticks =
+                cpu_accounting_add(cpu_accounting[cpu].system_ticks, delta);
+            owner->cpu_system_ticks = cpu_accounting_add(owner->cpu_system_ticks, delta);
+        } else {
+            cpu_accounting[cpu].user_ticks =
+                cpu_accounting_add(cpu_accounting[cpu].user_ticks, delta);
+            owner->cpu_user_ticks = cpu_accounting_add(owner->cpu_user_ticks, delta);
+        }
     } else {
         cpu_accounting[cpu].idle_ticks = cpu_accounting_add(cpu_accounting[cpu].idle_ticks, delta);
     }
@@ -248,4 +258,76 @@ uint32_t sched_snapshot(struct task_snapshot_info *out, uint32_t capacity, uint6
     result = n;
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
     return result;
+}
+
+/** @brief Snapshot scheduler lifetime counters and live runnable tasks.
+ * @param out Required output. Caller owns execution; scheduler lock is short.
+ * No allocation, callbacks or references escape the snapshot.
+ */
+void sched_proc_snapshot(struct sched_proc_stats *out)
+{
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&scheduler_lock, &flags);
+    *out = (struct sched_proc_stats){
+        .created = proc_created, .switches = proc_switches, .last_pid = proc_last_pid};
+    for (uint32_t i = 0; i < task_count; ++i) {
+        struct task *t = tasks[i];
+        if (!t || !t->pid)
+            continue;
+        ++out->tasks;
+        if (t->state == TASK_RUNNING || t->state == TASK_READY)
+            ++out->running;
+        /* All current waits are interruptible, so none is Linux D state. */
+    }
+    kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
+}
+
+/** @brief Settle the local CPU before changing syscall privilege attribution.
+ * @param kernel True on entry, false immediately before direct user return.
+ * IRQ-safe scheduler lock; no allocation, callbacks or lifetime transfer.
+ */
+void sched_account_mode(bool kernel)
+{
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&scheduler_lock, &flags);
+    uint32_t cpu = scheduler_cpu_index();
+    cpu_accounting_settle(cpu);
+    cpu_accounting[cpu].kernel_mode = kernel;
+    kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
+}
+/** @brief Snapshot actual user/system/idle scheduler ticks per CPU.
+ * @param user User output. @param system Kernel output. @param idle Idle output.
+ * @param capacity Array capacity. IRQ-safe; no retained references.
+ */
+void sched_cpu_times(uint64_t *user, uint64_t *system, uint64_t *idle, uint32_t capacity)
+{
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&scheduler_lock, &flags);
+    cpu_accounting_sync();
+    for (uint32_t i = 0; i < capacity && i < SMP_MAX_CPUS; ++i) {
+        user[i] = cpu_accounting[i].user_ticks;
+        system[i] = cpu_accounting[i].system_ticks;
+        idle[i] = cpu_accounting[i].idle_ticks;
+    }
+    kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
+}
+/** @brief Snapshot one thread's CPU times or the published thread group's sum.
+ * @param task Borrowed target. @param process Sum the group when true.
+ * @param user Required user ticks. @param system Required kernel ticks.
+ * IRQ-safe scheduler lock; no references escape.
+ */
+void sched_task_cpu_times(const struct task *task, bool process, uint64_t *user, uint64_t *system)
+{
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&scheduler_lock, &flags);
+    cpu_accounting_sync();
+    *user = *system = 0;
+    for (uint32_t i = 0; task && i < task_count; ++i) {
+        const struct task *t = tasks[i];
+        if ((!process && t == task) || (process && sched_task_tgid(t) == sched_task_tgid(task))) {
+            *user = cpu_accounting_add(*user, t->cpu_user_ticks);
+            *system = cpu_accounting_add(*system, t->cpu_system_ticks);
+        }
+    }
+    kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
 }

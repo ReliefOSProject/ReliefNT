@@ -736,4 +736,7 @@ int vfs_path_getcwd(const struct vfs_namespace *ns,const struct vfs_path *root,
  * a namespace prefix or substitutes for the caller's held object reference.
  */
 int vfs_path_backend_name(const struct vfs_path *path,char *buffer,size_t capacity);
+/** @brief Read the actual attachment ID used by mountinfo, without references.
+ * @param path Borrowed retained path or NULL. @return Mount ID or zero if absent. */
+uint64_t vfs_path_mount_id(const struct vfs_path *path);
 #endif

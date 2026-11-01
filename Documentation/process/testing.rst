@@ -37,6 +37,23 @@ ABI 变化必须明确审查，不通过重生成历史 golden 消除差异。
 ABI golden、导出头、启动、vDSO、徽标、panic、Kconfig 和模块布局检查。
 仅有 Linux 参考探针通过，不表示相同接口已在 ReliefNT 来宾运行通过。
 
+``procfs`` 套件执行真实 proc/VFS/fdinfo 的 ASan/UBSan 夹具，并在宿主 Linux
+编译运行 ``tools/tests/procfs_probe.c`` 作为 ABI 参考。探针检查系统/进程节点、
+seek、maps、二进制 auxv、描述符和多线程 thread-self；来宾验证应由操作系统
+使用其 SDK 编译该探针后实际运行，并与宿主结果分别记录。
+
+同套件还运行无需 libc 的 ``tools/tests/procfs_raw_probe.c``。该探针可编译为
+initramfs 的 ``/init``，通过 ``rdinit=/init`` 在真实挂载的 procfs 上验收；
+PID 1 将结果写入串口并等待。编译示例::
+
+    cc -std=c11 -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin \
+       -fno-stack-protector -nostdlib -static -no-pie -Wl,-e,_start \
+       -Wl,-Ttext-segment=0x400000 -Iinclude/uapi \
+       tools/tests/procfs_raw_probe.c -o <initramfs-root>/init
+
+来宾验收分别记录单核和多核启动的完整串口日志、内核与探针摘要；
+出现 PASS 后仍需检查没有 FAIL 或 panic，不能只以启动完成代替 syscall 验证。
+
 ``service_roles`` 套件检查旧内核桌面实现未恢复、旧窗口服务权限标志未恢复，
 以及 exec 只保留允许的任务标志；这些内核源码检查由本仓持有，父仓不再重复。
 

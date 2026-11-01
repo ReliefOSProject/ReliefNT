@@ -67,6 +67,12 @@ void kernel_irq_restore(uint64_t flags) { irq_flags = flags; }
 struct task *sched_find(uint32_t pid) { return current && current->pid == pid ? current : NULL; }
 uint64_t x86_64_read_cr2(void) { return fault_address; }
 uint64_t time_ticks(void) { return 0; }
+/* The fixture owns physical pages; count the dispatch boundary independently. */
+static atomic_uint_fast64_t user_faults;
+void mm_proc_fault(void)
+{
+    atomic_fetch_add(&user_faults, 1);
+}
 void smp_flush_user_tlb(void) { }
 void console_log(enum console_log_level level, const char *format, ...)
 { (void)level; (void)format; }
