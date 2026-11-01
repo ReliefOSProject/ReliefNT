@@ -121,6 +121,7 @@ static bool ext4_cache_ensure(struct ext4_cache_table *table)
      * ext2_cache does; an allocation failure only disables caching. */
     phys = mm_alloc_pages((uint32_t)((bytes + 4095u) / 4096u));
     if (!phys) {
+
         return false;
     }
     table->entries = (struct storage_ext4_cache_entry *)mm_phys_to_virt(phys);
@@ -192,6 +193,7 @@ static struct storage_ext4_cache_entry *ext4_cache_fill(struct ext4_cache_table 
     }
     if (!victim) {
         /* Capacity is full and every entry is pinned. */
+
         *err = -RELIEFOS_ENOMEM;
         return NULL;
     }
@@ -400,14 +402,16 @@ void storage_ext4_cache_finish(struct storage_volume *volume, uint64_t block, co
 }
 
 /** @brief Evict clean overlapping aliases of the exact referenced block device.
- * @param writer Borrowed instance with transport ownership held by the caller.
+ * @param writer Optional borrowed instance. @param device Optional exact device;
+ * at least one identity must be present and neither is retained.
  * @param lba First 512-byte sector. @param count Nonzero sectors, overflow ignored.
  * Dirty/pinned journal blocks remain owned by their transactions. Requires storage
  * execution exclusion; compares core identities without entering provider code.
  */
-void storage_ext4_cache_invalidate_write(const struct storage_volume *writer,uint64_t lba,uint32_t count)
+void storage_ext4_cache_invalidate_write(const struct storage_volume *writer,const struct block_device *device,
+                                         uint64_t lba,uint32_t count)
 {
-    if (!writer || !count || lba>UINT64_MAX-count) return;
+    if ((!writer && !device) || !count || lba>UINT64_MAX-count) return;
     for (unsigned t=0;t<EXT4_CACHE_TABLE_COUNT;t++) {
         struct ext4_cache_table *table=&ext4_cache_tables[t]; if (!table->entries) continue;
         for (unsigned i=0;i<table->capacity;i++) {
@@ -415,7 +419,7 @@ void storage_ext4_cache_invalidate_write(const struct storage_volume *writer,uin
             if (!e->valid || e->dirty || e->pinned) continue;
             const struct storage_volume *v=e->volume;
             bool same=v==writer;
-            if(v->device_ref.device && v->device_ref.device==writer->device_ref.device)same=true;
+            if(device && v->device_ref.device==device)same=true;
             if (!same) continue;
             uint64_t first=v->ext_start_lba+e->block*(v->ext4.block_size/512);
             if (first<lba+count && lba<first+v->ext4.block_size/512) e->valid=0;

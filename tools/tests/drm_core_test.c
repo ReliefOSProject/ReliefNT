@@ -923,6 +923,17 @@ uint64_t mm_alloc_pages(uint32_t page_count)
     return (uint64_t)(uintptr_t)memory;
 }
 
+/** @brief Model a bounded DMA allocation using host pointers as synthetic PFNs.
+ * @param page_count Requested contiguous pages. @param max_address Inclusive mask.
+ * @return Host allocation identity or zero; the dedicated PPN fixture verifies
+ * physical placement, while this fixture tests the rest of the DRM core.
+ */
+uint64_t mm_alloc_pages_below(uint32_t page_count, uint64_t max_address)
+{
+    assert(max_address == (1ULL << 44) - 1);
+    return mm_alloc_pages(page_count);
+}
+
 void mm_free_pages(uint64_t physical, uint32_t page_count)
 {
     assert(physical && page_count);
@@ -1045,6 +1056,9 @@ struct task_file *task_file_get(struct task_file *source)
 
 static void drm_test_ofd_release(struct task_file *description)
 {
+#if defined(CONFIG_SWAP) && defined(TASK8_DRM_CLEANUP_TEST)
+    if(description->drm_file)assert(!description->drm_file->kms_enumeration);
+#endif
     struct character_file *handle=description->character_file;description->character_file=NULL;
     character_file_close(handle,description);
     *description = (struct task_file){0};

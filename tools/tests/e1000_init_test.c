@@ -9,6 +9,7 @@ static unsigned allocations, allocation_limit = 1024;
 static uint64_t next_physical = 0x100000ULL;
 #define TEST_E1000_BAR_PHYS 0xfebc0000ULL
 #define TEST_E1000_REGISTER_BYTES 0x5408ULL
+static uint64_t fixture_bar = TEST_E1000_BAR_PHYS;
 static struct { uint64_t phys; uint32_t pages; void *host; } allocation_map[1024];
 static int registration_error;
 static int stuck_reset, teardown_error;
@@ -61,15 +62,27 @@ static int find(uint16_t vendor, uint16_t device, struct reliefos_driver_pci_dev
     *out = (struct reliefos_driver_pci_device){.vendor_id = vendor, .device_id = device, .class_code = 2};
     return 0;
 }
+/** @brief Return the configured low or 64-bit fixture BAR configuration word.
+ * @param b Bus. @param s Slot. @param f Function. @param offset Config byte offset.
+ * @return Selected BAR register value, or zero for other offsets.
+ */
 static uint32_t read32(uint8_t b, uint8_t s, uint8_t f, uint8_t offset)
-{ (void)b; (void)s; (void)f; return offset == 0x10 ? (uint32_t)TEST_E1000_BAR_PHYS : 0; }
+{
+    (void)b; (void)s; (void)f;
+    if (offset == 0x10) return (uint32_t)fixture_bar | (fixture_bar > UINT32_MAX ? 4u : 0);
+    return offset == 0x14 ? (uint32_t)(fixture_bar >> 32) : 0;
+}
 static uint16_t read16(uint8_t b, uint8_t s, uint8_t f, uint8_t offset)
 { (void)b; (void)s; (void)f; (void)offset; return command_bits; }
 static void write16(uint8_t b, uint8_t s, uint8_t f, uint8_t offset, uint16_t value)
 { (void)b; (void)s; (void)f; (void)offset; command_bits = value; }
+/** @brief Lease the configured fixture BAR through the driver API.
+ * @param phys Exact BAR physical address. @param bytes Register aperture bytes.
+ * @return Borrowed emulated register alias or NULL on injected failure.
+ */
 static void *map_mmio(uint64_t phys, uint64_t bytes)
 {
-    assert(phys == TEST_E1000_BAR_PHYS);
+    assert(phys == fixture_bar);
     assert(bytes == TEST_E1000_REGISTER_BYTES);
     assert(!(command_bits & (PCI_COMMAND_IO | PCI_COMMAND_MEMORY |
                              PCI_COMMAND_BUS_MASTER)));
@@ -94,6 +107,9 @@ static void log_record(enum console_log_level level, const char *format, ...)
 static int register_ops(const struct reliefos_driver_e1000_ops *ops)
 { assert(ops->is_ready()); return registration_error; }
 
+/** @brief Exercise complete e1000 lifecycle, high BAR and high DMA descriptors.
+ * @return Zero after all fixture assertions succeed.
+ */
 int main(void)
 {
     registers = mmap(NULL, 0x20000, PROT_READ | PROT_WRITE,
@@ -193,6 +209,13 @@ int main(void)
     assert(!teardown_error);
     assert(!allocations && !g_e1000.active && mmio_maps == mmio_unmaps);
     assert(command_bits == (PCI_COMMAND_IO | PCI_COMMAND_MEMORY | PCI_COMMAND_BUS_MASTER));
+    fixture_bar = 0xc000000000ULL;
+    next_physical = 5ULL << 30;
+    assert(!e1000_driver_init(&api));
+    assert(*(uint32_t *)(registers + E1000_REG_RDBAH) == (uint32_t)(g_e1000.rx_phys >> 32));
+    assert(g_e1000.rx_phys > UINT32_MAX && g_e1000.rx[0].addr > UINT32_MAX);
+    e1000_driver_fini();
+    assert(!allocations && mmio_maps == mmio_unmaps);
     assert(munmap(registers, 0x20000) == 0);
     puts("PASS e1000 initialization, VMware MAC, link setup, RX bounds and failure cleanup");
 }

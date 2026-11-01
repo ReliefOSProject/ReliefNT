@@ -1,5 +1,8 @@
 #include "../memory.h"
 #include "../drm_internal.h"
+#ifdef CONFIG_SWAP
+#include "execbuf_internal.h"
+#endif
 
 #include <drm/vmwgfx_drm.h>
 #include <linux/errno.h>
@@ -393,13 +396,23 @@ static int drm_vmwgfx_validate_surface(
     if (total_levels > UINT32_MAX / sizeof(struct drm_vmw_size))
         return -LINUX_EINVAL;
     size_bytes = (uint32_t)total_levels * sizeof(struct drm_vmw_size);
+#ifdef CONFIG_SWAP
+    if (request->size_addr &&
+        drm_user_prepare(task,request->size_addr,size_bytes,false)==KERNEL_SYSCALL_SWAP_CONTENDED)
+        return KERNEL_SYSCALL_SWAP_CONTENDED;
+#endif
     if (!request->size_addr || !user_range_ok(request->size_addr, size_bytes))
         return -LINUX_EFAULT;
     sizes = kernel_malloc(DRM_VMW_SURFACE_COPY_MAX_BYTES);
     if (!sizes) return -LINUX_ENOMEM;
-    if (user_copy_from_task(task, sizes, request->size_addr, size_bytes) < 0) {
+#ifdef CONFIG_SWAP
+    int copy_result=drm_user_import(task,sizes,request->size_addr,size_bytes);
+#else
+    int copy_result=user_copy_from_task(task,sizes,request->size_addr,size_bytes);
+#endif
+    if (copy_result < 0) {
         kernel_free(sizes);
-        return -LINUX_EFAULT;
+        return copy_result;
     }
 
     width = sizes[0].width;
@@ -573,16 +586,103 @@ static int drm_vmwgfx_create_surface_reply(
     return 0;
 }
 
+#ifdef CONFIG_SWAP
+/** @brief Retain a resolved surface and optional original PRIME OFD for retry.
+ * @param task Caller under the outer writer. @param file Pinned DRM OFD.
+ * @param command Original ioctl. @param user_argument Original request address.
+ * @param surface Owned retained surface. @param prime Owned secondary OFD or NULL.
+ * @return Private wait marker after taking both references, or ENOMEM without
+ * transfer. Cancellation releases both outside resource/exec locks.
+ */
+static int drm_vmwgfx_surface_wait(struct task *task,struct drm_file *file,
+    uint32_t command,uint64_t user_argument,struct drm_vmwgfx_surface *surface,
+    struct task_file *prime)
+{
+    struct drm_vmwgfx_task_continuation *continuation=drm_async_alloc(sizeof(*continuation));
+    if(!continuation)return -LINUX_ENOMEM;
+    *continuation=(struct drm_vmwgfx_task_continuation){.kind=DRM_VMW_CONT_SURFACE_REPLY,
+        .surface=surface,.prime_file=prime};
+    drm_vmwgfx_continuation_set_key(continuation,task,file,command,user_argument);
+    task->drm_vmwgfx_continuation=continuation;
+    return KERNEL_SYSCALL_SWAP_CONTENDED;
+}
+
+/** @brief Finish a retained surface lookup without resolving the user's fd again.
+ * @param task Live caller. @param file Original pinned DRM OFD.
+ * @param argument Retry-stable kernel request/reply.
+ * @param receipt Rollback record for a created logical reference.
+ * @param continuation Matching owned precommit state.
+ * @return Zero, errno or the private wait marker. The continuation is detached
+ * and released exactly once on every terminal path, outside spinlocks.
+ */
+static int drm_vmwgfx_surface_resume(struct task *task,struct drm_file *file,
+    union drm_vmw_surface_reference_arg *argument,
+    struct drm_vmwgfx_rollback_receipt *receipt,
+    struct drm_vmwgfx_task_continuation *continuation)
+{
+    struct drm_vmwgfx_surface *surface=continuation->surface;
+    struct drm_vmwgfx_resource *resource=&surface->resource;
+    uint64_t flags;int ret=0;
+    kernel_spin_lock_irqsave(&drm_vmwgfx_resource_lock,&flags);
+    if(resource->state!=DRM_VMW_RESOURCE_LIVE)ret=-LINUX_EINVAL;
+    else if(!continuation->prime_file) {
+        bool held=drm_vmwgfx_file_ref_find_locked(file,resource->id,DRM_VMW_RESOURCE_SURFACE)!=NULL;
+        bool same_master=file->master && resource->creator_master && file->master==resource->creator_master;
+        if(!(file->is_render ? held : file->authenticated && (same_master || held)))ret=-LINUX_EACCES;
+    }
+    kernel_spin_unlock_irqrestore(&drm_vmwgfx_resource_lock,flags);
+    uint64_t size_address=argument->rep.size_addr;
+    if(!ret && size_address && drm_user_prepare(task,size_address,sizeof(struct drm_vmw_size),true)==
+       KERNEL_SYSCALL_SWAP_CONTENDED)return KERNEL_SYSCALL_SWAP_CONTENDED;
+    if(!ret)ret=drm_vmwgfx_surface_add_file_reference(file,surface,receipt);
+    if(!ret) {
+        drm_vmwgfx_create_surface_reply(&argument->rep,&surface->metadata);
+        if(size_address) {
+            struct drm_vmw_size base_size={.width=surface->metadata.desc.width,
+                .height=surface->metadata.desc.height,.depth=surface->metadata.desc.depth};
+            if(!user_range_writable(size_address,sizeof(base_size)) ||
+               user_copy_to_task(task,size_address,&base_size,sizeof(base_size))<0) {
+                (void)drm_vmwgfx_drop_file_reference(file,resource->id,DRM_VMW_RESOURCE_SURFACE);
+                if(receipt)receipt->active=false;
+                ret=-LINUX_EFAULT;
+            }
+        }
+    }
+    task->drm_vmwgfx_continuation=NULL;
+    drm_vmwgfx_continuation_release(continuation);
+    return ret;
+}
+#endif
+
 static int drm_vmwgfx_ref_surface(
     struct task *task, struct drm_file *file,
     union drm_vmw_surface_reference_arg *argument,
-    struct drm_vmwgfx_rollback_receipt *receipt)
+    struct drm_vmwgfx_rollback_receipt *receipt,uint32_t command,uint64_t user_argument)
 {
+#ifdef CONFIG_SWAP
+    struct drm_vmwgfx_task_continuation *continuation=task->drm_vmwgfx_continuation;
+    if(continuation && continuation->kind==DRM_VMW_CONT_SURFACE_REPLY &&
+       drm_vmwgfx_continuation_matches(continuation,task,task->syscall_file,file,command,user_argument))
+        return drm_vmwgfx_surface_resume(task,file,argument,receipt,continuation);
+#else
+    (void)command;(void)user_argument;
+#endif
     if (argument->req.handle_type == DRM_VMW_HANDLE_PRIME) {
         struct drm_vmwgfx_surface *surface = NULL;
         int ret = drm_prime_surface_from_fd(task, argument->req.sid,
                                              file->device, &surface);
         if (ret) return ret;
+#ifdef CONFIG_SWAP
+        uint64_t pending_address=argument->rep.size_addr;
+        if(pending_address && drm_user_prepare(task,pending_address,sizeof(struct drm_vmw_size),true)==
+           KERNEL_SYSCALL_SWAP_CONTENDED) {
+            struct task_file *prime=task_file_get(task_file_for_fd(task,argument->req.sid));
+            if(!prime){drm_vmwgfx_surface_put(surface);return -LINUX_ENOMEM;}
+            ret=drm_vmwgfx_surface_wait(task,file,command,user_argument,surface,prime);
+            if(ret!=KERNEL_SYSCALL_SWAP_CONTENDED){task_file_put(prime);drm_vmwgfx_surface_put(surface);}
+            return ret;
+        }
+#endif
         ret = drm_vmwgfx_surface_add_file_reference(file, surface, receipt);
         if (ret) {
             drm_vmwgfx_surface_put(surface);
@@ -633,6 +733,17 @@ static int drm_vmwgfx_ref_surface(
     kernel_spin_unlock_irqrestore(&drm_vmwgfx_resource_lock, flags);
     if (!authorized) return -LINUX_EACCES;
 
+#ifdef CONFIG_SWAP
+    uint64_t pending_address=argument->rep.size_addr;
+    if(pending_address && drm_user_prepare(task,pending_address,sizeof(struct drm_vmw_size),true)==
+       KERNEL_SYSCALL_SWAP_CONTENDED) {
+        struct drm_vmwgfx_surface *held=(struct drm_vmwgfx_surface *)resource;
+        int ret=drm_vmwgfx_surface_get(held);if(ret)return ret;
+        ret=drm_vmwgfx_surface_wait(task,file,command,user_argument,held,NULL);
+        if(ret!=KERNEL_SYSCALL_SWAP_CONTENDED)drm_vmwgfx_surface_put(held);
+        return ret;
+    }
+#endif
     int ret = drm_vmwgfx_add_surface_ref(file, resource, receipt);
     if (ret) return ret;
     struct drm_vmwgfx_surface *surface =
@@ -660,7 +771,7 @@ static int drm_vmwgfx_ref_surface(
 
 int drm_vmwgfx_resource_ioctl(struct task *task, struct drm_file *file,
                               uint32_t command, void *data,
-    struct drm_vmwgfx_rollback_receipt *receipt)
+                              struct drm_vmwgfx_rollback_receipt *receipt,uint64_t user_argument)
 {
     if (!task || !file || !data || !receipt) return -LINUX_EINVAL;
     *receipt = (struct drm_vmwgfx_rollback_receipt){0};
@@ -683,7 +794,7 @@ int drm_vmwgfx_resource_ioctl(struct task *task, struct drm_file *file,
             file, (uint32_t)argument->sid, DRM_VMW_RESOURCE_SURFACE);
     }
     case DRM_VMW_REF_SURFACE:
-        return drm_vmwgfx_ref_surface(task, file, data, receipt);
+        return drm_vmwgfx_ref_surface(task, file, data, receipt,command,user_argument);
     default:
         return -LINUX_EINVAL;
     }

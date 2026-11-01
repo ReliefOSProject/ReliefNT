@@ -20,6 +20,9 @@ int64_t syscall_legacy_memory(uint64_t number, uint64_t a0, uint64_t a1, uint64_
 {
     (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
 
+    if (number == LINUX_SYS_SWAPON) return syscall_mm_swapon(a0,a1);
+    if (number == LINUX_SYS_SWAPOFF) return syscall_mm_swapoff(a0);
+
     if (number == LINUX_SYS_MEMFD_CREATE) return syscall_memfd_create(a0, (uint32_t)a1);
 
     if (number == LINUX_SYS_MSYNC) {
@@ -35,7 +38,7 @@ int64_t syscall_legacy_memory(uint64_t number, uint64_t a0, uint64_t a1, uint64_
     }
 
     if (number == LINUX_SYS_MMAP) {
-        return syscall_mm_mmap(a0, a1, a2, a3, a4, a5);
+        return syscall_mm_mmap_dispatch(a0, a1, a2, a3, a4, a5);
     }
 
     if (number == LINUX_SYS_MREMAP) {

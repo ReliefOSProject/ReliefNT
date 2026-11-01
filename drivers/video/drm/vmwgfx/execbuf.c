@@ -199,13 +199,32 @@ static int drm_vmwgfx_execbuf(struct task *task, struct drm_file *file,
     struct drm_vmwgfx_exec_work *work = drm_vmwgfx_exec_work_alloc(
         arg->command_size, 0, &allocation_error, diagnostics);
     if (!work) return allocation_error;
-    if (arg->command_size &&
-        user_copy_from_task(task, work->snapshot, arg->commands,
-                            arg->command_size) < 0) {
-        drm_vmwgfx_exec_work_fail(work, diagnostics, -LINUX_EFAULT,
-                                  "exec.input_copy");
-        return -LINUX_EFAULT;
+    int input_result=0;
+    if (arg->command_size) {
+#ifdef CONFIG_SWAP
+        input_result=drm_user_import(task,work->snapshot,arg->commands,arg->command_size);
+#else
+        input_result=user_copy_from_task(task,work->snapshot,arg->commands,arg->command_size);
+#endif
     }
+#ifdef CONFIG_SWAP
+    if(input_result==KERNEL_SYSCALL_SWAP_CONTENDED) {
+        drm_vmwgfx_exec_work_release(work);return input_result;
+    }
+#endif
+    if (input_result < 0) {
+        drm_vmwgfx_exec_work_fail(work, diagnostics, input_result,
+                                  "exec.input_copy");
+        return input_result;
+    }
+#ifdef CONFIG_SWAP
+    /* No GPU submission or resource handle is published until this reply
+     * page is resident. Permanent faults keep the existing fence-fault path. */
+    if(arg->fence_rep && drm_user_prepare(task,arg->fence_rep,
+         sizeof(struct drm_vmw_fence_rep),true)==KERNEL_SYSCALL_SWAP_CONTENDED) {
+        drm_vmwgfx_exec_work_release(work);return KERNEL_SYSCALL_SWAP_CONTENDED;
+    }
+#endif
 
     int status = 0;
     struct drm_vmwgfx_exec_walk walk = {.work = work, .file = file};
@@ -513,6 +532,9 @@ void drm_vmwgfx_cancel_task_continuation(struct task *task)
     struct drm_vmwgfx_task_continuation *continuation =
         task->drm_vmwgfx_continuation;
     if (!continuation) return;
+#ifdef CONFIG_SWAP
+    if(continuation->kind==DRM_VMW_CONT_KMS_ENUM)drm_kms_enum_unreserve(continuation);
+#endif
     task->drm_vmwgfx_continuation = NULL;
     drm_vmwgfx_continuation_queue_release(continuation);
 }

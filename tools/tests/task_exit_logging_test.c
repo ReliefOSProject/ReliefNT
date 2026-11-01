@@ -38,6 +38,7 @@ void paging_load_cr3(uint64_t cr3) { assert(cr3 == 0x1000); }
 uint64_t time_uptime_us(void) { return 0; }
 uint64_t time_uptime_ms(void) { return 0; }
 
+#ifndef PRESSURE_WAIT_FIXTURE
 void kernel_spin_lock_irqsave(struct kernel_spinlock *lock, uint64_t *flags)
 {
     assert(lock == &scheduler_lock);
@@ -59,6 +60,7 @@ void kernel_spin_unlock_irqrestore(struct kernel_spinlock *lock, uint64_t flags)
         callback();
     }
 }
+#endif
 
 static void fixture_console_vprintf(const char *format, va_list arguments)
 {
@@ -93,9 +95,38 @@ void console_log(enum console_log_level level, const char *format, ...)
     va_end(arguments);
 }
 
+#ifndef PRESSURE_REAL_SIGNAL
 int kernel_signal_fatal_pending(const struct task *task) { (void)task; return 0; }
-void *kernel_malloc(size_t size) { return calloc(1, size); }
+#endif
+#ifdef PRESSURE_REAL_SIGNAL
+static bool fixture_forbid_malloc;
+#endif
+void *kernel_malloc(size_t size)
+{
+#ifdef PRESSURE_REAL_SIGNAL
+    assert(!fixture_forbid_malloc);
+#endif
+    return calloc(1, size);
+}
 void kernel_free(void *ptr) { free(ptr); }
+/* This fixture constructs only zero-initialized VMAs.  If it ever exercises
+ * a device mapping, fail instead of pretending that retirement succeeded. */
+void device_mapping_retire_begin(struct device_mapping *mapping)
+{ (void)mapping; abort(); }
+void device_mapping_release_range(struct device_mapping *mapping, uint64_t offset,
+                                  uint64_t length, bool final_put)
+{ (void)mapping; (void)offset; (void)length; (void)final_put; abort(); }
+void device_mapping_retire_end(struct device_mapping *mapping)
+{ (void)mapping; abort(); }
+/* The real SysV release returns immediately for an unattached VMA.  This
+ * fixture exercises precisely that case; refuse an attached VMA rather than
+ * modeling segment ownership.  File and device puts are unreachable here. */
+void sysv_shm_vma_release(struct task *task, struct task_vma *vma)
+{ (void)task; if (vma && vma->sysv_shm_attachment) abort(); }
+void device_mapping_put(struct device_mapping *mapping)
+{ (void)mapping; abort(); }
+void task_file_put(struct task_file *description)
+{ (void)description; abort(); }
 int storage_inode_put(struct storage_inode_ref *reference) { (void)reference; return 0; }
 void task_groups_release(struct task *task) { (void)task; }
 __attribute__((noreturn)) void bugcheck_panic(const char *message)
@@ -119,8 +150,10 @@ void kernel_execution_unlock_irqrestore(uint64_t flags)
 void storage_drain_task_io(uint32_t pid)
 { (void)pid; assert(!scheduler_lock_depth); ++io_drains; }
 void syscall_record_lock_cancel(struct task *task) { (void)task; }
+#ifndef PRESSURE_WAIT_FIXTURE
 void kernel_wait_queue_remove(struct kernel_wait_queue *queue, struct task *task)
 { (void)queue; (void)task; }
+#endif
 uint64_t task_socket_cancel_receive(struct task *task) { (void)task; return 0; }
 void task_release_syscall_file(struct task *task) { (void)task; }
 void task_sysv_sem_exit(struct task *task) { (void)task; }
@@ -128,20 +161,40 @@ void futex_task_exit(struct task *task) { (void)task; }
 void pty_process_session_exit(uint32_t tgid) { (void)tgid; }
 void syscall_release_task_files(struct task *task)
 { (void)task; assert(!scheduler_lock_depth); ++file_releases; }
-void address_space_destroy(struct address_space *as) { (void)as; }
+#ifdef PRESSURE_DESTROY_HOOK
+/** @brief Observe modeled address-space destruction at real last-holder cleanup.
+ * @param as Borrowed MM immediately before the modeled destruction returns.
+ */
+void pressure_destroy_hook(struct address_space *as);
+#endif
+/** @brief Model destruction, optionally observing the last-holder boundary.
+ * @param as Borrowed MM destroyed by the real scheduler cleanup path.
+ */
+void address_space_destroy(struct address_space *as)
+{
+#ifdef PRESSURE_DESTROY_HOOK
+    pressure_destroy_hook(as);
+#else
+    (void)as;
+#endif
+}
 void svga_gpu_release_owner(uint32_t owner) { (void)owner; }
 void pty_process_exit(uint32_t pid) { (void)pid; }
+#ifndef PRESSURE_REAL_SIGNAL
 void kernel_signal_flush(struct task *task, bool process, uint64_t mask)
 { (void)task; (void)process; (void)mask; }
 int kernel_signal_enqueue(struct task *task, bool process, int sig,
                           const struct linux_siginfo *info)
 { (void)task; (void)process; (void)sig; (void)info; return 0; }
+#endif
 int kernel_signal_queue_task(struct task *task, int signal_number)
 { (void)task; (void)signal_number; return 0; }
 int kernel_signal_queue_task_info(struct task *task, int sig,
                                   const struct linux_siginfo *info)
 { (void)task; (void)sig; (void)info; return 0; }
+#ifndef PRESSURE_REAL_SIGNAL
 bool kernel_signal_default_ignored(int sig) { (void)sig; return false; }
+#endif
 void task_sysv_sem_stop(struct task *task) { (void)task; }
 
 static void reset_console_log(void)
@@ -155,7 +208,7 @@ static void reset_console_log(void)
 
 static struct task *fixture_task(uint32_t pid, const char *name)
 {
-    struct task *task = calloc(1, sizeof(*task));
+    struct task *task = calloc(1, sizeof(struct sched_task_object));
     assert(task);
     task->pid = pid;
     task->tgid = pid;

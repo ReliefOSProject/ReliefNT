@@ -72,6 +72,7 @@ int64_t syscall_rename_object(struct vfs_namespace *ns,struct task *task,int32_t
        !__builtin_strcmp(old_parent.last,"..")))rc=-RELIEFOS_EBUSY;
     if(!rc)rc=vfs_path_lookup_child(&old_parent.path,old_parent.last,&source);
     if(!rc && old_parent.trailing && vfs_path_node(&source)->type!=RELIEFOS_FS_TYPE_DIR)rc=-RELIEFOS_ENOTDIR;
+    if(!rc)storage_release_task_io(task->pid);
     if(!rc)rc=resolve_user_object_at_flags(ns,task,newfd,newname,false,false,VFS_LOOKUP_PARENT,&new_parent);
     if(!rc && (!new_parent.last[0] || !__builtin_strcmp(new_parent.last,".") ||
        !__builtin_strcmp(new_parent.last,"..")))rc=-RELIEFOS_EBUSY;
@@ -113,6 +114,7 @@ int64_t syscall_link_object(struct vfs_namespace *ns,struct task *task,int32_t o
     if(!rc)rc=resolve_kernel_object_at_flags(ns,task,oldfd,text.text,flags&LINUX_AT_EMPTY_PATH,false,
         flags&LINUX_AT_SYMLINK_FOLLOW ? VFS_LOOKUP_FOLLOW : 0,&source);
     kernel_free(text.allocation);
+    if(!rc)storage_release_task_io(task->pid);
     if(!rc)rc=resolve_user_object_at_flags(ns,task,newfd,newname,false,false,VFS_LOOKUP_PARENT,&parent);
     if(!rc && (!parent.last[0] || !__builtin_strcmp(parent.last,".") || !__builtin_strcmp(parent.last,"..")))
         rc=-RELIEFOS_EEXIST;

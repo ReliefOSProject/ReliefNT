@@ -8,6 +8,7 @@
 #undef main
 #include <reliefos/auth_abi.h>
 #include <reliefos/text.h>
+#include <reliefnt/swap.h>
 
 static _Noreturn int io_unexpected(const char *name, ...)
 {
@@ -16,6 +17,9 @@ static _Noreturn int io_unexpected(const char *name, ...)
 }
 #define IO_UNAVAILABLE(...) io_unexpected(__func__, ##__VA_ARGS__)
 #define task_signalfd_read IO_UNAVAILABLE
+/* Archived pre-extraction backends dispatched these devices directly. */
+#define syscall_drm_read IO_UNAVAILABLE
+#define drm_prime_file_rw IO_UNAVAILABLE
 #define character_file_read(...) io_unexpected(__func__, ##__VA_ARGS__)
 #define character_file_write(...) io_unexpected(__func__, ##__VA_ARGS__)
 #define pty_write_input IO_UNAVAILABLE
@@ -76,6 +80,37 @@ bool user_range_writable(uint64_t address, uint64_t length)
 { return user_writable && user_range_ok(address, length); }
 
 #include "syscall_io_body.inc"
+
+#ifdef SYSCALL_IO_HAS_SCALAR_PREPARE
+/* The imported helpers use the real CONFIG_SWAP=n inline implementation from
+ * swap.h; range and permission checks below model resident user mappings. */
+static void test_scalar_preparation(void)
+{
+    struct task *task = &test_tasks[0];
+    struct task_file pipe = {.flags = TASK_FILE_FLAG_PIPE};
+    struct task_file event = {.flags = TASK_FILE_FLAG_EVENTFD};
+    struct task_file staged = {.node = {.type = RELIEFOS_FS_TYPE_FILE}};
+    struct task_file null = {.flags = TASK_FILE_FLAG_DEV_NULL};
+    uint64_t address = (uintptr_t)user_bytes;
+
+    user_range_bytes = 32768;
+    user_writable = true;
+    assert(scalar_prepare_user(task, &pipe, address, 65536, false) == 0);
+    --user_range_bytes;
+    assert(scalar_prepare_user(task, &pipe, address, 65536, false) == -RELIEFOS_EFAULT);
+    user_range_bytes = 8;
+    user_writable = false;
+    assert(scalar_prepare_user(task, &event, address, 8, false) == -RELIEFOS_EFAULT);
+    assert(scalar_prepare_user(task, &event, address, 8, true) == 0);
+    user_range_bytes = 0;
+    assert(scalar_prepare_user(task, &staged, address, 1, false) == 0);
+    assert(scalar_prepare_user(task, &null, address, 1, false) == 0);
+    assert(scalar_prepare_user(task, &null, 0, 1, false) == -RELIEFOS_EFAULT);
+    assert(scalar_prepare_user(task, &null, RELIEFNT_USER_TOP - 1, 2, false) == -RELIEFOS_EFAULT);
+    user_range_bytes = sizeof(user_bytes);
+    user_writable = true;
+}
+#endif
 
 static void pin(struct task *task, int fd, struct task_file *file)
 {
@@ -251,6 +286,9 @@ static void test_all_regular_providers_use_one_read_path(void)
 int main(void)
 {
     assert(pipe_wake_regressions() == 0);
+#ifdef SYSCALL_IO_HAS_SCALAR_PREPARE
+    test_scalar_preparation();
+#endif
     test_redirected_stdio_and_validation();
     test_pipe_wait_retry_eof_and_signal();
     test_null_access_and_full_count();

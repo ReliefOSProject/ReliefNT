@@ -15,6 +15,7 @@
 #include <reliefnt/kernel_debug.h>
 #include <reliefnt/kernel.h>
 #include <reliefnt/mm.h>
+#include <reliefnt/memory_topology.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/multiboot2.h>
 #include <reliefnt/module.h>
@@ -41,6 +42,8 @@
 #include "../../arch/x86_64/idt.h"
 
 static uint8_t kernel_ring0_stack[65536] __attribute__((aligned(16)));
+/** @brief Entry stub marker set only after the i386 root has been installed. */
+extern uint8_t boot_via_bios;
 
 /**
  * @brief Scratch for the early EFI memory-map capture. GRUB on UEFI keeps boot
@@ -49,6 +52,27 @@ static uint8_t kernel_ring0_stack[65536] __attribute__((aligned(16)));
  * buffer lives in kernel .bss, which mm.c reserves through the linker bounds.
  */
 static uint8_t efi_mmap_buffer[262144] __attribute__((aligned(16)));
+
+/** @brief Apply UC policy to both retained display extents.
+ * @param display Borrowed framebuffer descriptor from the early probe.
+ * @param require_mapped True after publishing the complete sparse map.
+ * @return True on success; a missing temporary mapping is deferred until publish.
+ */
+static bool boot_claim_framebuffer(const struct framebuffer *display, bool require_mapped)
+{
+    if (!display || !display->available) return true;
+    const uint64_t starts[] = {display->reservation_start, display->auxiliary_reservation_start};
+    const uint64_t sizes[] = {display->reservation_bytes, display->auxiliary_reservation_bytes};
+    for (unsigned i = 0; i < 2; ++i) {
+        if (!starts[i] || !sizes[i]) continue;
+        if (!paging_kernel_direct_map_range(starts[i], sizes[i])) {
+            if (require_mapped) return false;
+            continue;
+        }
+        if (!paging_mmio_uncached(starts[i], sizes[i])) return false;
+    }
+    return true;
+}
 
 /**
  * @brief Halt the CPU forever; used when there is nothing left to run.
@@ -106,35 +130,56 @@ static void boot_log_wait_for_enter(void)
 }
 
 /**
- * @brief Fill boot's EFI memory-map fields from a live boot-services capture.
- * @param boot Writable boot information; NULL or a BIOS boot is ignored.
- * Called after all early EFI protocol use so newly allocated boot-service
- * data is represented before the physical allocator takes over.
+ * @brief End live EFI boot services and publish their final memory map.
+ * @param boot Writable decoded handoff; NULL is invalid and an ended handoff
+ * performs no firmware calls or map changes.
+ * @return 0 when services are ended, or a negative error requiring boot to stop.
+ * Called after all early EFI protocol use, while firmware mappings are live.
  */
-static void boot_capture_efi_memory_map(struct boot_info *boot)
+static int boot_capture_efi_memory_map(struct boot_info *boot)
 {
     uint64_t entry_size = 0;
     uint32_t entry_count = 0;
 
-    if (!boot || !boot->efi_system_table) {
-        return;
-    }
-    if (efi_boot_memory_map(boot->efi_system_table, efi_mmap_buffer,
-                            sizeof(efi_mmap_buffer), &entry_size,
-                            &entry_count) < 0) {
-        console_warn("[reliefnt] EFI memory map unavailable; retaining bootloader map if present\n");
-        return;
-    }
-    /* Prefer the final live EFI map over the older Multiboot map, which may
-     * predate the filesystem/GOP protocol allocations above. */
-    boot->mmap_addr = 0;
-    boot->mmap_entry_size = 0;
-    boot->mmap_entry_count = 0;
+    if (!boot) return -22;
+    if (!boot->efi_boot_services_active) return 0;
+    if (!boot->efi_system_table || !boot->efi_image_handle) return -22;
+    int rc = efi_boot_exit_services(boot->efi_system_table, boot->efi_image_handle,
+                                    efi_mmap_buffer, sizeof(efi_mmap_buffer),
+                                    &entry_size, &entry_count);
+    if (rc < 0) return rc;
+    /* The topology uses final EFI usable ranges, while still honoring every
+     * older Multiboot reservation that overlaps those ranges. */
     boot->efi_mmap_addr = (uint64_t)(uintptr_t)efi_mmap_buffer;
     boot->efi_mmap_entry_size = (uint32_t)entry_size;
     boot->efi_mmap_entry_count = entry_count;
+    boot->efi_boot_services_active = false;
     console_info("[reliefnt] using EFI memory map entries=%u descriptor=%u\n",
                    entry_count, (uint32_t)entry_size);
+    return 0;
+}
+
+/** @brief Snapshot live EFI address spaces and capture the ACPI RSDP before EBS.
+ * @param boot Writable active-EFI handoff with a valid system table.
+ * @return Zero or negative errno. Performs one GetMemoryMap and no exit; the
+ * final handoff refreshes the same image-owned buffer immediately before EBS.
+ * ACPI and SMBIOS consume only descriptor-proven identity spans in this window.
+ */
+static int boot_capture_efi_acpi(struct boot_info *boot)
+{
+    uint64_t stride = 0;
+    uint32_t count = 0;
+    if (!boot || !boot->efi_boot_services_active || !boot->efi_system_table) return -22;
+    int rc = efi_boot_memory_map(boot->efi_system_table, efi_mmap_buffer,
+                                 sizeof(efi_mmap_buffer), &stride, &count);
+    if (rc || stride < sizeof(struct efi_memory_descriptor) || stride > UINT32_MAX || !count)
+        return rc ? rc : -22;
+    boot->efi_mmap_addr = (uintptr_t)efi_mmap_buffer;
+    boot->efi_mmap_entry_size = (uint32_t)stride;
+    boot->efi_mmap_entry_count = count;
+    power_acpi_capture_efi_rsdp(boot);
+    platform_identity_init(boot);
+    return 0;
 }
 
 /**
@@ -191,6 +236,8 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
     if (multiboot2_parse(magic, multiboot_info, &boot) < 0) {
         panic("Invalid Multiboot2 boot information");
     }
+    boot.bios_identity_4g = boot_via_bios != 0;
+    boot.efi_identity_amd64 = !boot.bios_identity_4g && boot.efi_boot_services_active;
     console_log_configure(boot.cmdline);
     const struct reliefos_system_info *system = reliefnt_system_info();
     console_info("ReliefOS %s %s booting\n",
@@ -218,15 +265,23 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
     /* Firmware filesystem and GOP access is confined to this pre-paging
      * window. Snapshot retained data, close the root volume so its pools are
      * released, then replace stale GRUB maps with the final live EFI map. */
-    if (boot.efi_system_table) {
+    bool platform_captured = boot.efi_boot_services_active;
+    if (boot.efi_boot_services_active) {
+        if (!boot.efi_identity_amd64)
+            panic("Active EFI services without EFI amd64 identity mapping");
+        if (!boot.efi_system_table || !boot.efi_image_handle)
+            panic("EFI boot services active without system table or image handle");
         efi_fs_init(boot.efi_system_table);
         boot_theme = boot_load_ui_theme();
         framebuffer_capture_gop(boot.efi_system_table);
         efi_fs_shutdown();
+        if (boot_capture_efi_acpi(&boot) < 0)
+            panic("Unable to capture EFI ACPI mapping");
         /* GetMemoryMap uses the explicit table argument and does not need the
          * filesystem handle. Capture after close but before replacing firmware
          * mappings so any released pool pages are reflected in the allocator. */
-        boot_capture_efi_memory_map(&boot);
+        if (boot_capture_efi_memory_map(&boot) < 0)
+            panic("Unable to exit EFI boot services");
     }
     boot_log_pause = cmdline_has(&boot, "bootlog-pause=1");
     /**
@@ -234,7 +289,9 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
  */
     console_info("[boot] discovering ACPI power controls and SMBIOS identity\n");
     power_init(&boot);
-    platform_identity_init(&boot);
+    if (power_acpi_capture_resources() < 0)
+        panic("Unable to preserve ACPI boot resources");
+    if (!platform_captured) platform_identity_init(&boot);
     const struct platform_dmi_info *dmi = platform_dmi();
     if (dmi->values[0][0] || dmi->values[4][0]) {
         console_info("[boot] firmware_vendor=%s firmware_version=%s system_vendor=%s model=%s\n",
@@ -261,15 +318,22 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
      * setup as that path also converts the firmware-provided physical surface. */
     paging_init_user_identity();
     framebuffer_init(&boot);
-    mm_init(&boot);
+    /* Capture the controller claims while the temporary low map is live so
+     * their exact cache policies transfer into the sparse map before CR3. */
     apic_map_kernel_aliases();
     const struct framebuffer *boot_framebuffer = framebuffer_get();
-    if (boot_framebuffer->available && boot_framebuffer->reservation_start &&
-        boot_framebuffer->reservation_bytes &&
-        !paging_mmio_uncached(boot_framebuffer->reservation_start,
-                              boot_framebuffer->reservation_bytes)) {
-        console_warn("[reliefnt] framebuffer is outside the supported direct-map range\n");
+    if (!boot_claim_framebuffer(boot_framebuffer, false)) {
+        panic("Unable to preserve framebuffer cache policy");
     }
+    int memory_status = mm_bootstrap_prepare(&boot, paging_physical_bits());
+    if (!memory_status) memory_status = paging_direct_map_init(mm_bootstrap_topology());
+    if (memory_status) {
+        console_fatal("[reliefnt] sparse direct-map initialization failed rc=%d\n", memory_status);
+        panic("Unable to construct sparse direct map");
+    }
+    mm_init(&boot);
+    if (!boot_claim_framebuffer(boot_framebuffer, true))
+        panic("Unable to retain framebuffer mapping");
     if (boot.cmdline) {
         boot.cmdline = (const char *)mm_phys_to_virt((uint64_t)(uintptr_t)boot.cmdline);
     }

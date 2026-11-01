@@ -20,12 +20,13 @@ static uint64_t poll_readiness_generation;
  * @param task Task to link; it may already belong to another queue.
  * @param minimum Minimum available resource amount needed for a satisfied wake.
  * @param block_current Publish the current task's blocked state before unlock.
+ * @param wake_tick Absolute wake deadline when blocking, otherwise zero.
  * @return Zero on success, or -1 for invalid input, conflicting registration,
  *         or count overflow.
  */
 static int kernel_wait_queue_add_minimum(struct kernel_wait_queue *queue,
                                          struct task *task, uint32_t minimum,
-                                         bool block_current);
+                                         bool block_current, uint64_t wake_tick);
 
 /**
  * @brief Read the conservative fast hint without taking the queue lock.
@@ -132,7 +133,7 @@ void kernel_wait_queue_init(struct kernel_wait_queue *queue)
  */
 int kernel_wait_queue_add(struct kernel_wait_queue *queue, struct task *task)
 {
-    return kernel_wait_queue_add_minimum(queue, task, 0, false);
+    return kernel_wait_queue_add_minimum(queue, task, 0, false, 0);
 }
 
 /**
@@ -141,12 +142,13 @@ int kernel_wait_queue_add(struct kernel_wait_queue *queue, struct task *task)
  * @param task Task to link; it may already belong to another queue.
  * @param minimum Minimum available resource amount needed for a satisfied wake.
  * @param block_current True only when task is current; atomically publish sleep.
+ * @param wake_tick Absolute wake deadline when blocking, otherwise zero.
  * @return Zero on success, or -1 for invalid input, conflicting registration,
  *         or count overflow.
  */
 static int kernel_wait_queue_add_minimum(struct kernel_wait_queue *queue,
                                          struct task *task, uint32_t minimum,
-                                         bool block_current)
+                                         bool block_current, uint64_t wake_tick)
 {
     uint64_t flags;
     if (!queue || !task) return -1;
@@ -158,7 +160,7 @@ static int kernel_wait_queue_add_minimum(struct kernel_wait_queue *queue,
         kernel_wait_queue_publish_busy_fast_state(queue);
         task->wait_minimum = minimum;
         kernel_wait_queue_publish_fast_state(queue);
-        if (block_current) sched_block_current();
+        if (block_current) sched_sleep_current_until(wake_tick);
         kernel_spin_unlock_irqrestore(&queue->lock, flags);
         return 0;
     }
@@ -172,7 +174,7 @@ static int kernel_wait_queue_add_minimum(struct kernel_wait_queue *queue,
     /* Wakers take this same queue lock before consulting scheduler state.
      * Publishing TASK_BLOCKED here prevents wake-before-sleep from detaching
      * a still-running task and then leaving it blocked without a queue link. */
-    if (block_current) sched_block_current();
+    if (block_current) sched_sleep_current_until(wake_tick);
     kernel_spin_unlock_irqrestore(&queue->lock, flags);
     return 0;
 }
@@ -390,7 +392,19 @@ void kernel_wait_queue_block_current_minimum(struct kernel_wait_queue *queue,
     if (!task || task->pid == 0 || task->state == TASK_EXITED) return;
     /* The syscall epilogue retries after a wake; registration and scheduler
      * state must become visible atomically to IRQ and other CPU publishers. */
-    (void)kernel_wait_queue_add_minimum(queue, task, minimum, true);
+    (void)kernel_wait_queue_add_minimum(queue, task, minimum, true, 0);
+}
+
+/** @brief Atomically publish a current task's queue link and timed sleep.
+ * @param queue Stable queue. @param wake_tick Absolute fallback deadline.
+ * @return Zero on success; -1 if invalid or the task owns another queue.
+ */
+int kernel_wait_queue_sleep_current_until(struct kernel_wait_queue *queue, uint64_t wake_tick)
+{
+    struct task *task = sched_current_task();
+    if (!queue || !task || !task->pid || task->state == TASK_EXITED ||
+        (task->waiting_queue && task->waiting_queue != queue)) return -1;
+    return kernel_wait_queue_add_minimum(queue, task, 0, true, wake_tick);
 }
 
 EXPORT_SYMBOL(kernel_wait_queue_add);

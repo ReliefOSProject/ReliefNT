@@ -25,7 +25,8 @@ uint32_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack
  * @brief Wake (or release) task's CLONE_VFORK child as exec/exit completes.
  *
  * Called on the child lifecycle paths after no further failure can occur.  The
- * caller must not hold scheduler_lock.
+ * caller must not hold scheduler_lock. Clearing a link invalidates OOM snapshots.
+ * @param child Execution-owned vfork child, nullable; no ownership transfers.
  */
 void sched_vfork_child_done(struct task *child);
 /**
@@ -115,7 +116,9 @@ void sched_set_running(uint32_t pid);
  */
 void sched_exit(uint32_t pid, uint64_t code);
 /**
- * @brief Free the memory, descriptors, and mappings still held by task.
+ * @brief Release a quiescent user's resources once and invalidate OOM snapshots.
+ * @param task Execution-owned task, nullable. Running or released tasks remain
+ * unchanged; caller must not hold scheduler_lock across resource teardown.
  */
 void sched_release_task_resources(struct task *task);
 /**
@@ -190,6 +193,95 @@ struct task *sched_find(uint32_t pid);
  * transaction (or scheduler lock) while accessing the borrowed task and MM.
  */
 struct task *sched_task_at(uint32_t index);
+/** @brief Read scheduler-private preallocated OOM policy of a published task.
+ * @param task Execution-owned task, nullable. @param adjustment Optional output.
+ * @param minimum Optional output for inherited minimum. No ownership transfers.
+ */
+void sched_oom_policy_get(const struct task *task, int *adjustment, int *minimum);
+/** @brief Change scheduler-private OOM policy under execution ownership.
+ * @param task Pinned task, nullable. @param adjustment New policy value.
+ * @param minimum New inherited minimum. Changed policy invalidates bounded OOM
+ * holder validation; no allocation, extra lock, or reference transfer occurs.
+ */
+void sched_oom_policy_set(struct task *task, int adjustment, int minimum);
+/** @brief Note a scheduler membership or OOM protection change.
+ * This allocation-free, lock-free notification may run under scheduler_lock;
+ * it transfers no references and makes batched OOM validation restart.
+ */
+void sched_oom_membership_changed(void);
+/** @brief Read the scheduler's OOM membership and protection revision.
+ * @return Atomic revision for comparing bounded OOM scans across checkpoints.
+ * The caller retains no task or memory ownership through this scalar.
+ */
+uint64_t sched_oom_membership_revision(void);
+/** @brief Mark a task whose fatal signal was published by an OOM selection.
+ * @param task Execution-owned live task. @param epoch Nonzero selection identity.
+ * Only scheduler-private storage changes; no reference or signal is acquired.
+ */
+void sched_oom_victim_mark(struct task *task, uint64_t epoch);
+/** @brief Check a task's OOM selection identity without retaining it.
+ * @param task Execution-owned task, nullable. @param epoch Nonzero selection identity.
+ * @return True if this live task object was marked for the current selection.
+ */
+bool sched_oom_victim_marked(const struct task *task, uint64_t epoch);
+/** @brief Count repeated pressure stalls for one current task and fault.
+ * @param task Published task. @param address Fault address.
+ * @param free_pages Allocatable page snapshot. @param cause Nonzero stall kind.
+ * @param tick Current scheduler tick; count at most once per distinct tick.
+ * @return Consecutive stall observations with unchanged address, count and cause.
+ * Execution-writer ownership keeps the private task allocation stable.
+ */
+uint32_t sched_pressure_stall(struct task *task, uint64_t address,
+                              uint64_t free_pages, uint32_t cause, uint64_t tick);
+/** @brief Clear a published task's private pressure progress state.
+ * @param task Execution-owned task, nullable. No allocation or scheduling.
+ */
+void sched_pressure_reset(struct task *task);
+struct pressure_cursor;
+/** @brief Borrow this task's own fault-reclaim progress cursor.
+ * @param task Current live task pinned by the sole execution writer.
+ * @param allow_oom Select the OOM-capable or no-OOM policy cursor.
+ * @return Borrowed cursor, valid only until the writer is dropped; no allocation.
+ */
+struct pressure_cursor *sched_pressure_cursor(struct task *task, bool allow_oom);
+#ifdef CONFIG_SWAP
+struct pressure_headroom_state;
+/** @brief Borrow a task's private optional headroom state under execution ownership.
+ * @param task Live task, nullable. @return State valid until gate release, or NULL.
+ */
+struct pressure_headroom_state *sched_pressure_headroom_state(struct task *task);
+#endif
+/** @brief Record one resolved page for the current user instruction.
+ * @param task Current execution-owned task. @param rip Interrupted instruction.
+ * @param address Resolved byte address. Stores only scalar MM/page identities.
+ */
+void sched_pressure_fault_resolved(struct task *task, uint64_t rip, uint64_t address);
+/** @brief Admit one user hardware fault for accounting across timed retries.
+ * @param task Current execution-owned task. @param rip User instruction.
+ * @param address Faulting byte. @return True only for a new logical fault.
+ * Scalar identity is private to the task; no lock, allocation or pin occurs.
+ */
+bool sched_fault_event_begin(struct task *task, uint64_t rip, uint64_t address);
+/** @brief Admit one completed backing read for the current logical fault.
+ * @param task Current execution-owned task. @return True once per active
+ * hardware fault. Kernel prefault operations have no active fault identity.
+ */
+bool sched_fault_event_major(struct task *task);
+/** @brief Finish accounting for a resolved or terminal user fault.
+ * @param task Current execution-owned task, nullable. No allocation or pin.
+ */
+void sched_fault_event_end(struct task *task);
+/** @brief Snapshot four recent resolved pages of the same user instruction.
+ * @param task Current execution-owned task. @param rip Interrupted instruction.
+ * @param pages Receives four aligned pages, newest first; empty entries are zero.
+ */
+void sched_pressure_fault_pages(const struct task *task, uint64_t rip,
+                                uint64_t pages[4]);
+/** @brief Register the built-in memory waiter's resource-retirement callback.
+ * @param notify Stable kernel function called after actual resource release.
+ * Execution-writer context; the callback must not free or block the exiting task.
+ */
+void sched_set_memory_release_notify(void (*notify)(void));
 
 static inline uint64_t *sched_task_timer_pending(const struct task *task)
 {
@@ -285,6 +377,11 @@ void sched_signal_wait_current(uint64_t deadline);
  * running_cpu keeps an unretired frame from being claimed by another CPU.
  */
 void sched_wake_interruptible(struct task *task);
+/** @brief Wake a stopped or blocked task for an already queued fatal signal.
+ * @param task Borrowed task pinned by execution ownership, nullable. Scheduler
+ * locking and CPU reservation rules remain in force; no ownership transfers.
+ */
+void sched_wake_fatal(struct task *task);
 /** @brief Share SEM_UNDO on CLONE_SYSVSEM; ordinary fork starts with no undo records. */
 int task_sysv_sem_clone(struct task *parent, struct task *child, uint64_t flags);
 /** @brief Apply the final owner's undo adjustments on exit and release its records. */
@@ -416,6 +513,37 @@ int sched_kill_user_tasks_for_logout(uint32_t uid, uint32_t session_id,
  */
 int64_t sched_wait_reap(uint32_t waiter_pid, int32_t wanted_pid,
                         uint32_t options, int *status, struct linux_siginfo *info);
+/** @brief Advance at most budget deferred exited-task slots at an outer gate.
+ * @param budget Maximum slots examined, not a count of released tasks.
+ */
+void sched_cleanup_poll(uint32_t budget);
+/** @brief Transfer a loaded post-preparation exec image into its task slot.
+ * @param task Current owner. @param prepared Caller-owned prepared task.
+ * @return True on transfer; false retains caller ownership. The old MM stays
+ * owned until commit or fatal cancellation.
+ */
+bool sched_exec_stage(struct task *task, struct task *prepared);
+/** @brief Borrow a committed exec image. @param task Owner, nullable.
+ * @return Borrowed image or NULL, without detaching it.
+ */
+struct task *sched_exec_staged(const struct task *task);
+/** @brief Detach the committed exec image. @param task Owner, nullable.
+ * @return Transferred image or NULL for exactly-once commit/cancellation.
+ */
+struct task *sched_exec_take(struct task *task);
+struct socket_send_stage;
+/** @brief Borrow a task-owned socket stage. @param task Owner, nullable.
+ * @return Borrowed stage or NULL, without transferring it.
+ */
+struct socket_send_stage *sched_socket_stage(const struct task *task);
+/** @brief Transfer a socket stage into an empty task slot.
+ * @param task Owner. @param stage Caller-owned stage. @return True on transfer.
+ */
+bool sched_socket_stage_set(struct task *task, struct socket_send_stage *stage);
+/** @brief Detach a task-owned socket stage. @param task Owner, nullable.
+ * @return Transferred stage or NULL for completion/cancellation.
+ */
+struct socket_send_stage *sched_socket_stage_take(struct task *task);
 /**
  * @brief Copy up to capacity task summaries into out and report the current tick.
  */

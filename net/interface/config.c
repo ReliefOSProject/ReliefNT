@@ -1,4 +1,5 @@
 #include <reliefnt/kernel_file.h>
+#include <reliefnt/socket_usercopy.h>
 #include "../internal.h"
 
 /**
@@ -451,9 +452,8 @@ int net_interface_ioctl(uint32_t request, uint64_t address)
     if (change && (!task || !(task->cap_effective & (1ULL << CAP_NET_ADMIN))))
         return -LINUX_EPERM;
     if (request == SIOCADDRT || request == SIOCDELRT) {
-        if (!user_range_ok(address, sizeof(struct rtentry))) return -LINUX_EFAULT;
         struct rtentry route;
-        net_memcpy(&route, (void *)(uintptr_t)address, sizeof(route));
+        int rc=socket_user_import(task,address,&route,sizeof(route));if(rc)return rc;
         if (route.rt_dst.sa_family != AF_INET) return -LINUX_EAFNOSUPPORT;
         uint32_t route_mask = net_get_u32((uint8_t *)&route.rt_genmask + 4);
         if (route.rt_genmask.sa_family != AF_INET && (route.rt_genmask.sa_family || route_mask))
@@ -461,8 +461,8 @@ int net_interface_ioctl(uint32_t request, uint64_t address)
         if (route.rt_dev) {
             char name[IFNAMSIZ] = {0};
             for (unsigned i = 0; i < sizeof(name); ++i) {
-                if (!user_range_ok(route.rt_dev + i, 1)) return -LINUX_EFAULT;
-                name[i] = *(char *)(uintptr_t)(route.rt_dev + i);
+                if(route.rt_dev>UINT64_MAX-i)return -LINUX_EFAULT;
+                rc=socket_user_import(task,route.rt_dev+i,&name[i],1);if(rc)return rc;
                 if (!name[i]) break;
             }
             if (__builtin_memcmp(name, "eth0", 5)) return -LINUX_ENODEV;
@@ -492,15 +492,16 @@ int net_interface_ioctl(uint32_t request, uint64_t address)
     }
     if (request == SIOCGIFCONF) {
         struct ifconf conf;
-        if (!user_range_ok(address, sizeof(conf)) || !user_range_writable(address, sizeof(conf)))
-            return -LINUX_EFAULT;
-        net_memcpy(&conf, (void *)(uintptr_t)address, sizeof(conf));
+        int rc=socket_user_import(task,address,&conf,sizeof(conf));if(rc)return rc;
+        rc=socket_user_prepare(task,address,sizeof(conf),true);if(rc)return rc;
+        if(!user_range_writable(address,sizeof(conf)))return -LINUX_EFAULT;
         if (conf.ifc_len < 0) return -LINUX_EINVAL;
         int available = e1000_is_ready() && net_config.local_ip ? sizeof(struct ifreq) : 0;
         if (!conf.ifc_buf) conf.ifc_len = available;
         else {
             conf.ifc_len = conf.ifc_len >= available ? available : 0;
             if (conf.ifc_len) {
+                rc=socket_user_prepare(task,conf.ifc_buf,sizeof(struct ifreq),true);if(rc)return rc;
                 if (!user_range_writable(conf.ifc_buf, sizeof(struct ifreq))) return -LINUX_EFAULT;
                 struct ifreq result = { .ifr_name = "eth0", .data.addr.sa_family = AF_INET };
                 net_put_u32((uint8_t *)&result.data.addr + 4, net_config.local_ip);
@@ -518,9 +519,11 @@ int net_interface_ioctl(uint32_t request, uint64_t address)
     default: return -LINUX_ENOTTY;
     }
     struct ifreq req;
-    if (!user_range_ok(address, sizeof(req)) || (!change && !user_range_writable(address, sizeof(req))))
-        return -LINUX_EFAULT;
-    net_memcpy(&req, (void *)(uintptr_t)address, sizeof(req));
+    int rc=socket_user_import(task,address,&req,sizeof(req));if(rc)return rc;
+    if(!change) {
+        rc=socket_user_prepare(task,address,sizeof(req),true);if(rc)return rc;
+        if(!user_range_writable(address,sizeof(req)))return -LINUX_EFAULT;
+    }
     if (!e1000_is_ready()) return -LINUX_ENODEV;
     if (request == SIOCGIFNAME) {
         if (req.data.value != 2) return -LINUX_ENODEV;

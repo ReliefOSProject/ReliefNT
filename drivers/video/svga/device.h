@@ -257,6 +257,17 @@ struct svga_cache_report {
 };
 extern struct svga_device svga;
 
+/** @brief Check a complete nonzero aligned physical run fits 32-bit page numbers.
+ * @param physical First physical page; page zero remains the invalid sentinel.
+ * @param pages Nonzero 4096-byte page count.
+ * @return True when the last page number, including UINT32_MAX, is representable.
+ */
+static inline bool svga_ppn32_run(uint64_t physical, uint32_t pages)
+{
+    return physical && pages && !(physical & 4095u) &&
+           (physical >> 12) <= UINT32_MAX - (pages - 1u);
+}
+
 /** @brief Check owned/borrowed backing and shader staging against the GB budget.
  * Caller holds svga_lock.
  * @param pages Additional pages the resource would consume.

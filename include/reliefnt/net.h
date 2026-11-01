@@ -165,6 +165,13 @@ int net_socket_wait_writable(int32_t handle);
  * The socket's SO_RCVTIMEO value controls the wait; an unset timeout is infinite.
  */
 int net_socket_wait_readable(int32_t handle);
+#ifdef CONFIG_SWAP
+/** @brief Remove only this socket's readiness registration before page-in wait.
+ * @param handle Pinned TCP socket handle. @param task Borrowed waiting task.
+ * Execution ownership protects lookup; unrelated provider waits are untouched.
+ */
+void net_socket_cancel_wait(int32_t handle, struct task *task);
+#endif
 /**
  * @brief Read the configured TCP send or receive timeout in scheduler ticks.
  * @param handle Internal socket handle.

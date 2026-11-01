@@ -8,12 +8,53 @@ void drm_file_close(struct task_file *file)
 { if (file) file->drm_file = NULL; }
 
 static bool fail_allocation;
+#ifdef TASK8_EXEC_SNAPSHOT_TEST
+static unsigned exec_allocations,exec_frees;
+#endif
 static struct task caller;
+#ifdef CONFIG_SWAP
+static uint64_t swapped_exec_page;
+static int exec_prep_error;
+static unsigned exec_prep_calls;
+static uint64_t exec_blocked_address,exec_unmapped_address;
+static bool exec_contended;
+/** @brief Simulate a single swapped argument page at the unlocked front door.
+ * @param task Current task. @param address Operand start. @param length Bytes.
+ * @param write_access Requested access. @return Injected status or success.
+ */
+int swap_prepare_user_range(struct task *task, uint64_t address, uint64_t length, bool write_access)
+{
+    assert(task == &caller && length <= 4096 && !write_access);
+    ++exec_prep_calls;
+    if(address==exec_unmapped_address)return -RELIEFOS_EFAULT;
+    if(exec_contended && address==exec_blocked_address)return SWAP_STORAGE_CONTENDED;
+    if (exec_prep_error) return exec_prep_error;
+    if ((address & ~4095ULL) == swapped_exec_page) swapped_exec_page = 0;
+    return 0;
+}
+#endif
 struct task *sched_current_task(void) { return &caller; }
-bool user_range_ok(uint64_t address, uint64_t size) { return address >= 4096 && size <= UINT64_MAX - address; }
+bool user_range_ok(uint64_t address, uint64_t size) {
+#ifdef CONFIG_SWAP
+    if(address==exec_unmapped_address)return false;
+    if (swapped_exec_page && (address & ~4095ULL) == swapped_exec_page) return false;
+#endif
+    return address >= 4096 && size <= UINT64_MAX - address;
+}
 size_t user_strlen(const char *s, size_t max) { size_t n = 0; while (n < max && s[n]) ++n; return n; }
-void *kernel_malloc(size_t size) { return fail_allocation ? NULL : malloc(size); }
-void kernel_free(void *memory) { free(memory); }
+void *kernel_malloc(size_t size) {
+    void *memory=fail_allocation ? NULL : malloc(size);
+#ifdef TASK8_EXEC_SNAPSHOT_TEST
+    if(memory)++exec_allocations;
+#endif
+    return memory;
+}
+void kernel_free(void *memory) {
+#ifdef TASK8_EXEC_SNAPSHOT_TEST
+    if(memory)++exec_frees;
+#endif
+    free(memory);
+}
 
 int main(void)
 {
@@ -22,6 +63,31 @@ int main(void)
     assert(sched_exec_argument_limit(8u * 1024u * 1024u) == 2097152);
     assert(sched_exec_argument_limit(UINT64_MAX) == 6291456);
     struct exec_params_kernel vectors = {0};
+#ifdef CONFIG_SWAP
+    static char swapped_argument[4096] __attribute__((aligned(4096))) = "swapped-argument";
+    static char *swapped_vector[512] __attribute__((aligned(4096)));
+    swapped_vector[0] = swapped_argument;
+    swapped_exec_page = (uintptr_t)swapped_vector;
+    assert(!copy_exec_params_from_user((uintptr_t)swapped_vector, 0, &vectors));
+    assert(!swapped_exec_page && !strcmp(vectors.argv[0], swapped_argument));
+    free_exec_params(&vectors);
+    swapped_exec_page = (uintptr_t)swapped_argument;
+    assert(!copy_exec_params_from_user((uintptr_t)swapped_vector, 0, &vectors));
+    assert(!swapped_exec_page && exec_prep_calls);
+    free_exec_params(&vectors);
+    exec_prep_error = -4100;
+    assert(copy_exec_params_from_user((uintptr_t)swapped_vector, 0, &vectors) == -4099);
+    assert(!vectors.argv && !vectors.envp && !vectors.data);
+    exec_prep_error = 0;
+    static char swapped_path[4096] __attribute__((aligned(4096))) = "/tmp/swapped";
+    char path_copy[64];
+    swapped_exec_page = (uintptr_t)swapped_path;
+    assert(!copy_user_path(path_copy, sizeof(path_copy), (uintptr_t)swapped_path));
+    assert(!swapped_exec_page && !strcmp(path_copy, swapped_path));
+    exec_prep_error = -4100;
+    assert(copy_user_path(path_copy, sizeof(path_copy), (uintptr_t)swapped_path) == -4099);
+    exec_prep_error = 0;
+#endif
     char *environment[492];
     for (unsigned i = 0; i < 491; ++i) environment[i] = "KEY=compiler-flags-and-paths";
     environment[491] = NULL;
@@ -126,4 +192,5 @@ int main(void)
     assert(!params.argv[4] && !strcmp(params.envp[0], "NAME=value") && !params.envp[1]);
     free_exec_params(&params);
     puts("PASS production shebang parser, bounded fuzz, argv rewrite and allocation rollback");
+    return 0;
 }

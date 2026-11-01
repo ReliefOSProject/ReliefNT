@@ -13,7 +13,7 @@ with tempfile.TemporaryDirectory(prefix="reliefos-descriptors-") as directory:
         "clang", "-std=c11", "-g", "-O1", "-ffunction-sections", "-fdata-sections",
         "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
         "-Iinclude", "-Iinclude", "-Iinclude/uapi", "-Iinclude", "-Wl,--gc-sections",
-        "tools/tests/descriptor_table_test.c", *kernel_sources("scheduler"),
+        "tools/tests/descriptor_table_test.c", "tools/tests/task8_host_stubs/writable_alias_model.c", "tools/tests/task8_host_stubs/device_page_unreached.c", "tools/tests/task8_host_stubs/inet_available_unreached.c", *kernel_sources("scheduler"),
         "kernel/sync/wait.c", "kernel/syscall/ipc/sysv_msg.c",
         "kernel/syscall/ipc/sysv_sem.c", "kernel/syscall/fs/locks.c",
         "sound/core/core.c", *kernel_sources("pcm"),

@@ -143,7 +143,7 @@ static uint64_t task_find_mmap_region(struct task *task, uint64_t len)
             return start;
         }
         uint64_t occupied_page;
-        if (!address_space_user_page_next(sched_task_as(task), start, end,
+        if (!address_space_user_entry_next(sched_task_as(task), start, end,
                                           &occupied_page, NULL, NULL)) return 0;
         start = occupied_page + PAGE_SIZE;
     }
@@ -186,7 +186,7 @@ static uint64_t task_find_file_mmap_region(struct task *task, uint64_t len)
         uint64_t cursor = start;
         uint64_t last_page = 0;
         uint64_t page;
-        while (address_space_user_page_next(sched_task_as(task), cursor, end,
+        while (address_space_user_entry_next(sched_task_as(task), cursor, end,
                                             &page, NULL, NULL)) {
             last_page = page;
             cursor = page + PAGE_SIZE;
@@ -198,6 +198,34 @@ static uint64_t task_find_file_mmap_region(struct task *task, uint64_t len)
     }
 }
 
+/** @brief Admit a future-locked mapping against the final net MM quota.
+ * @param task Execution-owned user MM. @param start First page. @param end Exclusive end.
+ * @param vma_flags Mapping flags updated with lock policy on success.
+ * @return Zero or negative EAGAIN before any existing mapping is removed.
+ */
+static int task_future_lock_mapping(struct task *task, uint64_t start, uint64_t end,
+                                    uint32_t *vma_flags)
+{
+    uint32_t mode = mm_lock_flags(sched_task_as(task));
+    if (!(mode & LINUX_MCL_FUTURE)) return 0;
+    if (!(task->cap_effective & (1ULL << CAP_IPC_LOCK))) {
+        uint64_t held = mm_locked_bytes(task), replaced = 0;
+        uint64_t limit = sched_task_limits(task)->memlock.rlim_cur & ~(PAGE_SIZE - 1ULL);
+        for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
+            struct task_vma *old = sched_task_vma_at(task, i);
+            if (!old || !old->used || !(old->flags & TASK_VMA_FLAG_LOCKED)) continue;
+            uint64_t first = old->start > start ? old->start : start;
+            uint64_t last = old->end < end ? old->end : end;
+            if (last > first) replaced += last - first;
+        }
+        if (held < replaced || held - replaced > limit || end - start > limit - (held - replaced))
+            return -RELIEFOS_EAGAIN;
+    }
+    *vma_flags |= TASK_VMA_FLAG_LOCKED;
+    if (mode & LINUX_MCL_ONFAULT) *vma_flags |= TASK_VMA_FLAG_LOCKONFAULT;
+    return 0;
+}
+
 /** @brief Map anonymous/provider bytes or an independently pinned device backing.
  * @param addr Fixed address or placement hint, checked against the user aperture.
  * @param len Nonzero byte length, rounded to complete pages without overflow.
@@ -205,13 +233,18 @@ static uint64_t task_find_file_mmap_region(struct task *task, uint64_t len)
  * @param flags Linux mmap flags, including validated fixed/no-replace semantics.
  * @param fd Original OFD admitted by the syscall, ignored for anonymous mappings.
  * @param offset Page-aligned file offset or provider mapping selector.
- * @return User address or negative errno. Execution-owned current MM required;
+ * @param populate Attempt best-effort eager population after publication.
+ * @param tag_io_retry Return the private marker for retryable metadata I/O.
+ * @return User address, negative errno, or the private metadata retry marker.
+ * Execution-owned current MM required;
  * no graph/module lock spans callbacks, allocation or unmap. On success one
- * provider/device reference transfers to the VMA; unpublished failures drain
- * installed PTEs and release each temporary owner before returning.
+ * provider/device reference transfers to the VMA; typed DEVICE backing owns
+ * matching physical cache policies through every VMA and staged-I/O reference.
+ * Unpublished failures drain installed PTEs and release each temporary owner.
  */
-int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
-                        uint64_t flags, uint64_t fd, uint64_t offset)
+static int64_t mm_mmap_internal(uint64_t addr, uint64_t len, uint64_t prot,
+                                uint64_t flags, uint64_t fd, uint64_t offset,
+                                bool populate, bool tag_io_retry)
 {
     struct task *task = sched_current_task();
     struct task_file *file = NULL;
@@ -280,7 +313,8 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                 storage_set_io_async_context(false);
                 struct linux_stat_abi status;
                 int refresh=vfs_path_stat(&file->path_ref,&status);
-                if(refresh)return refresh;
+                if(refresh) return tag_io_retry && refresh == -RELIEFOS_EAGAIN
+                    ? KERNEL_MMAP_FILE_IO_RETRY : refresh;
                 if(status.st_size<0)return -LINUX_EIO;
                 file->node.size=(uint64_t)status.st_size;
             }
@@ -299,6 +333,12 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                 if (prot & LINUX_PROT_EXEC) return -RELIEFOS_EPERM;
                 max_prot &= ~LINUX_PROT_EXEC;
             }
+#ifdef CONFIG_SWAP
+            /* A claimed swap inode cannot admit a shared cache frame, even
+             * through a read-only or inaccessible mapping. */
+            if ((flags&LINUX_MAP_SHARED) &&
+                storage_inode_swap_active(file->inode)) return -LINUX_ETXTBSY;
+#endif
         }
         if (file->flags & TASK_FILE_FLAG_DEV_SHM) {
             int shm_ret = task_shm_mmap_check(file, (uint32_t)flags, (uint32_t)prot, &max_prot);
@@ -383,6 +423,12 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
         device_mapping=1;
     }
 
+    uint32_t lock_mode = mm_lock_flags(sched_task_as(task));
+    if (task_future_lock_mapping(task, start, end, &vma_flags) < 0) {
+        device_mapping_put(device_backing);
+        return -RELIEFOS_EAGAIN;
+    }
+
     if (flags & LINUX_MAP_FIXED) {
         if ((flags & LINUX_MAP_FIXED_NOREPLACE) && !task_user_pages_free(task, start, end)) {
             device_mapping_put(device_backing);
@@ -392,11 +438,6 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
             device_mapping_put(device_backing);
             return -RELIEFOS_ENOMEM;
         }
-        int unmap_ret = syscall_mm_munmap(start, mapped_len);
-        if (!(flags & LINUX_MAP_FIXED_NOREPLACE) && unmap_ret < 0 && unmap_ret != -RELIEFOS_EINVAL) {
-            device_mapping_put(device_backing);
-            return unmap_ret;
-        }
     } else if (!task_user_pages_free(task, start, end)) {
         device_mapping_put(device_backing);
         return -RELIEFOS_ENOMEM;
@@ -404,6 +445,27 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     if (!(flags & LINUX_MAP_FIXED) && !task_address_space_can_map(task, start, end)) {
         device_mapping_put(device_backing);
         return -RELIEFOS_ENOMEM;
+    }
+    /* The provider may return an already-owned backing without allocating.
+     * Reserve every new view and physical-policy owner before MAP_FIXED can
+     * destroy the old target. The execution writer keeps the chosen policies
+     * stable until PTE installation or exact admission rollback. */
+    if (device_backing) {
+        ret=device_mapping_admit_view(&device_backing);
+        if(ret<0){device_mapping_put(device_backing);return ret;}
+        for(uint64_t offset_in_view=0;offset_in_view<mapped_len;offset_in_view+=PAGE_SIZE) {
+            uint64_t actual=device_mapping_physical(device_backing,offset_in_view),cache;
+            if(!actual) { device_mapping_put(device_backing);return -RELIEFOS_ENOMEM; }
+            ret=device_mapping_cache_page(device_backing,offset_in_view,actual,&cache);
+            if(ret<0){device_mapping_put(device_backing);return ret;}
+        }
+    }
+    if (flags & LINUX_MAP_FIXED) {
+        int unmap_ret = syscall_mm_munmap(start, mapped_len);
+        if (!(flags & LINUX_MAP_FIXED_NOREPLACE) && unmap_ret < 0 && unmap_ret != -RELIEFOS_EINVAL) {
+            device_mapping_put(device_backing);
+            return unmap_ret;
+        }
     }
     if (!task_vma_can_record_mapping(task, start, end, prot, vma_flags,
                                      file ? &file->node : NULL, offset, max_prot,
@@ -415,7 +477,6 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
         device_mapping_put(device_backing);
         return -RELIEFOS_ENOMEM;
     }
-
 
     if (prot & LINUX_PROT_WRITE) {
         page_flags |= RELIEFNT_PAGE_WRITABLE;
@@ -429,18 +490,25 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
         uint64_t phys = device_phys;
         for (uint64_t page = start; page < end; page += PAGE_SIZE, phys += PAGE_SIZE) {
             uint64_t actual=device_backing ? device_mapping_physical(device_backing,page-start) : phys;
+            uint64_t cache=0;
+            /* Typed backing owns the physical policy through all VMA/stage
+             * references. FB0's boot/display policy and backing are permanent. */
+            if(actual && device_backing) {
+                ret=device_mapping_cache_page(device_backing,page-start,actual,&cache);
+                if(ret<0) {
+                    task_unmap_pages(task,start,page);
+                    device_mapping_put(device_backing);
+                    return ret;
+                }
+            } else if(actual) (void)paging_kernel_direct_cache_flags(actual,&cache);
             if (!actual || !address_space_map_user_page(sched_task_as(task), page, actual,
-                                             page_flags | RELIEFNT_PAGE_DEVICE)) {
+                                             page_flags | RELIEFNT_PAGE_DEVICE | cache)) {
                 task_unmap_pages(task, start, page);
                 device_mapping_put(device_backing);
                 return -RELIEFOS_ENOMEM;
             }
         }
         ret = 0;
-    } else if (anonymous && (flags & LINUX_MAP_NORESERVE) == 0 &&
-               (task->mlockall_flags & LINUX_MCL_FUTURE)) {
-        /* MCL_FUTURE promises resident pages for future mappings. */
-        ret = task_map_anonymous_pages(task, start, end, page_flags);
     } else if (anonymous) {
         ret = 0;
     } else {
@@ -475,11 +543,38 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
         if(!vma){task_unmap_pages(task,start,end);device_mapping_put(device_backing);return -RELIEFOS_ENOMEM;}
         vma->device_mapping=device_backing;vma->device_map_offset=0;device_backing=NULL;
     }
-    if (task->mlockall_flags & LINUX_MCL_FUTURE) {
-        struct task_vma *new_vma = task_vma_containing(task, start, end);
-        if (new_vma) new_vma->flags |= TASK_VMA_FLAG_LOCKED;
+    if (anonymous && (flags & LINUX_MAP_SHARED) && !device_mapping &&
+        mm_shared_create(sched_task_as(task), start, end) < 0) {
+        (void)syscall_mm_munmap(start, end - start);
+        return -RELIEFOS_ENOMEM;
     }
+    if (populate && (lock_mode & LINUX_MCL_FUTURE) && !(lock_mode & LINUX_MCL_ONFAULT))
+        (void)mm_populate_locked_range(start, end, false);
     return (int64_t)start;
+}
+
+/** @brief Map bytes and opportunistically populate any FUTURE-locked range.
+ * @param addr Address hint. @param len Bytes. @param prot Protection bits.
+ * @param flags Mapping flags. @param fd File descriptor. @param offset File offset.
+ * @return Mapped address or negative errno. All publication precedes a possible
+ * execution suspension; no borrowed VMA or movable MM pointer survives it.
+ */
+int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
+                        uint64_t flags, uint64_t fd, uint64_t offset)
+{
+    return mm_mmap_internal(addr, len, prot, flags, fd, offset, true, false);
+}
+
+/** @brief Map for the syscall frame with a distinguishable metadata I/O wait.
+ * @param addr Address hint. @param len Bytes. @param prot Protection bits.
+ * @param flags Mapping flags. @param fd File descriptor. @param offset File offset.
+ * @return Address, negative errno, or the private file-I/O marker consumed by
+ * syscall entry. Quota and provider errors remain ordinary final errnos.
+ */
+int64_t syscall_mm_mmap_dispatch(uint64_t addr, uint64_t len, uint64_t prot,
+                                uint64_t flags, uint64_t fd, uint64_t offset)
+{
+    return mm_mmap_internal(addr, len, prot, flags, fd, offset, true, true);
 }
 
 int64_t syscall_mm_brk(uint64_t requested)
@@ -491,6 +586,7 @@ int64_t syscall_mm_brk(uint64_t requested)
     uint64_t old_page;
     uint64_t new_page;
     int64_t mapped;
+    bool populate = false;
 
     if (!task || task->kind != TASK_KIND_USER) return -RELIEFOS_EINVAL;
     mm = sched_task_mm(task);
@@ -511,10 +607,12 @@ int64_t syscall_mm_brk(uint64_t requested)
         if (!task_user_pages_free(task, old_page, new_page)) {
             return (int64_t)current;
         }
-        mapped = syscall_mm_mmap(old_page, new_page - old_page,
+        uint32_t mode = mm_lock_flags(sched_task_as(task));
+        populate = (mode & LINUX_MCL_FUTURE) && !(mode & LINUX_MCL_ONFAULT);
+        mapped = mm_mmap_internal(old_page, new_page - old_page,
                                  LINUX_PROT_READ | LINUX_PROT_WRITE,
                                  LINUX_MAP_PRIVATE | LINUX_MAP_FIXED |
-                                 LINUX_MAP_ANONYMOUS, UINT64_MAX, 0);
+                                 LINUX_MAP_ANONYMOUS, UINT64_MAX, 0, false, false);
         if (mapped != (int64_t)old_page) return (int64_t)current;
     } else if (new_page < old_page) {
         if (syscall_mm_munmap(new_page, old_page - new_page) < 0) {
@@ -522,7 +620,92 @@ int64_t syscall_mm_brk(uint64_t requested)
         }
     }
     mm->program_break = requested;
+    mm = NULL; /* No pointer into movable inline MM crosses population. */
+    if (populate) (void)mm_populate_locked_range(old_page, new_page, false);
     return (int64_t)requested;
+}
+
+/** @brief Check net locked-byte cost before a locked VMA is remapped.
+ * @param task Execution-owned MM. @param old_len Locked bytes removed at source.
+ * @param new_len Locked bytes installed at destination. @param target Optional fixed target.
+ * @return True when capability or memlock quota admits the final intervals.
+ */
+static bool task_remap_lock_allowed(struct task *task, uint64_t old_len,
+                                    uint64_t new_len, uint64_t target)
+{
+    if (task->cap_effective & (1ULL << CAP_IPC_LOCK)) return true;
+    uint64_t held = mm_locked_bytes(task), replaced = 0;
+    if (target) {
+        uint64_t target_end = target + new_len;
+        for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
+            struct task_vma *vma = sched_task_vma_at(task, i);
+            if (!vma || !vma->used || !(vma->flags & TASK_VMA_FLAG_LOCKED)) continue;
+            uint64_t first = vma->start > target ? vma->start : target;
+            uint64_t last = vma->end < target_end ? vma->end : target_end;
+            if (last > first) replaced += last - first;
+        }
+    }
+    if (held < old_len || held - old_len < replaced) return false;
+    held -= old_len + replaced;
+    uint64_t limit = sched_task_limits(task)->memlock.rlim_cur & ~(PAGE_SIZE - 1ULL);
+    return held <= limit && new_len <= limit - held;
+}
+
+/** @brief Reserve an anonymous remap without applying FUTURE to an old VMA.
+ * @param task Execution-owned MM. @param address Destination or zero for search.
+ * @param length Aligned new bytes. @param prot Original VMA permissions.
+ * @param flags Original anonymous mapping mode. @return Address or negative errno.
+ */
+static int64_t task_remap_reserve(struct task *task, uint64_t address, uint64_t length,
+                                  uint32_t prot, uint32_t flags)
+{
+    uint32_t policy = mm_lock_flags(sched_task_as(task));
+    if (policy & LINUX_MCL_FUTURE) mm_context_set_lock_flags(sched_task_as(task), 0);
+    int64_t result = syscall_mm_mmap(address, length, prot, flags, UINT64_MAX, 0);
+    if (policy & LINUX_MCL_FUTURE) mm_context_set_lock_flags(sched_task_as(task), policy);
+    return result;
+}
+
+/** @brief Stage resident anonymous leaves at a remap destination without user access.
+ * @param task Execution-owned MM. @param source First source page.
+ * @param target First reserved destination page. @param length Bytes to preserve.
+ * @return Zero or negative ENOMEM; the caller removes staged destination leaves
+ * on failure. Source leaves stay untouched, and each destination owns a PMM pin.
+ * Absent leaves remain lazy; hardware permissions, PROT_NONE and COW are retained.
+ */
+static int task_remap_stage_leaves(struct task *task, uint64_t source,
+                                   uint64_t target, uint64_t length)
+{
+    const uint64_t mask = RELIEFNT_PAGE_WRITABLE | RELIEFNT_PAGE_NOEXEC |
+                          RELIEFNT_PAGE_PROTNONE | RELIEFNT_PAGE_SHARED | RELIEFNT_PAGE_WRITE_NOTIFY |
+                          RELIEFNT_PAGE_COW | RELIEFNT_PAGE_PWT |
+                          RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_PAT;
+    uint64_t cursor = source;
+    while (cursor < source + length) {
+        uint64_t page, phys, flags;
+        if (!address_space_user_entry_next(sched_task_as(task), cursor,
+                source + length, &page, &phys, &flags)) break;
+        uint64_t destination = target + page - source;
+        if (paging_user_entry_kind(sched_task_as(task), page) == PAGING_USER_ENTRY_SWAP) {
+            int ret = mm_swap_copy_record(sched_task_as(task), sched_task_as(task),
+                                          page, destination);
+            if (ret < 0) return ret;
+            mm_context_vma_changed(sched_task_as(task));
+            if (!address_space_map_user_swap(sched_task_as(task), destination, flags & mask)) {
+                mm_swap_record_remove(sched_task_as(task), destination);
+                return -RELIEFOS_ENOMEM;
+            }
+        } else {
+            mm_retain_page(phys);
+            if (!address_space_map_user_page(sched_task_as(task), destination,
+                                             phys, flags & mask)) {
+                mm_free_page(phys);
+                return -RELIEFOS_ENOMEM;
+            }
+        }
+        cursor = page + PAGE_SIZE;
+    }
+    return 0;
 }
 
 /** @brief Resize anonymous memory or shrink/move a movable retained device VMA.
@@ -601,6 +784,11 @@ int64_t syscall_mm_mremap(uint64_t old_addr, uint64_t old_len, uint64_t new_len,
         }
         if (source_index == UINT32_MAX) return -RELIEFOS_EFAULT;
 
+        /* No ownership-count failure may follow replacement of an existing
+         * destination. The execution writer keeps this preflight stable. */
+        int retain_check=device_mapping_check_range(vma->device_mapping,
+                                                     vma->device_map_offset,new_mapped);
+        if(retain_check)return retain_check;
         /* MREMAP_FIXED replaces its destination. Do that before checking the
          * final address-space accounting, while keeping the source pinned. */
         int unmap_ret = syscall_mm_munmap(new_addr, new_mapped);
@@ -629,8 +817,10 @@ int64_t syscall_mm_mremap(uint64_t old_addr, uint64_t old_len, uint64_t new_len,
         if (vma->prot == LINUX_PROT_NONE) page_flags |= RELIEFNT_PAGE_PROTNONE;
         for (uint64_t page = 0; page < new_mapped; page += PAGE_SIZE) {
             uint64_t actual=device_mapping_physical(vma->device_mapping,vma->device_map_offset+page);
+            uint64_t cache=address_space_user_page_flags(sched_task_as(task),old_addr+page) &
+                (RELIEFNT_PAGE_PWT|RELIEFNT_PAGE_PCD|RELIEFNT_PAGE_PAT);
             if (!actual || !address_space_map_user_page(sched_task_as(task), new_addr + page,
-                                             actual, page_flags)) {
+                                             actual, page_flags | cache)) {
                 task_unmap_pages(task, new_addr, new_addr + page);
                 return -RELIEFOS_ENOMEM;
             }
@@ -641,6 +831,12 @@ int64_t syscall_mm_mremap(uint64_t old_addr, uint64_t old_len, uint64_t new_len,
             task_unmap_pages(task,new_addr,destination_end);
             return retain;
         }
+        retain=device_mapping_retain_range(vma->device_mapping,vma->device_map_offset,new_mapped);
+        if(retain) {
+            task_unmap_pages(task,new_addr,destination_end);
+            device_mapping_put(moved_vma.device_mapping);
+            return retain;
+        }
         moved_vma.used = 1;
         moved_vma.start = new_addr;
         moved_vma.end = destination_end;
@@ -648,9 +844,12 @@ int64_t syscall_mm_mremap(uint64_t old_addr, uint64_t old_len, uint64_t new_len,
         struct task_vma *destination = sched_task_vma_at(task, destination_index);
         if (!destination || destination->used) {
             task_unmap_pages(task, new_addr, destination_end);
+            device_mapping_release_range(moved_vma.device_mapping,moved_vma.device_map_offset,
+                                         new_mapped,false);
             device_mapping_put(moved_vma.device_mapping);
             return -RELIEFOS_ENOMEM;
         }
+        mm_context_vma_changed(sched_task_as(task));
         *destination = moved_vma;
         task_unmap_pages(task, source_start, source_end);
         vma = sched_task_vma_at(task, source_index);
@@ -659,20 +858,34 @@ int64_t syscall_mm_mremap(uint64_t old_addr, uint64_t old_len, uint64_t new_len,
     }
     /* File/device mappings still need Linux backing-file readahead/writeback. */
     if (!(vma->flags & TASK_VMA_FLAG_ANON)) return -RELIEFOS_ENOMEM;
-    if (new_mapped == old_mapped) return (int64_t)old_addr;
-    if (new_mapped < old_mapped) {
+    uint32_t source_flags = vma->flags;
+    uint32_t source_prot = vma->prot;
+    bool source_locked = (source_flags & TASK_VMA_FLAG_LOCKED) != 0;
+    bool source_onfault = (source_flags & TASK_VMA_FLAG_LOCKONFAULT) != 0;
+    if (new_mapped == old_mapped && !(flags & LINUX_MREMAP_FIXED)) return (int64_t)old_addr;
+    if (new_mapped < old_mapped && !(flags & LINUX_MREMAP_FIXED)) {
         return syscall_mm_munmap(old_addr + new_mapped, old_mapped - new_mapped) < 0
                    ? -RELIEFOS_ENOMEM : (int64_t)old_addr;
     }
 
     new_end = old_addr + new_mapped;
-    if (new_end <= task_mmap_top(task) &&
+    if (!(flags & LINUX_MREMAP_FIXED) && new_end <= task_mmap_top(task) &&
         task_user_pages_free(task, old_end, new_end)) {
+        if (source_locked && !task_remap_lock_allowed(task, old_mapped, new_mapped, 0))
+            return -RELIEFOS_EAGAIN;
         map_flags = (vma->flags & TASK_VMA_FLAG_SHARED) ? LINUX_MAP_SHARED : LINUX_MAP_PRIVATE;
         map_flags |= LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED;
-        moved = syscall_mm_mmap(old_end, new_mapped - old_mapped, vma->prot,
-                                map_flags, UINT64_MAX, 0);
-        if (moved == (int64_t)old_end) return (int64_t)old_addr;
+        moved = task_remap_reserve(task, old_end, new_mapped - old_mapped, source_prot, map_flags);
+        if (moved == (int64_t)old_end) {
+            if (source_locked && mm_lock_remap(task, old_end, new_end, source_onfault) < 0) {
+                (void)syscall_mm_munmap(old_end, new_mapped - old_mapped);
+                return -RELIEFOS_EAGAIN;
+            }
+            vma = NULL;
+            if (source_locked && !source_onfault)
+                (void)mm_populate_locked_range(old_end, new_end, false);
+            return (int64_t)old_addr;
+        }
     }
     if (!(flags & LINUX_MREMAP_MAYMOVE)) return -RELIEFOS_ENOMEM;
     if (flags & LINUX_MREMAP_FIXED) {
@@ -685,17 +898,36 @@ int64_t syscall_mm_mremap(uint64_t old_addr, uint64_t old_len, uint64_t new_len,
     } else {
         new_addr = 0;
     }
-    map_flags = (vma->flags & TASK_VMA_FLAG_SHARED) ? LINUX_MAP_SHARED : LINUX_MAP_PRIVATE;
+    if (source_locked && !task_remap_lock_allowed(task, old_mapped, new_mapped, new_addr))
+        return -RELIEFOS_EAGAIN;
+    map_flags = (source_flags & TASK_VMA_FLAG_SHARED) ? LINUX_MAP_SHARED : LINUX_MAP_PRIVATE;
     map_flags |= LINUX_MAP_ANONYMOUS;
     if (flags & LINUX_MREMAP_FIXED) map_flags |= LINUX_MAP_FIXED;
-    moved = syscall_mm_mmap(new_addr, new_mapped, vma->prot, map_flags, UINT64_MAX, 0);
+    moved = task_remap_reserve(task, new_addr, new_mapped, source_prot, map_flags);
     if (moved < 0) return moved;
-    __builtin_memcpy((void *)(uintptr_t)moved, (const void *)(uintptr_t)old_addr,
-                     old_mapped < new_mapped ? old_mapped : new_mapped);
+    uint64_t copy_len = old_mapped < new_mapped ? old_mapped : new_mapped;
+    if (map_flags & LINUX_MAP_SHARED) {
+        if (mm_shared_alias(sched_task_as(task), old_addr, (uint64_t)moved, copy_len) < 0) {
+            (void)syscall_mm_munmap((uint64_t)moved, new_mapped);
+            return -RELIEFOS_ENOMEM;
+        }
+    }
+    if (task_remap_stage_leaves(task, old_addr, (uint64_t)moved, copy_len) < 0) {
+        (void)syscall_mm_munmap((uint64_t)moved, new_mapped);
+        return -RELIEFOS_ENOMEM;
+    }
+    if (source_locked && mm_lock_remap(task, (uint64_t)moved,
+                                       (uint64_t)moved + new_mapped, source_onfault) < 0) {
+        (void)syscall_mm_munmap((uint64_t)moved, new_mapped);
+        return -RELIEFOS_EAGAIN;
+    }
     if (syscall_mm_munmap(old_addr, old_mapped) < 0) {
         (void)syscall_mm_munmap((uint64_t)moved, new_mapped);
-        return -RELIEFOS_EFAULT;
+        return -RELIEFOS_ENOMEM;
     }
+    vma = NULL;
+    if (source_locked && !source_onfault)
+        (void)mm_populate_locked_range((uint64_t)moved, (uint64_t)moved + new_mapped, false);
     return moved;
 }
 
@@ -725,11 +957,16 @@ int64_t syscall_mm_map_sysv_shm(struct task *task, uint64_t address, uint64_t le
     uint64_t end = start + length;
     if (!remap && !task_user_pages_free(task, start, end)) return -RELIEFOS_EINVAL;
     if (!task_address_space_can_map(task, start, end)) return -RELIEFOS_ENOMEM;
+    uint32_t vma_flags = TASK_VMA_FLAG_SHARED | TASK_VMA_FLAG_SYSV_SHM;
+    if (task_future_lock_mapping(task, start, end, &vma_flags) < 0) return -RELIEFOS_EAGAIN;
     /* Reserve the metadata slot by index; SHM_REMAP may grow vma_extra. */
     uint32_t slot_index;
     if (task_vma_free_slot_index(task, &slot_index) < 0) return -RELIEFOS_ENOMEM;
     struct task_vma *slot = sched_task_vma_at(task, slot_index);
     if (!slot) return -RELIEFOS_ENOMEM;
+    /* Failed table preparation clears this provisional slot under the writer,
+     * before any mapping is published. Later unmaps and slot publication mark
+     * their own real changes. */
     slot->used = 0xffffffffu;
     if (!address_space_prepare_user_range(sched_task_as(task), start, end)) {
         slot = sched_task_vma_at(task, slot_index);
@@ -767,9 +1004,10 @@ int64_t syscall_mm_map_sysv_shm(struct task *task, uint64_t address, uint64_t le
         task_unmap_pages(task, start, end);
         return -RELIEFOS_ENOMEM;
     }
+    mm_context_vma_changed(sched_task_as(task));
     *slot = (struct task_vma){.used = 1, .start = start, .end = end,
         .prot = prot, .max_prot = max_prot,
-        .flags = TASK_VMA_FLAG_SHARED | TASK_VMA_FLAG_SYSV_SHM,
+        .flags = vma_flags,
         .sysv_shm_attachment = attachment};
     return (int64_t)start;
 }

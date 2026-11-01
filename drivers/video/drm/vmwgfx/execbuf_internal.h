@@ -4,6 +4,9 @@
 #include "../drm_internal.h"
 
 #include <drm/vmwgfx_drm.h>
+#ifdef CONFIG_SWAP
+#include <drm/drm_mode.h>
+#endif
 #include <linux/errno.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/lock.h>
@@ -96,6 +99,10 @@ enum drm_vmwgfx_continuation_kind {
     DRM_VMW_CONT_FENCE_WAIT = 1,
     DRM_VMW_CONT_SYNCCPU = 2,
     DRM_VMW_CONT_FENCE_REPLY_FAULT = 3,
+#ifdef CONFIG_SWAP
+    DRM_VMW_CONT_SURFACE_REPLY = 4,
+    DRM_VMW_CONT_KMS_ENUM = 5,
+#endif
 };
 
 struct drm_vmwgfx_task_continuation {
@@ -115,6 +122,13 @@ struct drm_vmwgfx_task_continuation {
     } snapshot;
     struct drm_bo *bo;
     struct drm_vmwgfx_fence *fence_object;
+#ifdef CONFIG_SWAP
+    struct drm_vmwgfx_surface *surface;
+    struct task_file *prime_file;
+    struct drm_kms_fb *enum_next;
+    struct drm_mode_card_res enum_request,enum_output;
+    uint32_t enum_limit,enum_done,enum_phase;
+#endif
     svga_handle fence;
 };
 

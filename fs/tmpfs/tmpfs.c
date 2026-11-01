@@ -1,4 +1,21 @@
 #include "../../block/core/storage_internal.h"
+/** @brief Query a selected tmpfs inode without populating a sparse page.
+ * @param node Borrowed tmpfs identity. @param offset Aligned file offset.
+ * @return True when the selected inode owns a page at that offset.
+ */
+bool storage_tmpfs_page_resident(const struct storage_node *node, uint64_t offset)
+{
+    if (!node || !(node->flags & STORAGE_NODE_FLAG_TMPFS)) return false;
+    uint64_t flags;
+    kernel_execution_lock_irqsave(&flags);
+    struct storage_volume *previous = NULL;
+    int ret = storage_select_node_volume(node, &previous);
+    bool found = !ret && g_storage.tmpfs &&
+        tmpfs_page_resident(g_storage.tmpfs, node->first_cluster, offset);
+    storage_restore_volume(previous);
+    kernel_execution_unlock_irqrestore(flags);
+    return found;
+}
 int storage_tmpfs_get_page(const struct storage_node *node, uint64_t offset, uint64_t *phys)
 {
     if (!node || !(node->flags & STORAGE_NODE_FLAG_TMPFS))

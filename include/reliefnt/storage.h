@@ -159,6 +159,19 @@ int storage_inode_deny_write(struct storage_inode_ref *reference);
  * Task context under the reentrant execution transaction; no backend I/O.
  */
 void storage_inode_allow_write(struct storage_inode_ref *reference);
+/** @brief Exclude future inode mutations while preserving existing open writers.
+ * @param reference Owned live regular inode. @return Zero or negative errno.
+ * Caller must separately drain accepted I/O and reject unsupported mappings/cache.
+ */
+int storage_inode_swap_claim(struct storage_inode_ref *reference);
+/** @brief Release a drained inode's unique swap claim.
+ * @param reference Original owned inode; NULL is ignored.
+ */
+void storage_inode_swap_release(struct storage_inode_ref *reference);
+/** @brief Test an inode's active swap claim under execution ownership.
+ * @param reference Borrowed live inode, nullable. @return True if claimed.
+ */
+bool storage_inode_swap_active(const struct storage_inode_ref *reference);
 struct storage_ext4_fiemap_extent { uint64_t logical,physical,length; uint32_t flags; };
 #define EXT4_FIEMAP_UNWRITTEN 1u
 #define EXT4_FIEMAP_HOLE 2u
@@ -174,6 +187,11 @@ int storage_fiemap_node(const struct storage_node *,uint64_t,uint64_t,
                        struct storage_ext4_fiemap_extent *,uint32_t,uint32_t *);
 int storage_node_mount_flags(const struct storage_node *node, uint64_t *flags);
 int storage_tmpfs_get_page(const struct storage_node *node, uint64_t offset, uint64_t *phys);
+/** @brief Query tmpfs inode page residency without allocating it.
+ * @param node Borrowed backing identity. @param offset Page-aligned byte offset.
+ * @return True if the inode currently owns a page at that offset.
+ */
+bool storage_tmpfs_page_resident(const struct storage_node *node, uint64_t offset);
 /** @brief Reserve pages in the exact selected mounted or anonymous tmpfs inode.
  * @param node Borrowed live node, refreshed on success; not a displayed name.
  * @param mode Zero or Linux KEEP_SIZE; other modes return EOPNOTSUPP.

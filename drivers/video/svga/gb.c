@@ -14,12 +14,15 @@ static void backing_free(struct svga_mob *m)
     *m = (struct svga_mob){0};
 }
 
+/** @brief Allocate an accessible complete PPN32 backing run.
+ * @param pages Nonzero page count. @return Physical base or zero; caller owns it.
+ */
 static uint64_t backing_alloc_pages(uint32_t pages)
 {
     uint64_t phys = svga.ops.alloc(pages);
     if (!phys) return 0;
     uint32_t *ptr = svga.ops.pointer(phys);
-    if (!ptr || (phys & 4095u) || (phys >> 12) > UINT32_MAX - pages) {
+    if (!ptr || !svga_ppn32_run(phys, pages)) {
         svga.ops.free(phys, pages);
         return 0;
     }
@@ -63,7 +66,7 @@ int svga_gb_backing_alloc_locked(struct svga_mob *m, uint32_t bytes)
 
 /** @brief Reserve a borrowed MOB's complete budget and allocate its page tables.
  * @param m Required exclusive output record; populated only on success.
- * @param phys Caller-owned page-aligned PPN32 physical backing, retained by its owner.
+ * @param phys Caller-owned page-aligned PPN32 backing, including the final PPN.
  * @param pages Nonzero backing page count within the MOB page-table format.
  * @param bytes Nonzero accessible byte count, at most pages * 4096 and MOB_MAX_SIZE.
  * @return Zero, EINVAL for invalid backing, or ENOMEM for budget/allocation failure.
@@ -75,7 +78,7 @@ int svga_gb_backing_borrow_locked(struct svga_mob *m, uint64_t phys,
 {
     if (!m || !phys || (phys & 4095u) || !pages || !bytes ||
         bytes > (uint64_t)pages * 4096u || pages > SVGA_MOB_MAX_PAGES || bytes > svga.mob_max_bytes ||
-        (phys >> 12) > UINT32_MAX - pages)
+        !svga_ppn32_run(phys, pages))
         return SVGA_EINVAL;
     uint32_t tables = pages <= 1 ? 0 : pages <= 1024 ? 1 : 1 + (pages + 1023u) / 1024u;
     if (!svga_page_budget_allows(pages + tables))

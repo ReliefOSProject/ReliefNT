@@ -414,8 +414,13 @@ int64_t drm_prime_file_ioctl(struct task *task, struct task_file *file,
     if (!task || !file || !file->drm_prime_file) return -LINUX_EBADF;
     if (command != DRM_DMA_BUF_IOCTL_SYNC) return -LINUX_ENOTTY;
     struct drm_dma_buf_sync sync;
+#ifdef CONFIG_SWAP
+    int prep=drm_user_import(task,&sync,argument,sizeof(sync));
+    if(prep)return prep;
+#else
     if (user_copy_from_task(task, &sync, argument, sizeof(sync)) < 0)
         return -LINUX_EFAULT;
+#endif
     if ((sync.flags & ~((uint64_t)DRM_DMA_BUF_SYNC_RW |
                         DRM_DMA_BUF_SYNC_END)) ||
         !(sync.flags & DRM_DMA_BUF_SYNC_RW))

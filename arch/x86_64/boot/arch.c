@@ -10,6 +10,7 @@
 #define X86_CR0_EM (1ULL << 2)
 #define X86_CR0_TS (1ULL << 3)
 #define X86_CR0_NE (1ULL << 5)
+#define X86_CR0_WP (1ULL << 16)
 #define X86_CR4_OSFXSR (1ULL << 9)
 #define X86_CR4_OSXMMEXCPT (1ULL << 10)
 #define X86_IA32_FS_BASE 0xc0000100u
@@ -70,7 +71,8 @@ void arch_init(void)
 }
 
 /**
- * @brief Enable x87/SSE in CR0/CR4, set the default MXCSR, and snapshot the clean FPU state.
+ * @brief Enable supervisor write protection and x87/SSE, set default MXCSR,
+ * and snapshot the clean FPU state before user execution.
  */
 void arch_fpu_init(void)
 {
@@ -80,7 +82,9 @@ void arch_fpu_init(void)
 
     __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
     cr0 &= ~(X86_CR0_EM | X86_CR0_TS);
-    cr0 |= X86_CR0_MP | X86_CR0_NE;
+    /* Supervisor writes must respect user COW/first-write PTEs on the BSP,
+     * including firmware entries which do not guarantee an inherited WP. */
+    cr0 |= X86_CR0_MP | X86_CR0_NE | X86_CR0_WP;
     __asm__ volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
 
     __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));

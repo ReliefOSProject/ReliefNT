@@ -18,20 +18,42 @@ static bool fixture_drm_present;
 static bool fixture_render_present;
 static bool fixture_kms_enabled;
 static bool fixture_ram;
+static bool fixture_block_pci;
+static bool fixture_second_pci;
+static uint32_t fixture_transport=BLOCK_TRANSPORT_AHCI;
+static uint8_t fixture_slot=3;
+static unsigned fixture_refs;
+int storage_disk_block_get(uint32_t disk,struct block_device_ref *out)
+{
+    if (!fixture_block_pci || (disk && !(disk==1 && fixture_second_pci))) return -LINUX_ENODEV;
+    out->device=(void *)(uintptr_t)1;++fixture_refs;return 0;
+}
+int block_device_info(const struct block_device_ref *ref,struct block_device_info *out)
+{
+    assert(ref && ref->device);
+    *out=(struct block_device_info){.transport=fixture_transport,.bus=0,.slot=fixture_slot,.function=0,
+                                    .flags=BLOCK_DEVICE_SWAP_SAFE};
+    return 0;
+}
+void block_device_put(struct block_device_ref *ref)
+{ assert(ref && ref->device && fixture_refs);ref->device=NULL;--fixture_refs; }
 int storage_list_block_disks(struct reliefos_install_disk *disks, uint32_t capacity, uint32_t *count)
 {
-    *count = fixture_ram ? 2 : 1;
+    *count = fixture_ram || fixture_second_pci ? 2 : 1;
     if (capacity) *disks = (struct reliefos_install_disk){.id=0, .sector_size=512, .sector_count=131072};
     if(fixture_ram && capacity>1)disks[1]=(struct reliefos_install_disk){.id=7,.sector_size=512,.sector_count=65536};
+    if(fixture_second_pci && capacity>1)disks[1]=(struct reliefos_install_disk){.id=1,.sector_size=512,.sector_count=65536};
     return 0;
 }
 /* The fixture supplies one major-259 disk and its GPT partition. */
 uint64_t storage_block_rdev(uint32_t value)
 { return STORAGE_BLOCK_DISK_ID(value)==7 ? block_device_make_number(1,0) :
+    STORAGE_BLOCK_DISK_ID(value)==1 ? block_device_make_number(259,128+STORAGE_BLOCK_PARTITION(value)+1) :
     block_device_make_number(259,STORAGE_BLOCK_MINOR(value)); }
 int storage_disk_block_info(uint32_t disk, int32_t part, uint64_t *start, uint64_t *count)
 {
-    if (disk || part > 0) return -2;
+    if (disk==1 && part>=0) return -2;
+    if (disk>1 || part > 0) return -2;
     *start = part < 0 ? 0 : 2048;
     *count = part < 0 ? 131072 : 32768;
     return 0;
@@ -50,6 +72,7 @@ int storage_disk_device_name(uint32_t disk, int32_t part, char *out, uint32_t ca
 {
     int written;
     if(disk==7 && part==-1 && capacity>=10){memcpy(out,"/dev/ram0",10);return 0;}
+    if(disk==1 && part==-1 && capacity>=9){memcpy(out,"/dev/sdb",9);return 0;}
     if (!out || capacity == 0 || disk != 0 || part < -1 || part >= 128) return -2;
     written = snprintf(out, capacity, "/dev/sda%s", part < 0 ? "" : "1");
     return written < 0 || (uint32_t)written >= capacity ? -22 : 0;
@@ -78,8 +101,13 @@ const struct framebuffer *framebuffer_get(void)
 }
 int pci_read_device(uint8_t bus, uint8_t slot, uint8_t fn, struct pci_device *out)
 {
-    if (bus || slot != 2 || fn)
+    if (bus || (slot != 2 && slot != 3) || fn)
         return -1;
+    if (slot==3) {
+        *out=(struct pci_device){.bus=bus,.slot=slot,.function=fn,
+                                  .class_code=1,.subclass=6,.prog_if=1};
+        return 0;
+    }
     *out = (struct pci_device){.bus = bus,
                                .slot = slot,
                                .function = fn,
@@ -90,7 +118,7 @@ int pci_read_device(uint8_t bus, uint8_t slot, uint8_t fn, struct pci_device *ou
 }
 uint32_t pci_config_read32(uint8_t b, uint8_t s, uint8_t f, uint8_t o)
 {
-    assert(!b && s == 2 && !f);
+    assert(!b && (s == 2 || s == 3) && !f);
     return o == 0x2c ? 0x11001af4 : 0;
 }
 int graphics_service_pci_identity(struct pci_device *out)
@@ -159,6 +187,31 @@ int main(void)
     read_value("/sys/devices/platform/leonos-block/sda/uevent", value, sizeof(value));
     assert(!strcmp(value, "MAJOR=259\nMINOR=0\nDEVNAME=sda\nDEVTYPE=disk\n"));
     assert(proc_readlink("/sys/dev/block/259:1", value, sizeof(value)) > 0);
+    fixture_block_pci=true;
+    read_value("/sys/devices/pci0000:00/0000:00:03.0/block/sda/dev",value,sizeof(value));
+    assert(!strcmp(value,"259:0\n"));
+    read_value("/sys/devices/pci0000:00/0000:00:03.0/block/sda/sda1/partition",value,sizeof(value));
+    assert(!strcmp(value,"1\n"));
+    const char *block_target="../../devices/pci0000:00/0000:00:03.0/block/sda";
+    int block_len=proc_readlink("/sys/class/block/sda",value,sizeof(value));
+    assert(block_len==(int)strlen(block_target));value[block_len]=0;
+    assert(!strcmp(value,block_target));
+    block_len=proc_readlink("/sys/dev/block/259:0",value,sizeof(value));
+    assert(block_len==(int)strlen(block_target));value[block_len]=0;
+    assert(!strcmp(value,block_target));
+    fixture_second_pci=true;
+    read_value("/sys/devices/pci0000:00/0000:00:03.0/block/sdb/dev",value,sizeof(value));
+    assert(!strcmp(value,"259:128\n") && !fixture_refs);
+    fixture_second_pci=false;
+    fixture_slot=2;
+    read_value("/sys/devices/platform/leonos-block/sda/dev",value,sizeof(value));
+    fixture_slot=9;
+    read_value("/sys/devices/platform/leonos-block/sda/dev",value,sizeof(value));
+    fixture_slot=3;fixture_transport=BLOCK_TRANSPORT_NVME;
+    read_value("/sys/devices/platform/leonos-block/sda/dev",value,sizeof(value));
+    assert(!fixture_refs);
+    fixture_transport=BLOCK_TRANSPORT_AHCI;
+    fixture_block_pci=false;
     read_value("/proc/sys/kernel/ostype", value, sizeof(value));
     assert(!strcmp(value, "ReliefNT\n"));
     /* Release interfaces must match the system-info record, including suffixes. */

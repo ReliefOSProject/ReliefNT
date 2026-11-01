@@ -98,6 +98,11 @@ int tmpfs_truncate(struct tmpfs_super *fs, uint32_t ino, uint64_t length);
 int tmpfs_fallocate(struct tmpfs_super *fs,uint32_t ino,uint32_t mode,uint64_t offset,uint64_t length);
 /* Returns a retained file page. The caller releases it with mm_free_page(). */
 int tmpfs_get_page(struct tmpfs_super *fs, uint32_t ino, uint64_t offset, uint64_t *phys);
+/** @brief Query a regular inode's existing page without allocating or retaining it.
+ * @param fs Serialized tmpfs instance. @param ino Inode identity.
+ * @param offset Page-aligned file offset. @return True when the page exists.
+ */
+bool tmpfs_page_resident(struct tmpfs_super *fs, uint32_t ino, uint64_t offset);
 int tmpfs_readdir(struct tmpfs_super *fs, uint32_t ino, uint64_t *offset, struct reliefos_dir_entry *out);
 /** @brief Enumerate one actual directory using this attachment's atime policy.
  * @param fs Borrowed live filesystem under execution ownership.

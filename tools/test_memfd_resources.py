@@ -21,7 +21,8 @@ with tempfile.TemporaryDirectory(prefix="memfd-resources-", dir=temporary) as wo
     subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Wno-unused-function",
                     "-g", "-O1", "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
                     "-fsanitize=address,undefined", "-Iinclude", "-Iinclude/uapi",
-                    "tools/tests/memfd_syscall_error_test.c", "-o", syscall_binary],
+                    "tools/tests/memfd_syscall_error_test.c", "kernel/syscall/fs/path.c",
+                    "-o", syscall_binary],
                    cwd=root, check=True)
     results.append(subprocess.run([syscall_binary], timeout=20).returncode)
     raise SystemExit(1 if any(results) else 0)

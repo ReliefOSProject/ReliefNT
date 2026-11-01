@@ -74,6 +74,8 @@ uint64_t time_uptime_us(void) { return 0; }
 uint8_t input_caps_lock_active(void) { return 0; }
 struct task *userland_schedule_from_frame(struct trap_frame *frame)
 { (void)frame; return NULL; }
+struct task *userland_schedule_from_timer(struct trap_frame *frame)
+{ return userland_schedule_from_frame(frame); }
 void smp_release_aps(void) {}
 void driver_manager_mouse_poll(void) { mouse_hardware_poll(); }
 uint32_t smp_current_cpu(void) { return 0; }

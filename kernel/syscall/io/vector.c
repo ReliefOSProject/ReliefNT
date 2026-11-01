@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "../internal.h"
 #include "vector_internal.h"
+#include <reliefnt/swap.h>
 
 /** @brief Canonicalize only ABI arguments consumed by a vector syscall.
  * @param number Native operation selector.
@@ -64,7 +65,7 @@ static int64_t regular_vector_finish(struct task *task,struct task_file *file,in
 {
     uint64_t accepted=task_vector_progress(task);
     if(task->waiting_queue)kernel_wait_queue_remove(task->waiting_queue,task);
-    storage_drain_task_io(task->pid);task->regular_io.active=false;
+    storage_drain_task_io(task->pid);task_regular_io_stage_cancel(task);task->regular_io.active=false;
     task_vector_cancel(task);if(file->io_owner==task->pid)file->io_owner=0;
     return accepted ? (int64_t)accepted : error;
 }
@@ -79,8 +80,9 @@ static int64_t regular_vector_finish(struct task *task,struct task_file *file,in
  * @param position Captured explicit byte position for positional operations.
  * @return Total bytes, negative errno or internal retry preserving imported
  * iovecs and accepted progress. The OFD position stays reserved across waits;
- * positional operations never temporarily change it. User payload is accessed
- * normally; only iovec metadata is snapshotted. No graph/module lock spans I/O.
+ * positional operations never temporarily change it. Imported iovecs remain
+ * snapshotted, while payload is prepared and staged one bounded slice at a time.
+ * No graph/module lock spans I/O.
  */
 static int64_t regular_vector_io(struct task *task,struct task_file *file,uint64_t number,
                                    const uint64_t raw[6],bool writing,bool positional,uint64_t position)
@@ -89,6 +91,9 @@ static int64_t regular_vector_io(struct task *task,struct task_file *file,uint64
     struct task_vector_state *state=task->vector_io;
     if(!state) {
         uint32_t count=(uint32_t)raw[2];
+        int prep=swap_prepare_user_range(task,raw[1],count*sizeof(struct iovec),false);
+        if(prep==SWAP_STORAGE_CONTENDED)return KERNEL_SYSCALL_SWAP_CONTENDED;
+        if(prep<0)return prep;
         if(!user_range_ok(raw[1],count*sizeof(struct iovec)))return -RELIEFOS_EFAULT;
         state=kernel_malloc(sizeof(*state)+count*sizeof(struct iovec));if(!state)return -RELIEFOS_ENOMEM;
         *state=(struct task_vector_state){.number=number,.position=positional ? position : 0,
@@ -99,8 +104,9 @@ static int64_t regular_vector_io(struct task *task,struct task_file *file,uint64
             if((int64_t)vector->iov_len<0)error=-RELIEFOS_EINVAL;
             else {
                 if(vector->iov_len>0x7ffff000u-state->requested)vector->iov_len=0x7ffff000u-state->requested;
-                if(vector->iov_len && !(writing ? user_range_ok((uintptr_t)vector->iov_base,vector->iov_len) :
-                    user_range_writable((uintptr_t)vector->iov_base,vector->iov_len)))error=-RELIEFOS_EFAULT;
+                uint64_t address=(uintptr_t)vector->iov_base;
+                if(vector->iov_len && (address<RELIEFNT_USER_BASE || address>=RELIEFNT_USER_TOP ||
+                    vector->iov_len>RELIEFNT_USER_TOP-address))error=-RELIEFOS_EFAULT;
             }
             if(error){kernel_free(state);return error;}state->requested+=vector->iov_len;
         }
@@ -114,12 +120,10 @@ static int64_t regular_vector_io(struct task *task,struct task_file *file,uint64
         if(!vector->iov_len){++state->index;continue;}
         uint64_t done=task->regular_io.active ? task->regular_io.done : 0;
         if(done>vector->iov_len)return regular_vector_finish(task,file,-LINUX_EIO);
-        uint64_t address=(uintptr_t)vector->iov_base+done,length=vector->iov_len-done;
-        if(length && !(state->writing ? user_range_ok(address,length) : user_range_writable(address,length)))
-            return regular_vector_finish(task,file,-RELIEFOS_EFAULT);
         file->io_owner=task->pid;
         int64_t part=syscall_regular_io(task,file,(uintptr_t)vector->iov_base,vector->iov_len,
             state->position+state->completed,state->writing,state->positional);
+        if(part==KERNEL_SYSCALL_SWAP_CONTENDED)return part;
         if(part==-RELIEFOS_EAGAIN || part==KERNEL_SYSCALL_BLOCKED)return part;
         if(part<0)return regular_vector_finish(task,file,(int)part);
         if((uint64_t)part>vector->iov_len)return regular_vector_finish(task,file,-LINUX_EIO);
@@ -179,22 +183,46 @@ int64_t syscall_vector_io(struct task *task,uint64_t number,uint64_t a0,uint64_t
     if (a2 > UIO_MAXIOV) return -RELIEFOS_EINVAL;
     if (!a2) return provider_readv ? character_file_readv(file->character_file,task,file,NULL,0,
         positional && !current_position,position,positional_flags) : 0;
+#ifdef CONFIG_SWAP
+    if(file && (file->flags & TASK_FILE_FLAG_SOCKET_UNIX)) {
+        if(positional && !current_position)return -RELIEFOS_ESPIPE;
+        return task_socket_vector_user(task,file,a1,(uint32_t)a2,writing);
+    }
+#endif
     if(file && file->node.type==RELIEFOS_FS_TYPE_FILE && file->path_ref.mount &&
        !file->character_file &&
        !(file->flags&(TASK_FILE_FLAG_DEV_NODE|TASK_FILE_FLAG_DEV_SHM|TASK_FILE_FLAG_SOCKET_UNIX|TASK_FILE_FLAG_SOCKET_INET))) {
         const uint64_t raw[]={a0,a1,a2,a3,a4,a5};
         return regular_vector_io(task,file,number,raw,writing,positional && !current_position,position);
     }
-    if (!user_range_ok(a1, a2 * sizeof(struct iovec))) return -RELIEFOS_EFAULT;
     struct iovec iov[UIO_MAXIOV];
     const struct iovec *user_iov = (const struct iovec *)(uintptr_t)a1;
+#ifdef CONFIG_SWAP
+    struct task_user_text vector_snapshot = {0};
+    int prep=task_lookup_user_bytes(task,a1,(uint32_t)(a2*sizeof(*iov)),&vector_snapshot);
+    if(prep)return prep;
+    __builtin_memcpy(iov,vector_snapshot.text,a2*sizeof(*iov));
+    kernel_free(vector_snapshot.allocation);
+    user_iov=iov;
+#else
+    if (!user_range_ok(a1, a2 * sizeof(struct iovec))) return -RELIEFOS_EFAULT;
+#endif
     uint64_t requested = 0;
     for (uint64_t i = 0; i < a2; ++i) {
         iov[i] = user_iov[i];
         if ((int64_t)iov[i].iov_len < 0) return -RELIEFOS_EINVAL;
+#ifdef CONFIG_SWAP
+        if (iov[i].iov_len &&
+            ((uint64_t)(uintptr_t)iov[i].iov_base<RELIEFNT_USER_BASE ||
+             (uint64_t)(uintptr_t)iov[i].iov_base>=RELIEFNT_USER_TOP ||
+             iov[i].iov_len>RELIEFNT_USER_TOP-(uint64_t)(uintptr_t)iov[i].iov_base))
+            return -RELIEFOS_EFAULT;
+#endif
         if (iov[i].iov_len > 0x7ffff000u - requested) iov[i].iov_len = 0x7ffff000u - requested;
+#ifndef CONFIG_SWAP
         if (iov[i].iov_len && !(writing ? user_range_ok((uintptr_t)iov[i].iov_base, iov[i].iov_len) :
             user_range_writable((uintptr_t)iov[i].iov_base, iov[i].iov_len))) return -RELIEFOS_EFAULT;
+#endif
         requested += iov[i].iov_len;
     }
     if(provider_readv)return character_file_readv(file->character_file,task,file,iov,a2,

@@ -1,4 +1,5 @@
 #include "../internal.h"
+#include <reliefnt/swap.h>
 
 
 
@@ -63,13 +64,33 @@ int64_t syscall_legacy_events(uint64_t number, uint64_t a0, uint64_t a1, uint64_
         struct task *task = sched_current_task();
         uint64_t mask_ptr = 0;
         uint64_t mask_len = 0;
+#ifdef CONFIG_SWAP
+        uint64_t admitted_mask = 0;
+#endif
         if (a5) {
+#ifdef CONFIG_SWAP
+            struct task_user_text argument;
+            int prep = task_lookup_user_bytes(task, a5, sizeof(mask_ptr) + sizeof(mask_len), &argument);
+            if (prep) return prep;
+            __builtin_memcpy(&mask_ptr, argument.text, sizeof(mask_ptr));
+            __builtin_memcpy(&mask_len, argument.text + sizeof(mask_ptr), sizeof(mask_len));
+            kernel_free(argument.allocation);
+#else
             if (!user_range_ok(a5, sizeof(mask_ptr) + sizeof(mask_len))) return -RELIEFOS_EFAULT;
             __builtin_memcpy(&mask_ptr, (const void *)(uintptr_t)a5, sizeof(mask_ptr));
             __builtin_memcpy(&mask_len, (const void *)(uintptr_t)(a5 + sizeof(mask_ptr)), sizeof(mask_len));
+#endif
             if (mask_ptr) {
                 if (mask_len != sizeof(uint64_t)) return -RELIEFOS_EINVAL;
+#ifdef CONFIG_SWAP
+                struct task_user_text value;
+                int prep = task_lookup_user_bytes(task, mask_ptr, sizeof(admitted_mask), &value);
+                if (prep) return prep;
+                __builtin_memcpy(&admitted_mask, value.text, sizeof(admitted_mask));
+                kernel_free(value.allocation);
+#else
                 if (!user_range_ok(mask_ptr, sizeof(uint64_t))) return -RELIEFOS_EFAULT;
+#endif
             }
         }
         if (!task) return -RELIEFOS_EINVAL;
@@ -78,11 +99,20 @@ int64_t syscall_legacy_events(uint64_t number, uint64_t a0, uint64_t a1, uint64_
         if (mask_ptr && !task->sigsuspend_active) {
             task->sigsuspend_saved_mask = task->blocked_signals;
             task->sigsuspend_active = 1;
-            task->blocked_signals = *(const uint64_t *)(uintptr_t)mask_ptr &
+            task->blocked_signals =
+#ifdef CONFIG_SWAP
+                                    admitted_mask &
+#else
+                                    *(const uint64_t *)(uintptr_t)mask_ptr &
+#endif
                                     ~((1ULL << 8) | (1ULL << 18));
         }
         int64_t result = syscall_select_common(a0, a1, a2, a3, a4, true);
         if (result != -RELIEFOS_EAGAIN && result != KERNEL_SYSCALL_BLOCKED &&
+#ifdef CONFIG_SWAP
+            !(result == KERNEL_SYSCALL_SWAP_CONTENDED && task->lookup_scope.armed &&
+              task->lookup_scope.number == LINUX_SYS_PSELECT6) &&
+#endif
             task->sigsuspend_active) {
             task->blocked_signals = task->sigsuspend_saved_mask;
             task->sigsuspend_active = 0;

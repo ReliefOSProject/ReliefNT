@@ -2,6 +2,7 @@
 #include <reliefnt/syscall_internal.h>
 #include <reliefnt/syscall.h>
 #include <reliefnt/usercopy.h>
+#include <reliefnt/swap.h>
 #include <reliefnt/driver_manager.h>
 #include <linux/capability.h>
 #include <linux/errno.h>
@@ -25,11 +26,16 @@ int64_t syscall_driver_control(uint32_t request_number, uint64_t address)
     if (request_number != RELIEFOS_DRIVER_CONTROL_IOCTL) return -LINUX_ENOTTY;
     if (!task || !(task->cap_effective & (1ULL << CAP_SYS_MODULE))) return -LINUX_EPERM;
     struct reliefos_driver_control request;
+    int prep=swap_prepare_user_range(task,address,sizeof(request),false);
+    if(prep==SWAP_STORAGE_CONTENDED)return KERNEL_SYSCALL_SWAP_CONTENDED;
+    if(prep<0)return -LINUX_EFAULT;
     if (!user_range_ok(address, sizeof(request))) return -LINUX_EFAULT;
     __builtin_memcpy(&request, (void *)(uintptr_t)address, sizeof(request));
     unsigned length = 0;
     while (length < sizeof(request.file) && request.file[length]) ++length;
     if (request.flags || request.reserved || length == sizeof(request.file)) return -LINUX_EINVAL;
+    prep=swap_prepare_user_range(task,address,sizeof(request),true);
+    if(prep==SWAP_STORAGE_CONTENDED)return KERNEL_SYSCALL_SWAP_CONTENDED;
     int ret = driver_manager_control(&request);
     if (!user_range_writable(address, sizeof(request))) return -LINUX_EFAULT;
     __builtin_memcpy((void *)(uintptr_t)address, &request, sizeof(request));

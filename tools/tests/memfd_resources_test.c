@@ -53,6 +53,7 @@ uint64_t mm_total_memory_kib(void) { return 65536; }
 int time_wall_clock(struct reliefos_time_info *time)
 { *time = (struct reliefos_time_info){.unix_seconds = 1234}; return 0; }
 void page_cache_invalidate_node(const struct storage_node *node) { (void)node; }
+void page_cache_forget_node(const struct storage_node *node) { (void)node; }
 void sched_truncate_file_mappings(const struct storage_node *node, uint64_t size)
 { (void)node; (void)size; }
 int storage_shmem_create(uint32_t uid, uint32_t gid, struct storage_node *node, struct storage_inode_ref **out)

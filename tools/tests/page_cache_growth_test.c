@@ -34,6 +34,10 @@ uint64_t mm_alloc_page(void)
 }
 void mm_free_page(uint64_t phys)
 { assert(phys && atomic_load(&live_pages));atomic_fetch_sub(&live_pages,1);free((void *)(uintptr_t)phys); }
+/** @brief Translate a fixture's identity-mapped physical frame.
+ * @param phys Owned page. @return Its host address.
+ */
+void *mm_phys_to_virt(uint64_t phys) { assert(irq_flags==(1ULL<<9)); return (void *)(uintptr_t)phys; }
 void *kernel_malloc(size_t size)
 {
     assert(irq_flags == (1ULL << 9)); /* Metadata growth must run unlocked. */
@@ -62,7 +66,7 @@ static void *concurrent_load(void *opaque)
 int main(void)
 {
     page_cache_init();
-    struct storage_node node={.type=1,.first_cluster=71,.volume_id=3,
+    struct storage_node node={.type=1,.flags=STORAGE_NODE_FLAG_FAT32,.first_cluster=71,.volume_id=3,
                              .size=(WORKING_PAGES*2+2)*4096ULL};
     uint64_t *pages=calloc(WORKING_PAGES,sizeof(*pages));assert(pages);
     for (unsigned i=0;i<WORKING_PAGES;++i) {

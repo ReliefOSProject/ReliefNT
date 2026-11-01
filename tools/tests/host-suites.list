@@ -10,6 +10,8 @@ cpu_accounting tools/test_cpu_accounting.py
 drm tools/test_drm.py
 e1000 tools/test_e1000.py
 efi_fs_early tools/test_efi_fs_early.py
+efi_handoff tools/test_efi_handoff.py
+efi_acpi_bootstrap tools/test_efi_acpi_bootstrap.py
 eevdf tools/test_eevdf.py
 evdev_overflow tools/test_evdev_overflow.py
 exec_limits tools/test_exec_limits.py
@@ -27,6 +29,8 @@ ext4_write tools/test_ext4_write.py
 fat_directory_growth tools/test_fat_directory_growth.py
 fbdev tools/test_fbdev.py
 framebuffer_fifo tools/test_framebuffer_fifo.py
+vbe_boot_surface tools/test_vbe_boot_surface.py
+vmware_boot_surface tools/test_vmware_boot_surface.py
 futimens tools/test_futimens.py
 gpu tools/test_gpu.py
 hda tools/test_hda.py
@@ -56,6 +60,9 @@ loadavg tools/test_loadavg.py
 network tools/test_network.py
 openrc_network tools/test_openrc_network.py
 page_cache_growth tools/test_page_cache_growth.py
+memory_reclaim tools/test_memory_reclaim.py
+cache_clustered_lifetime tools/test_cache_clustered_lifetime.py
+cache_ext_partial tools/test_cache_ext_partial.py
 private_fault_transactions tools/test_private_fault_transactions.py
 pipe_wake tools/test_pipe_wake.py
 poll_wakeup tools/test_poll_wakeup.py
@@ -163,3 +170,28 @@ graphics_service_dispatch tools/test_graphics_service_dispatch.py
 module_drm_core_owner tools/test_module_drm_core_owner.py
 module_svga_owner tools/test_module_svga_owner.py
 smp_barrier tools/test_smp_barrier.py
+
+memory_topology tools/test_memory_topology.py
+swap_backend tools/test_swap_backend.py
+swap_paging tools/test_swap_paging.py
+memory_pressure tools/test_memory_pressure.py
+memory_pressure_fix1 tools/test_memory_pressure_fix1.py
+memory_pressure_fix2 tools/test_memory_pressure_fix2.py
+memory_pressure_fix3 tools/test_memory_pressure_fix3.py
+memory_pressure_mincore_fix4 tools/test_memory_pressure_mincore_fix4.py
+memory_pressure_headroom_fix4 tools/test_memory_pressure_headroom_fix4.py
+memory_pressure_fix5 tools/test_memory_pressure_fix5.py
+memory_pressure_swapoff_recovery tools/test_memory_pressure_swapoff_recovery.py
+memory_reporting tools/test_memory_reporting.py
+task8_frontdoors tools/test_task8_frontdoors.py
+task8_user_return tools/test_task8_user_return.py
+memory_layout tools/test_memory_layout.py
+memory_layout_probe tools/test_memory_layout_probe.py
+acpi_directmap tools/test_acpi_directmap.py
+firmware_identity tools/test_firmware_identity.py
+smp_capability tools/test_smp_capability.py
+usercopy_map tools/test_usercopy_map.py
+svga_ppn_alloc tools/test_svga_ppn_alloc.py
+vmwgfx_ppn_bo tools/test_vmwgfx_ppn_bo.py
+physical_metadata tools/test_physical_metadata.py
+heap_slab tools/test_heap_slab.py

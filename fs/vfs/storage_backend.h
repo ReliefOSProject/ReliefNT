@@ -7,6 +7,11 @@ struct storage_volume;
  * single native inode reference. No name lookup or scheduler-table scan. */
 bool storage_inode_volume_other_users(uint32_t volume,const struct storage_inode_ref *root);
 bool storage_inode_volume_writers(uint32_t volume);
+/** @brief Check for any swap claim on a native volume.
+ * @param volume Native volume identity. @return True if a claim exists.
+ * Caller owns the execution transaction.
+ */
+bool storage_inode_volume_swap_active(uint32_t volume);
 void storage_volume_mount_put(struct storage_volume *volume);
 /** @brief Look up one component in an already selected filesystem directory.
  * @param context Borrowed storage volume, pinned by its VFS mount.
@@ -16,6 +21,15 @@ void storage_volume_mount_put(struct storage_volume *volume);
  * @return Zero or negative errno; execution transaction required across I/O.
  */
 int storage_backend_lookup(void *context,const struct storage_node *parent,
+                               const char *name,struct storage_node *out);
+/** @brief Perform a VFS-owned lookup, preserving the private pre-I/O marker.
+ * @param context Borrowed volume. @param parent Held directory inode.
+ * @param name Component. @param out Metadata output.
+ * @return Zero, errno or the internal native-workspace reclaim marker. The
+ * marker is converted to ENOMEM when storage is already reserved; the caller
+ * must otherwise either retain a scoped walker or convert it to ENOMEM.
+ */
+int storage_backend_lookup_vfs(void *context,const struct storage_node *parent,
                                const char *name,struct storage_node *out);
 /** @brief Read or change inode metadata using retained inode and parent objects.
  * @param context Borrowed mount volume.

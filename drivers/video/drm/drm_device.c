@@ -2,9 +2,6 @@
 
 #include <reliefnt/heap.h>
 
-#define DRM_VMWARE_VENDOR 0x15adu
-#define DRM_VMWARE_SVGA2  0x0405u
-
 static struct drm_device drm_primary;
 
 struct drm_device *drm_device_get(void)

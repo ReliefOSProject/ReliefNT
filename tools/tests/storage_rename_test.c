@@ -12,6 +12,8 @@ static FILE *disk;
 int block_device_info(const struct block_device_ref *reference,struct block_device_info *out)
 {(void)reference;(void)out;abort();}
 static struct task *writer;
+static unsigned cache_forgets;
+static uint32_t cache_forgot_inode;
 int time_wall_clock(struct reliefos_time_info *value)
 { value->unix_seconds = 1800000000; return 0; }
 uint64_t mm_alloc_page(void) { return (uintptr_t)aligned_alloc(4096, 4096); }
@@ -34,11 +36,15 @@ int storage_read_sectors(uint64_t lba, uint32_t count, void *out)
     assert(lba >= test_start_lba && !fseek(disk, (lba - test_start_lba) * 512, SEEK_SET));
     return fread(out, 512, count, disk) == count ? 0 : -5;
 }
+/** @brief Write fixture sectors, invalidating clean aliases before failure.
+ * @param lba First physical sector. @param count Number of sectors.
+ * @param in Readable sector bytes. @return Zero or injected/I/O errno.
+ */
 int storage_write_sectors(uint64_t lba, uint32_t count, const void *in)
 {
     ++test_write_commands;
     test_write_bytes += (uint64_t)count * 512;
-    ext2_cache_invalidate_range(lba, count);
+    ext2_cache_invalidate_range(&g_storage,g_storage.device_ref.device,lba,count);
     /* The real storage_block.c write invalidates the shared sector cache. */
     storage_read_cache.valid = 0;
     assert(lba >= test_start_lba && !fseek(disk, (lba - test_start_lba) * 512, SEEK_SET));
@@ -75,6 +81,24 @@ void kernel_execution_lock_irqsave(uint64_t *flags) { *flags = 0; }
 void kernel_execution_unlock_irqrestore(uint64_t flags) { (void)flags; }
 void page_cache_invalidate_node(const struct storage_node *node)
 { assert(node && (node->flags & STORAGE_NODE_FLAG_EXT2)); }
+/** @brief The isolated fixture contains no production page-cache entries.
+ * @param node Borrowed inode. @return Zero.
+ */
+int page_cache_has_inode(const struct storage_node *node) { (void)node; return 0; }
+/** @brief Accept a volume purge in the cache-free fixture. @param volume Slot. */
+void page_cache_forget_volume(uint32_t volume) { (void)volume; }
+/** @brief Accept a resize in the cache-free fixture.
+ * @param node Borrowed inode. @param old_size Previous size. @param new_size New size.
+ */
+void page_cache_resize_node(const struct storage_node *node,uint64_t old_size,uint64_t new_size)
+{ (void)node; (void)old_size; (void)new_size; }
+void page_cache_forget_node(const struct storage_node *node)
+{
+    assert(node && (node->flags & (STORAGE_NODE_FLAG_EXT2 | STORAGE_NODE_FLAG_TMPFS)));
+    ++cache_forgets; cache_forgot_inode=node->first_cluster;
+}
+void page_cache_zero_range(const struct storage_node *node,uint64_t offset,uint64_t length)
+{ (void)node; (void)offset; (void)length; abort(); }
 int storage_select_node_volume(const struct storage_node *node, struct storage_volume **previous)
 { *previous = g_active_volume; return node->volume_id == g_storage.volume_id ? 0 : -2; }
 void storage_restore_volume(struct storage_volume *previous) { g_active_volume = previous; }
@@ -94,8 +118,13 @@ int exfat_free_clusters(uint32_t cluster,uint8_t nofat,uint64_t bytes)
 #include "../../fs/ext_common/ext2_cache.c"
 int storage_read_device(const struct storage_volume *v,uint64_t lba,uint32_t n,void *out)
 { (void)v; return storage_read_sectors(lba,n,out); }
+/** @brief Forward a fixture write after invalidating exact-device ext aliases.
+ * @param v Borrowed writer volume. @param lba First physical sector.
+ * @param n Number of sectors. @param in Readable bytes.
+ * @return Zero or injected/I/O errno.
+ */
 int storage_write_device(const struct storage_volume *v,uint64_t lba,uint32_t n,const void *in)
-{ storage_ext4_cache_invalidate_write(v,lba,n); return storage_write_sectors(lba,n,in); }
+{ storage_ext4_cache_invalidate_write(v,v->device_ref.device,lba,n); return storage_write_sectors(lba,n,in); }
 int storage_ext4_device_flush(const struct storage_volume *v) { (void)v; return fflush(disk)?-5:0; }
 #include "../../fs/ext_common/format.c"
 #include "../../fs/ext_common/checksum.c"
@@ -124,7 +153,9 @@ static void test_held_inode(void)
     assert(ext2_lookup_path("/held-inode", &node) == 0);
     assert(storage_inode_get(&node, &held) == 0 && held);
     storage_inode_retain(held);
+    unsigned before=cache_forgets;
     assert(ext2_unlink("/held-inode") == 0);
+    assert(cache_forgets==before);
     assert(ext2_write_file("/held-inode", "new", 3) == 0);
     assert(ext2_lookup_path("/held-inode", &replacement) == 0 && replacement.first_cluster != node.first_cluster);
     assert(ext2_read_inode(node.first_cluster, &inode) == 0 && !inode.links_count);
@@ -134,6 +165,7 @@ static void test_held_inode(void)
     assert(storage_truncate_held_node(&node, 2) == 0);
     assert(ext2_read_node(&node, 0, data, 4, &got) == 0 && got == 2 && !memcmp(data, "he", 2));
     assert(storage_inode_put(held) == 0);
+    assert(cache_forgets==before+1 && cache_forgot_inode==node.first_cluster);
     assert(ext2_read_inode(node.first_cluster, &inode) == 0 && !inode.mode);
     assert(ext2_unlink("/held-inode") == 0 && !storage_inode_refs);
     puts("PASS production inode references: unlink retention, distinct replacement, write/truncate, final reclamation");
@@ -170,6 +202,64 @@ static void test_write_privileges(void)
     writer = NULL;
     assert(ext2_unlink("/write-privileges") == 0);
     puts("PASS production ext2 write/truncate drops set-ID bits according to CAP_FSETID and group membership");
+}
+
+/** @brief Native unlink/rename retires only a successfully destroyed inode.
+ * @return None; both hard-link survival and same-inode rename use real ext code.
+ */
+static void test_native_terminal_events(void)
+{
+    struct storage_node root, victim, alias, source;
+    assert(!ext2_lookup_path("/",&root));
+    assert(!ext2_write_file("/native-multi","v",1));
+    assert(!ext2_link("/native-multi","/native-multi-alias"));
+    assert(!ext2_lookup_path("/native-multi",&victim));
+    unsigned before=cache_forgets;
+    assert(!ext_native_remove(&g_storage,&root,"native-multi",&victim,false));
+    assert(cache_forgets==before);
+    assert(!ext2_lookup_path("/native-multi-alias",&alias));
+    assert(!ext_native_remove(&g_storage,&root,"native-multi-alias",&alias,false));
+    assert(cache_forgets==before+1 && cache_forgot_inode==victim.first_cluster);
+
+    assert(!ext2_write_file("/native-target","v",1));
+    assert(!ext2_link("/native-target","/native-target-alias"));
+    assert(!ext2_write_file("/native-source","s",1));
+    assert(!ext2_lookup_path("/native-target",&victim));
+    assert(!ext2_lookup_path("/native-source",&source));
+    bool committed=false;
+    struct storage_rename_args args={.source=&source,.old_parent=&root,.new_parent=&root,
+        .target=&victim,.old_name="native-source",.new_name="native-target",.committed=&committed};
+    before=cache_forgets;
+    assert(!ext_native_rename(&g_storage,&args) && committed);
+    assert(cache_forgets==before); /* Replaced inode still has an alias. */
+    assert(!ext2_link("/native-target","/native-source-alias"));
+    assert(!ext2_lookup_path("/native-target",&source));
+    assert(!ext2_lookup_path("/native-source-alias",&alias));
+    args.source=&source; args.target=&alias; args.old_name="native-target";
+    args.new_name="native-source-alias"; committed=false;
+    assert(!ext_native_rename(&g_storage,&args) && committed);
+    assert(cache_forgets==before); /* Two names for one inode: no-op. */
+    assert(!ext2_lookup_path("/native-target-alias",&alias));
+    assert(!ext_native_remove(&g_storage,&root,"native-target-alias",&alias,false));
+    assert(cache_forgets==before+1 && cache_forgot_inode==victim.first_cluster);
+    assert(!ext_native_remove(&g_storage,&root,"native-target",&source,false));
+    assert(cache_forgets==before+1);
+    assert(!ext2_lookup_path("/native-source-alias",&alias));
+    assert(!ext_native_remove(&g_storage,&root,"native-source-alias",&alias,false));
+    assert(cache_forgets==before+2 && cache_forgot_inode==source.first_cluster);
+
+    assert(!ext2_write_file("/native-last-source","s",1));
+    assert(!ext2_write_file("/native-last-target","v",1));
+    assert(!ext2_lookup_path("/native-last-source",&source));
+    assert(!ext2_lookup_path("/native-last-target",&victim));
+    args.source=&source; args.target=&victim; args.old_name="native-last-source";
+    args.new_name="native-last-target"; committed=false; before=cache_forgets;
+    assert(!ext_native_rename(&g_storage,&args) && committed);
+    assert(cache_forgets==before+1 && cache_forgot_inode==victim.first_cluster);
+    assert(!ext2_lookup_path("/native-last-target",&source));
+    assert(!ext_native_remove(&g_storage,&root,"native-last-target",&source,false));
+    assert(cache_forgets==before+2 && cache_forgot_inode==source.first_cluster);
+    puts("PASS native ext inode retirement distinguishes hard links, rename no-op and final cleanup");
 }
 
 static void test_symlinks(void)
@@ -235,6 +325,7 @@ int main(int argc, char **argv)
     test_symlinks();
     test_held_inode();
     test_write_privileges();
+    test_native_terminal_events();
     struct storage_node source, target;
     assert(ext2_lookup_path("/source", &source) == 0);
     assert(ext2_link("/source", "/source-hard") == 0);
@@ -243,11 +334,16 @@ int main(int argc, char **argv)
     struct ext2_inode linked_inode;
     assert(ext2_read_inode(source.first_cluster, &linked_inode) == 0 &&
            linked_inode.links_count == 2);
+    unsigned forget_before=cache_forgets;
+    assert(ext2_rename("/source", "/source-hard") == 0);
+    assert(cache_forgets == forget_before); /* Same inode: rename is a no-op. */
     assert(ext2_unlink("/source") == 0);
+    assert(cache_forgets == forget_before); /* The other hard link still owns it. */
     assert(ext2_lookup_path("/source-hard", &target) == 0);
     assert(ext2_read_inode(target.first_cluster, &linked_inode) == 0 &&
            linked_inode.links_count == 1);
     assert(ext2_unlink("/source-hard") == 0 && ext2_lookup_path("/source-hard", &target) == -2);
+    assert(cache_forgets == forget_before+1 && cache_forgot_inode==source.first_cluster);
     assert(ext2_write_file("/source", "new", 3) == 0);
     assert(ext2_lookup_path("/source", &source) == 0);
     assert(ext2_rename("/source", "/target") == 0);

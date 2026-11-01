@@ -1,12 +1,41 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "../internal.h"
+#include <reliefnt/swap.h>
+#include <reliefnt/export.h>
+#ifdef CONFIG_SWAP
+#include <reliefnt/memory_pressure.h>
+#include <reliefnt/lock.h>
+/** @brief Cancel the task's pressure wait and forget its stall accounting.
+ * @param task Execution-owned task, nullable; borrowed without ownership transfer.
+ * Only a link owned by the pressure queue is removed; unrelated waits remain.
+ * The native reclaim producer supplies the hook, while standalone lookup
+ * fixtures may omit it. MinCore and open-path continuations check it on cancellation.
+ */
+extern void memory_wait_cancel(struct task *) __attribute__((weak));
+#endif
 
 struct task_lookup_extra {struct task_lookup_extra *next;struct task_lookup_path path;};
 
+/* Binary operands retain their copied prefix across a prerequisite wait. */
+struct lookup_bytes_snapshot {
+    uint64_t user_ptr;
+    uint32_t length, done;
+    char bytes[];
+};
+
+/* A partially copied string is owned until its NUL or terminal cleanup. */
+struct lookup_text_snapshot {
+    uint64_t user_ptr;
+    uint32_t maximum,done;
+    bool allow_null,complete;
+    char bytes[];
+};
+
 /** @brief Identify syscalls whose object operations can retain lookup operands.
  * @param number Native Linux x86-64 syscall number.
- * @return True for pathname/directory-fd operations; ordinary read/write stay
- * on the zero-allocation fast path. Pure classification, no ownership change.
+ * @return True for pathname/directory-fd and native message operations.
+ * Ordinary file read/write stay on the zero-allocation fast path. Pure
+ * classification, no ownership change.
  */
 static bool lookup_path_call(uint64_t number)
 {
@@ -25,6 +54,19 @@ static bool lookup_path_call(uint64_t number)
     case __NR_mknod: case __NR_mknodat: case __NR_mount: case __NR_umount2:
     case __NR_statfs: case __NR_fstatfs: case __NR_execve: case __NR_execveat:
     case __NR_bind: case __NR_connect: case __NR_sendto: case __NR_sendmsg: case __NR_sendmmsg:
+#ifdef CONFIG_SWAP
+    case __NR_recvfrom: case __NR_recvmsg: case __NR_recvmmsg: case __NR_mincore:
+    case __NR_prlimit64: case __NR_rt_sigprocmask: case __NR_timerfd_settime:
+    case __NR_memfd_create: case __NR_swapon: case __NR_swapoff: case __NR_clone3:
+    case __NR_process_vm_readv: case __NR_process_vm_writev:
+    case __NR_poll: case __NR_ppoll: case __NR_select: case __NR_pselect6:
+    case __NR_getdents: case __NR_getdents64:
+    case __NR_msgsnd: case __NR_msgrcv: case __NR_msgctl:
+    case __NR_semop: case __NR_semtimedop: case __NR_semctl:
+    case __NR_init_module: case __NR_finit_module: case __NR_delete_module:
+    case __NR_accept: case __NR_accept4: case __NR_getsockname: case __NR_getpeername:
+    case __NR_getsockopt: case __NR_setsockopt: case __NR_socketpair:
+#endif
         return true;
     default:return false;
     }
@@ -44,6 +86,12 @@ static void lookup_path_release(struct task_lookup_path *path)
     vfs_walk_cancel(&path->walk);
     vfs_path_put(&path->result.path);
     path->complete=false;
+#ifdef CONFIG_SWAP
+    if(path->name && path->flags==TASK_LOOKUP_PROCESS_VM_KIND)task_process_vm_scope_release(path->name);
+    if(path->name && path->flags==TASK_LOOKUP_PRLIMIT_IDENTITY_KIND) {
+        sched_task_identity_put((struct task_identity *)path->name);path->name=NULL;
+    }
+#endif
     kernel_free(path->name);path->name=NULL;
     vfs_path_put(&path->root);vfs_path_put(&path->start);
 }
@@ -61,6 +109,22 @@ void task_lookup_scope_cancel(struct task *task)
     if(!task || !task->lookup_scope.armed)return;
     struct task_lookup_scope old=task->lookup_scope;
     task->lookup_scope=(struct task_lookup_scope){0};
+#ifdef CONFIG_SWAP
+    /* A canceled pselect owns its temporary mask until completion or signal. */
+    if(old.number==__NR_pselect6 && task->sigsuspend_active) {
+        task->blocked_signals=task->sigsuspend_saved_mask;
+        task->sigsuspend_active=0;
+    }
+#endif
+#ifdef CONFIG_SWAP
+    if(memory_wait_cancel &&
+       (old.number==__NR_mincore ||
+        ((old.number==__NR_open || old.number==__NR_openat) &&
+         (old.paths[0].flags==TASK_LOOKUP_PATH_IMPORT_KIND ||
+          (old.paths[0].flags&TASK_LOOKUP_OPEN_WALK_RECLAIM_FLAG)) &&
+         old.paths[0].root.mount && old.paths[0].start.mount)))
+        memory_wait_cancel(task);
+#endif
     if(task->waiting_queue)kernel_wait_queue_remove(task->waiting_queue,task);
     storage_drain_task_io(task->pid);
     for(size_t i=0;i<2;++i)lookup_path_release(&old.paths[i]);
@@ -80,7 +144,35 @@ void task_lookup_scope_cancel(struct task *task)
 void task_lookup_scope_begin(struct task *task,const struct trap_frame *frame)
 {
     if(!task || !frame || frame->rax==LINUX_SYS_RT_SIGRETURN)return;
-    if(!lookup_path_call(frame->rax)){task_lookup_scope_cancel(task);return;}
+    bool scoped=lookup_path_call(frame->rax);
+#ifdef CONFIG_SWAP
+    /* Special-device vectors retain the admitted metadata across a
+     * prerequisite page-in wait, just as ordinary files and sockets do. */
+    if(frame->rax==LINUX_SYS_READV || frame->rax==LINUX_SYS_WRITEV ||
+       frame->rax==LINUX_SYS_PREADV || frame->rax==LINUX_SYS_PWRITEV ||
+       frame->rax==LINUX_SYS_PREADV2 || frame->rax==LINUX_SYS_PWRITEV2)scoped=true;
+    /* UNIX writes can atomically publish a bounded packet after a wait. */
+    if((frame->rax==LINUX_SYS_WRITE || frame->rax==LINUX_SYS_READ ||
+        frame->rax==LINUX_SYS_WRITEV || frame->rax==LINUX_SYS_READV) && task->syscall_file &&
+       (task->syscall_file->flags & TASK_FILE_FLAG_SOCKET_UNIX))scoped=true;
+    if ((frame->rax==LINUX_SYS_READV || frame->rax==LINUX_SYS_PREADV ||
+         frame->rax==LINUX_SYS_PREADV2) && task->syscall_file &&
+        task->syscall_file->character_file && task->syscall_file->drm_file) scoped=true;
+    if(frame->rax==LINUX_SYS_IOCTL && ((uint32_t)frame->rsi==RELIEFOS_FBIOBLIT ||
+       (uint32_t)frame->rsi==FBIOGETCMAP || (uint32_t)frame->rsi==FBIOPUTCMAP ||
+       (uint32_t)frame->rsi==BLKGETSIZE || (uint32_t)frame->rsi==BLKGETSIZE64))scoped=true;
+    if(frame->rax==LINUX_SYS_IOCTL && task->syscall_file &&
+       task->syscall_file->character_file &&
+       (task->syscall_file->drm_file || task->syscall_file->drm_prime_file))scoped=true;
+    if(frame->rax==LINUX_SYS_IOCTL && task->syscall_file &&
+       task->syscall_file->character_file &&
+       (task->syscall_file->audio_file || task->syscall_file->audio_control_file ||
+        task->syscall_file->audio_mixer_file || task->syscall_file->audio_timer_file ||
+        task->syscall_file->audio_oss_file))scoped=true;
+    if(frame->rax==LINUX_SYS_IOCTL && task->syscall_file &&
+       (task->syscall_file->flags & TASK_FILE_FLAG_SOCKET_INET))scoped=true;
+#endif
+    if(!scoped){task_lookup_scope_cancel(task);return;}
     const uint64_t args[]={frame->rdi,frame->rsi,frame->rdx,frame->r10,frame->r8,frame->r9};
     struct task_lookup_scope *scope=&task->lookup_scope;
     if(scope->armed && scope->number==frame->rax && !__builtin_memcmp(scope->args,args,sizeof(args))) {
@@ -112,10 +204,25 @@ int task_lookup_scope_next(struct task *task,struct task_lookup_path **out)
         link=&(*link)->next;
     }
     if(!*link) {
-        *link=kernel_malloc(sizeof(**link));if(!*link)return -RELIEFOS_ENOMEM;
+        *link=kernel_malloc(sizeof(**link));
+        if(!*link){return -RELIEFOS_ENOMEM;}
         **link=(struct task_lookup_extra){0};
     }
     *out=&(*link)->path;return 0;
+}
+
+/** @brief Borrow an already allocated operand slot without changing its cursor.
+ * @param task Execution-owned task. @param index Zero-based scoped slot.
+ * @return Borrowed slot, or NULL if it was not allocated or no scope exists.
+ * No allocation, user access, reference transfer or I/O occurs.
+ */
+struct task_lookup_path *task_lookup_scope_at(struct task *task,uint64_t index)
+{
+    if(!task || !task->lookup_scope.armed)return NULL;
+    if(index<2)return &task->lookup_scope.paths[index];
+    struct task_lookup_extra *entry=task->lookup_scope.extra;
+    for(index-=2;entry && index;--index)entry=entry->next;
+    return entry?&entry->path:NULL;
 }
 
 /** @brief Acquire a retry-stable deny-write guard for a retained executable.
@@ -135,7 +242,7 @@ int task_lookup_exec_guard(struct task *task,const struct vfs_path *path,
     const struct storage_node *node=vfs_path_node(path);
     if(!node || node->type!=RELIEFOS_FS_TYPE_FILE)return -RELIEFOS_EACCES;
     struct task_lookup_path *saved=NULL;int rc=task_lookup_scope_next(task,&saved);if(rc)return rc;
-    const uint32_t guard_kind=0x20000000u;
+    const uint32_t guard_kind=TASK_LOOKUP_EXEC_GUARD_KIND;
     if(saved && saved->read_inode)return saved->flags==guard_kind &&
         vfs_path_same_inode(path,&saved->result.path) ? 0 : -RELIEFOS_EINVAL;
     if(saved && (saved->name || saved->walk || saved->result.path.mount))return -RELIEFOS_EINVAL;
@@ -149,37 +256,161 @@ int task_lookup_exec_guard(struct task *task,const struct vfs_path *path,
     return 0;
 }
 
-/** @brief Capture a non-path string in the current syscall operand scope.
- * @param task Borrowed caller with optional active retry scope.
+#ifdef CONFIG_SWAP
+/** @brief Pin open's root/cwd before an allocation-free pressure wait.
+ * @param task Current scoped open caller. @param saved Its first lookup slot.
+ * @param user_ptr Original pathname operand. @param kind Expected import kind.
+ * @return True only for open or openat(AT_FDCWD) before any pathname copy,
+ * lookup, provider callback or side effect. Existing paths remain task-owned
+ * across waits and are released by common lookup cancellation.
+ */
+static bool open_import_pin_paths(struct task *task,struct task_lookup_path *saved,
+                                  uint64_t user_ptr,uint32_t kind)
+{
+    if(!task || task!=sched_current_task() || !saved ||
+       kind!=TASK_LOOKUP_PATH_IMPORT_KIND || !task->lookup_scope.armed ||
+       saved!=&task->lookup_scope.paths[0] || saved->name || saved->walk ||
+       user_ptr<RELIEFNT_USER_BASE || user_ptr>=RELIEFNT_USER_TOP)
+        return false;
+    struct task_lookup_scope *scope=&task->lookup_scope;
+    if(scope->number==__NR_open) {
+        if(scope->args[0]!=user_ptr)return false;
+    } else if(scope->number==__NR_openat) {
+        if((int32_t)scope->args[0]!=LINUX_AT_FDCWD || scope->args[1]!=user_ptr)return false;
+    } else return false;
+    if(saved->root.mount || saved->start.mount)
+        return saved->flags==kind && saved->root.mount && saved->start.mount;
+    struct task_fs_paths *paths=sched_task_paths(task);
+    if(!vfs_path_node(&paths->root) || !vfs_path_node(&paths->cwd))return false;
+    vfs_path_get(&paths->root,&saved->root);vfs_path_get(&paths->cwd,&saved->start);
+    saved->flags=kind;saved->dirfd=LINUX_AT_FDCWD;
+    return saved->root.mount && saved->start.mount;
+}
+#endif
+
+#ifdef CONFIG_SWAP
+/** @brief Reclaim before an open's import, initial walk or native workspace.
+ * @param task Current execution-owned task. @param frame Original registers.
+ * @return Zero for retry, blocked marker, or terminal ENOMEM. For a retained
+ * walk the current native lookup has not submitted I/O. Completed earlier
+ * components, text and root/cwd remain scoped and are never replayed.
+ */
+int64_t syscall_open_path_reclaim(struct task *task,const struct trap_frame *frame)
+{
+    if(!task || task!=sched_current_task() || !frame || frame->rip<2 ||
+       (frame->rax!=LINUX_SYS_OPEN && frame->rax!=LINUX_SYS_OPENAT) ||
+       !kernel_execution_is_outermost() || !task->lookup_scope.armed ||
+       task->lookup_scope.number!=frame->rax)
+        {return -RELIEFOS_ENOMEM;}
+    const uint64_t args[]={frame->rdi,frame->rsi,frame->rdx,frame->r10,frame->r8,frame->r9};
+    struct task_lookup_path *slot=task_lookup_scope_at(task,0);
+    if(__builtin_memcmp(task->lookup_scope.args,args,sizeof(args)) || !slot ||
+       !slot->root.mount || !slot->start.mount)
+        {return -RELIEFOS_ENOMEM;}
+    bool importing=slot->flags==TASK_LOOKUP_PATH_IMPORT_KIND && !slot->name && !slot->walk;
+    bool walking=(slot->flags&TASK_LOOKUP_OPEN_WALK_RECLAIM_FLAG) && slot->name &&
+        !(slot->flags&~(TASK_LOOKUP_OPEN_WALK_RECLAIM_FLAG|VFS_LOOKUP_FOLLOW|VFS_LOOKUP_MISSING)) &&
+        !slot->complete && !slot->allow_empty && !slot->real_ids && slot->dirfd==LINUX_AT_FDCWD &&
+        (frame->rax==LINUX_SYS_OPEN || (int32_t)frame->rdi==LINUX_AT_FDCWD);
+    if(!importing && !walking){return -RELIEFOS_ENOMEM;}
+    uint64_t pathname=frame->rax==LINUX_SYS_OPEN ? frame->rdi : frame->rsi;
+    memory_reclaim_fault_scope_begin(task,frame->rip-2,pathname);
+    int rc=memory_fault_oom(task,pathname);
+    memory_reclaim_fault_scope_end();
+    if(rc==-EAGAIN)return KERNEL_SYSCALL_BLOCKED;
+    if(rc){
+        return -RELIEFOS_ENOMEM;
+    }
+    task_lookup_scope_begin(task,frame);
+    return 0;
+}
+#endif
+
+/** @brief Resume one bounded pathname or text import from owned bytes.
+ * @param task Borrowed caller under execution ownership.
+ * @param saved Optional owner slot, retained through a prerequisite wait.
  * @param user_ptr User string address checked through its terminating NUL.
  * @param maximum Buffer capacity including NUL, at most VFS_PATH_MAX.
  * @param allow_null Treat a NULL address as an empty string when true.
+ * @param kind Private discriminator for the saved operand.
  * @param out Required output, borrowing scoped text or owning allocation for
  * an unscoped call. Caller kernel_free(out->allocation) on every outcome.
  * @return Zero or negative errno, with empty output on failure. Scoped copies
  * belong to the task until common cancellation and matching retries do not
  * reread user memory. No inode I/O, reference transfer or spinlock occurs.
  */
-int task_lookup_user_text(struct task *task,uint64_t user_ptr,uint32_t maximum,
-                            bool allow_null,struct task_user_text *out)
+int task_lookup_text_resume(struct task *task,struct task_lookup_path *saved,
+                            uint64_t user_ptr,uint32_t maximum,bool allow_null,
+                            uint32_t kind,struct task_user_text *out)
 {
     if(!out)return -RELIEFOS_EINVAL;*out=(struct task_user_text){0};
     if(!maximum || maximum>VFS_PATH_MAX)return -RELIEFOS_EINVAL;
-    const uint32_t text_kind=0x80000000u;
-    struct task_lookup_path *saved=NULL;int rc=task_lookup_scope_next(task,&saved);if(rc)return rc;
+    if(kind!=TASK_LOOKUP_TEXT_IMPORT_KIND && kind!=TASK_LOOKUP_PATH_IMPORT_KIND)return -RELIEFOS_EINVAL;
+    struct lookup_text_snapshot *snapshot;
     if(saved && saved->name) {
-        if(saved->flags!=text_kind || saved->dirfd!=(int32_t)maximum || saved->allow_empty!=allow_null)
+        if(saved->flags!=kind)return -RELIEFOS_EINVAL;
+        snapshot=(struct lookup_text_snapshot *)saved->name;
+        if(snapshot->user_ptr!=user_ptr || snapshot->maximum!=maximum ||
+           snapshot->allow_null!=allow_null || snapshot->done>maximum)
             return -RELIEFOS_EINVAL;
-        out->text=saved->name;return 0;
+    } else {
+        snapshot=kernel_malloc(sizeof(*snapshot)+(size_t)maximum);
+        if(!snapshot) {
+
+#ifdef CONFIG_SWAP
+            if(open_import_pin_paths(task,saved,user_ptr,kind)) {
+
+                return KERNEL_SYSCALL_OPEN_PATH_RECLAIM;
+            }
+#endif
+            return -RELIEFOS_ENOMEM;
+        }
+        *snapshot=(struct lookup_text_snapshot){.user_ptr=user_ptr,.maximum=maximum,.allow_null=allow_null};
+        if(saved){saved->name=(char *)snapshot;saved->flags=kind;}
     }
-    char *copy=kernel_malloc(maximum);if(!copy)return -RELIEFOS_ENOMEM;
-    if(!user_ptr && allow_null)copy[0]=0;
-    else rc=copy_user_path(copy,maximum,user_ptr);
-    if(rc){kernel_free(copy);return rc;}
-    if(saved) {
-        saved->name=copy;saved->flags=text_kind;saved->dirfd=(int32_t)maximum;saved->allow_empty=allow_null;
-    } else out->allocation=copy;
-    out->text=copy;return 0;
+    if(!user_ptr && allow_null){snapshot->bytes[0]=0;snapshot->complete=true;}
+    int rc=0;
+    while(!snapshot->complete && snapshot->done<maximum) {
+        uint32_t done=snapshot->done;
+        if(user_ptr>UINT64_MAX-done){rc=-RELIEFOS_EFAULT;break;}
+        uint64_t address=user_ptr+done;
+        uint32_t chunk=4096u-(uint32_t)(address&4095u);
+        if(chunk>maximum-done)chunk=maximum-done;
+        int prep=swap_prepare_user_range(task,address,chunk,false);
+        if(prep || !user_range_ok(address,chunk)) {
+            rc=prep==SWAP_STORAGE_CONTENDED ? KERNEL_SYSCALL_SWAP_CONTENDED : -RELIEFOS_EFAULT;
+            break;
+        }
+        for(uint32_t i=0;i<chunk;++i) {
+            char ch=((const char *)(uintptr_t)address)[i];
+            snapshot->bytes[snapshot->done++]=ch;
+            if(!ch){snapshot->complete=true;break;}
+        }
+    }
+    if(!rc && !snapshot->complete)rc=-RELIEFOS_ENAMETOOLONG;
+    if(rc) {
+        if(rc!=KERNEL_SYSCALL_SWAP_CONTENDED || !saved) {
+            if(saved)saved->name=NULL;
+            kernel_free(snapshot);
+        }
+        return rc;
+    }
+    if(!saved)out->allocation=(char *)snapshot;
+    out->text=snapshot->bytes;return 0;
+}
+
+/** @brief Capture one bounded text operand in the task's retry scope.
+ * @param task Current caller. @param user_ptr User string or permitted NULL.
+ * @param maximum Capacity including NUL. @param allow_null Permit NULL.
+ * @param out Borrowed scoped text or owned unscoped allocation.
+ * @return Zero, terminal errno or prerequisite contention.
+ */
+int task_lookup_user_text(struct task *task,uint64_t user_ptr,uint32_t maximum,
+                            bool allow_null,struct task_user_text *out)
+{
+    struct task_lookup_path *saved=NULL;int rc=task_lookup_scope_next(task,&saved);
+    return rc ? rc : task_lookup_text_resume(task,saved,user_ptr,maximum,allow_null,
+                                             TASK_LOOKUP_TEXT_IMPORT_KIND,out);
 }
 
 /** @brief Capture exact binary user bytes in this syscall's operand scope.
@@ -190,23 +421,47 @@ int task_lookup_user_text(struct task *task,uint64_t user_ptr,uint32_t maximum,
  * @param out Required output; scoped bytes are borrowed, unscoped allocation
  * is owned and must be kernel_free'd by the caller on every return.
  * @return Zero or negative errno with empty output on failure. Matching
- * retries never reread changed/unmapped input. Common cancellation owns scoped
+ * retries resume after the copied prefix and never reread it, even when the
+ * caller changes or unmaps those pages. Common cancellation owns scoped
  * storage; no namespace lookup, inode I/O or spinlock participates.
  */
 int task_lookup_user_bytes(struct task *task,uint64_t user_ptr,uint32_t length,struct task_user_text *out)
 {
     if(!out)return -RELIEFOS_EINVAL;*out=(struct task_user_text){0};
     if(!length || length>INT32_MAX)return -RELIEFOS_EINVAL;
-    const uint32_t binary_kind=0x40000000u;
+    const uint32_t binary_kind=TASK_LOOKUP_BINARY_IMPORT_KIND;
     struct task_lookup_path *saved=NULL;int rc=task_lookup_scope_next(task,&saved);if(rc)return rc;
+    if(user_ptr>UINT64_MAX-length)return -RELIEFOS_EFAULT;
+    struct lookup_bytes_snapshot *snapshot;
     if(saved && saved->name) {
         if(saved->flags!=binary_kind || saved->dirfd!=(int32_t)length)return -RELIEFOS_EINVAL;
-        out->text=saved->name;return 0;
+        snapshot=(struct lookup_bytes_snapshot *)saved->name;
+        if(snapshot->user_ptr!=user_ptr || snapshot->length!=length || snapshot->done>length)
+            return -RELIEFOS_EINVAL;
+    } else {
+        snapshot=kernel_malloc(sizeof(*snapshot)+(size_t)length);
+        if(!snapshot)return -RELIEFOS_ENOMEM;
+        *snapshot=(struct lookup_bytes_snapshot){.user_ptr=user_ptr,.length=length};
+        if(saved) {
+            saved->name=(char *)snapshot;saved->flags=binary_kind;saved->dirfd=(int32_t)length;
+        }
     }
-    if(!user_range_ok(user_ptr,length))return -RELIEFOS_EFAULT;
-    char *copy=kernel_malloc(length);if(!copy)return -RELIEFOS_ENOMEM;
-    __builtin_memcpy(copy,(const void *)(uintptr_t)user_ptr,length);
-    if(saved){saved->name=copy;saved->flags=binary_kind;saved->dirfd=(int32_t)length;}
-    else out->allocation=copy;
-    out->text=copy;return 0;
+    while(snapshot->done<length) {
+        uint32_t done=snapshot->done,chunk=length-done;if(chunk>32768u)chunk=32768u;
+        int prep=swap_prepare_user_range(task,user_ptr+done,chunk,false);
+        if(prep || !user_range_ok(user_ptr+done,chunk)) {
+            if(prep!=SWAP_STORAGE_CONTENDED || !saved) {
+                if(saved)saved->name=NULL;
+                kernel_free(snapshot);
+            }
+            return prep==SWAP_STORAGE_CONTENDED ? KERNEL_SYSCALL_SWAP_CONTENDED : -RELIEFOS_EFAULT;
+        }
+        __builtin_memcpy(snapshot->bytes+done,(const void *)(uintptr_t)(user_ptr+done),chunk);
+        snapshot->done+=chunk;
+    }
+    if(!saved)out->allocation=(char *)snapshot;
+    out->text=snapshot->bytes;return 0;
 }
+#ifdef CONFIG_SWAP
+EXPORT_SYMBOL(task_lookup_user_bytes);
+#endif

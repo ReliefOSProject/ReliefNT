@@ -50,7 +50,8 @@ static int submit_mapping_chunk_locked(uint32_t id, struct svga_gmr *g)
 }
 
 /** @brief Construct or progress a borrowed GMR with independent callback-code ownership.
- * @param phys Contiguous page-aligned backing base. @param bytes Backing length.
+ * @param phys Contiguous page-aligned PPN32 base; the final PPN is supported.
+ * @param bytes Backing length.
  * @param owner Required backing identity, transferred only on handle publication.
  * @param owner_put Final backing callback outside the device lock.
  * @param code_owner LIVE callback module or NULL for permanent code.
@@ -94,7 +95,7 @@ int svga_gmr_borrowed_attach(uint64_t phys, uint32_t bytes, void *owner,
             (phys >> 12) > UINT32_MAX) goto done;
         uint32_t pages = svga_bytes_to_pages(bytes);
         if (!pages || pages > SVGA_MOB_MAX_PAGES ||
-            (phys >> 12) > UINT32_MAX - pages || bytes > svga.mob_max_bytes) {
+            !svga_ppn32_run(phys, pages) || bytes > svga.mob_max_bytes) {
             ret = SVGA_EINVAL;
             goto done;
         }

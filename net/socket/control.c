@@ -5,6 +5,7 @@
 #include <reliefnt/sched.h>
 #include <reliefnt/syscall.h>
 #include <reliefnt/usercopy.h>
+#include <reliefnt/socket_usercopy.h>
 #include <linux/capability.h>
 #include <linux/errno.h>
 #include <linux/tty.h>
@@ -13,13 +14,15 @@
 int task_net_control(struct task_file *file, uint32_t request, uint64_t address)
 {
     if (!file || !(file->flags & TASK_FILE_FLAG_SOCKET_INET)) return -LINUX_ENOTTY;
+    struct task *task = sched_current_task();
     if (request == FIONBIO) {
-        if (!user_range_ok(address, sizeof(int))) return -LINUX_EFAULT;
-        if (*(int *)(uintptr_t)address) file->flags |= RELIEFOS_O_NONBLOCK;
+        int value;int rc=socket_user_import(task,address,&value,sizeof(value));if(rc)return rc;
+        if (value) file->flags |= RELIEFOS_O_NONBLOCK;
         else file->flags &= ~RELIEFOS_O_NONBLOCK;
         return 0;
     }
     if (request == FIONREAD) {
+        int rc=socket_user_prepare(task,address,sizeof(int),true);if(rc)return rc;
         if (!user_range_writable(address, sizeof(int))) return -LINUX_EFAULT;
         net_poll_packets();
         int bytes = file->kind == TASK_FILE_KIND_PACKET ? task_packet_available(file) : file->kind == TASK_FILE_KIND_UDP ? task_udp_available(file) :
@@ -32,11 +35,10 @@ int task_net_control(struct task_file *file, uint32_t request, uint64_t address)
         return net_interface_ioctl(request, address);
     if (request != RELIEFOS_NET_CONTROL_IOCTL) return -LINUX_ENOTTY;
     struct reliefos_net_control control;
-    if (!user_range_ok(address, sizeof(control)) || !user_range_writable(address, sizeof(control)))
-        return -LINUX_EFAULT;
-    __builtin_memcpy(&control, (void *)(uintptr_t)address, sizeof(control));
+    int rc=socket_user_import(task,address,&control,sizeof(control));if(rc)return rc;
+    rc=socket_user_prepare(task,address,sizeof(control),true);if(rc)return rc;
+    if(!user_range_writable(address,sizeof(control)))return -LINUX_EFAULT;
     if (control.version != RELIEFOS_NET_CONTROL_VERSION || control.reserved) return -LINUX_EINVAL;
-    struct task *task = sched_current_task();
     if (!task) return -LINUX_EPERM;
     bool change = control.operation == RELIEFOS_NET_CONTROL_DHCP ||
         (control.operation == RELIEFOS_NET_CONTROL_DNS_POLICY &&

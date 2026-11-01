@@ -1278,8 +1278,21 @@ void net_close_owner_sockets(uint32_t owner_pid)
     }
 }
 
-/**
- * @brief Poll network progress and park a writer while its transmit queue is full.
+#ifdef CONFIG_SWAP
+/** @brief Retire only this TCP endpoint's read/write readiness registration.
+ * @param handle Pinned socket handle. @param task Waiting task, nullable.
+ * Execution ownership is required; no unrelated provider wait is removed.
+ */
+void net_socket_cancel_wait(int32_t handle, struct task *task)
+{
+    struct net_socket *socket=net_socket_find(handle,0,1);
+    if(!socket || !task)return;
+    kernel_wait_queue_remove(&socket->wait_read,task);
+    kernel_wait_queue_remove(&socket->wait_write,task);
+}
+#endif
+
+/** @brief Poll network progress and park a writer while its transmit queue is full.
  * @param handle Internal socket handle.
  * @return One while parked, zero when ready to retry, or a negative errno.
  */

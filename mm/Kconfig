@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+config SWAP
+    bool "Swap support"
+    default y
+    help
+      Build core swap area accounting and the fixed-block backing interface.

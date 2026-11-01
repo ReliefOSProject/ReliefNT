@@ -156,6 +156,7 @@ static int task_begin_syscall_io(struct task *task, uint64_t number, int32_t fd,
         number == LINUX_SYS_GETDENTS || number == LINUX_SYS_GETDENTS64 ||
         number == LINUX_SYS_FSYNC || number == LINUX_SYS_FDATASYNC ||
         number == LINUX_SYS_SYNCFS || number == LINUX_SYS_LSEEK ||
+        number == LINUX_SYS_TIMERFD_SETTIME || number == LINUX_SYS_TIMERFD_GETTIME ||
         number == LINUX_SYS_UTIMENSAT || number == LINUX_SYS_FUTIMESAT ||
         number == LINUX_SYS_IOCTL ||
         number == LINUX_SYS_PREAD64 || number == LINUX_SYS_PWRITE64 ||
@@ -167,7 +168,9 @@ static int task_begin_syscall_io(struct task *task, uint64_t number, int32_t fd,
         number == LINUX_SYS_SENDMSG || number == LINUX_SYS_RECVMSG ||
         number == LINUX_SYS_SENDMMSG || number == LINUX_SYS_RECVMMSG ||
         number == LINUX_SYS_ACCEPT || number == LINUX_SYS_ACCEPT4 ||
-        number == LINUX_SYS_BIND || number == LINUX_SYS_CONNECT;
+        number == LINUX_SYS_BIND || number == LINUX_SYS_CONNECT ||
+        number == LINUX_SYS_GETSOCKNAME || number == LINUX_SYS_GETPEERNAME ||
+        number == LINUX_SYS_GETSOCKOPT || number == LINUX_SYS_SETSOCKOPT;
     /* Metadata, directory and size operations can also wait for backing I/O.
      * Hold their OFD before the first callback, exactly as scalar data I/O. */
     if (number == LINUX_SYS_RT_SIGRETURN) return 0;
@@ -221,6 +224,18 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
     }
     /* Several storage and GUI services still own global scratch buffers. */
     kernel_execution_lock_scoped_irqsave(&lock_flags, lock_profile_syscall_scope(frame->rax));
+#ifdef CONFIG_SWAP
+    /* A committed exec is owned by the scheduler; reaching any old syscall
+     * frame here means that old user code unexpectedly ran.  Do not import
+     * its operands or advance its prepared image from this entry point. */
+    struct task *committed_task = sched_current_task();
+    if (committed_task && sched_exec_staged(committed_task)) {
+        userland_exec_cancel(committed_task);
+        sched_exit(committed_task->pid, 127);
+        kernel_execution_unlock_irqrestore(lock_flags);
+        return NULL;
+    }
+#endif
     net_tcp_maintenance();
     /* Drain small fair batches after taking execution ownership. Failed
      * filesystem cleanup retains its provider until a later successful flush;
@@ -249,6 +264,9 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
         /* sigaltstack must inspect the live user SP, not the last timer frame. */
         calling_task->frame.rsp = frame->rsp;
     }
+#ifdef CONFIG_SWAP
+    task_socket_stage_enter(calling_task,frame);
+#endif
     task_transfer_enter(calling_task,frame);
     task_vector_enter(calling_task,frame);
     int pin_error=task_begin_syscall_io(calling_task,number,
@@ -265,7 +283,7 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
     } else if (number == LINUX_SYS_CLONE) {
         /* Legacy clone() only consumes the low 32 flag bits; Linux silently
          * ignores the upper half rather than returning EINVAL. */
-        result = sched_clone_current(frame, (uint32_t)frame->rdi, frame->rsi,
+        result = syscall_clone_prepared(frame, (uint32_t)frame->rdi, frame->rsi,
                                      frame->rdx, frame->r10, frame->r8);
     } else if (number == LINUX_SYS_CLONE3) {
         result = syscall_clone3(frame, frame->rdi, frame->rsi);
@@ -282,8 +300,44 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
                                        frame->r8,
                                        frame->r9);
     }
+#ifdef CONFIG_SWAP
+    if ((number==LINUX_SYS_OPEN || number==LINUX_SYS_OPENAT) &&
+        result==KERNEL_SYSCALL_OPEN_PATH_RECLAIM) {
+        result=syscall_open_path_reclaim(calling_task,frame);
+        if(!result) {
+            result=RELIEFOS_SYSCALL_FRAME_DISPATCH(calling_task,number,
+                frame->rdi,frame->rsi,frame->rdx,frame->r10,frame->r8,frame->r9);
+            if(result==KERNEL_SYSCALL_OPEN_PATH_RECLAIM)
+                result=KERNEL_SYSCALL_SWAP_CONTENDED;
+        }
+    }
+    if (number==LINUX_SYS_READ && result==KERNEL_SYSCALL_REGULAR_READ_RECLAIM) {
+        result=syscall_regular_read_reclaim(calling_task,frame);
+        if (result==KERNEL_SYSCALL_REGULAR_READ_RECLAIM)
+            result=KERNEL_SYSCALL_SWAP_CONTENDED;
+    }
+    if (number==LINUX_SYS_MINCORE && result==KERNEL_SYSCALL_MINCORE_RECLAIM) {
+        result=syscall_mm_mincore_reclaim(calling_task,frame);
+        /* At most one reclaim batch per entry. A later output page retries
+         * from the retained scalar continuation on a future timer tick. */
+        if (result==KERNEL_SYSCALL_MINCORE_RECLAIM)
+            result=KERNEL_SYSCALL_SWAP_CONTENDED;
+    }
+#endif
     bool module_file_io_retry=number==LINUX_SYS_FINIT_MODULE && result==MODULE_FILE_IO_RETRY;
+    bool mmap_file_io_retry=number==LINUX_SYS_MMAP && result==KERNEL_MMAP_FILE_IO_RETRY;
+    bool prerequisite_retry=result==KERNEL_SYSCALL_SWAP_CONTENDED ||
+                            result==KERNEL_SYSCALL_DRM_ENUM_WAIT;
+    bool exec_commit_retry=result==KERNEL_SYSCALL_EXEC_COMMIT_WAIT;
+    if (result==KERNEL_SYSCALL_EXEC_FATAL) {
+        storage_set_io_async_context(false);
+        kernel_execution_unlock_irqrestore(lock_flags);
+        return NULL;
+    }
     if(module_file_io_retry) result=-RELIEFOS_EAGAIN;
+    if(mmap_file_io_retry) result=-RELIEFOS_EAGAIN;
+    if(prerequisite_retry) result=-RELIEFOS_EAGAIN;
+    if(exec_commit_retry) result=-RELIEFOS_EAGAIN;
     if ((number == LINUX_SYS_EXECVE || number == LINUX_SYS_EXECVEAT) && result == 0 && calling_task) {
         *frame = calling_task->frame;
         /* The fresh image frame is not a SYSCALL stub frame; drop the
@@ -297,9 +351,17 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
         result == -RELIEFOS_EAGAIN &&
         syscall_eagain_is_nonblocking_device(sched_current_task(),
                                              number, frame->rdi);
+    if (prerequisite_retry || exec_commit_retry) eagain_from_nonblocking = 0;
+    /* Memory quota, provider and checked-prefault EAGAINs are final errors.
+     * A separate mmap marker keeps the existing file-metadata retry intact. */
+    if (result == -RELIEFOS_EAGAIN && !prerequisite_retry &&
+        (number == LINUX_SYS_SWAPON || number == LINUX_SYS_SWAPOFF ||
+         number == LINUX_SYS_MLOCK || number == LINUX_SYS_MLOCK2 ||
+         number == LINUX_SYS_MREMAP || (number == LINUX_SYS_MMAP && !mmap_file_io_retry)))
+        eagain_from_nonblocking = 1;
     if (result == -LINUX_EAGAIN && calling_task && calling_task->syscall_file &&
         calling_task->syscall_file->kind == TASK_FILE_KIND_SIGNALFD) eagain_from_nonblocking = 1;
-    if ((number == LINUX_SYS_FUTEX || number == LINUX_SYS_FUTEX_WAIT ||
+    if (!prerequisite_retry && (number == LINUX_SYS_FUTEX || number == LINUX_SYS_FUTEX_WAIT ||
          number == LINUX_SYS_FUTEX_WAITV ||
          number == LINUX_SYS_RT_SIGQUEUEINFO || number == LINUX_SYS_RT_TGSIGQUEUEINFO ||
          number == LINUX_SYS_RT_SIGTIMEDWAIT ||
@@ -346,10 +408,22 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
         (((number == LINUX_SYS_SENDMSG || number == LINUX_SYS_RECVMSG) && (frame->rdx & 0x40)) ||
          ((number == LINUX_SYS_SENDTO || number == LINUX_SYS_RECVFROM) && (frame->r10 & 0x40))))
         eagain_from_nonblocking = 1;
+    /* A prerequisite wait is never an operation-specific final EAGAIN. */
+    if (prerequisite_retry || exec_commit_retry) eagain_from_nonblocking = 0;
     if (result != -RELIEFOS_EAGAIN || eagain_from_nonblocking) {
         storage_release_task_io(sched_current_pid());
     }
     storage_set_io_async_context(false);
+    if (exec_commit_retry) {
+        /* Do not re-enter any instruction in the old image after exec's
+         * irreversible boundary. The selected-task scheduler resumes it. */
+        if (calling_task) {
+            calling_task->restart_syscall = number + 1;
+            sched_sleep_current_until(time_ticks() + 1u);
+        }
+        kernel_execution_unlock_irqrestore(lock_flags);
+        return NULL;
+    }
     if (restored_signal_frame) {
         /* sigreturn and successful exec already supplied the user context. */
     } else if (result == KERNEL_SYSCALL_BLOCKED ||

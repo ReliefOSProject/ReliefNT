@@ -95,6 +95,7 @@ static int exfat_delete_acl_metadata_file(const struct storage_node *directory)
         ret = exfat_free_clusters(metadata.first_cluster,
                                   (metadata.flags & STORAGE_NODE_FLAG_EXFAT_NOFAT) != 0,
                                   metadata.size);
+        if (!ret) page_cache_forget_node(&metadata);
     }
     return ret;
 }
@@ -120,8 +121,10 @@ int exfat_remove_child(const struct storage_node *parent,const char *name,bool d
     }
     ret=exfat_delete_entry(&ref);if(ret)return ret;
     bool retained=storage_inode_unlinked(&node);storage_cache_invalidate();
-    return retained ? 0 : exfat_free_clusters(node.first_cluster,
+    if (!retained) ret=exfat_free_clusters(node.first_cluster,
         !!(node.flags&STORAGE_NODE_FLAG_EXFAT_NOFAT),node.size ? node.size : directory ? g_storage.cluster_bytes : 0);
+    if (!ret && !retained) page_cache_forget_node(&node);
+    return ret;
 }
 
 
@@ -194,6 +197,7 @@ int exfat_rename_child(const struct storage_node *directory,const char *old_name
         storage_inode_note_move(&node,&moved);
         if (!ret && !retained) ret = exfat_free_clusters(existing.first_cluster,
                             (existing.flags & STORAGE_NODE_FLAG_EXFAT_NOFAT) != 0, existing.size);
+        if (!ret && !retained) page_cache_forget_node(&existing);
         storage_cache_invalidate();
         return ret;
     }

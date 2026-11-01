@@ -44,6 +44,11 @@ int kernel_signal_queue_task_info(struct task *task, int sig, const struct linux
 int kernel_signal_enqueue(struct task *task, bool process, int sig, const struct linux_siginfo *info);
 /** @brief Consume one allowed signal, private queue before the shared queue. */
 int kernel_signal_dequeue(struct task *task, uint64_t allowed, struct linux_siginfo *info);
+/** @brief Inspect the next eligible signal using dequeue's selection order.
+ * @param task Execution-owned receiver. @param allowed Eligible signal bits.
+ * @return Signal number or zero; does not consume its bitmap or siginfo.
+ */
+int kernel_signal_peek(struct task *task, uint64_t allowed);
 /** @brief Flush matching records and release their original UID charges. */
 void kernel_signal_flush(struct task *task, bool process, uint64_t mask);
 /** @brief Move shared pending state into the sole surviving exec thread. */
@@ -78,6 +83,13 @@ int kernel_signal_set_action(struct task *task, int signal_number,
  *         or a negative errno when the user stack could not be written.
  */
 int kernel_signal_deliver_pending(struct task *task, struct trap_frame *frame);
+
+/** @brief Scheduler-only delivery with bounded swap preparation.
+ * @param task Current selected user task. @param frame Its saved return frame.
+ * @return As delivery, or SWAP_STORAGE_CONTENDED before signal consumption.
+ * Requires the outermost writer and no other spin/reader/loader lock.
+ */
+int kernel_signal_deliver_pending_outer(struct task *task, struct trap_frame *frame);
 
 /**
  * @brief Restore the interrupted frame saved by kernel_signal_deliver_pending().

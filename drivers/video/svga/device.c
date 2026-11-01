@@ -98,10 +98,23 @@ static uint64_t device_clock(void)
     __asm__ volatile("lfence; rdtsc; lfence" : "=a"(low), "=d"(high) :: "memory");
     return ((uint64_t)high << 32) | low;
 }
+/** @brief Allocate device-visible pages within SVGA's 32-bit page-number mask.
+ * @param pages Nonzero contiguous page count requested by the device owner.
+ * @return Zeroed owned physical base, or zero when no representable run exists.
+ * The final byte is constrained so no generated PPN can truncate.
+ */
+static uint64_t svga_alloc_ppn32(uint32_t pages)
+{
+    return mm_alloc_pages_below(pages, (1ULL << 44) - 1);
+}
+/** @brief Bind the native port, DMA and clock operations to an owned FIFO.
+ * @param port Device register I/O port. @param fifo Retained mapped FIFO base.
+ * @param bytes Complete FIFO mapping length in bytes.
+ */
 void svga_platform_bind(uint16_t port, volatile uint32_t *fifo, uint32_t bytes)
 {
     io_port = port;
-    const struct svga_ops ops = {port_read, port_write, mm_alloc_pages,
+    const struct svga_ops ops = {port_read, port_write, svga_alloc_ppn32,
                                  mm_free_pages, paging_kernel_direct_map, device_clock};
     svga_bind(&ops, fifo, bytes);
 }

@@ -17,6 +17,8 @@ struct vfs_pseudo_provider {
      * The adapter validates the retained instance before each operation. */
     int (*write)(const char *name,uint64_t offset,const void *buffer,uint32_t length,uint32_t *written);
     int (*truncate)(const char *name,uint64_t length);
+    /* Whether a successful write is fully committed without a later flush. */
+    bool (*immediate_write)(const char *name);
     int (*readdir)(const char *name,uint64_t *cursor,struct reliefos_dir_entry *entry);
     int (*readlink)(const char *name,char *buffer,uint32_t capacity);
     /* Optional identity trio: get transfers an owned pin on success, NULL for

@@ -280,6 +280,10 @@ static int drm_vmw_get_3d_cap(struct task *task,
     record[0] = DRM_VMW_CAP_HEADER_DWORDS + 2u * pair_count;
     record[1] = DRM_VMW_CAP_RECORD_TYPE;
     record[record[0]] = 0;
+#ifdef CONFIG_SWAP
+    if (drm_user_prepare(task,arg->buffer,bytes,true)==KERNEL_SYSCALL_SWAP_CONTENDED)
+        return KERNEL_SYSCALL_SWAP_CONTENDED;
+#endif
     if (user_copy_to_task(task, arg->buffer, record, bytes) < 0)
         return -LINUX_EFAULT;
     return 0;

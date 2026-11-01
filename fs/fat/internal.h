@@ -2,6 +2,7 @@
 #define RELIEFNT_FS_FAT_FAT32_C_INTERNAL_H
 
 #include "../../block/core/storage_internal.h"
+#include <reliefnt/page_cache.h>
 
 
 

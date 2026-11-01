@@ -9,17 +9,30 @@
 #include <reliefnt/syscall.h>
 #include <reliefnt/syscall_internal.h>
 #include <reliefnt/usercopy.h>
+#include <reliefnt/socket_usercopy.h>
+#include <reliefnt/swap.h>
 #include <reliefnt/wait.h>
 #include <reliefnt/futex.h>
+#ifdef CONFIG_SWAP
+#include <reliefnt/mm.h>
+#include <reliefnt/page_cache.h>
+#include <reliefnt/paging.h>
+#endif
 #include <reliefnt/time.h>
 #include <reliefnt/permissions.h>
 #include <reliefnt/pty.h>
 #include <reliefos/fs_abi.h>
 #include <reliefos/net_abi.h>
 #include <linux/socket.h>
+#include <linux/if_packet.h>
 #include <linux/errno.h>
 #include <linux/time.h>
 #include <linux/tty.h>
+#include <reliefnt/device_mapping.h>
+
+#ifdef CONFIG_SWAP
+extern void page_cache_note_write(uint64_t) __attribute__((weak));
+#endif
 
 #define ntohs(value) ((uint16_t)((((uint16_t)(value) & 0xffu) << 8) | ((uint16_t)(value) >> 8)))
 #define htons(value) ntohs(value)
@@ -32,11 +45,37 @@
 #define UNIX_SOCKET_FD_TRANSFER_MAX 253u
 #define UNIX_SOCKET_CMSG_CAP 65536u
 
+#ifdef CONFIG_SWAP
+/** @brief Retire this TCP socket's readiness wait before a prerequisite wait.
+ * @param task Current execution owner. @param file Pinned socket description.
+ * @param result Current result, returned unchanged. Other waits are untouched.
+ */
+static int64_t inet_user_wait(struct task *task,struct task_file *file,int64_t result)
+{
+    if(result==KERNEL_SYSCALL_SWAP_CONTENDED && file &&
+       (file->flags & TASK_FILE_FLAG_SOCKET_INET) &&
+       file->kind!=TASK_FILE_KIND_UDP && file->kind!=TASK_FILE_KIND_PACKET)
+        net_socket_cancel_wait((int32_t)file->aux,task);
+    return result;
+}
+
+/** @brief Check an original syscall byte span without touching its pages.
+ * @param address Original user pointer. @param length Original byte count.
+ * @return True when empty or wholly inside the user address aperture.
+ */
+static bool inet_user_span(uint64_t address,uint64_t length)
+{
+    return !length || (address>=RELIEFNT_USER_BASE && address<RELIEFNT_USER_TOP &&
+                       length<=RELIEFNT_USER_TOP-address);
+}
+#endif
+
 struct unix_rights {
     struct unix_rights *next;
     uint64_t position;
     uint64_t end;
     uint32_t count;
+    bool detached;
     struct task_file *files[UNIX_SOCKET_FD_TRANSFER_MAX];
     struct task_pty_fd ptys[UNIX_SOCKET_FD_TRANSFER_MAX];
 };
@@ -195,11 +234,121 @@ static void unix_rights_free(struct unix_rights *rights)
             task_pty_release_entry(&rights->ptys[i]);
             continue;
         }
-        --rights->files[i]->scm_references;
+        if(!rights->detached)--rights->files[i]->scm_references;
         task_file_put(rights->files[i]);
     }
     kernel_free(rights);
 }
+
+#ifdef CONFIG_SWAP
+/** @brief Move rights between a task root and the socket's queued edge set.
+ * @param rights Owned list, nullable. @param detached True for task ownership.
+ * Each entry is adjusted exactly once, including repeated references to the
+ * same OFD. The execution writer excludes concurrent socket graph collection.
+ */
+static void unix_rights_detach(struct unix_rights *rights,bool detached)
+{
+    if(!rights || rights->detached==detached)return;
+    for(uint32_t i=0;i<rights->count;++i)if(rights->files[i]) {
+        if(detached)--rights->files[i]->scm_references;
+        else ++rights->files[i]->scm_references;
+    }
+    rights->detached=detached;
+}
+
+/* Small output regions are pinned independently; copied packet bytes are
+ * streamed to user pages and never pin the entire payload. */
+#define SOCKET_OUTPUT_REGIONS 5u
+#define SOCKET_OUTPUT_PINS 10u
+struct socket_output_region {
+    uint64_t address;
+    uint32_t length,pinned;
+};
+struct socket_output_pin {
+    uint64_t physical;
+    uint16_t offset,length;
+    uint8_t region;
+    bool cache;
+    bool device;
+    struct device_user_page device_page;
+    struct paging_writable_alias alias;
+};
+
+/* The admitted OFD and copied operands outlive this private stage. */
+struct socket_send_stage {
+    struct task_file *file;
+    struct unix_rights *rights;
+    struct ucred credentials;
+    uint64_t number,args[6];
+    bool explicit_credentials;
+    bool receiving,accepted,progress_done,outputs_planned,passcred;
+    uint8_t *data;
+    uint32_t data_length,copied,pin_count;
+    uint64_t prior_done;
+    uint64_t receive_header,name_address,name_length_pointer;
+    uint32_t name_capacity;
+    int receive_result;
+    struct unix_receive_result metadata;
+    struct socket_output_region regions[SOCKET_OUTPUT_REGIONS];
+    struct socket_output_pin pins[SOCKET_OUTPUT_PINS];
+};
+
+/** @brief Free a detached private stage and all of its retained resources.
+ * @param task Execution-owned owner. @param stage Detached stage, required.
+ */
+static void socket_stage_dispose(struct task *task,struct socket_send_stage *stage)
+{
+    for(uint32_t i=0;i<stage->pin_count;++i) {
+        if(stage->pins[i].device)device_user_page_put(&stage->pins[i].device_page);
+        else {
+            paging_writable_alias_remove(&stage->pins[i].alias);
+            if(stage->pins[i].cache)page_cache_release(stage->pins[i].physical);
+            else mm_free_page(stage->pins[i].physical);
+        }
+    }
+    kernel_free(stage->data);
+    unix_rights_free(stage->rights);
+    if(stage->receiving)task_socket_cancel_receive(task);
+    kernel_free(stage);
+}
+
+/** @brief Detach and retire held SCM rights on final return or cancellation.
+ * @param task Live execution-owned task. The common syscall cleanup still
+ * owns the original OFD, and no queue/provider lock spans these releases.
+ */
+void task_socket_stage_cancel(struct task *task)
+{
+    struct socket_send_stage *stage=sched_socket_stage_take(task);
+    if(!stage)return;
+    socket_stage_dispose(task,stage);
+}
+
+/** @brief Identify an already accepted receive awaiting bounded output copy.
+ * @param task Execution-owned caller. @return True until its saved packet is
+ * delivered or cancelled. Caught-signal delivery lets the rewound syscall
+ * finish this accepted packet first; fatal/default actions retain priority.
+ */
+bool task_socket_stage_receive_accepted(const struct task *task)
+{
+    struct socket_send_stage *stage=task ? sched_socket_stage(task) : NULL;
+    return stage && stage->receiving && stage->accepted;
+}
+
+/** @brief Reject reuse of an atomic-send stage by a different syscall frame.
+ * @param task Current task. @param frame Incoming native register snapshot.
+ * A mismatch runs the ordinary cancellation path before new fd admission;
+ * sigreturn preserves the interrupted operation's existing cleanup policy.
+ */
+void task_socket_stage_enter(struct task *task,const struct trap_frame *frame)
+{
+    if(!task || !frame || frame->rax==LINUX_SYS_RT_SIGRETURN)return;
+    struct socket_send_stage *stage=sched_socket_stage(task);
+    if(!stage)return;
+    const uint64_t args[]={frame->rdi,frame->rsi,frame->rdx,frame->r10,frame->r8,frame->r9};
+    if(stage->number!=frame->rax || __builtin_memcmp(stage->args,args,sizeof(args)))
+        task_release_syscall_file(task);
+}
+#endif
 
 static struct unix_socket *unix_from_file(const struct task_file *file)
 {
@@ -259,11 +408,12 @@ static void unix_autobind(struct unix_socket *socket)
 
 static int unix_name_out(const char *path, uint32_t path_len, uint64_t address, uint64_t length)
 {
-    if (!user_range_writable(length, sizeof(socklen_t))) return -RELIEFOS_EFAULT;
-    socklen_t capacity = *(socklen_t *)(uintptr_t)length;
+    socklen_t capacity;int prep=socket_user_length(sched_current_task(),length,&capacity);
+    if(prep)return prep;
     if ((int32_t)capacity < 0) return -RELIEFOS_EINVAL;
     uint32_t size = 2 + path_len;
     uint32_t copied = capacity < size ? capacity : size;
+    prep=socket_user_prepare(sched_current_task(),address,copied,true);if(prep)return prep;
     if (!user_range_writable(address, copied)) return -RELIEFOS_EFAULT;
     unsigned char bytes[111] = {AF_UNIX, 0};
     for (uint32_t i = 0; i < path_len; ++i) bytes[2 + i] = path[i];
@@ -876,6 +1026,8 @@ int task_socket_ioctl(struct task_file *file, uint64_t request, uint64_t address
     struct unix_socket *socket = unix_from_file(file);
     if (!socket) return -RELIEFOS_EBADF;
     if (request == FIONBIO) {
+        int prep=socket_user_prepare(sched_current_task(),address,sizeof(int32_t),false);
+        if(prep)return prep;
         if (!user_range_ok(address, sizeof(int32_t))) return -RELIEFOS_EFAULT;
         if (*(const int32_t *)(uintptr_t)address) file->flags |= RELIEFOS_O_NONBLOCK;
         else file->flags &= ~RELIEFOS_O_NONBLOCK;
@@ -883,6 +1035,8 @@ int task_socket_ioctl(struct task_file *file, uint64_t request, uint64_t address
     }
     if (request != FIONREAD) return -RELIEFOS_ENOTTY;
     if (socket->state == UNIX_SOCKET_LISTEN) return -RELIEFOS_EINVAL;
+    int prep=socket_user_prepare(sched_current_task(),address,sizeof(int32_t),true);
+    if(prep)return prep;
     if (!user_range_writable(address, sizeof(int32_t))) return -RELIEFOS_EFAULT;
     uint32_t bytes = socket->type == SOCK_STREAM
         ? (socket->rx_head + UNIX_SOCKET_RX_CAP - socket->rx_tail) % UNIX_SOCKET_RX_CAP
@@ -935,6 +1089,37 @@ int task_inet_recv(struct task_file *file, void *buffer, uint32_t length, uint32
         ((file->flags & RELIEFOS_O_NONBLOCK) || (flags & MSG_DONTWAIT))) return -RELIEFOS_EAGAIN;
     return -RELIEFOS_EIO;
 }
+
+#ifdef CONFIG_SWAP
+/** @brief Observe one actual INET receive without consuming its queue data.
+ * @param file Original pinned socket OFD. @param capacity Requested byte cap.
+ * @param flags Native receive flags. @param copied Receives actual copy bound.
+ * @return Nonnegative provider result, ordinary errno, or blocked sentinel.
+ * Datagram PEEK|TRUNC distinguishes an empty queue from an empty packet. TCP
+ * runs its normal readiness/error/EOF path before inspecting queued bytes.
+ * No queue pointer survives this call or any subsequent prerequisite wait.
+ */
+static int inet_receive_probe(struct task_file *file,uint32_t capacity,
+                              uint32_t flags,uint32_t *copied)
+{
+    unsigned char byte=0;
+    int result;
+    if(file->kind==TASK_FILE_KIND_PACKET)
+        result=task_packet_recv_staged(file,&byte,0,flags|MSG_PEEK|MSG_TRUNC,NULL,NULL);
+    else if(file->kind==TASK_FILE_KIND_UDP)
+        result=task_udp_recv_staged(file,&byte,0,flags|MSG_PEEK|MSG_TRUNC,NULL);
+    else {
+        result=task_inet_recv(file,&byte,capacity ? 1u : 0u,flags|MSG_PEEK);
+        if(result>0) {
+            result=net_socket_available((int32_t)file->aux);
+            if(result<0)return result;
+        }
+    }
+    if(result<0)return result;
+    *copied=(uint32_t)result<capacity ? (uint32_t)result : capacity;
+    return result;
+}
+#endif
 
 /**
  * @brief Read available Internet socket bytes with ordinary read semantics.
@@ -1024,6 +1209,8 @@ static int inet_socket_option(bool setting, int level, int option,
             return -LINUX_ENOPROTOOPT;
         if ((int32_t)length < (int32_t)sizeof(struct linux_timeval))
             return -LINUX_EINVAL;
+        int prep=socket_user_prepare(sched_current_task(),address,sizeof(struct linux_timeval),false);
+        if(prep)return prep;
         if (!user_range_ok(address, sizeof(struct linux_timeval)))
             return -LINUX_EFAULT;
         struct linux_timeval timeout = *(const struct linux_timeval *)(uintptr_t)address;
@@ -1047,14 +1234,19 @@ static int inet_socket_option(bool setting, int level, int option,
             option == SO_SNDTIMEO || option == SO_SNDTIMEO_NEW, ticks);
     }
 
-    if (!user_range_writable(length, sizeof(socklen_t))) return -LINUX_EFAULT;
-    socklen_t capacity = *(socklen_t *)(uintptr_t)length;
+    socklen_t capacity;int prep=socket_user_length(sched_current_task(),length,&capacity);
+    if(prep)return prep;
     if ((int32_t)capacity < 0) return -LINUX_EINVAL;
     if (level != SOL_SOCKET) return -LINUX_ENOPROTOOPT;
     int32_t value = 0;
     struct linux_timeval timeout = {0};
     const void *data = &value;
     uint32_t size = sizeof(value);
+    if(option==SO_ERROR) {
+        uint32_t copied=capacity<sizeof(value) ? capacity : sizeof(value);
+        prep=socket_user_prepare(sched_current_task(),address,copied,true);
+        if(prep==KERNEL_SYSCALL_SWAP_CONTENDED)return prep;
+    }
     switch (option) {
     case SO_ERROR:
         value = net_socket_error(handle, true);
@@ -1087,6 +1279,7 @@ static int inet_socket_option(bool setting, int level, int option,
         return -LINUX_ENOPROTOOPT;
     }
     if (size > capacity) size = capacity;
+    prep=socket_user_prepare(sched_current_task(),address,size,true);if(prep)return prep;
     if (size && !user_range_writable(address, size)) return -LINUX_EFAULT;
     __builtin_memcpy((void *)(uintptr_t)address, data, size);
     *(socklen_t *)(uintptr_t)length = size;
@@ -1115,7 +1308,7 @@ static int64_t inet_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
     if (number == __NR_socket && (a1 & 0xfu) == SOCK_DGRAM)
         return syscall_udp(number, a0, a1, a2, a3, a4, 0);
     if (number != __NR_socket) {
-        file = task_file_for_fd(task, (int32_t)a0);
+        file = task_file_for_io(task, (int32_t)a0);
         if (file && file->kind == TASK_FILE_KIND_PACKET)
             return syscall_packet(number, a0, a1, a2, a3, a4, 0);
         if (file && file->kind == TASK_FILE_KIND_UDP)
@@ -1152,11 +1345,12 @@ static int64_t inet_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
         }
         return fd;
     }
-    file = task_file_for_fd(task, (int)a0);
+    file = task_file_for_io(task, (int)a0);
     if (!file || !(file->flags & TASK_FILE_FLAG_SOCKET_INET)) return -RELIEFOS_EBADF;
     if (number == __NR_connect) {
         struct sockaddr_in address;
         if ((int32_t)a2 < (int32_t)sizeof(address)) return -LINUX_EINVAL;
+        int prep=socket_user_prepare(task,a1,sizeof(address),false);if(prep)return prep;
         if (!user_range_ok(a1, sizeof(address))) return -LINUX_EFAULT;
         __builtin_memcpy(&address, (void *)(uintptr_t)a1, sizeof(address));
         if (address.sin_family != AF_INET) return -LINUX_EAFNOSUPPORT;
@@ -1166,10 +1360,10 @@ static int64_t inet_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
     if (number == __NR_getsockname || number == __NR_getpeername) {
         uint32_t local_ip, remote_ip;
         uint16_t local_port, remote_port;
-        if (!user_range_writable(a2, 4)) return -RELIEFOS_EFAULT;
-        uint32_t length = *(uint32_t *)(uintptr_t)a2;
+        uint32_t length;int prep=socket_user_length(task,a2,&length);if(prep)return prep;
         if ((int32_t)length < 0) return -LINUX_EINVAL;
         if (length > sizeof(struct sockaddr_in)) length = sizeof(struct sockaddr_in);
+        prep=socket_user_prepare(task,a1,length,true);if(prep)return prep;
         if (length && !user_range_writable(a1, length)) return -LINUX_EFAULT;
         if (net_socket_address((int32_t)file->aux, 0,
                                &local_ip, &local_port, &remote_ip, &remote_port) < 0) return -RELIEFOS_EBADF;
@@ -1210,15 +1404,22 @@ static int unix_message_vectors(struct msghdr *message, uint64_t *total)
     return 0;
 }
 
-static int unix_message_rights(struct task *task, const struct msghdr *message,
-                               struct unix_rights **out, struct ucred *credentials,
-                               bool *explicit_credentials)
+/** @brief Parse one admitted UNIX ancillary buffer and retain each fd entry.
+ * @param task Sender. @param message Original message metadata. @param out
+ * Receives owned rights. @param credentials Receives supplied credentials.
+ * @param explicit_credentials Reports a credentials record. @param kernel_control
+ * Selects an already owned kernel snapshot. @return Zero or a negative errno.
+ */
+static int unix_message_rights_common(struct task *task, const struct msghdr *message,
+                                      struct unix_rights **out, struct ucred *credentials,
+                                      bool *explicit_credentials,bool kernel_control)
 {
     *out = NULL;
     *explicit_credentials = false;
     if (!message->msg_controllen) return 0;
     if (message->msg_controllen > UNIX_SOCKET_CMSG_CAP) return -LINUX_ENOBUFS;
-    if (!user_range_ok((uintptr_t)message->msg_control, message->msg_controllen)) return -RELIEFOS_EFAULT;
+    if (!kernel_control && !user_range_ok((uintptr_t)message->msg_control, message->msg_controllen))
+        return -RELIEFOS_EFAULT;
     struct unix_rights *rights = kernel_malloc(sizeof(*rights));
     if (!rights) return -RELIEFOS_ENOMEM;
     *rights = (struct unix_rights){0};
@@ -1286,6 +1487,29 @@ static int unix_message_rights(struct task *task, const struct msghdr *message,
     return result;
 }
 
+static int unix_message_rights(struct task *task,const struct msghdr *message,
+                               struct unix_rights **out,struct ucred *credentials,
+                               bool *explicit_credentials)
+{
+    return unix_message_rights_common(task,message,out,credentials,explicit_credentials,false);
+}
+
+#ifdef CONFIG_SWAP
+/** @brief Retire send ownership unless an actual retry still owns it.
+ * @param task Current owner. @param stage Private stage or NULL.
+ * @param rights Locally owned rights when no stage exists. @param result Status.
+ * No user pointer is accessed and no queue lock is held.
+ */
+static void unix_send_finish(struct task *task,struct socket_send_stage *stage,
+                             struct unix_rights *rights,int result)
+{
+    if(!stage)unix_rights_free(rights);
+    else if(result!=KERNEL_SYSCALL_BLOCKED && result!=-LINUX_EAGAIN &&
+            result!=KERNEL_SYSCALL_SWAP_CONTENDED)
+        task_socket_stage_cancel(task);
+}
+#endif
+
 static int unix_sendmsg(struct task *task, struct task_file *file,
                        struct msghdr message, uint32_t flags,
                        bool batch, uint64_t total, struct socket_message_result *output)
@@ -1298,31 +1522,103 @@ static int unix_sendmsg(struct task *task, struct task_file *file,
     output->requested = total;
     if (socket->type != SOCK_STREAM && total > 65536) return -LINUX_EMSGSIZE;
     struct unix_rights *rights = NULL;
-    struct ucred credentials;
-    bool explicit_credentials;
+    struct ucred credentials={0};
+    bool explicit_credentials=false;
+#ifdef CONFIG_SWAP
+    struct socket_send_stage *stage=sched_socket_stage(task);
+    struct task_user_text control={0};
+    struct msghdr checked=message;
+    if (message.msg_controllen) {
+        if (message.msg_controllen>UNIX_SOCKET_CMSG_CAP)return -LINUX_ENOBUFS;
+        ret=task_lookup_user_bytes(task,(uintptr_t)message.msg_control,
+                                   (uint32_t)message.msg_controllen,&control);
+        if(ret)return ret;
+        checked.msg_control=(void *)control.text;
+    }
+    if(stage) {
+        if(stage->file!=file || !message.msg_controllen) {
+            kernel_free(control.allocation);return -LINUX_EINVAL;
+        }
+        rights=stage->rights;credentials=stage->credentials;
+        explicit_credentials=stage->explicit_credentials;
+        ret=0;
+    } else if(message.msg_controllen) {
+        ret=unix_message_rights_common(task,&checked,&rights,&credentials,&explicit_credentials,true);
+        if(!ret && task->lookup_scope.armed && task->syscall_file==file) {
+            stage=kernel_malloc(sizeof(*stage));
+            if(!stage)ret=-RELIEFOS_ENOMEM;
+            else {
+                *stage=(struct socket_send_stage){.file=file,.rights=rights,.credentials=credentials,
+                    .number=task->lookup_scope.number,.explicit_credentials=explicit_credentials};
+                __builtin_memcpy(stage->args,task->lookup_scope.args,sizeof(stage->args));
+                if(!sched_socket_stage_set(task,stage)) {
+                    kernel_free(stage);stage=NULL;ret=-RELIEFOS_EINVAL;
+                } else unix_rights_detach(rights,true);
+            }
+        }
+    } else ret=unix_message_rights(task,&message,&rights,&credentials,&explicit_credentials);
+    kernel_free(control.allocation);
+    if(ret){unix_rights_free(rights);return ret;}
+#else
     ret = unix_message_rights(task, &message, &rights, &credentials, &explicit_credentials);
     if (ret) return ret;
+#endif
     uint32_t length = socket->type == SOCK_STREAM && total > UNIX_SOCKET_RX_CAP
         ? UNIX_SOCKET_RX_CAP : (uint32_t)total;
     uint8_t *data = length ? kernel_malloc(length) : NULL;
-    if (length && !data) { unix_rights_free(rights); return -RELIEFOS_ENOMEM; }
+    if (length && !data) {
+#ifdef CONFIG_SWAP
+        unix_send_finish(task,stage,rights,-RELIEFOS_ENOMEM);
+#else
+        unix_rights_free(rights);
+#endif
+        return -RELIEFOS_ENOMEM;
+    }
     uint32_t copied = 0;
     for (uint64_t i = 0; i < message.msg_iovlen && copied < length; ++i) {
         uint64_t n = message.msg_iov[i].iov_len;
         if (n > length - copied) n = length - copied;
+#ifdef CONFIG_SWAP
+        uint64_t offset=0;
+        while(offset<n) {
+            uint32_t chunk=n-offset>32768u ? 32768u : (uint32_t)(n-offset);
+            struct task_user_text part={0};
+            ret=task_lookup_user_bytes(task,(uintptr_t)message.msg_iov[i].iov_base+offset,chunk,&part);
+            if(ret) {
+                kernel_free(data);unix_send_finish(task,stage,rights,ret);return ret;
+            }
+            __builtin_memcpy(data+copied,part.text,chunk);
+            kernel_free(part.allocation);copied+=chunk;offset+=chunk;
+        }
+#else
         if (n && !user_range_ok((uintptr_t)message.msg_iov[i].iov_base, n)) {
             kernel_free(data);
             unix_rights_free(rights);
             return -LINUX_EFAULT;
         }
         for (uint64_t j = 0; j < n; ++j) data[copied++] = ((uint8_t *)message.msg_iov[i].iov_base)[j];
+#endif
     }
     struct unix_socket *peer = unix_from_handle(socket->peer_handle);
     if (socket->type != SOCK_STREAM) {
         ret = unix_packet_peer(socket, message.msg_name, message.msg_namelen, &peer);
-        if (ret < 0) { kernel_free(data); unix_rights_free(rights); return ret; }
+        if (ret < 0) {
+            kernel_free(data);
+#ifdef CONFIG_SWAP
+            unix_send_finish(task,stage,rights,ret);
+#else
+            unix_rights_free(rights);
+#endif
+            return ret;
+        }
     } else if (message.msg_name) {
-        kernel_free(data); unix_rights_free(rights); return -RELIEFOS_EISCONN;
+        kernel_free(data);
+#ifdef CONFIG_SWAP
+        unix_send_finish(task,stage,rights,-RELIEFOS_EISCONN);
+#else
+        unix_rights_free(rights);
+#endif
+        return -RELIEFOS_EISCONN;
     }
     uint64_t position = peer ? peer->rx_written : 0;
     struct task_file local = *file;
@@ -1332,15 +1628,43 @@ static int unix_sendmsg(struct task *task, struct task_file *file,
         : unix_send_packet(&local, peer, data, length, flags, explicit_credentials ? &credentials : NULL);
     if (data) kernel_free(data);
     if ((ret > 0 || (ret == 0 && socket->type != SOCK_STREAM)) && rights && peer) {
+#ifdef CONFIG_SWAP
+        unix_rights_detach(rights,false);
+        if(stage)stage->rights=NULL;
+#endif
         rights->position = position;
         rights->end = socket->type == SOCK_STREAM ? position + (uint32_t)ret : position + 1;
         struct unix_rights **tail = &peer->rights;
         while (*tail) tail = &(*tail)->next;
         *tail = rights;
-    } else unix_rights_free(rights);
+        rights=NULL;
+    }
+#ifdef CONFIG_SWAP
+    unix_send_finish(task,stage,rights,ret);
+#else
+    unix_rights_free(rights);
+#endif
     if (ret == -RELIEFOS_EPIPE && !(flags & MSG_NOSIGNAL)) sched_signal_user_task(task->pid, 13);
     return ret;
 }
+
+#ifdef CONFIG_SWAP
+/** @brief Send a scalar UNIX socket write using bounded retry-stable input.
+ * @param task Calling task under execution ownership. @param file Admitted
+ * socket description. @param address User buffer. @param length Capped Linux
+ * write count. @return Accepted bytes, errno, or an internal retry marker.
+ * A datagram is imported in bounded pieces and published once; a stream uses
+ * its existing bounded send limit. Matching frame retries retain snapshots in
+ * the task lookup scope; common cancellation retires them and the held OFD.
+ */
+int task_socket_send_user(struct task *task,struct task_file *file,uint64_t address,uint32_t length)
+{
+    struct iovec vector={.iov_base=(void *)(uintptr_t)address,.iov_len=length};
+    struct msghdr message={.msg_iov=&vector,.msg_iovlen=1};
+    struct socket_message_result output={0};
+    return unix_sendmsg(task,file,message,0,false,length,&output);
+}
+#endif
 
 static uint64_t unix_put_credentials(struct msghdr *message, uint64_t capacity,
                                       const struct ucred *credentials)
@@ -1359,6 +1683,398 @@ static uint64_t unix_put_credentials(struct msghdr *message, uint64_t capacity,
     return used < capacity ? used : capacity;
 }
 
+#ifdef CONFIG_SWAP
+/** @brief Acquire independent ownership of one observed PEEK ancillary list.
+ * @param source Borrowed list while execution owns the queue. @param out
+ * Required independent list output. Each repeated OFD/PTY entry gets its own
+ * reference. @return Zero or negative allocation/invalid-reference errno.
+ */
+static int unix_peek_rights(const struct unix_rights *source,struct unix_rights **out)
+{
+    *out=NULL;if(!source)return 0;
+    struct unix_rights *copy=kernel_malloc(sizeof(*copy));
+    if(!copy)return -RELIEFOS_ENOMEM;
+    *copy=(struct unix_rights){.position=source->position,.end=source->end,.detached=true};
+    for(uint32_t i=0;i<source->count;++i) {
+        if(source->files[i]) {
+            struct task_file *file=task_file_get(source->files[i]);
+            if(!file){unix_rights_free(copy);return -RELIEFOS_ENOMEM;}
+            copy->files[copy->count++]=file;
+        } else {
+            struct task_pty_fd pty=source->ptys[i];
+            if(!pty.used || !pty.description || pty.description->references==UINT32_MAX) {
+                unix_rights_free(copy);return -RELIEFOS_EBADF;
+            }
+            ++pty.description->references;copy->ptys[copy->count++]=pty;
+        }
+    }
+    *out=copy;return 0;
+}
+
+/** @brief Pin one bounded metadata output a page at a time.
+ * @param task Execution-owned task. @param stage Owned receive stage.
+ * @param index Region index. @return Zero, EFAULT, or private contention.
+ * Numeric user addresses are revalidated before each pin; across a retry the
+ * stage retains physical/cache ownership, never a borrowed user mapping.
+ */
+static int socket_pin_output(struct task *task,struct socket_send_stage *stage,uint32_t index)
+{
+    struct socket_output_region *region=&stage->regions[index];
+    while(region->pinned<region->length) {
+        uint64_t address=region->address+region->pinned;
+        if(address<region->address)return -LINUX_EFAULT;
+        uint32_t offset=(uint32_t)(address&4095u),length=4096u-offset;
+        if(length>region->length-region->pinned)length=region->length-region->pinned;
+        int ret=swap_prepare_user_range(task,address,length,true);
+        if(ret==SWAP_STORAGE_CONTENDED)return KERNEL_SYSCALL_SWAP_CONTENDED;
+        if(ret<0 || !user_range_writable(address,length))return -LINUX_EFAULT;
+        uint64_t physical=address_space_user_page_phys(sched_task_as(task),address);
+        uint64_t flags=address_space_user_page_flags(sched_task_as(task),address);
+        if(!physical || stage->pin_count==SOCKET_OUTPUT_PINS)return -LINUX_EFAULT;
+        if(flags&RELIEFNT_PAGE_DEVICE) {
+            struct device_user_page device_page={0};
+            int error=device_user_page_get(task,address,physical,flags,&device_page);
+            if(error)return error;
+            struct socket_output_pin *pin=&stage->pins[stage->pin_count++];
+            *pin=(struct socket_output_pin){.physical=physical,.offset=offset,.length=length,
+                .region=index,.device=true,.device_page=device_page};
+            region->pinned+=length;continue;
+        }
+        if(!mm_phys_to_virt(physical))return -LINUX_EFAULT;
+        bool cache=page_cache_retain(physical)==0;
+        if(!cache) {
+            if(!mm_page_refcount(physical))return -LINUX_EFAULT;
+            mm_retain_page(physical);
+        } else page_cache_mark_shared_writable(physical);
+        struct socket_output_pin *pin=&stage->pins[stage->pin_count++];
+        *pin=(struct socket_output_pin){.physical=physical,.offset=offset,.length=length,
+                                       .region=index,.cache=cache};
+        paging_writable_alias_add(&pin->alias,physical);
+        region->pinned+=length;
+    }
+    return 0;
+}
+
+/** @brief Copy into a fully pinned output region without dereferencing its VA.
+ * @param stage Owning stage. @param index Region. @param offset Byte offset.
+ * @param source Kernel bytes. @param length Count within the retained region.
+ */
+static void socket_output_copy(const struct socket_send_stage *stage,uint32_t index,
+                               uint32_t offset,const void *source,uint32_t length)
+{
+    uint32_t position=0,end=offset+length;
+    for(uint32_t i=0;i<stage->pin_count && position<end;++i) {
+        const struct socket_output_pin *pin=&stage->pins[i];
+        if(pin->region!=index)continue;
+        uint32_t limit=position+pin->length;
+        if(limit>offset && position<end) {
+            uint32_t first=position>offset?position:offset,last=limit<end?limit:end;
+            uint8_t *alias=pin->device ? pin->device_page.alias : mm_phys_to_virt(pin->physical);
+            __builtin_memcpy(alias+pin->offset+first-position,
+                             (const uint8_t *)source+first-offset,last-first);
+            if (!pin->device && page_cache_note_write) page_cache_note_write(pin->physical);
+        }
+        position=limit;
+    }
+}
+
+/** @brief Retire one receive stage, optionally retaining WAITALL progress.
+ * @param task Owner. @param stage Private stage. @param scoped True if linked.
+ * @param keep_receive Existing WAITALL state remains owned by the task.
+ */
+static void socket_receive_finish(struct task *task,struct socket_send_stage *stage,
+                                  bool scoped,bool keep_receive)
+{
+    if(keep_receive)stage->receiving=false;
+    if(scoped)task_socket_stage_cancel(task);
+    else socket_stage_dispose(task,stage);
+}
+
+/** @brief Receive one UNIX message into bounded resumable owned staging.
+ * @param task Live caller. @param file Admitted socket OFD. @param user_msg
+ * Original numeric msghdr address, or zero for scalar/vector operations.
+ * @param name_length_pointer Optional recvfrom socklen output. @param message
+ * Imported header and vector snapshot. @param flags Receive flags. @param total Checked vector capacity.
+ * @param output Message result. @return Count, errno or private wait marker.
+ * Accepted packet bytes and ancillary ownership survive contention; each
+ * output data slice is prepared and copied once. Metadata/descriptor outputs
+ * are pinned before descriptor installation so retries cannot duplicate it.
+ */
+static int unix_recvmsg_staged(struct task *task,struct task_file *file,uint64_t user_msg,
+                               uint64_t name_length_pointer,struct msghdr message,uint32_t flags,uint64_t total,
+                               struct socket_message_result *output)
+{
+    if(flags & MSG_OOB)return -LINUX_EOPNOTSUPP;
+    struct unix_socket *socket=unix_from_file(file);
+    if(!socket)return -LINUX_ENOTSOCK;
+    struct socket_send_stage *stage=sched_socket_stage(task);
+    bool scoped=stage!=NULL;
+    if(stage && (!stage->receiving || stage->file!=file))return -LINUX_EINVAL;
+    if(!stage) {
+        if(task->socket_receive_done>total){task_socket_cancel_receive(task);return -LINUX_EINVAL;}
+        uint32_t maximum=socket->type==SOCK_STREAM?UNIX_SOCKET_RX_CAP:65536u;
+        uint64_t remaining=total-task->socket_receive_done;
+        uint32_t capacity=remaining>maximum?maximum:(uint32_t)remaining;
+        stage=kernel_malloc(sizeof(*stage));if(!stage)return -RELIEFOS_ENOMEM;
+        *stage=(struct socket_send_stage){.file=file,.receiving=true,.prior_done=task->socket_receive_done,
+            .number=task->lookup_scope.number,.receive_header=user_msg,.name_address=(uintptr_t)message.msg_name,
+            .name_length_pointer=name_length_pointer,.name_capacity=message.msg_namelen};
+        __builtin_memcpy(stage->args,task->lookup_scope.args,sizeof(stage->args));
+        if(capacity) {
+            stage->data=kernel_malloc(capacity);
+            if(!stage->data){kernel_free(stage);return -RELIEFOS_ENOMEM;}
+        }
+        if(task->lookup_scope.armed && task->syscall_file==file) {
+            if(!sched_socket_stage_set(task,stage)){socket_stage_dispose(task,stage);return -LINUX_EINVAL;}
+            scoped=true;
+        }
+    }
+    if(!stage->accepted) {
+        uint32_t maximum=socket->type==SOCK_STREAM?UNIX_SOCKET_RX_CAP:65536u;
+        uint64_t remaining=total-stage->prior_done;
+        uint32_t capacity=remaining>maximum?maximum:(uint32_t)remaining;
+        struct unix_rights *rights=NULL;
+        int ret=unix_read_data(file,stage->data?stage->data:(uint8_t *)"",capacity,flags,&rights,&stage->metadata);
+        if(stage->prior_done)stage->metadata.credentials=(struct ucred){task->socket_receive_pid,
+                                                      task->socket_receive_uid,task->socket_receive_gid};
+        if(ret<0) {
+            int progress=(int)unix_receive_progress(task,file,total,ret,flags,&stage->metadata);
+            if(progress==KERNEL_SYSCALL_BLOCKED) {
+                if(!scoped)socket_receive_finish(task,stage,false,true);
+                return progress;
+            }
+            if(progress<0){socket_receive_finish(task,stage,scoped,false);return progress;}
+            stage->receive_result=progress;stage->data_length=0;stage->progress_done=true;
+        } else {
+            if(flags & MSG_PEEK) {
+                int clone=unix_peek_rights(rights,&stage->rights);
+                if(clone){socket_receive_finish(task,stage,scoped,false);return clone;}
+            } else {stage->rights=rights;if(rights)rights->next=NULL;unix_rights_detach(rights,true);}
+            stage->receive_result=ret;
+            stage->data_length=(uint32_t)ret<capacity?(uint32_t)ret:capacity;
+        }
+        stage->passcred=socket->passcred;stage->accepted=true;
+    }
+    uint64_t skip=stage->prior_done+stage->copied;
+    for(uint64_t i=0;i<message.msg_iovlen && stage->copied<stage->data_length;++i) {
+        uint64_t length=message.msg_iov[i].iov_len;
+        if(skip>=length){skip-=length;continue;}
+        uint64_t offset=skip;skip=0;length-=offset;
+        if(length>stage->data_length-stage->copied)length=stage->data_length-stage->copied;
+        while(length) {
+            uint32_t chunk=length>32768u?32768u:(uint32_t)length;
+            uint64_t address=(uintptr_t)message.msg_iov[i].iov_base+offset;
+            if(address<(uintptr_t)message.msg_iov[i].iov_base) {
+                socket_receive_finish(task,stage,scoped,false);return -LINUX_EFAULT;
+            }
+            int ret=swap_prepare_user_range(task,address,chunk,true);
+            if(ret==SWAP_STORAGE_CONTENDED) {
+                if(!scoped)socket_receive_finish(task,stage,false,false);
+                return KERNEL_SYSCALL_SWAP_CONTENDED;
+            }
+            if(ret<0 || !user_range_writable(address,chunk)) {
+                int progress=(int)(stage->prior_done+stage->copied);
+                socket_receive_finish(task,stage,scoped,false);return progress?progress:-LINUX_EFAULT;
+            }
+            __builtin_memcpy((void *)(uintptr_t)address,stage->data+stage->copied,chunk);
+            stage->copied+=chunk;offset+=chunk;length-=chunk;
+        }
+    }
+    int ret=stage->receive_result;
+    if(!stage->progress_done) {
+        ret=(int)unix_receive_progress(task,file,total,ret,flags,&stage->metadata);
+        if(ret==KERNEL_SYSCALL_BLOCKED) {
+            task->socket_receive_message=user_msg;
+            task->socket_receive_control_capacity=message.msg_controllen;
+            task->socket_receive_name_capacity=message.msg_namelen;
+            task->socket_receive_name=(uintptr_t)message.msg_name;
+            if(!stage->prior_done && stage->metadata.path_len) {
+                task->socket_receive_path_length=stage->metadata.path_len+2;
+                task->socket_receive_path[0]=AF_UNIX;task->socket_receive_path[1]=0;
+                __builtin_memcpy(task->socket_receive_path+2,stage->metadata.path,stage->metadata.path_len);
+            }
+            task->socket_receive_flags=stage->metadata.flags | (flags & MSG_CMSG_CLOEXEC);
+            if(scoped) {
+                stage->accepted=false;stage->progress_done=false;stage->prior_done=task->socket_receive_done;
+                stage->data_length=stage->copied=0;
+            } else socket_receive_finish(task,stage,false,true);
+            return ret;
+        }
+        stage->receive_result=ret;stage->progress_done=true;
+    }
+    uint64_t capacity=message.msg_controllen;
+    uint32_t name_length=stage->metadata.path_len?stage->metadata.path_len+2:0;
+    uint32_t name_bytes=message.msg_name?(message.msg_namelen<name_length?message.msg_namelen:name_length):0;
+    uint32_t credential_bytes=0,credential_used=0;
+    if(stage->passcred && capacity>=CMSG_LEN(0)) {
+        credential_bytes=(uint32_t)(capacity<CMSG_LEN(sizeof(struct ucred))?capacity:CMSG_LEN(sizeof(struct ucred)));
+        credential_used=(uint32_t)(capacity<CMSG_SPACE(sizeof(struct ucred))?capacity:CMSG_SPACE(sizeof(struct ucred)));
+    }
+    uint64_t remaining_control=capacity-credential_used;
+    uint64_t rights_limit=remaining_control>=CMSG_LEN(0)?(remaining_control-CMSG_LEN(0))/sizeof(int):0;
+    uint32_t possible=stage->rights && rights_limit<stage->rights->count?(uint32_t)rights_limit:
+                      stage->rights?stage->rights->count:0;
+    uint32_t control_bytes=credential_bytes;
+    if(possible && credential_used+CMSG_LEN(possible*sizeof(int))>control_bytes)
+        control_bytes=credential_used+CMSG_LEN(possible*sizeof(int));
+    if(!stage->outputs_planned) {
+        if(user_msg && user_msg>UINT64_MAX-sizeof(struct msghdr)) {
+            socket_receive_finish(task,stage,scoped,false);return -LINUX_EFAULT;
+        }
+        stage->regions[0]=(struct socket_output_region){(uintptr_t)message.msg_name,name_bytes,0};
+        stage->regions[1]=(struct socket_output_region){(uintptr_t)message.msg_control,control_bytes,0};
+        stage->regions[2]=(struct socket_output_region){user_msg?user_msg+__builtin_offsetof(struct msghdr,msg_namelen):name_length_pointer,message.msg_name?sizeof(message.msg_namelen):0,0};
+        stage->regions[3]=(struct socket_output_region){user_msg?user_msg+__builtin_offsetof(struct msghdr,msg_flags):0,user_msg?sizeof(message.msg_flags):0,0};
+        stage->regions[4]=(struct socket_output_region){user_msg?user_msg+__builtin_offsetof(struct msghdr,msg_controllen):0,user_msg?sizeof(message.msg_controllen):0,0};
+        stage->outputs_planned=true;
+    }
+    for(uint32_t i=0;i<SOCKET_OUTPUT_REGIONS;++i) {
+        int pin=socket_pin_output(task,stage,i);
+        if(pin) {
+            if(pin!=KERNEL_SYSCALL_SWAP_CONTENDED || !scoped)socket_receive_finish(task,stage,scoped,false);
+            return pin;
+        }
+    }
+    unsigned char name[111]={AF_UNIX,0};
+    if(stage->metadata.path_len)__builtin_memcpy(name+2,stage->metadata.path,stage->metadata.path_len);
+    if(name_bytes)socket_output_copy(stage,0,0,name,name_bytes);
+    unsigned char control[CMSG_SPACE(sizeof(struct ucred))+CMSG_SPACE(UNIX_SOCKET_FD_TRANSFER_MAX*sizeof(int))]={0};
+    struct msghdr prepared=message;prepared.msg_control=control;prepared.msg_controllen=0;
+    prepared.msg_flags=stage->metadata.flags | (flags & MSG_CMSG_CLOEXEC);
+    if(stage->passcred)prepared.msg_controllen=unix_put_credentials(&prepared,capacity,&stage->metadata.credentials);
+    if(credential_bytes)socket_output_copy(stage,1,0,control,credential_bytes);
+    uint32_t count=0;
+    while(stage->rights && count<possible) {
+        int fd=stage->rights->files[count]?unix_clone_fd_to_task(task,stage->rights->files[count]):
+            task_pty_import_fd(task,&stage->rights->ptys[count],flags & MSG_CMSG_CLOEXEC?RELIEFOS_FD_CLOEXEC:0);
+        if(fd<0)break;
+        if((flags & MSG_CMSG_CLOEXEC) && stage->rights->files[count])task_descriptor_for_fd(task,fd)->fd_flags=RELIEFOS_FD_CLOEXEC;
+        __builtin_memcpy(control+credential_used+CMSG_LEN(0)+count*sizeof(int),&fd,sizeof(fd));++count;
+    }
+    if(count) {
+        struct cmsghdr header={.cmsg_len=CMSG_LEN(count*sizeof(int)),.cmsg_level=SOL_SOCKET,.cmsg_type=SCM_RIGHTS};
+        __builtin_memcpy(control+credential_used,&header,sizeof(header));
+        socket_output_copy(stage,1,credential_used,control+credential_used,CMSG_LEN(count*sizeof(int)));
+        uint64_t size=CMSG_SPACE(count*sizeof(int));
+        prepared.msg_controllen+=size<remaining_control?size:remaining_control;
+    }
+    if(stage->rights && count<stage->rights->count)prepared.msg_flags|=MSG_CTRUNC;
+    if(message.msg_name)socket_output_copy(stage,2,0,&name_length,sizeof(name_length));
+    if(user_msg) {
+        socket_output_copy(stage,3,0,&prepared.msg_flags,sizeof(prepared.msg_flags));
+        socket_output_copy(stage,4,0,&prepared.msg_controllen,sizeof(prepared.msg_controllen));
+    }
+    output->flags=(uint32_t)prepared.msg_flags;
+    socket_receive_finish(task,stage,scoped,false);return ret;
+}
+
+/** @brief Receive a scalar UNIX buffer or recvfrom result through the stage.
+ * @param task Current caller. @param file Admitted socket. @param address User
+ * payload address. @param length Declared payload length. @param flags Native
+ * receive flags. @param name Optional sockaddr output. @param name_length_pointer
+ * User socklen address when name is nonzero. @return Count, errno or retry.
+ */
+int task_socket_receive_user(struct task *task,struct task_file *file,uint64_t address,uint64_t length,
+                             uint32_t flags,uint64_t name,uint64_t name_length_pointer)
+{
+    if(flags & ~(MSG_DONTWAIT|MSG_PEEK|MSG_TRUNC|MSG_WAITALL|MSG_CMSG_CLOEXEC))return -LINUX_EOPNOTSUPP;
+    if(length && (address<RELIEFNT_USER_BASE || address>=RELIEFNT_USER_TOP ||
+                  length>RELIEFNT_USER_TOP-address))return -LINUX_EFAULT;
+    uint32_t capacity=0;
+    if(name) {
+        struct task_user_text imported={0};
+        int ret=task_lookup_user_bytes(task,name_length_pointer,sizeof(capacity),&imported);
+        if(ret)return ret;
+        __builtin_memcpy(&capacity,imported.text,sizeof(capacity));kernel_free(imported.allocation);
+        if((int32_t)capacity<0)return -LINUX_EINVAL;
+        if(capacity>111)capacity=111;
+    }
+    struct iovec vector={.iov_base=(void *)(uintptr_t)address,.iov_len=length};
+    struct msghdr message={.msg_iov=&vector,.msg_iovlen=1,.msg_name=(void *)(uintptr_t)name,.msg_namelen=capacity};
+    struct socket_message_result result={0};
+    return unix_recvmsg_staged(task,file,0,name_length_pointer,message,flags,length,&result);
+}
+
+/** @brief Perform one UNIX vector transfer from a retry-stable iovec snapshot.
+ * @param task Current caller. @param file Admitted UNIX socket. @param address
+ * Native iovec array address. @param count Previously validated UIO_MAXIOV count.
+ * @param writing True for writev. @return Count, errno or private retry marker.
+ * Payloads are copied in bounded slices; a datagram is committed exactly once.
+ */
+int task_socket_vector_user(struct task *task,struct task_file *file,uint64_t address,uint32_t count,bool writing)
+{
+    if(count>1024)return -LINUX_EINVAL;
+    struct task_user_text imported={0};
+    int ret=task_lookup_user_bytes(task,address,count*sizeof(struct iovec),&imported);
+    if(ret)return ret;
+    struct iovec vectors[1024];uint64_t total=0;
+    __builtin_memcpy(vectors,imported.text,count*sizeof(struct iovec));kernel_free(imported.allocation);
+    for(uint32_t i=0;i<count;++i) {
+        if((int64_t)vectors[i].iov_len<0)return -LINUX_EINVAL;
+        if(vectors[i].iov_len>0x7ffff000u-total)vectors[i].iov_len=0x7ffff000u-total;
+        uint64_t base=(uintptr_t)vectors[i].iov_base,length=vectors[i].iov_len;
+        if(length && (base<RELIEFNT_USER_BASE || base>=RELIEFNT_USER_TOP || length>RELIEFNT_USER_TOP-base))return -LINUX_EFAULT;
+        total+=length;
+    }
+    if(!total)return 0;
+    struct msghdr message={.msg_iov=vectors,.msg_iovlen=count};
+    struct socket_message_result result={0};
+    return writing?unix_sendmsg(task,file,message,0,false,total,&result):
+                   unix_recvmsg_staged(task,file,0,0,message,0,total,&result);
+}
+
+/** @brief Prepare interrupted WAITALL metadata at the outer signal boundary.
+ * @param task Live execution-owned receive owner. @return Zero or transient
+ * storage contention. Invalid outputs retain their existing late EFAULT path.
+ */
+int task_socket_signal_prepare(struct task *task)
+{
+    struct socket_send_stage *stage=task?sched_socket_stage(task):NULL;
+    if(!stage || !stage->receiving || stage->accepted || !task->socket_receive_done)return 0;
+    uint64_t addresses[4]={0},lengths[4]={0};uint32_t count=0;
+    if(stage->name_address) {
+        uint32_t length=task->socket_receive_path_length;
+        if(length>stage->name_capacity)length=stage->name_capacity;
+        if(length){addresses[count]=stage->name_address;lengths[count++]=length;}
+        addresses[count]=stage->receive_header?stage->receive_header+__builtin_offsetof(struct msghdr,msg_namelen):stage->name_length_pointer;
+        lengths[count++]=sizeof(uint32_t);
+    }
+    if(stage->receive_header) {
+        addresses[count]=stage->receive_header+__builtin_offsetof(struct msghdr,msg_flags);lengths[count++]=sizeof(uint32_t);
+        addresses[count]=stage->receive_header+__builtin_offsetof(struct msghdr,msg_controllen);lengths[count++]=sizeof(uint64_t);
+    }
+    for(uint32_t i=0;i<count;++i) {
+        int ret=swap_prepare_user_range(task,addresses[i],lengths[i],true);
+        if(ret==SWAP_STORAGE_CONTENDED)return ret;
+    }
+    return 0;
+}
+
+/** @brief Publish non-batch interrupted WAITALL metadata once before cleanup.
+ * @param task Live execution-owned receive owner. @return Zero or late EFAULT.
+ */
+int task_socket_signal_finish(struct task *task)
+{
+    struct socket_send_stage *stage=task?sched_socket_stage(task):NULL;
+    if(!stage || !stage->receiving || stage->accepted || !task->socket_receive_done)return 0;
+    if(stage->name_address) {
+        uint32_t length=task->socket_receive_path_length,n=length;
+        if(n>stage->name_capacity)n=stage->name_capacity;
+        uint64_t length_pointer=stage->receive_header?stage->receive_header+__builtin_offsetof(struct msghdr,msg_namelen):stage->name_length_pointer;
+        if((n && user_copy_to_task(task,stage->name_address,task->socket_receive_path,n)<0) ||
+           user_copy_to_task(task,length_pointer,&length,sizeof(length))<0)return -LINUX_EFAULT;
+    }
+    if(stage->receive_header) {
+        uint32_t flags=task->socket_receive_flags;uint64_t no_control=0;
+        if(user_copy_to_task(task,stage->receive_header+__builtin_offsetof(struct msghdr,msg_flags),&flags,sizeof(flags))<0 ||
+           user_copy_to_task(task,stage->receive_header+__builtin_offsetof(struct msghdr,msg_controllen),&no_control,sizeof(no_control))<0)
+            return -LINUX_EFAULT;
+    }
+    return 0;
+}
+#endif
+
+#ifndef CONFIG_SWAP
 static int unix_recvmsg(struct task *task, struct task_file *file,
                         const struct msghdr *user_msg, struct msghdr message,
                         uint32_t flags, uint64_t total, struct socket_message_result *output)
@@ -1491,6 +2207,7 @@ complete_message: ;
     output->flags = (uint32_t)message.msg_flags;
     return ret;
 }
+#endif
 
 /**
  * @brief Preserve common single-message behavior for native message batches.
@@ -1513,31 +2230,97 @@ static int64_t inet_message(struct task_file *file, uint64_t user_header,
         return -LINUX_EOPNOTSUPP;
     if (!receiving && message.msg_controllen) return -LINUX_EINVAL;
     if (!receiving && datagram && total > (packet ? 1514u : 1472u)) return -LINUX_EMSGSIZE;
+#ifdef CONFIG_SWAP
+    struct task *task=sched_current_task();
+    uint32_t native_name_size=packet ? task_packet_address_size(file) : sizeof(struct sockaddr_in);
+    if(packet && !native_name_size)return -LINUX_EBADF;
+    if(!receiving && datagram && message.msg_name && message.msg_namelen>=native_name_size) {
+        int prep=socket_user_prepare(task,(uintptr_t)message.msg_name,native_name_size,false);
+        if(prep==KERNEL_SYSCALL_SWAP_CONTENDED)return prep;
+    }
+#endif
+#ifndef CONFIG_SWAP
     if (receiving && !user_range_writable(user_header, sizeof(message))) return -LINUX_EFAULT;
+#endif
     uint32_t size = total > 16384 ? 16384 : (uint32_t)total;
     uint8_t *data = size ? kernel_malloc(size) : NULL;
     if (size && !data) return -LINUX_ENOMEM;
+    uint8_t *payload=data ? data : (uint8_t *)"";
     int64_t ret = -LINUX_EFAULT;
     uint32_t offset = 0;
-    for (uint64_t i = 0; i < message.msg_iovlen && offset < size; ++i) {
-        uint32_t n = message.msg_iov[i].iov_len > size - offset ? size - offset : message.msg_iov[i].iov_len;
+    uint32_t output_size=size;
+#ifdef CONFIG_SWAP
+    if(receiving) {
+        int probe=inet_receive_probe(file,size,datagram ? flags&~MSG_CMSG_CLOEXEC : flags,&output_size);
+        if(probe<0){ret=probe;goto done;}
+        int prep=socket_user_prepare(task,user_header,sizeof(message),true);
+        if(prep){ret=prep;goto done;}
+        if(!user_range_writable(user_header,sizeof(message)))goto done;
+    }
+#endif
+    for (uint64_t i = 0; i < message.msg_iovlen && offset < (receiving ? output_size : size); ++i) {
+        uint32_t limit=receiving ? output_size : size;
+        uint32_t n = message.msg_iov[i].iov_len > limit - offset ? limit - offset : message.msg_iov[i].iov_len;
         uint64_t pointer = (uintptr_t)message.msg_iov[i].iov_base;
+#ifdef CONFIG_SWAP
+        if(n && receiving) {
+            int prep=socket_user_prepare(task,pointer,n,true);
+            if(prep){ret=prep;goto done;}
+        }
+        if(n && !receiving) {
+            struct task_user_text part={0};
+            int prep=task_lookup_user_bytes(task,pointer,n,&part);
+            if(prep){ret=prep;goto done;}
+            __builtin_memcpy(data+offset,part.text,n);kernel_free(part.allocation);
+        }
+#endif
+#ifdef CONFIG_SWAP
+        if (n && receiving && !user_range_writable(pointer, n)) goto done;
+#else
         if (n && !(receiving ? user_range_writable(pointer, n) : user_range_ok(pointer, n))) goto done;
         if (!receiving && n) __builtin_memcpy(data + offset, (void *)(uintptr_t)pointer, n);
+#endif
         offset += n;
     }
+#ifdef CONFIG_SWAP
+    if(receiving && datagram && message.msg_name) {
+        uint32_t copied=message.msg_namelen<native_name_size ? message.msg_namelen : native_name_size;
+        int prep=socket_user_prepare(task,(uintptr_t)message.msg_name,copied,true);
+        if(prep){ret=prep;goto done;}
+        if(copied && !user_range_writable((uintptr_t)message.msg_name,copied))goto done;
+    }
+#endif
     output->requested = total;
     struct task_file local = *file;
     if (flags & MSG_DONTWAIT) local.flags |= RELIEFOS_O_NONBLOCK;
     struct msghdr *destination = (void *)(uintptr_t)user_header;
     if (receiving) {
-        if (packet) ret = task_packet_recv(file, data, size, (flags & ~MSG_CMSG_CLOEXEC) | MSG_TRUNC,
+#ifdef CONFIG_SWAP
+        union {struct sockaddr_in in;struct sockaddr_ll ll;} source={0};
+        uint32_t source_length=0;
+        if(packet)ret=task_packet_recv_staged(file,payload,output_size,(flags & ~MSG_CMSG_CLOEXEC)|MSG_TRUNC,
+                                               message.msg_name ? &source : NULL,&source_length);
+        else if(datagram) {
+            ret=task_udp_recv_staged(file,payload,output_size,(flags & ~MSG_CMSG_CLOEXEC)|MSG_TRUNC,
+                                     message.msg_name ? &source.in : NULL);
+            source_length=sizeof(source.in);
+        } else ret=task_inet_recv(file,payload,output_size,flags);
+#else
+        if (packet) ret = task_packet_recv(file, payload, size, (flags & ~MSG_CMSG_CLOEXEC) | MSG_TRUNC,
             (uintptr_t)message.msg_name, (uintptr_t)&destination->msg_namelen);
-        else if (datagram) ret = task_udp_recv(file, data, size, (flags & ~MSG_CMSG_CLOEXEC) | MSG_TRUNC,
+        else if (datagram) ret = task_udp_recv(file, payload, size, (flags & ~MSG_CMSG_CLOEXEC) | MSG_TRUNC,
             (uintptr_t)message.msg_name, (uintptr_t)&destination->msg_namelen);
-        else ret = task_inet_recv(file, data, size, flags);
+        else ret = task_inet_recv(file, payload, size, flags);
+#endif
         if (ret < 0) goto done;
-        uint32_t copied = (uint64_t)ret < size ? (uint32_t)ret : size;
+#ifdef CONFIG_SWAP
+        if(datagram && message.msg_name) {
+            uint32_t copied_name=message.msg_namelen<source_length ? message.msg_namelen : source_length;
+            if(copied_name)__builtin_memcpy(message.msg_name,&source,copied_name);
+            destination->msg_namelen=source_length;
+        }
+#endif
+        uint32_t copied = (uint64_t)ret < output_size ? (uint32_t)ret : output_size;
         offset = 0;
         for (uint64_t i = 0; i < message.msg_iovlen && offset < copied; ++i) {
             uint32_t n = message.msg_iov[i].iov_len > copied - offset ? copied - offset : message.msg_iov[i].iov_len;
@@ -1550,9 +2333,9 @@ static int64_t inet_message(struct task_file *file, uint64_t user_header,
         if (!message.msg_name || !datagram) destination->msg_namelen = 0;
         if (!(flags & MSG_TRUNC)) ret = copied;
     } else {
-        if (packet) ret = task_packet_send(file, data, size, flags, (uintptr_t)message.msg_name, message.msg_namelen);
-        else if (datagram) ret = task_udp_send(file, data, size, flags, (uintptr_t)message.msg_name, message.msg_namelen);
-        else ret = task_inet_write(&local, data, size);
+        if (packet) ret = task_packet_send(file, payload, size, flags, (uintptr_t)message.msg_name, message.msg_namelen);
+        else if (datagram) ret = task_udp_send(file, payload, size, flags, (uintptr_t)message.msg_name, message.msg_namelen);
+        else ret = task_inet_write(&local, payload, size);
     }
 done:
     if (data) kernel_free(data);
@@ -1583,11 +2366,22 @@ int64_t task_socket_message(struct task *task, struct task_file *file, uint64_t 
     if (!(file->flags & (TASK_FILE_FLAG_SOCKET_UNIX | TASK_FILE_FLAG_SOCKET_INET))) return -LINUX_EOPNOTSUPP;
     struct msghdr imported;
     if(receiving) {
+#ifdef CONFIG_SWAP
+        struct task_user_text header={0};
+        int rc=task_lookup_user_bytes(task,message,sizeof(imported),&header);if(rc)return inet_user_wait(task,file,rc);
+        __builtin_memcpy(&imported,header.text,sizeof(imported));kernel_free(header.allocation);
+#else
         if(!user_range_ok(message,sizeof(imported)))return -LINUX_EFAULT;
         __builtin_memcpy(&imported,(const void *)(uintptr_t)message,sizeof(imported));
+#endif
     } else {
         struct task_user_text header={0};
-        int rc=task_lookup_user_bytes(task,message,sizeof(imported),&header);if(rc)return rc;
+        int rc=task_lookup_user_bytes(task,message,sizeof(imported),&header);
+#ifdef CONFIG_SWAP
+        if(rc)return inet_user_wait(task,file,rc);
+#else
+        if(rc)return rc;
+#endif
         __builtin_memcpy(&imported,header.text,sizeof(imported));kernel_free(header.allocation);
     }
     if ((int32_t)imported.msg_namelen < 0) return -LINUX_EINVAL;
@@ -1601,25 +2395,48 @@ int64_t task_socket_message(struct task *task, struct task_file *file, uint64_t 
         if (!vectors) return -LINUX_ENOMEM;
     }
     int64_t status = -LINUX_EFAULT;
-    if(!receiving && size) {
+    if(size
+#ifndef CONFIG_SWAP
+       && !receiving
+#endif
+       ) {
         struct task_user_text copied={0};
         int rc=task_lookup_user_bytes(task,(uintptr_t)imported.msg_iov,size,&copied);
-        if(rc){if(vectors!=fast)kernel_free(vectors);return rc;}
+        if(rc){if(vectors!=fast)kernel_free(vectors);
+#ifdef CONFIG_SWAP
+            return inet_user_wait(task,file,rc);
+#else
+            return rc;
+#endif
+        }
         __builtin_memcpy(vectors,copied.text,size);kernel_free(copied.allocation);
     }
-    if (!size || !receiving || user_range_ok((uintptr_t)imported.msg_iov, size)) {
-        if (receiving && size) __builtin_memcpy(vectors, imported.msg_iov, size);
-        imported.msg_iov = vectors;
-        uint64_t total;
-        status = unix_message_vectors(&imported, &total);
-        if (!status && (file->flags & TASK_FILE_FLAG_SOCKET_INET))
-            status = inet_message(file, message, imported, flags, receiving, total, result);
-        else if (!status) status = receiving ?
-            unix_recvmsg(task, file, (const void *)(uintptr_t)message, imported, flags, total, result) :
-            unix_sendmsg(task, file, imported, flags, batch, total, result);
+#ifndef CONFIG_SWAP
+    if(receiving && size) {
+        if(!user_range_ok((uintptr_t)imported.msg_iov,size)) {
+            if(vectors!=fast)kernel_free(vectors);return -LINUX_EFAULT;
+        }
+        __builtin_memcpy(vectors,imported.msg_iov,size);
     }
+#endif
+    imported.msg_iov = vectors;
+    uint64_t total;
+    status = unix_message_vectors(&imported, &total);
+    if (!status && (file->flags & TASK_FILE_FLAG_SOCKET_INET))
+        status = inet_message(file, message, imported, flags, receiving, total, result);
+    else if (!status) status = receiving ?
+#ifdef CONFIG_SWAP
+            unix_recvmsg_staged(task,file,message,0,imported,flags,total,result) :
+#else
+            unix_recvmsg(task, file, (const void *)(uintptr_t)message, imported, flags, total, result) :
+#endif
+        unix_sendmsg(task, file, imported, flags, batch, total, result);
     if (vectors != fast) kernel_free(vectors);
+#ifdef CONFIG_SWAP
+    return inet_user_wait(task,file,status);
+#else
     return status;
+#endif
 }
 
 /**
@@ -1687,6 +2504,7 @@ static int64_t unix_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
         struct unix_socket *right;
         int left_fd;
         int right_fd;
+        int prep=socket_user_prepare(task,a3,sizeof(int)*2u,true);if(prep)return prep;
         if (!user_range_writable(a3, sizeof(int) * 2u)) return -RELIEFOS_EFAULT;
         if ((int)a0 != AF_UNIX || (type != SOCK_STREAM && type != SOCK_DGRAM && type != SOCK_SEQPACKET) ||
             (a2 != 0 && a2 != AF_UNIX) || (a1 & ~(uint32_t)(15 | SOCK_NONBLOCK | SOCK_CLOEXEC))) {
@@ -1825,8 +2643,12 @@ static int64_t unix_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
         number = __NR_accept;
     }
     if (number == __NR_accept) {
-        if (a1 && !user_range_writable(a2, sizeof(socklen_t))) return -RELIEFOS_EFAULT;
         kernel_wait_queue_remove(&socket->wait_accept, task);
+        if(a1) {
+            int prep=socket_user_prepare(task,a2,sizeof(socklen_t),true);
+            if(prep)return prep;
+        }
+        if (a1 && !user_range_writable(a2, sizeof(socklen_t))) return -RELIEFOS_EFAULT;
         if (socket->state != UNIX_SOCKET_LISTEN) return -RELIEFOS_EINVAL;
         if (!socket->pending_count) {
             return unix_block(socket, file, &socket->wait_accept, true, 0);
@@ -1902,6 +2724,8 @@ static int unix_socket_option(struct unix_socket *socket, bool setting, int leve
         if (option == SO_RCVTIMEO || option == SO_RCVTIMEO_NEW ||
             option == SO_SNDTIMEO || option == SO_SNDTIMEO_NEW) {
             if (length < sizeof(struct linux_timeval)) return -RELIEFOS_EINVAL;
+            int prep=socket_user_prepare(sched_current_task(),address,sizeof(struct linux_timeval),false);
+            if(prep)return prep;
             if (!user_range_ok(address, sizeof(struct linux_timeval))) return -RELIEFOS_EFAULT;
             struct linux_timeval timeout = *(const struct linux_timeval *)(uintptr_t)address;
             if (timeout.tv_usec < 0 || timeout.tv_usec >= 1000000)
@@ -1926,20 +2750,27 @@ static int unix_socket_option(struct unix_socket *socket, bool setting, int leve
         }
         if (option != SO_PASSCRED && option != SO_RCVLOWAT) return -LINUX_ENOPROTOOPT;
         if (length < sizeof(int32_t)) return -RELIEFOS_EINVAL;
+        int prep=socket_user_prepare(sched_current_task(),address,sizeof(int32_t),false);
+        if(prep)return prep;
         if (!user_range_ok(address, sizeof(int32_t))) return -RELIEFOS_EFAULT;
         int32_t value = *(const int32_t *)(uintptr_t)address;
         if (option == SO_PASSCRED) socket->passcred = value != 0;
         else socket->receive_lowwater = value < 0 ? INT32_MAX : value ? (uint32_t)value : 1;
         return 0;
     }
-    if (!user_range_writable(length, sizeof(socklen_t))) return -RELIEFOS_EFAULT;
-    socklen_t capacity = *(socklen_t *)(uintptr_t)length;
+    socklen_t capacity;int prep=socket_user_length(sched_current_task(),length,&capacity);
+    if(prep)return prep;
     if ((int32_t)capacity < 0) return -RELIEFOS_EINVAL;
     if (level != SOL_SOCKET) return -LINUX_ENOPROTOOPT;
     int32_t value = 0;
     struct linux_timeval timeout = {0};
     const void *data = &value;
     uint32_t size = sizeof(value);
+    if(option==SO_ERROR) {
+        uint32_t copied=capacity<sizeof(value) ? capacity : sizeof(value);
+        prep=socket_user_prepare(sched_current_task(),address,copied,true);
+        if(prep==KERNEL_SYSCALL_SWAP_CONTENDED)return prep;
+    }
     switch (option) {
     case SO_PEERCRED: data = &socket->peer_credentials; size = sizeof(socket->peer_credentials); break;
     case SO_TYPE: value = (int32_t)socket->type; break;
@@ -1968,6 +2799,7 @@ static int unix_socket_option(struct unix_socket *socket, bool setting, int leve
         return -LINUX_ENOPROTOOPT;
     }
     if (size > capacity) size = capacity;
+    prep=socket_user_prepare(sched_current_task(),address,size,true);if(prep)return prep;
     if (size && !user_range_writable(address, size)) return -RELIEFOS_EFAULT;
     for (unsigned i = 0; i < size; ++i) ((uint8_t *)(uintptr_t)address)[i] = ((const uint8_t *)data)[i];
     *(socklen_t *)(uintptr_t)length = size;
@@ -2006,7 +2838,7 @@ int64_t syscall_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
         a3 = (uint32_t)a3;
     if (number == __NR_getsockopt || number == __NR_setsockopt) {
         task = sched_current_task();
-        file = task_file_for_fd(task, (int)a0);
+        file = task_file_for_io(task, (int)a0);
         if (!file) return -RELIEFOS_EBADF;
         struct unix_socket *socket = unix_from_file(file);
         if (socket) return unix_socket_option(socket, number == __NR_setsockopt,
@@ -2027,6 +2859,39 @@ int64_t syscall_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
         struct task *task = sched_current_task();
         struct task_file *file = task_file_for_io(task, (int)a0);
         if (!file) return -RELIEFOS_EBADF;
+#ifdef CONFIG_SWAP
+        if (file->flags & TASK_FILE_FLAG_SOCKET_UNIX) {
+            if (!inet_user_span(a1,a2)) return -RELIEFOS_EFAULT;
+            if (a3 & ~(MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE | MSG_EOR)) return -LINUX_EOPNOTSUPP;
+            struct iovec vector={.iov_base=(void *)(uintptr_t)a1,.iov_len=a2};
+            struct msghdr message={.msg_name=(void *)(uintptr_t)a4,.msg_namelen=(uint32_t)a5,
+                                   .msg_iov=&vector,.msg_iovlen=1};
+            struct socket_message_result result={0};
+            return unix_sendmsg(task,file,message,(uint32_t)a3,false,a2,&result);
+        }
+        if(file->flags & TASK_FILE_FLAG_SOCKET_INET) {
+            if(!inet_user_span(a1,a2))return -RELIEFOS_EFAULT;
+            if(a3 & ~(MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE | MSG_EOR))return -LINUX_EOPNOTSUPP;
+            bool packet=file->kind==TASK_FILE_KIND_PACKET,udp=file->kind==TASK_FILE_KIND_UDP;
+            if((packet && a2>1514u) || (udp && a2>1472u))return -LINUX_EMSGSIZE;
+            uint32_t size=a2>32768u ? 32768u : (uint32_t)a2;
+            struct task_user_text data={0};
+            int rc=size ? task_lookup_user_bytes(task,a1,size,&data) : 0;
+            if(rc)return inet_user_wait(task,file,rc);
+            const void *bytes=size ? data.text : "";
+            int ret;
+            if(packet)ret=task_packet_send(file,bytes,size,(uint32_t)a3,a4,(uint32_t)a5);
+            else if(udp)ret=task_udp_send(file,bytes,size,(uint32_t)a3,a4,(uint32_t)a5);
+            else {
+                struct task_file local=*file;
+                if(a3 & MSG_DONTWAIT)local.flags|=RELIEFOS_O_NONBLOCK;
+                ret=task_inet_write(&local,bytes,size);
+                if(ret==-RELIEFOS_EPIPE && !(a3 & MSG_NOSIGNAL))sched_signal_user_task(task->pid,13);
+            }
+            kernel_free(data.allocation);
+            return inet_user_wait(task,file,ret);
+        }
+#endif
         if (a2 && !user_range_ok(a1, a2)) return -RELIEFOS_EFAULT;
         if (file->flags & TASK_FILE_FLAG_SOCKET_INET) {
             if (a3 & ~(MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE | MSG_EOR))
@@ -2065,6 +2930,29 @@ int64_t syscall_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
         struct task *task = sched_current_task();
         struct task_file *file = task->socket_receive_file ? task->socket_receive_file : task_file_for_io(task, (int)a0);
         if (!file) return -RELIEFOS_EBADF;
+#ifdef CONFIG_SWAP
+        if(file->flags & TASK_FILE_FLAG_SOCKET_UNIX)
+            return task_socket_receive_user(task,file,a1,a2,(uint32_t)a3,a4,a5);
+        if(file->flags & TASK_FILE_FLAG_SOCKET_INET) {
+            if(!inet_user_span(a1,a2))return -RELIEFOS_EFAULT;
+            uint32_t cap=file->kind==TASK_FILE_KIND_PACKET ? 1514u :
+                         file->kind==TASK_FILE_KIND_UDP ? 1472u : 32768u;
+            uint32_t size=a2>cap ? cap : (uint32_t)a2;
+            uint32_t actual=0;
+            int observed=inet_receive_probe(file,size,(uint32_t)a3,&actual);
+            if(observed<0)return inet_user_wait(task,file,observed);
+            int rc=socket_user_prepare(task,a1,actual,true);
+            if(rc)return inet_user_wait(task,file,rc);
+            if(actual && !user_range_writable(a1,actual))return -RELIEFOS_EFAULT;
+            int ret;
+            if(file->kind==TASK_FILE_KIND_PACKET)
+                ret=task_packet_recv(file,(void *)(uintptr_t)a1,actual,(uint32_t)a3,a4,a5);
+            else if(file->kind==TASK_FILE_KIND_UDP)
+                ret=task_udp_recv(file,(void *)(uintptr_t)a1,actual,(uint32_t)a3,a4,a5);
+            else ret=task_inet_recv(file,(void *)(uintptr_t)a1,actual,(uint32_t)a3);
+            return inet_user_wait(task,file,ret);
+        }
+#endif
         if (a2 && !user_range_writable(a1, a2)) return -RELIEFOS_EFAULT;
         if (file->flags & TASK_FILE_FLAG_SOCKET_INET) {
             if (file->kind == TASK_FILE_KIND_PACKET)
@@ -2097,7 +2985,7 @@ int64_t syscall_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
     }
     task = sched_current_task();
     if (number == __NR_socket && ((int)a0 == AF_INET || (int)a0 == AF_PACKET)) return inet_socket_dispatch(number, a0, a1, a2, a3, a4);
-    file = task_file_for_fd(task, (int)a0);
+    file = task_file_for_io(task, (int)a0);
     if (number != __NR_socket && file && (file->flags & TASK_FILE_FLAG_SOCKET_INET)) {
         return inet_socket_dispatch(number, a0, a1, a2, a3, a4);
     }

@@ -384,23 +384,44 @@ int task_shm_read(struct task_file *file, void *buffer, uint32_t length)
     return got ? (int)got : ret;
 }
 
-/** @brief Write sparse file pages, preserving partial progress on allocation failure.
- * @param file Pinned writable shmem OFD under execution ownership.
- * @param buffer Validated source for length bytes.
- * @param length Requested byte count.
- * @return Bytes written or negative EBADF/EFAULT/EFBIG/EPERM/backing error.
- * Gaps are zero-filled by tmpfs and no offset or length wraps signed off_t.
+/** @brief Validate the full provider extent before a bounded shmem write.
+ * @param file Pinned shmem OFD. @param length Original provider byte count.
+ * @return Zero or EBADF/EPERM/EFBIG without changing the file or its seals.
  */
-int task_shm_write(struct task_file *file, const void *buffer, uint32_t length)
+static int task_shm_write_check(struct task_file *file,uint32_t length)
 {
     struct task_shm *segment = task_shm_for_file(file);
     if (!segment || !file_can_write(file)) return -RELIEFOS_EBADF;
-    if (length && !buffer) return -RELIEFOS_EFAULT;
     if (!length) return 0;
     if (segment->seals & (LINUX_F_SEAL_WRITE | LINUX_F_SEAL_FUTURE_WRITE)) return -RELIEFOS_EPERM;
     if (file->offset > INT64_MAX || length > (uint64_t)INT64_MAX - file->offset) return -RELIEFOS_EFBIG;
     if (file->offset + length > segment->node.size && (segment->seals & LINUX_F_SEAL_GROW))
         return -RELIEFOS_EPERM;
+    return 0;
+}
+
+#ifdef CONFIG_SWAP
+/** @brief Apply the original provider extent checks before a bounded slice.
+ * @param file Pinned shmem description. @param length Original byte count.
+ * @return Zero or the original validation error without changing state.
+ */
+int task_shm_write_admit(struct task_file *file,uint32_t length)
+{ return task_shm_write_check(file,length); }
+#endif
+
+/** @brief Write sparse file pages, preserving partial progress on allocation failure.
+ * @param file Pinned writable shmem OFD under execution ownership.
+ * @param buffer Validated source for length bytes. @param length Byte count.
+ * @return Bytes written or EBADF/EFAULT/EFBIG/EPERM/backing error. Gaps are
+ * zero-filled by tmpfs and no offset or length wraps signed off_t.
+ */
+int task_shm_write(struct task_file *file, const void *buffer, uint32_t length)
+{
+    struct task_shm *segment=task_shm_for_file(file);
+    if(!segment || !file_can_write(file))return -RELIEFOS_EBADF;
+    if(length && !buffer)return -RELIEFOS_EFAULT;
+    int check=task_shm_write_check(file,length);if(check)return check;
+    if(!length)return 0;
     uint32_t written = 0;
     int ret = storage_write_held_node(&segment->node, file->offset, buffer, length, &written);
     file->offset += written;

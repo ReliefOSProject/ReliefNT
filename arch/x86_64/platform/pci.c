@@ -534,8 +534,6 @@ static void *pci_map_mmio_lease(uint64_t phys, uint64_t bytes)
     uint64_t length = (bytes + 4095u) & ~4095ull;
     if (phys > UINT64_MAX - length) return NULL;
     bool high = !paging_kernel_direct_map_range(phys, length);
-    /* A high UC alias must never overlap a still-WB part of the RAM direct map. */
-    if (high && phys < RELIEFNT_KERNEL_DIRECT_MAP_SIZE) return NULL;
     kernel_spin_lock(&pci_mapping_lock);
     struct pci_mmio_mapping *mapping = NULL;
     for (uint32_t i = 0; i < PCI_MMIO_MAX; ++i)

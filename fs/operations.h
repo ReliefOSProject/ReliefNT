@@ -4,10 +4,12 @@
 #include <reliefnt/types.h>
 #include <reliefnt/storage.h>
 struct storage_volume;
+struct block_device;
 struct module;
 struct fs_mount_request;
 struct vfs_mount;
 struct storage_cluster_ops;
+struct swap_storage_extent;
 #define STORAGE_FS_READONLY 1u
 #define STORAGE_FS_SIDECAR 2u
 
@@ -66,10 +68,20 @@ struct storage_filesystem_ops {
                    const struct storage_node *parent,const char *name);
     int (*fallocate)(struct storage_volume *volume,struct storage_node *node,uint32_t mode,uint64_t offset,uint64_t length);
     int (*sync)(struct storage_volume *volume);
+#ifdef CONFIG_SWAP
+    /* Exact provider mappings, borrowed only under the inode claim. */
+    int (*swap_extent)(struct storage_volume *volume,const struct storage_node *node,
+                       uint64_t offset,struct swap_storage_extent *out);
+    int (*swap_initialize)(struct storage_volume *volume,const struct storage_node *node,
+                           uint64_t offset,uint64_t length);
+#endif
     /* Global native cache notifications: IRQ-safe, no allocation/I/O, may run
-     * under the physical transport lock. Instance/type pins keep code alive. */
+     * under the physical transport lock. Instance/type pins keep code alive.
+     * Write notification gets an optional volume and a borrowed exact device;
+     * either identity may be absent but at least one is present for a write. */
     void (*invalidate)(void);
-    void (*invalidate_write)(const struct storage_volume *writer,uint64_t lba,uint32_t sectors);
+    void (*invalidate_write)(const struct storage_volume *writer,const struct block_device *device,
+                             uint64_t lba,uint32_t sectors);
 };
 
 /* Only the owning filesystem's parser/constructor installs its table. The
@@ -140,4 +152,12 @@ int storage_readdir_node_policy(const struct storage_node *node,uint64_t *cursor
  * physical aliases are passed even when the writer has no filesystem itself.
  */
 void storage_filesystem_cache_event(const struct storage_volume *writer,uint64_t lba,uint32_t sectors);
+/** @brief Evict physical aliases before a write through an exact held device.
+ * @param device Borrowed exact device identity, NULL ignored; caller retains its reference.
+ * @param lba First 512-byte physical sector. @param sectors Nonzero sector count.
+ * Caller owns execution and provider lifetimes. Callbacks allocate nothing,
+ * perform no I/O, and never retain the identity or acquire ownership of it.
+ */
+void storage_filesystem_cache_event_device(const struct block_device *device,
+                                           uint64_t lba,uint32_t sectors);
 #endif

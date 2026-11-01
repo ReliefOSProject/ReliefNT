@@ -11,6 +11,9 @@
 #include <reliefnt/futex.h>
 #include <reliefnt/sysv_shm.h>
 #include <reliefos/fs_abi.h>
+#ifdef CONFIG_SWAP
+#include <reliefnt/swap.h>
+#endif
 
 /* Linux's default is sixteen pages. Capacity is per pipe, not a global pool. */
 #define TASK_PIPE_RING_CAP (TASK_PIPE_CAP + 1u)
@@ -445,11 +448,26 @@ int task_fifo_open(struct task *task, const struct storage_node *node,
  * @return Zero, negative descriptor/allocation error, or EFAULT; publishes
  * neither endpoint on failure. Caller holds execution ownership.
  */
+/** @brief Prepare the two descriptor outputs before publishing either end.
+ * @param task Live calling task. @param pointer Two-int user output.
+ * @return Zero, EFAULT or the private prerequisite-wait marker. No descriptor
+ * or pipe is created until the complete bounded output is writable.
+ */
+static int ipc_prepare_pipe_output(struct task *task,uint64_t pointer)
+{
+    if(!task)return -RELIEFOS_EFAULT;
+#ifdef CONFIG_SWAP
+    int ret=swap_prepare_user_range(task,pointer,sizeof(int)*2u,true);
+    if(ret==SWAP_STORAGE_CONTENDED)return KERNEL_SYSCALL_SWAP_CONTENDED;
+    if(ret<0)return -RELIEFOS_EFAULT;
+#endif
+    return user_range_writable(pointer,sizeof(int)*2u) ? 0 : -RELIEFOS_EFAULT;
+}
+
 int syscall_ipc_pipe(uint64_t user_ptr)
 {
     struct task *task = sched_current_task();
-    if (!task || !user_range_writable(user_ptr, sizeof(int) * 2u))
-        return -RELIEFOS_EFAULT;
+    int prep=ipc_prepare_pipe_output(task,user_ptr);if(prep)return prep;
     int error = 0;
     struct task_pipe *pipe = task_pipe_create(NULL, &error);
     if (!pipe) return error;
@@ -476,7 +494,7 @@ int syscall_ipc_pipe2(uint64_t user_ptr, uint64_t flags)
     if (flags & ~(uint32_t)(RELIEFOS_O_NONBLOCK | RELIEFOS_O_CLOEXEC)) {
         return -RELIEFOS_EINVAL;
     }
-    if (!task || !user_range_writable(user_ptr, sizeof(fds))) return -RELIEFOS_EFAULT;
+    int prep=ipc_prepare_pipe_output(task,user_ptr);if(prep)return prep;
     int result = syscall_ipc_pipe(user_ptr);
     if (result < 0 || !task) return result;
     fds[0] = ((const int *)(uintptr_t)user_ptr)[0];

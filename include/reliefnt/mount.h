@@ -398,9 +398,11 @@ int vfs_path_resolve(struct vfs_namespace *ns,const struct vfs_path *root,
  * @param name Initial copied input; a resumed walk uses its own pending text.
  * @param policy Borrowed per-call search callback/context and unchanged flags;
  * callback/context are never retained between calls.
- * @param state Empty or owned opaque walk, retained only when EAGAIN is returned.
+ * @param state Empty or owned opaque walk, retained on EAGAIN or the private
+ * native-workspace marker; scoped callers must normalize or resume the latter.
  * @param out Empty result receiving an owned final path on success.
- * @return Zero or negative errno. EAGAIN preserves the exact current directory,
+ * @return Zero, negative errno or the private pre-I/O native-workspace marker.
+ * Retry outcomes preserve the exact current directory,
  * pending symlink and traversal phase; overmounts/renames cannot replay earlier
  * components or release in-flight provider code. Other results consume/clear
  * state. Caller must cancel on signals/exit/replacement; no graph lock spans I/O.

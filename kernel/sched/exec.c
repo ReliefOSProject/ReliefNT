@@ -1,5 +1,21 @@
 #include <reliefnt/graphics_service.h>
+#include <reliefnt/swap.h>
 #include "internal.h"
+
+/** @brief Invalidate OOM holder snapshots after an exec root commit.
+ * Production supplies the allocation-free notifier; detached scheduler
+ * fixtures may omit it. The caller still owns the outer execution writer.
+ */
+extern void sched_oom_membership_changed(void) __attribute__((weak));
+
+#ifdef CONFIG_SWAP
+/** @brief Discard a committed exec's old-MM headroom and fault identity.
+ * @param task Current execution-owned task, nullable. Its owned old pressure
+ * link is unlinked; independent waits remain. No unrelated spinlock may be held.
+ * Production links this helper; detached scheduler fixtures may omit it.
+ */
+extern void memory_headroom_exec_cancel(struct task *task) __attribute__((weak));
+#endif
 
 
 
@@ -134,13 +150,25 @@ int sched_prepare_exec_current(struct task *task)
     for (uint32_t i = 0; i < task_count; ++i) {
         struct task *other = tasks[i];
         if (other == task || sched_task_tgid(other) != group) continue;
-        sched_exit(other->pid, 0);
+        if (other->state != TASK_EXITED) sched_exit(other->pid, 0);
         if (other->running_cpu != SCHED_CPU_NONE) pending = true;
+#ifdef CONFIG_SWAP
+        else if (!(other->flags & TASK_FLAG_RESOURCES_RELEASED)) {
+            sched_release_task_resources(other);
+            if (!(other->flags & TASK_FLAG_RESOURCES_RELEASED)) pending = true;
+        }
+#endif
     }
     /* Remote members retire at their next kernel boundary before mm changes. */
     if (pending) return -11;
     storage_drain_task_io(task->pid);
+#ifdef CONFIG_SWAP
+    int cleanup = futex_task_exit_step(task);
+    if (cleanup == 0 || cleanup == SWAP_STORAGE_CONTENDED) return -EAGAIN;
+    if (cleanup != 1) return cleanup < 0 ? cleanup : -EIO;
+#else
     futex_task_exit(task);
+#endif
     task->robust_list = 0;
     uint64_t signal_flags;
     kernel_spin_lock_irqsave(&scheduler_lock, &signal_flags);
@@ -190,10 +218,17 @@ int sched_prepare_exec_current(struct task *task)
  * @return None; this commit cannot fail or return to the replaced user image.
  * @note Task context. Cancel saved graphics user pointers, release a vfork
  * parent, activate the kernel CR3 and drop the old mm/VMA owner references
- * before installing the replacement. No provider callback spans a scheduler lock.
+ * before installing the replacement. The committed root change invalidates
+ * OOM holder snapshots and old-MM headroom identity. No scheduler or unrelated
+ * spinlock spans wait unlink or any provider callback.
  */
 void sched_exec_replace_mm(struct task *task, const struct address_space *replacement)
 {
+#ifdef CONFIG_SWAP
+    /* This is past exec's last fallible check, before the old root can be
+     * destroyed or recycled. Failed exec preparation keeps its old token. */
+    if(memory_headroom_exec_cancel)memory_headroom_exec_cancel(task);
+#endif
     /* A committed exec has replaced the user's address-space contract. Drop
      * any saved ioctl user pointers before releasing the previous mm. */
     graphics_service_cancel_task_continuation(task);
@@ -212,4 +247,5 @@ void sched_exec_replace_mm(struct task *task, const struct address_space *replac
     }
     task->shared_mm = NULL;
     task->address_space = (struct task_address_space_state){.as = *replacement};
+    if (sched_oom_membership_changed) sched_oom_membership_changed();
 }

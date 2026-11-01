@@ -54,12 +54,15 @@ struct vfs_rename {
 /* All helpers require the caller's execution transaction. No internal spinlock
  * or backend callback is hidden behind a mount graph lock. */
 bool vfs_path_valid(const struct vfs_path *path);
-#ifdef CONFIG_LOCK_STAT
-/** @brief Recognize the immediate-commit proc control by retained provider/key.
+/** @brief Resolve a child for a retained walker, preserving its private
+ * pre-I/O native-workspace marker. The walker owns final normalization.
+ */
+int vfs_path_lookup_child_for_walk(const struct vfs_path *parent,const char *name,
+                                   struct vfs_path *out);
+/** @brief Recognize an immediate-commit control by retained provider/key.
  * @param path Borrowed valid inode path, protected by execution ownership.
- * @return True only for the live lock_stats control; no lookup or allocation. */
-bool vfs_pseudo_lock_stats_control(const struct vfs_path *path);
-#endif
+ * @return True only when its live provider promises immediate commit. */
+bool vfs_pseudo_immediate_control(const struct vfs_path *path) __attribute__((weak));
 bool vfs_path_covered(const struct vfs_namespace *ns,const struct vfs_path *path);
 void vfs_follow_mounts(const struct vfs_namespace *ns,struct vfs_path *path);
 /* Bind metadata returned by a completed native creation without re-looking up

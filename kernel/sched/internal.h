@@ -23,6 +23,7 @@
 #include <reliefnt/heap.h>
 #include <reliefnt/mm.h>
 #include <reliefnt/lock.h>
+#include <reliefnt/memory_pressure.h>
 #include <reliefnt/smp.h>
 #include <reliefnt/svga.h>
 #include <reliefnt/usercopy.h>
@@ -169,14 +170,52 @@ _Static_assert(RELIEFNT_TICK_HZ == 100, "CPU ticks use Linux USER_HZ=100");
 
 
 
+#ifdef CONFIG_SWAP
+/* Scalar-only continuation for a pre-publication fork COW allocation shortage. */
+struct fork_cow_reclaim_state {
+    uint64_t cr3, rip;
+    uint32_t prefix_pages, minimum_pages;
+    bool active;
+};
+/** @brief Cancel one task's scalar-only suspended fork reclaim state. */
+void sched_fork_reclaim_cancel(struct task *task);
+#endif
+
 /* Keep the scheduler-private tree node next to its task without changing
  * struct task's size or any externally visible task field offset. */
 struct sched_task_object {
     struct task task;
     struct eevdf_node fair_node;
+    struct futex_exit_cursor futex_exit;
+    struct task *exec_prepared;
+    struct socket_send_stage *socket_stage;
+    int32_t oom_adjustment, oom_minimum;
+    uint64_t oom_victim_epoch;
+    uint64_t pressure_address, pressure_free, pressure_stall_tick;
+    uint32_t pressure_cause, pressure_stalls;
+    uint64_t pressure_fault_cr3, pressure_fault_rip, pressure_fault_pages[4];
+    struct pressure_cursor pressure_fault_cursor[2];
+#ifdef CONFIG_SWAP
+    struct pressure_headroom_state pressure_headroom;
+    struct fork_cow_reclaim_state fork_cow_reclaim;
+#endif
+    uint64_t event_fault_cr3, event_fault_rip, event_fault_page;
+    bool event_fault_active, event_fault_major;
 };
 _Static_assert(__builtin_offsetof(struct sched_task_object, task) == 0,
                "task must be the first member of its private allocation");
+
+/** @brief Copy an existing policy while the new task remains unpublished.
+ * @param child Unpublished destination. @param parent Borrowed source, nullable.
+ * Scheduler serialization pins both private task objects; no references move.
+ */
+static inline void sched_oom_policy_inherit(struct task *child, const struct task *parent)
+{
+    struct sched_task_object *dst = (struct sched_task_object *)child;
+    const struct sched_task_object *src = (const struct sched_task_object *)parent;
+    dst->oom_adjustment = src ? src->oom_adjustment : 0;
+    dst->oom_minimum = src ? src->oom_minimum : 0;
+}
 
 
 
@@ -564,11 +603,14 @@ uint32_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack
  * Linux completes tsk->vfork_done from mm_release() on both the exec and the
  * final exit path.  The parent is woken only from TASK_BLOCKED; a parent that
  * was concurrently killed or stopped keeps its terminal/job-control state and
- * simply loses the stale child pointer.
+ * simply loses the stale child pointer and invalidates OOM snapshots.
+ * @param child Execution-owned child, nullable, under scheduler_lock.
  */
 void vfork_child_done_locked(struct task *child);
 
-/** @brief Drop a dying parent's reference to its vfork child under lock. */
+/** @brief Drop a dying parent's vfork link and invalidate OOM snapshots.
+ * @param parent Execution-owned parent, nullable, under scheduler_lock.
+ */
 void vfork_parent_exit_locked(struct task *parent);
 
 /**
@@ -577,6 +619,7 @@ void vfork_parent_exit_locked(struct task *parent);
  * Called with the scheduler unlocked after the child is committed to exec or
  * terminally exiting.  Keep the link cleared even when the parent already
  * died: a later task slot reuse must never observe a stale parent pointer.
+ * @param child Execution-owned child, nullable; no ownership is transferred.
  */
 void sched_vfork_child_done(struct task *child);
 
@@ -650,7 +693,8 @@ void sched_mark_orphaned_group(uint32_t group);
 void sched_exit(uint32_t pid, uint64_t code);
 
 /**
- * @brief Free a user task's storage, files, and address space once, guarded by a released flag.
+ * @brief Release a quiescent task's resources once and invalidate OOM snapshots.
+ * @param task Execution-owned task or NULL; no scheduler lock across teardown.
  */
 void sched_release_task_resources(struct task *task);
 
@@ -664,7 +708,8 @@ int sched_prepare_exec_current(struct task *task);
  * @param replacement Prepared address space transferred to task without retaining it.
  * @return None; caller cannot resume the replaced image after this commit.
  * @note Task context without scheduler locks across cleanup; releases the vfork
- * parent and switches to kernel CR3 before dropping the former address space.
+ * parent and switches to kernel CR3 before dropping the former address space;
+ * the resulting MM membership change invalidates OOM snapshots.
  */
 void sched_exec_replace_mm(struct task *task, const struct address_space *replacement);
 

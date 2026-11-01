@@ -1,4 +1,18 @@
 #include "../internal.h"
+#include <reliefnt/memory_stats.h>
+#include <reliefnt/swap.h>
+
+/** @brief Prepare one bounded statistics output before scheduler queries.
+ * @param task Current task. @param address User output. @param size Bytes.
+ * @return Zero, EFAULT, or the private prerequisite-contention marker.
+ */
+static int resource_prepare_output(struct task *task, uint64_t address, uint64_t size)
+{
+    if (!task) return 0;
+    int ret = swap_prepare_user_range(task, address, size, true);
+    if (ret == SWAP_STORAGE_CONTENDED) return KERNEL_SYSCALL_SWAP_CONTENDED;
+    return ret < 0 ? -RELIEFOS_EFAULT : 0;
+}
 
 static void syscall_rusage_cpu_time(uint64_t ticks, struct linux_timeval *out);
 
@@ -14,6 +28,9 @@ int64_t syscall_getrusage(uint64_t who_arg, uint64_t usage_ptr)
     struct task *task = sched_current_task();
     struct linux_rusage usage = {0};
     int32_t who = (int32_t)who_arg;
+    if (task && usage_ptr) {
+        int prep=resource_prepare_output(task,usage_ptr,sizeof(usage));if(prep)return prep;
+    }
     if (!task || !usage_ptr || !user_range_writable(usage_ptr, sizeof(usage))) {
         return -RELIEFOS_EFAULT;
     }
@@ -30,11 +47,17 @@ int64_t syscall_sysinfo(uint64_t info_ptr)
 {
     struct linux_sysinfo info = {0};
     uint32_t task_count = 0;
+    if (info_ptr) {
+        int prep=resource_prepare_output(sched_current_task(),info_ptr,sizeof(info));if(prep)return prep;
+    }
     if (!info_ptr || !user_range_writable(info_ptr, sizeof(info))) return -RELIEFOS_EFAULT;
     info.uptime = (int64_t)(time_ticks() / RELIEFNT_TICK_HZ);
     sched_load_averages(info.loads);
-    info.totalram = mm_total_memory_kib();
-    info.freeram = mm_free_memory_kib();
+    struct memory_snapshot memory; memory_snapshot_get(&memory);
+    info.totalram = memory.total_kib;
+    info.freeram = memory.free_kib;
+    info.totalswap = memory.swap_total_kib;
+    info.freeswap = memory.swap_free_kib;
     info.mem_unit = 1024;
     sched_task_counts(&task_count, NULL, NULL, NULL);
     info.procs = task_count > UINT16_MAX ? UINT16_MAX : (uint16_t)task_count;
@@ -46,6 +69,9 @@ int64_t syscall_times(uint64_t tms_ptr)
 {
     struct task *task = sched_current_task();
     if (!task) return -RELIEFOS_EFAULT;
+    if (tms_ptr) {
+        int prep=resource_prepare_output(task,tms_ptr,sizeof(struct linux_tms));if(prep)return prep;
+    }
     if (tms_ptr && !user_range_writable(tms_ptr, sizeof(struct linux_tms))) {
         return -RELIEFOS_EFAULT;
     }

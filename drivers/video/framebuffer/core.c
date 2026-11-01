@@ -28,6 +28,9 @@ uint64_t framebuffer_current_bytes(void)
     return (uint64_t)fb.pitch * fb.height;
 }
 
+/** @brief Record the selected boot display's physical reservation and limits.
+ * Called before sparse map construction; the future pixel alias is not touched.
+ */
 static void framebuffer_set_boot_limits(void)
 {
     uint64_t bytes = framebuffer_current_bytes();
@@ -37,8 +40,11 @@ static void framebuffer_set_boot_limits(void)
     fb.max_bytes = bytes <= UINT32_MAX ? (uint32_t)bytes : 0;
     fb.backend = FRAMEBUFFER_BACKEND_BOOT;
     fb.capabilities = 0;
-    fb.reservation_start = mm_virt_to_phys(fb.pixels);
-    fb.reservation_bytes = fb.max_bytes;
+    uint64_t address = (uintptr_t)fb.pixels;
+    fb.reservation_start = fb.available && address >= RELIEFNT_KERNEL_DIRECT_MAP_BASE &&
+        address - RELIEFNT_KERNEL_DIRECT_MAP_BASE < RELIEFNT_KERNEL_DIRECT_MAP_SIZE ?
+        address - RELIEFNT_KERNEL_DIRECT_MAP_BASE : 0;
+    fb.reservation_bytes = fb.reservation_start ? fb.max_bytes : 0;
 }
 
 /** @brief Copy the active GOP mode while firmware virtual mappings still work.
@@ -92,13 +98,18 @@ static void framebuffer_capture_gop_impl(uint64_t system_table_addr)
         uint64_t framebuffer_bytes =
             (uint64_t)gop->mode->info->pixels_per_scan_line *
             gop->mode->info->vertical_resolution * 4u;
-        if (!framebuffer_bytes ||
-            !paging_kernel_direct_map_range(gop->mode->framebuffer_base,
-                                            framebuffer_bytes)) {
+        if (!framebuffer_bytes || framebuffer_bytes > UINT32_MAX ||
+            !paging_phys_addressable(gop->mode->framebuffer_base, framebuffer_bytes) ||
+            gop->mode->framebuffer_base >= RELIEFNT_KERNEL_DIRECT_MAP_SIZE ||
+            framebuffer_bytes > RELIEFNT_KERNEL_DIRECT_MAP_SIZE - gop->mode->framebuffer_base) {
             continue;
         }
-        gop_framebuffer.pixels = (uint32_t *)mm_phys_to_virt(gop->mode->framebuffer_base);
-        if (!gop_framebuffer.pixels) continue;
+        /* Capture physical metadata before the kernel root exists. No pixels
+         * are accessed until sparse direct-map construction has completed. */
+        gop_framebuffer.pixels = (uint32_t *)(uintptr_t)(RELIEFNT_KERNEL_DIRECT_MAP_BASE +
+                                                        gop->mode->framebuffer_base);
+        gop_framebuffer.reservation_start = gop->mode->framebuffer_base;
+        gop_framebuffer.reservation_bytes = (uint32_t)framebuffer_bytes;
         gop_framebuffer.width = gop->mode->info->horizontal_resolution;
         gop_framebuffer.height = gop->mode->info->vertical_resolution;
         gop_framebuffer.pitch = gop->mode->info->pixels_per_scan_line * 4;
@@ -165,11 +176,21 @@ void framebuffer_capture_gop(uint64_t system_table_addr)
     kernel_irq_restore(irq_flags);
 }
 
+/** @brief Record the boot display and select its supported framebuffer backend.
+ * @param boot Borrowed boot description; construction of the shared map follows.
+ * Captured physical display ranges are mapped before the pixels are accessed.
+ */
 void framebuffer_init(const struct boot_info *boot)
 {
     int direct_color;
 
-    fb.pixels = (uint32_t *)mm_phys_to_virt(boot->framebuffer_addr);
+    uint64_t boot_bytes = (uint64_t)boot->framebuffer_pitch * boot->framebuffer_height;
+    bool representable = boot->framebuffer_addr && boot_bytes && boot_bytes <= UINT32_MAX &&
+        paging_phys_addressable(boot->framebuffer_addr, boot_bytes) &&
+        boot->framebuffer_addr < RELIEFNT_KERNEL_DIRECT_MAP_SIZE &&
+        boot_bytes <= RELIEFNT_KERNEL_DIRECT_MAP_SIZE - boot->framebuffer_addr;
+    fb.pixels = representable ? (uint32_t *)(uintptr_t)
+        (RELIEFNT_KERNEL_DIRECT_MAP_BASE + boot->framebuffer_addr) : NULL;
     fb.width = boot->framebuffer_width;
     fb.height = boot->framebuffer_height;
     fb.pitch = boot->framebuffer_pitch;
@@ -189,8 +210,7 @@ void framebuffer_init(const struct boot_info *boot)
     fb.available = boot->framebuffer_addr != 0 &&
                    (boot->framebuffer_bpp == 24u || boot->framebuffer_bpp == 32u) &&
                    fb.bytes_per_pixel != 0u && fb.pixels &&
-                   paging_kernel_direct_map_range(boot->framebuffer_addr,
-                       (uint64_t)boot->framebuffer_pitch * boot->framebuffer_height) &&
+                   representable &&
                    (direct_color || boot->framebuffer_type == 0u);
     if (!fb.available && gop_framebuffer.available) {
         fb = gop_framebuffer;

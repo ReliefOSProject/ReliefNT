@@ -6,6 +6,8 @@
 
 static uint8_t controller_status, controller_byte;
 static unsigned data_reads, input_events, eois;
+static unsigned apic_eois, timer_entries, timer_pic_eois, timer_apic_eois;
+static uint32_t fixture_cpu;
 static uint8_t last_key, last_pressed;
 
 uint8_t x86_64_inb(uint16_t port)
@@ -25,15 +27,18 @@ void input_handle_scancode(uint8_t key, uint8_t pressed)
     ++input_events; last_key = key; last_pressed = pressed;
 }
 void pci_irq_dispatch(uint32_t vector) { (void)vector; }
-void apic_eoi(void) {}
+void apic_eoi(void) { ++apic_eois; }
 void time_on_tick(void) {}
 uint64_t time_uptime_us(void) { return 0; }
 uint8_t input_caps_lock_active(void) { return 0; }
 struct task *userland_schedule_from_frame(struct trap_frame *frame)
 { (void)frame; return NULL; }
+struct task *userland_schedule_from_timer(struct trap_frame *frame)
+{ ++timer_entries; timer_pic_eois = eois; timer_apic_eois = apic_eois;
+  return userland_schedule_from_frame(frame); }
 void smp_release_aps(void) {}
 void driver_manager_mouse_poll(void) {}
-uint32_t smp_current_cpu(void) { return 0; }
+uint32_t smp_current_cpu(void) { return fixture_cpu; }
 void sched_on_cpu_tick(void) {}
 void smp_membarrier_poll(void) {}
 

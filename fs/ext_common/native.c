@@ -1,9 +1,13 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "../../block/core/storage_internal.h"
+#ifdef CONFIG_SWAP
+#include <reliefnt/swap_internal.h>
+#endif
 #include <reliefnt/export.h>
 #include <reliefnt/module.h>
 #include <reliefnt/page_cache.h>
 #include <reliefnt/fs_type.h>
+#include <reliefnt/syscall_internal.h>
 
 /** @brief Decode the ext-family root with the native feature-checked parser.
  * @param volume Borrowed pinned instance. @param out Required metadata output.
@@ -12,22 +16,56 @@
  */
 static int ext_native_root(struct storage_volume *volume,struct storage_node *out)
 { return storage_ext4_ops.lookup(volume,"/",out); }
+#ifdef CONFIG_SWAP
+/* Only a retained open walker can consume the private pre-I/O failure marker. */
+static bool ext_native_open_walk(void)
+{
+    struct task *task=sched_current_task();
+    if(!task || !task->lookup_scope.armed)return false;
+    struct task_lookup_scope *scope=&task->lookup_scope;
+    struct task_lookup_path *slot=&scope->paths[0];
+    if(!slot->name || !slot->walk || slot->complete || !slot->root.mount || !slot->start.mount ||
+       slot->allow_empty || slot->real_ids || slot->dirfd!=LINUX_AT_FDCWD ||
+       (slot->flags&~(VFS_LOOKUP_FOLLOW|VFS_LOOKUP_MISSING)))return false;
+    return scope->number==LINUX_SYS_OPEN ||
+        (scope->number==LINUX_SYS_OPENAT && (int32_t)scope->args[0]==LINUX_AT_FDCWD);
+}
+#endif
 /** @brief Decode one literal child from a retained ext-family parent inode.
  * @param volume Borrowed pinned instance. @param parent Actual directory node.
  * @param name Literal component. @param out Required caller metadata output.
  * @return Zero or native validation/lookup/inode errno. Execution ownership
  * required across native I/O; never resolves a diagnostic mount pathname.
+ * Successful regular-file metadata is authoritative for its resident pages.
  */
-static int ext_native_lookup(struct storage_volume *volume,const struct storage_node *parent,
-                               const char *name,struct storage_node *out)
+static int ext_native_lookup(struct storage_volume *volume,const struct storage_node *parent,const char *name,struct storage_node *out)
 {
     struct ext4_inode_view directory,found;uint64_t ino=0;
+    uint8_t *workspace=NULL;
+#ifdef CONFIG_SWAP
+    /* Reserve before parent/inode reads: a failed reservation has not
+     * submitted or completed this provider's native lookup I/O. */
+    if(volume && ext_native_open_walk() &&
+       (volume->ext4.block_size==1024 || volume->ext4.block_size==2048 || volume->ext4.block_size==4096)) {
+        workspace=kernel_malloc(3u*volume->ext4.block_size);
+        if(!workspace){return VFS_NATIVE_LOOKUP_RECLAIM;}
+    }
+#endif
     int rc=storage_ext4_check_node(volume,parent,&directory);
     if(!rc && (directory.mode&0170000)!=0040000)rc=-ENOTDIR;
-    if(!rc)rc=storage_ext4_dir_lookup(volume,parent->first_cluster,name,&ino,NULL);
-    if(!rc)rc=storage_ext4_read_inode(volume,ino,&found);
-    if(!rc)storage_ext4_node_from_inode(volume,ino,&found,out);
-    return rc;
+    if(!rc){
+        rc=workspace ? storage_ext4_dir_lookup_prepared(volume,parent->first_cluster,name,&ino,NULL,workspace) :
+            storage_ext4_dir_lookup(volume,parent->first_cluster,name,&ino,NULL);
+    }
+    if(!rc){
+        rc=storage_ext4_read_inode(volume,ino,&found);
+    }
+    if(!rc) {
+        storage_ext4_node_from_inode(volume,ino,&found,out);
+        if(out && (found.mode&LINUX_S_IFMT)==LINUX_S_IFREG)
+            page_cache_resize_node(out,found.size,found.size);
+    }
+    kernel_free(workspace);return rc;
 }
 /** @brief Read a retained ext-family symlink without name resolution.
  * @param volume Borrowed pinned instance. @param node Retained symlink inode.
@@ -124,10 +162,13 @@ static int ext_native_permissions(struct storage_volume *volume,const struct sto
  * @param value Required caller-owned stat output, unspecified on error.
  * @return Zero or native inode errno. Execution ownership required across I/O;
  * generation, high uid/gid words and native device-node identity are preserved.
+ * A successfully checked regular inode also publishes its current cache size.
  */
 static int ext_native_stat(struct storage_volume *volume,const struct storage_node *node,struct linux_stat_abi *value)
 {
     struct ext4_inode_view inode;int rc=storage_ext4_check_node(volume,node,&inode);if(rc)return rc;
+    if ((inode.mode&LINUX_S_IFMT)==LINUX_S_IFREG)
+        page_cache_resize_node(node,inode.size,inode.size);
     *value = (struct linux_stat_abi){0};
     value->st_dev = storage_volume_device_number(volume);
     value->st_ino = node->first_cluster;
@@ -238,8 +279,9 @@ static int ext_native_put_inode(struct storage_volume *volume,const struct stora
     if(!unlinked)return 0;
     struct ext4_inode_view inode;int rc=storage_ext4_check_node(volume,node,&inode);if(rc)return rc;
     if(inode.links_count)return 0;
-    page_cache_invalidate_node(node);
-    return storage_ext4_destroy_inode(volume,node->first_cluster);
+    rc=storage_ext4_destroy_inode(volume,node->first_cluster);
+    if(!rc)page_cache_forget_node(node);
+    return rc;
 }
 /** @brief Write an authorized retained native file after core writer admission.
  * @param volume Borrowed selected/pinned instance. @param node Actual mutable inode.
@@ -293,9 +335,10 @@ static int ext_native_remove(struct storage_volume *volume,const struct storage_
 {
     struct storage_inode_ref *pin=storage_inode_find(volume->volume_id,node->first_cluster);
     bool held=pin && pin->references;
-    int rc=storage_ext4_unlink_held(volume,parent->first_cluster,name,directory,held);
+    bool destroyed=false;
+    int rc=storage_ext4_unlink_held(volume,parent->first_cluster,name,directory,held,&destroyed);
     if(!rc && held)pin->unlinked=true;
-    if(!rc && !held)page_cache_invalidate_node(node);
+    if(!rc && destroyed)page_cache_forget_node(node);
     return rc;
 }
 /** @brief Rename verified native members using the core's preheld graph operands.
@@ -308,11 +351,12 @@ static int ext_native_rename(struct storage_volume *volume,const struct storage_
 {
     struct storage_inode_ref *pin=args->target ? storage_inode_find(volume->volume_id,args->target->first_cluster) : NULL;
     bool held=pin && pin->references;
+    bool destroyed=false;
     int rc=storage_ext4_rename_held(volume,args->old_parent->first_cluster,args->old_name,
-        args->new_parent->first_cluster,args->new_name,held);
+        args->new_parent->first_cluster,args->new_name,held,&destroyed);
     *args->committed=!rc;
     if(!rc && held)pin->unlinked=true;
-    if(!rc && args->target && !held)page_cache_invalidate_node(args->target);
+    if(!rc && args->target && destroyed)page_cache_forget_node(args->target);
     return rc;
 }
 /** @brief Publish a hard link to the actual retained native inode.
@@ -327,38 +371,124 @@ static int ext_native_link(struct storage_volume *volume,const struct storage_no
     return storage_ext4_link(volume,parent->first_cluster,name,source->first_cluster);
 }
 /** @brief Evict native raw aliases before a physical sector write is submitted.
- * @param writer Borrowed physical identity, possibly without a mounted codec.
+ * @param writer Optional borrowed volume. @param device Optional borrowed physical
+ * identity; at least one is present and neither is retained.
  * @param lba First physical sector. @param sectors Written sector count.
  * @return None. IRQ-safe under execution/optional transport lock, no allocation
  * or I/O. Journal-owned dirty data follows its existing cache ownership rules.
  */
-static void ext_native_invalidate_write(const struct storage_volume *writer,uint64_t lba,uint32_t sectors)
+static void ext_native_invalidate_write(const struct storage_volume *writer,const struct block_device *device,
+                                         uint64_t lba,uint32_t sectors)
 {
-    ext2_cache_invalidate_range(lba,sectors);
-    storage_ext4_cache_invalidate_write(writer,lba,sectors);
+    ext2_cache_invalidate_range(writer,device,lba,sectors);
+    storage_ext4_cache_invalidate_write(writer,device,lba,sectors);
 }
+/** @brief Reconcile one already committed ext zero range with resident pages.
+ * @param context Borrowed stable inode. @param offset First committed byte.
+ * @param length Committed byte count. @return None; no provider I/O.
+ */
+static void ext_native_zero_committed(void *context,uint64_t offset,uint64_t length)
+{ page_cache_zero_range(context,offset,length); }
+
 /** @brief Change native ext allocation and refresh the retained inode size.
  * @param volume Borrowed selected/pinned instance. @param node Actual retained file.
  * @param mode Validated Linux fallocate mode. @param offset Range start.
  * @param len Range length.
  * @return Zero or native validation/allocation/I/O errno. Caller owns execution
- * and authorization; invalidates data cache after successful native mutation,
- * no graph/module lock spans provider I/O and failures remain observable.
+ * and authorization; each committed zero/punch range is reconciled even if a
+ * later provider operation or metadata refresh fails. After a potentially
+ * growing provider error, a successful same-generation nonshrinking inode
+ * reread publishes its actual size while the original provider errno is
+ * retained. An inconsistent reread cannot discard data. No graph lock spans I/O.
  */
 static int ext_native_fallocate(struct storage_volume *volume,struct storage_node *node,uint32_t mode,uint64_t offset,uint64_t len)
 {
     struct ext4_inode_view in;int ret=0;
     if (!ret) ret=storage_ext4_check_node(volume,node,&in);
     if (!ret && (in.mode&0170000)!=0100000) ret=-RELIEFOS_EINVAL;
-    if (!ret) ret=storage_ext4_fallocate(volume,node->first_cluster,mode,offset,len);
     if (!ret) {
+        ret=storage_ext4_fallocate_observed(volume,node->first_cluster,mode,offset,len,
+                                            ext_native_zero_committed,node);
+        if (ret<0 && (mode==0 || mode==16) && len && len<=UINT64_MAX-offset && offset+len>in.size) {
+            struct ext4_inode_view committed;
+            if (!storage_ext4_read_inode(volume,node->first_cluster,&committed) &&
+                committed.generation==in.generation && committed.size>=in.size) {
+                page_cache_resize_node(node,in.size,committed.size);
+                storage_cache_invalidate();
+                node->size=committed.size;
+            }
+        }
+    }
+    if (!ret) {
+        if (!(mode&1u) && len<=UINT64_MAX-offset && offset+len>in.size)
+            page_cache_resize_node(node,in.size,offset+len);
         page_cache_invalidate_node(node); storage_cache_invalidate();
         ret=storage_ext4_read_inode(volume,node->first_cluster,&in);
         if (!ret) node->size=in.size;
     }
     return ret;
 }
+#ifdef CONFIG_SWAP
+/** @brief Query initialized or unwritten ext blocks without allocating them.
+ * @param volume Selected native instance. @param node Claimed exact inode.
+ * @param offset Filesystem-block-aligned logical byte offset. @param out Result.
+ * @return Zero or negative errno. Holes and unsupported inode encodings fail;
+ * reported physical sectors include the retained partition's first LBA.
+ */
+static int ext_native_swap_extent(struct storage_volume *volume,const struct storage_node *node,
+                                  uint64_t offset,struct swap_storage_extent *out)
+{
+    struct ext4_inode_view in;int rc=storage_ext4_check_node(volume,node,&in);if (rc) return rc;
+    uint32_t bs=volume->ext4.block_size;
+    if ((in.mode&0170000)!=0100000 || !bs || bs%512 || offset%bs || offset>=in.size ||
+        (in.flags&(0x00000004u|0x00000800u|0x00100000u|0x10000000u))) return -EOPNOTSUPP;
+    struct storage_ext4_map_result map;
+    rc=storage_ext4_map_block(volume,node->first_cluster,&in,offset/bs,false,&map);if (rc) return rc;
+    if (map.hole || !map.length) return -EINVAL;
+    uint64_t ratio=bs/512,blocks=(in.size-offset)/512;
+    uint64_t physical=map.physical*ratio,length=(uint64_t)map.length*ratio;
+    if (map.physical>UINT64_MAX/ratio || physical>=volume->ext_sector_count ||
+        length>volume->ext_sector_count-physical || volume->ext_start_lba>UINT64_MAX-physical) return -EIO;
+    if (length>blocks) length=blocks;
+    if (!length) return -EINVAL;
+    *out=(struct swap_storage_extent){.logical=offset/512,
+        .physical=volume->ext_start_lba+physical,.length=length,.unwritten=map.unwritten};
+    return 0;
+}
+
+/** @brief Materialize only already allocated unwritten ext blocks as zeroes.
+ * @param volume Selected native instance. @param node Claimed exact inode.
+ * @param offset First aligned byte. @param length Aligned bytes inside the file.
+ * @return Zero or native validation/allocation/journal/I/O errno. Earlier
+ * successful zero conversions remain valid if a later step fails. Activation
+ * must sync the provider before publishing its final fixed extent snapshot.
+ */
+static int ext_native_swap_initialize(struct storage_volume *volume,const struct storage_node *node,
+                                      uint64_t offset,uint64_t length)
+{
+    uint32_t bs=volume->ext4.block_size;
+    if (!bs || offset%bs || !length || length%bs || length>UINT64_MAX-offset) return -EINVAL;
+    uint8_t *zero=kernel_malloc(4096);if (!zero) return -ENOMEM;
+    for (uint32_t i=0;i<4096;++i)zero[i]=0;
+    uint64_t end=offset+length;int rc=0;
+    while (offset<end) {
+        struct swap_storage_extent extent;
+        rc=ext_native_swap_extent(volume,node,offset,&extent);
+        if (rc || !extent.unwritten) {if (!rc)rc=-EINVAL;break;}
+        uint64_t n=extent.length*512;if (n>end-offset)n=end-offset;if (n>4096)n=4096;
+        uint32_t done=0;rc=storage_ext4_write_file_range(volume,node->first_cluster,offset,zero,(uint32_t)n,&done);
+        if (rc || done!=n) {if (!rc)rc=-EIO;break;}
+        offset+=n;
+    }
+    kernel_free(zero);return rc;
+}
+#endif
+
 const struct storage_filesystem_ops storage_ext_ops={
+#ifdef CONFIG_SWAP
+    .swap_extent=ext_native_swap_extent,
+    .swap_initialize=ext_native_swap_initialize,
+#endif
     .fallocate=ext_native_fallocate,
     .sync=storage_ext4_sync,
     .invalidate_write=ext_native_invalidate_write,

@@ -5,6 +5,9 @@
 #include <reliefnt/heap.h>
 #include <reliefnt/time.h>
 #include <reliefnt/usercopy.h>
+#ifdef CONFIG_SWAP
+#include <reliefnt/swap.h>
+#endif
 #include <linux/time.h>
 #include <linux/sched.h>
 #include <linux/capability.h>
@@ -64,6 +67,16 @@ static uint64_t sem_monotonic(void)
 static int sem_copy_in(void *destination, uint64_t pointer, uint64_t length)
 {
     if (length > UINT64_MAX - pointer) return -LINUX_EFAULT;
+#ifdef CONFIG_SWAP
+    if (!length) return 0;
+    if (length > INT32_MAX) return -LINUX_EFAULT;
+    struct task_user_text snapshot;
+    int result = task_lookup_user_bytes(sched_current_task(), pointer, (uint32_t)length, &snapshot);
+    if (result) return result;
+    __builtin_memcpy(destination, snapshot.text, length);
+    kernel_free(snapshot.allocation);
+    return 0;
+#else
     unsigned char *out = destination;
     while (length) {
         uint64_t take = 4096 - (pointer & 4095);
@@ -73,7 +86,31 @@ static int sem_copy_in(void *destination, uint64_t pointer, uint64_t length)
         out += take; pointer += take; length -= take;
     }
     return 0;
+#endif
 }
+
+#ifdef CONFIG_SWAP
+/** @brief Prepare a bounded semctl output, one at-most-32KiB slice at a time.
+ * @param task Execution-owned calling task. @param pointer User output.
+ * @param length Actual output length, bounded by twice SEMMSL.
+ * @return Zero, EFAULT, or the private prerequisite-wait marker. No array
+ * state is changed; GETALL can retry before copying any result bytes.
+ */
+static int sem_prepare_output(struct task *task, uint64_t pointer, uint64_t length)
+{
+    if (!length) return 0;
+    if (pointer < RELIEFNT_USER_BASE || pointer >= RELIEFNT_USER_TOP ||
+        length > RELIEFNT_USER_TOP - pointer) return -LINUX_EFAULT;
+    while (length) {
+        uint64_t take = length < 32768 ? length : 32768;
+        int result = swap_prepare_user_range(task, pointer, take, true);
+        if (result == SWAP_STORAGE_CONTENDED) return KERNEL_SYSCALL_SWAP_CONTENDED;
+        if (result < 0) return -LINUX_EFAULT;
+        pointer += take; length -= take;
+    }
+    return 0;
+}
+#endif
 
 /** @brief Apply ipcperms using effective UID, fsgid and supplementary groups. */
 static bool sem_permitted(const struct task *task, const struct sysv_sem_array *a, uint32_t flags)
@@ -442,7 +479,10 @@ static int64_t sem_operate(struct task *task, uint32_t number, int32_t id,
         return sem_park(w);
     }
     struct linux_timespec duration;
-    if (timeout && sem_copy_in(&duration, timeout, sizeof(duration))) return -LINUX_EFAULT;
+    if (timeout) {
+        int result = sem_copy_in(&duration, timeout, sizeof(duration));
+        if (result) return result;
+    }
     if (count > LINUX_SEMOPM) return -LINUX_E2BIG;
     if (!count) return -LINUX_EINVAL;
     *w = (struct task_sysv_sem_state){.task = task, .number = number, .count = count,
@@ -545,6 +585,12 @@ static int sem_all(struct task *task, struct sysv_sem_array *a, uint64_t pointer
         a->stat.sem_ctime = sem_wall_time(); sem_update(a, NULL, 0, false);
     } else {
         for (uint32_t i = 0; i < n; ++i) values[i] = a->values[i].value;
+#ifdef CONFIG_SWAP
+        /* Permanent faults still follow the original partial-copy path. */
+        if (sem_prepare_output(task, pointer, n * sizeof(*values)) == KERNEL_SYSCALL_SWAP_CONTENDED) {
+            error = KERNEL_SYSCALL_SWAP_CONTENDED; goto out;
+        }
+#endif
         error = user_copy_to_task(task, pointer, values, n * sizeof(*values));
     }
 out:
@@ -564,6 +610,10 @@ static int64_t sem_control(struct task *task, int32_t id, int32_t index, int32_t
             .semvmx = LINUX_SEMVMX, .semaem = cmd == LINUX_SEM_INFO ? (int32_t)sem_used : LINUX_SEMVMX};
         int32_t maximum = SEM_ID_SLOTS - 1;
         while (maximum > 0 && !sem_ids[maximum]) --maximum;
+#ifdef CONFIG_SWAP
+        int prep = sem_prepare_output(task, arg, sizeof(info));
+        if (prep) return prep;
+#endif
         int error = user_copy_to_task(task, arg, &info, sizeof(info));
         return error ? error : maximum;
     }
@@ -571,7 +621,10 @@ static int64_t sem_control(struct task *task, int32_t id, int32_t index, int32_t
     bool owner = cmd == LINUX_IPC_SET || cmd == LINUX_IPC_RMID;
     if (!stat && !owner && (cmd < LINUX_GETPID || cmd > LINUX_SETALL)) return -LINUX_EINVAL;
     struct linux_semid64_ds input;
-    if (cmd == LINUX_IPC_SET && sem_copy_in(&input, arg, sizeof(input))) return -LINUX_EFAULT;
+    if (cmd == LINUX_IPC_SET) {
+        int error = sem_copy_in(&input, arg, sizeof(input));
+        if (error) return error;
+    }
     int32_t value = (int32_t)arg;
     if (cmd == LINUX_SETVAL && (value < 0 || value > LINUX_SEMVMX)) return -LINUX_ERANGE;
     struct sysv_sem_array *a = sem_find(id, cmd != LINUX_SEM_STAT && cmd != LINUX_SEM_STAT_ANY);
@@ -594,6 +647,10 @@ static int64_t sem_control(struct task *task, int32_t id, int32_t index, int32_t
         output.sem_otime = a->values[0].otime;
         for (uint32_t i = 1; i < output.sem_nsems; ++i)
             if (a->values[i].otime > output.sem_otime) output.sem_otime = a->values[i].otime;
+#ifdef CONFIG_SWAP
+        int prep = sem_prepare_output(task, arg, sizeof(output));
+        if (prep) return prep;
+#endif
         int error = user_copy_to_task(task, arg, &output, sizeof(output));
         return error ? error : cmd == LINUX_IPC_STAT ? 0 : a->id;
     }

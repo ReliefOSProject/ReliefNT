@@ -5,6 +5,20 @@
 #include <reliefnt/syscall.h>
 #include <reliefnt/syscall_internal.h>
 #include <reliefnt/usercopy.h>
+#ifdef CONFIG_SWAP
+#include <reliefnt/paging.h>
+
+/** @brief Check an event buffer's numerical user aperture without faulting it.
+ * @param address User byte address. @param length Declared capacity.
+ * @return True for an empty range or a wholly in-aperture range. The current
+ * event provider has no event payload to copy, so no mapping is touched.
+ */
+static bool drm_event_aperture(uint64_t address,uint64_t length)
+{
+    return !length || (address>=RELIEFNT_USER_BASE && address<RELIEFNT_USER_TOP &&
+                        length<=RELIEFNT_USER_TOP-address);
+}
+#endif
 #include <reliefos/fs_abi.h>
 #include <linux/uio.h>
 
@@ -25,7 +39,11 @@ int64_t drm_event_read(struct task *task, struct task_file *file,
     uint32_t request_len;
     if (!file || !file->drm_file || !file_can_read(file))
         return -RELIEFOS_EBADF;
+#ifdef CONFIG_SWAP
+    if (!drm_event_aperture(buffer,length)) return -RELIEFOS_EFAULT;
+#else
     if (!user_range_writable(buffer, length)) return -RELIEFOS_EFAULT;
+#endif
     request_len = length > RELIEFOS_FS_IO_SLICE_BYTES
         ? RELIEFOS_FS_IO_SLICE_BYTES : (uint32_t)length;
     return drm_file_read(task, file, (void *)(uintptr_t)buffer, request_len);
@@ -62,10 +80,15 @@ int64_t drm_event_readv(struct task *task, struct task_file *file,
     for (uint64_t i = 0; i < iovcnt; ++i) {
         uint64_t length = iov[i].iov_len;
         if ((int64_t)length < 0) return -RELIEFOS_EINVAL;
+#ifdef CONFIG_SWAP
+        if (!drm_event_aperture((uintptr_t)iov[i].iov_base,length)) return -RELIEFOS_EFAULT;
+#endif
         if (length > 0x7ffff000u - requested)
             length = 0x7ffff000u - requested;
+#ifndef CONFIG_SWAP
         if (length && !user_range_writable((uintptr_t)iov[i].iov_base, length))
             return -RELIEFOS_EFAULT;
+#endif
         requested += length;
     }
     for (uint64_t i = 0; i < iovcnt && requested; ++i) {

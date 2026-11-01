@@ -2,4 +2,7 @@
 # Objects are owned by this directory; child modules own their own lists.
 obj-y := device_number.o volume.o storage_block.o storage_state.o storage_state_data.o storage_sync.o
 
+obj-$(CONFIG_SWAP) += storage_swap.o
+
+
 include $(srctree)/scripts/Makefile.module

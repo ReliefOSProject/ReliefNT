@@ -27,7 +27,16 @@
 #include "audio_device_fixture.h"
 
 /* Host allocator boundary; descriptor growth stays in the real scheduler. */
-void *kernel_malloc(uint64_t size) { return malloc(size); }
+#ifdef TASK12_FORK_RECLAIM_FIXTURE
+extern bool task12_fork_heap_admit(uint64_t size);
+#endif
+void *kernel_malloc(uint64_t size)
+{
+#ifdef TASK12_FORK_RECLAIM_FIXTURE
+    if (!task12_fork_heap_admit(size)) return NULL;
+#endif
+    return malloc(size);
+}
 void kernel_free(void *pointer) { free(pointer); }
 
 static struct audio_test_card *wait_card;

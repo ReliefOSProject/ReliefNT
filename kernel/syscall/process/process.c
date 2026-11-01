@@ -11,6 +11,8 @@
 #include <reliefnt/syscall.h>
 #include <reliefnt/time.h>
 #include <reliefnt/usercopy.h>
+#include <reliefnt/swap.h>
+#include <reliefnt/syscall_internal.h>
 #include <reliefnt/version.h>
 #include <reliefnt/uts.h>
 #include <reliefnt/arch.h>
@@ -38,6 +40,19 @@
      MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED | MEMBARRIER_CMD_GET_REGISTRATIONS | \
      MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE)
 
+/** @brief Prepare a small signal or process operand before its first access.
+ * @param task Current user task. @param address User address. @param size Bytes.
+ * @param writing True for output. @return Zero, EFAULT, or private contention.
+ * Called only at the outer syscall writer, before any affected state change.
+ */
+static int process_prepare_user(struct task *task, uint64_t address, uint64_t size,
+                                bool writing)
+{
+    int rc = swap_prepare_user_range(task, address, size, writing);
+    if (rc == SWAP_STORAGE_CONTENDED) return KERNEL_SYSCALL_SWAP_CONTENDED;
+    return rc < 0 ? -LINUX_EFAULT : 0;
+}
+
 /**
  * @brief Implement Linux get/set/prlimit ordering and process-wide limit updates.
  * Input is captured before an overlapping old-limit output is written. Linux
@@ -54,12 +69,37 @@ static int64_t process_resource_limit(uint64_t number, uint64_t a0, uint64_t a1,
     bool setting = new_pointer || number == LINUX_SYS_SETRLIMIT;
     struct linux_rlimit64 next, previous;
     if (setting) {
+#ifdef CONFIG_SWAP
+        if (caller && caller->lookup_scope.armed) {
+            struct task_user_text snapshot={0};
+            int prep=task_lookup_user_bytes(caller,new_pointer,sizeof(next),&snapshot);
+            if(prep)return prep;
+            __builtin_memcpy(&next,snapshot.text,sizeof(next));
+        } else
+#endif
+        {
+        int prep = process_prepare_user(caller, new_pointer, sizeof(next), false);
+        if (prep) return prep;
         if (!user_range_ok(new_pointer, sizeof(next))) return -LINUX_EFAULT;
         /* User buffers need not have natural alignment. */
         for (uint32_t i = 0; i < sizeof(next); ++i)
             ((uint8_t *)&next)[i] = ((const uint8_t *)(uintptr_t)new_pointer)[i];
+        }
     }
-    struct task *target = combined && (uint32_t)a0 ? sched_find((uint32_t)a0) : caller;
+    struct task *target;
+#ifdef CONFIG_SWAP
+    struct task_lookup_path *identity_slot=NULL;
+    if(combined && (uint32_t)a0 && caller && caller->lookup_scope.armed) {
+        int rc=task_lookup_scope_next(caller,&identity_slot);if(rc)return rc;
+        if(identity_slot->name &&
+           (identity_slot->flags!=TASK_LOOKUP_PRLIMIT_IDENTITY_KIND ||
+            identity_slot->dirfd!=(int32_t)(uint32_t)a0))return -LINUX_EINVAL;
+    }
+    if(identity_slot && identity_slot->name)
+        target=sched_task_identity_task((struct task_identity *)identity_slot->name);
+    else
+#endif
+        target=combined && (uint32_t)a0 ? sched_find((uint32_t)a0) : caller;
     if (!target) return -LINUX_ESRCH;
     if (combined && caller != target && !(caller->cap_effective & (1ULL << CAP_SYS_RESOURCE)) &&
         (caller->uid != target->uid || caller->uid != target->euid || caller->uid != target->suid ||
@@ -83,6 +123,20 @@ static int64_t process_resource_limit(uint64_t number, uint64_t a0, uint64_t a1,
     else return -LINUX_ENOSYS;
     if (setting && next.rlim_max > stored->rlim_max &&
         !(caller->cap_effective & (1ULL << CAP_SYS_RESOURCE))) return -LINUX_EPERM;
+    if ((old_pointer || number == LINUX_SYS_GETRLIMIT) &&
+        process_prepare_user(caller, old_pointer, sizeof(previous), true) ==
+            KERNEL_SYSCALL_SWAP_CONTENDED) {
+#ifdef CONFIG_SWAP
+        if(identity_slot && !identity_slot->name) {
+            struct task_identity *identity=NULL;
+            int rc=sched_task_identity_get(target,&identity);if(rc)return rc;
+            identity_slot->name=(char *)identity;
+            identity_slot->flags=TASK_LOOKUP_PRLIMIT_IDENTITY_KIND;
+            identity_slot->dirfd=(int32_t)(uint32_t)a0;
+        }
+#endif
+        return KERNEL_SYSCALL_SWAP_CONTENDED;
+    }
     previous = *stored;
     if (setting) *stored = next;
     if (old_pointer || number == LINUX_SYS_GETRLIMIT) {
@@ -142,6 +196,8 @@ int64_t syscall_linux_signal(uint64_t number, uint64_t signal_number,
         if (task->signal_stack_size) old.flags = task->signal_stack_flags | (on_stack ? 1 : 0);
         struct linux_sigaltstack requested;
         if (signal_number) {
+            int prep = process_prepare_user(task, signal_number, sizeof(requested), false);
+            if (prep) return prep;
             if (!user_range_ok(signal_number, sizeof(requested))) return -RELIEFOS_EFAULT;
             requested = *(const struct linux_sigaltstack *)(uintptr_t)signal_number;
             if (on_stack) return -RELIEFOS_EPERM;
@@ -151,6 +207,10 @@ int64_t syscall_linux_signal(uint64_t number, uint64_t signal_number,
                 if (requested.sp >= RELIEFNT_USER_TOP || requested.size > RELIEFNT_USER_TOP - requested.sp)
                     return -RELIEFOS_EINVAL;
             }
+        }
+        if (action_ptr) {
+            int prep = process_prepare_user(task, action_ptr, sizeof(old), true);
+            if (prep) return prep;
         }
         if (action_ptr && !user_range_writable(action_ptr, sizeof(old))) return -RELIEFOS_EFAULT;
         if (signal_number) {
@@ -163,6 +223,8 @@ int64_t syscall_linux_signal(uint64_t number, uint64_t signal_number,
     }
     if (number == LINUX_SYS_RT_SIGPENDING) {
         if (action_ptr != 8) return -RELIEFOS_EINVAL;
+        int prep = process_prepare_user(task, signal_number, 8, true);
+        if (prep) return prep;
         if (!user_range_writable(signal_number, 8)) return -RELIEFOS_EFAULT;
         *(uint64_t *)(uintptr_t)signal_number = sched_task_pending(task) & task->blocked_signals;
         return 0;
@@ -170,6 +232,10 @@ int64_t syscall_linux_signal(uint64_t number, uint64_t signal_number,
     if (number == LINUX_SYS_RT_SIGSUSPEND) {
         uint64_t requested_mask;
         if (action_ptr != sizeof(uint64_t)) return -RELIEFOS_EINVAL;
+        if (signal_number) {
+            int prep = process_prepare_user(task, signal_number, sizeof(uint64_t), false);
+            if (prep) return prep;
+        }
         if (!signal_number || !user_range_ok(signal_number, sizeof(uint64_t))) {
             return -RELIEFOS_EFAULT;
         }
@@ -187,12 +253,26 @@ int64_t syscall_linux_signal(uint64_t number, uint64_t signal_number,
         uint64_t old = task->blocked_signals;
         if (mask_ptr != sizeof(uint64_t)) return -RELIEFOS_EINVAL;
         if (action_ptr) {
+#ifdef CONFIG_SWAP
+            if(task->lookup_scope.armed) {
+                struct task_user_text snapshot={0};
+                int prep=task_lookup_user_bytes(task,action_ptr,sizeof(set),&snapshot);
+                if(prep)return prep;
+                __builtin_memcpy(&set,snapshot.text,sizeof(set));
+            } else
+#endif
+            {
+            int prep = process_prepare_user(task, action_ptr, sizeof(uint64_t), false);
+            if (prep) return prep;
             if (!user_range_ok(action_ptr, sizeof(uint64_t))) return -RELIEFOS_EFAULT;
-            set = *(const uint64_t *)(uintptr_t)action_ptr;
+            __builtin_memcpy(&set,(const void *)(uintptr_t)action_ptr,sizeof(set));
+            }
         }
         if (old_action_ptr) {
+            int prep = process_prepare_user(task, old_action_ptr, sizeof(uint64_t), true);
+            if (prep) return prep;
             if (!user_range_writable(old_action_ptr, sizeof(uint64_t))) return -RELIEFOS_EFAULT;
-            *(uint64_t *)(uintptr_t)old_action_ptr = old;
+            __builtin_memcpy((void *)(uintptr_t)old_action_ptr,&old,sizeof(old));
         }
         /* Linux: SIG_BLOCK=0, SIG_UNBLOCK=1, SIG_SETMASK=2. */
         if (!action_ptr) return 0;
@@ -213,6 +293,14 @@ int64_t syscall_linux_signal(uint64_t number, uint64_t signal_number,
         if (signal_number == 0 || signal_number >= LINUX_NSIG || signal_number == 9 ||
             signal_number == 19) return -RELIEFOS_EINVAL;
         if (mask_ptr != sizeof(uint64_t)) return -RELIEFOS_EINVAL;
+        if (action_ptr) {
+            int prep = process_prepare_user(task, action_ptr, sizeof(request), false);
+            if (prep) return prep;
+        }
+        if (old_action_ptr) {
+            int prep = process_prepare_user(task, old_action_ptr, sizeof(request), true);
+            if (prep) return prep;
+        }
         if (action_ptr && !user_range_ok(action_ptr, sizeof(request))) return -RELIEFOS_EFAULT;
         if (old_action_ptr && !user_range_writable(old_action_ptr, sizeof(request))) return -RELIEFOS_EFAULT;
         if (action_ptr) {
@@ -249,12 +337,15 @@ int64_t syscall_process_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
         task->pdeath_signal = (uint32_t)arg2;
         return 0;
     case LINUX_PR_GET_PDEATHSIG:
+        { int prep=process_prepare_user(task,arg2,sizeof(int),true);if(prep)return prep; }
         if (!user_range_writable(arg2, sizeof(int))) return -RELIEFOS_EFAULT;
         *(int *)(uintptr_t)arg2 = (int)task->pdeath_signal;
         return 0;
     case LINUX_PR_SET_NAME: {
         char name[16] = {0};
         for (unsigned i = 0; i < sizeof(name) - 1; ++i) {
+            if (arg2 > UINT64_MAX - i) return -RELIEFOS_EFAULT;
+            int prep=process_prepare_user(task,arg2+i,1,false);if(prep)return prep;
             if (!user_range_ok(arg2 + i, 1)) return -RELIEFOS_EFAULT;
             name[i] = *(const char *)(uintptr_t)(arg2 + i);
             if (!name[i]) break;
@@ -265,6 +356,7 @@ int64_t syscall_process_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
         return 0;
     }
     case LINUX_PR_GET_NAME:
+        { int prep=process_prepare_user(task,arg2,16,true);if(prep)return prep; }
         if (!user_range_writable(arg2, 16)) return -RELIEFOS_EFAULT;
         __builtin_memcpy((void *)(uintptr_t)arg2, task->name_storage, 16);
         return 0;
@@ -337,12 +429,15 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
         struct __user_cap_data_struct data[2] = {{0}};
         uint32_t words;
         uint64_t requested;
-        if (!task || !a0 || !user_range_ok(a0, sizeof(header))) return -LINUX_EFAULT;
+        if (!task || !a0) return -LINUX_EFAULT;
+        int prep=process_prepare_user(task,a0,sizeof(header),false);if(prep)return prep;
+        if (!user_range_ok(a0, sizeof(header))) return -LINUX_EFAULT;
         __builtin_memcpy(&header, (const void *)(uintptr_t)a0, sizeof(header));
         if (header.version == _LINUX_CAPABILITY_VERSION_1) words = 1;
         else if (header.version == _LINUX_CAPABILITY_VERSION_2 ||
                  header.version == _LINUX_CAPABILITY_VERSION_3) words = 2;
         else {
+            prep=process_prepare_user(task,a0,sizeof(header.version),true);if(prep)return prep;
             if (!user_range_writable(a0, sizeof(header.version))) return -LINUX_EFAULT;
             header.version = _LINUX_CAPABILITY_VERSION_3;
             __builtin_memcpy((void *)(uintptr_t)a0, &header.version, sizeof(header.version));
@@ -356,6 +451,7 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
                 task = sched_find((uint32_t)header.pid);
                 if (!task) return -LINUX_ESRCH;
             }
+            prep=process_prepare_user(sched_current_task(),a1,words*sizeof(data[0]),true);if(prep)return prep;
             if (!user_range_writable(a1, words * sizeof(data[0]))) return -LINUX_EFAULT;
             data[0].effective = (uint32_t)task->cap_effective;
             data[0].permitted = (uint32_t)task->cap_permitted;
@@ -369,6 +465,7 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
             return 0;
         }
         if (header.pid && (uint32_t)header.pid != task->pid) return -LINUX_EPERM;
+        prep=process_prepare_user(task,a1,words*sizeof(data[0]),false);if(prep)return prep;
         if (!user_range_ok(a1, words * sizeof(data[0]))) return -LINUX_EFAULT;
         __builtin_memcpy(data, (const void *)(uintptr_t)a1, words * sizeof(data[0]));
         requested = (uint64_t)data[0].permitted | ((uint64_t)data[1].permitted << 32);
@@ -482,6 +579,9 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
         struct task *task = sched_current_task();
         uint32_t values[3];
         if (!task) return -LINUX_ESRCH;
+        int prep=process_prepare_user(task,a0,sizeof(uint32_t),true);if(prep)return prep;
+        prep=process_prepare_user(task,a1,sizeof(uint32_t),true);if(prep)return prep;
+        prep=process_prepare_user(task,a2,sizeof(uint32_t),true);if(prep)return prep;
         if (!user_range_writable(a0, sizeof(uint32_t)) ||
             !user_range_writable(a1, sizeof(uint32_t)) ||
             !user_range_writable(a2, sizeof(uint32_t))) return -RELIEFOS_EFAULT;
@@ -606,6 +706,7 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
         struct task *target = a0 ? sched_find((uint32_t)a0) : current;
         if (!target || target->state == TASK_EXITED) return -LINUX_ESRCH;
         if (number == LINUX_SYS_SCHED_GETSCHEDULER) return SCHED_OTHER;
+        int prep=process_prepare_user(current,a1,sizeof(int32_t),true);if(prep)return prep;
         if (!user_range_writable(a1, sizeof(int32_t))) return -LINUX_EFAULT;
         *(int32_t *)(uintptr_t)a1 = 0;
         return 0;
@@ -621,6 +722,7 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
         if (policy != SCHED_OTHER) return -RELIEFOS_EINVAL;
         if (current->euid && current != target && current->euid != target->uid &&
             current->euid != target->euid) return -RELIEFOS_EPERM;
+        int prep=process_prepare_user(current,param_ptr,sizeof(priority),false);if(prep)return prep;
         if (!user_range_ok(param_ptr, sizeof(priority))) return -RELIEFOS_EFAULT;
         priority = *(const int32_t *)(uintptr_t)param_ptr;
         if (priority != 0) return -RELIEFOS_EINVAL;
@@ -633,6 +735,7 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
         struct task *target = a0 ? sched_find((uint32_t)a0) : current;
         uint64_t tick_ns = 1000000000ULL / RELIEFNT_TICK_HZ;
         if (!current || !target || target->state == TASK_EXITED) return -LINUX_ESRCH;
+        int prep=process_prepare_user(current,a1,sizeof(struct linux_timespec),true);if(prep)return prep;
         if (!user_range_writable(a1, sizeof(struct linux_timespec))) return -RELIEFOS_EFAULT;
         ((struct linux_timespec *)(uintptr_t)a1)->tv_sec = 0;
         ((struct linux_timespec *)(uintptr_t)a1)->tv_nsec = (int64_t)tick_ns;
@@ -648,6 +751,7 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
         if (a3 != 0) return -RELIEFOS_EINVAL;
         if (user_size < SCHED_ATTR_SIZE_VER0) return -RELIEFOS_EINVAL;
         if (user_size > 4096U) return -RELIEFOS_E2BIG;
+        int prep=process_prepare_user(current,a1,user_size,true);if(prep)return prep;
         if (!user_range_writable(a1, user_size)) return -RELIEFOS_EFAULT;
         attr.size = sizeof(attr);
         attr.sched_policy = SCHED_OTHER;
@@ -669,12 +773,14 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
         uint32_t copy_size;
         if (!current || !target || target->state == TASK_EXITED) return -LINUX_ESRCH;
         if (a2 != 0) return -RELIEFOS_EINVAL;
+        int prep=process_prepare_user(current,a1,SCHED_ATTR_SIZE_VER0,false);if(prep)return prep;
         if (!user_range_ok(a1, SCHED_ATTR_SIZE_VER0)) return -RELIEFOS_EFAULT;
         for (uint32_t i = 0; i < SCHED_ATTR_SIZE_VER0; ++i)
             ((uint8_t *)&attr)[i] = ((const uint8_t *)(uintptr_t)a1)[i];
         user_size = attr.size;
         if (user_size < SCHED_ATTR_SIZE_VER0) return -RELIEFOS_EINVAL;
         if (user_size > 4096U) return -RELIEFOS_E2BIG;
+        prep=process_prepare_user(current,a1,user_size,false);if(prep)return prep;
         if (!user_range_ok(a1, user_size)) return -RELIEFOS_EFAULT;
         copy_size = user_size < sizeof(attr) ? user_size : sizeof(attr);
         for (uint32_t i = SCHED_ATTR_SIZE_VER0; i < copy_size; ++i)
@@ -707,6 +813,7 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
     if (number == LINUX_SYS_UNAME) {
         struct utsname info = {0};
         const struct reliefos_system_info *system = reliefnt_system_info();
+        if (a0) { int prep=process_prepare_user(sched_current_task(),a0,sizeof(info),true);if(prep)return prep; }
         if (!a0 || !user_range_writable(a0, sizeof(info))) return -RELIEFOS_EFAULT;
         {
             uint32_t i;
@@ -733,6 +840,7 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
         int32_t length = (int32_t)a1; /* native syscall takes int, not size_t */
         if (!task || !(task->cap_effective & (1ULL << CAP_SYS_ADMIN))) return -RELIEFOS_EPERM;
         if (length < 0 || length >= (int32_t)RELIEFOS_UTSNAME_LEN) return -RELIEFOS_EINVAL;
+        if (length) { int prep=process_prepare_user(task,a0,(uint32_t)length,false);if(prep)return prep; }
         if (length && !user_range_ok(a0, (uint32_t)length)) return -RELIEFOS_EFAULT;
         if (length) __builtin_memcpy(captured, (const void *)(uintptr_t)a0, (uint32_t)length);
         return linux_uts_set(captured, (uint32_t)length, number == LINUX_SYS_SETDOMAINNAME);
@@ -786,6 +894,8 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
     }
     if (number == LINUX_SYS_GETTIMEOFDAY) {
         struct linux_timespec value;
+        if (a0) { int prep=process_prepare_user(sched_current_task(),a0,16,true);if(prep)return prep; }
+        if (a1) { int prep=process_prepare_user(sched_current_task(),a1,8,true);if(prep)return prep; }
         if (a0 && !user_range_writable(a0, 16u)) return -RELIEFOS_EFAULT;
         if (a1 && !user_range_writable(a1, 8u)) return -RELIEFOS_EFAULT;
         int ret = time_clock_get(LINUX_CLOCK_REALTIME, &value);
@@ -803,6 +913,7 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
     if (number == LINUX_SYS_SETTIMEOFDAY) {
         struct task *task = sched_current_task();
         if (!task || !(task->cap_effective & (1ULL << CAP_SYS_TIME))) return -RELIEFOS_EPERM;
+        if (a0) { int prep=process_prepare_user(task,a0,16,false);if(prep)return prep; }
         if (!a0 || !user_range_ok(a0, 16u)) return -RELIEFOS_EFAULT;
         int64_t sec = ((const int64_t *)(uintptr_t)a0)[0], usec = ((const int64_t *)(uintptr_t)a0)[1];
         if (sec < 0 || usec < 0 || usec >= 1000000 || time_set_wall_clock_ns((uint64_t)sec, (uint32_t)usec * 1000) < 0) {
@@ -815,6 +926,7 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
         struct linux_timespec value;
         if (!task || !(task->cap_effective & (1ULL << CAP_SYS_TIME))) return -RELIEFOS_EPERM;
         if ((int32_t)a0 != LINUX_CLOCK_REALTIME) return -RELIEFOS_EINVAL;
+        if (a1) { int prep=process_prepare_user(task,a1,sizeof(value),false);if(prep)return prep; }
         if (!a1 || !user_range_ok(a1, sizeof(value))) return -RELIEFOS_EFAULT;
         value = *(const struct linux_timespec *)(uintptr_t)a1;
         if (value.tv_nsec < 0 || value.tv_nsec >= 1000000000LL || value.tv_sec < 0)
@@ -836,6 +948,7 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
                 return -RELIEFOS_EINVAL;
             ret = sched_get_task_affinity(pid, &mask);
             if (ret < 0) return ret == -2 ? -LINUX_ESRCH : -RELIEFOS_EINVAL;
+            int prep=process_prepare_user(current,a2,sizeof(mask),true);if(prep)return prep;
             if (!user_range_writable(a2, sizeof(mask))) return -RELIEFOS_EFAULT;
             *(uint64_t *)(uintptr_t)a2 = mask;
             return sizeof(mask);
@@ -843,6 +956,7 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
         /* Short input masks are zero-extended; oversized inputs only copy
          * the kernel mask. In particular, len=0 need not dereference ptr. */
         uint32_t copied = length < sizeof(mask) ? length : sizeof(mask);
+        if (copied) { int prep=process_prepare_user(current,a2,copied,false);if(prep)return prep; }
         if (copied && !user_range_ok(a2, copied)) return -RELIEFOS_EFAULT;
         for (uint32_t i = 0; i < copied; ++i)
             ((uint8_t *)&mask)[i] = ((const uint8_t *)(uintptr_t)a2)[i];
@@ -858,6 +972,7 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
         struct linux_timespec value;
         int ret = time_clock_get((int32_t)a0, &value);
         if (ret < 0) return ret;
+        int prep=process_prepare_user(sched_current_task(),a1,sizeof(value),true);if(prep)return prep;
         if (!user_range_writable(a1, sizeof(value))) return -RELIEFOS_EFAULT;
         *(struct linux_timespec *)(uintptr_t)a1 = value;
         return 0;
@@ -868,6 +983,7 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
         int ret = time_clock_getres(clock_id, &resolution);
         if (ret < 0) return ret;
         if (!a1) return 0;
+        int prep=process_prepare_user(sched_current_task(),a1,sizeof(resolution),true);if(prep)return prep;
         if (!user_range_writable(a1, sizeof(resolution))) return -RELIEFOS_EFAULT;
         *(struct linux_timespec *)(uintptr_t)a1 = resolution;
         return 0;
@@ -887,6 +1003,8 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
         struct task *target = a0 ? sched_find((uint32_t)a0) : caller;
         if (!target || target->state == TASK_EXITED) return -LINUX_ESRCH;
         if (!caller || (caller->euid && caller->euid != target->uid)) return -LINUX_EPERM;
+        int prep=process_prepare_user(caller,a1,8,true);if(prep)return prep;
+        prep=process_prepare_user(caller,a2,8,true);if(prep)return prep;
         if (!user_range_writable(a1, 8) || !user_range_writable(a2, 8)) return -LINUX_EFAULT;
         *(uint64_t *)(uintptr_t)a1 = target->robust_list;
         *(uint64_t *)(uintptr_t)a2 = sizeof(struct linux_robust_list_head);

@@ -110,4 +110,12 @@ void kernel_wait_queue_block_current(struct kernel_wait_queue *queue);
  */
 void kernel_wait_queue_block_current_minimum(struct kernel_wait_queue *queue, uint32_t minimum);
 
+/** @brief Atomically link and time-block the current task on one queue.
+ * @param queue Stable queue that remains live until unlink or wake.
+ * @param wake_tick Absolute fallback deadline, or zero for an untimed wait.
+ * @return Zero on registration, -1 for an invalid task or another queue.
+ * The caller must serialize its condition check with the producer.
+ */
+int kernel_wait_queue_sleep_current_until(struct kernel_wait_queue *queue, uint64_t wake_tick);
+
 #endif

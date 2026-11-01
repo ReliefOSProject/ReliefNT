@@ -203,6 +203,12 @@ void framebuffer_vmware_sync(bool report)
     }
 }
 
+/** @brief Probe VMware scanout and publish it only after all checks succeed.
+ * @return 1 when the device surface is selected; 0 retaining the boot surface.
+ * The replacement aperture is claimed UC before its alias is published. If
+ * an initially disabled device is reprogrammed and a later check fails, its
+ * enable and writable geometry registers are restored before returning.
+ */
 int framebuffer_vmware_probe(void)
 {
     struct pci_device device;
@@ -223,6 +229,9 @@ int framebuffer_vmware_probe(void)
     int boot_mode_valid;
     uint64_t usable_bytes;
     uint32_t io_base;
+    uint32_t *device_pixels;
+    uint32_t old_enable, old_width, old_height, old_depth, old_bpp, old_pseudocolor;
+    bool reprogrammed = false;
 
     if (!fb.available || pci_find_device(VMWARE_VENDOR_ID, VMWARE_SVGA_DEVICE_ID,
                                          &device) < 0) {
@@ -278,6 +287,12 @@ int framebuffer_vmware_probe(void)
     pseudocolor = vmware_svga_read(VMWARE_SVGA_REG_PSEUDOCOLOR);
     pitch = vmware_svga_read(VMWARE_SVGA_REG_BYTES_PER_LINE);
     enabled = vmware_svga_read(VMWARE_SVGA_REG_ENABLE);
+    old_enable = enabled;
+    old_width = width;
+    old_height = height;
+    old_depth = depth;
+    old_bpp = bpp;
+    old_pseudocolor = pseudocolor;
     device_mode_valid = width && height && depth == 24u && bpp == 32u &&
         pseudocolor == 0u && (uint64_t)pitch >= (uint64_t)width * 4u &&
         (uint64_t)pitch * height <= usable_bytes &&
@@ -299,6 +314,7 @@ int framebuffer_vmware_probe(void)
          * host scan-out and the first client that clears the greeter leaves a
          * black screen.  Reprogram the boot handover geometry explicitly so the
          * device surface and the inherited framebuffer stay identical. */
+        reprogrammed = true;
         vmware_svga_write(VMWARE_SVGA_REG_ENABLE, 0u);
         vmware_svga_write(VMWARE_SVGA_REG_WIDTH, fb.width);
         vmware_svga_write(VMWARE_SVGA_REG_HEIGHT, fb.height);
@@ -319,32 +335,22 @@ int framebuffer_vmware_probe(void)
             (uint64_t)pitch * height <= usable_bytes &&
             framebuffer_range_valid((uint64_t)fb_start + fb_offset,
                                     (uint64_t)pitch * height);
-        if (device_mode_valid) {
-            console_info("[reliefnt] VMware SVGA scan-out enabled at boot mode "
-                           "%ux%u pitch=%u\n", width, height, pitch);
-        }
     }
     if (device_mode_valid && (enabled & 1u) != 0u) {
-        if (!paging_mmio_uncached(fb_start, fb_max_size)) return 0;
-        fb.pixels = (uint32_t *)mm_phys_to_virt((uint64_t)fb_start + fb_offset);
-        if (!fb.pixels) return 0;
-        fb.width = width;
-        fb.height = height;
-        fb.pitch = pitch;
-        fb.bpp = (uint8_t)bpp;
-        fb.bytes_per_pixel = 4u;
-        framebuffer_set_default_format();
+        if (!paging_mmio_uncached(fb_start, fb_max_size)) goto restore_scanout;
+        device_pixels = (uint32_t *)mm_phys_to_virt((uint64_t)fb_start + fb_offset);
+        if (!device_pixels) goto restore_scanout;
     } else {
         console_warn("[reliefnt] VMware SVGA active mode unavailable "
                        "mode=%ux%u depth=%u bpp=%u pseudo=%u pitch=%u\n",
                        width, height, depth, bpp, pseudocolor, pitch);
-        return 0;
+        goto restore_scanout;
     }
 
     vmware_svga.max_width = vmware_svga_read(VMWARE_SVGA_REG_MAX_WIDTH);
     vmware_svga.max_height = vmware_svga_read(VMWARE_SVGA_REG_MAX_HEIGHT);
     if (!vmware_svga.max_width || !vmware_svga.max_height) {
-        return 0;
+        goto restore_scanout;
     }
     if (vmware_svga.max_width > FRAMEBUFFER_MODE_MAX_WIDTH) {
         vmware_svga.max_width = FRAMEBUFFER_MODE_MAX_WIDTH;
@@ -352,6 +358,17 @@ int framebuffer_vmware_probe(void)
     if (vmware_svga.max_height > FRAMEBUFFER_MODE_MAX_HEIGHT) {
         vmware_svga.max_height = FRAMEBUFFER_MODE_MAX_HEIGHT;
     }
+    if (reprogrammed) {
+        console_info("[reliefnt] VMware SVGA scan-out enabled at boot mode "
+                       "%ux%u pitch=%u\n", width, height, pitch);
+    }
+    fb.pixels = device_pixels;
+    fb.width = width;
+    fb.height = height;
+    fb.pitch = pitch;
+    fb.bpp = (uint8_t)bpp;
+    fb.bytes_per_pixel = 4u;
+    framebuffer_set_default_format();
     vmware_svga.pci = device;
     vmware_svga.present = true;
     framebuffer_vmware_fifo_init(true, false);
@@ -369,6 +386,18 @@ int framebuffer_vmware_probe(void)
                    fb_size, fb_max_size, vmware_svga.max_width,
                    vmware_svga.max_height, (void *)vmware_svga.fifo);
     return 1;
+
+restore_scanout:
+    if (reprogrammed) {
+        vmware_svga_write(VMWARE_SVGA_REG_ENABLE, 0u);
+        vmware_svga_write(VMWARE_SVGA_REG_WIDTH, old_width);
+        vmware_svga_write(VMWARE_SVGA_REG_HEIGHT, old_height);
+        vmware_svga_write(VMWARE_SVGA_REG_DEPTH, old_depth);
+        vmware_svga_write(VMWARE_SVGA_REG_BITS_PER_PIXEL, old_bpp);
+        vmware_svga_write(VMWARE_SVGA_REG_PSEUDOCOLOR, old_pseudocolor);
+        vmware_svga_write(VMWARE_SVGA_REG_ENABLE, old_enable);
+    }
+    return 0;
 }
 
 int framebuffer_vmware_set_mode(uint32_t width, uint32_t height)

@@ -1,10 +1,52 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "internal.h"
 
+/** @brief Optionally invalidate OOM scans after identity changes.
+ * The production scheduler supplies this allocation-free notification; small
+ * independent PID fixtures may omit the scheduler's OOM object.
+ */
+extern void sched_oom_membership_changed(void) __attribute__((weak));
+
 /* Invalidate the target before its task record can be recycled. Keeping this
  * allocation alive, rather than comparing timestamps or a wrapping PID, lets
  * an old proc inode distinguish a dead process from a reused task slot. */
 struct task_identity {struct task *task;uint64_t references;};
+
+/** @brief Allocate one unbound PID object before scheduler locking.
+ * @return One caller-owned identity, or NULL on allocation failure.
+ */
+struct task_identity *sched_task_identity_prepare(void)
+{
+    struct task_identity *identity=kernel_malloc(sizeof(*identity));
+    if(identity)*identity=(struct task_identity){.references=1};
+    return identity;
+}
+
+/** @brief Transfer a prepared PID identity to one unpublished task.
+ * @param task Unpublished task, nullable. @param identity Prepared reference,
+ * nullable. A valid pair transfers ownership to task under serialization and
+ * invalidates any in-progress OOM holder scan without acquiring another lock.
+ */
+void sched_task_identity_bind(struct task *task, struct task_identity *identity)
+{
+    if (!task || !identity) return;
+    identity->task=task;task->identity_token=identity;
+    if (sched_oom_membership_changed) sched_oom_membership_changed();
+}
+
+/** @brief Retain only a previously prepared PID identity, without heap work.
+ * @param task Execution-owned task. @param out Empty required identity output.
+ * @return Zero with one owned reference or -EINVAL/-ESRCH/-EOVERFLOW.
+ */
+int sched_task_identity_get_existing(struct task *task, struct task_identity **out)
+{
+    if(!out)return -EINVAL;
+    *out=NULL;
+    if(!task || !task->pid || !task->identity_token)return -ESRCH;
+    struct task_identity *identity=task->identity_token;
+    if (identity->references==UINT64_MAX) return -EOVERFLOW;
+    ++identity->references;*out=identity;return 0;
+}
 
 /** @brief Acquire an independent stable PID-object reference for proc lookup.
  * @param task Borrowed live task or waitable zombie under execution ownership.
@@ -42,19 +84,22 @@ void sched_task_identity_put(struct task_identity *identity)
 
 /** @brief Disconnect a recycled/reaped task from every previously held proc inode.
  * @param task Stable task under execution ownership or scheduler_lock, nullable.
- * Clears ownership and the target before releasing the task's reference. No I/O.
+ * Clears ownership and the target before releasing the task's reference; also
+ * invalidates an OOM holder scan. No I/O or additional lock is taken.
  */
 void sched_task_identity_detach(struct task *task)
 {
     if(!task || !task->identity_token)return;
     struct task_identity *identity=task->identity_token;task->identity_token=NULL;
     identity->task=NULL;sched_task_identity_put(identity);
+    if (sched_oom_membership_changed) sched_oom_membership_changed();
 }
 
 /** @brief Exchange identity targets with the PIDs of a de-threading exec.
  * @param left Stable task under scheduler_lock, required.
  * @param right Stable task under scheduler_lock, required.
  * No references are created/dropped; existing holders follow their same PID.
+ * Invalidates an in-progress OOM holder scan without acquiring another lock.
  */
 void sched_task_identity_swap(struct task *left,struct task *right)
 {
@@ -62,4 +107,5 @@ void sched_task_identity_swap(struct task *left,struct task *right)
     left->identity_token=right->identity_token;right->identity_token=old;
     if(left->identity_token)left->identity_token->task=left;
     if(right->identity_token)right->identity_token->task=right;
+    if (sched_oom_membership_changed) sched_oom_membership_changed();
 }

@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := area.o backend.o drain.o paging.o slot.o
+
+include $(srctree)/scripts/Makefile.module

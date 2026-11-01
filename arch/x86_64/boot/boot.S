@@ -13,10 +13,12 @@ multiboot2_header:
     .align 8
     .short 1
     .short 1
-    .long 20
+    .long 28
     .long 4
     .long 6
     .long 17
+    .long 18
+    .long 20
 
     /* Optional framebuffer request: no preferred geometry, 32 bpp. GRUB
      * hands over its current mode (gfxpayload), which the kernel adopts
@@ -47,6 +49,9 @@ multiboot2_header:
 multiboot2_header_end:
 
 .section .bss, "aw", @nobits
+.global boot_via_bios
+boot_via_bios:
+    .byte 0
 .align 16
 boot_stack_bottom:
     .skip 65536

@@ -7,14 +7,25 @@
 #include <reliefnt/console.h>
 #include <reliefnt/lock.h>
 #include <reliefnt/lock_profile.h>
+#include <reliefnt/memory_pressure.h>
+#include <reliefnt/memory_stats.h>
+#include <reliefnt/mm.h>
 #include <reliefnt/paging.h>
 #include <reliefnt/pty.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/syscall.h>
+#include <reliefnt/swap.h>
 #include <reliefnt/time.h>
 #include <reliefnt/userland.h>
+#include <linux/errno.h>
 
 #include "../idt.h"
+
+/* Standalone trap fixtures can omit the reporting and scheduler producers. */
+extern void memory_event_add(enum memory_event, uint64_t) __attribute__((weak));
+extern bool sched_fault_event_begin(struct task *, uint64_t, uint64_t) __attribute__((weak));
+extern bool sched_fault_event_major(struct task *) __attribute__((weak));
+extern void sched_fault_event_end(struct task *) __attribute__((weak));
 
 struct __attribute__((packed)) idt_entry {
     uint16_t offset_low;
@@ -475,6 +486,7 @@ static void signal_user_page_fault(struct trap_frame *frame, uint64_t cr2)
     if (!task || task->kind != TASK_KIND_USER) {
         bugcheck_trap("Unhandled Page Fault", frame, cr2);
     }
+    if (sched_fault_event_end) sched_fault_event_end(task);
     format_user_page_fault_report(report, sizeof(report), task, frame, cr2);
     uint32_t signal = task->page_fault_signal == 7 ? 7 : 11;
     console_warn("[reliefnt] user page fault signal=%u pid=%u name=%s cr2=0x%llx rip=0x%llx error=0x%llx\n",
@@ -487,12 +499,38 @@ static void signal_user_page_fault(struct trap_frame *frame, uint64_t cr2)
     kernel_signal_force_fault(task, signal, syscall_page_fault_signal_code(task, cr2), cr2);
 }
 
+/** @brief Account a user hardware fault once across deferred fault retries.
+ * @param frame Ring-3 frame under execution ownership. @param address CR2.
+ * Kernel copy faults and prefault helpers do not enter this accounting path.
+ */
+static void user_fault_event_enter(struct trap_frame *frame, uint64_t address)
+{
+    if (memory_event_add && sched_fault_event_begin &&
+        sched_fault_event_begin(sched_current_task(), frame->rip, address))
+        memory_event_add(MEMORY_EVENT_PGFAULT, 1);
+}
+
+/** @brief Run one reclaim attempt with the user instruction's operands protected.
+ * @param task Current execution-owned user task. @param frame Borrowed trap frame.
+ * @param address Faulting address. @return Pressure retry/wait result.
+ * The scalar exclusion scope ends before execution ownership is released.
+ */
+static int user_fault_pressure(struct task *task, struct trap_frame *frame, uint64_t address)
+{
+    memory_reclaim_fault_scope_begin(task, frame->rip, address);
+    int result = memory_fault_oom(task, address);
+    memory_reclaim_fault_scope_end();
+    return result;
+}
+
 /** @brief Resolve or signal a fault with execution ownership and safe fallback.
  * @param frame Borrowed interrupted trap frame, nullable for fatal diagnostics.
  * @return NULL to resume directly or the task selected by the scheduler.
  * IRQ/fault context: private non-I/O user faults use a read gate when available
  * or the FIFO writer when queued; shared and backing-I/O faults retain the
  * exclusive fault lock. Kernel usercopy faults use recursive writer ownership.
+ * A pending private fault with no MM generation may acquire its first one
+ * while parked; task teardown and committed exec invalidate its scalar token.
  */
 struct task *page_fault_dispatch(struct trap_frame *frame)
 {
@@ -510,12 +548,22 @@ struct task *page_fault_dispatch(struct trap_frame *frame)
      * already own the recursive writer and must not take a nested read gate. */
     if (frame && (frame->cs & 3ULL) == 3ULL &&
         kernel_execution_try_read_lock_scoped_irqsave(&execution_flags, LOCK_SCOPE_FAULT)) {
-        enum syscall_private_fault_result handled =
-            syscall_handle_private_page_fault(sched_current_task(), cr2, frame->error);
+        user_fault_event_enter(frame, cr2);
+        enum syscall_private_fault_result handled=SYSCALL_PRIVATE_FAULT_UNHANDLED;
+#ifdef CONFIG_SWAP
+        /* Below low, defer admission to the outer writer; no reclaim or I/O
+         * is ever attempted while this reader is held. */
+        if(!memory_headroom_needed(sched_current_task()))
+#endif
+            handled=syscall_handle_private_page_fault(sched_current_task(),cr2,frame->error);
         bool resume = handled == SYSCALL_PRIVATE_FAULT_ANON &&
                       sched_try_resume_current_user_frame(frame);
+        if (handled == SYSCALL_PRIVATE_FAULT_ANON || handled == SYSCALL_PRIVATE_FAULT_RESIDENT) {
+            sched_pressure_fault_resolved(sched_current_task(), frame->rip, cr2);
+            memory_wait_cancel(sched_current_task());
+        }
         kernel_execution_read_unlock_irqrestore(execution_flags);
-        if (handled != SYSCALL_PRIVATE_FAULT_UNHANDLED)
+        if (handled == SYSCALL_PRIVATE_FAULT_ANON || handled == SYSCALL_PRIVATE_FAULT_RESIDENT)
             return resume ? NULL : userland_schedule_from_frame(frame);
     }
 
@@ -528,15 +576,123 @@ struct task *page_fault_dispatch(struct trap_frame *frame)
 
     /* A queued writer may have denied reader admission. Resolve the same
      * non-I/O work under its FIFO successor, then take the normal checkpoint. */
-    if (frame && (frame->cs & 3ULL) == 3ULL &&
-        syscall_handle_private_page_fault(sched_current_task(), cr2, frame->error) !=
-            SYSCALL_PRIVATE_FAULT_UNHANDLED) {
-        kernel_execution_unlock_irqrestore(execution_flags);
-        return userland_schedule_from_frame(frame);
+    if (frame && (frame->cs & 3ULL) == 3ULL) {
+        user_fault_event_enter(frame, cr2);
+        struct task *task = sched_current_task();
+#ifdef CONFIG_SWAP
+        if(memory_headroom_needed(task)) {
+            struct pressure_headroom_state *state=sched_pressure_headroom_state(task);
+            struct address_space *as=task ? sched_task_as(task) : NULL;
+            bool eligible=(frame->error&4ULL) && !(frame->error&~0x1fULL) &&
+                syscall_private_anon_fault_eligible(task,cr2,frame->error);
+            uint64_t generation=as ? mm_context_generation_existing(as) : 0;
+            bool same_fault=state && state->fault_pending && as &&
+                state->cr3==as->cr3 && (!state->generation || state->generation==generation) &&
+                state->rip==frame->rip && state->page==(cr2&~4095ULL);
+            /* A real failed allocation owns the next retry. Optional refill
+             * must not restart when that fault's cache scan advances an epoch. */
+            if(state && state->fault_pending && (!same_fault || !eligible)) {
+                memory_headroom_cancel(task);same_fault=false;
+            }
+            /* Only the first identity of this still-owned root can promote a
+             * zero token. Exec/teardown clear the token before root retirement;
+             * every subsequent nonzero generation must match exactly. */
+            if(same_fault && eligible && !state->generation)state->generation=generation;
+            if(eligible && !same_fault) {
+                if(memory_headroom_step(task,frame->rip,cr2)==-EAGAIN) {
+                    kernel_execution_unlock_irqrestore(execution_flags);
+                    return userland_schedule_from_frame(frame);
+                }
+            } else if(!eligible && state && state->active)memory_headroom_cancel(task);
+        }
+#endif
+        enum syscall_private_fault_result handled =
+            syscall_handle_private_page_fault(task, cr2, frame->error);
+        if (handled == SYSCALL_PRIVATE_FAULT_ANON || handled == SYSCALL_PRIVATE_FAULT_RESIDENT) {
+#ifdef CONFIG_SWAP
+            struct pressure_headroom_state *state=sched_pressure_headroom_state(task);
+            if(state)state->fault_pending=false;
+#endif
+            sched_pressure_fault_resolved(task, frame->rip, cr2);
+            memory_wait_cancel(task);
+            kernel_execution_unlock_irqrestore(execution_flags);
+            return userland_schedule_from_frame(frame);
+        }
+        if (handled == SYSCALL_PRIVATE_FAULT_OOM) {
+            int pressure = user_fault_pressure(task, frame, cr2);
+            if (pressure != 0 && pressure != -EAGAIN) {
+                memory_wait_cancel(task);
+#ifdef CONFIG_SWAP
+                memory_headroom_cancel(task);
+#endif
+                task->page_fault_signal = 11;
+                signal_user_page_fault(frame, cr2);
+            }
+#ifdef CONFIG_SWAP
+            else {
+                struct pressure_headroom_state *state=sched_pressure_headroom_state(task);
+                struct address_space *as=sched_task_as(task);
+                if(state && as) {
+                    state->fault_pending=true;state->cr3=as->cr3;
+                    state->generation=mm_context_generation_existing(as);
+                    state->rip=frame->rip;state->page=cr2&~4095ULL;
+                    state->wait_owned=pressure==-EAGAIN;
+                }
+            }
+#endif
+            kernel_execution_unlock_irqrestore(execution_flags);
+            return userland_schedule_from_frame(frame);
+        }
+    }
+    /* Ring-3 entry owns exactly the outer writer here, with neither the fault
+     * spinlock nor a reader/loader/usercopy transaction held. The current
+     * backend completes one slot transfer synchronously under this boundary. */
+    if (frame && (frame->cs & 3ULL) == 3ULL) {
+        int swap_result = swap_resolve_fault(sched_current_task(), cr2, frame->error);
+        if (swap_result != 0) {
+            if (swap_result == SWAP_STORAGE_CONTENDED) {
+                /* No slot request exists. Wait without cancelling the owner,
+                 * and terminate a stopped owner's repeated no-progress case. */
+                struct task *task = sched_current_task();
+                int wait = memory_fault_storage_wait(task, cr2);
+                if (wait != -EAGAIN) {
+                    memory_wait_cancel(task);
+                    if (task) task->page_fault_signal = 7;
+                    signal_user_page_fault(frame, cr2);
+                }
+                kernel_execution_unlock_irqrestore(execution_flags);
+                return userland_schedule_from_frame(frame);
+            }
+            if (swap_result < 0) {
+                struct task *task = sched_current_task();
+                /* A validated swapped leaf can fail to obtain an ordinary
+                 * frame at the reserve boundary.  Reclaim at this outer
+                 * writer boundary, never under the user-fault spinlock. */
+                if (swap_result == -ENOMEM) {
+                    int pressure = user_fault_pressure(task, frame, cr2);
+                    if (pressure == 0 || pressure == -EAGAIN) {
+                        kernel_execution_unlock_irqrestore(execution_flags);
+                        return userland_schedule_from_frame(frame);
+                    }
+                }
+                memory_wait_cancel(task);
+                if (task) task->page_fault_signal = swap_result == -EIO ? 7 : 11;
+                signal_user_page_fault(frame, cr2);
+            } else {
+                if (memory_event_add && sched_fault_event_major &&
+                    sched_fault_event_major(sched_current_task())) memory_event_add(MEMORY_EVENT_PGMAJFAULT, 1);
+                sched_pressure_fault_resolved(sched_current_task(), frame->rip, cr2);
+                memory_wait_cancel(sched_current_task());
+            }
+            kernel_execution_unlock_irqrestore(execution_flags);
+            return userland_schedule_from_frame(frame);
+        }
     }
     kernel_spin_lock(&user_page_fault_lock);
 
-    if (frame && syscall_handle_user_page_fault(cr2, frame->error)) {
+    int fault_result = frame ? syscall_handle_user_page_fault_detailed(cr2, frame->error,
+                                                                        (frame->cs & 3ULL) == 3ULL) : 0;
+    if (fault_result > 0) {
         /**
  * @brief Kernel helpers may write a current user's COW buffer while serving a syscall. Its page is now private, so resume the interrupted kernel instruction instead of trying to iret through a kernel-mode trap frame.
  */
@@ -549,6 +705,19 @@ struct task *page_fault_dispatch(struct trap_frame *frame)
  * @brief A lazy file-backed page may require a synchronous FAT read. Switch away after each resolved fault so a newly-starting app cannot hold the desktop in a long run of consecutive page-ins.
  */
         kernel_spin_unlock(&user_page_fault_lock);
+        sched_pressure_fault_resolved(sched_current_task(), frame->rip, cr2);
+        memory_wait_cancel(sched_current_task());
+        kernel_execution_unlock_irqrestore(execution_flags);
+        return userland_schedule_from_frame(frame);
+    }
+    if (frame && (frame->cs & 3ULL) == 3ULL && fault_result == -ENOMEM) {
+        struct task *task = sched_current_task();
+        kernel_spin_unlock(&user_page_fault_lock);
+        int pressure = user_fault_pressure(task, frame, cr2);
+        if (pressure != 0 && pressure != -EAGAIN) {
+            memory_wait_cancel(task);
+            signal_user_page_fault(frame, cr2);
+        }
         kernel_execution_unlock_irqrestore(execution_flags);
         return userland_schedule_from_frame(frame);
     }
@@ -570,6 +739,7 @@ struct task *page_fault_dispatch(struct trap_frame *frame)
                        (unsigned)((frame->error >> 3) & 1u),
                        (unsigned)((frame->error >> 4) & 1u));
         kernel_spin_unlock(&user_page_fault_lock);
+        memory_wait_cancel(sched_current_task());
         signal_user_page_fault(frame, cr2);
         kernel_execution_unlock_irqrestore(execution_flags);
         return userland_schedule_from_frame(frame);

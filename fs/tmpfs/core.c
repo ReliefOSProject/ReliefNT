@@ -85,7 +85,7 @@ static void tmpfs_free_inode(struct tmpfs_super *fs, struct tmpfs_inode *n)
 {
     struct storage_node node;
     tmpfs_node(fs, n, &node);
-    page_cache_invalidate_node(&node);
+    page_cache_forget_node(&node);
     for (unsigned i = 0; i < TMPFS_HASH; ++i) {
         struct tmpfs_page *p = n->pages[i];
         while (p) {
@@ -534,6 +534,17 @@ static struct tmpfs_page *tmpfs_page_find(struct tmpfs_inode *n, uint64_t index)
         if (p->index == index)
             return p;
     return NULL;
+}
+/** @brief Inspect an existing regular-file page without allocating a sparse hole.
+ * @param fs Serialized tmpfs. @param ino Borrowed inode number.
+ * @param offset Aligned file offset. @return True when the page is resident.
+ */
+bool tmpfs_page_resident(struct tmpfs_super *fs, uint32_t ino, uint64_t offset)
+{
+    struct tmpfs_inode *n = tmpfs_inode(fs, ino);
+    return n && !(offset % TMPFS_PAGE) && offset < (uint64_t)n->stat.st_size &&
+        (n->stat.st_mode & LINUX_S_IFMT) == LINUX_S_IFREG &&
+        tmpfs_page_find(n, offset / TMPFS_PAGE) != NULL;
 }
 /** @brief Allocate one zeroed, quota-accounted page without publishing it.
  * @param fs Borrowed serialized filesystem.

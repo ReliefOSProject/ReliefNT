@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-obj-y := legacy_memory.o
+obj-y := legacy_memory.o swap.o
+obj-$(CONFIG_SWAP) += swap_area.o
 
 include $(srctree)/scripts/Makefile.module

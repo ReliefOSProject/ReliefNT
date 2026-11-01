@@ -41,6 +41,22 @@ void sched_wake_interruptible(struct task *task)
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
 }
 
+/** @brief Make a stopped or blocked task runnable for an admitted fatal signal.
+ * @param task Execution-owned task. Never releases a running CPU reservation.
+ */
+void sched_wake_fatal(struct task *task)
+{
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&scheduler_lock, &flags);
+    if (task && !task->vfork_child &&
+        (task->state == TASK_BLOCKED || task->state == TASK_STOPPED)) {
+        task->wake_tick = 0;
+        task->state = TASK_READY;
+        sched_request_reschedule_all_online();
+    }
+    kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
+}
+
 void sched_mark_ready(uint32_t pid)
 {
     uint64_t flags;
@@ -175,7 +191,11 @@ int64_t sched_wait_reap(uint32_t waiter_pid, int32_t wanted_pid,
             reap_status = task->exit_signal ? (int)(task->exit_signal & 0x7fU) :
                 (int)((task->exit_code & 0xffU) << 8);
             sched_wait_info(info, task, reap_status);
-            if (options & 0x01000000u) {
+            if ((options & 0x01000000u)
+#ifdef CONFIG_SWAP
+                && (task->flags & TASK_FLAG_RESOURCES_RELEASED)
+#endif
+               ) {
                 if (status) *status = reap_status;
                 kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
                 return reap_pid;
@@ -213,6 +233,17 @@ int64_t sched_wait_reap(uint32_t waiter_pid, int32_t wanted_pid,
         kernel_spin_lock_irqsave(&scheduler_lock, &lock_flags);
         if (reap_task->pid == reap_pid &&
             (reap_task->flags & TASK_FLAG_REAP_IN_PROGRESS)) {
+            if (!(reap_task->flags & TASK_FLAG_RESOURCES_RELEASED)) {
+                reap_task->flags &= ~TASK_FLAG_REAP_IN_PROGRESS;
+                kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
+                return -RELIEFOS_EAGAIN;
+            }
+            if (options & 0x01000000u) {
+                reap_task->flags &= ~TASK_FLAG_REAP_IN_PROGRESS;
+                if (status) *status = reap_status;
+                kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
+                return reap_pid;
+            }
             reap_task->parent_pid = 0;
             sched_task_identity_detach(reap_task);
             task_release_limits(reap_task);

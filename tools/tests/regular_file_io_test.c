@@ -1,7 +1,10 @@
+#define _GNU_SOURCE
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #include "../../kernel/syscall/io/file_io.c"
 #include "../../kernel/syscall/io/vector_internal.h"
 #include <reliefnt/mount.h>
@@ -9,6 +12,51 @@
 #include <linux/mount.h>
 
 static unsigned char disk[1048576], data[1048576];
+static unsigned char *fixture_user, *fixture_alias;
+static unsigned fixture_refs;
+static bool fixture_device,fixture_readonly;
+static uint64_t fixture_device_cache_flags;
+static bool fixture_expect_drain, fixture_drained;
+
+/** @brief Translate the simulated current user page to its retained alias.
+ * @param as Unused fixture address space. @param va User virtual address.
+ * @return Aligned original-frame identity for the modeled mapped page.
+ */
+uint64_t address_space_user_page_phys(const struct address_space *as, uint64_t va)
+{ (void)as; return (va & ~4095ULL) == (uintptr_t)fixture_user ? (uintptr_t)fixture_alias : 0; }
+
+/** @brief Report fixture page flags. @param as Unused root. @param va User address.
+ * @return User, present and writable flags for the modeled page.
+ */
+uint64_t address_space_user_page_flags(const struct address_space *as, uint64_t va)
+{ (void)as; (void)va; return RELIEFNT_PAGE_USER | RELIEFNT_PAGE_PRESENT |
+    (fixture_readonly ? 0 : RELIEFNT_PAGE_WRITABLE) | (fixture_device ? RELIEFNT_PAGE_DEVICE : 0) |
+    fixture_device_cache_flags; }
+
+/** @brief Return a direct alias for fixture physical bytes. @param phys Address.
+ * @return The host pointer modeling the physical direct map.
+ */
+void *mm_phys_to_virt(uint64_t phys) { return (void *)(uintptr_t)phys; }
+/** @brief Retain a modeled frame. @param phys Original frame identity. */
+void mm_retain_page(uint64_t phys) { assert(phys == (uintptr_t)fixture_alias); ++fixture_refs; }
+/** @brief Release a modeled frame. @param phys Original frame identity. */
+void mm_free_page(uint64_t phys)
+{ assert(phys == (uintptr_t)fixture_alias && fixture_refs && (!fixture_expect_drain || fixture_drained)); --fixture_refs; }
+/** @brief Snapshot fixture frame owners. @param phys Frame identity. @return Owner count. */
+uint32_t mm_page_refcount(uint64_t phys) { return phys == (uintptr_t)fixture_alias ? fixture_refs : 0; }
+/** @brief Find no cache-owned fixture frame. @param phys Frame identity. @return Negative. */
+int page_cache_retain(uint64_t phys) { (void)phys; return -1; }
+/** @brief Reject a cache release in this non-cache fixture. @param phys Frame identity. */
+void page_cache_release(uint64_t phys) { (void)phys; abort(); }
+/** @brief Validate the modeled resident range. @param address User start. @param len Length.
+ * @return True when the complete interval lies within the fixture page.
+ */
+bool user_range_ok(uint64_t address, uint64_t len)
+{ return address >= (uintptr_t)fixture_user && len <= 4096 && address - (uintptr_t)fixture_user <= 4096 - len; }
+/** @brief Validate the modeled writable range. @param address Start. @param len Length.
+ * @return True for the fixture page.
+ */
+bool user_range_writable(uint64_t address, uint64_t len) { return !fixture_readonly && user_range_ok(address, len); }
 static uint64_t disk_size = sizeof(disk), error_offset = UINT64_MAX;
 static int injected_error;
 static uint64_t clock_step, clock_us;
@@ -18,6 +66,10 @@ int storage_sync_disk(uint32_t id) { (void)id; ++disk_syncs; return sync_error; 
 int storage_sync_volume(uint32_t id) { (void)id; abort(); }
 uint64_t time_uptime_us(void) { clock_us += clock_step; return clock_us; }
 void storage_release_task_io(uint32_t pid) { assert(pid == 10); }
+/** @brief Drain the fixture provider before releasing a staged chunk.
+ * @param pid Fixture task identity.
+ */
+void storage_drain_task_io(uint32_t pid) { assert(pid == 10); fixture_drained = true; }
 static int transfer(uint64_t offset, void *buffer, uint32_t length, uint32_t *done, bool writing)
 {
     *done = 0;
@@ -232,8 +284,43 @@ int main(void)
     assert(syscall_regular_io(task,&file,(uintptr_t)data,32,0,false,false)==13);
     assert(!memcmp(data,"captured view",13) && capture_reads==1 && provider_reads==old_reads);
     vfs_file_close(file.provider_file);file.provider_file=NULL;assert(capture_closes==1);
+    /* A CLONE_VM peer can replace the VA after the provider has returned EAGAIN. */
+    int shared = memfd_create("regular-read-original", 0);
+    assert(shared >= 0 && !ftruncate(shared, 4096));
+    fixture_user = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, shared, 0);
+    fixture_alias = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, shared, 0);
+    assert(fixture_user != MAP_FAILED && fixture_alias != MAP_FAILED);
+    fixture_refs = 1; task->kind = TASK_KIND_USER;
+    file.offset = 0; task->syscall_file_number = LINUX_SYS_READ;
+    memset(disk, 0x71, 64); error_offset = 0; injected_error = -LINUX_EAGAIN;
+    assert(syscall_regular_io(task, &file, (uintptr_t)fixture_user, 64, 0, false, false) == -LINUX_EAGAIN);
+    assert(mmap(fixture_user, 4096, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == fixture_user);
+    assert(syscall_regular_io(task, &file, (uintptr_t)fixture_user, 64, 0, false, false) == 64);
+    for (unsigned i = 0; i < 64; ++i) assert(!fixture_user[i] && fixture_alias[i] == 0x71);
+    assert(fixture_refs == 1);
+    assert(mmap(fixture_user, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, shared, 0) == fixture_user);
+    memset(fixture_alias, 0x93, 64); file.flags = RELIEFOS_O_RDWR; file.offset = 128;
+    task->syscall_file_number = LINUX_SYS_WRITE; error_offset = 128; injected_error = -LINUX_EAGAIN;
+    assert(syscall_regular_io(task, &file, (uintptr_t)fixture_user, 64, 0, true, false) == -LINUX_EAGAIN);
+    assert(mmap(fixture_user, 4096, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == fixture_user);
+    memset(fixture_user, 0x32, 64);
+    assert(syscall_regular_io(task, &file, (uintptr_t)fixture_user, 64, 0, true, false) == 64);
+    for (unsigned i = 0; i < 64; ++i) assert(disk[128 + i] == 0x93 && fixture_user[i] == 0x32);
+    assert(fixture_refs == 1);
+    assert(mmap(fixture_user, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, shared, 0) == fixture_user);
+    file.offset = 0; task->syscall_file_number = LINUX_SYS_READ; error_offset = 0;
+    assert(syscall_regular_io(task, &file, (uintptr_t)fixture_user, 64, 0, false, false) == -LINUX_EAGAIN);
+    assert(fixture_refs == 2);
+    fixture_expect_drain = true; fixture_drained = false;
+    storage_drain_task_io(task->pid); task_regular_io_stage_cancel(task);
+    assert(fixture_refs == 1 && fixture_drained); fixture_expect_drain = false;
+    task->regular_io.active = false; file.io_owner = 0; close(shared);
+    munmap(fixture_user, 4096); munmap(fixture_alias, 4096); task->kind = TASK_KIND_KERNEL;
     vfs_path_put(&file.path_ref);assert(!provider_pins);
     free(task);
     free(other);
     puts("PASS full file transfers, async continuation, shared offsets, EOF, error progress and genuine block-node validation");
+    return 0;
 }

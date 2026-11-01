@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "mount_internal.h"
+#include <reliefnt/syscall_internal.h>
 
 /* Detached mounts reuse next only after losing namespace membership. The
  * private queue retains context/ops/module lifetime without any public path. */
@@ -274,7 +275,7 @@ int vfs_namespace_destroy(struct vfs_namespace *ns)
     *ns=(struct vfs_namespace){0};return 0;
 }
 
-int vfs_path_lookup_child(const struct vfs_path *parent,const char *name,struct vfs_path *out)
+int vfs_path_lookup_child_for_walk(const struct vfs_path *parent,const char *name,struct vfs_path *out)
 {
     if(!out)return -EINVAL;*out=(struct vfs_path){0};
     if(!vfs_path_valid(parent) || !name || !name[0] || !__builtin_strcmp(name,".") || !__builtin_strcmp(name,".."))
@@ -290,6 +291,12 @@ int vfs_path_lookup_child(const struct vfs_path *parent,const char *name,struct 
     return rc ? rc : vfs_bind_child(parent,name,&node,out);
 }
 
+int vfs_path_lookup_child(const struct vfs_path *parent,const char *name,struct vfs_path *out)
+{
+    int rc=vfs_path_lookup_child_for_walk(parent,name,out);
+    return rc==VFS_NATIVE_LOOKUP_RECLAIM ? -ENOMEM : rc;
+}
+
 int vfs_bind_child(const struct vfs_path *parent,const char *name,
                        const struct storage_node *metadata,struct vfs_path *out)
 {
@@ -301,7 +308,8 @@ int vfs_bind_child(const struct vfs_path *parent,const char *name,
            mount->ops->same_node(mount->context,&dentry->node,&node))break;
     if(!dentry) {
         size_t length=__builtin_strlen(name);
-        dentry=kernel_malloc(sizeof(*dentry));if(!dentry)return -ENOMEM;
+        dentry=kernel_malloc(sizeof(*dentry));
+        if(!dentry){return -ENOMEM;}
         *dentry=(struct vfs_dentry){.parent=parent->dentry,.node=node};
         dentry->name=kernel_malloc(length+1);
         if(!dentry->name){kernel_free(dentry);return -ENOMEM;}

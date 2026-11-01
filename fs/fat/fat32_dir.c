@@ -472,6 +472,7 @@ int fat32_delete_acl_metadata_file(uint32_t dir_cluster)
             return ret;
         }
     }
+    page_cache_forget_node(&meta);
     return 0;
 }
 

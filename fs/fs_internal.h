@@ -201,6 +201,7 @@ struct storage_inode_ref {
     uint64_t references;
     /* Positive writable OFDs, negative kernel read guards; execution-owned. */
     int64_t write_count;
+    bool swap_active; /* Separately excludes mutation without revoking old OFDs. */
     bool read_only;
     bool unlinked;
     /* FAT-family inode metadata survives renamed/unlinked directory records.
@@ -242,6 +243,11 @@ int storage_inode_purge_volume(uint32_t volume);
  * @return Zero or ETXTBSY; does not acquire an OFD writer lease.
  */
 int storage_inode_mutation_allowed(const struct storage_node *node);
+/** @brief Observe the exact retained inode's swap claim for namespace changes.
+ * @param node Borrowed stable inode identity under execution ownership.
+ * @return True while the inode has an active swap claim.
+ */
+bool storage_inode_swap_busy(const struct storage_node *node);
 int storage_cluster_write(struct storage_node *node,uint64_t offset,const void *data,
                              uint32_t length,uint32_t *written);
 int storage_cluster_truncate(struct storage_node *node,uint64_t length);
@@ -299,7 +305,13 @@ uint32_t storage_ext4_inode_type(uint16_t mode);
 void storage_ext4_node_from_inode(struct storage_volume *v,uint64_t ino,const struct ext4_inode_view *in,struct storage_node *out); /* fs/ext_common/ops.c */
 void exfat_put_u16(uint8_t *p, uint16_t value); /* fs/exfat/exfat_name.c */
 void exfat_put_u64(uint8_t *p, uint64_t value); /* fs/exfat/exfat_name.c */
-void ext2_cache_invalidate_range(uint64_t lba, uint32_t sectors); /* fs/ext_common/ext2_cache.c */
+/** @brief Evict clean physical-sector aliases on the exact writer device.
+ * @param writer Optional borrowed volume. @param device Optional borrowed device.
+ * @param lba First physical sector. @param sectors Nonzero sector count.
+ * Caller owns execution; identities remain borrowed and no I/O or allocation occurs.
+ */
+void ext2_cache_invalidate_range(const struct storage_volume *writer,const struct block_device *device,
+                                 uint64_t lba,uint32_t sectors); /* fs/ext_common/ext2_cache.c */
 /** @brief Forget clean cache entries and borrowed identities for a retired volume.
  * @param volume Quiescent instance; caller holds storage exclusion. Shared cache
  * backing remains owned until final provider teardown, no I/O or allocation.

@@ -65,6 +65,8 @@ struct storage_node;
 #define LINUX_SYS_MUNLOCKALL __NR_munlockall
 #define LINUX_SYS_MLOCK2 __NR_mlock2
 #define LINUX_SYS_BRK __NR_brk
+#define LINUX_SYS_SWAPON __NR_swapon
+#define LINUX_SYS_SWAPOFF __NR_swapoff
 #define LINUX_SYS_MSYNC __NR_msync
 #define LINUX_SYS_MINCORE __NR_mincore
 #define LINUX_SYS_MADVISE __NR_madvise
@@ -358,6 +360,18 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame);
  * @return Child TID or negative errno; unsupported backends return ENOSYS.
  */
 int64_t syscall_clone3(const struct trap_frame *frame, uint64_t arguments, uint64_t size);
+
+/** @brief Prepare clone's actual TID operands before scheduler locking.
+ * @param frame Parent registers. @param flags Linux flags and exit signal.
+ * @param stack Child stack. @param parent_tid Parent output user address.
+ * @param child_tid Child output user address. @param tls Child TLS value.
+ * @return Child TID, ordinary errno, or a private prerequisite-wait marker.
+ * At the outer execution writer, a short writable lease protects the parent
+ * TID pages from fork COW until the scheduler's synchronous store completes.
+ */
+int64_t syscall_clone_prepared(const struct trap_frame *frame,uint64_t flags,
+                               uint64_t stack,uint64_t parent_tid,
+                               uint64_t child_tid,uint64_t tls);
 /**
  * @brief Resolve a current task's fault under exclusive execution ownership.
  * @param fault_addr Faulting virtual byte address.
@@ -365,6 +379,14 @@ int64_t syscall_clone3(const struct trap_frame *frame, uint64_t arguments, uint6
  * @return One if resolved; zero if not. May perform synchronous backing I/O.
  */
 int syscall_handle_user_page_fault(uint64_t fault_addr, uint64_t error);
+/** @brief Resolve a current task fault, retaining admitted allocation failure.
+ * @param fault_addr Faulting address. @param error x86 page-fault flags.
+ * @param user_fault True only for a real ring-3 hardware fault.
+ * @return One if resolved, zero for ineligible, -ENOMEM for a valid page
+ * whose backing or page tables could not be allocated. The caller must drop
+ * fault/loader locks before deciding whether pressure reclaim is admissible.
+ */
+int syscall_handle_user_page_fault_detailed(uint64_t fault_addr, uint64_t error, bool user_fault);
 /** @brief Resolve an unshared task's private demand-zero VMA fault.
  * @param task Borrowed live user task under read or exclusive execution ownership.
  * @param fault_addr Faulting virtual byte address.
@@ -373,18 +395,25 @@ int syscall_handle_user_page_fault(uint64_t fault_addr, uint64_t error);
  * performs backing I/O, usercopy or scheduling; caller keeps task/MM alive.
  */
 int syscall_handle_private_anon_fault(struct task *task, uint64_t fault_addr, uint64_t error);
+/** @brief Validate a private anonymous demand fault without allocating.
+ * @param task Current task under reader or writer ownership. @param fault_addr
+ * Faulting user byte. @param error x86 page-fault flags.
+ * @return True only for an eligible empty private anonymous mapping.
+ */
+bool syscall_private_anon_fault_eligible(struct task *task, uint64_t fault_addr, uint64_t error);
 /* Internal dispatcher result: no ABI layout or exported syscall is changed. */
 enum syscall_private_fault_result {
     SYSCALL_PRIVATE_FAULT_UNHANDLED = 0,
     SYSCALL_PRIVATE_FAULT_ANON,
     SYSCALL_PRIVATE_FAULT_RESIDENT,
+    SYSCALL_PRIVATE_FAULT_OOM,
 };
 /** @brief Resolve non-I/O faults belonging to one unshared user MM.
  * @param task Borrowed current user task under read or exclusive execution ownership.
  * @param fault_addr Faulting virtual byte address.
  * @param error x86 user page-fault error bits.
  * @return ANON for demand-zero, RESIDENT for present COW or cached executable
- * pages, or UNHANDLED for fallback without a user-visible error.
+ * pages, OOM for an eligible allocation failure, or UNHANDLED for fallback.
  * Task/fault context with IRQs masked; no usercopy, scheduling, source
  * reference changes or backing/provider callbacks. A retained executable
  * source and the task/MM are kept alive by execution ownership.
@@ -402,15 +431,43 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                         uint64_t flags, uint64_t fd, uint64_t offset);
 int64_t syscall_mm_mremap(uint64_t old_addr, uint64_t old_len, uint64_t new_len,
                           uint64_t flags, uint64_t new_addr);
+/** @brief Lock a rounded user range with Linux memlock admission.
+ * @param addr First byte. @param len Bytes. @param flags Low 32-bit mlock2 flags.
+ * @return Zero or negative errno.
+ */
 int64_t syscall_mm_mlock(uint64_t addr, uint64_t len, uint64_t flags);
+/** @brief Unlock a rounded user range.
+ * @param addr First byte. @param len Bytes. @return Zero or negative errno.
+ */
 int64_t syscall_mm_munlock(uint64_t addr, uint64_t len);
+/** @brief Set current and future lock policy for the shared MM.
+ * @param flags Low 32-bit Linux MCL flags. @return Zero or negative errno.
+ */
 int64_t syscall_mm_mlockall(uint64_t flags);
+/** @brief Clear current and future lock policy. @return Zero or negative errno. */
 int64_t syscall_mm_munlockall(void);
+/** @brief Activate a swap area after Linux flag-width and capability checks.
+ * @param user_path User pathname. @param flags Raw syscall-register flags.
+ * @return Zero or negative errno; disabled builds return -ENOSYS.
+ */
+int64_t syscall_mm_swapon(uint64_t user_path,uint64_t flags);
+/** @brief Deactivate a swap area after the Linux capability check.
+ * @param user_path User pathname. @return Zero or negative errno.
+ */
+int64_t syscall_mm_swapoff(uint64_t user_path);
 int64_t syscall_mm_brk(uint64_t requested);
 int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot);
 int64_t syscall_mm_munmap(uint64_t addr, uint64_t len);
 int64_t syscall_mm_msync(uint64_t addr, uint64_t len, uint64_t flags);
+/** @brief Snapshot PTE or backing-cache residency into a user vector.
+ * @param addr Aligned start. @param len Bytes. @param vec User output vector.
+ * @return Zero or negative errno.
+ */
 int64_t syscall_mm_mincore(uint64_t addr, uint64_t len, uint64_t vec);
+/** @brief Apply supported advice to a user interval.
+ * @param addr Aligned start. @param len Bytes. @param advice Low 32-bit hint.
+ * @return Zero or negative errno; mapped portions around holes may be changed.
+ */
 int64_t syscall_mm_madvise(uint64_t addr, uint64_t len, uint64_t advice);
 /**
  * @brief Close and free every file descriptor still open in task.

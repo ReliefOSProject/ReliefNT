@@ -221,11 +221,14 @@ static int ed_probe_next(struct storage_volume *v,uint64_t ino,const struct ext4
     int ret=ed_read(v,ino,in,p->node,node,true); if (ret<0) return ret;
     p->leaf=ext4_get_le32(node+12); return 0;
 }
-int storage_ext4_dir_lookup(struct storage_volume *v,uint64_t ino,const char *name,uint64_t *found,uint8_t *type)
+static int ed_lookup(struct storage_volume *v,uint64_t ino,const char *name,uint64_t *found,
+                     uint8_t *type,uint8_t *prepared)
 {
     int ret=ed_name(name,false); if (ret<0 || !found) return ret<0?ret:-RELIEFOS_EINVAL;
-    struct ext4_inode_view in; ret=ed_get_inode(v,ino,&in); if (ret<0) return ret;
-    unsigned bs=v->ext4.block_size; uint8_t *buf=kernel_malloc(3*bs); if (!buf) return -RELIEFOS_ENOMEM;
+    struct ext4_inode_view in; ret=ed_get_inode(v,ino,&in);
+    if (ret<0) { return ret; }
+    unsigned bs=v->ext4.block_size; uint8_t *buf=prepared ? prepared : kernel_malloc(3*bs);
+    if (!buf) { return -RELIEFOS_ENOMEM; }
     bool indexed=(in.flags&EXT4_INDEX_FL)!=0;
     if (indexed && !(name[0]=='.' && (name[1]==0 || (name[1]=='.' && !name[2])))) {
         struct ed_probe p; ret=ed_probe(v,ino,&in,name,buf,buf+bs,&p);
@@ -236,7 +239,7 @@ int storage_ext4_dir_lookup(struct storage_volume *v,uint64_t ino,const char *na
             int next=ed_probe_next(v,ino,&in,buf,buf+bs,&p);
             if (next) { if (next<0) ret=next; break; }
         }
-        if (ret==0 || ret==-RELIEFOS_ENOENT) { kernel_free(buf); return ret; }
+        if (ret==0 || ret==-RELIEFOS_ENOENT) { if(!prepared)kernel_free(buf); return ret; }
         /* Damaged index: validated leaf scanning can still serve reads, but
          * mutations remain disabled until repair/remount. */
         v->ext4.fs_error=1;
@@ -248,8 +251,13 @@ int storage_ext4_dir_lookup(struct storage_volume *v,uint64_t ino,const char *na
         ret=ed_scan(v,buf,index?bs:ed_limit(v),name,NULL,found,type);
         if (ret!=-RELIEFOS_ENOENT) break;
     }
-    kernel_free(buf); return ret;
+    if(!prepared)kernel_free(buf); return ret;
 }
+int storage_ext4_dir_lookup(struct storage_volume *v,uint64_t ino,const char *name,uint64_t *found,uint8_t *type)
+{ return ed_lookup(v,ino,name,found,type,NULL); }
+int storage_ext4_dir_lookup_prepared(struct storage_volume *v,uint64_t ino,const char *name,
+                                     uint64_t *found,uint8_t *type,uint8_t *buffer)
+{ return buffer ? ed_lookup(v,ino,name,found,type,buffer) : -RELIEFOS_EINVAL; }
 int storage_ext4_dir_iterate(struct storage_volume *v,uint64_t ino,uint64_t *cursor,struct storage_ext4_dirent *out)
 {
     if (!cursor || !out) return -RELIEFOS_EINVAL;
@@ -575,8 +583,16 @@ static int ed_cleanup(struct storage_volume *v,uint64_t ino,bool dir)
     (void)dir;
     return storage_ext4_destroy_inode(v,ino);
 }
-int storage_ext4_unlink_held(struct storage_volume *v,uint64_t parent,const char *name,bool directory,bool held)
+/** @brief Remove a member, optionally retaining an unlinked inode.
+ * @param v Borrowed volume. @param parent Parent inode. @param name Member name.
+ * @param directory Require a directory. @param held Keep a pinned orphan.
+ * @param destroyed Optional terminal-cleanup result, false on failure or surviving links.
+ * @return Zero or negative provider errno under execution ownership.
+ */
+int storage_ext4_unlink_held(struct storage_volume *v,uint64_t parent,const char *name,
+                              bool directory,bool held,bool *destroyed)
 {
+    if (destroyed) *destroyed=false;
     int ret=ed_name(name,true); if (ret<0) return ret;
     struct storage_ext4_handle h; ret=storage_ext4_journal_start(v,EXT4_JOURNAL_CREDITS,&h); if (ret<0) return ret;
     uint64_t ino=0; struct ext4_inode_view in,par;
@@ -596,11 +612,22 @@ int storage_ext4_unlink_held(struct storage_volume *v,uint64_t parent,const char
     ret=in.links_count?storage_ext4_write_inode(v,ino,&in):storage_ext4_orphan_add(v,ino,&in);
 done:
     ret=ed_stop(&h,ret);
-    if (!ret && !in.links_count && !held) ret=ed_cleanup(v,ino,directory);
+    if (!ret && !in.links_count && !held) {
+        ret=ed_cleanup(v,ino,directory);
+        if (!ret && destroyed) *destroyed=true;
+    }
     return ret;
 }
-int storage_ext4_rename_held(struct storage_volume *v,uint64_t oldparent,const char *oldname,uint64_t newparent,const char *newname,bool held)
+/** @brief Rename a member, optionally retaining a replaced pinned inode.
+ * @param v Borrowed volume. @param oldparent Source parent. @param oldname Source name.
+ * @param newparent Target parent. @param newname Target name. @param held Keep a pinned target.
+ * @param destroyed Optional terminal-cleanup result, false for same-inode no-op.
+ * @return Zero or negative provider errno under execution ownership.
+ */
+int storage_ext4_rename_held(struct storage_volume *v,uint64_t oldparent,const char *oldname,
+                            uint64_t newparent,const char *newname,bool held,bool *destroyed)
 {
+    if (destroyed) *destroyed=false;
     int ret=ed_name(oldname,true); if (ret<0) return ret; ret=ed_name(newname,true); if (ret<0) return ret;
     uint64_t source,target=0; struct ext4_inode_view in,replaced={0};
     ret=storage_ext4_dir_lookup(v,oldparent,oldname,&source,NULL); if (ret<0) return ret;
@@ -657,10 +684,13 @@ int storage_ext4_rename_held(struct storage_volume *v,uint64_t oldparent,const c
     ed_touch(&in); ret=storage_ext4_write_inode(v,source,&in);
 done:
     ret=ed_stop(&h,ret);
-    if (!ret && target && !replaced.links_count && !held) ret=ed_cleanup(v,target,dir);
+    if (!ret && target && !replaced.links_count && !held) {
+        ret=ed_cleanup(v,target,dir);
+        if (!ret && destroyed) *destroyed=true;
+    }
     return ret;
 }
 int storage_ext4_unlink(struct storage_volume *v,uint64_t parent,const char *name,bool directory)
-{ return storage_ext4_unlink_held(v,parent,name,directory,false); }
+{ return storage_ext4_unlink_held(v,parent,name,directory,false,NULL); }
 int storage_ext4_rename(struct storage_volume *v,uint64_t op,const char *on,uint64_t np,const char *nn)
-{ return storage_ext4_rename_held(v,op,on,np,nn,false); }
+{ return storage_ext4_rename_held(v,op,on,np,nn,false,NULL); }

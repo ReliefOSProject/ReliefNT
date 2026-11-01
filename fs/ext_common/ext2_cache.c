@@ -28,19 +28,34 @@ void ext2_cache_reset(struct storage_volume *volume)
         }
 }
 
-void ext2_cache_invalidate_range(uint64_t lba, uint32_t sectors)
+/** @brief Check an exact physical alias without acquiring a device reference.
+ * @param volume Cached volume, nullable. @param writer Optional borrowed writer volume.
+ * @param device Optional borrowed exact block identity. @return True for an alias.
+ */
+static bool ext2_cache_same_device(const struct storage_volume *volume,
+                                   const struct storage_volume *writer,const struct block_device *device)
 {
-    /* Invalidate aliases too: raw disk writes can use a temporary volume
-     * object instead of the mounted partition's identity. Extra eviction on
-     * another disk at the same LBA is harmless; stale aliases are not. */
-    if (storage_read_cache.valid &&
+    return volume && (volume==writer || (device && volume->device_ref.device==device));
+}
+
+/** @brief Evict only clean overlapping physical aliases of a writer device.
+ * @param writer Optional borrowed volume. @param device Optional borrowed identity;
+ * at least one must be present and neither is retained.
+ * @param lba First physical sector. @param sectors Nonzero sector count.
+ * Caller holds storage execution; no references, allocation or I/O are taken.
+ */
+void ext2_cache_invalidate_range(const struct storage_volume *writer,const struct block_device *device,
+                                 uint64_t lba,uint32_t sectors)
+{
+    if (!sectors || (!writer && !device)) return;
+    if (storage_read_cache.valid && ext2_cache_same_device(storage_read_cache.volume,writer,device) &&
         (lba <= storage_read_cache.first_lba
             ? storage_read_cache.first_lba - lba < sectors
             : lba - storage_read_cache.first_lba < storage_read_cache.sector_count))
         storage_read_cache.valid = 0;
     if (!ext2_cache) return;
     for (unsigned i = 0; i < EXT2_CACHE_ENTRIES; ++i) {
-        if (ext2_cache[i].sectors &&
+        if (ext2_cache[i].sectors && ext2_cache_same_device(ext2_cache[i].volume,writer,device) &&
             (lba <= ext2_cache[i].lba
                 ? ext2_cache[i].lba - lba < sectors
                 : lba - ext2_cache[i].lba < ext2_cache[i].sectors))

@@ -31,7 +31,7 @@ class FilesystemBoundaries(unittest.TestCase):
                         result = subprocess.run([
                             "clang", "-std=gnu11", "-O1", "-ffreestanding", "-fno-pie",
                             "-fno-stack-protector", "-mno-red-zone", "-mcmodel=large",
-                            "-DCONFIG_MODULES=1", "-DCONFIG_MODULE_UNLOAD=1",
+                            "-DCONFIG_MODULES=1", "-DCONFIG_MODULE_UNLOAD=1", "-DCONFIG_SWAP=1",
                             "-Iinclude", "-Iinclude/uapi", "-c", str(relative), "-o", str(obj),
                         ], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                         self.assertEqual(result.returncode, 0, str(relative) + "\n" + result.stderr)

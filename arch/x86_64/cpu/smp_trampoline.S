@@ -6,6 +6,7 @@
 .global smp_trampoline_stack_imm
 .global smp_trampoline_cpu_imm
 .global smp_trampoline_entry_imm
+.global smp_trampoline_physbits_imm
 .global smp_trampoline_gdtr_base
 .global smp_trampoline_gdtr
 .global smp_trampoline_gdt
@@ -51,6 +52,18 @@ smp_trampoline_cr3_imm:
     cpuid
     cmp $0x80000001, %eax
     jb .Lap_nx_unsupported
+    cmp $0x80000008, %eax
+    jb .Lap_nx_unsupported
+    mov $0x80000008, %eax
+    cpuid
+    /* Reject an AP unable to address the BSP's shared page tables or stacks
+     * before enabling paging or touching its potentially high stack. */
+    .byte 0x3c
+smp_trampoline_physbits_imm:
+    .byte 0
+    jb .Lap_nx_unsupported
+    cmp $52, %al
+    ja .Lap_nx_unsupported
     mov $0x80000001, %eax
     cpuid
     test $(1 << 20), %edx

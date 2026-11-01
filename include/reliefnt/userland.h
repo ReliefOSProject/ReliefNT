@@ -48,6 +48,15 @@ int userland_exec_current_path(const struct vfs_path *image,const char *execfn,
                                uint32_t argc, char *const argv[],
                                uint32_t envc, char *const envp[],
                                const char *data, uint32_t data_len);
+/** @brief Resume a committed exec only from the scheduler gate.
+ * @param task Owner of the prepared image. @return Zero after commit, private
+ * wait while cleanup progresses, or private fatal result on process exit.
+ */
+int userland_exec_continue(struct task *task);
+/** @brief Detach and discard a prepared exec image at cancellation/exit.
+ * @param task Owner; an absent image is a no-op. Execution ownership required.
+ */
+void userland_exec_cancel(struct task *task);
 /**
  * @brief Spawn a new process from path; returns the child pid or a negative error.
  */
@@ -96,5 +105,10 @@ int64_t userland_spawn_path_argv_for_user(const char *path,
  */
 const char *userland_boot_cmdline(void);
 struct task *userland_schedule_from_frame(struct trap_frame *frame);
+/** @brief Schedule an acknowledged PIT/AP timer return from Ring 3.
+ * @param frame Actual interrupted user frame. @return Selected task.
+ * Only the timer IRQ entry may call this boundary.
+ */
+struct task *userland_schedule_from_timer(struct trap_frame *frame);
 
 #endif

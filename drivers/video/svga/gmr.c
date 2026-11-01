@@ -14,6 +14,11 @@ static int define_gmr2(uint32_t id, uint32_t pages)
     return svga_fifo_packet_locked(SVGA_CMD_DEFINE_GMR2, false, &span, 1);
 }
 
+/** @brief Allocate and define a GMR from a complete PPN32 physical run.
+ * @param bytes Requested nonzero payload size. @param out Required handle output.
+ * @return Zero or SVGA error; published failed cleanup retains its handle.
+ * Caller holds svga_lock; owned pages stay pinned through host retirement.
+ */
 int svga_gmr_create_locked(uint32_t bytes, svga_handle *out)
 {
     if (!out || !bytes) return SVGA_EINVAL;
@@ -30,7 +35,7 @@ int svga_gmr_create_locked(uint32_t bytes, svga_handle *out)
     uint64_t phys = svga.ops.alloc(pages);
     if (!phys) goto done;
     void *ptr = svga.ops.pointer(phys);
-    if (!ptr || (phys & 4095) || phys / 4096 > UINT32_MAX - pages) {
+    if (!ptr || !svga_ppn32_run(phys, pages)) {
         svga.ops.free(phys, pages); goto done;
     }
     struct svga_gmr *g = &svga.gmrs[id];
@@ -39,7 +44,7 @@ int svga_gmr_create_locked(uint32_t bytes, svga_handle *out)
     if (!(svga.caps & SVGA_CAP_GMR2)) {
         uint64_t desc_phys = svga.ops.alloc(1);
         SVGAGuestMemDescriptor *desc = desc_phys ? svga.ops.pointer(desc_phys) : NULL;
-        if (!desc || (desc_phys & 4095) || (desc_phys >> 12) > UINT32_MAX) {
+        if (!desc || !svga_ppn32_run(desc_phys, 1)) {
             if (desc_phys) svga.ops.free(desc_phys, 1);
             release_pages(g); goto done;
         }

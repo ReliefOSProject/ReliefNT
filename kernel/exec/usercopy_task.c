@@ -2,8 +2,12 @@
 #include <reliefnt/usercopy.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/paging.h>
+#include <reliefnt/mm.h>
+#include <reliefnt/page_cache.h>
 #include <reliefnt/syscall.h>
 #include <linux/errno.h>
+
+extern void page_cache_note_write(uint64_t) __attribute__((weak));
 
 /**
  * @brief Copy through the target's page tables rather than the current CR3.
@@ -29,8 +33,10 @@ int user_copy_to_task(struct task *task, uint64_t address, const void *source, u
         uint64_t offset = destination & 4095u, take = 4096u - offset;
         if (!phys) return -LINUX_EFAULT;
         if (take > size - copied) take = size - copied;
-        __builtin_memcpy((void *)(uintptr_t)(RELIEFNT_KERNEL_DIRECT_MAP_BASE + phys + offset),
-                         (const uint8_t *)source + copied, take);
+        void *destination_map = mm_phys_to_virt(phys + offset);
+        if (!destination_map) return -LINUX_EFAULT;
+        __builtin_memcpy(destination_map, (const uint8_t *)source + copied, take);
+        if (page_cache_note_write) page_cache_note_write(phys);
         copied += take;
     }
     return 0;
@@ -64,9 +70,9 @@ int user_copy_from_task(struct task *task, void *destination, uint64_t address,
             return -LINUX_EFAULT;
         uint64_t offset = source & 4095u, take = 4096u - offset;
         if (take > size - copied) take = size - copied;
-        __builtin_memcpy((uint8_t *)destination + copied,
-                         (const void *)(uintptr_t)(RELIEFNT_KERNEL_DIRECT_MAP_BASE + phys + offset),
-                         take);
+        const void *source_map = mm_phys_to_virt(phys + offset);
+        if (!source_map) return -LINUX_EFAULT;
+        __builtin_memcpy((uint8_t *)destination + copied, source_map, take);
         copied += take;
     }
     return 0;

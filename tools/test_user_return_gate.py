@@ -12,15 +12,48 @@ from kernel_test_sources import kernel_sources, module_text
 
 ROOT = Path(__file__).resolve().parents[1]
 
+BODIES = [
+    ("syscall_return_body.inc", "kernel/syscall/entry.c", "syscall_dispatch_frame"),
+    ("user_return_entry_body.inc", "kernel/exec/userland.c", "userland_schedule_entry"),
+    ("user_return_body.inc", "kernel/exec/userland.c", "userland_schedule_from_frame"),
+    ("user_timer_return_body.inc", "kernel/exec/userland.c", "userland_schedule_from_timer"),
+    ("network_maintenance_body.inc", "kernel/exec/userland.c", "sched_network_maintenance"),
+    ("network_maintenance_runner_body.inc", "kernel/exec/userland.c", "sched_run_network_maintenance"),
+    ("pressure_maintenance_body.inc", "kernel/exec/userland.c", "sched_pressure_maintenance"),
+    ("pressure_maintenance_runner_body.inc", "kernel/exec/userland.c", "sched_run_pressure_maintenance"),
+    ("idle_service_body.inc", "kernel/exec/userland.c", "sched_idle_service_wait"),
+    ("int80_return_body.inc", "arch/x86_64/interrupt/idt.c", "int80_dispatch"),
+]
+
 
 def function(path, name):
+    """Extract exactly one balanced C function, ignoring braces in literals/comments."""
     source = path.read_text()
     match = re.search(r"^[^\n]+\b" + name + r"\([^\n]*\)\n\{", source, re.M)
     if match is None:
         raise RuntimeError("function not found: " + name)
-    end = source.index("\n}\n", match.start()) + 3
-    print(f"SOURCE {name} sha256={hashlib.sha256(source.encode()).hexdigest()}", flush=True)
-    return source[match.start():end]
+    tokens = re.compile(r'''/\*[\s\S]*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[{}]''')
+    depth = 0
+    for token in tokens.finditer(source, match.end() - 1):
+        if token.group() == "{":
+            depth += 1
+        elif token.group() == "}":
+            depth -= 1
+            if depth == 0:
+                print(f"SOURCE {name} sha256={hashlib.sha256(source.encode()).hexdigest()}", flush=True)
+                return source[match.start():token.end()] + "\n"
+    raise RuntimeError("unbalanced function: " + name)
+
+
+def host_function(path, name):
+    """Model only the privileged idle instruction; retain the surrounding body."""
+    body = function(path, name)
+    if name == "sched_idle_service_wait":
+        wait = '__asm__ volatile("sti; hlt; cli" ::: "memory");'
+        if body.count(wait) != 1:
+            raise RuntimeError("scheduler idle wait instruction not found exactly once")
+        body = body.replace(wait, "test_idle_wait();")
+    return body
 
 
 def main():
@@ -28,25 +61,12 @@ def main():
     if compiler is None:
         raise RuntimeError("a C compiler is required")
     kernel = ROOT
-    bodies = [
-        ("syscall_return_body.inc", "kernel/syscall/entry.c", "syscall_dispatch_frame"),
-        ("user_return_body.inc", "kernel/exec/userland.c", "userland_schedule_from_frame"),
-        ("network_maintenance_body.inc", "kernel/exec/userland.c", "sched_network_maintenance"),
-        ("network_maintenance_runner_body.inc", "kernel/exec/userland.c", "sched_run_network_maintenance"),
-        ("idle_service_body.inc", "kernel/exec/userland.c", "sched_idle_service_wait"),
-        ("int80_return_body.inc", "arch/x86_64/interrupt/idt.c", "int80_dispatch"),
-    ]
     temporary = Path(os.environ.get("TMPDIR", str(ROOT / "out" / "tmp")))
     temporary.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="user-return-", dir=temporary) as directory:
         work = Path(directory)
-        for target, source, name in bodies:
-            body = function(kernel / source, name)
-            if name == "sched_idle_service_wait":
-                wait = '__asm__ volatile("sti; hlt; cli" ::: "memory");'
-                if wait not in body:
-                    raise RuntimeError("scheduler idle wait instruction not found")
-                body = body.replace(wait, "test_idle_wait();")
+        for target, source, name in BODIES:
+            body = host_function(kernel / source, name)
             (work / target).write_text(body)
         source = module_text("syscall_dispatch")
         start = source.index("    if (number == LINUX_SYS_PSELECT6) {")

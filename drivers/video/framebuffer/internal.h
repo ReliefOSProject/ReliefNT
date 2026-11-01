@@ -389,8 +389,14 @@ void framebuffer_panic_present(void);
 
 void framebuffer_vmware_sync(bool report);
 
+/** @brief Probe VMware, restoring reprogrammed scanout on selection failure.
+ * @return 1 for a published device surface, or 0 for the unchanged boot surface.
+ */
 int framebuffer_vmware_probe(void);
 
+/** @brief Probe VBE without discarding the active boot framebuffer reservation.
+ * @return 1 when selected; 0 when the boot framebuffer remains the backend.
+ */
 int framebuffer_vbe_probe(void);
 
 int framebuffer_vbe_set_mode(uint32_t width, uint32_t height);

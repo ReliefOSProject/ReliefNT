@@ -1,5 +1,11 @@
 #include "internal.h"
 
+/** @brief Invalidate OOM snapshots when a vfork relation ends.
+ * Production links the allocation-free scheduler notifier; standalone clone
+ * fixtures may omit it. This notification is safe under scheduler_lock.
+ */
+extern void sched_oom_membership_changed(void) __attribute__((weak));
+
 /**
  * @brief Promote requested private task resources to shareable clone state.
  * @param task Stable parent under execution ownership and scheduler_lock.
@@ -72,7 +78,8 @@ static int task_promote_shared(struct task *task, uint64_t flags)
  * Linux completes tsk->vfork_done from mm_release() on both the exec and the
  * final exit path.  The parent is woken only from TASK_BLOCKED; a parent that
  * was concurrently killed or stopped keeps its terminal/job-control state and
- * simply loses the stale child pointer.
+ * simply loses the stale child pointer. Invalidates OOM holder validation.
+ * @param child Execution-owned vfork child, nullable, under scheduler_lock.
  */
 void vfork_child_done_locked(struct task *child)
 {
@@ -80,6 +87,7 @@ void vfork_child_done_locked(struct task *child)
     if (!parent) return;
     child->vfork_parent = NULL;
     if (parent->vfork_child == child) parent->vfork_child = NULL;
+    if (sched_oom_membership_changed) sched_oom_membership_changed();
     if (parent->state == TASK_BLOCKED) {
         parent->wake_tick = 0;
         parent->state = TASK_READY;
@@ -87,13 +95,16 @@ void vfork_child_done_locked(struct task *child)
     }
 }
 
-/** @brief Drop a dying parent's reference to its vfork child under lock. */
+/** @brief Drop a dying parent's vfork link and invalidate OOM holder validation.
+ * @param parent Execution-owned parent, nullable, under scheduler_lock.
+ */
 void vfork_parent_exit_locked(struct task *parent)
 {
     struct task *child = parent ? parent->vfork_child : NULL;
     if (!child) return;
     child->vfork_parent = NULL;
     parent->vfork_child = NULL;
+    if (sched_oom_membership_changed) sched_oom_membership_changed();
 }
 
 /**
@@ -102,6 +113,8 @@ void vfork_parent_exit_locked(struct task *parent)
  * Called with the scheduler unlocked after the child is committed to exec or
  * terminally exiting.  Keep the link cleared even when the parent already
  * died: a later task slot reuse must never observe a stale parent pointer.
+ * @param child Execution-owned vfork child, nullable. A cleared link
+ * invalidates bounded OOM holder snapshots without transferring ownership.
  */
 void sched_vfork_child_done(struct task *child)
 {
@@ -110,6 +123,25 @@ void sched_vfork_child_done(struct task *child)
     kernel_spin_lock_irqsave(&scheduler_lock, &flags);
     vfork_child_done_locked(child);
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
+}
+
+/** @brief Validate clone flag combinations before inspecting TID outputs.
+ * @param flags Linux clone flags and exit signal. @param tls Requested TLS base.
+ * @return Zero or the original clone validation errno; no allocation, locks,
+ * user access or state changes occur.
+ */
+int sched_clone_validate_flags(uint64_t flags,uint64_t tls)
+{
+    const uint64_t supported = CSIGNAL | CLONE_VM | CLONE_VFORK | CLONE_FS |
+        CLONE_FILES | CLONE_SIGHAND | CLONE_PARENT | CLONE_THREAD | CLONE_SYSVSEM |
+        CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID |
+        CLONE_DETACHED | CLONE_UNTRACED | CLONE_CHILD_SETTID | CLONE_CLEAR_SIGHAND;
+    if ((flags & CLONE_CLEAR_SIGHAND) && (flags & CLONE_SIGHAND)) return -22;
+    if ((flags & CLONE_THREAD) && !(flags & CLONE_SIGHAND)) return -22;
+    if ((flags & CLONE_SIGHAND) && !(flags & CLONE_VM)) return -22;
+    if (flags & ~supported) return -RELIEFOS_ENOSYS;
+    if ((flags & CLONE_SETTLS) && tls >= RELIEFNT_USER_TLS_LIMIT) return -RELIEFOS_EPERM;
+    return 0;
 }
 
 /**
@@ -131,18 +163,18 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
                            uint64_t stack, uint64_t parent_tid,
                            uint64_t child_tid, uint64_t tls)
 {
-    const uint64_t supported = CSIGNAL | CLONE_VM | CLONE_VFORK | CLONE_FS |
-        CLONE_FILES | CLONE_SIGHAND | CLONE_PARENT | CLONE_THREAD | CLONE_SYSVSEM |
-        CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID |
-        CLONE_DETACHED | CLONE_UNTRACED | CLONE_CHILD_SETTID | CLONE_CLEAR_SIGHAND;
-    if ((flags & CLONE_CLEAR_SIGHAND) && (flags & CLONE_SIGHAND)) return -22;
-    if ((flags & CLONE_THREAD) && !(flags & CLONE_SIGHAND)) return -22;
-    if ((flags & CLONE_SIGHAND) && !(flags & CLONE_VM)) return -22;
-    if (flags & ~supported) return -RELIEFOS_ENOSYS;
-    if ((flags & CLONE_SETTLS) && tls >= RELIEFNT_USER_TLS_LIMIT) return -RELIEFOS_EPERM;
+    int validate=sched_clone_validate_flags(flags,tls);
+    if(validate)return validate;
     if ((flags & CLONE_PARENT_SETTID) && !user_range_writable(parent_tid, 4)) return -14;
     if ((flags & CLONE_CHILD_SETTID) && !user_range_writable(child_tid, 4)) return -14;
     if (stack && (stack < RELIEFNT_USER_BASE || stack >= RELIEFNT_USER_TOP)) return -14;
+#ifdef CONFIG_SWAP
+    bool fork_reclaim_admitted = flags == 17 && parent_frame &&
+        parent_frame->rax == LINUX_SYS_FORK && kernel_execution_is_outermost();
+    uint64_t fork_free_before = fork_reclaim_admitted ? mm_free_memory_kib() / 4 : 0;
+#endif
+    struct task_identity *identity = sched_task_identity_prepare();
+    if (!identity) {  return -12; }
     uint64_t lock_flags;
     kernel_spin_lock_irqsave(&scheduler_lock, &lock_flags);
     struct task *parent = sched_current_task();
@@ -152,31 +184,40 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
     if (!parent || !parent_frame || parent->kind != TASK_KIND_USER ||
         parent->state == TASK_EXITED || !(*sched_task_as(parent)).cr3) {
         kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
+        sched_task_identity_put(identity);
         return -22;
     }
     if (task_nproc_denied_locked(parent)) {
         kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
+        sched_task_identity_put(identity);
         return -LINUX_EAGAIN;
     }
     parent->nproc_exceeded = false;
     if (task_promote_shared(parent, flags) < 0) {
+
         kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
+        sched_task_identity_put(identity);
         return -12;
     }
     child = alloc_task_slot();
     if (!child) {
+
         kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
+        sched_task_identity_put(identity);
         return -12;
     }
     child_pid = task_allocate_pid();
     if (!child_pid) {
+
         task_zero(child);
         child->state = TASK_EXITED;
         kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
+        sched_task_identity_put(identity);
         return -12;
     }
     task_zero(child);
     *child = *parent;
+    sched_oom_policy_inherit(child, parent);
     child->identity_token=NULL;
     /* Pending syscall operands belong to the caller, never its new child. */
     child->lookup_scope=(struct task_lookup_scope){0};
@@ -348,11 +389,42 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
         child->shared_mm = parent->shared_mm;
         ++child->shared_mm->references;
     } else {
-        if (!address_space_clone_cow(sched_task_as(parent), sched_task_as(child))) goto fail;
+        /* Lock policy belongs to the parent MM and is never inherited by fork. */
+        child->mlockall_flags = 0;
+        bool cloned;
+#ifdef CONFIG_SWAP
+        bool allocation_exhausted = false;
+        uint64_t failure_free = 0;
+        uint64_t before_cow = fork_reclaim_admitted ? mm_free_memory_kib() / 4 : 0;
+        if (fork_reclaim_admitted)
+            cloned = address_space_clone_cow_fork(sched_task_as(parent), sched_task_as(child),
+                                                   &allocation_exhausted, &failure_free);
+        else
+#endif
+            cloned = address_space_clone_cow(sched_task_as(parent), sched_task_as(child));
+        if (!cloned) {
+#ifdef CONFIG_SWAP
+            if (fork_reclaim_admitted && allocation_exhausted) {
+                uint64_t prefix = fork_free_before > before_cow ? fork_free_before - before_cow : 0;
+                uint64_t peak = fork_free_before > failure_free ? fork_free_before - failure_free : 0;
+                if (prefix <= UINT32_MAX && peak < UINT32_MAX) {
+                    struct fork_cow_reclaim_state *state =
+                        &((struct sched_task_object *)parent)->fork_cow_reclaim;
+                    *state = (struct fork_cow_reclaim_state){
+                        .cr3 = sched_task_as(parent)->cr3, .rip = parent_frame->rip,
+                        .prefix_pages = (uint32_t)prefix,
+                        .minimum_pages = (uint32_t)peak + 1, .active = true};
+                }
+            }
+#endif
+             goto fail;
+        }
         child->address_space.executable_inode = sched_task_mm(parent)->executable_inode;
         storage_inode_retain(child->address_space.executable_inode);
         if(sched_task_mm(parent)->executable_denied_write) {
-            if(storage_inode_deny_write(child->address_space.executable_inode)<0)goto fail;
+            if(storage_inode_deny_write(child->address_space.executable_inode)<0) {
+                 goto fail;
+            }
             child->address_space.executable_denied_write=true;
         }
         vfs_path_get(&sched_task_mm(parent)->executable_path,&child->address_space.executable_path);
@@ -360,30 +432,32 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
             const struct task_vma *src = &sched_task_mm(parent)->vmas[i];
             struct task_vma *dst = &child->address_space.vmas[i];
             *dst = *src;
+            dst->flags &= ~(TASK_VMA_FLAG_LOCKED | TASK_VMA_FLAG_LOCKONFAULT);
             dst->inode = NULL;
             dst->device_mapping = NULL;
             dst->mapping_file = NULL;
             dst->exec_source = NULL;
             dst->sysv_shm_attachment = NULL;
             if (src->inode) storage_inode_retain(dst->inode = src->inode);
-            if (sched_task_vma_retain_device(dst, src) < 0) goto fail;
-            if (sched_task_vma_retain_file(dst, src) < 0) goto fail;
-            if (sysv_shm_vma_clone(child, dst, src) < 0) goto fail;
+            if (sched_task_vma_retain_device(dst, src) < 0) {  goto fail; }
+            if (sched_task_vma_retain_file(dst, src) < 0) {  goto fail; }
+            if (sysv_shm_vma_clone(child, dst, src) < 0) {  goto fail; }
         }
         for (uint32_t i = 0; i < sched_task_mm(parent)->vma_extra_count; ++i) {
             struct task_vma *dst = sched_task_vma_at(child, SCHED_TASK_VMA_MAX + i);
-            if (!dst) goto fail;
+            if (!dst) {  goto fail; }
             const struct task_vma *src = &sched_task_mm(parent)->vma_extra[i];
             *dst = *src;
+            dst->flags &= ~(TASK_VMA_FLAG_LOCKED | TASK_VMA_FLAG_LOCKONFAULT);
             dst->inode = NULL;
             dst->device_mapping = NULL;
             dst->mapping_file = NULL;
             dst->exec_source = NULL;
             dst->sysv_shm_attachment = NULL;
             if (src->inode) storage_inode_retain(dst->inode = src->inode);
-            if (sched_task_vma_retain_device(dst, src) < 0) goto fail;
-            if (sched_task_vma_retain_file(dst, src) < 0) goto fail;
-            if (sysv_shm_vma_clone(child, dst, src) < 0) goto fail;
+            if (sched_task_vma_retain_device(dst, src) < 0) {  goto fail; }
+            if (sched_task_vma_retain_file(dst, src) < 0) {  goto fail; }
+            if (sysv_shm_vma_clone(child, dst, src) < 0) {  goto fail; }
         }
     }
     if (flags & CLONE_FILES) {
@@ -392,10 +466,10 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
     } else {
         for (uint32_t i = 0; i < sched_task_fds(parent)->file_extra_count; ++i) {
             struct task_file *dst = sched_task_file_at(child, SCHED_TASK_FILE_MAX + i);
-            if (!dst) goto fail;
+            if (!dst) {  goto fail; }
             *dst = sched_task_fds(parent)->file_extra[i];
         }
-        if (syscall_clone_task_files(parent, child) < 0) goto fail;
+        if (syscall_clone_task_files(parent, child) < 0) {  goto fail; }
         files_retained = true;
     }
     /**
@@ -403,8 +477,10 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
  */
     if (sched_set_task_exec_params(child_pid, parent->exec_argc, parent->exec_argv,
                                    parent->exec_envc, parent->exec_envp,
-                                   parent->exec_data, parent->exec_data_len) < 0) goto fail;
-    if (task_sysv_sem_clone(parent, child, flags) < 0) goto fail;
+                                   parent->exec_data, parent->exec_data_len) < 0) {
+         goto fail;
+    }
+    if (task_sysv_sem_clone(parent, child, flags) < 0) {  goto fail; }
     if (flags & CLONE_FS) {
         child->shared_fs = parent->shared_fs;
         ++child->shared_fs->references;
@@ -418,12 +494,22 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
         ++child->shared_limits->references;
     }
     task_groups_retain(child->groups);
-    if (flags & CLONE_PARENT_SETTID) *(uint32_t *)(uintptr_t)parent_tid = child_pid;
+    if (flags & CLONE_PARENT_SETTID)
+        __builtin_memcpy((void *)(uintptr_t)parent_tid,&child_pid,sizeof(child_pid));
     if (flags & CLONE_CHILD_SETTID) {
-        if (!address_space_user_page_writable(sched_task_as(child), child_tid))
-            address_space_handle_cow_fault(sched_task_as(child), child_tid);
-        uint64_t phys = address_space_user_page_phys(sched_task_as(child), child_tid);
-        *(uint32_t *)(uintptr_t)(RELIEFNT_KERNEL_DIRECT_MAP_BASE + phys + (child_tid & 4095)) = child_pid;
+        /* Resolve COW on both possible pages without demand-faulting while
+         * scheduler_lock is held; the task copy checks physical aliases. */
+        uint64_t endpoints[] = {child_tid, child_tid + sizeof(child_pid) - 1};
+        bool writable = true;
+        for (unsigned i = 0; i < 2; ++i) {
+            if (!address_space_user_page_writable(sched_task_as(child), endpoints[i]) &&
+                (!address_space_handle_cow_fault(sched_task_as(child), endpoints[i]) ||
+                 !address_space_user_page_writable(sched_task_as(child), endpoints[i]))) {
+                writable = false;
+                break;
+            }
+        }
+        if (writable) (void)user_copy_to_task(child, child_tid, &child_pid, sizeof(child_pid));
     }
     if (flags & CLONE_VFORK) {
         /* Publish the parent/child relation while still holding
@@ -435,9 +521,14 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
         parent->wake_tick = 0;
         parent->state = TASK_BLOCKED;
     }
+    sched_task_identity_bind(child, identity);
     child->state = TASK_READY;
     sched_request_reschedule_all_online();
     kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
+    /* Execution ownership keeps the published child stable while this
+     * non-scheduler-locked healthy-path MM identity preparation runs. */
+    uint64_t generation;
+    (void)mm_context_ensure_generation(sched_task_as(child), &generation);
     return (int64_t)child_pid;
 
 fail:
@@ -463,11 +554,90 @@ fail:
     child->running_cpu = SCHED_CPU_NONE;
     child->flags = TASK_FLAG_RESOURCES_RELEASED;
     kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
+    sched_task_identity_put(identity);
     return -12;
 }
 
+#ifdef CONFIG_SWAP
+/** @brief Discard a suspended fork's scalar-only COW reclaim continuation.
+ * @param task Current or retiring task, nullable. Holds no MM/child references.
+ */
+void sched_fork_reclaim_cancel(struct task *task)
+{
+    if (!task) return;
+    struct fork_cow_reclaim_state *state =
+        &((struct sched_task_object *)task)->fork_cow_reclaim;
+    if (!state->active) return;
+    *state = (struct fork_cow_reclaim_state){0};
+    sched_pressure_reset(task);
+}
+
+/** @brief Recount one suspended fork and advance one outer-writer reclaim batch.
+ * @param task Current parent. @param frame Original live fork frame.
+ * @return Zero when ready, a retry marker, or the original ENOMEM. No child,
+ * MM pointer, physical reservation or scheduler lock survives this call.
+ */
+static int64_t fork_cow_reclaim_step(struct task *task, const struct trap_frame *frame)
+{
+    struct fork_cow_reclaim_state *state =
+        &((struct sched_task_object *)task)->fork_cow_reclaim;
+    uint32_t tables;
+    uint64_t swapped;
+    if (!frame || frame->rip < 2 || frame->rax != LINUX_SYS_FORK ||
+        !kernel_execution_is_outermost() || task != sched_current_task() ||
+        state->rip != frame->rip || state->cr3 != sched_task_as(task)->cr3 ||
+        !address_space_fork_page_cost(sched_task_as(task), &tables, &swapped)) {
+        sched_fork_reclaim_cancel(task); return -12;
+    }
+    uint64_t metadata = mm_fork_metadata_page_bound(sched_task_as(task), swapped);
+    if (metadata == UINT64_MAX || metadata > UINT32_MAX - (uint64_t)tables ||
+        metadata + tables > UINT32_MAX - (uint64_t)state->prefix_pages) {
+        sched_fork_reclaim_cancel(task); return -12;
+    }
+    uint64_t required = metadata + tables + state->prefix_pages;
+    if (required < state->minimum_pages) required = state->minimum_pages;
+    uint64_t total = mm_total_memory_kib() / 4, reserve = mm_emergency_reserve_pages();
+    if (total <= reserve || required > total - reserve) {
+        sched_fork_reclaim_cancel(task); return -12;
+    }
+    memory_reclaim_fault_scope_begin(task, frame->rip - 2, frame->rsp);
+    int rc = memory_try_reclaim((uint32_t)required, 0);
+    memory_reclaim_fault_scope_end();
+    if (rc == -EAGAIN) return KERNEL_SYSCALL_SWAP_CONTENDED;
+    if (rc) { sched_fork_reclaim_cancel(task); return -12; }
+    return 0;
+}
+#endif
+
 int64_t sched_fork_current(const struct trap_frame *frame)
 {
+#ifdef CONFIG_SWAP
+    struct task *parent = sched_current_task();
+    if (parent && frame && frame->rax == LINUX_SYS_FORK && kernel_execution_is_outermost()) {
+        struct fork_cow_reclaim_state *state =
+            &((struct sched_task_object *)parent)->fork_cow_reclaim;
+        if (state->active && (state->rip != frame->rip || state->cr3 != sched_task_as(parent)->cr3))
+            sched_fork_reclaim_cancel(parent);
+        if (state->active) {
+            int64_t rc = fork_cow_reclaim_step(parent, frame);
+            if (rc) return rc;
+            sched_fork_reclaim_cancel(parent);
+        }
+        int64_t result = sched_clone_current(frame, 17, 0, 0, 0, 0);
+        if (result == -12 && state->active) {
+            /* Rollback may itself return many child tables and slab pages.
+             * Demand a real ordinary-page gain beyond that post-rollback
+             * snapshot, not merely a target the rollback already satisfied. */
+            uint64_t free = mm_free_memory_kib() / 4, reserve = mm_emergency_reserve_pages();
+            uint64_t ordinary = free > reserve ? free - reserve : 0;
+            if (ordinary >= UINT32_MAX) { sched_fork_reclaim_cancel(parent); return -12; }
+            if (state->minimum_pages <= ordinary) state->minimum_pages = (uint32_t)ordinary + 1;
+            int64_t rc = fork_cow_reclaim_step(parent, frame);
+            return rc ? rc : KERNEL_SYSCALL_SWAP_CONTENDED;
+        }
+        return result;
+    }
+#endif
     return sched_clone_current(frame, 17, 0, 0, 0, 0);
 }
 

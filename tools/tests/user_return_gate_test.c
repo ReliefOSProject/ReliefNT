@@ -22,6 +22,10 @@
 #include <reliefnt/module.h>
 #include <reliefnt/syscall_internal.h>
 #include <reliefnt/storage.h>
+#include <reliefnt/swap.h>
+#include <reliefnt/swap_internal.h>
+#include <reliefnt/memory_pressure.h>
+#include <reliefnt/time.h>
 #include <reliefnt/framebuffer.h>
 #include <reliefos/fb.h>
 #include <linux/errno.h>
@@ -40,6 +44,7 @@ static bool network_stack_active;
 static unsigned network_maintenance_calls;
 static unsigned network_stack_maintenance_calls;
 static unsigned network_stack_calls;
+static unsigned pressure_calls;
 #define SCHED_IDLE_SERVICE_STACK_BYTES (16u * 1024u)
 static uint8_t sched_idle_service_stacks[SMP_MAX_CPUS]
     [SCHED_IDLE_SERVICE_STACK_BYTES] __attribute__((aligned(16)));
@@ -51,10 +56,37 @@ static struct task *selected;
 static atomic_bool key_pending;
 static unsigned drained, delivered, released, fpu_saved, fpu_restored;
 static uint64_t installed_fs;
+#ifdef CONFIG_SWAP
+static struct task *staged_exec;
+static unsigned exec_continuations, exec_cancellations, exec_exits, exec_backend_calls;
+void task_socket_stage_enter(struct task *task,const struct trap_frame *frame)
+{ (void)task;(void)frame; }
+struct task *sched_exec_staged(const struct task *task) { return task==staged_exec ? staged_exec : NULL; }
+int userland_exec_continue(struct task *task)
+{ assert(exclusive() && task==staged_exec);++exec_continuations;task->frame.rip=0x900000;staged_exec=NULL;return 0; }
+void userland_exec_cancel(struct task *task) { assert(task==staged_exec);staged_exec=NULL;++exec_cancellations; }
+int swap_prepare_user_range(struct task *task,uint64_t address,uint64_t length,bool writing)
+{ (void)task;(void)address;(void)length;(void)writing;return 0; }
+/** @brief Reject process_vm ownership, outside this scheduler-gate fixture.
+ * @param state Unexpected private process_vm scope.
+ */
+void task_process_vm_scope_release(void *state) { (void)state;assert(false); }
+#endif
 
 uint32_t smp_current_cpu(void) { return cpu; }
 bool net_tcp_maintenance_due(void)
 { assert(exclusive()); return network_due; }
+/** @brief Model a completed pressure batch on the scheduler service stack.
+ * @param budget Requested page budget from the real timer admission.
+ */
+void memory_pressure_poll(uint32_t budget)
+{ assert(exclusive() && network_stack_active && budget == 16); ++pressure_calls; }
+#ifdef CONFIG_SWAP
+/** @brief Model an available swap transport for this return-gate fixture.
+ * @return False; no storage transaction is active in the fixture.
+ */
+bool swap_storage_busy(void) { assert(exclusive()); return false; }
+#endif
 void net_tcp_maintenance(void)
 {
     assert(exclusive());
@@ -89,13 +121,23 @@ bool sched_try_resume_current_user_frame(const struct trap_frame *frame)
 }
 bool sched_capture_current_user_frame(const struct trap_frame *frame)
 { assert(exclusive()); current.frame=*frame; return true; }
-struct task *sched_select_next_user(void) { assert(exclusive()); return selected; }
+struct task *sched_select_next_user(void) { assert(exclusive());
+#ifdef CONFIG_SWAP
+    if (staged_exec==&current && current.state==TASK_BLOCKED && selected==&current) return &replacement;
+#endif
+    return selected; }
 struct task *sched_reclaim_current_user(void) { assert(exclusive()); return selected; }
 void sched_quiesce_exited_current(void) { assert(exclusive()); }
 void sched_release_task_resources(struct task *task)
 { assert(exclusive() && task==&current); ++released; }
-void sched_exit(uint32_t pid, uint64_t code) { (void)pid;(void)code; assert(false); }
-int kernel_signal_deliver_pending(struct task *task, struct trap_frame *frame)
+void sched_cleanup_poll(uint32_t budget) { assert(exclusive() && budget==8); }
+void sched_exit(uint32_t pid, uint64_t code) {
+#ifdef CONFIG_SWAP
+    if(pid==current.pid && code==127){++exec_exits;current.state=TASK_EXITED;return;}
+#endif
+    (void)pid;(void)code; assert(false);
+}
+int kernel_signal_deliver_pending_outer(struct task *task, struct trap_frame *frame)
 {
     assert(exclusive());
     if (sched_task_pending(task)&~task->blocked_signals) {
@@ -124,8 +166,12 @@ static struct task *wait_for_runnable_task(uint64_t *flags)
  * The real scheduler's eligibility rules have separate sched_resume coverage. */
 #include "network_maintenance_body.inc"
 #include "network_maintenance_runner_body.inc"
+#include "pressure_maintenance_body.inc"
+#include "pressure_maintenance_runner_body.inc"
 #include "idle_service_body.inc"
+#include "user_return_entry_body.inc"
 #include "user_return_body.inc"
+#include "user_timer_return_body.inc"
 
 static void reset(void)
 {
@@ -140,7 +186,11 @@ static void reset(void)
     selected=&current;drained=delivered=released=fpu_saved=fpu_restored=0;
     network_due=false;network_stack_active=false;
     network_maintenance_calls=network_stack_maintenance_calls=network_stack_calls=0;
+    pressure_calls=0;
     installed_fs=0;
+#ifdef CONFIG_SWAP
+    staged_exec=NULL;exec_continuations=exec_cancellations=exec_exits=exec_backend_calls=0;
+#endif
     atomic_store(&key_pending,false);
 }
 static bool async_io, inject_input;
@@ -174,6 +224,9 @@ int64_t kernel_signal_rt_sigreturn(struct task *task, struct trap_frame *frame)
 int64_t sched_clone_current(const struct trap_frame *frame, uint64_t flags,
     uint64_t stack, uint64_t parent, uint64_t child, uint64_t tls)
 { (void)frame;(void)flags;(void)stack;(void)parent;(void)child;(void)tls;assert(false);return 0; }
+int64_t syscall_clone_prepared(const struct trap_frame *frame, uint64_t flags,
+    uint64_t stack, uint64_t parent, uint64_t child, uint64_t tls)
+{ (void)frame;(void)flags;(void)stack;(void)parent;(void)child;(void)tls;assert(false);return 0; }
 int64_t syscall_clone3(const struct trap_frame *frame, uint64_t args, uint64_t size)
 { (void)frame;(void)args;(void)size;assert(false);return 0; }
 int64_t sched_fork_current(const struct trap_frame *frame)
@@ -185,6 +238,10 @@ static int64_t backend(struct task *task, uint64_t nr, uint64_t a0,
 {
     (void)nr;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;
     assert(exclusive() && async_io && task==&current);
+#ifdef CONFIG_SWAP
+    ++exec_backend_calls;
+    if (backend_result==KERNEL_SYSCALL_EXEC_COMMIT_WAIT) staged_exec=task;
+#endif
     if (inject_input) atomic_store(&key_pending,true);
     return backend_result;
 }
@@ -212,6 +269,31 @@ static void test_one_transaction_for_completed_syscall(void)
         fputs("FAIL: completed syscall reacquired the execution transaction on user return\n",stderr);
     assert(execution_next_ticket-before==1);
 }
+#ifdef CONFIG_SWAP
+/** @brief A committed exec continues at the selected-task gate, never old RIP. */
+static void test_exec_continues_without_old_user_instruction(void)
+{
+    struct trap_frame frame=prepare(LINUX_SYS_EXECVE);
+    uint64_t old_rip=frame.rip;
+    backend_result=KERNEL_SYSCALL_EXEC_COMMIT_WAIT;
+    assert(int80_dispatch(&frame)==&replacement);
+    assert(frame.rip==old_rip && current.frame.rip==old_rip && staged_exec==&current);
+    assert(current.state==TASK_BLOCKED && slept==1 && !exec_continuations);
+    current.state=TASK_READY;selected=&current;
+    assert(userland_schedule_from_frame(NULL)==&current);
+    assert(!staged_exec && exec_continuations==1 && current.frame.rip==0x900000);
+}
+/** @brief No syscall frame may resume a committed kernel-owned exec. */
+static void test_committed_exec_rejects_unexpected_syscall(void)
+{
+    struct trap_frame frame=prepare(LINUX_SYS_EXECVE);
+    staged_exec=&current;
+    assert(!syscall_dispatch_frame(&frame));
+    assert(current.state==TASK_EXITED && !staged_exec);
+    assert(exec_cancellations==1 && exec_exits==1 && !exec_continuations && !exec_backend_calls);
+    assert(!current.lookup_scope.armed && !async_io);
+}
+#endif
 static void test_timer_user_return_network_maintenance_stack(void)
 {
     struct trap_frame frame=prepare(LINUX_SYS_GETPID);
@@ -220,6 +302,18 @@ static void test_timer_user_return_network_maintenance_stack(void)
     assert(network_maintenance_calls==1 && network_stack_maintenance_calls==1);
     assert(network_stack_calls==1 && !network_stack_active);
     assert(!irq_state);
+}
+/** @brief Check that only the timer wrapper admits bounded pressure work. */
+static void test_timer_pressure_entry(void)
+{
+    struct trap_frame frame=prepare(LINUX_SYS_GETPID);
+    assert(userland_schedule_from_frame(&frame)==&current);
+    assert(!pressure_calls && !network_stack_calls);
+    assert(userland_schedule_from_timer(&frame)==&current);
+    assert(pressure_calls==1 && network_stack_calls==1 && !network_stack_active);
+    frame.cs=8;
+    assert(!userland_schedule_from_timer(&frame));
+    assert(pressure_calls==1 && network_stack_calls==1);
 }
 static struct usb_host *hotplug_host;
 static struct block_device_registration hotplug_disk;
@@ -300,6 +394,13 @@ static void test_signal_input_and_retry(void)
     assert(int80_dispatch(&frame)==&replacement);
     assert(frame.rax==LINUX_SYS_GETPID && frame.rip==rip-2 && slept==1);
     assert(current.restart_syscall==LINUX_SYS_GETPID+1 && !io_releases && !async_io);
+    for(unsigned i=0;i<2;++i) {
+        uint64_t number=i ? LINUX_SYS_SWAPOFF : LINUX_SYS_SWAPON;
+        frame=prepare(number);backend_result=-RELIEFOS_EAGAIN;selected=&replacement;rip=frame.rip;
+        assert(int80_dispatch(&frame)==&current);
+        assert((int64_t)frame.rax==-RELIEFOS_EAGAIN && frame.rip==rip && !slept);
+        assert(!current.restart_syscall && io_releases==1 && !async_io);
+    }
 }
 static void test_restored_context_and_fallback(void)
 {
@@ -318,8 +419,13 @@ static void test_restored_context_and_fallback(void)
 }
 int main(void)
 {
+#ifdef CONFIG_SWAP
+    test_exec_continues_without_old_user_instruction();
+    test_committed_exec_rejects_unexpected_syscall();
+#endif
     test_one_transaction_for_completed_syscall();
     test_timer_user_return_network_maintenance_stack();
+    test_timer_pressure_entry();
     test_idle_usb_work_without_syscall();
     test_usb_work_without_syscall();
     test_signal_input_and_retry();

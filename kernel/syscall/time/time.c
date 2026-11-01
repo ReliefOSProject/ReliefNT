@@ -2,6 +2,7 @@
 #include <reliefnt/time.h>
 #include <reliefnt/usercopy.h>
 #include <reliefnt/futex.h>
+#include <reliefnt/swap.h>
 #include <linux/time.h>
 #include <linux/timex.h>
 #include <linux/capability.h>
@@ -16,10 +17,27 @@ struct linux_kernel_sigevent {
     int32_t reserved;
 };
 
+/** @brief Prepare a bounded time/signal operand at the outer syscall gate.
+ * @param task Current task, nullable. @param address User operand.
+ * @param size Byte count. @param writing True for output.
+ * @param late Preserve an existing late-EFAULT side-effect order.
+ * @return Zero, EFAULT for an input, or the private contention marker.
+ */
+static int time_prepare_user(struct task *task, uint64_t address, uint64_t size,
+                             bool writing, bool late)
+{
+    if (!task) return 0;
+    int ret = swap_prepare_user_range(task, address, size, writing);
+    if (ret == SWAP_STORAGE_CONTENDED) return KERNEL_SYSCALL_SWAP_CONTENDED;
+    return ret < 0 && !late ? -LINUX_EFAULT : 0;
+}
+
 int64_t syscall_itimer(bool setting, int32_t which, uint64_t value, uint64_t old_value)
 {
     struct linux_itimerval requested = {0}, old;
     if (setting && value) {
+        int prep=time_prepare_user(sched_current_task(),value,sizeof(requested),false,false);
+        if(prep)return prep;
         if (!user_range_ok(value, sizeof(requested))) return -LINUX_EFAULT;
         requested = *(const struct linux_itimerval *)(uintptr_t)value;
         if (requested.it_value.tv_sec < 0 || requested.it_interval.tv_sec < 0 ||
@@ -30,8 +48,12 @@ int64_t syscall_itimer(bool setting, int32_t which, uint64_t value, uint64_t old
     if (which != LINUX_ITIMER_REAL) return -LINUX_ENOSYS;
     struct task *task = sched_current_task();
     if (!task) return -LINUX_ESRCH;
-    sched_itimer_task(task, setting ? &requested : NULL, &old);
     uint64_t output = setting ? old_value : value;
+    if (!setting || output) {
+        int prep=time_prepare_user(task,output,sizeof(old),true,true);
+        if(prep)return prep;
+    }
+    sched_itimer_task(task, setting ? &requested : NULL, &old);
     /* Linux commits setitimer before attempting the optional old-value copy. */
     if (!setting || output) {
         if (!user_range_writable(output, sizeof(old))) return -LINUX_EFAULT;
@@ -76,6 +98,8 @@ int64_t syscall_nanosleep(int32_t clock, uint32_t flags, uint64_t request, uint6
     if (ret < 0) { task->nanosleep_deadline = task->nanosleep_remaining = 0; return ret; }
     uint64_t now = timespec_ticks(clock_value);
     if (!task->nanosleep_deadline) {
+        int prep=time_prepare_user(task,request,sizeof(struct linux_timespec),false,false);
+        if(prep)return prep;
         if (!user_range_ok(request, sizeof(struct linux_timespec))) return -LINUX_EFAULT;
         struct linux_timespec value = *(const struct linux_timespec *)(uintptr_t)request;
         if (value.tv_sec < 0 || value.tv_nsec < 0 || value.tv_nsec >= 1000000000) return -LINUX_EINVAL;
@@ -99,8 +123,12 @@ int64_t syscall_timer_create(uint64_t clockid, uint64_t sevp, uint64_t timerid)
     struct task *task = sched_current_task();
     struct linux_kernel_sigevent event = {.signo = 14, .notify = 0};
     int32_t id;
+    int prep=time_prepare_user(task,timerid,sizeof(id),true,false);
+    if(prep)return prep;
     if (!task || !user_range_writable(timerid, sizeof(id))) return -LINUX_EFAULT;
     if (sevp) {
+        prep=time_prepare_user(task,sevp,sizeof(event),false,false);
+        if(prep)return prep;
         if (!user_range_ok(sevp, sizeof(event))) return -LINUX_EFAULT;
         event = *(const struct linux_kernel_sigevent *)(uintptr_t)sevp;
     }
@@ -127,8 +155,11 @@ int64_t syscall_timer_settime(uint64_t timerid, uint64_t flags, uint64_t value, 
 {
     struct task *task = sched_current_task();
     struct linux_itimerspec requested, old;
+    int prep=time_prepare_user(task,value,sizeof(requested),false,false);
+    if(prep)return prep;
     if (!task || !user_range_ok(value, sizeof(requested))) return -LINUX_EFAULT;
     requested = *(const struct linux_itimerspec *)(uintptr_t)value;
+    if(old_value) {prep=time_prepare_user(task,old_value,sizeof(old),true,true);if(prep)return prep;}
     int ret = sched_timer_settime(task, (int32_t)timerid, (uint32_t)flags,
                                   &requested, old_value ? &old : NULL);
     if (ret < 0) return ret;
@@ -143,6 +174,8 @@ int64_t syscall_timer_gettime(uint64_t timerid, uint64_t value)
 {
     struct task *task = sched_current_task();
     struct linux_itimerspec result;
+    int prep=time_prepare_user(task,value,sizeof(result),true,false);
+    if(prep)return prep;
     if (!task || !user_range_writable(value, sizeof(result))) return -LINUX_EFAULT;
     int ret = sched_timer_gettime(task, (int32_t)timerid, &result);
     if (ret < 0) return ret;
@@ -165,12 +198,16 @@ int64_t syscall_rt_sigtimedwait(uint64_t mask, uint64_t info, uint64_t timeout,
     if (sigset_size != sizeof(uint64_t)) return -LINUX_EINVAL;
     if (!task) return -LINUX_EFAULT;
     if (!resuming) {
+        int prep=time_prepare_user(task,mask,sizeof(requested),false,false);
+        if(prep)return prep;
         if (!user_range_ok(mask, sizeof(requested))) return -LINUX_EFAULT;
         __builtin_memcpy(&requested, (const void *)(uintptr_t)mask, sizeof(requested));
         requested &= ~((1ULL << 8) | (1ULL << 18));
         task->sigwait_mask = task->sigwait_deadline = 0;
         if (timeout) {
             struct linux_timespec value;
+            prep=time_prepare_user(task,timeout,sizeof(value),false,false);
+            if(prep)return prep;
             if (!user_range_ok(timeout, sizeof(value))) return -LINUX_EFAULT;
             __builtin_memcpy(&value, (const void *)(uintptr_t)timeout, sizeof(value));
             if (value.tv_sec < 0 || value.tv_nsec < 0 || value.tv_nsec >= 1000000000LL)
@@ -185,6 +222,14 @@ int64_t syscall_rt_sigtimedwait(uint64_t mask, uint64_t info, uint64_t timeout,
         }
     } else requested = task->sigwait_mask;
     struct linux_siginfo result;
+    if (info && kernel_signal_peek(task, requested)) {
+        int prep=time_prepare_user(task,info,48,true,true);
+        if(prep)return prep;
+        if(info<=UINT64_MAX-sizeof(result)) {
+            prep=time_prepare_user(task,info+48,sizeof(result)-48,true,true);
+            if(prep)return prep;
+        }
+    }
     int signal = kernel_signal_dequeue(task, requested, &result);
     if (signal) {
         task->sigwait_deadline = task->sigwait_mask = 0;
@@ -226,9 +271,13 @@ int64_t syscall_adjtimex(int32_t clock, uint64_t address)
 {
     if (clock != LINUX_CLOCK_REALTIME) return -LINUX_EOPNOTSUPP;
     struct linux_timex value;
+    struct task *task = sched_current_task();
+    int prep=time_prepare_user(task,address,sizeof(value),false,false);
+    if(prep)return prep;
     if (!user_range_ok(address, sizeof(value))) return -LINUX_EFAULT;
     __builtin_memcpy(&value, (void *)(uintptr_t)address, sizeof(value));
-    struct task *task = sched_current_task();
+    prep=time_prepare_user(task,address,sizeof(value),true,true);
+    if(prep)return prep;
     int result = time_adjust(&value, task && (task->cap_effective & (1ULL << CAP_SYS_TIME)));
     if (result < 0) return result;
     /* Like Linux, mutation precedes the output copy; a late EFAULT does not undo it. */

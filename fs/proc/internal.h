@@ -3,6 +3,46 @@
 #define RELIEFNT_PROC_INTERNAL_H
 #include <reliefnt/procfs.h>
 struct task_identity;
+/** @brief Test whether an intrinsic proc key names a memory snapshot file.
+ * @param name Borrowed key, nullable. @return True for swaps, meminfo or vmstat.
+ */
+bool proc_memory_is_file(const char *name);
+/** @brief Capture one immutable memory snapshot for a proc open.
+ * @param name Intrinsic memory key. @param out Required owned output.
+ * @return Zero or negative errno. Execution writer pins snapshot inputs; no
+ * path or area owner is retained after capture.
+ */
+int proc_memory_open(const char *name, void **out);
+/** @brief Render a byte range from an immutable memory snapshot.
+ * @param view Borrowed capture. @param offset Byte position. @param buffer
+ * Writable destination, nullable for zero capacity. @param capacity Maximum
+ * bytes. @param read Required actual byte count. @return Zero or -EINVAL.
+ */
+int proc_memory_read(void *view, uint64_t offset, void *buffer, uint32_t capacity, uint32_t *read);
+/** @brief Release an owned memory snapshot; NULL is ignored. */
+void proc_memory_close(void *view);
+/** @brief Obtain immutable proc permissions, including per-task OOM ownership.
+ * @param name Intrinsic key. @param node Retained node. @param value Metadata
+ * output or proposal. @param write True for unsupported metadata mutation.
+ * @return Zero or negative errno. Task identity remains execution-owned.
+ */
+int proc_control_permissions(const char *name, const struct storage_node *node,
+                             struct reliefos_permissions *value, bool write);
+/** @brief Commit a whole proc control write after normal VFS authorization.
+ * @param name Intrinsic live key. @param offset File position. @param buffer
+ * Validated bytes. @param length Byte count. @param written Completed bytes.
+ * @return Zero or negative errno. OOM policy is checked under the sole writer.
+ */
+int proc_control_write(const char *name, uint64_t offset, const void *buffer,
+                       uint32_t length, uint32_t *written);
+/** @brief Admit zero truncation on writable proc controls for shell redirection.
+ * @param name Intrinsic key. @param length Requested size. @return Zero or errno.
+ */
+int proc_control_truncate(const char *name, uint64_t length);
+/** @brief Identify controls whose successful write needs no subsequent flush.
+ * @param name Intrinsic key. @return True for a supported immediate control.
+ */
+bool proc_control_immediate(const char *name);
 
 /** @brief Capture a mount view or diagnostic snapshot at open time.
  * @param name Required borrowed NUL-terminated intrinsic inode key.

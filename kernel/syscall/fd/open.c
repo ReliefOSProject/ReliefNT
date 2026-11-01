@@ -43,7 +43,8 @@ static int open_inode_path(struct task *task,const struct vfs_path *path,uint32_
         if(rc){task_discard_file_fd(task,fd);return rc;}
         return fd;
     }
-    fd=alloc_task_fd(task,node,flags,diagnostic);if(fd<0)return fd;
+    fd=alloc_task_fd(task,node,flags,diagnostic);
+    if(fd<0){return fd;}
     struct task_file *file=task_file_for_fd(task,fd);task_file_bind_path(file,path);
     if(!(flags&TASK_FILE_FLAG_PATH)) {
         int rc=vfs_file_open(path,flags,&file->provider_file);
@@ -89,7 +90,7 @@ int64_t syscall_open_object(struct vfs_namespace *ns,struct task *task,int32_t d
     if(flags&LINUX_O_CREAT)lookup|=VFS_LOOKUP_MISSING;
     struct vfs_lookup_result found={0};
     int rc=resolve_user_object_at_flags(ns,task,dirfd,pathname,false,false,lookup,&found);
-    if(rc)return rc;
+    if(rc){return rc;}
     bool created=false;
     if(found.missing) {
         struct reliefos_permissions value;

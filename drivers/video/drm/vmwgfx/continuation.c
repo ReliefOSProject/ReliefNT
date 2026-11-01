@@ -43,6 +43,11 @@ void drm_vmwgfx_continuation_release(
     if (!continuation) return;
     drm_bo_put(continuation->bo);
     drm_vmwgfx_fence_put(continuation->fence_object);
+#ifdef CONFIG_SWAP
+    drm_vmwgfx_surface_put(continuation->surface);
+    task_file_put(continuation->prime_file);
+    drm_kms_fb_put(continuation->enum_next);
+#endif
     drm_async_free(continuation);
 }
 
@@ -73,6 +78,12 @@ static int64_t drm_vmwgfx_resume_continuation(
         drm_vmwgfx_cancel_task_continuation(task);
         return 0;
     }
+#ifdef CONFIG_SWAP
+    /* Resource.c owns the retained surface and the original secondary OFD;
+     * its matching, scope-snapshotted header is imported below. */
+    if (continuation->kind == DRM_VMW_CONT_SURFACE_REPLY ||
+        continuation->kind == DRM_VMW_CONT_KMS_ENUM) return 0;
+#endif
     if (continuation->kind == DRM_VMW_CONT_FENCE_REPLY_FAULT) {
         bool signaled = false;
         int status = drm_vmwgfx_map_svga_status(

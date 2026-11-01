@@ -11,6 +11,8 @@
 #include <reliefnt/framebuffer.h>
 #include <reliefnt/drm.h>
 #include <reliefnt/mm.h>
+#include <reliefnt/lock.h>
+#include <reliefnt/panic.h>
 #include <reliefnt/smp.h>
 #include <reliefnt/paging.h>
 #include <reliefnt/page_cache.h>
@@ -104,6 +106,7 @@ struct file_page_load_context {
     const struct task_vma *vma;
     uint64_t offset;
     uint64_t limit;
+    bool did_read;
 };
 
 
@@ -240,6 +243,211 @@ bool task_address_space_can_map(const struct task *task, uint64_t start, uint64_
  */
 void task_unmap_pages(struct task *task, uint64_t start, uint64_t end);
 
+/** @brief Count locked virtual bytes owned by the task's shared MM.
+ * @param task Borrowed user task under execution ownership.
+ * @return Locked bytes, counting each VMA interval once.
+ */
+uint64_t mm_locked_bytes(struct task *task);
+
+/** @brief Read future-lock policy for a stable CR3 ownership identity.
+ * @param as Borrowed live address space. @return Linux MCL_FUTURE/ONFAULT bits.
+ */
+uint32_t mm_lock_flags(struct address_space *as);
+
+/** @brief Ensure private state exists for one live CR3 and its generation.
+ * @param as Borrowed live address space. @return Zero or negative ENOMEM.
+ */
+int mm_context_ensure(struct address_space *as);
+
+struct mm_identity { uint64_t cr3, generation; };
+/** @brief Obtain a generation-bearing identity for a pinned live root.
+ * @param as Borrowed address space. @param out Required identity output.
+ * @return Zero or negative ENOMEM; identity remains valid until root destruction.
+ */
+int mm_context_identity(struct address_space *as, struct mm_identity *out);
+
+/* A checked mlock keeps this private record on its reserved kernel stack.
+ * Only mm_context_lock_intent_begin/end may link or unlink it. */
+struct mm_lock_intent {
+    struct mm_lock_intent *next;
+    struct mm_identity identity;
+    uint64_t start, end;
+};
+/** @brief Register a transient checked-population interval for a live root.
+ * @param as Execution-owned address space. @param start Inclusive page address.
+ * @param end Exclusive address. @param intent Caller-owned live stack record.
+ * @return Zero or negative ENOMEM. No public lock policy or quota is changed.
+ */
+int mm_context_lock_intent_begin(struct address_space *as, uint64_t start,
+                                 uint64_t end, struct mm_lock_intent *intent);
+/** @brief Remove an intent without allocation, even after its root is retired.
+ * @param intent Previously registered caller-owned record.
+ */
+void mm_context_lock_intent_end(struct mm_lock_intent *intent);
+/** @brief Check whether a range intersects a transient checked-lock intent.
+ * @param as Live execution-owned root. @param start Inclusive address.
+ * @param end Exclusive address. @return True when eviction must be excluded.
+ * Future eviction providers must query this before retiring a resident leaf;
+ * explicit userspace discard remains allowed and advances the MM revision.
+ */
+bool mm_context_lock_intent_intersects(struct address_space *as, uint64_t start,
+                                       uint64_t end);
+
+/* VMA mutation contract: under execution ownership, publish a revision change
+ * before writing live VMA slots or VMA permissions. This includes new mappings,
+ * merges, splits, lock policy and unmapping; unpublished exec/fork roots have
+ * no concurrent walker. A future VMA mutator must follow the same boundary. */
+/** @brief Read a live root's population-relevant mutation revision without allocation.
+ * @param as Execution-owned address space. @return Revision, zero if absent.
+ */
+uint64_t mm_context_vma_revision(struct address_space *as);
+/** @brief Mark a VMA or resident-leaf mutation for suspended walkers.
+ * @param as Execution-owned address space. Writers hold the execution gate;
+ * no allocation occurs. VMA creators, splitters, modifiers and removers mark
+ * before publication; task_unmap_pages marks resident PTE removal centrally.
+ * A protection update can mark an actual PTE change immediately afterward only
+ * when no suspension, writer release or reentry-permitting callback occurs
+ * between the change and the mark.
+ * A missing context means no active walk. Root destruction invalidates identity.
+ */
+void mm_context_vma_changed(struct address_space *as);
+
+/** @brief Publish future-lock policy on an already ensured MM identity.
+ * @param as Borrowed live address space. @param flags Linux future-lock bits.
+ */
+void mm_context_set_lock_flags(struct address_space *as, uint32_t flags);
+
+/** @brief Retire identity metadata before its CR3 page can be reused.
+ * @param as Address space whose root is being destroyed; NULL is ignored.
+ */
+void mm_context_destroy(struct address_space *as);
+
+/** @brief Publish one root-scoped nonresident slot owner.
+ * @param as Live execution-owned root. @param page Aligned user address.
+ * @param token Opaque slot with one caller-owned reference.
+ * @return Zero after transferring the reference, or negative errno leaving it
+ * with the caller. No PTE is changed; publication requires the same writer.
+ */
+int mm_swap_record_insert(struct address_space *as, uint64_t page, uint64_t token);
+/** @brief Insert a reclaim record, allowing its narrowly audited reserve pool.
+ * @param as Pinned root. @param page Aligned address. @param token Owned slot.
+ * @return Zero on transfer, negative errno retaining caller ownership.
+ * Caller holds the sole outer execution writer without other locks.
+ */
+int mm_swap_record_insert_reclaim(struct address_space *as, uint64_t page, uint64_t token);
+/** @brief Borrow the slot token belonging to one root and page.
+ * @param as Live execution-owned root. @param page Aligned user address.
+ * @return Complete opaque token or zero when absent; no new reference.
+ */
+uint64_t mm_swap_record_lookup(struct address_space *as, uint64_t page);
+/** @brief Find the next swap record in an execution-owned root.
+ * @param as Pinned root. @param start Inclusive aligned address.
+ * @param page Receives its virtual address. @param token Receives the borrowed
+ * full slot identity. @return True when found; no reference survives the writer.
+ */
+bool mm_swap_record_next(struct address_space *as, uint64_t start,
+                         uint64_t *page, uint64_t *token);
+/** @brief Remove and release one slot owner, if present.
+ * @param as Live execution-owned root. @param page Aligned user address.
+ * No PTE is changed; the caller serializes both changes under the writer.
+ */
+void mm_swap_record_remove(struct address_space *as, uint64_t page);
+/** @brief Retain a source slot for an independent child root.
+ * @param source Live execution-owned source. @param target New child root.
+ * @param page Source and destination virtual page. @return Zero or negative
+ * errno; failed insertion releases any newly acquired slot reference. ENOMEM
+ * only denotes ordinary child context/record allocation failure, with no I/O.
+ */
+int mm_swap_clone_leaf(struct address_space *source, struct address_space *target,
+                       uint64_t page);
+/** @brief Retain a slot owner at a different virtual page or root.
+ * @param source Live source root. @param target Live destination root.
+ * @param source_page Aligned source page. @param target_page Aligned destination.
+ * @return Zero after transfer or negative errno with no target record published.
+ */
+int mm_swap_copy_record(struct address_space *source, struct address_space *target,
+                        uint64_t source_page, uint64_t target_page);
+
+/** @brief Give a new shared-anonymous interval a RAM-backed sharing object.
+ * @param as Pinned live root. @param start First page. @param end Exclusive end.
+ * @return Zero or negative ENOMEM; requires exclusive execution ownership.
+ */
+int mm_shared_create(struct address_space *as, uint64_t start, uint64_t end);
+
+/** @brief Remove shared-anonymous interval owners after preflighting any split.
+ * @param as Pinned live root. @param start First page. @param end Exclusive end.
+ * @return Zero or negative ENOMEM without modification; execution-owned context.
+ */
+int mm_shared_forget(struct address_space *as, uint64_t start, uint64_t end);
+
+/** @brief Retain source shared-anonymous intervals for a new fork root.
+ * @param src Pinned source root. @param dst New destination root.
+ * @return Zero or negative ENOMEM only for ordinary context/span allocation;
+ * no provider callback or I/O occurs, and partial state is retired with dst.
+ */
+int mm_shared_clone(struct address_space *src, struct address_space *dst);
+
+/** @brief Populate one shared-anonymous PTE from its RAM backing object.
+ * @param as Pinned root. @param page Aligned address. @param flags PTE flags.
+ * @return Zero on success, -ENOENT for an unregistered interval or -ENOMEM.
+ */
+int mm_shared_fault(struct address_space *as, uint64_t page, uint64_t flags);
+
+/** @brief Test whether a shared-anonymous backing page currently exists.
+ * @param as Pinned root. @param page Aligned address. @return True if resident.
+ */
+bool mm_shared_resident(struct address_space *as, uint64_t page);
+
+/** @brief Alias shared backing spans into an already reserved destination.
+ * @param as Pinned root. @param source Old first page. @param target New first page.
+ * @param length Page-aligned byte count. @return Zero or negative ENOMEM.
+ */
+int mm_shared_alias(struct address_space *as, uint64_t source, uint64_t target,
+                    uint64_t length);
+
+/** @brief Populate one admitted page for an ordinary memory lock.
+ * @param task Execution-owned user MM. @param page Aligned page address.
+ * @return Zero, negative EFAULT for inaccessible pages, or negative ENOMEM
+ *         for allocation failure; private writable COW is made exclusive.
+ */
+int task_populate_lock_page(struct task *task, uint64_t page);
+
+/** @brief Populate a page using its already located, execution-owned VMA.
+ * @param task Current execution-owned user MM. @param vma Live covering slot;
+ * the caller revalidates it after every execution suspension.
+ * @param page Aligned page address. @return Zero or the fault/provider errno.
+ * Performs no VMA-store search; no pointer is retained after return.
+ */
+int task_populate_lock_vma_page(struct task *task, struct task_vma *vma, uint64_t page);
+
+/** @brief Populate an implicit-stack page already verified to have no VMA.
+ * @param task Execution-owned user MM. @param page Aligned page address.
+ * @return Zero or the fault/allocator errno. Performs no VMA-store search.
+ */
+int task_populate_lock_stack_page(struct task *task, uint64_t page);
+
+/** @brief Cooperatively populate an already locked, page-aligned interval.
+ * @param start First address. @param end Exclusive end. @param checked Report
+ * population/reentry failures instead of leaving best-effort pages lazy.
+ * @return Zero or a translated mlock errno. Each batch drops outer execution
+ * ownership only after releasing subordinate locks; no VMA/MM pointer survives.
+ */
+int mm_populate_locked_range(uint64_t start, uint64_t end, bool checked);
+
+/** @brief Admit and populate the faulting part of newly locked stack growth.
+ * @param task Execution-owned user MM. @param low New inclusive low page.
+ * @param old_low Previous stack low bound. @param mode MCL_FUTURE policy.
+ * @return Zero or negative ENOMEM; failure rolls back new PTEs and metadata.
+ */
+int mm_lock_future_stack(struct task *task, uint64_t low, uint64_t old_low, uint32_t mode);
+
+/** @brief Transfer an already-admitted lock policy to a remap destination.
+ * @param task Execution-owned MM. @param start First page. @param end Exclusive end.
+ * @param onfault Preserve deferred population. @return Zero or negative errno.
+ * The caller checks final net quota and rolls back the destination on failure.
+ */
+int mm_lock_remap(struct task *task, uint64_t start, uint64_t end, bool onfault);
+
 void syscall_mm_truncate_file(struct task *task, const struct storage_node *node, uint64_t size);
 
 /**
@@ -293,12 +501,25 @@ int64_t syscall_mm_brk(uint64_t requested);
 int64_t syscall_mm_mremap(uint64_t old_addr, uint64_t old_len, uint64_t new_len,
                           uint64_t flags, uint64_t new_addr);
 
+/** @brief Lock a rounded user interval under capability and memlock limits.
+ * @param addr First byte. @param len Byte count. @param flags Low 32-bit mlock2 flags.
+ * @return Zero or negative EINVAL, EPERM, ENOMEM or EAGAIN.
+ */
 int64_t syscall_mm_mlock(uint64_t addr, uint64_t len, uint64_t flags);
 
+/** @brief Remove lock policy from the rounded user interval.
+ * @param addr First byte. @param len Byte count. @return Zero or negative errno.
+ */
 int64_t syscall_mm_munlock(uint64_t addr, uint64_t len);
 
+/** @brief Apply current and/or future shared-MM lock policy.
+ * @param flags Low 32-bit Linux MCL flags. @return Zero or negative errno.
+ */
 int64_t syscall_mm_mlockall(uint64_t flags);
 
+/** @brief Remove all current and future shared-MM lock policy.
+ * @return Zero or negative EINVAL when there is no current task.
+ */
 int64_t syscall_mm_munlockall(void);
 
 /** @brief Protect a covered user range while preserving split backing references.
@@ -323,8 +544,17 @@ int64_t syscall_mm_munmap(uint64_t addr, uint64_t len);
 
 int64_t syscall_mm_msync(uint64_t addr, uint64_t len, uint64_t flags);
 
+/** @brief Copy one residency bit per rounded page, including backing caches.
+ * @param addr Aligned user address. @param len Byte count.
+ * @param vec Writable user vector containing one byte per page.
+ * @return Zero or negative EINVAL, ENOMEM or EFAULT.
+ */
 int64_t syscall_mm_mincore(uint64_t addr, uint64_t len, uint64_t vec);
 
+/** @brief Apply a memory hint or discard mapped pages after TLB retirement.
+ * @param addr Aligned user address. @param len Byte count.
+ * @param advice Low 32-bit Linux advice value. @return Zero or negative errno.
+ */
 int64_t syscall_mm_madvise(uint64_t addr, uint64_t len, uint64_t advice);
 
 /** @brief Publish one SysV attachment using the existing VMA and PTE allocator.

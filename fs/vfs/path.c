@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "mount_internal.h"
+#include <reliefnt/syscall_internal.h>
 
 /* Copy a bounded userspace-style pathname already owned by the kernel. */
 static size_t vfs_path_length(const char *name)
@@ -41,7 +42,8 @@ static int vfs_walk_new(struct vfs_namespace *ns,const struct vfs_path *root,
     if(root->mount->ns!=ns || start->mount->ns!=ns)return -EXDEV;
     size_t length=vfs_path_length(name);if(length>=VFS_PATH_MAX)return -ENAMETOOLONG;
     if(!length)return -ENOENT;
-    struct vfs_walk *walk=kernel_malloc(sizeof(*walk));if(!walk)return -ENOMEM;
+    struct vfs_walk *walk=kernel_malloc(sizeof(*walk));
+    if(!walk){return -ENOMEM;}
     *walk=(struct vfs_walk){.ns=ns,.flags=flags};
     walk->pending=kernel_malloc(VFS_PATH_MAX);
     if(!walk->pending){kernel_free(walk);return -ENOMEM;}
@@ -103,7 +105,12 @@ int vfs_path_resolve_resume(struct vfs_namespace *ns,const struct vfs_path *root
             walk->phase=VFS_WALK_LOOKUP;break;
         }
         case VFS_WALK_LOOKUP: {
-            rc=vfs_path_lookup_child(&walk->current,walk->component,&walk->child);
+            rc=vfs_path_lookup_child_for_walk(&walk->current,walk->component,&walk->child);
+            if(rc==VFS_NATIVE_LOOKUP_RECLAIM) {
+                /* No current-component lookup I/O ran. Retain earlier
+                 * traversal and recheck search permission before resuming. */
+                walk->phase=VFS_WALK_SEARCH;return rc;
+            }
             if(rc==-ENOENT && (flags&VFS_LOOKUP_MISSING) && walk->last) {
                 __builtin_memcpy(result->last,walk->component,walk->used+1);
                 result->trailing=walk->pending[walk->after]!=0;result->missing=true;rc=0;done=true;break;
@@ -163,7 +170,7 @@ int vfs_path_resolve(struct vfs_namespace *ns,const struct vfs_path *root,
     struct vfs_walk *state=NULL;
     int rc=vfs_path_resolve_resume(ns,root,start,name,policy,&state,result);
     /* Trusted unscoped callers retain the historical all-or-nothing API. */
-    vfs_walk_cancel(&state);return rc;
+    vfs_walk_cancel(&state);return rc==VFS_NATIVE_LOOKUP_RECLAIM ? -ENOMEM : rc;
 }
 
 int vfs_path_lookup(struct vfs_namespace *ns,const struct vfs_path *root,

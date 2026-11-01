@@ -339,12 +339,14 @@ int task_vma_record_mapping(struct task *task, uint64_t start, uint64_t end,
     struct task_vma *right = (flags & TASK_VMA_FLAG_DEVICE) ? NULL :
         task_vma_right_adjacent(task, end, prot, flags, file_node, file_offset, len, max_prot, pin);
     if (left && right && left != right) {
+        mm_context_vma_changed(sched_task_as(task));
         left->end = right->end;
         task_vma_clear(right);task_file_put(pin);
         return 0;
     }
-    if (left) { left->end=end;task_file_put(pin);return 0; }
+    if (left) { mm_context_vma_changed(sched_task_as(task));left->end=end;task_file_put(pin);return 0; }
     if (right) {
+        mm_context_vma_changed(sched_task_as(task));
         right->start=start;
         if(flags&TASK_VMA_FLAG_FILE)right->file_offset=file_offset;
         task_file_put(pin);return 0;
@@ -354,6 +356,7 @@ int task_vma_record_mapping(struct task *task, uint64_t start, uint64_t end,
     struct storage_inode_ref *inode=NULL;
     int ret=file_node ? storage_inode_get(file_node,&inode) : 0;
     if(ret<0){task_file_put(pin);return ret;}
+    mm_context_vma_changed(sched_task_as(task));
     *slot=(struct task_vma){.inode=inode,.mapping_file=pin,.used=1,.prot=(uint32_t)prot,
         .max_prot=max_prot,.flags=flags,.start=start,.end=end,.file_offset=file_offset,
         .file_limit=file_node ? file_node->size : 0};

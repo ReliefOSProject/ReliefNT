@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-obj-y := cache/ heap/ physical/ user/
+obj-y := cache/ heap/ physical/ reclaim/ user/
+obj-$(CONFIG_SWAP) += swap/
 
 include $(srctree)/scripts/Makefile.module

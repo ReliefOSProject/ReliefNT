@@ -3,18 +3,44 @@
 #include <reliefnt/lock.h>
 #include <reliefnt/usercopy.h>
 #include <reliefnt/time.h>
+#include <reliefnt/mm.h>
+#include <reliefnt/page_cache.h>
+#include <reliefnt/swap.h>
+#include <reliefnt/syscall_internal.h>
 #include <reliefos/system_abi.h>
 #include <linux/futex.h>
 #include <linux/errno.h>
 #include <linux/time.h>
 
+/** @brief Record a completed physical-alias store when the cache is present.
+ * @param physical Aligned frame pinned by the execution-owned user mapping.
+ * The optional cache implementation serializes dirty state without transferring
+ * ownership; this caller invokes it only after the successful store.
+ */
+extern void page_cache_note_write(uint64_t physical) __attribute__((weak));
+
 static struct kernel_spinlock futex_lock = KERNEL_SPINLOCK_INIT;
 static struct task *waiters;
+
+/** @brief Prepare one bounded futex input before taking futex_lock.
+ * @param address User operand. @param length Validated operand size.
+ * @param write_access True when the operation modifies the operand.
+ * @return Zero, a syscall contention marker, or EFAULT for inaccessible input.
+ * The syscall caller owns the outer writer and no futex spinlock here.
+ */
+static int futex_prepare_user(uint64_t address, uint64_t length, bool write_access)
+{
+    int ret = swap_prepare_user_range(sched_current_task(), address, length, write_access);
+    if (ret == SWAP_STORAGE_CONTENDED) return KERNEL_SYSCALL_SWAP_CONTENDED;
+    return ret < 0 ? -EFAULT : 0;
+}
 
 static int futex_key(struct task *task, uint64_t address, uint32_t operation,
                      uint64_t *domain, uint64_t *key)
 {
     if (address & 3) return -EINVAL;
+    int prep = futex_prepare_user(address, 4, false);
+    if (prep) return prep;
     if (!user_range_ok(address, 4)) return -EFAULT;
     if (operation & FUTEX_PRIVATE_FLAG) {
         *domain = sched_task_as(task)->cr3;
@@ -45,6 +71,33 @@ static bool task_futex_key_matches(const struct task *task, uint64_t domain, uin
         return false;
     }
     return task->futex_domain == domain && task->futex_key == key;
+}
+
+/** @brief Preserve physical futex keys while a waiter is queued.
+ * @param physical Candidate frame. @return True if a scalar or vector key
+ * names that frame. Private keys use root/VA and do not constrain eviction.
+ */
+bool futex_swap_pinned(uint64_t physical)
+{
+    uint64_t flags;
+    bool pinned = false;
+    physical &= ~4095ULL;
+    kernel_spin_lock_irqsave(&futex_lock, &flags);
+    for (struct task *task = waiters; task && !pinned; task = task->futex_next) {
+        if (task->futex_waitv_count) {
+            for (uint32_t i = 0; i < task->futex_waitv_count; ++i) {
+                if (!task->futex_waitv_domain[i] &&
+                    (task->futex_waitv_key[i] & ~4095ULL) == physical) {
+                    pinned = true;
+                    break;
+                }
+            }
+        } else if (!task->futex_domain && (task->futex_key & ~4095ULL) == physical) {
+            pinned = true;
+        }
+    }
+    kernel_spin_unlock_irqrestore(&futex_lock, flags);
+    return pinned;
 }
 
 static uint32_t wake(uint64_t domain, uint64_t key, uint32_t count, uint32_t bitset)
@@ -101,6 +154,8 @@ static int deadline(uint64_t timeout, uint32_t operation, uint64_t *out)
 {
     *out = 0;
     if (!timeout) return 0;
+    int prep = futex_prepare_user(timeout, sizeof(struct linux_timespec), false);
+    if (prep) return prep;
     if (!user_range_ok(timeout, sizeof(struct linux_timespec))) return -EFAULT;
     struct linux_timespec ts = *(const struct linux_timespec *)(uintptr_t)timeout;
     if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000) return -EINVAL;
@@ -219,6 +274,8 @@ int64_t syscall_futex(uint64_t address, uint64_t operation, uint64_t value,
     } else if (op == FUTEX_WAKE_OP) {
         if (address2 & 3) return -EINVAL;
         /* Resolve COW before deriving the shared physical key. */
+        ret = futex_prepare_user(address2, 4, true);
+        if (ret) return ret;
         if (!user_range_writable(address2, 4)) return -EFAULT;
         ret = futex_key(task, address2, (uint32_t)operation, &domain2, &key2);
         if (ret) return ret;
@@ -342,6 +399,8 @@ int64_t syscall_futex_wait2(uint64_t address, uint64_t value, uint64_t mask,
  */
 static int futex2_waiter(uint64_t address, struct futex_waitv *waiter, uint32_t *operation)
 {
+    int prep = futex_prepare_user(address, sizeof(*waiter), false);
+    if (prep) return prep;
     if (!user_range_ok(address, sizeof(*waiter))) return -EFAULT;
     __builtin_memcpy(waiter, (const void *)(uintptr_t)address, sizeof(*waiter));
     if (waiter->__reserved || waiter->val > UINT32_MAX)
@@ -435,8 +494,10 @@ int64_t syscall_futex_waitv(uint64_t waiters_ptr, uint64_t count, uint64_t flags
         kernel_spin_unlock_irqrestore(&futex_lock, irq_flags);
         return result;
     }
-    if (count > UINT64_MAX / sizeof(struct futex_waitv) ||
-        !user_range_ok(waiters_ptr, count * sizeof(struct futex_waitv))) return -EFAULT;
+    if (count > UINT64_MAX / sizeof(struct futex_waitv)) return -EFAULT;
+    int prep = futex_prepare_user(waiters_ptr, count * sizeof(struct futex_waitv), false);
+    if (prep) return prep;
+    if (!user_range_ok(waiters_ptr, count * sizeof(struct futex_waitv))) return -EFAULT;
     __builtin_memcpy(entries, (const void *)(uintptr_t)waiters_ptr,
                      count * sizeof(struct futex_waitv));
     for (uint32_t i = 0; i < count; ++i) {
@@ -478,15 +539,24 @@ int64_t syscall_futex_waitv(uint64_t waiters_ptr, uint64_t count, uint64_t flags
     return KERNEL_SYSCALL_BLOCKED;
 }
 
+/** @brief Resolve a writable aligned futex word through actual direct-map coverage.
+ * @param task Stable target task. @param address Aligned user virtual address.
+ * @return Borrowed mapped word or NULL when inaccessible; no ownership transfer.
+ */
 static uint32_t *task_word(struct task *task, uint64_t address)
 {
     if (address < RELIEFNT_USER_BASE || (address & 3) || address >= RELIEFNT_USER_TOP) return NULL;
     if (!address_space_user_page_writable(sched_task_as(task), address) &&
         !address_space_handle_cow_fault(sched_task_as(task), address)) return NULL;
     uint64_t phys = address_space_user_page_phys(sched_task_as(task), address);
-    return phys ? (uint32_t *)(uintptr_t)(RELIEFNT_KERNEL_DIRECT_MAP_BASE + phys + (address & 4095)) : NULL;
+    return phys ? mm_phys_to_virt(phys + (address & 4095)) : NULL;
 }
 
+/** @brief Read validated user bytes through mapped physical aliases.
+ * @param task Stable target task. @param address First user byte.
+ * @param out Caller-owned writable destination. @param size Number of bytes.
+ * @return True after all bytes copy, false on an inaccessible page or alias.
+ */
 static bool task_read(struct task *task, uint64_t address, void *out, uint32_t size)
 {
     if (address < RELIEFNT_USER_BASE || address >= RELIEFNT_USER_TOP || size > RELIEFNT_USER_TOP - address) return false;
@@ -497,7 +567,8 @@ static bool task_read(struct task *task, uint64_t address, void *out, uint32_t s
         uint32_t offset = (uint32_t)((address + i) & 4095);
         uint32_t count = 4096 - offset;
         if (count > size - i) count = size - i;
-        const uint8_t *source = (const uint8_t *)(uintptr_t)(RELIEFNT_KERNEL_DIRECT_MAP_BASE + phys + offset);
+        const uint8_t *source = mm_phys_to_virt(phys + offset);
+        if (!source) return false;
         for (uint32_t j = 0; j < count; ++j) ((uint8_t *)out)[i + j] = source[j];
         i += count;
     }
@@ -520,6 +591,8 @@ static void owner_died(struct task *task, uint64_t address, bool pending)
     while ((value & FUTEX_TID_MASK) == task->pid) {
         uint32_t replacement = (value & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
         if (__atomic_compare_exchange_n(word, &value, replacement, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+            if (page_cache_note_write)
+                page_cache_note_write(address_space_user_page_phys(sched_task_as(task),address));
             if (value & FUTEX_WAITERS) {
                 uint64_t flags;
                 kernel_spin_lock_irqsave(&futex_lock, &flags);
@@ -550,6 +623,8 @@ static void robust_exit(struct task *task)
 
 /**
  * @brief Clear a registered TID like Linux put_user, including unaligned words.
+ * @param task Stable exiting task. @param address User address of the word.
+ * @return True after clearing the complete word; false if any page is inaccessible.
  * The write can cross physical pages; futex alignment constrains the subsequent
  * wake operation, not this write. Invalid or read-only pointers are ignored.
  */
@@ -560,16 +635,21 @@ static bool clear_registered_tid(struct task *task, uint64_t address)
     for (uint64_t page = address & ~4095ULL; page <= ((address + 3) & ~4095ULL); page += 4096) {
         if (!address_space_user_page_writable(as, page) && !address_space_handle_cow_fault(as, page))
             return false;
-        if (!address_space_user_page_phys(as, page)) return false;
+        uint64_t physical = address_space_user_page_phys(as, page);
+        if (!physical || !mm_phys_to_virt(physical)) return false;
     }
     if (!(address & 3)) {
         uint32_t *word = task_word(task, address);
         if (!word) return false;
         __atomic_store_n(word, 0, __ATOMIC_SEQ_CST);
+        if (page_cache_note_write) page_cache_note_write(address_space_user_page_phys(as,address));
     } else {
         for (unsigned i = 0; i < 4; ++i) {
             uint64_t phys = address_space_user_page_phys(as, address + i);
-            *(uint8_t *)(uintptr_t)(RELIEFNT_KERNEL_DIRECT_MAP_BASE + phys + ((address + i) & 4095)) = 0;
+            uint8_t *mapped = mm_phys_to_virt(phys + ((address + i) & 4095));
+            if (!mapped) return false;
+            *mapped = 0;
+            if (page_cache_note_write) page_cache_note_write(phys);
         }
     }
     return true;
@@ -593,4 +673,127 @@ void futex_task_exit(struct task *task)
     }
     task->clear_child_tid = 0;
     kernel_spin_unlock_irqrestore(&futex_lock, flags);
+}
+
+enum futex_exit_phase {
+    FUTEX_EXIT_INIT, FUTEX_EXIT_HEAD, FUTEX_EXIT_NODE, FUTEX_EXIT_WORD,
+    FUTEX_EXIT_PENDING, FUTEX_EXIT_CLEAR, FUTEX_EXIT_COMPLETE,
+};
+
+/** @brief Prepare a bounded exiting-MM operand without holding futex_lock.
+ * @param task Retained target. @param address User address. @param size Bytes.
+ * @param writing True for an owner/TID update. @return Zero, contention, or
+ * negative terminal access error. The cleanup scope ends before return.
+ */
+static int futex_exit_prepare(struct task *task, uint64_t address, uint64_t size, bool writing)
+{
+    int rc = swap_prepare_user_cleanup(task, address, size, writing);
+    if (rc == SWAP_STORAGE_CONTENDED || rc == -EDEADLK) return rc;
+    return rc < 0 ? -EFAULT : 0;
+}
+
+/** @brief Advance one no-allocation robust-list or clear-TID cleanup step.
+ * @param task Unreleased task retaining its actual root and private cursor.
+ * @return One when complete, zero for bounded progress, or prerequisite wait.
+ * Permanent malformed/inaccessible operands end their portion without retry;
+ * no futex spinlock or borrowed user alias spans page-in or a scheduling gate.
+ */
+int futex_task_exit_step(struct task *task)
+{
+    if (!task) return 1;
+    struct futex_exit_cursor *cursor = sched_futex_exit_cursor(task);
+    struct address_space *as = sched_task_as(task);
+    if (!cursor || !as) return -EINVAL;
+    if (cursor->phase == FUTEX_EXIT_COMPLETE) return 1;
+    uint64_t generation = mm_context_generation_existing(as);
+    if (cursor->phase == FUTEX_EXIT_INIT) {
+        cursor->root = as->cr3;
+        cursor->generation = generation;
+        cursor->head = task->robust_list;
+        cursor->phase = cursor->head ? FUTEX_EXIT_HEAD : FUTEX_EXIT_CLEAR;
+    } else if (cursor->root != as->cr3 ||
+               (cursor->generation && cursor->generation != generation)) {
+        /* Never follow saved user values into a replacement MM. */
+        task->robust_list = task->clear_child_tid = 0;
+        futex_cancel_wait(task);
+        cursor->phase = FUTEX_EXIT_COMPLETE;
+        return 1;
+    } else if (!cursor->generation && generation) {
+        /* The still-owned root acquired its first context between steps. */
+        cursor->generation = generation;
+    }
+    if (cursor->phase == FUTEX_EXIT_HEAD) {
+        struct linux_robust_list_head head;
+        int rc = futex_exit_prepare(task, cursor->head, sizeof(head), false);
+        if (rc == SWAP_STORAGE_CONTENDED || rc == -EDEADLK) return rc;
+        if (rc || !task_read(task, cursor->head, &head, sizeof(head))) {
+            task->robust_list = 0; cursor->phase = FUTEX_EXIT_CLEAR; return 0;
+        }
+        cursor->entry = head.next;
+        cursor->offset = head.futex_offset;
+        cursor->pending = head.list_op_pending & ~1ULL;
+        cursor->pending_pi = (head.list_op_pending & 1) != 0;
+        cursor->phase = FUTEX_EXIT_NODE;
+        return 0;
+    }
+    if (cursor->phase == FUTEX_EXIT_NODE) {
+        if (cursor->count >= 2048 || (cursor->entry & ~1ULL) == cursor->head) {
+            cursor->phase = FUTEX_EXIT_PENDING; return 0;
+        }
+        uint64_t address = cursor->entry & ~1ULL;
+        int rc = futex_exit_prepare(task, address, sizeof(cursor->next), false);
+        if (rc == SWAP_STORAGE_CONTENDED || rc == -EDEADLK) return rc;
+        if (rc || !task_read(task, address, &cursor->next, sizeof(cursor->next))) {
+            cursor->phase = FUTEX_EXIT_PENDING; return 0;
+        }
+        cursor->phase = FUTEX_EXIT_WORD;
+        return 0;
+    }
+    if (cursor->phase == FUTEX_EXIT_WORD) {
+        uint64_t address = cursor->entry & ~1ULL;
+        if (address != cursor->pending && !(cursor->entry & 1)) {
+            uint64_t word = address + cursor->offset;
+            int rc = futex_exit_prepare(task, word, sizeof(uint32_t), true);
+            if (rc == SWAP_STORAGE_CONTENDED || rc == -EDEADLK) return rc;
+            if (!rc) owner_died(task, word, false);
+        }
+        cursor->entry = cursor->next;
+        ++cursor->count;
+        cursor->phase = FUTEX_EXIT_NODE;
+        return 0;
+    }
+    if (cursor->phase == FUTEX_EXIT_PENDING) {
+        if (cursor->pending && !cursor->pending_pi) {
+            uint64_t word = cursor->pending + cursor->offset;
+            int rc = futex_exit_prepare(task, word, sizeof(uint32_t), true);
+            if (rc == SWAP_STORAGE_CONTENDED || rc == -EDEADLK) return rc;
+            if (!rc) owner_died(task, word, true);
+        }
+        task->robust_list = 0;
+        cursor->phase = FUTEX_EXIT_CLEAR;
+        return 0;
+    }
+    if (cursor->phase == FUTEX_EXIT_CLEAR) {
+        bool cleared = false;
+        if (task->shared_mm && task->shared_mm->references > 1 && task->clear_child_tid) {
+            int rc = futex_exit_prepare(task, task->clear_child_tid, 4, true);
+            if (rc == SWAP_STORAGE_CONTENDED || rc == -EDEADLK) return rc;
+            if (!rc) cleared = clear_registered_tid(task, task->clear_child_tid);
+        }
+        uint64_t flags;
+        kernel_spin_lock_irqsave(&futex_lock, &flags);
+        dequeue(task);
+        task->futex_state = 0;
+        task->futex_waitv_count = 0;
+        if (cleared && !(task->clear_child_tid & 3)) {
+            uint64_t key = address_space_user_page_phys(as, task->clear_child_tid) +
+                (task->clear_child_tid & 4095);
+            wake(0, key, 1, FUTEX_BITSET_MATCH_ANY);
+        }
+        task->clear_child_tid = 0;
+        kernel_spin_unlock_irqrestore(&futex_lock, flags);
+        cursor->phase = FUTEX_EXIT_COMPLETE;
+        return 1;
+    }
+    return -EINVAL;
 }

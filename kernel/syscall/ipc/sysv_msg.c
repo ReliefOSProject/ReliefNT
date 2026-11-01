@@ -5,6 +5,9 @@
 #include <reliefnt/heap.h>
 #include <reliefnt/time.h>
 #include <reliefnt/usercopy.h>
+#ifdef CONFIG_SWAP
+#include <reliefnt/swap.h>
+#endif
 #include <linux/msg.h>
 #include <linux/time.h>
 #include <linux/capability.h>
@@ -46,6 +49,16 @@ static int64_t msg_now(void)
 static int msg_copy_in(void *destination, uint64_t address, uint64_t size)
 {
     if (size > UINT64_MAX - address) return -LINUX_EFAULT;
+#ifdef CONFIG_SWAP
+    if (!size) return 0;
+    if (size > INT32_MAX) return -LINUX_EFAULT;
+    struct task_user_text snapshot;
+    int result = task_lookup_user_bytes(sched_current_task(), address, (uint32_t)size, &snapshot);
+    if (result) return result;
+    __builtin_memcpy(destination, snapshot.text, size);
+    kernel_free(snapshot.allocation);
+    return 0;
+#else
     unsigned char *out = destination;
     while (size) {
         uint64_t take = 4096 - (address & 4095);
@@ -55,7 +68,24 @@ static int msg_copy_in(void *destination, uint64_t address, uint64_t size)
         out += take; address += take; size -= take;
     }
     return 0;
+#endif
 }
+
+#ifdef CONFIG_SWAP
+/** @brief Prepare a bounded message or control output at the outer writer.
+ * @param task Execution-owned receiving task.
+ * @param address Start of the current output.
+ * @param size Bytes actually to be written, bounded by MSGMAX plus the type.
+ * @return Zero, the private prerequisite-wait marker, or EFAULT. No message
+ * or queue ownership changes; callers preserve their existing fault order.
+ */
+static int msg_prepare_output(struct task *task, uint64_t address, uint64_t size)
+{
+    int result = swap_prepare_user_range(task, address, size, true);
+    return result == SWAP_STORAGE_CONTENDED ? KERNEL_SYSCALL_SWAP_CONTENDED :
+           result < 0 ? -LINUX_EFAULT : 0;
+}
+#endif
 
 /** @brief Match Linux in_group_p using fsgid and supplementary groups. */
 static bool msg_in_group(const struct task *task, uint32_t group)
@@ -267,7 +297,8 @@ static int64_t msg_send(struct task *task, int32_t id, uint64_t buffer, uint64_t
         msg_unlink_wait(w);
     } else {
         int64_t type;
-        if (msg_copy_in(&type, buffer, 8)) return -LINUX_EFAULT;
+        error = msg_copy_in(&type, buffer, 8);
+        if (error) return error;
         if (id < 0 || size > LINUX_MSGMAX || type < 1) return -LINUX_EINVAL;
         m = msg_load(buffer + 8, size, &error);
         if (!m) return error;
@@ -320,10 +351,18 @@ static int64_t msg_receive(struct task *task, int32_t id, uint64_t buffer, uint6
     if (w->queue) {
         q = w->queue; buffer = w->buffer; size = w->size; type = w->type; flags = w->flags;
         if (w->completed) {
-            struct sysv_message *m = w->message; error = w->result; w->message = NULL;
+            struct sysv_message *m = w->message; error = w->result;
+#ifdef CONFIG_SWAP
+            if (!error && msg_prepare_output(task, buffer, 8 + (size < m->size ? size : m->size)) ==
+                KERNEL_SYSCALL_SWAP_CONTENDED) return KERNEL_SYSCALL_SWAP_CONTENDED;
+#endif
+            w->message = NULL;
             task_sysv_msg_cancel(task);
             return error ? error : msg_fill(task, m, buffer, size);
         }
+        /* A prerequisite page-in can leave this owned waiter unlinked while
+         * IPC_RMID runs, so removal need not have completed the wait record. */
+        if (q->removed) { task_sysv_msg_cancel(task); return -LINUX_EIDRM; }
         if (sched_task_pending(task) & ~task->blocked_signals) return msg_park(w);
         msg_unlink_wait(w);
     } else {
@@ -347,22 +386,32 @@ static int64_t msg_receive(struct task *task, int32_t id, uint64_t buffer, uint6
         }
         if (found) {
             if (size < found->size && !(flags & LINUX_MSG_NOERROR)) error = -LINUX_E2BIG;
-            else if (copy) {
-                if (copy->size < found->size) error = -LINUX_EINVAL;
-                else {
+            else if (copy && copy->size < found->size) error = -LINUX_EINVAL;
+            else {
+#ifdef CONFIG_SWAP
+                /* A queued candidate is borrowed only during this writer
+                 * transaction. On contention, leave it in the queue and
+                 * select again after the real scheduling boundary. */
+                if (msg_prepare_output(task, buffer, 8 + (size < found->size ? size : found->size)) ==
+                    KERNEL_SYSCALL_SWAP_CONTENDED) {
+                    if (copy) kernel_free(copy);
+                    return KERNEL_SYSCALL_SWAP_CONTENDED;
+                }
+#endif
+                if (copy) {
                     copy->type = found->type; copy->size = found->size;
                     __builtin_memcpy(copy->data, found->data, found->size);
                     found = copy; copy = NULL;
+                } else {
+                    if (found->previous) found->previous->next = found->next;
+                    else q->first = found->next;
+                    if (found->next) found->next->previous = found->previous;
+                    else q->last = found->previous;
+                    --q->stat.msg_qnum; q->stat.msg_cbytes -= found->size;
+                    --msg_total_headers; msg_total_bytes -= found->size;
+                    q->stat.msg_lrpid = sched_task_tgid(task); q->stat.msg_rtime = msg_now();
+                    msg_wake_senders(q);
                 }
-            } else {
-                if (found->previous) found->previous->next = found->next;
-                else q->first = found->next;
-                if (found->next) found->next->previous = found->previous;
-                else q->last = found->previous;
-                --q->stat.msg_qnum; q->stat.msg_cbytes -= found->size;
-                --msg_total_headers; msg_total_bytes -= found->size;
-                q->stat.msg_lrpid = sched_task_tgid(task); q->stat.msg_rtime = msg_now();
-                msg_wake_senders(q);
             }
         } else if (flags & LINUX_IPC_NOWAIT) error = -LINUX_ENOMSG;
         else {
@@ -408,17 +457,28 @@ static int64_t msg_control(struct task *task, int32_t id, int32_t command, uint6
         }
         int32_t maximum = MSG_ID_SLOTS - 1;
         while (maximum > 0 && !msg_ids[maximum]) --maximum;
+#ifdef CONFIG_SWAP
+        int prep = msg_prepare_output(task, buffer, sizeof(info));
+        if (prep) return prep;
+#endif
         int error = user_copy_to_task(task, buffer, &info, sizeof(info));
         return error ? error : maximum;
     }
     if (command != LINUX_IPC_STAT && command != LINUX_MSG_STAT && command != LINUX_MSG_STAT_ANY &&
         command != LINUX_IPC_SET && command != LINUX_IPC_RMID) return -LINUX_EINVAL;
     struct linux_msqid64_ds input;
-    if (command == LINUX_IPC_SET && msg_copy_in(&input, buffer, sizeof(input))) return -LINUX_EFAULT;
+    if (command == LINUX_IPC_SET) {
+        int error = msg_copy_in(&input, buffer, sizeof(input));
+        if (error) return error;
+    }
     struct sysv_msg_queue *q = msg_find(id, command != LINUX_MSG_STAT && command != LINUX_MSG_STAT_ANY);
     if (!q) return -LINUX_EINVAL;
     if (command == LINUX_IPC_STAT || command == LINUX_MSG_STAT || command == LINUX_MSG_STAT_ANY) {
         if (command != LINUX_MSG_STAT_ANY && !msg_permitted(task, q, 0444)) return -LINUX_EACCES;
+#ifdef CONFIG_SWAP
+        int prep = msg_prepare_output(task, buffer, sizeof(q->stat));
+        if (prep) return prep;
+#endif
         int error = user_copy_to_task(task, buffer, &q->stat, sizeof(q->stat));
         return error ? error : command == LINUX_IPC_STAT ? 0 : q->id;
     }

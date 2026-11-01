@@ -128,6 +128,7 @@ bios_cpu_error:
 
 .code64
 bios_long_mode:
+    movb $1, boot_via_bios(%rip)
     mov $0x10, %ax
     mov %ax, %ds
     mov %ax, %es

@@ -11,6 +11,7 @@
 #include <reliefnt/sched.h>
 #include <reliefnt/storage.h>
 #include <reliefnt/usercopy.h>
+#include "usercopy.h"
 
 #define AUDIO_CONTROL_FILE_MAX 64U
 #define AUDIO_CONTROL_MAX 64U
@@ -429,13 +430,23 @@ int audio_control_write_shared(uint32_t card, uint32_t control,
  * @return Event bytes, -EBADFD if unsubscribed, -EAGAIN if empty, or negative errno.
  * Does not sleep; the task-aware wrapper owns blocking and signal wakeups.
  */
-int audio_control_read_file(struct audio_control_file *file, void *buffer,
-                            uint32_t count)
+int audio_control_read_user(struct task *task, struct audio_control_file *file,
+                            void *buffer, uint32_t count)
 {
     if (!file || !file->used) return -EBADF;
     if (!file->subscribed) return -EBADFD;
     if (!buffer || count < sizeof(struct snd_ctl_event)) return -EINVAL;
     uint32_t control, mask = SNDRV_CTL_EVENT_MASK_VALUE;
+#ifdef CONFIG_SWAP
+    if (task && task->kind == TASK_KIND_USER) {
+        int ret = audio_control_queue_next(&file->events, &control, &mask, 0);
+        if (ret) return ret;
+        int prep = audio_user_prepare(task, (uintptr_t)buffer, sizeof(struct snd_ctl_event), true);
+        if (prep) return prep;
+    }
+#else
+    (void)task;
+#endif
     int ret = audio_control_queue_next(&file->events, &control, &mask, 1);
     if (ret) return ret;
     struct snd_ctl_event event = {0};
@@ -445,6 +456,12 @@ int audio_control_read_file(struct audio_control_file *file, void *buffer,
     if (ret) return ret;
     __builtin_memcpy(buffer, &event, sizeof(event));
     return (int)sizeof(event);
+}
+
+int audio_control_read_file(struct audio_control_file *file, void *buffer,
+                            uint32_t count)
+{
+    return audio_control_read_user(NULL, file, buffer, count);
 }
 
 /** @brief Read an event or publish a race-checked interruptible control wait.
@@ -462,7 +479,7 @@ int audio_control_read_task(struct task *task, struct task_file *file,
         return -EBADF;
     audio_control_wait_remove(task);
     uint32_t epoch = audio_control_event_epoch();
-    int ret = audio_control_read_file(file->audio_control_file, buffer, count);
+    int ret = audio_control_read_user(task, file->audio_control_file, buffer, count);
     if (ret != -EAGAIN || task->pid == 0)
         return ret;
 
@@ -473,7 +490,7 @@ int audio_control_read_task(struct task *task, struct task_file *file,
     if (audio_control_event_epoch() != epoch) {
         audio_control_wait_remove(task);
         sched_wake_interruptible(task);
-        ret = audio_control_read_file(file->audio_control_file, buffer, count);
+        ret = audio_control_read_user(task, file->audio_control_file, buffer, count);
         if (ret != -EAGAIN) return ret;
     }
     if (task->state != TASK_BLOCKED) {
@@ -573,21 +590,61 @@ int audio_control_ioctl(struct task *task, struct task_file *file,
     int copy_in = (direction & _IOC_WRITE) != 0 ||
                   request == SNDRV_CTL_IOCTL_PCM_NEXT_DEVICE;
     int copy_out = (direction & _IOC_READ) != 0;
-    if ((copy_in && !user_range_ok(address, size)) ||
-        (copy_out && !user_range_writable(address, size))) return -EFAULT;
     union { max_align_t align; uint8_t bytes[sizeof(struct snd_ctl_elem_value)]; } local = {0};
-    if (copy_in) __builtin_memcpy(local.bytes, (const void *)(uintptr_t)address, size);
+#ifdef CONFIG_SWAP
+    if (task && task->kind == TASK_KIND_USER) {
+        audio_control_wait_remove(task);
+        if (copy_in) {
+            int ret = audio_user_import(task, address, size, local.bytes);
+            if (ret) return ret;
+        }
+        if (copy_out) {
+            int ret = audio_user_prepare(task, address, size, true);
+            if (ret) return ret;
+        }
+    } else
+#endif
+    {
+        if ((copy_in && !user_range_ok(address, size)) ||
+            (copy_out && !user_range_writable(address, size))) return -EFAULT;
+        if (copy_in) __builtin_memcpy(local.bytes, (const void *)(uintptr_t)address, size);
+    }
     if (request == SNDRV_CTL_IOCTL_TLV_READ) {
         struct snd_ctl_tlv *tlv = (struct snd_ctl_tlv *)local.bytes;
         uint64_t payload = address + sizeof(*tlv);
-        if (tlv->length >= 16u &&
-            (payload < address || !user_range_writable(payload,16u))) return -EFAULT;
+        if (tlv->length >= 16u) {
+            if (payload < address) return -EFAULT;
+#ifdef CONFIG_SWAP
+            if (task && task->kind == TASK_KIND_USER) {
+                int prep = audio_user_prepare(task, payload, 16u, true);
+                if (prep) return prep;
+            } else
+#endif
+            if (!user_range_writable(payload,16u)) return -EFAULT;
+        }
         int ret = audio_alsa_control_ioctl(file->audio_control_file,request,tlv);
         if (!ret) __builtin_memcpy((void *)(uintptr_t)payload,tlv->tlv,16u);
         return ret; /* Linux leaves the header's capacity unchanged. */
     }
     if (request == SNDRV_CTL_IOCTL_ELEM_LIST) {
         struct snd_ctl_elem_list *list = (struct snd_ctl_elem_list *)local.bytes;
+#ifdef CONFIG_SWAP
+        if (task && task->kind == TASK_KIND_USER) {
+            uint64_t span = (uint64_t)list->space * sizeof(*list->pids);
+            if (list->space && (!list->pids || !audio_user_span_valid((uintptr_t)list->pids, span)))
+                return -EFAULT;
+            uint32_t count = 0;
+            int ret = audio_card_control_count(file->audio_control_file->card, &count);
+            if (ret) return ret;
+            uint32_t available = list->offset < count ? count - list->offset : 0;
+            uint32_t used = list->space < available ? list->space : available;
+            if (used) {
+                int prep = audio_user_prepare(task, (uintptr_t)list->pids,
+                                              (uint64_t)used * sizeof(*list->pids), true);
+                if (prep) return prep;
+            }
+        } else
+#endif
         if (list->space && (!list->pids ||
             !user_range_writable((uintptr_t)list->pids,
                                  (uint64_t)list->space * sizeof(*list->pids))))

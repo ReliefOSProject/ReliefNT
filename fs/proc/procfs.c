@@ -1,6 +1,7 @@
 #include <reliefnt/sound_service.h>
 /* Generated procfs with a narrowly scoped optional diagnostic control. */
 #include <reliefnt/mm.h>
+#include <reliefnt/memory_pressure.h>
 #include <reliefnt/module.h>
 #include <reliefnt/driver_manager.h>
 #include <reliefnt/sched.h>
@@ -130,6 +131,22 @@ static int proc_path_kind(const char *path, const char **file_name,
     return 0;
 }
 
+/** @brief Resolve a live task-relative OOM control key.
+ * @param name Intrinsic key. @param task Optional borrowed live target output.
+ * @return One for oom_score_adj, two for oom_score, or zero for other keys.
+ * Execution ownership pins a returned target; retained proc inode identity
+ * must be checked by the pseudo provider before calling this helper.
+ */
+static int proc_oom_key(const char *name, struct task **task)
+{
+    const char *file = NULL; uint32_t pid = 0;
+    int kind = proc_path_kind(name, &file, &pid);
+    if ((kind != 2 && kind != 3) || !file) return 0;
+    int which = proc_text_eq(file, "oom_score_adj") ? 1 : proc_text_eq(file, "oom_score") ? 2 : 0;
+    if (which && task) *task = kind == 3 ? sched_current_task() : sched_find(pid);
+    return which;
+}
+
 /**
  * @brief Fill buffer with the complete content of a fixed proc file.
  * @param path Absolute kernel pathname of the fixed proc file.
@@ -165,18 +182,6 @@ static int proc_fill_content(const char *path, char *buffer, uint32_t capacity)
         if (fraction < 10) proc_append_text(buffer, &pos, capacity, "0");
         proc_append_u64(buffer, &pos, capacity, fraction);
         proc_append_text(buffer, &pos, capacity, "\n");
-        return 0;
-    }
-    if (proc_text_eq(path, "/proc/meminfo")) {
-        proc_append_text(buffer, &pos, capacity, "MemTotal: ");
-        proc_append_u64(buffer, &pos, capacity, mm_total_memory_kib());
-        proc_append_text(buffer, &pos, capacity, " kB\nMemFree: ");
-        proc_append_u64(buffer, &pos, capacity, mm_free_memory_kib());
-        /* There is no swap or reclaimable page-cache pool yet. All memory
-         * currently available for new allocations is in the free-page pool. */
-        proc_append_text(buffer, &pos, capacity, " kB\nMemAvailable: ");
-        proc_append_u64(buffer, &pos, capacity, mm_free_memory_kib());
-        proc_append_text(buffer, &pos, capacity, " kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n");
         return 0;
     }
     if (proc_text_eq(path, "/proc/version")) {
@@ -412,6 +417,8 @@ static int proc_mount_view(const char *path,struct task **target)
 
 struct proc_open_view {
     struct vfs_namespace *ns; struct vfs_path root; bool mountinfo;
+    void *memory;
+    bool score_valid; int score;
 #ifdef CONFIG_LOCK_STAT
     void *lock_stats;
 #endif
@@ -429,6 +436,16 @@ struct proc_open_view {
 int proc_file_open(const char *name,uint32_t flags,void **out)
 {
     (void)flags;if(!out)return -RELIEFOS_EINVAL;*out=NULL;
+    if (proc_memory_is_file(name)) {
+        if ((flags & LINUX_O_ACCMODE) != LINUX_O_RDONLY || (flags & LINUX_O_TRUNC))
+            return -RELIEFOS_EROFS;
+        struct proc_open_view *state = kernel_malloc(sizeof(*state));
+        if (!state) {  return -RELIEFOS_ENOMEM; }
+        *state = (struct proc_open_view){0};
+        int rc = proc_memory_open(name, &state->memory);
+        if (rc) { kernel_free(state); return rc; }
+        *out = state; return 0;
+    }
 #ifdef CONFIG_LOCK_STAT
     if (proc_text_eq(name, "/proc/reliefnt/lock_stats")) {
         /* Controls need no view and must remain usable under memory pressure. */
@@ -440,9 +457,18 @@ int proc_file_open(const char *name,uint32_t flags,void **out)
         if (rc) { kernel_free(state); return rc; }
         *out=state; return 0;
     }
-    if ((flags & LINUX_O_ACCMODE) != LINUX_O_RDONLY || (flags & LINUX_O_TRUNC))
-        return -RELIEFOS_EROFS;
 #endif
+    if (((flags & LINUX_O_ACCMODE) != LINUX_O_RDONLY || (flags & LINUX_O_TRUNC)) &&
+        !proc_control_immediate(name)) return -RELIEFOS_EROFS;
+    struct task *score_task = NULL;
+    if (proc_oom_key(name, &score_task) == 2) {
+        int score = oom_proc_score_for_task(score_task);
+        if (score < 0) return score;
+        struct proc_open_view *state = kernel_malloc(sizeof(*state));
+        if (!state) return -RELIEFOS_ENOMEM;
+        *state = (struct proc_open_view){.score_valid = true, .score = score};
+        *out = state; return 0;
+    }
     struct task *task=NULL;int view=proc_mount_view(name,&task);if(!view)return 0;
     const struct vfs_path *root=&sched_task_paths(task)->root;
     struct vfs_namespace *ns=vfs_path_namespace(root);if(!ns)return -RELIEFOS_ENOENT;
@@ -464,6 +490,13 @@ int proc_file_read(void *value,uint64_t offset,void *buffer,uint32_t capacity,ui
 {
     if(!read)return -RELIEFOS_EINVAL;*read=0;
     struct proc_open_view *state=value;if(!state)return -RELIEFOS_EINVAL;
+    if (state->memory) return proc_memory_read(state->memory,offset,buffer,capacity,read);
+    if (state->score_valid) {
+        if (!buffer && capacity) return -RELIEFOS_EINVAL;
+        struct text_stream stream = {.offset=offset,.buffer=buffer,.capacity=capacity};
+        text_signed(&stream,state->score); text_string(&stream,"\n");
+        *read=stream.written; return 0;
+    }
 #ifdef CONFIG_LOCK_STAT
     if (state->lock_stats) return lock_profile_view_read(state->lock_stats,offset,buffer,capacity,read);
 #endif
@@ -478,6 +511,8 @@ int proc_file_read(void *value,uint64_t offset,void *buffer,uint32_t capacity,ui
 void proc_file_close(void *value)
 {
     struct proc_open_view *state=value;if(!state)return;
+    if (state->memory) { proc_memory_close(state->memory); kernel_free(state); return; }
+    if (state->score_valid) { kernel_free(state); return; }
 #ifdef CONFIG_LOCK_STAT
     if (state->lock_stats) { lock_profile_view_free(state->lock_stats); kernel_free(state); return; }
 #endif
@@ -724,7 +759,7 @@ int proc_lookup(const char *path, struct storage_node *out)
         return 0;
     }
 #endif
-    if (proc_mount_view(path,NULL) || proc_text_eq(path,"/proc/cpuinfo") || proc_text_eq(path,"/proc/leonos-drivers")) {
+    if (proc_memory_is_file(path) || proc_mount_view(path,NULL) || proc_text_eq(path,"/proc/cpuinfo") || proc_text_eq(path,"/proc/leonos-drivers")) {
         if (out) *out = (struct storage_node){
             .type = RELIEFOS_FS_TYPE_FILE, .flags = STORAGE_NODE_FLAG_PROC,
             .first_cluster = 0x50524f43u, .size = 0,
@@ -733,7 +768,6 @@ int proc_lookup(const char *path, struct storage_node *out)
     }
     if (proc_text_eq(path, "/proc/cmdline") ||
         proc_text_eq(path, "/proc/uptime") ||
-        proc_text_eq(path, "/proc/meminfo") ||
         proc_text_eq(path, "/proc/version") ||
         proc_text_eq(path, "/proc/filesystems") ||
         proc_text_eq(path, "/proc/asound/cards") ||
@@ -798,7 +832,8 @@ int proc_lookup(const char *path, struct storage_node *out)
             return 0;
         }
         if ((kind == 2 || kind == 3) && file &&
-            (proc_text_eq(file, "stat") || proc_text_eq(file, "comm") || proc_text_eq(file, "cmdline") || proc_text_eq(file, "environ") || proc_text_eq(file, "status"))) {
+            (proc_text_eq(file, "stat") || proc_text_eq(file, "comm") || proc_text_eq(file, "cmdline") || proc_text_eq(file, "environ") || proc_text_eq(file, "status") ||
+             proc_text_eq(file, "oom_score") || proc_text_eq(file, "oom_score_adj"))) {
             if (kind == 2 && !sched_find(pid)) return -2;
             if (out) {
                 *out = (struct storage_node){
@@ -839,6 +874,12 @@ int proc_read(const char *path, uint64_t offset, void *buffer, uint32_t length,
     if (proc_text_eq(path,"/proc/cpuinfo")) return cpu_inventory_read(offset,buffer,length,out_read);
     if (out_read) *out_read = 0;
     if (!buffer && length) return -22;
+    if (proc_memory_is_file(path)) {
+        void *view = NULL; uint32_t ignored = 0;
+        int rc = proc_memory_open(path, &view);
+        if (!rc) rc = proc_memory_read(view, offset, buffer, length, out_read ? out_read : &ignored);
+        proc_memory_close(view); return rc;
+    }
     /* Read-only, versioned driver records from the actual driver manager;
      * no user pointer reaches driver_manager_list. */
     if (proc_text_eq(path, "/proc/leonos-drivers")) {
@@ -855,6 +896,19 @@ int proc_read(const char *path, uint64_t offset, void *buffer, uint32_t length,
     }
     const char *file=0; uint32_t pid=0; int kind=proc_path_kind(path,&file,&pid);
     if(kind==3) pid=sched_current_pid();
+    if ((kind == 2 || kind == 3) && file &&
+        (proc_text_eq(file,"oom_score") || proc_text_eq(file,"oom_score_adj"))) {
+        struct task *task=sched_find(pid);
+        if (!task || task->kind != TASK_KIND_USER || !task->pid ||
+            (task->flags & TASK_FLAG_RESOURCES_RELEASED)) return -ESRCH;
+        int value;
+        if (proc_text_eq(file,"oom_score")) {
+            value=oom_proc_score_for_task(task); if (value < 0) return value;
+        } else sched_oom_policy_get(task,&value,NULL);
+        struct text_stream stream={.offset=offset,.buffer=buffer,.capacity=length};
+        text_signed(&stream,value); text_string(&stream,"\n");
+        if(out_read)*out_read=stream.written; return 0;
+    }
     if((kind==2 || kind==3) && file && (proc_text_eq(file,"cmdline") || proc_text_eq(file,"environ") || proc_text_eq(file,"stat") || proc_text_eq(file,"comm"))) {
         struct task *task=sched_find(pid); if(!task) return -2;
         struct text_stream stream={.offset=offset,.buffer=buffer,.capacity=length};
@@ -957,7 +1011,7 @@ int proc_readlink(const char *path, char *buffer, uint32_t capacity)
 int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *entry)
 {
     uint32_t index;
-    static const char *files[] = {"uptime", "meminfo", "version", "filesystems", "stat", "mounts", "self", "sys", "cpuinfo", "leonos-drivers", "cmdline", "asound"
+    static const char *files[] = {"uptime", "meminfo", "version", "filesystems", "stat", "mounts", "self", "sys", "cpuinfo", "leonos-drivers", "cmdline", "asound", "swaps", "vmstat"
 #ifdef CONFIG_MODULES
         , "modules"
 #endif
@@ -1036,7 +1090,7 @@ int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *
         }
         if ((kind != 2 && kind != 3) || file) return -20;
         if (!sched_find(pid)) return -2;
-        static const char *task_files[] = {"stat", "cmdline", "status", "mounts", "mountinfo", "exe", "cwd", "root", "comm", "environ", "fd"};
+        static const char *task_files[] = {"stat", "cmdline", "status", "mounts", "mountinfo", "exe", "cwd", "root", "comm", "environ", "fd", "oom_score", "oom_score_adj"};
         if (*offset >= sizeof(task_files) / sizeof(task_files[0])) return 0;
         *entry = (struct reliefos_dir_entry){.type = *offset == 10 ? RELIEFOS_FS_TYPE_DIR : *offset >= 5 && *offset <= 7 ? RELIEFOS_FS_TYPE_SYMLINK : RELIEFOS_FS_TYPE_FILE};
         proc_copy(entry->name, sizeof(entry->name), task_files[(*offset)++]);
@@ -1071,6 +1125,126 @@ int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *
         }
     }
     return 0;
+}
+
+/** @brief Report synthetic proc metadata with ordinary per-task OOM ownership.
+ * @param name Intrinsic key. @param node Retained generated inode.
+ * @param value Required metadata output/proposal. @param write True for an
+ * unsupported metadata mutation. @return Zero or negative errno. Execution
+ * ownership pins the target; the pseudo provider validates its PID identity.
+ */
+int proc_control_permissions(const char *name, const struct storage_node *node,
+                             struct reliefos_permissions *value, bool write)
+{
+#ifdef CONFIG_LOCK_STAT
+    int rc = proc_lock_stats_permissions(name, node, value, write);
+#else
+    int rc = fs_virtual_permissions(name, node, value, write);
+#endif
+    if (rc || write) return rc;
+    struct task *task = NULL; int which = proc_oom_key(name, &task);
+    if (which) {
+        if (!task || task->kind != TASK_KIND_USER || (task->flags & TASK_FLAG_RESOURCES_RELEASED))
+            return -ESRCH;
+        value->mode = which == 1 ? 0644 : 0444;
+        if (!sched_task_mm(task)->nondumpable) { value->uid = task->euid; value->gid = task->egid; }
+    }
+    return 0;
+}
+
+/** @brief Test ASCII whitespace used by a stripped integer control.
+ * @param c Input byte. @return True for the six standard whitespace bytes.
+ */
+static bool proc_integer_space(unsigned char c)
+{ return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'; }
+
+/** @brief Parse a stripped signed base-zero OOM adjustment.
+ * @param buffer Validated bytes. @param length Count. @param out Value output.
+ * @return Zero or -EINVAL; no input or output ownership is transferred.
+ */
+static int proc_oom_parse(const void *buffer, uint32_t length, int *out)
+{
+    if (!buffer || !out || !length || length > 64) return -EINVAL;
+    const unsigned char *p = buffer; uint32_t first = 0, last = length;
+    while (first < last && proc_integer_space(p[first])) ++first;
+    while (last > first && proc_integer_space(p[last - 1])) --last;
+    bool negative = false;
+    if (first < last && (p[first] == '+' || p[first] == '-')) negative = p[first++] == '-';
+    if (first == last) return -EINVAL;
+    unsigned base = 10;
+    if (p[first] == '0') {
+        base = 8;
+        if (first + 1 < last && (p[first + 1] == 'x' || p[first + 1] == 'X')) {
+            base = 16; first += 2;
+        }
+    }
+    if (first == last) return -EINVAL;
+    unsigned value = 0;
+    for (; first < last; ++first) {
+        unsigned c = p[first], digit;
+        if (c >= '0' && c <= '9') digit = c - '0';
+        else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+        else return -EINVAL;
+        if (digit >= base || value > (1000u - digit) / base) return -EINVAL;
+        value = value * base + digit;
+    }
+    *out = negative ? -(int)value : (int)value; return 0;
+}
+
+/** @brief Recognize a live generated control committed by its write callback.
+ * @param name Intrinsic key. @return True for the OOM or configured lock control.
+ */
+bool proc_control_immediate(const char *name)
+{
+    if (proc_oom_key(name, NULL) == 1) return true;
+#ifdef CONFIG_LOCK_STAT
+    if (proc_text_eq(name, "/proc/reliefnt/lock_stats")) return true;
+#endif
+    return false;
+}
+
+/** @brief Admit shell's zero truncate on an immediate control.
+ * @param name Intrinsic live key. @param length Requested size.
+ * @return Zero or negative errno. Normal VFS DAC and mount policy precede it.
+ */
+int proc_control_truncate(const char *name, uint64_t length)
+{
+    if (proc_oom_key(name, NULL) == 1) return length ? -EINVAL : 0;
+#ifdef CONFIG_LOCK_STAT
+    return proc_lock_stats_truncate(name, length);
+#else
+    return -EROFS;
+#endif
+}
+
+/** @brief Apply one authorized whole-value OOM or lock diagnostic write.
+ * @param name Intrinsic live key. @param offset File position, ignored for OOM.
+ * @param buffer Validated bytes. @param length Exact byte count. @param written
+ * Required output, cleared on failure. @return Zero or negative errno.
+ * VFS DAC and PID identity precede this callback; OOM capability and inherited
+ * minimum policy are checked by the producer under the sole outer writer.
+ */
+int proc_control_write(const char *name, uint64_t offset, const void *buffer,
+                       uint32_t length, uint32_t *written)
+{
+    if (!written) return -EINVAL;
+    *written = 0;
+    struct task *task = NULL;
+    if (proc_oom_key(name, &task) == 1) {
+        int value, rc = proc_oom_parse(buffer, length, &value);
+        if (rc) return rc;
+        if (!task || (task->flags & TASK_FLAG_RESOURCES_RELEASED)) return -ESRCH;
+        rc = oom_adj_set(task, value, sched_current_task());
+        if (!rc) *written = length;
+        return rc;
+    }
+#ifdef CONFIG_LOCK_STAT
+    return proc_lock_stats_write(name, offset, buffer, length, written);
+#else
+    (void)offset;
+    return -EROFS;
+#endif
 }
 
 #ifdef CONFIG_LOCK_STAT

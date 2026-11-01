@@ -7,13 +7,52 @@ int sound_service_card_snapshot(uint32_t index, uint32_t *out_id,
                         struct audio_card_identity *identity)
 { (void)index; (void)out_id; (void)identity; return -2; }
 #include "../../fs/proc/procfs.c"
+#ifndef MEMORY_REPORTING_REAL_PRODUCERS
+/* Other proc tests model the separately linked memory reporting provider. */
+bool proc_memory_is_file(const char *name)
+{ return name && (!strcmp(name,"/proc/meminfo") || !strcmp(name,"/proc/swaps") || !strcmp(name,"/proc/vmstat")); }
+int proc_memory_open(const char *name, void **out)
+{ if (!out || !proc_memory_is_file(name)) return -22; *out=(void *)name; return 0; }
+int proc_memory_read(void *view, uint64_t offset, void *buffer, uint32_t capacity, uint32_t *read)
+{
+    if (!view || !read || (!buffer && capacity)) return -22;
+    struct text_stream stream={.offset=offset,.buffer=buffer,.capacity=capacity};
+    text_string(&stream,"fixture\n"); *read=stream.written; return 0;
+}
+void proc_memory_close(void *view) { (void)view; }
+int oom_proc_score_for_task(struct task *task) { (void)task; return 0; }
+void sched_oom_policy_get(const struct task *task, int *adjustment, int *minimum)
+{ (void)task; if (adjustment) *adjustment=0; if (minimum) *minimum=0; }
+int oom_adj_set(struct task *task, int value, struct task *caller)
+{ (void)task; (void)value; (void)caller; return -EACCES; }
+#else
+#include <reliefnt/page_cache.h>
+#include "../../kernel/sched/internal.h"
+void page_cache_report(struct page_cache_report *out) { *out=(struct page_cache_report){0}; }
+void page_cache_note_write(uint64_t physical) { (void)physical; }
+bool address_space_user_page_next(const struct address_space *as, uint64_t start,
+                                  uint64_t end, uint64_t *page, uint64_t *physical,
+                                  uint64_t *flags)
+{ (void)as; (void)start; (void)end; (void)page; (void)physical; (void)flags; return false; }
+uint64_t mm_emergency_reserve_pages(void) { return 0; }
+uint64_t mm_swap_count_existing(const struct address_space *as) { (void)as; return 0; }
+bool kernel_execution_is_outermost(void) { return true; }
+#endif
 int pty_inode_permissions(const struct storage_node *node,struct reliefos_permissions *value,bool write)
 {(void)node;(void)value;(void)write;abort();}
 
 static struct task_pty_fd fixture_ptys[2];
+#ifdef MEMORY_REPORTING_REAL_PRODUCERS
+static struct sched_task_object current_object = {.task = {.pid = 42, .name = "test", .uid = 1000,
+    .pty_fds = fixture_ptys, .pty_fd_count = 2, .pty_fd_capacity = 2}};
+static struct sched_task_object foreign_object = {.task = {.pid = 43, .name = "foreign", .uid = 2000}};
+#define current current_object.task
+#define foreign foreign_object.task
+#else
 static struct task current = {.pid = 42, .name = "test", .uid = 1000,
     .pty_fds = fixture_ptys, .pty_fd_count = 2, .pty_fd_capacity = 2};
 static struct task foreign = {.pid = 43, .name = "foreign", .uid = 2000};
+#endif
 static bool expose_foreign;
 static struct task extra_tasks[100];
 static uint32_t visible_tasks = 1;
@@ -53,7 +92,8 @@ uint32_t sched_snapshot(struct task_snapshot_info *out, uint32_t capacity, uint6
     return count;
 }
 uint64_t time_uptime_ms(void) { return 1234; }
-uint64_t mm_total_memory_kib(void) { return 1024; }
+static uint64_t fixture_total_kib = 1024;
+uint64_t mm_total_memory_kib(void) { return fixture_total_kib; }
 uint64_t mm_free_memory_kib(void) { return 512; }
 #ifndef TEST_REAL_INVENTORY
 uint32_t smp_cpu_count(void) { return 1; }
@@ -182,7 +222,7 @@ static void test_proc_mount_objects(void)
     struct vfs_path mounts_view={0};char mount_text[512];
     assert(!vfs_path_lookup(&ns,&root,&root,"/procdir/self/mountinfo",VFS_LOOKUP_FOLLOW,&mounts_view));
     assert(!vfs_path_read(&mounts_view,0,mount_text,sizeof(mount_text)-1,&got));mount_text[got]=0;
-    assert(strstr(mount_text,"2 1 0:201 / /procdir ro - proc proc ro\n"));
+    assert(strstr(mount_text,"2 1 0:201 / /procdir rw - proc proc rw\n"));
     struct vfs_open_file *old_view=NULL,*new_view=NULL;
     unsigned open_baseline=proc_allocations;
     for(int budget=0;budget<3;++budget) {
@@ -196,7 +236,7 @@ static void test_proc_mount_objects(void)
     vfs_path_put(&current.fs_paths.root);vfs_path_get(&destination,&current.fs_paths.root);
     assert(!vfs_file_open(&mounts_view,0,&new_view) && new_view);
     assert(!vfs_file_read(old_view,0,mount_text,sizeof(mount_text)-1,&got));mount_text[got]=0;
-    assert(strstr(mount_text,"/procdir ro - proc proc ro\n"));
+    assert(strstr(mount_text,"/procdir rw - proc proc rw\n"));
     assert(!vfs_file_read(new_view,0,mount_text,sizeof(mount_text)-1,&got) && !got);
     vfs_path_put(&current.fs_paths.root);vfs_path_get(&root,&current.fs_paths.root);
     assert(!vfs_file_read(new_view,0,mount_text,sizeof(mount_text)-1,&got) && !got);
@@ -228,11 +268,11 @@ static void test_proc_mount_objects(void)
     assert(!vfs_path_lookup(&ns,&root,&old_process,"status",VFS_LOOKUP_FOLLOW,&old_status));
     assert(!vfs_mount_move(&ns,&mounted,&destination));
     assert(!vfs_path_read(&mounts_view,0,mount_text,sizeof(mount_text)-1,&got));mount_text[got]=0;
-    assert(strstr(mount_text,"2 1 0:201 / /else ro - proc proc ro\n") && !strstr(mount_text,"/procdir"));
+    assert(strstr(mount_text,"2 1 0:201 / /else rw - proc proc rw\n") && !strstr(mount_text,"/procdir"));
     assert(!vfs_file_read(old_view,0,mount_text,sizeof(mount_text)-1,&got));mount_text[got]=0;
-    assert(strstr(mount_text,"/else ro - proc proc ro\n") && !strstr(mount_text,"/procdir"));
+    assert(strstr(mount_text,"/else rw - proc proc rw\n") && !strstr(mount_text,"/procdir"));
     assert(!vfs_file_read(new_view,0,mount_text,sizeof(mount_text)-1,&got));mount_text[got]=0;
-    assert(strstr(mount_text,"2 1 0:201 / / ro - proc proc ro\n"));
+    assert(strstr(mount_text,"2 1 0:201 / / rw - proc proc rw\n"));
     vfs_path_put(&mounts_view);
     const char *actual_executable="/else/sys/kernel/osrelease";
     assert(proc_readlink("/proc/self/exe",bytes,sizeof(bytes))==(int)strlen(actual_executable) &&
@@ -251,9 +291,9 @@ static void test_proc_mount_objects(void)
     assert(vfs_path_lookup(&ns,&root,&old_process,"status",0,&target)==-RELIEFOS_ENOENT);
     assert(vfs_path_read(&old_status,0,bytes,sizeof(bytes),&got)==-RELIEFOS_ENOENT && !got);
     assert(!vfs_file_read(old_view,0,mount_text,sizeof(mount_text)-1,&got));mount_text[got]=0;
-    assert(strstr(mount_text,"/else ro - proc proc ro\n"));
+    assert(strstr(mount_text,"/else rw - proc proc rw\n"));
     assert(!vfs_file_read(new_view,0,mount_text,sizeof(mount_text)-1,&got));mount_text[got]=0;
-    assert(strstr(mount_text,"2 1 0:201 / / ro - proc proc ro\n"));
+    assert(strstr(mount_text,"2 1 0:201 / / rw - proc proc rw\n"));
     vfs_file_close(old_view);vfs_file_close(new_view);
     assert(!vfs_path_lookup(&ns,&root,&root,"/else/42",0,&target));
     assert(!vfs_path_equal(&old_process,&target));vfs_path_put(&target);
@@ -398,6 +438,8 @@ int main(void)
     assert(proc_readdir("/proc/42", &offset, &entry) == 1 && !strcmp(entry.name, "comm"));
     assert(proc_readdir("/proc/42", &offset, &entry) == 1 && !strcmp(entry.name, "environ"));
     assert(proc_readdir("/proc/42", &offset, &entry) == 1 && !strcmp(entry.name, "fd") && entry.type == RELIEFOS_FS_TYPE_DIR);
+    assert(proc_readdir("/proc/42", &offset, &entry) == 1 && !strcmp(entry.name, "oom_score") && entry.type == RELIEFOS_FS_TYPE_FILE);
+    assert(proc_readdir("/proc/42", &offset, &entry) == 1 && !strcmp(entry.name, "oom_score_adj") && entry.type == RELIEFOS_FS_TYPE_FILE);
     assert(proc_readdir("/proc/42", &offset, &entry) == 0);
     offset = 0;
     assert(proc_readdir("/proc/42/fd", &offset, &entry) == 1 && !strcmp(entry.name, "0"));
@@ -470,4 +512,5 @@ int main(void)
     for (unsigned n = 3; n < 20; ++n) field = strchr(field, ' ') + 1;
     assert(!strncmp(field, "101 ", 4));
     puts("PASS procfs task directory lookup, traversal, enumeration and overflow rejection");
+    return 0;
 }

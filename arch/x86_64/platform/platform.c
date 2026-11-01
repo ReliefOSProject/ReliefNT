@@ -4,6 +4,7 @@
  */
 #include <reliefnt/console.h>
 #include <reliefnt/platform.h>
+#include "firmware_internal.h"
 
 struct efi_guid {
     uint32_t data1;
@@ -79,6 +80,8 @@ struct __attribute__((packed)) smbios_header {
 
 static struct reliefos_machine_identity platform_identity;
 static struct platform_dmi_info platform_dmi_data;
+/** @brief Handoff used to validate all firmware-data spans during BSP capture. */
+static const struct boot_info *platform_boot;
 
 /**
  * @brief Return 1 if the two EFI GUIDs are identical.
@@ -128,8 +131,10 @@ static void copy_text(char *dst, uint32_t cap, const char *src)
     dst[i] = 0;
 }
 
-/**
- * @brief Convert a UTF-16 string to ASCII into dst, replacing non-printable chars with '?'.
+/** @brief Copy a proven EFI UTF-16 string to bounded ASCII.
+ * @param dst Writable destination. @param cap Destination capacity.
+ * @param src Firmware physical string address; each character is checked.
+ * Stops at the first unproved character or NUL and always terminates dst.
  */
 static void copy_efi_text(char *dst, uint32_t cap, const uint16_t *src)
 {
@@ -137,8 +142,14 @@ static void copy_efi_text(char *dst, uint32_t cap, const uint16_t *src)
     if (!dst || cap == 0) {
         return;
     }
-    while (src && src[i] && i + 1U < cap) {
-        uint16_t ch = src[i];
+    while (src && i + 1U < cap) {
+        uint64_t address = (uintptr_t)src;
+        if ((uint64_t)i * 2 > UINT64_MAX - address) break;
+        address += (uint64_t)i * 2;
+        if (!firmware_identity_range(platform_boot, address, sizeof(uint16_t))) break;
+        uint16_t ch;
+        __builtin_memcpy(&ch, (const void *)(uintptr_t)address, sizeof(ch));
+        if (!ch) break;
         dst[i] = (ch >= 32U && ch < 127U) ? (char)ch : '?';
         ++i;
     }
@@ -306,28 +317,36 @@ static int parse_smbios_table(uint64_t table_addr, uint32_t table_len, bool litt
     return found?0:-1;
 }
 
-/**
- * @brief Validate an SMBIOS 3.0 entry (anchor + checksum) and parse its table.
+/** @brief Validate a fully covered SMBIOS 3.0 entry and table.
+ * @param entry Borrowed physical entry address from the EFI configuration.
+ * @return Zero after parsing, or -1 for unproved/malformed input.
  */
 static int parse_smbios3(const void *entry)
 {
     const struct smbios3_entry *smbios = (const struct smbios3_entry *)entry;
-    if (!smbios || !bytes_eq(smbios->anchor, "_SM3_", 5U) ||
+    if (!firmware_identity_range(platform_boot, (uintptr_t)entry, sizeof(*smbios)) ||
+        !bytes_eq(smbios->anchor, "_SM3_", 5U) ||
         smbios->length < sizeof(*smbios) ||
+        !firmware_identity_range(platform_boot, (uintptr_t)entry, smbios->length) ||
+        !firmware_identity_range(platform_boot, smbios->table_address, smbios->table_max_size) ||
         checksum8(smbios, smbios->length) != 0) {
         return -1;
     }
     return parse_smbios_table(smbios->table_address, smbios->table_max_size, true);
 }
 
-/**
- * @brief Validate an SMBIOS 2.x entry (anchors + checksum) and parse its table.
+/** @brief Validate a fully covered SMBIOS 2.x entry and table.
+ * @param entry Borrowed physical entry address from the EFI configuration.
+ * @return Zero after parsing, or -1 for unproved/malformed input.
  */
 static int parse_smbios2(const void *entry)
 {
     const struct smbios2_entry *smbios = (const struct smbios2_entry *)entry;
-    if (!smbios || !bytes_eq(smbios->anchor, "_SM_", 4U) ||
+    if (!firmware_identity_range(platform_boot, (uintptr_t)entry, sizeof(*smbios)) ||
+        !bytes_eq(smbios->anchor, "_SM_", 4U) ||
         smbios->length < 0x1fU ||
+        !firmware_identity_range(platform_boot, (uintptr_t)entry, smbios->length) ||
+        !firmware_identity_range(platform_boot, smbios->table_address, smbios->table_length) ||
         checksum8(smbios, smbios->length) != 0 ||
         !bytes_eq(smbios->intermediate_anchor, "_DMI_", 5U)) {
         return -1;
@@ -335,8 +354,9 @@ static int parse_smbios2(const void *entry)
     return parse_smbios_table(smbios->table_address, smbios->table_length, smbios->major > 2 || (smbios->major == 2 && smbios->minor >= 6));
 }
 
-/**
- * @brief Populate the machine identity from the EFI system table's SMBIOS3/SMBIOS2 config tables when present.
+/** @brief Capture firmware identity through proven EFI handoff mappings.
+ * @param boot Borrowed handoff with a validated EFI map, or NULL.
+ * BSP before the kernel root switch; unproved data remains unavailable.
  */
 void platform_identity_init(const struct boot_info *boot)
 {
@@ -353,8 +373,13 @@ void platform_identity_init(const struct boot_info *boot)
     platform_dmi_data = (struct platform_dmi_info){0};
     platform_identity.version = RELIEFOS_MACHINE_IDENTITY_VERSION;
     copy_text(platform_identity.source, sizeof(platform_identity.source), "unavailable");
+    platform_boot = boot;
     if (!boot || !boot->efi_system_table) {
         console_warn("[reliefnt] platform identity unavailable: no EFI system table\n");
+        return;
+    }
+    if (!firmware_identity_range(boot, boot->efi_system_table, sizeof(*st))) {
+        console_warn("[reliefnt] platform identity unavailable: EFI system table is not mapped by handoff\n");
         return;
     }
     st = (struct efi_system_table *)(uintptr_t)boot->efi_system_table;
@@ -362,7 +387,9 @@ void platform_identity_init(const struct boot_info *boot)
     copy_efi_text(platform_identity.firmware_vendor,
                   sizeof(platform_identity.firmware_vendor),
                   st->firmware_vendor);
-    if (!st->configuration_table || st->number_of_table_entries > 256ULL) {
+    if (!st->configuration_table || st->number_of_table_entries > 256ULL ||
+        !firmware_identity_range(boot, (uintptr_t)st->configuration_table,
+                                 st->number_of_table_entries * sizeof(*st->configuration_table))) {
         console_warn("[reliefnt] platform identity unavailable: no EFI config table\n");
         return;
     }

@@ -1,5 +1,8 @@
 #include "storage_internal.h"
 #include <reliefnt/export.h>
+#ifdef CONFIG_SWAP
+#include <reliefnt/swap_internal.h>
+#endif
 static uint64_t storage_metadata_epoch = 1;
 
 uint64_t storage_metadata_generation(void)
@@ -27,6 +30,9 @@ int storage_acquire_task_io(void)
 {
     uint32_t pid;
 
+#ifdef CONFIG_SWAP
+    if (swap_storage_slot_active()) return -RELIEFOS_EBUSY;
+#endif
     if (!storage_io_async_context) {
         return 0;
     }
@@ -108,26 +114,53 @@ void storage_memzero(void *dst, size_t len)
     }
 }
 
-/** @brief Notify each pinned native cache provider once without optional imports.
- * @param writer Borrowed stable raw/native writer, NULL for global invalidation.
- * @param lba First physical sector, ignored without writer.
- * @param sectors Sector count, ignored without writer.
- * @return None. Execution ownership keeps all contexts stable; callbacks are
- * IRQ-safe, nonallocating and perform no I/O. A physical alias need not have
- * its own codec; each native provider checks its own cached device identities.
+/** @brief Dispatch a cache event once to each execution-owned native provider.
+ * @param writer Optional borrowed volume, never retained.
+ * @param device Optional borrowed physical identity, never retained.
+ * @param physical True for a range write; false for global invalidation.
+ * @param lba First 512-byte sector for a physical write.
+ * @param sectors Sector count for a physical write.
+ * Execution ownership keeps providers live; callbacks cannot allocate or do I/O.
  */
-void storage_filesystem_cache_event(const struct storage_volume *writer,uint64_t lba,uint32_t sectors)
+static void storage_filesystem_cache_dispatch(const struct storage_volume *writer,
+                                              const struct block_device *device,bool physical,
+                                              uint64_t lba,uint32_t sectors)
 {
     const struct storage_filesystem_ops *seen[STORAGE_MAX_VOLUMES+2];uint32_t count=0;
     for(uint32_t i=0;i<STORAGE_MAX_VOLUMES+2;++i) {
         const struct storage_volume *volume=i==0 ? writer : i==1 ? &g_shmem_volume : &g_volumes[i-2];
         const struct storage_filesystem_ops *ops=volume ? volume->fs_ops : NULL;
-        if(!ops || (writer ? !ops->invalidate_write : !ops->invalidate))continue;
+        if(!ops || (physical ? !ops->invalidate_write : !ops->invalidate))continue;
         bool duplicate=false;
         for(uint32_t n=0;n<count;++n)if(seen[n]==ops){duplicate=true;break;}
         if(duplicate)continue;seen[count++]=ops;
-        if(writer)ops->invalidate_write(writer,lba,sectors);else ops->invalidate();
+        if(physical)ops->invalidate_write(writer,device,lba,sectors);else ops->invalidate();
     }
+}
+
+/** @brief Notify native cache providers of a volume write or global invalidation.
+ * @param writer Borrowed writer, or NULL for global invalidation.
+ * @param lba First 512-byte sector; ignored for global invalidation.
+ * @param sectors Sector count; ignored for global invalidation.
+ * Caller holds execution ownership; callbacks do not allocate, perform I/O or
+ * retain the writer or its device identity.
+ */
+void storage_filesystem_cache_event(const struct storage_volume *writer,uint64_t lba,uint32_t sectors)
+{
+    storage_filesystem_cache_dispatch(writer,writer ? writer->device_ref.device : NULL,
+                                      writer!=NULL,lba,sectors);
+}
+
+/** @brief Notify native cache providers before a write through a held device.
+ * @param device Borrowed exact identity pinned by the caller.
+ * @param lba First 512-byte sector. @param sectors Nonzero sector count.
+ * Caller holds execution ownership; callbacks do not allocate, perform I/O or
+ * retain the identity. No block reference is copied or transferred.
+ */
+void storage_filesystem_cache_event_device(const struct block_device *device,
+                                           uint64_t lba,uint32_t sectors)
+{
+    if(device && sectors)storage_filesystem_cache_dispatch(NULL,device,true,lba,sectors);
 }
 
 /**

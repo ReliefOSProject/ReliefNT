@@ -11,6 +11,20 @@
  * its own reference until reap/recycle; proc inodes keep independent references.
  */
 int sched_task_identity_get(struct task *task,struct task_identity **out);
+/** @brief Retain an already prepared PID identity without allocating.
+ * @param task Execution-owned live task. @param out Empty identity output.
+ * @return Zero or -EINVAL/-ESRCH/-EOVERFLOW; success transfers one reference.
+ */
+int sched_task_identity_get_existing(struct task *task, struct task_identity **out);
+/** @brief Allocate an unbound PID identity before taking scheduler_lock.
+ * @return One caller-owned identity, or NULL on allocation failure.
+ */
+struct task_identity *sched_task_identity_prepare(void);
+/** @brief Bind a prepared identity to its unpublished task, consuming it.
+ * @param task Unpublished task, nullable. @param identity Prepared owned identity,
+ * nullable; a valid pair transfers the reference to the task under serialization.
+ */
+void sched_task_identity_bind(struct task *task, struct task_identity *identity);
 /** @brief Borrow the task currently carrying a retained PID identity.
  * @param identity Held identity, nullable, under execution ownership.
  * @return Borrowed task, or NULL after reap/recycle. Never a replacement task.
@@ -43,6 +57,11 @@ void sched_task_identity_swap(struct task *left,struct task *right);
  */
 int sched_prepare_exec_current(struct task *task);
 void sched_signalfd_reconfigure(struct task *task);
+/** @brief Commit a prepared exec root and release the old MM ownership.
+ * @param task Execution-owned current task. @param replacement Prepared root
+ * whose ownership transfers to task. Releases a vfork parent and invalidates
+ * OOM snapshots; caller holds no scheduler_lock across resource teardown.
+ */
 void sched_exec_replace_mm(struct task *task, const struct address_space *replacement);
 
 /* Inline storage is promoted on first sharing. All users of an ownership
@@ -223,6 +242,11 @@ static inline struct kernel_sigqueue *sched_task_process_signal_queue(struct tas
         &task->process_signal_queue;
 }
 
+/** @brief Validate supported clone flags and TLS before accessing TID operands.
+ * @param flags Linux clone flags and optional exit signal. @param tls TLS base.
+ * @return Zero or the scheduler's original validation errno; no locks or I/O.
+ */
+int sched_clone_validate_flags(uint64_t flags,uint64_t tls);
 /** @brief Clone or share a user's resources and owned filesystem paths.
  * @param frame Borrowed saved user frame, required.
  * @param flags Supported Linux clone flags and exit signal.

@@ -12,6 +12,55 @@ struct vfs_path;
 struct trap_frame;
 struct task_lookup_path;
 struct storage_inode_ref;
+
+/* Entry-private marker for a retryable mmap file-metadata operation. */
+#define KERNEL_MMAP_FILE_IO_RETRY (-4098LL)
+/* A competing task owns storage; no swap I/O was queued or accepted. */
+#define KERNEL_SYSCALL_SWAP_CONTENDED (-4099LL)
+/* A loaded exec passed its irreversible cleanup boundary and must resume. */
+#define KERNEL_SYSCALL_EXEC_COMMIT_WAIT (-4101LL)
+#define KERNEL_SYSCALL_EXEC_FATAL (-4102LL)
+/* An owned DRM file enumeration temporarily excludes membership changes. */
+#define KERNEL_SYSCALL_DRM_ENUM_WAIT (-4103LL)
+/* A scoped mincore output page needs an outer-writer reclaim attempt. */
+#define KERNEL_SYSCALL_MINCORE_RECLAIM (-4104LL)
+/* An unsubmitted scalar regular read needs an outer-writer reclaim attempt. */
+#define KERNEL_SYSCALL_REGULAR_READ_RECLAIM (-4105LL)
+/* Open path setup, or one unsubmitted native lookup, needs bounded reclaim. */
+#define KERNEL_SYSCALL_OPEN_PATH_RECLAIM (-4106LL)
+/* Private VFS signal: a native lookup's workspace failed before its I/O. */
+#define VFS_NATIVE_LOOKUP_RECLAIM (-4107)
+#ifdef CONFIG_SWAP
+/** @brief Reclaim before an open's import, walk or unsubmitted native lookup.
+ * @param task Current task under sole outer execution ownership.
+ * @param frame Original syscall registers, borrowed only for this call.
+ * @return Zero to retry, a blocked marker, or terminal ENOMEM. The scoped
+ * root/cwd references remain owned through waits and cancellation.
+ */
+int64_t syscall_open_path_reclaim(struct task *task, const struct trap_frame *frame);
+/** @brief Reclaim before a scalar regular read's unsubmitted output slice.
+ * @param task Current task under sole outer execution ownership.
+ * @param frame Live syscall registers, borrowed only for this transaction.
+ * @return Completed read result, private retry marker, or terminal errno.
+ * The pinned OFD and scalar progress survive waits; user pages are revalidated.
+ */
+int64_t syscall_regular_read_reclaim(struct task *task, const struct trap_frame *frame);
+/** @brief Advance one bounded reclaim step for a scoped mincore output page.
+ * @param task Current task under sole outer execution ownership.
+ * @param frame Live syscall registers, borrowed only for this transaction.
+ * @return Completed mincore result, a private retry marker, or terminal error.
+ * No pointer or lock survives a wait; each retry revalidates the remaining MM.
+ */
+int64_t syscall_mm_mincore_reclaim(struct task *task, const struct trap_frame *frame);
+#endif
+/** @brief Map for the syscall entry, preserving file I/O versus final errors.
+ * @param addr Address hint. @param len Bytes. @param prot Protection bits.
+ * @param flags Mapping flags. @param fd File descriptor. @param offset File offset.
+ * @return Mapped address, negative errno, or KERNEL_MMAP_FILE_IO_RETRY for
+ * a retryable file-metadata operation. No userspace ABI or task layout changes.
+ */
+int64_t syscall_mm_mmap_dispatch(uint64_t addr, uint64_t len, uint64_t prot,
+                                 uint64_t flags, uint64_t fd, uint64_t offset);
 /** @brief Cancel a suspended two-descriptor copy before retiring its OFDs.
  * @param task Owner under execution ownership, nullable.
  * Detaches state and unlinks its wait record first, then drains any provider
@@ -36,6 +85,14 @@ void task_transfer_enter(struct task *task,const struct trap_frame *frame);
  * cancellation. No scheduler/graph/module spinlock may span this operation.
  */
 int64_t task_transfer_interrupt(struct task *task);
+#ifdef CONFIG_SWAP
+/** @brief Prepare completed transfer offsets before a caught signal is dequeued.
+ * @param task Current execution-owned transfer owner, nullable.
+ * @return Zero, prerequisite swap contention, or terminal page error. Any
+ * pending request belonging to this transfer is drained before page-in.
+ */
+int task_transfer_prepare_interrupt(struct task *task);
+#endif
 /** @brief Prepare stable lookup operands for a path syscall or its I/O retry.
  * @param task Current task under execution ownership, nullable.
  * @param frame Borrowed current syscall registers, required with a task.
@@ -53,6 +110,51 @@ void task_lookup_scope_begin(struct task *task,const struct trap_frame *frame);
  * an empty slot only after validation and before entering retryable VFS I/O.
  */
 int task_lookup_scope_next(struct task *task,struct task_lookup_path **out);
+/** @brief Borrow an existing scoped operand without allocating or advancing. */
+struct task_lookup_path *task_lookup_scope_at(struct task *task,uint64_t index);
+/* Private lookup-slot discriminators. Keep each group contiguous so additions
+ * cannot collide silently with a different slot's cleanup ownership. */
+enum task_lookup_private_kind {
+    METADATA_RESULT_READLINK = 0x10000001u,
+    METADATA_RESULT_STAT,
+    METADATA_RESULT_STATFS,
+    SOCKET_BATCH_META_KIND = 0x10000010u,
+    SOCKET_BATCH_RECEIPT_KIND,
+    MINCORE_PROGRESS_KIND = 0x10000020u,
+    TASK_LOOKUP_PROCESS_VM_KIND,
+    /* A prlimit retry retains this PID identity, not a task/MM pointer. */
+    TASK_LOOKUP_PRLIMIT_IDENTITY_KIND,
+    TASK_LOOKUP_PATH_IMPORT_KIND,
+    TASK_LOOKUP_TEXT_IMPORT_KIND,
+    TASK_LOOKUP_EXEC_IMPORT_KIND,
+    TASK_LOOKUP_DIRENT_KIND,
+    TASK_LOOKUP_POLL_KIND,
+    TASK_LOOKUP_BLOCK_SIZE_KIND,
+    TASK_LOOKUP_SELECT_KIND,
+    TASK_LOOKUP_FB_BLIT_KIND,
+    TASK_LOOKUP_FB_CMAP_KIND,
+    TASK_LOOKUP_EXEC_GUARD_KIND = 0x20000000u,
+    TASK_LOOKUP_BINARY_IMPORT_KIND = 0x40000000u,
+    TASK_LOOKUP_MODULE_IMAGE_KIND = 0x40000031u,
+    TASK_LOOKUP_MODULE_NAME_KIND,
+    TASK_LOOKUP_MODULE_PARAMETERS_KIND,
+};
+/* Scoped open retains its text/paths and optionally its walker while an
+ * initial walk or unsubmitted native workspace is reclaimed. Low bits remain
+ * VFS flags. */
+#define TASK_LOOKUP_OPEN_WALK_RECLAIM_FLAG 0x80000000u
+_Static_assert(METADATA_RESULT_STATFS < SOCKET_BATCH_META_KIND &&
+               SOCKET_BATCH_RECEIPT_KIND < MINCORE_PROGRESS_KIND &&
+               TASK_LOOKUP_FB_CMAP_KIND < TASK_LOOKUP_EXEC_GUARD_KIND &&
+               TASK_LOOKUP_EXEC_GUARD_KIND < TASK_LOOKUP_BINARY_IMPORT_KIND &&
+               TASK_LOOKUP_BINARY_IMPORT_KIND < TASK_LOOKUP_MODULE_IMAGE_KIND &&
+               TASK_LOOKUP_MODULE_PARAMETERS_KIND < TASK_LOOKUP_OPEN_WALK_RECLAIM_FLAG,
+               "lookup slot kind groups overlap");
+/* Private scope destructor for process_vm retry ownership. */
+/** @brief Release a detached process_vm retry snapshot and identity once.
+ * @param state Owned private scope, nullable; no stale MM pointer is followed.
+ */
+void task_process_vm_scope_release(void *state);
 /** @brief Retire all copied lookup inputs and held directory objects once.
  * @param task Owner under execution ownership, nullable; empty scopes are cheap.
  * Detaches state before releasing references, so signals, changed calls, exit
@@ -83,6 +185,17 @@ int resolve_kernel_object_at_flags(struct vfs_namespace *ns,struct task *task,in
                                      uint32_t lookup_flags,struct vfs_lookup_result *out);
 
 struct task_user_text {const char *text;char *allocation;};
+/** @brief Resume a scoped pathname/text import from its accepted byte prefix.
+ * @param task Current execution-owned task. @param slot Optional owned slot.
+ * @param user_ptr Original user string. @param maximum Capacity including NUL.
+ * @param allow_null Accept NULL as an empty string. @param kind Private slot tag.
+ * @param out Borrowed scoped text or owned unscoped allocation on success.
+ * @return Zero, errno, or private contention. Scoped storage is retired by
+ * common cancellation; no user pointer or VMA is retained across the wait.
+ */
+int task_lookup_text_resume(struct task *task,struct task_lookup_path *slot,
+                            uint64_t user_ptr,uint32_t maximum,bool allow_null,
+                            uint32_t kind,struct task_user_text *out);
 /** @brief Copy a counted binary user operand once across matching retries.
  * @param task Borrowed caller with optional active lookup scope.
  * @param user_ptr Readable user bytes, checked for the entire counted range.
@@ -202,6 +315,26 @@ struct task_file *task_file_for_io(struct task *task, int fd);
 int64_t syscall_regular_io(struct task *task, struct task_file *file,
                            uint64_t buffer, uint64_t count, uint64_t position,
                            bool writing, bool positional);
+
+/** @brief Release a regular-I/O stage after its provider request is drained.
+ * @param task Execution-owned owner, nullable. A pending provider must first be
+ * canceled with storage_drain_task_io; no raw user VA is dereferenced here.
+ */
+void task_regular_io_stage_cancel(struct task *task);
+/** @brief Cancel a task's private socket-send stage before dropping its OFD. */
+void task_socket_stage_cancel(struct task *task);
+/** @brief Retire a socket-send stage when new syscall registers do not match. */
+void task_socket_stage_enter(struct task *task,const struct trap_frame *frame);
+/** @brief True while a received packet is owned pending bounded output. */
+bool task_socket_stage_receive_accepted(const struct task *task);
+/** @brief True for an accepted batch message or terminal batch result awaiting output. */
+bool task_socket_batch_accepted(struct task *task);
+/** @brief Prepare bounded interrupted-receive metadata before signal dequeue. */
+int task_socket_signal_prepare(struct task *task);
+/** @brief Publish interrupted non-batch UNIX receive metadata once. */
+int task_socket_signal_finish(struct task *task);
+/** @brief Prepare bounded interrupted batch length/timeout output. */
+int task_socket_batch_signal_prepare(struct task *task);
 
 /** @brief Execute native SysV semaphore calls under the kernel execution lock. */
 int64_t syscall_sysv_sem(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3);
@@ -376,6 +509,18 @@ void task_socket_collect(void);
 void task_socket_release(struct task_file *file);
 int task_socket_read(struct task_file *file, void *buffer, uint32_t length);
 int task_socket_write(struct task_file *file, const void *buffer, uint32_t length);
+#ifdef CONFIG_SWAP
+/** @brief Import and send a bounded UNIX message through the original OFD.
+ * @param task Caller. @param file Pinned socket. @param address User source.
+ * @param length Original byte count. @return Accepted bytes, errno or wait.
+ */
+int task_socket_send_user(struct task *task,struct task_file *file,uint64_t address,uint32_t length);
+/** @brief Receive through the bounded UNIX staging path, including recvfrom. */
+int task_socket_receive_user(struct task *task,struct task_file *file,uint64_t address,uint64_t length,
+                             uint32_t flags,uint64_t name,uint64_t name_length_pointer);
+/** @brief Import vector metadata once and stage one UNIX socket transfer. */
+int task_socket_vector_user(struct task *task,struct task_file *file,uint64_t vectors,uint32_t count,bool writing);
+#endif
 struct iovec;
 int task_socket_vector(struct task_file *file, const struct iovec *vectors,
                        uint32_t count, uint64_t total, bool writing);
@@ -453,6 +598,15 @@ int task_shm_read(struct task_file *file, void *buffer, uint32_t length);
  * @return Bytes written or negative EBADF, EFAULT, EFBIG, EPERM or backing error.
  */
 int task_shm_write(struct task_file *file, const void *buffer, uint32_t length);
+#ifdef CONFIG_SWAP
+/** @brief Check the original shmem write extent before a bounded user slice.
+ * @param file Pinned shmem OFD. @param length Original provider byte count.
+ * @return Zero or EBADF/EPERM/EFBIG, with no data or offset changes.
+ * This preserves seal and offset error order when the actual user copy is
+ * limited to one resident slice; execution ownership must remain held.
+ */
+int task_shm_write_admit(struct task_file *file,uint32_t length);
+#endif
 /** @brief Check memfd mapping seals and restrict later protection upgrades.
  * @param file Pinned shmem description under execution ownership.
  * @param flags Linux MAP flags. @param prot Requested PROT bits.

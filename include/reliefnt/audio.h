@@ -464,6 +464,14 @@ int audio_pcm_unlink(struct audio_pcm *pcm);
  * No PCM lock spans a driver callback. The caller retains sample ownership.
  */
 long audio_pcm_transfer(struct audio_pcm *pcm, void *kernel_data, uint32_t frames);
+
+/** @brief Query currently transferable complete frames without consuming them.
+ * @param pcm Borrowed PCM retained by the caller.
+ * @param frames Maximum requested frame count.
+ * @return Positive frame count or the transfer's state/device error. The result
+ * is a snapshot only; the actual transfer checks again under the PCM lock.
+ */
+long audio_pcm_transfer_available(struct audio_pcm *pcm, uint32_t frames);
 /** @brief Snapshot PCM state and frame pointers after polling hardware progress.
  * @param pcm Live PCM object.
  * @param status Writable status output.

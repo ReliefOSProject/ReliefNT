@@ -11,6 +11,30 @@ int64_t syscall_futex(uint64_t address, uint64_t operation, uint64_t value,
 void futex_task_exit(struct task *task);
 void futex_cancel_wait(struct task *task);
 
+/** @brief Test whether an active waiter keys a queue by this physical frame.
+ * @param physical Aligned resident frame. @return True while its key is queued.
+ * Caller holds execution ownership and no unrelated spinlock. The queue lock
+ * is held only during inspection; no reference, allocation or I/O is acquired.
+ */
+bool futex_swap_pinned(uint64_t physical);
+
+/* Scheduler-private tail state; all addresses are user values, never aliases. */
+struct futex_exit_cursor {
+    uint64_t root, generation, head, entry, next, pending, offset;
+    uint32_t phase, count;
+    bool pending_pi;
+};
+/** @brief Borrow a preallocated cursor owned by an unreleased task slot.
+ * @param task Stable task. @return Private cursor, reset on slot reuse.
+ */
+struct futex_exit_cursor *sched_futex_exit_cursor(struct task *task);
+/** @brief Progress one bounded robust-list or clear-child-tid cleanup step.
+ * @param task Unreleased target, with its root actually retained by the task.
+ * @return One when complete, zero for more work, or SWAP_STORAGE_CONTENDED.
+ * Requires outer writer depth one, with no other lock and target I/O drained.
+ */
+int futex_task_exit_step(struct task *task);
+
 /**
  * @brief Wake matching futex2 waiters, preserving zero-count semantics.
  * @param address Aligned user U32 futex address.

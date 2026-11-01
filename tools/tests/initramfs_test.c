@@ -25,6 +25,7 @@ void mm_free_page(uint64_t p){assert(p && pages);--pages;free((void *)(uintptr_t
 void *mm_phys_to_virt(uint64_t p){return (void *)(uintptr_t)p;}
 uint64_t mm_total_memory_kib(void){return 65536;}
 void page_cache_invalidate_node(const struct storage_node *node){assert(node->flags&STORAGE_NODE_FLAG_TMPFS);}
+void page_cache_forget_node(const struct storage_node *node){assert(node->flags&STORAGE_NODE_FLAG_TMPFS);}
 void sched_truncate_file_mappings(const struct storage_node *node,uint64_t length){(void)length;assert(node);}
 int time_wall_clock(struct reliefos_time_info *out){*out=(struct reliefos_time_info){.unix_seconds=5000};return 0;}
 bool try_module_get(struct module *owner){assert(!owner);return true;}

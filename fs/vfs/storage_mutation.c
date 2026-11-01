@@ -25,6 +25,7 @@ int storage_backend_remove_node(void *context,const struct vfs_path *path,bool d
     rc=storage_inode_refresh(&current_parent);if(rc)return rc;
     rc=storage_backend_lookup(context,&current_parent,name,&node);if(rc)return rc;
     if(!storage_backend_same_node(context,expected,&node))return -ENOENT;
+    if(storage_inode_swap_busy(&node))return -EPERM;
     struct storage_volume *previous=NULL;
     rc=storage_select_node_volume(&current_parent,&previous);if(rc)return rc;
     storage_begin_mutation();
@@ -72,6 +73,7 @@ int storage_backend_rename_node(void *context,const struct vfs_path *source,cons
         else if(found!=-ENOENT)rc=found ? found : -EEXIST;
     }
     if(rc)return rc;
+    if(storage_inode_swap_busy(node) || (replaced && storage_inode_swap_busy(replaced)))return -EPERM;
     struct storage_volume *previous=NULL;rc=storage_select_node_volume(&old_parent,&previous);if(rc)return rc;
     struct storage_rename_metadata *metadata=NULL;
     if(clustered)rc=storage_backend_prepare_rename_metadata(volume,source,parent,name,&saved_mode,&metadata);
@@ -104,6 +106,7 @@ int storage_backend_link_node(void *context,const struct storage_node *source,
     struct storage_volume *volume=context;
     if(!volume || !source || !parent || !name || source->volume_id!=volume->volume_id ||
        parent->volume_id!=volume->volume_id)return -EINVAL;
+    if(storage_inode_swap_busy(source))return -EPERM;
     if(volume->mount_flags&MS_RDONLY)return -EROFS;
     const struct storage_filesystem_ops *ops=volume->fs_ops;
     if(!ops || !ops->link)return -EOPNOTSUPP;

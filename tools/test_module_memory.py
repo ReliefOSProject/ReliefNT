@@ -24,7 +24,14 @@ class ModuleMemory(unittest.TestCase):
             work = Path(directory)
             source = work / "probe.c"
             source.write_text('#include <assert.h>\n#include <reliefnt/mm.h>\n'
-                              '#include <reliefnt/module_memory.h>\nint main(void) {\n'
+                              '#include <reliefnt/module_memory.h>\n#include <stdbool.h>\n'
+                              '#include <stdint.h>\n'
+                              '/** @brief Reject fixture coverage. @param p Physical base. '
+                              '@param n Length in bytes. @return Always false. */\n'
+                              'bool paging_kernel_direct_map_range(uint64_t p, uint64_t n) '
+                              '{ (void)p; (void)n; return false; }\n'
+                              '/** @brief Check module aliases. @return Zero on success. */\n'
+                              'int main(void) {\n'
                               'assert(!mm_virt_to_phys((void *)RELIEFNT_MODULE_BASE));\n'
                               'assert(!mm_virt_to_phys((void *)(RELIEFNT_MODULE_END-1)));\n}\n')
             binary = work / "test"

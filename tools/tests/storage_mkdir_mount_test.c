@@ -64,7 +64,18 @@
 #include "modules/exfat.h"
 #include "../../fs/ext_common/mount.c"
 #include "../../fs/ext_common/sync.c"
+#ifdef RELIEFNT_FIXTURE_WRAP_NATIVE_INODE_READ
+/** @brief Control only direct native-adapter inode rereads in a host fixture.
+ * @param volume Borrowed ext instance. @param ino Native inode number.
+ * @param out Required decoded metadata. @return Zero or injected provider errno.
+ */
+int fixture_native_inode_read(struct storage_volume *volume,uint64_t ino,struct ext4_inode_view *out);
+#define storage_ext4_read_inode fixture_native_inode_read
+#endif
 #include "../../fs/ext_common/native.c"
+#ifdef RELIEFNT_FIXTURE_WRAP_NATIVE_INODE_READ
+#undef storage_ext4_read_inode
+#endif
 #include "../../fs/vfs/mount.c"
 #include "../../sound/core/storage_audio.c"
 #include "modules/vfs.h"
@@ -136,8 +147,26 @@ struct task *sched_current_task(void) { return NULL; }
 bool task_in_group(const struct task *task, uint32_t gid, bool real)
 { (void)task; (void)gid; (void)real; abort(); }
 #endif
+#ifndef RELIEFNT_FIXTURE_REAL_PAGE_CACHE
+/** @brief Report no resident pages in this cache-free fixture.
+ * @param node Borrowed inode. @return Zero.
+ */
+int page_cache_has_inode(const struct storage_node *node) { (void)node; return 0; }
+/** @brief Accept a volume purge in the cache-free fixture. @param volume Slot. */
+void page_cache_forget_volume(uint32_t volume) { (void)volume; }
+/** @brief Accept a resize in the cache-free fixture.
+ * @param node Borrowed inode. @param old_size Prior size. @param new_size New size.
+ */
+void page_cache_resize_node(const struct storage_node *node,uint64_t old_size,uint64_t new_size)
+{ (void)node; (void)old_size; (void)new_size; }
 void page_cache_invalidate_node(const struct storage_node *node)
 { assert(node && (node->flags & (STORAGE_NODE_FLAG_EXT2 | STORAGE_NODE_FLAG_TMPFS))); }
+void page_cache_forget_node(const struct storage_node *node)
+{ assert(node && (node->flags & (STORAGE_NODE_FLAG_EXT2 | STORAGE_NODE_FLAG_TMPFS |
+                                 STORAGE_NODE_FLAG_FAT32 | STORAGE_NODE_FLAG_EXFAT))); }
+void page_cache_zero_range(const struct storage_node *node,uint64_t offset,uint64_t length)
+{ (void)node; (void)offset; (void)length; abort(); }
+#endif
 #ifndef RELIEFNT_FIXTURE_PTY_METADATA
 int pty_inode_permissions(const struct storage_node *node,struct reliefos_permissions *value,bool write)
 { (void)node; (void)value; (void)write; abort(); }

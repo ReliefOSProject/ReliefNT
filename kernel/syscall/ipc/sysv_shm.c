@@ -3,6 +3,8 @@
  */
 #include <reliefnt/sysv_shm.h>
 #include <reliefnt/syscall.h>
+#include <reliefnt/syscall_internal.h>
+#include <reliefnt/swap.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/mm.h>
@@ -37,6 +39,18 @@ static struct sysv_shm_segment *sysv_shm_ids[SYSV_SHM_SLOTS];
 static uint32_t sysv_shm_generations[SYSV_SHM_SLOTS];
 static uint32_t sysv_shm_used, sysv_shm_cursor;
 static uint64_t sysv_shm_pages, sysv_shm_identity;
+
+/** @brief Prepare one fixed shmctl operand before its copy or mutation.
+ * @param task Caller under the outer execution writer. @param address User VA.
+ * @param size Exact operand length. @param writing True for output.
+ * @return Zero, EFAULT or private prerequisite contention, with no retained VA.
+ */
+static int sysv_shm_prepare(struct task *task,uint64_t address,uint64_t size,bool writing)
+{
+    int rc=swap_prepare_user_range(task,address,size,writing);
+    if(rc==SWAP_STORAGE_CONTENDED)return KERNEL_SYSCALL_SWAP_CONTENDED;
+    return rc<0 ? -LINUX_EFAULT : 0;
+}
 
 /** @brief Read the realtime clock for IPC metadata. @return Seconds. */
 static long sysv_shm_now(void)
@@ -259,6 +273,41 @@ void sysv_shm_vma_release(struct task *task, struct task_vma *vma)
     if (a->pieces && !--a->pieces) kernel_free(a);
     if (s->deleted && !s->stat.shm_nattch && !s->pending_attach) sysv_shm_destroy(s);
 }
+
+/** @brief Restore one attachment leaf from its segment-owned RAM page.
+ * @param task Execution-owned address space. @param vma Retained attachment VMA.
+ * @param page Aligned virtual address inside the original attachment.
+ * @return Zero or negative EFAULT/ENOMEM; successful mapping owns a PMM pin.
+ */
+int sysv_shm_fault_page(struct task *task, struct task_vma *vma, uint64_t page)
+{
+    struct sysv_shm_attachment *a = vma ? vma->sysv_shm_attachment : NULL;
+    if (!task || !a || page < a->base || page < vma->start || page >= vma->end)
+        return -LINUX_EFAULT;
+    uint64_t index = (page - a->base) / SYSV_SHM_PAGE;
+    if (index >= a->segment->page_count) return -LINUX_EFAULT;
+    uint64_t phys = a->segment->pages[index];
+    uint64_t flags = RELIEFNT_PAGE_SHARED;
+    if (vma->prot & LINUX_PROT_WRITE) flags |= RELIEFNT_PAGE_WRITABLE;
+    if (!(vma->prot & LINUX_PROT_EXEC)) flags |= RELIEFNT_PAGE_NOEXEC;
+    mm_retain_page(phys);
+    if (!address_space_map_user_page(sched_task_as(task), page, phys, flags)) {
+        mm_free_page(phys);
+        return -LINUX_ENOMEM;
+    }
+    return 0;
+}
+/** @brief Check attachment backing without acquiring a mapping reference.
+ * @param vma Live attachment VMA. @param page Aligned address in that piece.
+ * @return True when its segment owns the corresponding page.
+ */
+bool sysv_shm_page_resident(struct task_vma *vma, uint64_t page)
+{
+    struct sysv_shm_attachment *a = vma ? vma->sysv_shm_attachment : NULL;
+    if (!a || page < vma->start || page >= vma->end || page < a->base) return false;
+    uint64_t index = (page - a->base) / SYSV_SHM_PAGE;
+    return index < a->segment->page_count && a->segment->pages[index];
+}
 /** @brief Detach all remaining split pieces for one original shmat address.
  * @param task Current user address space. @param address Original shmat base.
  * @return Zero or negative errno; unrelated and adjacent VMAs stay live.
@@ -331,12 +380,14 @@ static int64_t sysv_shm_control(struct task *task, int32_t id, int32_t command, 
         struct shminfo64 info = {.shmmax = SYSV_SHM_MAX_BYTES, .shmmin = 1,
             .shmmni = SYSV_SHM_SLOTS, .shmseg = SYSV_SHM_SLOTS,
             .shmall = SYSV_SHM_MAX_PAGES};
+        int prep=sysv_shm_prepare(task,pointer,sizeof(info),true);if(prep)return prep;
         return user_copy_to_task(task, pointer, &info, sizeof(info)) ?
             -LINUX_EFAULT : sysv_shm_max_index();
     }
     if (command == SHM_INFO) {
         struct shm_info info = {.used_ids = (int)sysv_shm_used,
             .shm_tot = sysv_shm_pages, .shm_rss = sysv_shm_pages};
+        int prep=sysv_shm_prepare(task,pointer,sizeof(info),true);if(prep)return prep;
         return user_copy_to_task(task, pointer, &info, sizeof(info)) ?
             -LINUX_EFAULT : sysv_shm_max_index();
     }
@@ -345,6 +396,7 @@ static int64_t sysv_shm_control(struct task *task, int32_t id, int32_t command, 
     if (!stat && command != IPC_SET && command != IPC_RMID &&
         command != SHM_LOCK && command != SHM_UNLOCK) return -LINUX_EINVAL;
     if (command == IPC_SET) {
+        int prep=sysv_shm_prepare(task,pointer,sizeof(input),false);if(prep)return prep;
         if (!user_range_ok(pointer, sizeof(input))) return -LINUX_EFAULT;
         __builtin_memcpy(&input, (const void *)(uintptr_t)pointer, sizeof(input));
     }
@@ -371,6 +423,7 @@ static int64_t sysv_shm_control(struct task *task, int32_t id, int32_t command, 
     if (command == SHM_LOCK || command == SHM_UNLOCK)
         return sysv_shm_lock(task, s, command == SHM_LOCK);
     if (command != SHM_STAT_ANY && !sysv_shm_access(task, s, 4)) return -LINUX_EACCES;
+    int prep=sysv_shm_prepare(task,pointer,sizeof(s->stat),true);if(prep)return prep;
     return user_copy_to_task(task, pointer, &s->stat, sizeof(s->stat)) ?
         -LINUX_EFAULT : (command == IPC_STAT ? 0 : s->id);
 }

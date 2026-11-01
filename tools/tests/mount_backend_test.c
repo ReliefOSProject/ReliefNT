@@ -178,8 +178,13 @@ static uintptr_t lookup_user_base;
 static size_t lookup_user_bytes;
 bool user_range_ok(uint64_t address,uint64_t length)
 {
-    return address>=lookup_user_base && length<=lookup_user_bytes &&
-        address-lookup_user_base<=lookup_user_bytes-length;
+    if(!length)return true;
+    if(!lookup_user_bytes || lookup_user_base>UINT64_MAX-(lookup_user_bytes-1))return false;
+    /* Usercopy admits mapped pages, rather than individual C objects. Zero
+     * lookup_user_bytes still models an unmap between syscall retries. */
+    uint64_t first=(uint64_t)lookup_user_base & ~UINT64_C(4095);
+    uint64_t last=((uint64_t)lookup_user_base+lookup_user_bytes-1) | UINT64_C(4095);
+    return address>=first && address<=last && length-1<=last-address;
 }
 size_t user_strlen(const char *text,size_t maximum)
 {
@@ -200,6 +205,7 @@ void kernel_spin_lock_irqsave(struct kernel_spinlock *lock,uint64_t *flags)
 void kernel_spin_unlock_irqrestore(struct kernel_spinlock *lock,uint64_t flags)
 {assert(lock->state && !flags);lock->state=0;}
 void sched_block_current(void){abort();}
+void sched_sleep_current_until(uint64_t wake_tick){(void)wake_tick;abort();}
 bool user_range_writable(uint64_t address,uint64_t length)
 {return user_range_ok(address,length);}
 static unsigned readlink_waits;

@@ -91,7 +91,7 @@ static bool device_valid(const struct block_device_registration *registration)
     const struct block_device_operations *ops=registration->operations;
     if(!info->device || !info->blocks || !info->max_blocks || info->block_size<512 ||
        (info->block_size&(info->block_size-1u)) ||
-       (info->flags&~(BLOCK_DEVICE_READ_ONLY|BLOCK_DEVICE_REMOVABLE|BLOCK_DEVICE_OPTICAL|BLOCK_DEVICE_WRITE_THROUGH)))return false;
+       (info->flags&~(BLOCK_DEVICE_READ_ONLY|BLOCK_DEVICE_REMOVABLE|BLOCK_DEVICE_OPTICAL|BLOCK_DEVICE_WRITE_THROUGH|BLOCK_DEVICE_SWAP_SAFE)))return false;
     return ops->read && ((info->flags&BLOCK_DEVICE_READ_ONLY) || ops->write) &&
         ((info->flags&(BLOCK_DEVICE_READ_ONLY|BLOCK_DEVICE_WRITE_THROUGH)) || ops->flush);
 }

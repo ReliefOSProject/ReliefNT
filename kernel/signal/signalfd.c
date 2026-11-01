@@ -7,6 +7,9 @@
 #include <linux/socket.h>
 #include <linux/poll.h>
 #include <linux/errno.h>
+#ifdef CONFIG_SWAP
+#include <reliefnt/swap.h>
+#endif
 
 /** @brief Check Linux access_ok without consuming signals or faulting pages. */
 static bool signalfd_access(uint64_t address, uint64_t size)
@@ -26,6 +29,14 @@ static bool signalfd_access(uint64_t address, uint64_t size)
 int64_t syscall_signalfd(int32_t fd, uint64_t pointer, uint64_t size, uint32_t flags)
 {
     if (size != sizeof(uint64_t)) return -LINUX_EINVAL;
+#ifdef CONFIG_SWAP
+    struct task *prepare_task=sched_current_task();
+    if(prepare_task) {
+        int prep=swap_prepare_user_range(prepare_task,pointer,size,false);
+        if(prep==SWAP_STORAGE_CONTENDED)return KERNEL_SYSCALL_SWAP_CONTENDED;
+        if(prep<0)return -LINUX_EFAULT;
+    }
+#endif
     if (!user_range_ok(pointer, size)) return -LINUX_EFAULT;
     uint64_t mask;
     __builtin_memcpy(&mask, (const void *)(uintptr_t)pointer, sizeof(mask));
@@ -123,6 +134,30 @@ static int signalfd_copy(struct task *task, const struct iovec *vectors, uint32_
     return copied == sizeof(*info) ? 0 : -LINUX_EFAULT;
 }
 
+#ifdef CONFIG_SWAP
+/** @brief Prepare one actual signalfd record before removing its signal.
+ * @param task Live current reader. @param vectors Imported owned metadata.
+ * @param count Vector count. @param position Start within the byte stream.
+ * @return The private wait marker or zero. A permanent page error is left to
+ * the original per-vector copy so signal consumption and partial EFAULT stay
+ * unchanged. No signal queue spinlock spans the bounded page preparation.
+ */
+static int signalfd_prepare_record(struct task *task,const struct iovec *vectors,
+                                   uint32_t count,uint64_t position)
+{
+    uint64_t remaining=sizeof(struct linux_signalfd_siginfo);
+    for(uint32_t i=0;i<count && remaining;++i) {
+        if(position>=vectors[i].iov_len){position-=vectors[i].iov_len;continue;}
+        uint64_t take=vectors[i].iov_len-position;if(take>remaining)take=remaining;
+        int prep=swap_prepare_user_range(task,(uintptr_t)vectors[i].iov_base+position,take,true);
+        if(prep==SWAP_STORAGE_CONTENDED)return KERNEL_SYSCALL_SWAP_CONTENDED;
+        if(prep<0)return 0;
+        remaining-=take;position=0;
+    }
+    return 0;
+}
+#endif
+
 /** @brief Dequeue complete records; only the first record may block. */
 static int64_t signalfd_read_iter(struct task *task, struct task_file *file,
                                  const struct iovec *vectors, uint32_t count,
@@ -133,6 +168,14 @@ static int64_t signalfd_read_iter(struct task *task, struct task_file *file,
     if (bytes < sizeof(struct linux_signalfd_siginfo)) return -LINUX_EINVAL;
     uint64_t total = 0;
     while (bytes - total >= sizeof(struct linux_signalfd_siginfo)) {
+#ifdef CONFIG_SWAP
+        if(kernel_signal_peek(task,file->aux) &&
+           signalfd_prepare_record(task,vectors,count,total)==KERNEL_SYSCALL_SWAP_CONTENDED) {
+            if(total)return (int64_t)total;
+            task->signalfd_wait_mask=file->aux;task->signalfd_waiting=true;
+            return KERNEL_SYSCALL_SWAP_CONTENDED;
+        }
+#endif
         struct linux_siginfo info;
         int sig = kernel_signal_dequeue(task, file->aux, &info);
         if (!sig) {
@@ -169,7 +212,11 @@ int64_t task_signalfd_readv(struct task *task, struct task_file *file, uint64_t 
     if (task->signalfd_vectors) {
         int64_t result = signalfd_read_iter(task, file, task->signalfd_vectors,
             task->signalfd_vector_count, task->signalfd_vector_bytes, task->signalfd_read_flags & 8u);
-        if (result != KERNEL_SYSCALL_BLOCKED) {
+        if (result != KERNEL_SYSCALL_BLOCKED
+#ifdef CONFIG_SWAP
+            && result != KERNEL_SYSCALL_SWAP_CONTENDED
+#endif
+           ) {
             if (task->signalfd_vectors != task->signalfd_fast_vectors) kernel_free(task->signalfd_vectors);
             task->signalfd_vectors = NULL;
         }
@@ -183,6 +230,13 @@ int64_t task_signalfd_readv(struct task *task, struct task_file *file, uint64_t 
         if (!vectors) return -LINUX_ENOMEM;
     }
     int64_t result = -LINUX_EFAULT;
+#ifdef CONFIG_SWAP
+    if(size) {
+        int prep=swap_prepare_user_range(task,pointer,size,false);
+        if(prep==SWAP_STORAGE_CONTENDED){result=KERNEL_SYSCALL_SWAP_CONTENDED;goto done;}
+        if(prep<0)goto done;
+    }
+#endif
     if (size && !user_range_ok(pointer, size)) goto done;
     if (size) __builtin_memcpy(vectors, (const void *)(uintptr_t)pointer, size);
     result = -LINUX_EINVAL;
@@ -202,7 +256,11 @@ int64_t task_signalfd_readv(struct task *task, struct task_file *file, uint64_t 
     result = -LINUX_EINVAL;
     if ((flags & 0x30u) == 0x30u) goto done; /* APPEND and NOAPPEND conflict. */
     result = signalfd_read_iter(task, file, vectors, (uint32_t)count, total, flags & 8u);
-    if (result == KERNEL_SYSCALL_BLOCKED) {
+    if (result == KERNEL_SYSCALL_BLOCKED
+#ifdef CONFIG_SWAP
+        || result == KERNEL_SYSCALL_SWAP_CONTENDED
+#endif
+       ) {
         task->signalfd_vectors = vectors;
         task->signalfd_vector_count = (uint32_t)count;
         task->signalfd_vector_bytes = total;

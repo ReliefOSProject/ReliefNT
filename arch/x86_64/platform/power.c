@@ -5,8 +5,12 @@
 #include <reliefnt/console.h>
 #include <reliefnt/multiboot2.h>
 #include <reliefnt/power.h>
+#include <reliefnt/paging.h>
+#include <reliefnt/memory_topology.h>
+#include <linux/errno.h>
 
 #include "../port.h"
+#include "firmware_internal.h"
 
 /**
  * Io delay.
@@ -55,6 +59,12 @@ struct acpi_power_state {
 
 static struct acpi_power_state acpi_power;
 static const struct acpi_rsdp *acpi_root_rsdp;
+/** @brief Borrowed boot map while the loader's physical identity map is active. */
+static const struct boot_info *acpi_early_boot;
+#define ACPI_RESOURCE_MAX 4096u
+struct acpi_boot_resource { uint64_t start, bytes; };
+static struct acpi_boot_resource acpi_resources[ACPI_RESOURCE_MAX];
+static uint32_t acpi_resource_count;
 static uint16_t acpi_pm_timer_port;
 static uint32_t acpi_pm_timer_mask;
 
@@ -251,10 +261,31 @@ static const struct acpi_rsdp *acpi_scan_rsdp(void)
     return acpi_scan_rsdp_range(0xe0000U, 0x100000U);
 }
 
-/**
- * Acpi rsdp from efi.
- * @param system_table Value supplied by the caller.
- * @return The value or status produced by the operation.
+/** @brief Resolve a complete ACPI physical span with the active mapping.
+ * @param address Physical first byte. @param bytes Nonzero extent length.
+ * @return Borrowed readable alias or NULL when its mapping cannot be proved.
+ */
+static const void *acpi_physical_span(uint64_t address, uint64_t bytes);
+
+/** @brief Validate an RSDP without accessing bytes outside a proven span.
+ * @param physical Physical RSDP address. @return Borrowed valid alias or NULL.
+ */
+static const struct acpi_rsdp *acpi_resolve_rsdp(uint64_t physical)
+{
+    const struct acpi_rsdp *rsdp = acpi_physical_span(physical, 20);
+    if (!rsdp) return NULL;
+    if (rsdp->revision >= 2) {
+        rsdp = acpi_physical_span(physical, sizeof(*rsdp));
+        if (!rsdp || rsdp->length < sizeof(*rsdp) || rsdp->length > 4096) return NULL;
+        rsdp = acpi_physical_span(physical, rsdp->length);
+        if (!rsdp) return NULL;
+    }
+    return acpi_rsdp_valid(rsdp) ? rsdp : NULL;
+}
+
+/** @brief Find an EFI configuration-table RSDP through proven identity spans.
+ * @param system_table Live EFI system table physical address.
+ * @return Borrowed valid RSDP alias or NULL. Called before ExitBootServices.
  */
 static const struct acpi_rsdp *acpi_rsdp_from_efi(uint64_t system_table)
 {
@@ -267,41 +298,83 @@ static const struct acpi_rsdp *acpi_rsdp_from_efi(uint64_t system_table)
     };
     uint64_t entry_count;
     uint64_t config_table;
-    if (!system_table || system_table > 0xffffffffULL) {
-        return 0;
-    }
-    /**
- * @brief EFI_SYSTEM_TABLE.ConfigurationTable fields are at offsets 104/112.
- */
-    entry_count = acpi_read64((const uint8_t *)(uintptr_t)system_table, 104);
-    config_table = acpi_read64((const uint8_t *)(uintptr_t)system_table, 112);
-    if (!entry_count || entry_count > 1024U || !config_table ||
-        config_table > 0xffffffffULL ||
-        config_table + entry_count * 24U > 0x100000000ULL) {
-        return 0;
-    }
+    const uint8_t *st = acpi_physical_span(system_table, 120);
+    if (!st) return NULL;
+    /* EFI_SYSTEM_TABLE.ConfigurationTable fields are at offsets 104/112. */
+    entry_count = acpi_read64(st, 104);
+    config_table = acpi_read64(st, 112);
+    if (!entry_count || entry_count > 1024U || !config_table) return NULL;
+    const uint8_t *entries = acpi_physical_span(config_table, entry_count * 24U);
+    if (!entries) return NULL;
     for (uint64_t i = 0; i < entry_count; ++i) {
-        const uint8_t *entry = (const uint8_t *)(uintptr_t)(config_table + i * 24U);
+        const uint8_t *entry = entries + i * 24U;
         uint64_t table_address = acpi_read64(entry, 16);
         for (uint32_t guid = 0; guid < sizeof(acpi_guids) / sizeof(acpi_guids[0]); ++guid) {
-            if (acpi_guid_equal(entry, acpi_guids[guid]) &&
-                table_address <= 0xffffffffULL) {
-                const struct acpi_rsdp *rsdp =
-                    (const struct acpi_rsdp *)(uintptr_t)table_address;
-                if (acpi_rsdp_valid(rsdp)) {
-                    return rsdp;
-                }
+            if (acpi_guid_equal(entry, acpi_guids[guid])) {
+                const struct acpi_rsdp *rsdp = acpi_resolve_rsdp(table_address);
+                if (rsdp) return rsdp;
             }
         }
     }
     return 0;
 }
 
+/** @brief Check a span inside the Multiboot block already parsed by the loader.
+ * @param start Physical first byte. @param bytes Nonzero bounded extent.
+ * @return True only for bytes inside the validated borrowed handoff block.
+ */
+static bool acpi_multiboot_identity_range(uint64_t start, uint64_t bytes)
+{
+    const struct boot_info *boot = acpi_early_boot;
+    if (!boot || !boot->multiboot_info) return false;
+    const struct multiboot2_info *info = (const void *)(uintptr_t)boot->multiboot_info;
+    uint64_t base = boot->multiboot_info, size = info->total_size;
+    return start >= base && start - base < size && bytes <= size - (start - base);
+}
+
+/** @brief Resolve a bounded ACPI physical span in the current boot phase.
+ * @param address Physical start. @param bytes Complete required byte length.
+ * @return Borrowed proven identity or direct-map alias, or NULL.
+ * The i386 entry proves its first 4 GiB; active EFI amd64 entry and descriptor
+ * coverage prove firmware spans until sparse kernel mapping is published.
+ */
+static const void *acpi_physical_span(uint64_t address, uint64_t bytes)
+{
+    if (!address || !bytes || address >= RELIEFNT_KERNEL_DIRECT_MAP_SIZE ||
+        bytes > RELIEFNT_KERNEL_DIRECT_MAP_SIZE - address ||
+        !paging_phys_addressable(address, bytes)) return NULL;
+    if (!mm_bootstrap_topology()) {
+        if (acpi_multiboot_identity_range(address, bytes)) return (const void *)(uintptr_t)address;
+        if (acpi_early_boot && acpi_early_boot->efi_system_table)
+            return firmware_identity_range(acpi_early_boot, address, bytes) ?
+                (const void *)(uintptr_t)address : NULL;
+        return acpi_early_boot && acpi_early_boot->bios_identity_4g &&
+            address < 0x100000000ULL && bytes <= 0x100000000ULL - address ?
+            (const void *)(uintptr_t)address : NULL;
+    }
+    if (!paging_kernel_direct_map_range(address, bytes)) return NULL;
+    return paging_kernel_direct_map(address);
+}
+
+/** @brief Capture an EFI RSDP while boot services and identity mappings live.
+ * @param boot Writable handoff with a fresh EFI map and active services.
+ * Preserves a valid Multiboot RSDP, otherwise records the configuration-table
+ * RSDP. This performs no firmware calls and never follows unproved pointers.
+ */
+void power_acpi_capture_efi_rsdp(struct boot_info *boot)
+{
+    if (!boot || !boot->efi_boot_services_active || !boot->efi_system_table) return;
+    acpi_early_boot = boot;
+    if (acpi_resolve_rsdp(boot->rsdp_addr)) return;
+    const struct acpi_rsdp *rsdp = acpi_rsdp_from_efi(boot->efi_system_table);
+    boot->efi_rsdp_addr = (uintptr_t)rsdp;
+}
+
 /**
- * Acpi find table.
- * @param rsdp Value supplied by the caller.
- * @param signature Value supplied by the caller.
- * @return The value or status produced by the operation.
+ * @brief Find a validated root-listed ACPI table through the active mapping.
+ * @param rsdp Borrowed readable RSDP in the current address space.
+ * @param signature Four-byte table signature.
+ * @return Borrowed validated table or NULL for absent, malformed or unmapped data.
  */
 static const struct acpi_sdt_header *acpi_find_table(const struct acpi_rsdp *rsdp,
                                                       const char signature[4])
@@ -328,12 +401,11 @@ static const struct acpi_sdt_header *acpi_find_table(const struct acpi_rsdp *rsd
             root_address = rsdp->rsdt_address;
             entry_size = 4;
         }
-        if (root_address > 0xffffffffULL) {
-            continue;
-        }
-        root = (const uint8_t *)(uintptr_t)root_address;
+        root = acpi_physical_span(root_address, sizeof(struct acpi_sdt_header));
+        if (!root) continue;
         root_length = ((const struct acpi_sdt_header *)root)->length;
-        if (root_length < sizeof(struct acpi_sdt_header) ||
+        if (root_length < sizeof(struct acpi_sdt_header) || root_length > 16U * 1024U * 1024U ||
+            !(root = acpi_physical_span(root_address, root_length)) ||
             !acpi_checksum_valid(root, root_length)) {
             continue;
         }
@@ -343,18 +415,111 @@ static const struct acpi_sdt_header *acpi_find_table(const struct acpi_rsdp *rsd
                                    ? acpi_read64(root, sizeof(struct acpi_sdt_header) + i * 8U)
                                    : acpi_read32(root, sizeof(struct acpi_sdt_header) + i * 4U);
             const struct acpi_sdt_header *table;
-            if (!address || address > 0xffffffffULL) {
+            if (!address) {
                 continue;
             }
-            table = (const struct acpi_sdt_header *)(uintptr_t)address;
+            table = acpi_physical_span(address, sizeof(*table));
+            if (!table) continue;
             if (acpi_bytes_equal(table->signature, signature, 4) &&
-                table->length >= sizeof(struct acpi_sdt_header) &&
+                table->length >= sizeof(struct acpi_sdt_header) && table->length <= 16U * 1024U * 1024U &&
+                (table = acpi_physical_span(address, table->length)) &&
                 acpi_checksum_valid((const uint8_t *)table, table->length)) {
                 return table;
             }
         }
     }
     return 0;
+}
+
+/** @brief Record one verified nonempty ACPI physical span without allocation.
+ * @param start Physical start. @param bytes Complete byte length.
+ * @return 0, -EINVAL or -ENOSPC; duplicate exact spans do not consume slots.
+ */
+static int acpi_resource_add(uint64_t start, uint64_t bytes)
+{
+    if (!start || !bytes || start >= RELIEFNT_KERNEL_DIRECT_MAP_SIZE ||
+        bytes > RELIEFNT_KERNEL_DIRECT_MAP_SIZE - start || !paging_phys_addressable(start, bytes))
+        return -EINVAL;
+    for (uint32_t i = 0; i < acpi_resource_count; ++i)
+        if (acpi_resources[i].start == start && acpi_resources[i].bytes == bytes) return 0;
+    if (acpi_resource_count == ACPI_RESOURCE_MAX) return -ENOSPC;
+    acpi_resources[acpi_resource_count++] = (struct acpi_boot_resource){start, bytes};
+    return 0;
+}
+
+/** @brief Record a bounded ACPI table if its complete physical extent is readable.
+ * @param address Candidate physical SDT address.
+ * @param table Optional output receiving the borrowed identity table pointer.
+ * @return 1 for a recorded table, 0 for malformed input, or negative errno.
+ */
+static int acpi_resource_table(uint64_t address, const struct acpi_sdt_header **table)
+{
+    const struct acpi_sdt_header *header = acpi_physical_span(address, sizeof(*header));
+    if (!header || header->length < sizeof(*header) || header->length > 16U * 1024U * 1024U ||
+        !acpi_physical_span(address, header->length)) return 0;
+    int rc = acpi_resource_add(address, header->length);
+    if (rc) return rc;
+    if (table) *table = header;
+    return 1;
+}
+
+/** @brief Capture RSDP, root, referenced SDTs and the FADT's DSDT as boot resources.
+ * @return 0 or negative errno. BSP before bootstrap publication while proven
+ * firmware identity spans remain readable; malformed tables are skipped.
+ */
+int power_acpi_capture_resources(void)
+{
+    if (mm_bootstrap_topology()) return -EBUSY;
+    acpi_resource_count = 0;
+    const struct acpi_rsdp *rsdp = acpi_root_rsdp;
+    if (!rsdp) return 0;
+    uint64_t rsdp_bytes = rsdp->revision >= 2 ? rsdp->length : 20;
+    int rc = acpi_resource_add((uintptr_t)rsdp, rsdp_bytes);
+    if (rc) return rc;
+    for (unsigned which = 0; which < 2; ++which) {
+        uint64_t physical = which ? rsdp->rsdt_address :
+            (rsdp->revision >= 2 ? rsdp->xsdt_address : 0);
+        uint32_t entry_size = which ? 4 : 8;
+        if (!physical) continue;
+        const struct acpi_sdt_header *root;
+        rc = acpi_resource_table(physical, &root);
+        if (rc < 0) return rc;
+        if (!rc || !acpi_checksum_valid((const uint8_t *)root, root->length)) continue;
+        uint32_t count = (root->length - sizeof(*root)) / entry_size;
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint8_t *raw = (const uint8_t *)root;
+            uint32_t offset = sizeof(*root) + i * entry_size;
+            uint64_t address = entry_size == 8 ? acpi_read64(raw, offset) : acpi_read32(raw, offset);
+            const struct acpi_sdt_header *table;
+            rc = acpi_resource_table(address, &table);
+            if (rc < 0) return rc;
+            if (!rc || !acpi_bytes_equal(table->signature, "FACP", 4) || table->length < 44) continue;
+            const uint8_t *fadt = (const uint8_t *)table;
+            uint64_t dsdt = acpi_read32(fadt, 40);
+            if (table->length >= 148 && acpi_read64(fadt, 140)) dsdt = acpi_read64(fadt, 140);
+            rc = acpi_resource_table(dsdt, NULL);
+            if (rc < 0) return rc;
+        }
+    }
+    return 0;
+}
+
+/** @brief Count ACPI spans captured before bootstrap allocation.
+ * @return Stable count; no physical page ownership is transferred.
+ */
+uint32_t power_acpi_resource_count(void) { return acpi_resource_count; }
+
+/** @brief Read one captured ACPI physical span.
+ * @param index Zero-based inventory index. @param start Required base output.
+ * @param bytes Required byte-length output.
+ * @return True for a valid entry; false for invalid arguments or index.
+ */
+bool power_acpi_resource(uint32_t index, uint64_t *start, uint64_t *bytes)
+{
+    if (index >= acpi_resource_count || !start || !bytes) return false;
+    *start = acpi_resources[index].start;
+    *bytes = acpi_resources[index].bytes;
+    return true;
 }
 
 /**
@@ -544,9 +709,9 @@ static uint16_t acpi_gas_io_port(const uint8_t *fadt, uint32_t offset)
     return address <= 0xffffU ? (uint16_t)address : 0;
 }
 
-/**
- * Power init.
- * @param boot Value supplied by the caller.
+/** @brief Locate validated ACPI tables and cache shutdown controls.
+ * @param boot Borrowed handoff, with EFI RSDP captured before service exit.
+ * BSP before root replacement; subsequent lookups use retained direct aliases.
  */
 void power_init(const struct boot_info *boot)
 {
@@ -561,16 +726,12 @@ void power_init(const struct boot_info *boot)
     acpi_root_rsdp = 0;
     acpi_pm_timer_port = 0;
     acpi_pm_timer_mask = 0;
-    if (boot && boot->rsdp_addr <= 0xffffffffULL) {
-        rsdp = (const struct acpi_rsdp *)(uintptr_t)boot->rsdp_addr;
-        if (!acpi_rsdp_valid(rsdp)) {
-            rsdp = 0;
-        }
+    acpi_early_boot = boot;
+    if (boot) {
+        rsdp = acpi_resolve_rsdp(boot->rsdp_addr);
+        if (!rsdp) rsdp = acpi_resolve_rsdp(boot->efi_rsdp_addr);
     }
-    if (!rsdp && boot) {
-        rsdp = acpi_rsdp_from_efi(boot->efi_system_table);
-    }
-    if (!rsdp) {
+    if (!rsdp && boot && boot->bios_identity_4g && !boot->efi_system_table) {
         rsdp = acpi_scan_rsdp();
     }
     if (!rsdp) {
@@ -612,11 +773,12 @@ void power_init(const struct boot_info *boot)
             dsdt_address = extended_dsdt;
         }
     }
-    if (!dsdt_address || dsdt_address > 0xffffffffULL) {
+    dsdt = acpi_physical_span(dsdt_address, sizeof(*dsdt));
+    if (!dsdt || dsdt->length < sizeof(*dsdt) ||
+        !(dsdt = acpi_physical_span(dsdt_address, dsdt->length))) {
         console_warn("[reliefnt] ACPI DSDT unavailable\n");
         return;
     }
-    dsdt = (const struct acpi_sdt_header *)(uintptr_t)dsdt_address;
     if (!acpi_bytes_equal(dsdt->signature, "DSDT", 4) ||
         dsdt->length < sizeof(struct acpi_sdt_header) ||
         !acpi_checksum_valid((const uint8_t *)dsdt, dsdt->length) ||
@@ -634,9 +796,14 @@ void power_init(const struct boot_info *boot)
                    acpi_power.pm1a_control, acpi_power.pm1b_control);
 }
 
+/** @brief Find a validated ACPI table without retaining a stale identity alias.
+ * @param signature Four-byte signature supplied by the caller.
+ * @return Borrowed validated table in the current address space or NULL.
+ */
 const void *power_acpi_find_table(const char signature[4])
 {
-    return acpi_find_table(acpi_root_rsdp, signature);
+    const struct acpi_rsdp *rsdp = acpi_resolve_rsdp((uintptr_t)acpi_root_rsdp);
+    return acpi_find_table(rsdp, signature);
 }
 
 /**

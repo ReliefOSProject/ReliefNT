@@ -1,5 +1,24 @@
 #include "../internal.h"
+#include <reliefnt/swap.h>
+#include <reliefnt/lock.h>
 
+#ifdef CONFIG_SWAP
+/** @brief Prepare an output only after a wait result is known to need it.
+ * @param address User status or siginfo destination.
+ * @param size Size of that fixed result.
+ * @return The private contention marker or zero. Permanent failures are left
+ * to the original late writable check, after a consuming wait has taken its
+ * event. Only the outer execution-writer boundary may perform slot I/O.
+ */
+static int wait_prepare_output(uint64_t address,uint64_t size)
+{
+    struct task *task=sched_current_task();
+    if(task && kernel_execution_is_outermost() &&
+       swap_prepare_user_range(task,address,size,true)==SWAP_STORAGE_CONTENDED)
+        return KERNEL_SYSCALL_SWAP_CONTENDED;
+    return 0;
+}
+#endif
 
 
 
@@ -73,6 +92,9 @@ int64_t syscall_legacy_process(uint64_t number, uint64_t a0, uint64_t a1, uint64
                 path_append_text(execfn,&position,VFS_PATH_MAX+32,raw.text);
             } else copy_text(execfn,VFS_PATH_MAX+32,raw.text);
             struct exec_params_kernel params;
+            /* Successful lookup completed its provider call; release only
+             * that completed reservation before preparing user arguments. */
+            storage_release_task_io(task->pid);
             rc=copy_exec_params_from_user(at ? a2 : a1,at ? a3 : a2,&params);
             if(!rc) {
                 bool inaccessible=at && raw.text[0]!='/' && dirfd!=LINUX_AT_FDCWD &&
@@ -120,6 +142,21 @@ int64_t syscall_legacy_process(uint64_t number, uint64_t a0, uint64_t a1, uint64
         int status = 0;
         int64_t pid;
         if ((uint32_t)a2 & ~(1u | 2u | 8u | 0xc0000000u)) return -RELIEFOS_EINVAL;
+#ifdef CONFIG_SWAP
+        if(a1) {
+            /* Observe without consuming so a prerequisite wait leaves the
+             * event available. Cleanup readiness is checked by the real wait
+             * implementation, including for this non-consuming pass. */
+            pid=sched_wait_reap(sched_current_pid(),requested_pid,
+                (uint32_t)a2|4u|0x01000000u,&status,NULL);
+            if(pid>0) {
+                int prep=wait_prepare_output(a1,sizeof(status));
+                if(prep)return prep;
+                pid=sched_wait_reap(sched_current_pid(),requested_pid,
+                                    (uint32_t)a2|4u,&status,NULL);
+            }
+        } else
+#endif
         pid = sched_wait_reap(sched_current_pid(), requested_pid, (uint32_t)a2 | 4u,
                               a1 ? &status : NULL, NULL);
         if (pid == -RELIEFOS_EAGAIN) {
@@ -160,10 +197,26 @@ int64_t syscall_legacy_process(uint64_t number, uint64_t a0, uint64_t a1, uint64
             return -RELIEFOS_EINVAL;
         }
         struct linux_siginfo info = {0};
+#ifdef CONFIG_SWAP
+        if(a2) {
+            pid=sched_wait_reap(sched_current_pid(),wanted,options|LINUX_WNOWAIT,&status,&info);
+            /* waitid also writes a zero siginfo for WNOHANG without an event,
+             * and performs its output check before returning ECHILD. */
+            if(pid!=-RELIEFOS_EAGAIN || (options&LINUX_WNOHANG)) {
+                int prep=wait_prepare_output(a2,sizeof(info));
+                if(prep)return prep;
+                if(pid>0 && !(options&LINUX_WNOWAIT))
+                    pid=sched_wait_reap(sched_current_pid(),wanted,options,&status,&info);
+            }
+        } else
+#endif
         pid = sched_wait_reap(sched_current_pid(), wanted, options, &status, &info);
         if (pid == -RELIEFOS_EAGAIN) {
             if (!(options & LINUX_WNOHANG)) return pid;
             pid = 0;
+            /* Cleanup can have inspected a zombie before reporting that its
+             * deferred resources are still pending. That is no event yet. */
+            info = (struct linux_siginfo){0};
         } else if (pid <= 0) pid = -RELIEFOS_ECHILD;
         if (a2) {
             if (!user_range_writable(a2, sizeof(info))) return -RELIEFOS_EFAULT;

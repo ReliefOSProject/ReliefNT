@@ -10,6 +10,7 @@
 #include <reliefnt/sched.h>
 #include <reliefnt/storage.h>
 #include <reliefnt/usercopy.h>
+#include "usercopy.h"
 
 #define AUDIO_DEVICE_MAX 64u
 
@@ -204,8 +205,22 @@ static int audio_device_transfer(struct task *task, struct task_file *file,
     for (;;) {
         uint32_t chunk = frames - done;
         if (chunk > chunk_max) chunk = chunk_max;
+#ifdef CONFIG_SWAP
+        long available = audio_pcm_transfer_available(audio->pcm, chunk);
+        long ret;
+        if (available > 0) {
+            chunk = (uint32_t)available;
+            int prep = audio_user_prepare(task,
+                (uint64_t)(uintptr_t)buffer + (uint64_t)done * status.frame_bytes,
+                (uint64_t)chunk * status.frame_bytes, !writing);
+            if (prep) return done ? (int)(done * status.frame_bytes) : prep;
+            ret = audio_pcm_transfer(audio->pcm,
+                (uint8_t *)buffer + (uint64_t)done * status.frame_bytes, chunk);
+        } else ret = available;
+#else
         long ret = audio_pcm_transfer(audio->pcm,
             (uint8_t *)buffer + (uint64_t)done * status.frame_bytes, chunk);
+#endif
         if (ret > 0) {
             done += (uint32_t)ret;
             if (done == frames || (uint32_t)ret < chunk)
@@ -354,13 +369,28 @@ int audio_device_ioctl(struct task *task, struct task_file *file,
     if (request == SNDRV_PCM_IOCTL_READI_FRAMES ||
         request == SNDRV_PCM_IOCTL_CHANNEL_INFO) copy_in = 1;
     if (request == SNDRV_PCM_IOCTL_WRITEI_FRAMES) copy_out = 1;
-    if ((copy_in && !user_range_ok(address, size)) ||
-        (copy_out && !user_range_writable(address, size))) return -LINUX_EFAULT;
     union {
         max_align_t align;
         uint8_t bytes[1024];
     } local = {0};
-    if (copy_in) __builtin_memcpy(local.bytes, (const void *)(uintptr_t)address, size);
+#ifdef CONFIG_SWAP
+    if (task && task->kind == TASK_KIND_USER) {
+        if (task) audio_pcm_wait_remove(task);
+        if (copy_in) {
+            int ret = audio_user_import(task, address, size, local.bytes);
+            if (ret) return ret;
+        }
+        if (copy_out) {
+            int ret = audio_user_prepare(task, address, size, true);
+            if (ret) return ret;
+        }
+    } else
+#endif
+    {
+        if ((copy_in && !user_range_ok(address, size)) ||
+            (copy_out && !user_range_writable(address, size))) return -LINUX_EFAULT;
+        if (copy_in) __builtin_memcpy(local.bytes, (const void *)(uintptr_t)address, size);
+    }
     if (request == SNDRV_PCM_IOCTL_READI_FRAMES ||
         request == SNDRV_PCM_IOCTL_WRITEI_FRAMES) {
         struct snd_xferi *transfer = (struct snd_xferi *)local.bytes;
@@ -372,10 +402,14 @@ int audio_device_ioctl(struct task *task, struct task_file *file,
             (transfer->frames && !transfer->buf) ||
             transfer->frames > UINT32_MAX / status.frame_bytes) return -LINUX_EINVAL;
         uint64_t bytes = transfer->frames * status.frame_bytes;
+#ifdef CONFIG_SWAP
+        if (task && task->kind == TASK_KIND_USER) {
+            if (!audio_user_span_valid((uintptr_t)transfer->buf, bytes)) return -LINUX_EFAULT;
+        } else
+#endif
         if (bytes && (request == SNDRV_PCM_IOCTL_WRITEI_FRAMES
                           ? !user_range_ok((uintptr_t)transfer->buf, bytes)
-                          : !user_range_writable((uintptr_t)transfer->buf, bytes)))
-            return -LINUX_EFAULT;
+                          : !user_range_writable((uintptr_t)transfer->buf, bytes))) return -LINUX_EFAULT;
         int writing = request == SNDRV_PCM_IOCTL_WRITEI_FRAMES;
         int done = audio_device_transfer(task, file, transfer->buf, (uint32_t)bytes, writing);
         if (done < 0) return done;

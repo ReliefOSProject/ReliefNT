@@ -4,9 +4,6 @@
 #include <reliefnt/module.h>
 #include <linux/errno.h>
 #include "mount_internal.h"
-#ifdef CONFIG_LOCK_STAT
-#include "../proc/internal.h"
-#endif
 
 struct pseudo_key {
     struct pseudo_key *next;
@@ -41,10 +38,12 @@ static void pseudo_key_free(struct pseudo_mount *context,struct pseudo_key *key)
 static int pseudo_key_lookup(struct pseudo_mount *context,const char *name,struct storage_node *out)
 {
     const struct vfs_pseudo_provider *provider=context->provider;
-    struct storage_node node;int rc=provider->lookup(name,&node);if(rc)return rc;
+    struct storage_node node;int rc=provider->lookup(name,&node);
+    if(rc){return rc;}
     void *identity=NULL;bool magic=false;
     if(provider->get_identity) {
-        rc=provider->get_identity(name,&identity,&magic);if(rc)return rc;
+        rc=provider->get_identity(name,&identity,&magic);
+        if(rc){return rc;}
     }
     for(struct pseudo_key *key=context->keys;key;key=key->next)
         if(key->identity==identity && !__builtin_strcmp(key->name,name)) {
@@ -71,7 +70,8 @@ static int pseudo_node_lookup(void *value,const struct storage_node *parent,
     if(parent->type!=RELIEFOS_FS_TYPE_DIR)return -ENOTDIR;
     size_t prefix=__builtin_strlen(key->name),length=__builtin_strlen(name);
     if(prefix+length+1>=VFS_PATH_MAX)return -ENAMETOOLONG;
-    char *joined=kernel_malloc(prefix+length+2);if(!joined)return -ENOMEM;
+    char *joined=kernel_malloc(prefix+length+2);
+    if(!joined){return -ENOMEM;}
     __builtin_memcpy(joined,key->name,prefix);joined[prefix]='/';
     __builtin_memcpy(joined+prefix+1,name,length+1);
     int rc=pseudo_key_lookup(context,joined,out);kernel_free(joined);return rc;
@@ -154,20 +154,18 @@ static int pseudo_node_write(void *value,struct storage_node *node,uint64_t offs
     if(!pseudo_key_live(context,key))return -ENOENT;
     return context->provider->write ? context->provider->write(key->name,offset,buffer,length,written) : -EROFS;
 }
-#ifdef CONFIG_LOCK_STAT
-/** @brief Identify the immediate diagnostic control through its held provider.
+/** @brief Identify an immediate-commit control through its held provider.
  * @param path Borrowed valid path with a retained inode and provider context.
- * @return True only for the live proc lock_stats key, never an alias in a
- * different provider. Execution-owned; no lookup, allocation, or I/O. */
-bool vfs_pseudo_lock_stats_control(const struct vfs_path *path)
+ * @return True only for a live provider key admitting immediate commit.
+ * Execution-owned; no lookup, allocation, or I/O. */
+bool vfs_pseudo_immediate_control(const struct vfs_path *path)
 {
     if (!vfs_path_valid(path) || path->mount->ops->write != pseudo_node_write) return false;
     struct pseudo_mount *context = path->mount->context;
     struct pseudo_key *key = pseudo_key_find(context, path->dentry->node.entry_id);
-    return pseudo_key_live(context, key) && context->provider->write == proc_lock_stats_write &&
-           !__builtin_strcmp(key->name, "/proc/reliefnt/lock_stats");
+    return pseudo_key_live(context, key) && context->provider->immediate_write &&
+           context->provider->immediate_write(key->name);
 }
-#endif
 
 /** @brief Forward truncation only to the exact live generated provider.
  * @param value Pinned pseudo context.

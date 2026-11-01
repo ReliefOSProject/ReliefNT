@@ -7,6 +7,7 @@
 #include <linux/soundcard.h>
 #include <linux/poll.h>
 #include <reliefnt/sched.h>
+#include <reliefnt/time.h>
 #include <reliefnt/wait.h>
 #include "../../fs/fs_internal.h"
 #include <reliefnt/devfs.h>
@@ -27,10 +28,15 @@ static unsigned transfer_pipe_mode,transfer_pipe_calls,transfer_pipe_bytes;
 static unsigned char transfer_pipe_data[16];
 static struct kernel_wait_queue transfer_pipe_waiters={.lock=KERNEL_SPINLOCK_INIT};
 static unsigned descriptor_dispatch_sleep_count;
+static unsigned descriptor_swap_wait_stage;
+static unsigned descriptor_stage_references;
+static bool descriptor_require_stage_drain, descriptor_stage_drained;
 static unsigned descriptor_module_retry_stage;
 static struct task_file *descriptor_module_source;
 static unsigned descriptor_mmap_retry_stage;
 static struct task_file *descriptor_mmap_source;
+static bool descriptor_mm_final_test;
+static unsigned descriptor_mm_dispatch_calls;
 static bool descriptor_dirent_io_pending;
 static int descriptor_module_prepare_error;
 static bool descriptor_module_check_selection;
@@ -39,7 +45,14 @@ static struct task *descriptor_dispatch_current(void)
 static uint32_t descriptor_dispatch_pid(void)
 { return descriptor_dispatch_task ? descriptor_dispatch_task->pid : 0; }
 static void descriptor_dispatch_sleep(uint64_t deadline)
-{ (void)deadline; ++descriptor_dispatch_sleep_count; }
+{
+    ++descriptor_dispatch_sleep_count;
+    if (descriptor_swap_wait_stage) {
+        assert(descriptor_dispatch_task && deadline == time_ticks() + 1u);
+        descriptor_dispatch_task->state = TASK_BLOCKED;
+        descriptor_dispatch_task->wake_tick = deadline;
+    }
+}
 static int64_t descriptor_dispatch_regs(struct task *task, uint64_t number,
                                         uint64_t a0, uint64_t a1, uint64_t a2,
                                         uint64_t a3, uint64_t a4, uint64_t a5);
@@ -54,6 +67,7 @@ static int64_t descriptor_dispatch_vfork(const struct trap_frame *frame);
 #define sched_current_pid descriptor_dispatch_pid
 #define sched_sleep_current_until descriptor_dispatch_sleep
 #define sched_clone_current descriptor_dispatch_clone
+#define syscall_clone_prepared descriptor_dispatch_clone
 #define sched_fork_current descriptor_dispatch_fork
 #define sched_vfork_current descriptor_dispatch_vfork
 #define RELIEFOS_SYSCALL_FRAME_DISPATCH descriptor_dispatch_regs
@@ -62,6 +76,7 @@ static int64_t descriptor_dispatch_vfork(const struct trap_frame *frame);
 #undef sched_vfork_current
 #undef sched_fork_current
 #undef sched_clone_current
+#undef syscall_clone_prepared
 #undef sched_current_task
 #undef sched_current_pid
 #undef sched_sleep_current_until
@@ -117,6 +132,16 @@ static int64_t descriptor_dispatch_regs(struct task *task, uint64_t number,
                                         uint64_t a3, uint64_t a4, uint64_t a5)
 {
     (void)a3; (void)a4; (void)a5;
+    if (descriptor_swap_wait_stage) {
+        assert(number == LINUX_SYS_READ || number == LINUX_SYS_READV || number == LINUX_SYS_MLOCK);
+        return descriptor_swap_wait_stage++ == 1 ? KERNEL_SYSCALL_SWAP_CONTENDED : 7;
+    }
+    if (descriptor_mm_final_test) {
+        assert(number == LINUX_SYS_MLOCK || number == LINUX_SYS_MLOCK2 ||
+               number == LINUX_SYS_MMAP || number == LINUX_SYS_MREMAP);
+        ++descriptor_mm_dispatch_calls;
+        return -RELIEFOS_EAGAIN;
+    }
     if(number==LINUX_SYS_MMAP) {
         assert(task==descriptor_dispatch_task);
         if((uint32_t)a3&LINUX_MAP_ANONYMOUS) {
@@ -129,7 +154,7 @@ static int64_t descriptor_dispatch_regs(struct task *task, uint64_t number,
             task_discard_file_fd(task,(int32_t)a4);struct task_file *replacement=NULL;
             assert(task_allocate_fd(task,(int32_t)a4,&replacement)==(int32_t)a4);
             replacement->flags=TASK_FILE_FLAG_DEV_NULL;replacement->node.first_cluster=0x5678;
-            return -EAGAIN;
+            return KERNEL_MMAP_FILE_IO_RETRY;
         }
         assert(task_file_for_fd(task,(int32_t)a4)->node.first_cluster==0x5678);return (int64_t)a0;
     }
@@ -497,6 +522,32 @@ bool user_range_ok(uint64_t address, uint64_t length)
 { return address >= 4096 && length <= UINT64_MAX - address; }
 bool user_range_writable(uint64_t address, uint64_t length)
 { return user_range_ok(address, length); }
+
+/** @brief Model descriptor fixture pages as direct host aliases.
+ * @param as Unused fixture root. @param va User address. @return Aligned host page.
+ */
+uint64_t address_space_user_page_phys(const struct address_space *as, uint64_t va)
+{ (void)as; return va & ~4095ULL; }
+/** @brief Model a writable ordinary descriptor fixture page.
+ * @param as Unused fixture root. @param va Unused user address. @return Page flags.
+ */
+uint64_t address_space_user_page_flags(const struct address_space *as, uint64_t va)
+{ (void)as; (void)va; return RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_USER | RELIEFNT_PAGE_WRITABLE; }
+/** @brief Translate a fixture frame to its host alias. @param phys Address. @return Alias. */
+void *mm_phys_to_virt(uint64_t phys) { return (void *)(uintptr_t)phys; }
+/** @brief Report a fixture mapping owner. @param phys Frame. @return One owner. */
+uint32_t mm_page_refcount(uint64_t phys) { (void)phys; return 1; }
+/** @brief Retain a fixture mapping. @param phys Frame with host-process lifetime. */
+void mm_retain_page(uint64_t phys) { (void)phys; ++descriptor_stage_references; }
+/** @brief Release a fixture mapping. @param phys Frame with host-process lifetime. */
+void mm_free_page(uint64_t phys)
+{ (void)phys; assert(descriptor_stage_references && (!descriptor_require_stage_drain || descriptor_stage_drained)); --descriptor_stage_references; }
+/** @brief Report that descriptor fixture pages are not cache-owned.
+ * @param phys Frame. @return Negative cache miss.
+ */
+int page_cache_retain(uint64_t phys) { (void)phys; return -1; }
+/** @brief Reject an unexpected cache reference. @param phys Frame. */
+void page_cache_release(uint64_t phys) { (void)phys; abort(); }
 
 static int64_t descriptor_control_value;
 static uint32_t descriptor_control_count(void *opaque)
@@ -1000,6 +1051,58 @@ static void test_finit_module_retry_description(void)
     descriptor_module_source=NULL;descriptor_module_retry_stage=0;descriptor_dispatch_task=NULL;
     free(task);
     puts("PASS finit_module snapshot retries retain the original OFD across close/reuse and return final init EAGAIN once");
+}
+
+/** @brief Final memory EAGAIN must reach userspace rather than restart. */
+static void test_mm_final_eagain_dispatch(void)
+{
+    struct task *task = calloc(1, sizeof(*task)); assert(task);
+    task->pid = task->tgid = 1392; descriptor_dispatch_task = task;
+    const uint64_t calls[] = { LINUX_SYS_MLOCK, LINUX_SYS_MLOCK2,
+                               LINUX_SYS_MMAP, LINUX_SYS_MREMAP };
+    descriptor_mm_final_test = true;
+    for (unsigned i = 0; i < sizeof(calls) / sizeof(calls[0]); ++i) {
+        descriptor_dispatch_sleep_count = descriptor_mm_dispatch_calls = 0;
+        struct trap_frame frame = {.rax = calls[i], .r10 = LINUX_MAP_ANONYMOUS,
+                                   .rip = 0x7302, .rsp = 0x8000};
+        syscall_dispatch_frame(&frame);
+        assert(descriptor_mm_dispatch_calls == 1);
+        assert((int64_t)frame.rax == -RELIEFOS_EAGAIN && frame.rip == 0x7302);
+        assert(!descriptor_dispatch_sleep_count && !task->restart_syscall);
+    }
+    descriptor_mm_final_test = false; descriptor_dispatch_task = NULL; free(task);
+    puts("PASS final memory EAGAIN returns once without syscall rewind");
+}
+
+/** @brief Retain retry state and use a real frame boundary for swap contention.
+ * A modeled timer wake allows the same syscall to complete; cancellation
+ * releases the admitted description before its task can exit.
+ */
+static void test_swap_contention_frame_dispatch(void)
+{
+    const uint64_t numbers[] = {LINUX_SYS_READ, LINUX_SYS_READV, LINUX_SYS_MLOCK};
+    for (unsigned i = 0; i < sizeof(numbers) / sizeof(numbers[0]); ++i) {
+        struct task *task = calloc(1, sizeof(*task)); assert(task);
+        task->pid = task->tgid = 1390 + i; task->state = TASK_RUNNING;
+        sched_task_limits(task)->nofile.rlim_cur = 64; descriptor_dispatch_task = task;
+        struct task_file *file = NULL; int fd = task_allocate_fd(task, 3, &file); assert(fd == 3);
+        file->flags = TASK_FILE_FLAG_DEV_NULL;
+        descriptor_dispatch_sleep_count = 0; descriptor_swap_wait_stage = 1;
+        struct trap_frame frame = {.rax=numbers[i], .rdi=(uint64_t)fd, .rsi=0x10000,
+                                   .rdx=1, .rip=0x7602, .rsp=0x8000};
+        assert(!syscall_dispatch_frame(&frame));
+        assert(frame.rax == numbers[i] && frame.rip == 0x7600 &&
+               descriptor_dispatch_sleep_count == 1 && task->state == TASK_BLOCKED &&
+               task->restart_syscall == numbers[i] + 1);
+        if (numbers[i] != LINUX_SYS_MLOCK) assert(task->syscall_file);
+        task->state = TASK_RUNNING; task->wake_tick = 0; frame.rip += 2;
+        syscall_dispatch_frame(&frame);
+        assert(frame.rax == 7 && frame.rip == 0x7602 && !task->syscall_file && !task->restart_syscall);
+        descriptor_swap_wait_stage = 0;
+        task_discard_file_fd(task, fd); sched_task_file_release(task);
+        descriptor_dispatch_task = NULL; free(task);
+    }
+    puts("PASS swap contention parks actual syscall frames, wakes and retires admission");
 }
 
 static void test_mmap_retry_description(void)
@@ -2384,7 +2487,7 @@ int storage_read_node(const struct storage_node *node,uint64_t offset,void *buff
 {(void)node;(void)offset;(void)buffer;(void)capacity;(void)read;fputs("unexpected bare transfer read\n",stderr);abort();}
 int storage_write_held_node(struct storage_node *node,uint64_t offset,const void *buffer,uint32_t length,uint32_t *written)
 {(void)node;(void)offset;(void)buffer;(void)length;(void)written;abort();}
-void storage_drain_task_io(uint32_t pid){assert(descriptor_dispatch_task && pid==descriptor_dispatch_task->pid);++transfer_drains;descriptor_dirent_io_pending=false;}
+void storage_drain_task_io(uint32_t pid){assert(descriptor_dispatch_task && pid==descriptor_dispatch_task->pid);++transfer_drains;descriptor_dirent_io_pending=false;descriptor_stage_drained=true;}
 uint64_t time_uptime_us(void){return 0;}
 /* Transfer completion is in this current task; the signal fixture exercises
  * the real destination-MM copy while an unrelated CR3 remains active. */
@@ -2773,11 +2876,38 @@ static void test_block_description_lifetime(void)
     puts("PASS block OFD ownership moves on promotion, survives dup, releases once on final close");
 }
 
+/** @brief Common signal/replacement/exit cleanup drains before staged aliases.
+ * The provider queues an incomplete read; the real descriptor cancellation
+ * removes its wait, drains it, frees the stage, and releases the admitted OFD.
+ */
+static void test_regular_stage_common_cancel(void)
+{
+    struct task *task = descriptor_audio_task(1991); task->kind = TASK_KIND_USER;
+    descriptor_dispatch_task = task;
+    memset(transfer_files, 0, sizeof(transfer_files));
+    memcpy(transfer_files[0].bytes, "abcdef", 6); transfer_files[0].size = 6;
+    struct storage_node root = {.type=RELIEFOS_FS_TYPE_DIR}; struct vfs_mount *mount = NULL;
+    assert(!vfs_mount_new(&transfer_ops, transfer_files, NULL, &root, &mount));
+    int fd = transfer_open(task, mount, 0); assert(!task_begin_syscall_io(task, LINUX_SYS_READ, fd, 0));
+    char bytes[6] = {0}; transfer_wait_read = true;
+    assert(syscall_regular_io(task, task->syscall_file, (uintptr_t)bytes, sizeof(bytes), 0, false, false) == -EAGAIN);
+    assert(regular_stage_find(task) && descriptor_stage_references && transfer_waiters.count == 1);
+    descriptor_require_stage_drain = true; descriptor_stage_drained = false;
+    task_release_syscall_file(task);
+    assert(descriptor_stage_drained && !descriptor_stage_references && !regular_stage_find(task));
+    assert(!task->syscall_file && !task->regular_io.active && !task->waiting_queue && !transfer_waiters.count);
+    descriptor_require_stage_drain = false;
+    task_discard_file_fd(task, fd); clear_task_files(task); free(task);
+    descriptor_dispatch_task = NULL; vfs_mount_put(mount); assert(!transfer_provider_pins);
+    puts("PASS common cancellation drains queued provider before releasing staged aliases and OFD");
+}
+
 int main(void)
 {
     assert(!audio_character_init());
     assert(!drm_character_init());
     test_block_description_lifetime();
+    test_regular_stage_common_cancel();
     test_vector_held_provider();
     test_vector_native_position();
     test_getdents_held_provider();
@@ -2788,6 +2918,8 @@ int main(void)
     test_module_init_error_dispatch();
     test_finit_module_retry_description();
     test_fd_metadata_retry_description();
+    test_mm_final_eagain_dispatch();
+    test_swap_contention_frame_dispatch();
     test_mmap_retry_description();
     test_standard_character_stat();
     test_materialized_console_permissions();

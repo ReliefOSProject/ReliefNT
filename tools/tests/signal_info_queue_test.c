@@ -10,6 +10,23 @@ static struct task people[3], *current;
 static uint64_t ticks = 100, inaccessible;
 static unsigned allocations, exits;
 static bool fail_alloc;
+#ifdef CONFIG_SWAP
+static uint64_t swapped_output,swapped_input;
+static bool wait_contention,input_contention;
+int swap_prepare_user_range(struct task *task,uint64_t address,uint64_t length,bool writing)
+{
+    assert(task==current && length<=32768);
+    if(!writing && swapped_input && address==swapped_input) {
+        if(input_contention)return SWAP_STORAGE_CONTENDED;
+        swapped_input=0;
+    }
+    if(writing && swapped_output && address==swapped_output) {
+        if(wait_contention)return SWAP_STORAGE_CONTENDED;
+        swapped_output=0;
+    }
+    return 0;
+}
+#endif
 void power_reboot(void) { abort(); }
 void power_shutdown(void) { abort(); }
 void *kernel_malloc(size_t size)
@@ -26,7 +43,11 @@ void sched_alarm_rearm(struct task *task) { (void)task; }
 void sched_notify_runnable(void) { }
 uint64_t time_ticks(void) { return ticks; }
 bool user_range_ok(uint64_t p, uint64_t n)
-{ return p >= 4096 && n <= UINT64_MAX - p && (!inaccessible || p + n <= inaccessible); }
+{
+#ifdef CONFIG_SWAP
+  if((swapped_output && p==swapped_output) || (swapped_input && p==swapped_input))return false;
+#endif
+  return p >= 4096 && n <= UINT64_MAX - p && (!inaccessible || p + n <= inaccessible); }
 bool user_range_writable(uint64_t p, uint64_t n) { return user_range_ok(p, n); }
 void sched_block_current(void) { current->state = TASK_BLOCKED; }
 void sched_sleep_current_until(uint64_t deadline) { current->wake_tick = deadline; sched_block_current(); }
@@ -69,6 +90,18 @@ int main(void)
     people[1].shared_process_signal_queue = &people[0].process_signal_queue;
     current = &people[0];
     struct linux_siginfo info, sent = {.code = LINUX_SI_QUEUE};
+#ifdef CONFIG_SWAP
+    swapped_input=(uintptr_t)&sent;input_contention=true;
+    assert(kernel_signal_queueinfo(10,10,35,(uintptr_t)&sent,true)==KERNEL_SYSCALL_SWAP_CONTENDED);
+    assert(!current->pending_signals);
+    input_contention=false;
+    assert(!kernel_signal_queueinfo(10,10,35,(uintptr_t)&sent,true));
+    assert(kernel_signal_dequeue(current,UINT64_MAX,&info)==35);
+    sent.code=-99;swapped_input=(uintptr_t)&sent+48;input_contention=true;
+    assert(kernel_signal_queueinfo(10,10,0,(uintptr_t)&sent,true)==KERNEL_SYSCALL_SWAP_CONTENDED);
+    input_contention=false;assert(!kernel_signal_queueinfo(10,10,0,(uintptr_t)&sent,true));
+    sent.code=LINUX_SI_QUEUE;
+#endif
     assert(send_info(0, 35, 111, false) == 0);
     assert(send_info(0, 35, 222, false) == 0);
     assert(send_info(1, 35, 333, true) == 0);
@@ -143,6 +176,12 @@ int main(void)
     assert(syscall_rt_sigtimedwait((uintptr_t)&mask, 0, (uintptr_t)&timeout, 8) == -LINUX_EINVAL);
     assert(allocations == 2);
     timeout.tv_nsec = 0;
+#ifdef CONFIG_SWAP
+    swapped_output=(uintptr_t)&info;wait_contention=true;
+    assert(syscall_rt_sigtimedwait((uintptr_t)&mask,(uintptr_t)&info,(uintptr_t)&timeout,8)==KERNEL_SYSCALL_SWAP_CONTENDED);
+    assert(allocations==2 && sched_task_pending(current));
+    wait_contention=false;
+#endif
     assert(syscall_rt_sigtimedwait((uintptr_t)&mask, (uintptr_t)&info, (uintptr_t)&timeout, 8) == 35);
     assert(info.fields.realtime.value == 5 && allocations == 1);
     assert(syscall_rt_sigtimedwait((uintptr_t)&mask, 1, (uintptr_t)&timeout, 8) == -LINUX_EFAULT);

@@ -238,6 +238,12 @@ static uint32_t drm_bo_allocate_handle_locked(struct drm_file *file)
     return 0;
 }
 
+/** @brief Allocate a per-file BO, respecting the owning device's address mask.
+ * @param file Borrowed file and device. @param diagnostics Optional diagnostics.
+ * @param requested_size Nonzero requested bytes. @param handle_out Required handle output.
+ * @param map_offset_out Required mapping-offset output.
+ * @return Zero with an owned handle, or negative errno with no published BO.
+ */
 int drm_bo_create(struct drm_file *file,
                   struct drm_faildiag_context *diagnostics,
                   uint64_t requested_size,
@@ -266,7 +272,10 @@ int drm_bo_create(struct drm_file *file,
                               requested_size, size, retained, page_count);
         return -LINUX_ENOMEM;
     }
-    uint64_t physical = mm_alloc_pages(page_count);
+    bool vmwgfx = file->device && file->device->pci.vendor_id == DRM_VMWARE_VENDOR &&
+                  file->device->pci.device_id == DRM_VMWARE_SVGA2;
+    uint64_t physical = vmwgfx ? mm_alloc_pages_below(page_count, (1ULL << 44) - 1) :
+                                 mm_alloc_pages(page_count);
     if (!physical) {
         kernel_free(entry);
         kernel_free(bo);

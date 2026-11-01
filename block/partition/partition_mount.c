@@ -1,6 +1,9 @@
 #include "internal.h"
 #include <reliefnt/mount.h>
 #include <linux/errno.h>
+#ifdef CONFIG_SWAP
+#include <reliefnt/swap_internal.h>
+#endif
 
 static uint32_t storage_next_data_mount_volume(void);
 
@@ -25,6 +28,17 @@ int storage_disk_block_busy(uint32_t disk_id, int32_t partition_index)
     if (disk_id >= g_install_disk_count || !g_install_disks[disk_id].present ||
         partition_index < -1 || (partition_index >= 0 &&
         (uint32_t)partition_index >= RELIEFOS_DISK_MAX_PARTITIONS)) return -22;
+#ifdef CONFIG_SWAP
+    struct block_device_ref swap_ref={0};
+    int swap_rc=storage_disk_block_get(disk_id,&swap_ref);
+    if (swap_rc) return swap_rc;
+    uint64_t swap_first=0,swap_count=1;
+    if (partition_index>=0)
+        swap_rc=storage_disk_block_info(disk_id,partition_index,&swap_first,&swap_count);
+    if (!swap_rc) swap_rc=swap_storage_raw_busy(&swap_ref,swap_first,swap_count,partition_index<0);
+    block_device_put(&swap_ref);
+    if (swap_rc) return swap_rc;
+#endif
     uint64_t device = storage_block_rdev(STORAGE_BLOCK_VOLUME_ID(disk_id, partition_index));
     for (uint32_t i = 0; i < STORAGE_MAX_VOLUMES; ++i) {
         const struct storage_volume *volume = &g_volumes[i];

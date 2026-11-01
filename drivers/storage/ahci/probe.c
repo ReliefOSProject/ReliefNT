@@ -125,6 +125,9 @@ static int ahci_probe_disk(struct ahci_controller *controller,unsigned port)
         info.blocks=(uint64_t)identify[100]|(uint64_t)identify[101]<<16|
             (uint64_t)identify[102]<<32|(uint64_t)identify[103]<<48;
         if(!info.blocks || info.blocks>(1ull<<48))return -EOPNOTSUPP;
+        /* In synchronous mode retries end in STOP or retain quarantined,
+         * driver-owned DMA; the existing port context supplies all buffers. */
+        info.flags|=BLOCK_DEVICE_SWAP_SAFE;
         for(unsigned i=0;i<20;++i){info.model[2*i]=identify[27+i]>>8;info.model[2*i+1]=identify[27+i];}
         for(unsigned i=40;i && info.model[i-1]==' ';--i)info.model[i-1]=0;
     }

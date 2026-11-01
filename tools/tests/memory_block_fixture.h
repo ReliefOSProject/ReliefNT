@@ -12,7 +12,7 @@ struct test_memory_disk {
     struct block_device *identity;
     struct block_device_registration registration;
     uint8_t *bytes;
-    uint64_t length, failure_lba;
+    uint64_t length, failure_lba, write_failure_lba;
 };
 static struct test_memory_disk *test_memory_disks;
 static uint32_t test_memory_minor;
@@ -36,6 +36,7 @@ static int test_memory_write(void *context,uint64_t first,uint32_t count,const v
 {
     struct test_memory_disk *disk=context;
     if(first>=disk->failure_lba || count>disk->failure_lba-first)return -EIO;
+    if(first>=disk->write_failure_lba || count>disk->write_failure_lba-first)return -EIO;
     memcpy(disk->bytes+first*512,buffer,(size_t)count*512);return 0;
 }
 /** @brief Bind caller-owned image bytes through an actual immutable registration.
@@ -50,7 +51,7 @@ static inline void test_memory_bind(struct storage_volume *volume,uint8_t *bytes
     struct test_memory_disk *disk=calloc(1,sizeof(*disk));assert(disk);
     static const struct block_device_operations operations={.read=test_memory_read,.write=test_memory_write};
     uint32_t minor=test_memory_minor++;
-    *disk=(struct test_memory_disk){.volume=volume,.bytes=bytes,.length=length,.failure_lba=UINT64_MAX,
+    *disk=(struct test_memory_disk){.volume=volume,.bytes=bytes,.length=length,.failure_lba=UINT64_MAX,.write_failure_lba=UINT64_MAX,
         .registration={.operations=&operations,.context=disk,.info={.device=block_device_make_number(1,minor),
             .blocks=length/512,.block_size=512,.max_blocks=128,.flags=BLOCK_DEVICE_WRITE_THROUGH,
             .transport=BLOCK_TRANSPORT_MEMORY,.controller=(uint16_t)minor}}};

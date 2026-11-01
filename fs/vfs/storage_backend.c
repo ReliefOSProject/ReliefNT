@@ -3,6 +3,10 @@
 #include "../../block/core/storage_internal.h"
 #include <linux/errno.h>
 #include <reliefnt/module.h>
+#include <reliefnt/syscall_internal.h>
+#ifdef CONFIG_SWAP
+#include <reliefnt/swap_internal.h>
+#endif
 
 /* Adapters use explicit directory inodes and real backing pins. They do not
  * enter a global pathname router or consult a namespace prefix. */
@@ -12,15 +16,33 @@
  * @return Zero or negative input/provider errno. Caller owns execution; saves
  * and restores native selection without module/graph locks across I/O.
  */
-int storage_backend_lookup(void *context,const struct storage_node *parent,
-                               const char *name,struct storage_node *out)
+int storage_backend_lookup_vfs(void *context,const struct storage_node *parent,const char *name,struct storage_node *out)
 {
     struct storage_volume *volume=context,*previous=NULL;
     if(!volume || !parent || parent->volume_id!=volume->volume_id || !out)return -EINVAL;
     if(parent->type!=RELIEFOS_FS_TYPE_DIR)return -ENOTDIR;
-    int rc=storage_select_node_volume(parent,&previous);if(rc)return rc;
+    int rc=storage_select_node_volume(parent,&previous);
+    if(rc){return rc;}
     rc=volume->fs_ops && volume->fs_ops->lookup ? volume->fs_ops->lookup(volume,parent,name,out) : -EOPNOTSUPP;
-    storage_restore_volume(previous);return rc;
+    storage_restore_volume(previous);
+#ifdef CONFIG_SWAP
+    /* In particular, UP may still own an earlier asynchronous command. Never
+     * release or cancel that reservation to make room for this lookup. */
+    if(rc==VFS_NATIVE_LOOKUP_RECLAIM && !storage_filesystem_is_ext(volume)) {
+        return -ENOMEM;
+    }
+    if(rc==VFS_NATIVE_LOOKUP_RECLAIM && swap_storage_busy()) {
+        return -ENOMEM;
+    }
+#endif
+    return rc;
+}
+
+int storage_backend_lookup(void *context,const struct storage_node *parent,
+                               const char *name,struct storage_node *out)
+{
+    int rc=storage_backend_lookup_vfs(context,parent,name,out);
+    return rc==VFS_NATIVE_LOOKUP_RECLAIM ? -ENOMEM : rc;
 }
 
 static int storage_vfs_retain(void *context,const struct storage_node *node,void **pin)
@@ -140,7 +162,8 @@ static int storage_vfs_remount(void *context,uint64_t flags)
         int rc=block_device_info(&volume->device_ref,&info);if(rc)return rc;
         if(info.flags&BLOCK_DEVICE_READ_ONLY)return -EROFS;
     }
-    if((flags&MS_RDONLY) && !(volume->mount_flags&MS_RDONLY) && storage_inode_volume_writers(volume->volume_id))return -EBUSY;
+    if((flags&MS_RDONLY) && !(volume->mount_flags&MS_RDONLY) &&
+       (storage_inode_volume_writers(volume->volume_id) || storage_inode_volume_swap_active(volume->volume_id)))return -EBUSY;
     volume->mount_flags=flags;if(volume->tmpfs)tmpfs_set_flags(volume->tmpfs,flags);return 0;
 }
 static int storage_vfs_can_unmount(void *context,void *pin)
@@ -162,13 +185,13 @@ static int storage_vfs_finish(void *context)
     struct storage_volume *volume=context;
     if(!volume->vfs_managed || volume->vfs_mounts>1)return 0;
     if(!volume->ready || volume->vfs_mounts!=1)return -EINVAL;
-    int rc=storage_inode_purge_volume(volume->volume_id);
-    return rc ? rc : storage_sync_volume(volume->volume_id);
+    int rc=storage_sync_volume(volume->volume_id);
+    return rc ? rc : storage_inode_purge_volume(volume->volume_id);
 }
 static void storage_vfs_destroy(void *context)
 {storage_volume_mount_put(context);}
 static const struct vfs_backend_ops storage_vfs_ops={
-    .lookup=storage_backend_lookup,.retain=storage_vfs_retain,.release=storage_vfs_release,
+    .lookup=storage_backend_lookup_vfs,.retain=storage_vfs_retain,.release=storage_vfs_release,
     .same_node=storage_backend_same_node,.readlink=storage_vfs_readlink,
     .finish=storage_vfs_finish,.destroy=storage_vfs_destroy,.can_unmount=storage_vfs_can_unmount,.remount=storage_vfs_remount,
     .read=storage_vfs_read,.read_cursor=storage_vfs_read_cursor,.readdir=storage_vfs_readdir,.permissions=storage_backend_permissions,

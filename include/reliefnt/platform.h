@@ -9,7 +9,9 @@
 #include <reliefnt/multiboot2.h>
 
 /**
- * @brief Record the machine identity (firmware vendor, UUID) parsed from boot info.
+ * @brief Capture firmware identity using proven EFI handoff mappings.
+ * @param boot Borrowed parsed handoff and EFI memory map, or NULL.
+ * BSP before the kernel root switch; unavailable spans remain absent.
  */
 void platform_identity_init(const struct boot_info *boot);
 /**

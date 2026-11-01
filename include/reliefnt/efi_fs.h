@@ -42,6 +42,20 @@ int efi_boot_memory_map(uint64_t system_table_addr, void *buffer,
                         uint64_t buffer_bytes, uint64_t *out_entry_size,
                         uint32_t *out_entry_count);
 /**
+ * @brief Capture the final map and end live EFI boot services with its map key.
+ * @param system_table_addr Reachable live EFI system table.
+ * @param image_handle Nonzero firmware image handle supplied by the loader.
+ * @param buffer Caller-owned writable map storage retained after successful exit.
+ * @param buffer_bytes Capacity of buffer in bytes.
+ * @param out_entry_size Required output descriptor stride, zero on failure.
+ * @param out_entry_count Required output descriptor count, zero on failure.
+ * @return 0 after successful exit or negative errno-style failure. BSP only,
+ * before replacing firmware mappings; a failure requires boot to stop.
+ */
+int efi_boot_exit_services(uint64_t system_table_addr, uint64_t image_handle,
+                           void *buffer, uint64_t buffer_bytes,
+                           uint64_t *out_entry_size, uint32_t *out_entry_count);
+/**
  * @brief Read a bounded file into caller-owned storage without allocating pages.
  * @param path Absolute EFI path, including a leading slash.
  * @param buffer Writable destination of capacity bytes, valid across firmware calls.

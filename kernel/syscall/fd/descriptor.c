@@ -1,3 +1,8 @@
+#ifdef CONFIG_SWAP
+#include <reliefnt/memory_pressure.h>
+/* Standalone descriptor fixtures may omit the pressure engine. */
+extern void memory_wait_cancel(struct task *) __attribute__((weak));
+#endif
 #include <reliefnt/export.h>
 #include <reliefnt/graphics_service.h>
 #include "../internal.h"
@@ -254,7 +259,7 @@ int syscall_clone_task_files(const struct task *parent, struct task *child)
         return -RELIEFOS_EINVAL;
     }
     int ret = task_pty_materialize_stdio((struct task *)parent);
-    if (ret < 0) return ret;
+    if (ret < 0) {  return ret; }
     struct task_fd_table_state *child_files = sched_task_fds(child);
     const struct task_fd_table_state *parent_files = sched_task_fds(parent);
     if (child_files == parent_files) return 0;
@@ -268,7 +273,7 @@ int syscall_clone_task_files(const struct task *parent, struct task *child)
     }
     uint32_t pty_count = parent_files->pty_fd_count;
     ret = sched_task_pty_table_reserve(child_files, pty_count);
-    if (ret < 0) return ret;
+    if (ret < 0) {  return ret; }
     child_files->pty_fd_count = pty_count;
     /* Finish all allocations before child references are published, so an
      * allocation failure cannot leak half of the inherited descriptor set. */
@@ -278,7 +283,7 @@ int syscall_clone_task_files(const struct task *parent, struct task *child)
             if (!source->used) continue;
             if (!pass) {
                 ret = task_pty_promote(source);
-                if (ret < 0) return ret;
+                if (ret < 0) {  return ret; }
             } else {
                 *sched_task_pty_at(child, i) = *source;
                 ++source->description->references;
@@ -291,7 +296,7 @@ int syscall_clone_task_files(const struct task *parent, struct task *child)
                 sched_task_file_at(child, i - 3);
             if (!source || !source->used) continue;
             if (!pass) {
-                if (!task_file_promote(source)) return -RELIEFOS_ENOMEM;
+                if (!task_file_promote(source)) {  return -RELIEFOS_ENOMEM; }
             } else {
                 task_file_reference(destination, source);
                 destination->fd_flags = source->fd_flags;
@@ -466,11 +471,20 @@ void task_fifo_cancel(struct task *task)
 void task_release_syscall_file(struct task *task)
 {
     if (!task) return;
+#ifdef CONFIG_SWAP
+    if (task->regular_io.active && task->syscall_file_number == LINUX_SYS_READ &&
+        memory_wait_cancel)
+        memory_wait_cancel(task);
+#endif
     if(task->waiting_queue)kernel_wait_queue_remove(task->waiting_queue,task);
     if(task->regular_io.active || task->vector_io) {
         task->regular_io.active=false;storage_drain_task_io(task->pid);
     }
+    task_regular_io_stage_cancel(task);
     task_vector_cancel(task);
+#ifdef CONFIG_SWAP
+    task_socket_stage_cancel(task);
+#endif
     task_transfer_cancel(task);
     task_lookup_scope_cancel(task);
     module_file_cancel(task);
@@ -647,7 +661,9 @@ int alloc_task_fd(struct task *task, const struct storage_node *node, uint32_t f
     if (!task || !node) return -RELIEFOS_EINVAL;
     struct task_file *file;
     int fd = task_allocate_fd(task, 0, &file);
-    if (fd < 0) return fd;
+    if (fd < 0) {
+        return fd;
+    }
     int ret = storage_inode_get(node, &file->inode);
     if (ret < 0) {
         task_discard_file_fd(task,fd);

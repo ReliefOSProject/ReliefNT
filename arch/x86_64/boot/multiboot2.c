@@ -33,6 +33,7 @@ int multiboot2_parse(uint32_t magic, uintptr_t info_addr, struct boot_info *out)
     uintptr_t cursor = info_addr + sizeof(*info);
     uintptr_t end = info_addr + info->total_size;
     struct boot_info parsed = {0};
+    bool image_handle_seen = false;
     parsed.magic = magic;
     parsed.multiboot_info = info_addr;
     while (end - cursor >= sizeof(struct multiboot2_tag)) {
@@ -64,6 +65,17 @@ int multiboot2_parse(uint32_t magic, uintptr_t info_addr, struct boot_info *out)
                 mod->mod_start, mod->mod_end, mod->string};
             break;
         }
+        case MULTIBOOT2_TAG_TYPE_EFI_BS:
+            if (tag->size != sizeof(*tag) || parsed.efi_boot_services_active)
+                return -EINVAL;
+            parsed.efi_boot_services_active = true;
+            break;
+        case MULTIBOOT2_TAG_TYPE_EFI64_IH:
+            if (payload_size != sizeof(uint64_t) || image_handle_seen)
+                return -EINVAL;
+            __builtin_memcpy(&parsed.efi_image_handle, payload, sizeof(uint64_t));
+            image_handle_seen = true;
+            break;
         case MULTIBOOT2_TAG_TYPE_BASIC_MEMINFO: {
             if (payload_size < 8) return -EINVAL;
             const uint32_t *mem = (const void *)payload;

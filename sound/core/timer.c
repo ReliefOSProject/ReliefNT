@@ -12,6 +12,7 @@
 #include <reliefnt/time.h>
 #include <reliefnt/usercopy.h>
 #include <sound/asound.h>
+#include "usercopy.h"
 
 #define AUDIO_TIMER_MAX 32u
 #define AUDIO_TIMER_QUEUE_MAX 128u
@@ -176,7 +177,6 @@ int audio_timer_close(struct task_file *file)
 int audio_timer_read(struct task *task, struct task_file *file,
                      void *buffer, uint32_t count)
 {
-    (void)task;
     struct audio_timer_file *timer = audio_timer_state(file);
     if (!timer || !buffer) return -LINUX_EBADF;
     uint32_t item_size = timer->tread ? (uint32_t)sizeof(struct audio_timer_tread_abi)
@@ -190,6 +190,20 @@ int audio_timer_read(struct task *task, struct task_file *file,
     }
     uint32_t items = count / item_size;
     if (items > timer->count) items = timer->count;
+#ifdef CONFIG_SWAP
+    if (task && task->kind == TASK_KIND_USER) {
+        /* IRQs may append events while pages are prepared; never carry the
+         * spinlock into a page-in, and consume at most the observed count. */
+        kernel_spin_unlock_irqrestore(&timer->lock, flags);
+        int prep = audio_user_prepare(task, (uintptr_t)buffer,
+                                      (uint64_t)items * item_size, true);
+        if (prep) return prep;
+        kernel_spin_lock_irqsave(&timer->lock, &flags);
+        if (items > timer->count) items = timer->count;
+    }
+#else
+    (void)task;
+#endif
     for (uint32_t i = 0; i < items; ++i) {
         struct audio_timer_event item = timer->queue[timer->head];
         timer->head = (timer->head + 1u) % AUDIO_TIMER_QUEUE_MAX;
@@ -321,10 +335,24 @@ int audio_timer_ioctl(struct task *task, struct task_file *file,
     uint32_t direction = _IOC_DIR(request);
     int copy_in = (direction & _IOC_WRITE) != 0;
     int copy_out = (direction & _IOC_READ) != 0;
-    if ((copy_in && !user_range_ok(address, size)) ||
-        (copy_out && !user_range_writable(address, size))) return -LINUX_EFAULT;
     union { max_align_t align; uint8_t bytes[1024]; } local = {0};
-    if (copy_in) __builtin_memcpy(local.bytes, (const void *)(uintptr_t)address, size);
+#ifdef CONFIG_SWAP
+    if (task && task->kind == TASK_KIND_USER) {
+        if (copy_in) {
+            int ret = audio_user_import(task, address, size, local.bytes);
+            if (ret) return ret;
+        }
+        if (copy_out) {
+            int ret = audio_user_prepare(task, address, size, true);
+            if (ret) return ret;
+        }
+    } else
+#endif
+    {
+        if ((copy_in && !user_range_ok(address, size)) ||
+            (copy_out && !user_range_writable(address, size))) return -LINUX_EFAULT;
+        if (copy_in) __builtin_memcpy(local.bytes, (const void *)(uintptr_t)address, size);
+    }
     int ret = audio_timer_ioctl_file(timer, request, local.bytes);
     if (!ret && copy_out) __builtin_memcpy((void *)(uintptr_t)address, local.bytes, size);
     return ret;

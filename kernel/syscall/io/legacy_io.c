@@ -1,5 +1,16 @@
 #include "../internal.h"
 
+/** @brief Check a positional request's original numeric user range.
+ * @param address First byte of the declared user buffer.
+ * @param count Original, uncapped syscall byte count.
+ * @return True for an empty or nonwrapping range within the user aperture.
+ * This does not access or fault any user page.
+ */
+static bool positional_address_valid(uint64_t address,uint64_t count)
+{
+    return !count || (address>=RELIEFNT_USER_BASE && address<RELIEFNT_USER_TOP &&
+                      count<=RELIEFNT_USER_TOP-address);
+}
 
 
 
@@ -49,7 +60,7 @@ int64_t syscall_legacy_io(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2
         if (file->flags & TASK_FILE_FLAG_DEV_BLOCK) {
             bool writing = number == LINUX_SYS_PWRITE64;
             if (writing ? !file_can_write(file) : !file_can_read(file)) return -RELIEFOS_EBADF;
-            if (writing ? !user_range_ok(a1,a2) : !user_range_writable(a1,a2)) return -RELIEFOS_EFAULT;
+            if (!positional_address_valid(a1,a2)) return -RELIEFOS_EFAULT;
             /* Match write(2): device DAC is checked when this descriptor is opened. */
             return syscall_regular_io(task,file,a1,a2,a3,writing,true);
         }
@@ -57,7 +68,7 @@ int64_t syscall_legacy_io(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2
             !(file->flags & (TASK_FILE_FLAG_DEV_NODE | TASK_FILE_FLAG_DEV_SHM))) {
             bool writing = number == LINUX_SYS_PWRITE64;
             if (writing ? !file_can_write(file) : !file_can_read(file)) return -RELIEFOS_EBADF;
-            if (writing ? !user_range_ok(a1, a2) : !user_range_writable(a1, a2)) return -RELIEFOS_EFAULT;
+            if (!positional_address_valid(a1,a2)) return -RELIEFOS_EFAULT;
             return syscall_regular_io(task, file, a1, a2, a3, writing, true);
         }
         saved = file->offset;

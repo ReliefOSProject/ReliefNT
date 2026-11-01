@@ -5,6 +5,8 @@
 #include <reliefnt/heap.h>
 #include <reliefnt/lock.h>
 #include <reliefnt/usercopy.h>
+#include <reliefnt/swap.h>
+#include <reliefnt/syscall_internal.h>
 #include <linux/capability.h>
 #include <linux/errno.h>
 
@@ -132,6 +134,33 @@ void kernel_signal_flush(struct task *task, bool process, uint64_t mask)
     kernel_spin_unlock_irqrestore(&signal_queue_lock, flags);
 }
 
+/** @brief Select the next signal bit using the same priority as dequeue.
+ * @param ready Eligible pending bits. @return Signal number or zero.
+ */
+static int signal_select(uint64_t ready)
+{
+    const uint64_t synchronous = (1ULL << 3) | (1ULL << 4) | (1ULL << 6) |
+        (1ULL << 7) | (1ULL << 10) | (1ULL << 30);
+    if (ready & synchronous) ready &= synchronous;
+    return ready ? __builtin_ctzll(ready) + 1 : 0;
+}
+
+/** @brief Observe the next eligible signal without dequeuing its payload.
+ * @param task Live receiving task. @param allowed Eligible signal bits.
+ * @return Signal number in normal priority order or zero.
+ */
+int kernel_signal_peek(struct task *task, uint64_t allowed)
+{
+    uint64_t flags;
+    int sig;
+    kernel_spin_lock_irqsave(&signal_queue_lock, &flags);
+    sig = signal_select(__atomic_load_n(&task->pending_signals, __ATOMIC_SEQ_CST) & allowed);
+    if (!sig) sig = signal_select(__atomic_load_n(sched_task_process_pending(task),
+                                                  __ATOMIC_SEQ_CST) & allowed);
+    kernel_spin_unlock_irqrestore(&signal_queue_lock, flags);
+    return sig;
+}
+
 /**
  * @brief Consume one signal with Linux private/shared, synchronous and FIFO ordering.
  * @param task Receiver whose lifetime is pinned by the caller.
@@ -148,10 +177,7 @@ int kernel_signal_dequeue(struct task *task, uint64_t allowed, struct linux_sigi
         struct kernel_sigqueue *queue = process ? sched_task_process_signal_queue(task) : &task->signal_queue;
         uint64_t ready = __atomic_load_n(pending, __ATOMIC_SEQ_CST) & allowed;
         if (!ready) continue;
-        const uint64_t synchronous = (1ULL << 3) | (1ULL << 4) | (1ULL << 6) |
-            (1ULL << 7) | (1ULL << 10) | (1ULL << 30);
-        if (ready & synchronous) ready &= synchronous;
-        int sig = __builtin_ctzll(ready) + 1;
+        int sig = signal_select(ready);
         uint64_t bit = 1ULL << (sig - 1);
         struct kernel_sigqueue_entry **link = &queue->head, *previous = NULL;
         while (*link && (*link)->info.signo != sig) {
@@ -237,12 +263,26 @@ int64_t kernel_signal_queueinfo(int32_t tgid, int32_t tid, int sig,
 {
     struct linux_siginfo info = {0};
     struct task *caller = sched_current_task();
+    /* Only the outer rt_sigqueueinfo syscall calls this user-import path.
+     * Prepare the prefix before enqueue; inspect the expansion only when this
+     * signal layout actually requires it. */
+    if (caller) {
+        int prep=swap_prepare_user_range(caller,pointer,KERNEL_SIGINFO_SIZE,false);
+        if(prep==SWAP_STORAGE_CONTENDED)return KERNEL_SYSCALL_SWAP_CONTENDED;
+        if(prep<0)return -LINUX_EFAULT;
+    }
     if (!user_range_ok(pointer, KERNEL_SIGINFO_SIZE)) return -LINUX_EFAULT;
     __builtin_memcpy(&info, (const void *)(uintptr_t)pointer, KERNEL_SIGINFO_SIZE);
     info.signo = sig;
     if (!signal_known_layout(sig, info.code)) {
-        if (pointer > UINT64_MAX - sizeof(info) ||
-            !user_range_ok(pointer + KERNEL_SIGINFO_SIZE, sizeof(info) - KERNEL_SIGINFO_SIZE))
+        if (pointer > UINT64_MAX - sizeof(info)) return -LINUX_EFAULT;
+        if (caller) {
+            int prep=swap_prepare_user_range(caller,pointer+KERNEL_SIGINFO_SIZE,
+                                             sizeof(info)-KERNEL_SIGINFO_SIZE,false);
+            if(prep==SWAP_STORAGE_CONTENDED)return KERNEL_SYSCALL_SWAP_CONTENDED;
+            if(prep<0)return -LINUX_EFAULT;
+        }
+        if (!user_range_ok(pointer + KERNEL_SIGINFO_SIZE, sizeof(info) - KERNEL_SIGINFO_SIZE))
             return -LINUX_EFAULT;
         const unsigned char *extra = (const void *)(uintptr_t)(pointer + KERNEL_SIGINFO_SIZE);
         for (unsigned i = 0; i < sizeof(info) - KERNEL_SIGINFO_SIZE; ++i)

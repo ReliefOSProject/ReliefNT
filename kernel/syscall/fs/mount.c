@@ -16,6 +16,7 @@ static int mount_move(struct vfs_namespace *ns,struct task *task,uint64_t source
 {
     struct vfs_lookup_result from={0},to={0};
     int rc=resolve_user_object_at_flags(ns,task,LINUX_AT_FDCWD,source,false,false,VFS_LOOKUP_FOLLOW,&from);
+    if(!rc)storage_release_task_io(task->pid);
     if(!rc)rc=resolve_user_object_at_flags(ns,task,LINUX_AT_FDCWD,target,false,false,VFS_LOOKUP_FOLLOW,&to);
     if(!rc)rc=vfs_mount_move(ns,&from.path,&to.path);
     vfs_path_put(&from.path);vfs_path_put(&to.path);return rc;
@@ -160,6 +161,7 @@ int64_t syscall_mount_control(struct vfs_namespace *ns,struct task *task,uint64_
     if(!(flags&MS_NOATIME))flags|=MS_RELATIME;
     if(flags&MS_STRICTATIME)flags&=~(MS_NOATIME|MS_RELATIME);
     storage_set_io_async_context(false);
+    if(!rc)storage_release_task_io(task->pid);
     if(!rc)rc=mount_backend(ns,task,source.text,a0,type.text,options.text,flags,&mount);
     if(!rc)rc=vfs_mount_set_flags(mount,flags&(VFS_MOUNT_POLICY_MASK|MS_STRICTATIME));
     if(!rc)rc=vfs_mount_attach(ns,mount,&target.path);

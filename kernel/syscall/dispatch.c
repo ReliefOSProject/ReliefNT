@@ -1,4 +1,5 @@
 #include "internal.h"
+#include <reliefnt/swap.h>
 
 /**
  * @brief Apply Linux' ioctl() descriptor-resolution rule for O_PATH files.
@@ -96,7 +97,11 @@ static int64_t syscall_ioctl_descriptor_flags(struct task *task, uint64_t fd_arg
 static int64_t syscall_ioctl_nonblock(struct task *task, int fd, uint64_t argument)
 {
     int32_t enabled;
-    struct task_file *file = task_file_for_fd(task, fd);
+    struct task_file *file = task && task->syscall_file && task->syscall_fd==fd &&
+        task->syscall_file_number==LINUX_SYS_IOCTL ? task->syscall_file : task_file_for_fd(task, fd);
+    int prep=swap_prepare_user_range(task,argument,sizeof(enabled),false);
+    if(prep==SWAP_STORAGE_CONTENDED)return KERNEL_SYSCALL_SWAP_CONTENDED;
+    if(prep<0)return -RELIEFOS_EFAULT;
     if (!user_range_ok(argument, sizeof(enabled))) return -RELIEFOS_EFAULT;
     __builtin_memcpy(&enabled, (const void *)(uintptr_t)argument, sizeof(enabled));
     /* Linux fs/ioctl.c updates the shared open description, not the
@@ -127,13 +132,17 @@ void syscall_init(void)
  * access. Module operations retain the same capability and ABI checks as the
  * register entry and do not materialize unrelated file descriptions.
  */
-int64_t syscall_dispatch(const struct syscall_frame *frame)
+static int64_t syscall_dispatch_normalized_inner(const struct syscall_frame *frame)
 {
     if (!frame) {
         return -RELIEFOS_EFAULT;
     }
 
     switch (frame->number) {
+    case LINUX_SYS_SWAPON:
+        return syscall_mm_swapon(frame->args[0],frame->args[1]);
+    case LINUX_SYS_SWAPOFF:
+        return syscall_mm_swapoff(frame->args[0]);
     case LINUX_SYS_INIT_MODULE:
     case LINUX_SYS_DELETE_MODULE:
     case LINUX_SYS_FINIT_MODULE:
@@ -268,9 +277,11 @@ int64_t syscall_dispatch(const struct syscall_frame *frame)
     case LINUX_SYS_TIME:
     case LINUX_SYS_GETCPU:
     case LINUX_SYS_CLOSE_RANGE:
-        return syscall_dispatch_regs(sched_current_task(), frame->number, frame->args[0], frame->args[1],
-                                     frame->args[2], frame->args[3], frame->args[4],
-                                     frame->args[5]);
+        {
+            return syscall_dispatch_regs(sched_current_task(), frame->number,
+                frame->args[0], frame->args[1], frame->args[2], frame->args[3],
+                frame->args[4], frame->args[5]);
+        }
     case LINUX_SYS_CLOCK_GETRES:
     case LINUX_SYS_GETTID:
     case LINUX_SYS_SET_TID_ADDRESS:
@@ -370,6 +381,30 @@ int64_t syscall_dispatch(const struct syscall_frame *frame)
     default:
         return -RELIEFOS_ENOSYS;
     }
+}
+
+/** @brief Dispatch a normalized call without a resumable trap frame.
+ * @param frame Kernel-owned register snapshot. @return Native result or a
+ * terminal EBUSY when a prerequisite cannot be scheduled. Any admitted
+ * resources are cancelled once before returning that terminal result.
+ */
+int64_t syscall_dispatch(const struct syscall_frame *frame)
+{
+    int64_t result=syscall_dispatch_normalized_inner(frame);
+    if(result==KERNEL_SYSCALL_MINCORE_RECLAIM) {
+        task_release_syscall_file(sched_current_task());
+        return -RELIEFOS_EFAULT;
+    }
+    if(result==KERNEL_SYSCALL_REGULAR_READ_RECLAIM ||
+       result==KERNEL_SYSCALL_OPEN_PATH_RECLAIM) {
+        task_release_syscall_file(sched_current_task());
+        return -RELIEFOS_ENOMEM;
+    }
+    if(result==KERNEL_SYSCALL_SWAP_CONTENDED || result==KERNEL_SYSCALL_DRM_ENUM_WAIT) {
+        task_release_syscall_file(sched_current_task());
+        return -RELIEFOS_EBUSY;
+    }
+    return result;
 }
 
 /**
@@ -682,6 +717,8 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
         return syscall_legacy_ipc(number, a0, a1, a2, a3, a4, a5);
     if (number == LINUX_SYS_FUTEX_REQUEUE)
         return syscall_legacy_ipc(number, a0, a1, a2, a3, a4, a5);
+    if (number == LINUX_SYS_SWAPON || number == LINUX_SYS_SWAPOFF)
+        return syscall_legacy_memory(number, a0, a1, a2, a3, a4, a5);
     if (number == LINUX_SYS_MMAP)
         return syscall_legacy_memory(number, a0, a1, a2, a3, a4, a5);
     if (number == LINUX_SYS_MREMAP)
@@ -727,6 +764,8 @@ int64_t syscall_dispatch_regs(struct task *task, uint64_t number, uint64_t a0, u
                                      uint64_t a2, uint64_t a3, uint64_t a4,
                                      uint64_t a5)
 {
+    if(number==LINUX_SYS_SWAPON)return syscall_mm_swapon(a0,a1);
+    if(number==LINUX_SYS_SWAPOFF)return syscall_mm_swapoff(a0);
     if(number==LINUX_SYS_INIT_MODULE || number==LINUX_SYS_DELETE_MODULE || number==LINUX_SYS_FINIT_MODULE)
         return syscall_modules(number,a0,a1,a2);
     /* Identity/time calls and exact entry-pinned READ/WRITE descriptions need

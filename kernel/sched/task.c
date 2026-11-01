@@ -1,5 +1,29 @@
 #include "internal.h"
+#ifdef CONFIG_SWAP
+/** @brief Cancel a task's optional pressure-refill state and its owned queue link.
+ * @param task Execution-owned task, nullable; borrowed without ownership transfer.
+ * No MM reference is retained. The native reclaim producer provides this hook;
+ * standalone scheduler fixtures may omit it, so callers must check it first.
+ */
+extern void memory_headroom_cancel(struct task *) __attribute__((weak));
+#endif
 #include <reliefnt/lock_profile.h>
+#include <reliefnt/userland.h>
+
+/** @brief Invalidate OOM holder snapshots after final task resource release.
+ * Production supplies the allocation-free notifier; standalone scheduler
+ * fixtures may omit it. No additional lock or reference is taken.
+ */
+extern void sched_oom_membership_changed(void) __attribute__((weak));
+
+static void (*memory_release_notify)(void);
+
+/** @brief Register the built-in pressure waiter's retirement notification.
+ * @param notify Stable callback, or NULL before publication. The callback
+ * wakes waiters only; it never tears down the releasing task.
+ */
+void sched_set_memory_release_notify(void (*notify)(void))
+{ __atomic_store_n(&memory_release_notify, notify, __ATOMIC_RELEASE); }
 
 static uint64_t user_task_count_locked(uint32_t uid);
 
@@ -20,7 +44,11 @@ bool thread_group_pending(uint32_t tgid, const struct task *except)
     for (uint32_t i = 0; i < task_count; ++i) {
         const struct task *task = tasks[i];
         if (task && task != except && task->pid && sched_task_tgid(task) == tgid &&
-            (task->state != TASK_EXITED || task->running_cpu != SCHED_CPU_NONE)) return true;
+            (task->state != TASK_EXITED || task->running_cpu != SCHED_CPU_NONE
+#ifdef CONFIG_SWAP
+             || !(task->flags & TASK_FLAG_RESOURCES_RELEASED)
+#endif
+             )) return true;
     }
     return false;
 }
@@ -143,6 +171,24 @@ struct task *alloc_task_slot(void)
             task_release_limits(tasks[i]);
             fair_forget(tasks[i]);
             sched_task_identity_detach(tasks[i]);
+            struct sched_task_object *object = (struct sched_task_object *)tasks[i];
+            object->futex_exit = (struct futex_exit_cursor){0};
+            object->exec_prepared = NULL;
+            object->socket_stage = NULL;
+            object->oom_adjustment = object->oom_minimum = 0;
+            object->oom_victim_epoch = 0;
+            object->pressure_address = object->pressure_free = 0;
+            object->pressure_stall_tick = 0;
+            object->pressure_cause = object->pressure_stalls = 0;
+            object->pressure_fault_cr3 = object->pressure_fault_rip = 0;
+            object->pressure_fault_pages[0] = object->pressure_fault_pages[1] = 0;
+            object->pressure_fault_pages[2] = object->pressure_fault_pages[3] = 0;
+            object->pressure_fault_cursor[0] = object->pressure_fault_cursor[1] = (struct pressure_cursor){0};
+#ifdef CONFIG_SWAP
+            object->pressure_headroom = (struct pressure_headroom_state){0};
+            object->fork_cow_reclaim = (struct fork_cow_reclaim_state){0};
+#endif
+            object->event_fault_active = false;
             task_zero(tasks[i]);
             return tasks[i];
         }
@@ -152,11 +198,13 @@ struct task *alloc_task_slot(void)
         uint32_t new_capacity = task_capacity ? task_capacity * 2u : SCHED_TASK_MAX;
         struct task **replacement;
         if (new_capacity < task_capacity || new_capacity > UINT32_MAX / sizeof(*tasks)) {
+
             return NULL;
         }
         replacement = (struct task **)kernel_malloc(
             (size_t)new_capacity * sizeof(*replacement));
         if (!replacement) {
+
             return NULL;
         }
         for (uint32_t i = 0; i < new_capacity; ++i) {
@@ -172,11 +220,95 @@ struct task *alloc_task_slot(void)
     struct sched_task_object *object =
         (struct sched_task_object *)kernel_malloc(sizeof(*object));
     if (!object) {
+
         return NULL;
     }
     tasks[task_count] = &object->task;
+    object->futex_exit = (struct futex_exit_cursor){0};
+    object->exec_prepared = NULL;
+    object->socket_stage = NULL;
+    object->oom_adjustment = object->oom_minimum = 0;
+    object->oom_victim_epoch = 0;
+    object->pressure_address = object->pressure_free = 0;
+    object->pressure_stall_tick = 0;
+    object->pressure_cause = object->pressure_stalls = 0;
+    object->pressure_fault_cr3 = object->pressure_fault_rip = 0;
+    object->pressure_fault_pages[0] = object->pressure_fault_pages[1] = 0;
+    object->pressure_fault_pages[2] = object->pressure_fault_pages[3] = 0;
+    object->pressure_fault_cursor[0] = object->pressure_fault_cursor[1] = (struct pressure_cursor){0};
+#ifdef CONFIG_SWAP
+    object->fork_cow_reclaim = (struct fork_cow_reclaim_state){0};
+#endif
+    object->event_fault_active = false;
     task_zero(tasks[task_count]);
     return tasks[task_count++];
+}
+
+/** @brief Borrow the unreleased task's preallocated robust-exit cursor.
+ * @param task Task object, nullable. @return Private cursor or NULL.
+ */
+struct futex_exit_cursor *sched_futex_exit_cursor(struct task *task)
+{
+    return task ? &((struct sched_task_object *)task)->futex_exit : NULL;
+}
+
+/** @brief Transfer a prepared image into an armed task continuation.
+ * @param task Execution-owned task. @param prepared Owned image.
+ * @return True on transfer; false leaves ownership with the caller.
+ */
+bool sched_exec_stage(struct task *task, struct task *prepared)
+{
+    if (!task || !prepared || !task->lookup_scope.armed) return false;
+    struct sched_task_object *object = (struct sched_task_object *)task;
+    if (object->exec_prepared) return false;
+    object->exec_prepared = prepared;
+    return true;
+}
+
+/** @brief Borrow a task's committed prepared image without detaching it.
+ * @param task Owner, nullable. @return Prepared image or NULL.
+ */
+struct task *sched_exec_staged(const struct task *task)
+{ return task ? ((const struct sched_task_object *)task)->exec_prepared : NULL; }
+
+/** @brief Detach a prepared image for one commit or cancellation.
+ * @param task Owner, nullable. @return Transferred image or NULL.
+ */
+struct task *sched_exec_take(struct task *task)
+{
+    if (!task) return NULL;
+    struct sched_task_object *object = (struct sched_task_object *)task;
+    struct task *prepared = object->exec_prepared;
+    object->exec_prepared = NULL;
+    return prepared;
+}
+
+/** @brief Borrow a task-owned socket stage. @param task Owner, nullable.
+ * @return Current stage or NULL; no ownership transfer.
+ */
+struct socket_send_stage *sched_socket_stage(const struct task *task)
+{ return task ? ((const struct sched_task_object *)task)->socket_stage : NULL; }
+
+/** @brief Install a socket stage only into an empty task slot.
+ * @param task Owner. @param stage Caller-owned stage. @return True on transfer.
+ */
+bool sched_socket_stage_set(struct task *task, struct socket_send_stage *stage)
+{
+    if (!task || !stage) return false;
+    struct sched_task_object *object=(struct sched_task_object *)task;
+    if (object->socket_stage) return false;
+    object->socket_stage=stage;return true;
+}
+
+/** @brief Detach socket stage ownership for completion or cancellation.
+ * @param task Owner, nullable. @return Transferred stage or NULL.
+ */
+struct socket_send_stage *sched_socket_stage_take(struct task *task)
+{
+    if (!task) return NULL;
+    struct sched_task_object *object=(struct sched_task_object *)task;
+    struct socket_send_stage *stage=object->socket_stage;
+    object->socket_stage=NULL;return stage;
 }
 
 /**
@@ -241,20 +373,28 @@ uint32_t sched_create_kernel_task(const char *name, uint64_t entry)
 
 /**
  * @brief Allocate a user task, build its address space and stack, and inherit cwd/identity from parent.
+ * @param name Borrowed NUL-terminated task name. @param entry User entry address.
+ * @param stack_top Initial exclusive stack top. @param parent_pid Inheriting parent.
+ * @param flags Initial task flags. @return Published PID, or zero on failure.
+ * Prepares PID identity before scheduler locking and retains root state for the task.
  */
 uint32_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack_top,
                                 uint32_t parent_pid, uint32_t flags)
 {
+    struct task_identity *identity = sched_task_identity_prepare();
+    if (!identity) return 0;
     uint64_t lock_flags;
     kernel_spin_lock_irqsave(&scheduler_lock, &lock_flags);
     if (task_nproc_denied_locked(sched_find(parent_pid))) {
         kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
+        sched_task_identity_put(identity);
         return 0;
     }
     struct task *task = alloc_task_slot();
     uint32_t pid;
     if (!task) {
         kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
+        sched_task_identity_put(identity);
         return 0;
     }
     pid = task_allocate_pid();
@@ -262,6 +402,7 @@ uint32_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack
         task_zero(task);
         task->state = TASK_EXITED;
         kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
+        sched_task_identity_put(identity);
         return 0;
     }
     task_zero(task);
@@ -298,6 +439,7 @@ uint32_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack
         task->state = TASK_EXITED;
         task->flags = TASK_FLAG_RESOURCES_RELEASED;
         kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
+        sched_task_identity_put(identity);
         return 0;
     }
     task->frame.rip = entry;
@@ -312,6 +454,7 @@ uint32_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack
     task->running_cpu = SCHED_CPU_NONE;
     task->kind = TASK_KIND_USER;
     task->flags = flags;
+    sched_task_identity_bind(task, identity);
     task_clear_identity(task);
     task_copy_cwd(task, "/");
     if (!parent_pid) {
@@ -321,6 +464,7 @@ uint32_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack
     if (parent_pid) {
         struct task *parent = sched_find(parent_pid);
         if (parent) {
+            sched_oom_policy_inherit(task, parent);
             task_copy_cwd(task, sched_task_cwd(parent));
             task_copy_identity_from_parent(task, parent);
             task->priority = parent->priority;
@@ -341,6 +485,11 @@ uint32_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack
                    (unsigned long long)task->stack_top,
                    task->flags);
     kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
+    /* The task is still unpublished to its caller; prepare the root identity
+     * after dropping scheduler_lock. Reclaim can use its reserve fallback if
+     * the ordinary heap is already exhausted here. */
+    uint64_t generation;
+    (void)mm_context_ensure_generation(sched_task_as(task), &generation);
     return task->pid;
 }
 
@@ -486,6 +635,7 @@ static void sched_release_task_signals(struct task *task)
  * Drains pending I/O before releasing OFDs, mappings and filesystem paths;
  * CLONE_FS paths retire only at the final shared holder. Backend cleanup can
  * perform I/O, so the caller must not hold scheduler_lock across this call.
+ * Successful release invalidates bounded OOM holder eligibility snapshots.
  */
 void sched_release_task_resources(struct task *task)
 {
@@ -494,13 +644,27 @@ void sched_release_task_resources(struct task *task)
         (task->flags & TASK_FLAG_RESOURCES_RELEASED)) {
         return;
     }
+#ifdef CONFIG_SWAP
+    /* Recursive exit callers cannot perform a page transaction. The task slot
+     * and its shared MM remain owned until an outer scheduler poll finishes. */
+    if (!kernel_execution_is_outermost()) return;
+    ((struct sched_task_object *)task)->fork_cow_reclaim = (struct fork_cow_reclaim_state){0};
+#endif
     storage_drain_task_io(task->pid);
+#ifdef CONFIG_SWAP
+    if(memory_headroom_cancel)memory_headroom_cancel(task);
+    userland_exec_cancel(task);
+    int futex_result = futex_task_exit_step(task);
+    if (futex_result != 1) return;
+#endif
     syscall_record_lock_cancel(task);
     if (task->waiting_queue) kernel_wait_queue_remove(task->waiting_queue, task);
     task_socket_cancel_receive(task);
     task_release_syscall_file(task);
     task_sysv_sem_exit(task);
+#ifndef CONFIG_SWAP
     futex_task_exit(task);
+#endif
     /* Linux mm_release clears child_tid and releases robust futexes before
      * vfork completion. This task can no longer touch the parent's memory. */
     if (task->vfork_parent || task->vfork_child) {
@@ -539,10 +703,38 @@ void sched_release_task_resources(struct task *task)
     task->exec_argc = task->exec_envc = task->exec_data_len = 0;
     svga_gpu_release_owner(task->pid);
     task->flags |= TASK_FLAG_RESOURCES_RELEASED;
+    if (sched_oom_membership_changed) sched_oom_membership_changed();
+    void (*notify)(void) = __atomic_load_n(&memory_release_notify, __ATOMIC_ACQUIRE);
+    if (notify) notify();
     /* Signal/fault exits also retire private PTY owners. Publish cleanup first:
      * hangup can recursively terminate other members of the foreground group. */
     if (last_files) pty_process_exit(task->pid);
     sched_notify_parent_exit(task);
+}
+
+/** @brief Advance a bounded number of quiescent deferred task cleanups.
+ * @param budget Maximum task slots examined, zero a no-op. The unreleased
+ * task owns its MM until completion; callers provide outer writer ownership.
+ */
+void sched_cleanup_poll(uint32_t budget)
+{
+#ifdef CONFIG_SWAP
+    static uint32_t cursor;
+    if (!kernel_execution_is_outermost() || !task_count) return;
+    if (budget > task_count) budget = task_count;
+    while (budget--) {
+        if (cursor >= task_count) cursor = 0;
+        struct task *task = tasks[cursor++];
+        if (task && task->kind == TASK_KIND_USER && task->state == TASK_EXITED &&
+            task->running_cpu == SCHED_CPU_NONE &&
+            !(task->flags & (TASK_FLAG_RESOURCES_RELEASED | TASK_FLAG_REAP_IN_PROGRESS))) {
+            sched_release_task_resources(task);
+            break;
+        }
+    }
+#else
+    (void)budget;
+#endif
 }
 
 void sched_exit_group(uint32_t tgid, uint64_t code)

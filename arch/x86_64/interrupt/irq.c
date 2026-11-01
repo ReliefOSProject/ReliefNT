@@ -173,8 +173,8 @@ void irq_init(void)
 }
 
 /**
- * Irq dispatch.
- * @param frame Value supplied by the caller.
+ * @brief Dispatch and acknowledge a hardware interrupt or timer-return entry.
+ * @param frame Borrowed interrupt frame, nullable for an invalid vector.
  * @return Next scheduled task, or NULL. IRQ context; MSI callback finishes
  * W1C acknowledgement before EOI; no registry lock is held across callbacks.
  */
@@ -204,7 +204,7 @@ struct task *irq_dispatch(struct trap_frame *frame)
          * CPU's scheduling decision first as well, so APs never observe the
          * selected task with an unprepared entry frame. */
         if (from_user) {
-            struct task *next = userland_schedule_from_frame(frame);
+            struct task *next = userland_schedule_from_timer(frame);
             smp_release_aps();
             return next;
         }
@@ -268,7 +268,7 @@ struct task *irq_dispatch(struct trap_frame *frame)
         if (smp_current_cpu() != 0) {
             sched_on_cpu_tick();
             if (from_user) {
-                struct task *next = userland_schedule_from_frame(frame);
+                struct task *next = userland_schedule_from_timer(frame);
                 return next;
             }
             return NULL;

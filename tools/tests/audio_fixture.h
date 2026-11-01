@@ -23,6 +23,7 @@ uint64_t kernel_irq_save(void) {
 }
 void kernel_irq_restore(uint64_t flags) { audio_fixture_irq_flags = flags & (1ULL << 9); }
 #include "../../kernel/sync/lock.c"
+#define RELIEFNT_TEST_REAL_EXECUTION_GATE
 
 #include <linux/time.h>
 /* Hardware clock boundary only; all PCM state and ABI logic stays production. */

@@ -9,6 +9,44 @@
 #include <reliefnt/syscall_internal.h>
 #include <reliefnt/text_stream.h>
 #include <reliefnt/usercopy.h>
+#ifdef CONFIG_SWAP
+#include <reliefnt/swap.h>
+#include <reliefnt/paging.h>
+
+/** @brief Prepare an actual DRM operand at the outer execution boundary.
+ * @param task Current user owner. @param address First user byte.
+ * @param length Actual byte count. @param writing True for a destination.
+ * @return Zero, EFAULT, or prerequisite wait; each preparation is at most 32 KiB.
+ */
+int drm_user_prepare(struct task *task,uint64_t address,uint64_t length,bool writing)
+{
+    if (!length) return 0;
+    if (address<RELIEFNT_USER_BASE || address>=RELIEFNT_USER_TOP ||
+        length>RELIEFNT_USER_TOP-address) return -LINUX_EFAULT;
+    while(length) {
+        uint64_t take=length<32768u ? length : 32768u;
+        int ret=swap_prepare_user_range(task,address,take,writing);
+        if(ret==SWAP_STORAGE_CONTENDED)return KERNEL_SYSCALL_SWAP_CONTENDED;
+        if(ret<0)return -LINUX_EFAULT;
+        address+=take;length-=take;
+    }
+    return 0;
+}
+
+/** @brief Import a DRM input into kernel storage using the retry-owned snapshot.
+ * @param task Current owner. @param destination Kernel buffer. @param address
+ * User source. @param length Actual input size. @return Zero, errno or wait.
+ */
+int drm_user_import(struct task *task,void *destination,uint64_t address,uint32_t length)
+{
+    if(!length)return 0;
+    struct task_user_text snapshot;
+    int ret=task_lookup_user_bytes(task,address,length,&snapshot);
+    if(ret)return ret;
+    __builtin_memcpy(destination,snapshot.text,length);kernel_free(snapshot.allocation);
+    return 0;
+}
+#endif
 
 #define DRM_IOCTL_REQUIRED_IN  (_IOC_WRITE << _IOC_DIRSHIFT)
 #define DRM_IOCTL_REQUIRED_OUT (_IOC_READ << _IOC_DIRSHIFT)
@@ -327,6 +365,21 @@ static int drm_copy_field(struct task *task, uint64_t address, size_t *length,
 
 static int drm_ioctl_version(struct task *task, struct drm_version *version)
 {
+#ifdef CONFIG_SWAP
+    /* Prepare every actually used output before the first field is copied. */
+    const uint64_t addresses[]={(uint64_t)(uintptr_t)version->name,
+        (uint64_t)(uintptr_t)version->date,(uint64_t)(uintptr_t)version->desc};
+    const size_t lengths[]={version->name_len,version->date_len,version->desc_len};
+    const size_t actual[]={sizeof("vmwgfx")-1,sizeof("0")-1,
+        sizeof("Linux drm driver for VMware graphics devices")-1};
+    for(unsigned i=0;i<3;++i) {
+        size_t n=lengths[i]<actual[i] ? lengths[i] : actual[i];
+        if(!addresses[i] || !n)continue;
+        int prep=drm_user_prepare(task,addresses[i],n,true);
+        if(prep==KERNEL_SYSCALL_SWAP_CONTENDED)return prep;
+        if(prep<0 || !user_range_writable(addresses[i],n))break;
+    }
+#endif
     int ret = drm_copy_field(task, (uint64_t)(uintptr_t)version->name,
                              &version->name_len, "vmwgfx");
     if (!ret)
@@ -347,6 +400,11 @@ static int drm_ioctl_get_unique(struct task *task, struct drm_file *file,
 {
     struct drm_master *master = file->master;
     if (!master) return -LINUX_EINVAL;
+#ifdef CONFIG_SWAP
+    if (unique->unique_len >= master->unique_length && master->unique_length &&
+        drm_user_prepare(task,(uint64_t)(uintptr_t)unique->unique,master->unique_length,true)==
+            KERNEL_SYSCALL_SWAP_CONTENDED) return KERNEL_SYSCALL_SWAP_CONTENDED;
+#endif
     if (unique->unique_len >= master->unique_length && master->unique_length &&
         user_copy_to_task(task, (uint64_t)(uintptr_t)unique->unique,
                           master->unique, master->unique_length) < 0)
@@ -506,12 +564,12 @@ static int drm_ioctl_dispatch(struct task *task, struct drm_file *file,
         return drm_prime_ioctl(task, file, command, data, created_fd_out,
                                resource_receipt);
     case DRM_HANDLER_KMS:
-        return drm_kms_ioctl(task, file, command, data, created_fb_out);
+        return drm_kms_ioctl(task, file, command, data, created_fb_out,user_argument);
     case DRM_HANDLER_VMW_CAPS:
         return drm_vmwgfx_caps_ioctl(task, file, command, data);
     case DRM_HANDLER_VMW_RESOURCE:
         return drm_vmwgfx_resource_ioctl(task, file, command, data,
-                                         resource_receipt);
+                                         resource_receipt,user_argument);
     case DRM_HANDLER_VMW_EXECBUF:
         return (int)drm_vmwgfx_execbuf_ioctl(task, file, command, data,
                                              user_argument, diagnostics);
@@ -584,19 +642,32 @@ int64_t drm_file_ioctl(struct task *task, struct task_file *task_file,
     if (continuation_handled) goto out;
     if (ret) goto out;
     if (input_size && !skip_input) {
+#ifdef CONFIG_SWAP
+        ret=drm_user_import(task,data,argument,input_size);
+        if(ret)goto out;
+#else
         if (user_copy_from_task(task, data, argument, input_size) < 0) {
             ret = -LINUX_EFAULT;
             goto out;
         }
+#endif
     }
     /* Linux copies the encoded input payload before checking DRM_AUTH,
      * DRM_MASTER, and DRM_ROOT_ONLY permissions. Preserve that errno order. */
     ret = drm_ioctl_check_permission(task, file, desc->permission);
+#ifdef CONFIG_SWAP
+    if (output_size && drm_user_prepare(task,argument,output_size,true)==KERNEL_SYSCALL_SWAP_CONTENDED) {
+        ret=KERNEL_SYSCALL_SWAP_CONTENDED;goto out;
+    }
+#endif
     if (!ret) ret = drm_ioctl_dispatch(task, file, desc, command, data,
                                        &created_handle, &created_fb,
                                        &created_fd,
                                        &resource_receipt, &diagnostics,
                                        argument);
+#ifdef CONFIG_SWAP
+    if(ret==KERNEL_SYSCALL_SWAP_CONTENDED || ret==KERNEL_SYSCALL_DRM_ENUM_WAIT)goto out;
+#endif
     if (output_size && user_copy_to_task(task, argument, data, output_size) < 0) {
         ret = -LINUX_EFAULT;
         if (created_handle) (void)drm_bo_handle_delete(file, created_handle);
@@ -606,7 +677,8 @@ int64_t drm_file_ioctl(struct task *task, struct task_file *task_file,
     }
 out:
     if (allocated) kernel_free(data);
-    if (ret < 0 && !diagnostics.attempted)
+    if (ret < 0 && ret != KERNEL_SYSCALL_SWAP_CONTENDED &&
+        ret != KERNEL_SYSCALL_DRM_ENUM_WAIT && !diagnostics.attempted)
         drm_faildiag_record(&diagnostics, ret,
             drm_ioctl_failure_stage(desc, command), NULL, 0);
     return ret;

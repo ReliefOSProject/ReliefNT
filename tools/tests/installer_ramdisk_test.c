@@ -143,6 +143,20 @@ struct task *sched_current_task(void) { return NULL; }
 uint32_t sched_current_pid(void) { return 1; }
 /** @brief Ignore page-cache invalidation for non-page-backed test nodes. */
 void page_cache_invalidate_node(const struct storage_node *node) { (void)node; }
+/** @brief Report no cache entries in the installer fixture.
+ * @param node Borrowed inode. @return Zero.
+ */
+int page_cache_has_inode(const struct storage_node *node) { (void)node; return 0; }
+/** @brief Accept a volume purge in the cache-free fixture. @param volume Slot. */
+void page_cache_forget_volume(uint32_t volume) { (void)volume; }
+/** @brief Accept a resize in the cache-free fixture.
+ * @param node Borrowed inode. @param old_size Previous size. @param new_size New size.
+ */
+void page_cache_resize_node(const struct storage_node *node,uint64_t old_size,uint64_t new_size)
+{ (void)node; (void)old_size; (void)new_size; }
+void page_cache_forget_node(const struct storage_node *node) { (void)node; }
+void page_cache_zero_range(const struct storage_node *node,uint64_t offset,uint64_t length)
+{ (void)node; (void)offset; (void)length; abort(); }
 /** @brief Reject PTY lookup in this ramdisk-only fixture. */
 int pty_lookup_path(const char *path, struct storage_node *node)
 { (void)path; (void)node; return -2; }

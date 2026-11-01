@@ -8,12 +8,20 @@
 #include <reliefnt/input.h>
 #include <reliefnt/kernel.h>
 #include <reliefnt/mm.h>
+#include <reliefnt/memory_pressure.h>
 #include <reliefnt/pty.h>
 #include <reliefnt/random.h>
 #include <reliefnt/sched.h>
+#include <reliefnt/futex.h>
 #include <reliefnt/storage.h>
+#include <reliefnt/swap.h>
+#ifdef CONFIG_SWAP
+#include <reliefnt/swap_internal.h>
+#endif
+#include <reliefnt/time.h>
 #include <reliefnt/uts.h>
 #include <reliefnt/syscall.h>
+#include <reliefnt/syscall_internal.h>
 #include <reliefnt/lock.h>
 #include <reliefnt/lock_profile.h>
 #include <reliefnt/smp.h>
@@ -93,6 +101,33 @@ static void sched_run_network_maintenance(void)
     if (cpu >= SMP_MAX_CPUS) cpu = 0;
     stack_top = &sched_idle_service_stacks[cpu][SCHED_IDLE_SERVICE_STACK_BYTES];
     arch_call_on_stack(stack_top, sched_network_maintenance, 0);
+}
+
+/** @brief Execute one pressure batch on the existing per-CPU service stack.
+ * @param opaque Unused NULL callback argument. The sole outer writer remains
+ * held until this synchronous callback returns to the original stack.
+ */
+static void sched_pressure_maintenance(void *opaque)
+{ (void)opaque; memory_pressure_poll(16); }
+
+/** @brief Admit only an acknowledged live user timer-return consumer.
+ * @param frame Borrowed interrupted frame, nullable. Caller owns the outer
+ * writer; no storage owner or current-MM reclaim is admitted in the callback.
+ */
+static void sched_run_pressure_maintenance(struct trap_frame *frame)
+{
+    struct task *current = sched_current_task();
+    if (!frame || (frame->cs & 3u) != 3u || !current ||
+        current->kind != TASK_KIND_USER || current->state != TASK_RUNNING ||
+        !current->pid || current->pid != sched_current_pid() ||
+        !kernel_execution_is_outermost()) return;
+#ifdef CONFIG_SWAP
+    if (swap_storage_busy()) return;
+#endif
+    uint32_t cpu = smp_current_cpu();
+    if (cpu >= SMP_MAX_CPUS) return;
+    void *stack_top = &sched_idle_service_stacks[cpu][SCHED_IDLE_SERVICE_STACK_BYTES];
+    arch_call_on_stack(stack_top, sched_pressure_maintenance, NULL);
 }
 
 /* Internal boot/service launch requests remain small; execve uses heap-sized vectors. */
@@ -798,6 +833,7 @@ static struct task *wait_for_runnable_task(uint64_t *execution_flags)
     struct task *next;
     for (;;) {
         input_process_pending();
+        sched_cleanup_poll(8);
         if ((next = sched_select_next_user())) break;
         /* Selection retired the previous CR3 and task reservation. Run the
          * timer-paced DRM service away from the active trap-return stack. */
@@ -817,13 +853,15 @@ static struct task *wait_for_runnable_task(uint64_t *execution_flags)
 /**
  * @brief Serialize task retirement and selection against exec, exit and reaping.
  * @param frame Current user frame, or NULL on AP entry or a selection retry.
+ * @param timer True only for an acknowledged user timer-return entry.
  * Caller has interrupts disabled and must not hold the execution transaction.
  * @return A CPU-reserved task ready for user entry, or NULL for an invalid frame.
  */
-struct task *userland_schedule_from_frame(struct trap_frame *frame)
+static struct task *userland_schedule_entry(struct trap_frame *frame, bool timer)
 {
     uint64_t execution_flags;
     kernel_execution_lock_scoped_irqsave(&execution_flags, LOCK_SCOPE_SCHED);
+    if (timer) sched_run_pressure_maintenance(frame);
     /* Pure-CPU user tasks reach this scheduler boundary from timer return. */
     sched_run_network_maintenance();
     input_process_pending();
@@ -846,12 +884,16 @@ retry:
             if (sched_task_pending(current) & ~current->blocked_signals) {
                 arch_fpu_save(current->fpu_state);
                 live_fpu_saved = 1;
-                (void)kernel_signal_deliver_pending(current, frame);
+                if (kernel_signal_deliver_pending_outer(current, frame) == SWAP_STORAGE_CONTENDED)
+                    sched_sleep_current_until(time_ticks() + 1);
             }
             /* Keep a syscall's RUNNING state and fair-accounting interval
              * intact when the same task can safely return immediately. A
              * rejected attempt falls through to full capture and selection. */
             if (!live_fpu_saved &&
+#ifdef CONFIG_SWAP
+                !sched_exec_staged(current) &&
+#endif
                 sched_try_resume_current_user_frame(frame)) {
                 arch_set_user_fs(current->fs_base);
                 kernel_execution_unlock_irqrestore(execution_flags);
@@ -882,6 +924,8 @@ retry:
         sched_release_task_resources(current);
     }
 
+    sched_cleanup_poll(8);
+
     next = sched_select_next_user();
     if (!next && current && current->kind == TASK_KIND_USER && current->state == TASK_READY) {
         next = sched_reclaim_current_user();
@@ -900,13 +944,39 @@ retry:
         arch_fpu_save(next->fpu_state);
         live_fpu_saved = 1;
     }
-    (void)kernel_signal_deliver_pending(next, &next->frame);
+    if (kernel_signal_deliver_pending_outer(next, &next->frame) == SWAP_STORAGE_CONTENDED)
+        sched_sleep_current_until(time_ticks() + 1);
     if (next->state == TASK_EXITED) { frame = NULL; goto retry; }
     if (next->state == TASK_STOPPED || next->state == TASK_BLOCKED) {
         (void)sched_capture_current_user_frame(&next->frame);
         frame = NULL;
         goto retry;
     }
+#ifdef CONFIG_SWAP
+    if (sched_exec_staged(next)) {
+        /* The old MM is past exec's irreversible point. Continue entirely
+         * at this real scheduler boundary; never execute its old RIP again. */
+        storage_set_io_async_context(false);
+        int result = userland_exec_continue(next);
+        if (result == KERNEL_SYSCALL_EXEC_COMMIT_WAIT) {
+            sched_sleep_current_until(time_ticks() + 1);
+            (void)sched_capture_current_user_frame(&next->frame);
+            frame = NULL;
+            goto retry;
+        }
+        if (result == KERNEL_SYSCALL_EXEC_FATAL || next->state == TASK_EXITED) {
+            frame = NULL;
+            goto retry;
+        }
+        if (result) {
+            userland_exec_cancel(next);
+            sched_exit(next->pid, 127);
+            frame = NULL;
+            goto retry;
+        }
+        task_release_syscall_file(next);
+    }
+#endif
     if (!userland_load_task_image(next)) {
         sched_exit(next->pid, 127);
         frame = NULL;
@@ -925,6 +995,22 @@ retry:
     kernel_execution_unlock_irqrestore(execution_flags);
     return next;
 }
+
+/** @brief Schedule from an ordinary saved user frame without timer maintenance.
+ * @param frame Borrowed user frame, nullable for a selection retry.
+ * @return CPU-reserved next task, or NULL for invalid input. IRQs are disabled;
+ * the caller must not hold the execution writer or transfer frame ownership.
+ */
+struct task *userland_schedule_from_frame(struct trap_frame *frame)
+{ return userland_schedule_entry(frame, false); }
+
+/** @brief Schedule after the acknowledged PIT/AP user timer return.
+ * @param frame Borrowed interrupted user frame, nullable. @return CPU-reserved
+ * next task or NULL. IRQs are disabled; bounded pressure maintenance returns
+ * on its service stack before scheduling and no frame ownership transfers.
+ */
+struct task *userland_schedule_from_timer(struct trap_frame *frame)
+{ return userland_schedule_entry(frame, true); }
 
 static void userland_enter_task(struct task *task) __attribute__((noreturn));
 
@@ -1040,6 +1126,92 @@ void userland_process_exit(uint64_t code)
     sched_exit(sched_current_pid(), code);
 }
 
+/** @brief Release one unpublished prepared image and all of its owned state.
+ * @param prepared Detached prepared task, nullable; no graph/loader lock held.
+ */
+static void userland_discard_prepared(struct task *prepared)
+{
+    if (!prepared) return;
+    kernel_free(prepared->exec_argv); kernel_free(prepared->exec_envp); kernel_free(prepared->exec_data);
+    address_space_destroy(sched_task_as(prepared));
+    sched_task_vma_release(prepared);
+    sched_task_fs_release(prepared);kernel_free(prepared);
+}
+
+/** @brief Publish a completely loaded image after all old-MM cleanup finishes.
+ * @param task Current task. @param prepared Detached owned image.
+ * @return Zero; all resources move exactly once or retire after publication.
+ */
+static int userland_commit_prepared(struct task *task, struct task *prepared)
+{
+    svga_gpu_release_owner(task->pid);
+    sched_exec_replace_mm(task, sched_task_as(prepared));
+    task->address_space = prepared->address_space;
+    task->credentials = prepared->credentials;
+    task->entry = prepared->entry;
+    task->stack_top = prepared->stack_top;
+    task->stack_low = prepared->stack_low;
+    sched_task_mm(task)->program_break_base = sched_task_mm(prepared)->program_break_base;
+    sched_task_mm(task)->program_break = sched_task_mm(prepared)->program_break;
+    kernel_free(task->exec_argv); kernel_free(task->exec_envp); kernel_free(task->exec_data);
+    task->loader_state = prepared->loader_state;
+    prepared->exec_argv=prepared->exec_envp=NULL;prepared->exec_data=NULL;
+    kernel_signal_reset_handlers(task);
+    task->frame = prepared->frame;
+    uint32_t preserved = task->flags & (TASK_FLAG_ELEVATED_ADMIN | TASK_FLAG_WAITABLE_CHILD);
+    task->flags = preserved | TASK_FLAG_STARTED;
+    copy_text(task->name_storage, sizeof(task->name_storage), prepared->name_storage);
+    task->name = task->name_storage;
+#ifdef CONFIG_SWAP
+    *sched_futex_exit_cursor(task) = (struct futex_exit_cursor){0};
+#endif
+    syscall_close_cloexec_files(task);
+    arch_fpu_task_init(task->fpu_state);
+    arch_fpu_restore(task->fpu_state);
+    kernel_debug_finish_initramfs_boot(task);
+    console_debug("[reliefnt] exec pid=%u path=%s pty=%u committed cr3=0x%llx\n",
+                   task->pid, prepared->path, task->pty_id,
+                   (unsigned long long)(*sched_task_as(task)).cr3);
+    sched_task_fs_release(prepared);kernel_free(prepared);
+    return 0;
+}
+
+/** @brief Detach and release an uninstalled committed exec image once.
+ * @param task Execution-owned task; a missing continuation is a no-op.
+ */
+void userland_exec_cancel(struct task *task)
+{
+#ifdef CONFIG_SWAP
+    userland_discard_prepared(sched_exec_take(task));
+#else
+    (void)task;
+#endif
+}
+
+/** @brief Advance a committed exec only from the scheduler-owned gate.
+ * @param task Execution-owned task holding the prepared image.
+ * @return Zero on installation, private wait while siblings clean up, or a
+ * private fatal result after unrecoverable failure terminates the old image.
+ */
+int userland_exec_continue(struct task *task)
+{
+#ifdef CONFIG_SWAP
+    struct task *prepared = sched_exec_staged(task);
+    if (!prepared) return -EINVAL;
+    int ret = sched_prepare_exec_current(task);
+    if (ret == -EAGAIN) return KERNEL_SYSCALL_EXEC_COMMIT_WAIT;
+    if (ret < 0) {
+        userland_exec_cancel(task);
+        sched_exit(task->pid, 127);
+        return KERNEL_SYSCALL_EXEC_FATAL;
+    }
+    prepared = sched_exec_take(task);
+    return userland_commit_prepared(task, prepared);
+#else
+    (void)task; return -ENOSYS;
+#endif
+}
+
 /**
  * @brief Prepare a replacement image and stack before committing exec.
  * @param image Actual held executable path retaining its filesystem provider.
@@ -1061,7 +1233,6 @@ int userland_exec_current_path(const struct vfs_path *image,const char *execfn,
     struct storage_node node;
     struct task *prepared = NULL;
     char task_name[SCHED_TASK_NAME_LEN];
-    uint32_t preserved_flags;
     int ret;
     const struct storage_node *held=vfs_path_node(image);
     if (!task || task->kind != TASK_KIND_USER || !held || !execfn) {
@@ -1098,7 +1269,8 @@ int userland_exec_current_path(const struct vfs_path *image,const char *execfn,
     prepared->address_space.initial_stack_top = prepared->stack_top;
     prepared->address_space.initial_stack_low = prepared->stack_low;
     prepared->image_node = node;
-    prepared->name = task_name;
+    copy_text(prepared->name_storage,sizeof(prepared->name_storage),task_name);
+    prepared->name = prepared->name_storage;
     prepared->flags = TASK_FLAG_PENDING_LOAD;
     prepared->address_space.nondumpable = fs_permissions_check_path(task,image,FS_ACCESS_READ,false)<0;
     copy_text(prepared->path,sizeof(prepared->path),display);
@@ -1107,6 +1279,8 @@ int userland_exec_current_path(const struct vfs_path *image,const char *execfn,
     ret = -12;
     if (!task_name[0] || !address_space_create(sched_task_as(prepared)) ||
         !address_space_map_user_stack(sched_task_as(prepared), USER_STACK_TOP)) goto failed;
+    uint64_t generation;
+    if (mm_context_ensure_generation(sched_task_as(prepared), &generation) < 0) goto failed;
 
     uint64_t loader_flags;
     userland_loader_lock(&loader_flags);
@@ -1114,44 +1288,20 @@ int userland_exec_current_path(const struct vfs_path *image,const char *execfn,
     userland_loader_unlock(loader_flags);
     if (ret < 0) goto failed;
 
+#ifdef CONFIG_SWAP
+    /* The successful loader returned with no accepted command pending. */
+    storage_release_task_io(task->pid);
+    /* The normalized debug entry has no saved user frame to resume. */
+    if (!sched_exec_stage(task, prepared)) { ret=-EBUSY; goto failed; }
+    storage_set_io_async_context(false);
+    return userland_exec_continue(task);
+#else
     ret = sched_prepare_exec_current(task);
     if (ret < 0) goto failed;
-    /* The ELF mappings and initial stack are complete. Only now retire the
-     * old mm, close CLOEXEC descriptors and reset process execution state. */
-    svga_gpu_release_owner(task->pid);
-    sched_exec_replace_mm(task, sched_task_as(prepared));
-    task->address_space = prepared->address_space;
-    task->credentials = prepared->credentials;
-    task->entry = prepared->entry;
-    task->stack_top = prepared->stack_top;
-    task->stack_low = prepared->stack_low;
-    sched_task_mm(task)->program_break_base = sched_task_mm(prepared)->program_break_base;
-    sched_task_mm(task)->program_break = sched_task_mm(prepared)->program_break;
-    kernel_free(task->exec_argv); kernel_free(task->exec_envp); kernel_free(task->exec_data);
-    task->loader_state = prepared->loader_state;
-    /* POSIX execve preserves ignored signals but resets caught dispositions. */
-    kernel_signal_reset_handlers(task);
-    task->frame = prepared->frame;
-    /* exec cannot confer kernel service authority through an image gid. */
-    preserved_flags = task->flags & (TASK_FLAG_ELEVATED_ADMIN | TASK_FLAG_WAITABLE_CHILD);
-    task->flags = preserved_flags | TASK_FLAG_STARTED;
-    copy_text(task->name_storage, sizeof(task->name_storage), task_name);
-    task->name = task->name_storage;
-    syscall_close_cloexec_files(task);
-
-    arch_fpu_task_init(task->fpu_state);
-    arch_fpu_restore(task->fpu_state);
-    sched_task_fs_release(prepared);kernel_free(prepared);
-    kernel_debug_finish_initramfs_boot(task);
-    console_debug("[reliefnt] exec pid=%u path=%s pty=%u committed cr3=0x%llx\n",
-                   task->pid, display, task->pty_id,
-                   (unsigned long long)(*sched_task_as(task)).cr3);
-    return 0;
+    return userland_commit_prepared(task, prepared);
+#endif
 failed:
-    kernel_free(prepared->exec_argv); kernel_free(prepared->exec_envp); kernel_free(prepared->exec_data);
-    address_space_destroy(sched_task_as(prepared));
-    sched_task_vma_release(prepared);
-    sched_task_fs_release(prepared);kernel_free(prepared);
+    userland_discard_prepared(prepared);
     return ret;
 }
 

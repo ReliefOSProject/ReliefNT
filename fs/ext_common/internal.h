@@ -14,6 +14,7 @@
  */
 
 struct storage_volume;
+struct block_device;
 
 int storage_ext4_journal_open(struct storage_volume *);
 /**
@@ -42,10 +43,13 @@ int storage_ext4_journal_publish(struct storage_volume *, uint64_t, const uint8_
 bool storage_ext4_journal_owns(const struct storage_volume *, uint64_t);
 void storage_ext4_cache_finish(struct storage_volume *, uint64_t, const uint8_t *);
 /** @brief Evict clean sector-overlapping cache aliases of the same block identity.
- * @param writer Borrowed pinned instance. @param lba First sector. @param count Sector count.
+ * @param writer Optional borrowed instance. @param device Optional exact identity;
+ * at least one is present and neither is retained.
+ * @param lba First sector. @param count Sector count.
  * Storage execution exclusion required; dirty/pinned journal data is preserved.
  */
-void storage_ext4_cache_invalidate_write(const struct storage_volume *writer,uint64_t lba,uint32_t count);
+void storage_ext4_cache_invalidate_write(const struct storage_volume *writer,const struct block_device *device,
+                                         uint64_t lba,uint32_t count);
 /** @brief Flush ext-family backing through the registered provider even during mount.
  * @param volume Borrowed instance with a live device reference; ready may be false.
  * @return Zero or negative transport errno. Takes transport exclusion only.
@@ -65,6 +69,23 @@ int storage_ext4_removexattr(struct storage_volume *,uint64_t,const char *);
 int storage_ext4_drop_xattrs(struct storage_volume *,uint64_t,struct ext4_inode_view *);
 int storage_ext4_recover_orphans(struct storage_volume *);
 int storage_ext4_fallocate(struct storage_volume *, uint64_t, uint32_t, uint64_t, uint64_t);
+/** @brief Observe bytes known to have become zero through a native mutation.
+ * @param context Borrowed caller state. @param offset First committed byte.
+ * @param length Nonzero committed byte count. Called synchronously under storage
+ * execution ownership, possibly before a later provider error is returned.
+ */
+typedef void (*storage_ext4_zero_observer)(void *context,uint64_t offset,uint64_t length);
+/** @brief Apply fallocate and report each known committed zero/punch range.
+ * @param v Borrowed instance. @param ino Inode number. @param mode Native mode.
+ * @param offset First requested byte. @param len Requested byte count.
+ * @param observe Optional synchronous observer. @param context Borrowed state.
+ * @return Zero or native errno; successful reports remain committed after errors.
+ * Direct-data writes are reported after transport success, mapping changes only
+ * after successful transaction completion. No general writeback is performed.
+ */
+int storage_ext4_fallocate_observed(struct storage_volume *v,uint64_t ino,uint32_t mode,
+                                    uint64_t offset,uint64_t len,
+                                    storage_ext4_zero_observer observe,void *context);
 int storage_ext4_change_mapping(struct storage_volume *, uint64_t, struct ext4_inode_view *,
                                 uint64_t, uint64_t, uint32_t, bool, bool);
 int storage_ext4_map_block(struct storage_volume *, uint64_t, const struct ext4_inode_view *,
@@ -72,6 +93,14 @@ int storage_ext4_map_block(struct storage_volume *, uint64_t, const struct ext4_
 int storage_ext4_insert_extent(struct storage_volume *, uint64_t, uint64_t, uint64_t,
                                uint32_t, bool);
 int storage_ext4_remove_range(struct storage_volume *, uint64_t, uint64_t, uint64_t);
+/** @brief Remove blocks and report each successfully completed transaction.
+ * @param v Borrowed instance. @param ino Inode. @param start First logical block.
+ * @param end Exclusive block end. @param observe Optional byte-range observer.
+ * @param context Borrowed observer state. @return Zero or native errno; earlier
+ * observed transactions remain committed after a later failure.
+ */
+int storage_ext4_remove_range_observed(struct storage_volume *v,uint64_t ino,uint64_t start,
+                                       uint64_t end,storage_ext4_zero_observer observe,void *context);
 /* FIEMAP start/len are bytes. capacity=0 counts mappings without storing them.
  * A full output array reports the stored count; LAST is set only if iteration
  * reached EOF, not merely because the output capacity was exhausted. */
@@ -83,6 +112,15 @@ int storage_ext4_read_file_range(struct storage_volume *, uint64_t,
 int storage_ext4_cache_read_blocks(struct storage_volume *, uint64_t, uint32_t, void *);
 int storage_ext4_dir_iterate(struct storage_volume *,uint64_t,uint64_t *,struct storage_ext4_dirent *);
 int storage_ext4_dir_lookup(struct storage_volume *,uint64_t,const char *,uint64_t *,uint8_t *);
+/** @brief Search one directory using a preallocated three-block workspace.
+ * @param v Retained volume. @param ino Directory inode. @param name Component.
+ * @param found Required inode result. @param type Optional directory type.
+ * @param buffer Caller-owned workspace of at least three filesystem blocks.
+ * @return Zero or negative validation, inode or directory I/O errno. Buffer
+ * ownership remains with the caller, including on error; no pathname is held.
+ */
+int storage_ext4_dir_lookup_prepared(struct storage_volume *v,uint64_t ino,const char *name,
+                                     uint64_t *found,uint8_t *type,uint8_t *buffer);
 int storage_ext4_dir_insert(struct storage_volume *,uint64_t,const char *,uint64_t,uint8_t);
 int storage_ext4_dir_remove(struct storage_volume *,uint64_t,const char *,uint64_t *);
 int storage_ext4_create(struct storage_volume *,uint64_t,const char *,uint16_t,uint32_t,uint32_t,const char *,uint64_t *);
@@ -91,8 +129,22 @@ int storage_ext4_link(struct storage_volume *,uint64_t,const char *,uint64_t);
 int storage_ext4_unlink(struct storage_volume *,uint64_t,const char *,bool);
 int storage_ext4_rename(struct storage_volume *,uint64_t,const char *,uint64_t,const char *);
 int storage_ext4_orphan_add(struct storage_volume *,uint64_t,struct ext4_inode_view *);
-int storage_ext4_unlink_held(struct storage_volume *,uint64_t,const char *,bool,bool);
-int storage_ext4_rename_held(struct storage_volume *,uint64_t,const char *,uint64_t,const char *,bool);
+/** @brief Remove one directory member and report completed terminal cleanup.
+ * @param v Borrowed volume. @param parent Parent inode. @param name Member name.
+ * @param directory Require a directory. @param held Keep an unlinked pinned inode.
+ * @param destroyed Optional result, true only after terminal cleanup succeeds.
+ * @return Zero or negative provider errno; caller holds execution ownership.
+ */
+int storage_ext4_unlink_held(struct storage_volume *v,uint64_t parent,const char *name,
+                              bool directory,bool held,bool *destroyed);
+/** @brief Rename a member and report completed cleanup of the replaced inode.
+ * @param v Borrowed volume. @param oldparent Source directory. @param oldname Source name.
+ * @param newparent Target directory. @param newname Target name. @param held Keep a pinned target.
+ * @param destroyed Optional result, true only after terminal cleanup succeeds.
+ * @return Zero or negative provider errno; caller holds execution ownership.
+ */
+int storage_ext4_rename_held(struct storage_volume *v,uint64_t oldparent,const char *oldname,
+                              uint64_t newparent,const char *newname,bool held,bool *destroyed);
 void storage_ext4_invalidate_groups(struct storage_volume *);
 int storage_ext4_check_node(struct storage_volume *,const struct storage_node *,struct ext4_inode_view *);
 int storage_ext4_replace(struct storage_volume *,const char *,const void *,uint32_t);

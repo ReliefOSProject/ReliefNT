@@ -9,14 +9,30 @@
 #include <reliefnt/smp.h>
 #include <reliefnt/lock.h>
 #include <reliefnt/heap.h>
+#include <reliefnt/framebuffer.h>
+#include <linux/errno.h>
 #include "internal.h"
+
+/* Some standalone page-table fixtures deliberately omit the cache producer. */
+extern void page_cache_note_write(uint64_t) __attribute__((weak));
+
+/** @brief Preserve a confirmed shared file write before a leaf is discarded.
+ * @param entry Backed user PTE. Caller stabilizes its page-table ownership.
+ */
+static void note_dirty_leaf(uint64_t entry)
+{
+    if ((entry & (RELIEFNT_PAGE_SHARED | RELIEFNT_PAGE_DIRTY | RELIEFNT_PAGE_DEVICE)) ==
+        (RELIEFNT_PAGE_SHARED | RELIEFNT_PAGE_DIRTY) && page_cache_note_write)
+        page_cache_note_write(entry & RELIEFNT_PHYS_ADDR_MASK);
+}
 
 #define PAGE_SIZE 4096ULL
 #define PAGE_SIZE_2M 0x200000ULL
 #define PAGE_SIZE_FLAG 0x080ULL
 #define USER_PDPT_INDEX 0
 #define LOW_PD_INDEX 0
-#define KERNEL_DIRECT_PML4_INDEX 511u
+#define KERNEL_DIRECT_PML4_INDEX 256u
+#define KERNEL_SHARED_PML4_INDEX 511u
 #define KERNEL_PD_COUNT 16u /* 16 GiB identity map using 2 MiB leaves. */
 #define MMIO_EARLY_PT_TABLE_COUNT 1024u
 #define X86_EFER_MSR 0xc0000080u
@@ -24,6 +40,7 @@
 
 static uint64_t kernel_pml4[512] __attribute__((aligned(4096)));
 static uint64_t kernel_pdpt[512] __attribute__((aligned(4096)));
+static uint64_t kernel_shared_pdpt[512] __attribute__((aligned(4096)));
 static uint64_t kernel_pd[KERNEL_PD_COUNT][512] __attribute__((aligned(4096)));
 /* User CR3s keep only the supervisor low-identity branch containing the
  * physically linked kernel image; all other low identity leaves are omitted. */
@@ -41,6 +58,33 @@ static bool mmio_dynamic_tables_ready;
 
 extern void x86_64_load_cr3(uint64_t cr3);
 extern void x86_64_invlpg(uint64_t addr);
+
+/** @brief Retire private MM metadata before a root page can be reused.
+ * @param as Root being destroyed. Standalone paging fixtures may omit policy.
+ */
+extern void mm_context_destroy(struct address_space *as) __attribute__((weak));
+/** @brief Invalidate a generation-bound device-leaf walk after PTE mutation.
+ * @param as Root pinned by the caller; standalone paging fixtures may omit it.
+ */
+extern void mm_context_device_changed(const struct address_space *as) __attribute__((weak));
+/** @brief Retain shared-anonymous owners while cloning a root.
+ * @param src Source root. @param dst New root. @return Zero or ENOMEM only for
+ * an ordinary context/span allocation; no backend callback or I/O is invoked.
+ */
+extern int mm_shared_clone(struct address_space *src, struct address_space *dst) __attribute__((weak));
+/** @brief Retain a nonresident slot in a newly cloned root.
+ * @param src Source root. @param dst Child root. @param page User page.
+ * @return Zero or negative errno. ENOMEM means only child context/record
+ * allocation failure; slot retention reports its own non-ENOMEM errors.
+ * No backend callback or I/O is invoked; fixtures may omit swap support.
+ */
+extern int mm_swap_clone_leaf(struct address_space *src, struct address_space *dst,
+                              uint64_t page) __attribute__((weak));
+/** @brief Drop one nonresident slot owner after its leaf is removed.
+ * @param as Live root. @param page Aligned user page.
+ */
+extern void mm_swap_record_remove(struct address_space *as, uint64_t page)
+    __attribute__((weak));
 
 /* All first-GiB kernel leaves are split before any user CR3 copies its PDEs.
  * Later BAR attribute changes remain visible through every copied low PDE. */
@@ -60,7 +104,45 @@ static struct mmio_run mmio_runs[MMIO_RUN_MAX], mmio_work[MMIO_RUN_MAX];
 static struct mmio_lease mmio_leases[MMIO_LEASE_MAX], mmio_lease_work[MMIO_LEASE_MAX];
 static uint32_t mmio_run_count, mmio_lease_count;
 static struct kernel_spinlock mmio_lock = KERNEL_SPINLOCK_INIT;
+/* Physical-policy owners include high aliases and DEVICE VMA backings. The
+ * intrusive nodes outlive every installed alias and are guarded by mmio_lock. */
+static struct paging_cache_claim *cache_claims, *cache_claim_tree;
 static bool nx_enabled;
+/* Owner-embedded nodes require no allocation and are mutated only under the
+ * execution writer, which also excludes fork while this list is inspected. */
+static struct paging_writable_alias *writable_aliases;
+
+/** @brief Register an owner's independently retained writable physical page.
+ * @param alias Empty node in the long-lived owner. @param physical Aligned page.
+ * The execution writer serializes registration, fork, and deregistration.
+ */
+void paging_writable_alias_add(struct paging_writable_alias *alias,uint64_t physical)
+{
+    alias->physical=physical;alias->next=writable_aliases;writable_aliases=alias;
+}
+
+/** @brief Remove a registered alias before its owner drops the backing.
+ * @param alias Previously registered owner-embedded node.
+ * The execution writer is held; no references are acquired or dropped.
+ */
+void paging_writable_alias_remove(struct paging_writable_alias *alias)
+{
+    struct paging_writable_alias **link=&writable_aliases;
+    while(*link && *link!=alias)link=&(*link)->next;
+    if(*link)*link=alias->next;
+    alias->next=NULL;alias->physical=0;
+}
+
+/** @brief Test whether a physical frame has any retained writable alias.
+ * @param physical Aligned page identity. @return True if a live owner writes it.
+ * The execution writer keeps all inspected owner-embedded nodes alive.
+ */
+static bool paging_has_writable_alias(uint64_t physical)
+{
+    for(const struct paging_writable_alias *p=writable_aliases;p;p=p->next)
+        if(p->physical==physical)return true;
+    return false;
+}
 
 /**
  * @brief Copies one physical page without relying on the user virtual mapping.
@@ -75,6 +157,23 @@ static void copy_page(uint64_t destination, uint64_t source)
     for (uint32_t i = 0; i < PAGE_SIZE; ++i) {
         dst[i] = src[i];
     }
+}
+
+/**
+ * @brief Read the architectural physical-address width from extended CPUID.
+ * @return Width from 32 through 52, or zero when the leaf is absent or invalid.
+ * No allocation, locks, privileged instructions, or ownership transfer.
+ */
+uint8_t paging_physical_bits(void)
+{
+    uint32_t a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                     : "a"(0x80000000u), "c"(0));
+    if (a < 0x80000008u) return 0;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                     : "a"(0x80000008u), "c"(0));
+    uint8_t bits = (uint8_t)a;
+    return bits >= 32 && bits <= 52 ? bits : 0;
 }
 
 /**
@@ -141,14 +240,16 @@ static uint64_t kernel_page_flags_for(uint64_t addr)
     return RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE | PAGE_SIZE_FLAG;
 }
 
-/**
- * Paging init user identity.
+/** @brief Install temporary low/direct aliases and the separate shared branch.
+ * BSP before bootstrap allocation or user roots; enables NX and loads CR3.
+ * The later sparse-map publication replaces the temporary direct-map branch.
  */
 void paging_init_user_identity(void)
 {
     paging_enable_nx();
     zero_table(kernel_pml4);
     zero_table(kernel_pdpt);
+    zero_table(kernel_shared_pdpt);
 
     for (uint64_t table = 0; table < KERNEL_PD_COUNT; ++table) {
         for (uint64_t i = 0; i < 512; ++i) {
@@ -165,12 +266,12 @@ void paging_init_user_identity(void)
     }
 
     kernel_pml4[0] = (uint64_t)(uintptr_t)kernel_pdpt | RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE;
-    /* User address spaces replace portions of PML4[0]'s low identity map.
-     * Keep a second supervisor-only view at a canonical high address so
-     * kernel code can safely read reserved Multiboot modules regardless of
-     * where GRUB placed them in low physical memory. */
+    /* Temporary high alias reaches the same low pages during bootstrap. The
+     * module/device PDPT is separate from both the low and direct branches. */
     kernel_pml4[KERNEL_DIRECT_PML4_INDEX] =
         (uint64_t)(uintptr_t)kernel_pdpt | RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE;
+    kernel_pml4[KERNEL_SHARED_PML4_INDEX] =
+        (uint64_t)(uintptr_t)kernel_shared_pdpt | RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE;
     for (uint64_t i = 0; i < KERNEL_PD_COUNT; ++i) {
         kernel_pdpt[i] = (uint64_t)(uintptr_t)kernel_pd[i] | RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE;
     }
@@ -191,6 +292,57 @@ void paging_init_user_identity(void)
     kernel_hole_pml4e = (uint64_t)(uintptr_t)user_kernel_pdpt |
                         RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE;
 
+    x86_64_load_cr3((uint64_t)(uintptr_t)kernel_pml4);
+}
+
+/** @brief Borrow the image-owned BSP kernel root during map construction.
+ * @return Aligned root pointer, never transferred to the caller.
+ */
+uint64_t *paging_kernel_root_table(void) { return kernel_pml4; }
+
+/** @brief Report whether the BSP enabled the execute-disable mechanism.
+ * @return True only when NXE has been enabled successfully.
+ */
+bool paging_nx_ready(void) { return nx_enabled; }
+
+/** @brief Borrow one boot-time MMIO cache claim for transfer to the new map.
+ * @param index Zero-based claim index. @param start Inclusive physical output.
+ * @param end Exclusive physical output. @param uncached Output cache policy.
+ * @return True for an existing claim, false for the end or invalid output.
+ * BSP only before user address spaces or APs; the registry remains owned here.
+ */
+bool paging_boot_mmio_run(uint32_t index, uint64_t *start, uint64_t *end,
+                          bool *uncached)
+{
+    if (index >= mmio_run_count || !start || !end || !uncached) return false;
+    *start = mmio_runs[index].start;
+    *end = mmio_runs[index].end;
+    *uncached = mmio_runs[index].policy == MMIO_CACHE_POLICY_UC;
+    return true;
+}
+
+/** @brief Activate all direct branches and remove unneeded low identity aliases.
+ * @param branches Image-owned 128 PDPT pages populated by the bootstrap builder.
+ * BSP only, before APs and user roots. Low VGA/trampoline and the linked kernel
+ * hole remain identity mapped; CR3 reload retires the temporary aliases.
+ */
+void paging_publish_direct_map(uint64_t branches[128][512])
+{
+    for (uint32_t i = 0; i < 128; ++i)
+        kernel_pml4[KERNEL_DIRECT_PML4_INDEX + i] =
+            (uintptr_t)branches[i] | RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE;
+    for (uint32_t i = 0; i < 512; ++i) {
+        uint64_t page = (uint64_t)i * PAGE_SIZE;
+        if (page >= 0x100000ULL) kernel_low_pt[0][i] = 0;
+    }
+    for (uint32_t i = 1; i < 512; ++i) {
+        uint64_t address = (uint64_t)i * PAGE_SIZE_2M;
+        if (address < RELIEFNT_KERNEL_HOLE_START || address >= RELIEFNT_KERNEL_HOLE_END)
+            kernel_pd[0][i] = 0;
+    }
+    for (uint32_t i = 1; i < KERNEL_PD_COUNT; ++i) kernel_pdpt[i] = 0;
+    for (uint32_t i = 0; i < mmio_run_count; ++i)
+        mmio_runs[i].original_flags |= RELIEFNT_PAGE_NOEXEC;
     x86_64_load_cr3((uint64_t)(uintptr_t)kernel_pml4);
 }
 
@@ -268,15 +420,386 @@ void paging_load_cr3_if_changed(uint64_t cr3)
     paging_load_cr3(value);
 }
 
-/** @brief Check a physical extent against the inherited supervisor RAM window.
- * @param phys Physical start, not a CPU pointer. @param len Bytes including zero.
- * @return True iff the complete extent fits, without overflow. Pure metadata
- * check; does not prove allocation/RAM ownership or admit high MMIO mappings.
+/** @brief Check CPU physical-address representation without inferring mapping.
+ * @param phys First physical byte. @param len Byte length, including zero.
+ * @return True if the range fits the CPU physical width without overflow.
+ */
+bool paging_phys_addressable(uint64_t phys, uint64_t len)
+{
+    uint8_t bits = paging_physical_bits();
+    if (!bits) return false;
+    uint64_t limit = 1ULL << bits;
+    return phys < limit && len <= limit - phys;
+}
+
+/**
+ * @brief Inspect one direct-map leaf and report the remainder of its table span.
+ * @param phys Physical byte below the direct-map and CPU limits.
+ * @param span Required output bytes before a page-table boundary.
+ * @return True only for a present supervisor mapping to the same physical byte.
+ * Kernel tables are trusted-owned; the private table accessor cannot recurse
+ * into public coverage validation.
+ */
+static bool direct_leaf(uint64_t phys, uint64_t *span)
+{
+    uint64_t address = RELIEFNT_KERNEL_DIRECT_MAP_BASE + phys;
+    uint64_t entry = kernel_pml4[(address >> 39) & 511u];
+    *span = (1ULL << 39) - (phys & ((1ULL << 39) - 1));
+    if (!(entry & RELIEFNT_PAGE_PRESENT) || (entry & (RELIEFNT_PAGE_USER | PAGE_SIZE_FLAG)))
+        return false;
+    uint64_t *table = paging_trusted_table_alias(entry & RELIEFNT_PHYS_ADDR_MASK);
+    if (!table) return false;
+    entry = table[(address >> 30) & 511u];
+    *span = (1ULL << 30) - (phys & ((1ULL << 30) - 1));
+    if (!(entry & RELIEFNT_PAGE_PRESENT) || (entry & RELIEFNT_PAGE_USER)) return false;
+    if (entry & PAGE_SIZE_FLAG)
+        return (entry & RELIEFNT_PHYS_ADDR_MASK & ~((1ULL << 30) - 1)) ==
+               (phys & ~((1ULL << 30) - 1));
+    table = paging_trusted_table_alias(entry & RELIEFNT_PHYS_ADDR_MASK);
+    if (!table) return false;
+    entry = table[(address >> 21) & 511u];
+    *span = PAGE_SIZE_2M - (phys & (PAGE_SIZE_2M - 1));
+    if (!(entry & RELIEFNT_PAGE_PRESENT) || (entry & RELIEFNT_PAGE_USER)) return false;
+    if (entry & PAGE_SIZE_FLAG)
+        return (entry & RELIEFNT_PHYS_ADDR_MASK & ~(PAGE_SIZE_2M - 1)) ==
+               (phys & ~(PAGE_SIZE_2M - 1));
+    table = paging_trusted_table_alias(entry & RELIEFNT_PHYS_ADDR_MASK);
+    if (!table) return false;
+    entry = table[(address >> 12) & 511u];
+    *span = PAGE_SIZE - (phys & (PAGE_SIZE - 1));
+    return (entry & RELIEFNT_PAGE_PRESENT) && !(entry & RELIEFNT_PAGE_USER) &&
+           (entry & RELIEFNT_PHYS_ADDR_MASK) == (phys & ~(PAGE_SIZE - 1));
+}
+
+/** @brief Check actual supervisor direct-map coverage and physical identity.
+ * @param phys First physical byte. @param len Byte length, including zero.
+ * @return True only when the complete range is representable and identity mapped.
  */
 bool paging_kernel_direct_map_range(uint64_t phys, uint64_t len)
 {
-    return phys < RELIEFNT_KERNEL_DIRECT_MAP_SIZE &&
-           len <= RELIEFNT_KERNEL_DIRECT_MAP_SIZE - phys;
+    if (phys >= RELIEFNT_KERNEL_DIRECT_MAP_SIZE ||
+        len > RELIEFNT_KERNEL_DIRECT_MAP_SIZE - phys ||
+        !paging_phys_addressable(phys, len)) return false;
+    while (len) {
+        uint64_t span;
+        if (!direct_leaf(phys, &span)) return false;
+        if (span > len) span = len;
+        phys += span; len -= span;
+    }
+    return true;
+}
+
+/** @brief Obtain the normalized policy of a direct leaf while holding mmio_lock.
+ * @param phys Aligned physical page. @param flags Receives 4 KiB PWT/PCD/PAT bits.
+ * @return True when a matching direct leaf exists; no allocation or I/O.
+ * Large-page PAT is translated from bit 12; the large-page PS bit is not PAT.
+ */
+static bool direct_cache_flags_locked(uint64_t phys,uint64_t *flags)
+{
+    if(!flags || (phys&(PAGE_SIZE-1)) || !paging_kernel_direct_map_range(phys,PAGE_SIZE))return false;
+    uint64_t address=RELIEFNT_KERNEL_DIRECT_MAP_BASE+phys;
+    uint64_t entry=kernel_pml4[(address>>39)&511u];
+    uint64_t *table=paging_trusted_table_alias(entry&RELIEFNT_PHYS_ADDR_MASK);
+    if(!table)return false;
+    entry=table[(address>>30)&511u];
+    bool large=(entry&PAGE_SIZE_FLAG)!=0;
+    if(!large) {
+        table=paging_trusted_table_alias(entry&RELIEFNT_PHYS_ADDR_MASK);
+        if(!table)return false;
+        entry=table[(address>>21)&511u];large=(entry&PAGE_SIZE_FLAG)!=0;
+        if(!large) {
+            table=paging_trusted_table_alias(entry&RELIEFNT_PHYS_ADDR_MASK);
+            if(!table)return false;
+            entry=table[(address>>12)&511u];
+        }
+    }
+    *flags=entry&(RELIEFNT_PAGE_PWT|RELIEFNT_PAGE_PCD);
+    if(entry&(large ? (1ULL<<12) : RELIEFNT_PAGE_PAT))*flags|=RELIEFNT_PAGE_PAT;
+    return true;
+}
+
+/** @brief Obtain the normalized cache policy of a direct-mapped physical page.
+ * @param phys Aligned physical page. @param flags Receives 4 KiB PWT/PCD/PAT bits.
+ * @return True when a matching direct leaf exists; no allocation or I/O.
+ */
+bool paging_kernel_direct_cache_flags(uint64_t phys,uint64_t *flags)
+{
+    kernel_spin_lock(&mmio_lock);
+    bool found=direct_cache_flags_locked(phys,flags);
+    kernel_spin_unlock(&mmio_lock);
+    return found;
+}
+
+/* Intrusive AVL interval index: bounds include every claim in each subtree.
+ * Storage belongs to the claim owner; all operations hold mmio_lock. */
+enum cache_query_kind { CACHE_QUERY_EXISTS, CACHE_QUERY_COMPATIBLE,
+    CACHE_QUERY_SELECT, CACHE_QUERY_ORIGINAL, CACHE_QUERY_DEFER };
+struct cache_query {
+    uint64_t start, end, policy, original;
+    enum cache_query_kind kind;
+    bool found, known, pending, failed;
+};
+#ifdef RELIEFNT_MM_TEST_STATS
+static uint64_t paging_cache_node_visits;
+#define CACHE_NODE_VISIT() (++paging_cache_node_visits)
+#else
+#define CACHE_NODE_VISIT() ((void)0)
+#endif
+
+/** @brief Read an interval-index subtree height.
+ * @param node Borrowed node, nullable. @return Height or zero for an empty subtree.
+ */
+static int cache_tree_height(const struct paging_cache_claim *node)
+{ return node ? node->tree_height : 0; }
+/** @brief Refresh the height and maximum endpoint of an indexed claim.
+ * @param node Nonnull node whose child metadata is already current.
+ */
+static void cache_tree_update(struct paging_cache_claim *node)
+{
+    int left=cache_tree_height(node->left),right=cache_tree_height(node->right);
+    node->tree_height=1+(left>right ? left : right);node->subtree_end=node->end;
+    if(node->left && node->left->subtree_end>node->subtree_end)node->subtree_end=node->left->subtree_end;
+    if(node->right && node->right->subtree_end>node->subtree_end)node->subtree_end=node->right->subtree_end;
+}
+/** @brief Compare unique physical-start and owner-address index keys.
+ * @param a First live owner. @param b Second live owner.
+ * @return Negative, zero or positive in total index order.
+ */
+static int cache_tree_compare(const struct paging_cache_claim *a,const struct paging_cache_claim *b)
+{
+    if(a->start!=b->start)return a->start<b->start ? -1 : 1;
+    return (uintptr_t)a<(uintptr_t)b ? -1 : (uintptr_t)a>(uintptr_t)b;
+}
+/** @brief Rotate a right-heavy interval subtree while retaining its owners.
+ * @param root Root with a right child. @return New balanced subtree root.
+ */
+static struct paging_cache_claim *cache_tree_rotate_left(struct paging_cache_claim *root)
+{
+    struct paging_cache_claim *next=root->right;root->right=next->left;next->left=root;
+    cache_tree_update(root);cache_tree_update(next);return next;
+}
+/** @brief Rotate a left-heavy interval subtree while retaining its owners.
+ * @param root Root with a left child. @return New balanced subtree root.
+ */
+static struct paging_cache_claim *cache_tree_rotate_right(struct paging_cache_claim *root)
+{
+    struct paging_cache_claim *next=root->left;root->left=next->right;next->right=root;
+    cache_tree_update(root);cache_tree_update(next);return next;
+}
+/** @brief Restore AVL height and endpoint invariants after a subtree mutation.
+ * @param root Nonnull mutated root. @return Balanced subtree root.
+ */
+static struct paging_cache_claim *cache_tree_balance(struct paging_cache_claim *root)
+{
+    cache_tree_update(root);
+    int delta=cache_tree_height(root->left)-cache_tree_height(root->right);
+    if(delta>1) {
+        if(cache_tree_height(root->left->left)<cache_tree_height(root->left->right))
+            root->left=cache_tree_rotate_left(root->left);
+        return cache_tree_rotate_right(root);
+    }
+    if(delta< -1) {
+        if(cache_tree_height(root->right->right)<cache_tree_height(root->right->left))
+            root->right=cache_tree_rotate_right(root->right);
+        return cache_tree_rotate_left(root);
+    }
+    return root;
+}
+/** @brief Insert one inactive-in-index owner into an AVL interval subtree.
+ * @param root Current subtree, nullable. @param node Distinct owned claim.
+ * @return New subtree root. No allocation or callbacks occur.
+ */
+static struct paging_cache_claim *cache_tree_insert(struct paging_cache_claim *root,
+                                                     struct paging_cache_claim *node)
+{
+    if(!root) {node->left=node->right=NULL;node->tree_height=1;node->subtree_end=node->end;return node;}
+    CACHE_NODE_VISIT();
+    if(cache_tree_compare(node,root)<0)root->left=cache_tree_insert(root->left,node);
+    else root->right=cache_tree_insert(root->right,node);
+    return cache_tree_balance(root);
+}
+/** @brief Remove an exact owner without moving another owner's storage.
+ * @param root Current subtree, nullable. @param node Indexed claim to remove.
+ * @return New subtree root. No allocation or callbacks occur.
+ */
+static struct paging_cache_claim *cache_tree_remove(struct paging_cache_claim *root,
+                                                     struct paging_cache_claim *node)
+{
+    if(!root)return NULL;
+    CACHE_NODE_VISIT();
+    int order=cache_tree_compare(node,root);
+    if(order<0)root->left=cache_tree_remove(root->left,node);
+    else if(order>0)root->right=cache_tree_remove(root->right,node);
+    else if(!root->left)return root->right;
+    else if(!root->right)return root->left;
+    else if(cache_tree_height(root->left)>cache_tree_height(root->right)) {
+        root=cache_tree_rotate_right(root);root->right=cache_tree_remove(root->right,node);
+    } else {
+        root=cache_tree_rotate_left(root);root->left=cache_tree_remove(root->left,node);
+    }
+    return cache_tree_balance(root);
+}
+/** @brief Visit only physical-policy intervals that can intersect a query.
+ * @param node Current indexed subtree, nullable. @param query In/out query state.
+ * The MMIO lock is held; no allocation, provider callback or I/O occurs.
+ */
+static void cache_tree_query(struct paging_cache_claim *node,struct cache_query *query)
+{
+    if(!node || query->failed ||
+       (query->found && (query->kind==CACHE_QUERY_EXISTS || query->kind==CACHE_QUERY_ORIGINAL)))return;
+    CACHE_NODE_VISIT();
+    if(node->subtree_end<=query->start)return;
+    cache_tree_query(node->left,query);
+    if(query->failed || (query->found && (query->kind==CACHE_QUERY_EXISTS ||
+       query->kind==CACHE_QUERY_ORIGINAL)) || node->start>=query->end)return;
+    if(node->end>query->start) {
+        if(query->kind==CACHE_QUERY_EXISTS)query->found=true;
+        else if(query->kind==CACHE_QUERY_COMPATIBLE) {
+            if(node->flags!=query->policy)query->failed=true;
+        } else if(query->kind==CACHE_QUERY_SELECT) {
+            if((query->known && query->policy!=node->flags) ||
+               (node->restore_pending && query->pending && query->original!=node->restore_flags))
+                query->failed=true;
+            else {
+                query->known=true;query->policy=node->flags;
+                if(node->restore_pending){query->pending=true;query->original=node->restore_flags;}
+            }
+        } else if(query->kind==CACHE_QUERY_ORIGINAL) {
+            if(node->restore_pending){query->found=true;query->original=node->restore_flags;}
+        } else {
+            node->restore_flags=query->original;node->restore_pending=true;query->found=true;
+        }
+    }
+    cache_tree_query(node->right,query);
+}
+
+/** @brief Test active physical-policy owners for overlap under mmio_lock.
+ * @param start Inclusive aligned physical page. @param end Exclusive end.
+ * @return True if any independently owned policy intersects the range.
+ */
+static bool cache_claim_overlaps(uint64_t start,uint64_t end)
+{
+    struct cache_query query={.start=start,.end=end,.kind=CACHE_QUERY_EXISTS};
+    cache_tree_query(cache_claim_tree,&query);return query.found;
+}
+
+/** @brief Check overlapping physical-policy owners under mmio_lock.
+ * @param start Inclusive aligned physical page. @param end Exclusive end.
+ * @param flags Exact normalized PWT/PCD/PAT policy. @return True when compatible.
+ */
+static bool cache_claim_compatible(uint64_t start,uint64_t end,uint64_t flags)
+{
+    struct cache_query query={.start=start,.end=end,.policy=flags,.kind=CACHE_QUERY_COMPATIBLE};
+    cache_tree_query(cache_claim_tree,&query);return !query.failed;
+}
+
+/** @brief Select and register a DEVICE page's physical cache policy.
+ * @param claim Empty owner-embedded node. @param physical Aligned physical page.
+ * @param flags Receives its normalized policy. @return True on success.
+ * Existing direct or high aliases establish the policy; otherwise it is zero.
+ * No allocation, provider callback or I/O occurs under the shared MMIO lock.
+ */
+bool paging_cache_claim_select(struct paging_cache_claim *claim,uint64_t physical,
+                               uint64_t *flags)
+{
+    if(!claim || claim->active || !flags || !physical || (physical&(PAGE_SIZE-1)) ||
+       !paging_phys_addressable(physical,PAGE_SIZE))return false;
+    uint64_t end=physical+PAGE_SIZE,policy=0;
+    kernel_spin_lock(&mmio_lock);
+    bool direct=direct_cache_flags_locked(physical,&policy);
+    struct cache_query query={.start=physical,.end=end,.policy=policy,
+                              .known=direct,.kind=CACHE_QUERY_SELECT};
+    cache_tree_query(cache_claim_tree,&query);
+    if(query.failed){kernel_spin_unlock(&mmio_lock);return false;}
+    *claim=(struct paging_cache_claim){.next=cache_claims,.previous=&cache_claims,.start=physical,
+        .end=end,.flags=query.policy,.restore_flags=query.original,.active=true,
+        .direct=direct,.restore_pending=query.pending};
+    if(cache_claims)cache_claims->previous=&claim->next;
+    cache_claims=claim;cache_claim_tree=cache_tree_insert(cache_claim_tree,claim);*flags=query.policy;
+    kernel_spin_unlock(&mmio_lock);
+    return true;
+}
+
+/** @brief Register one exact high-alias cache policy before page-table creation.
+ * @param claim Empty owner node. @param physical Aligned physical base.
+ * @param bytes Nonzero aligned extent. @param flags PWT/PCD/PAT bits.
+ * @return True only for an uncovered, fully compatible physical range.
+ */
+bool paging_cache_claim_exact(struct paging_cache_claim *claim,uint64_t physical,
+                              uint64_t bytes,uint64_t flags)
+{
+    const uint64_t mask=RELIEFNT_PAGE_PWT|RELIEFNT_PAGE_PCD|RELIEFNT_PAGE_PAT;
+    if(!claim || claim->active || !physical || (physical&(PAGE_SIZE-1)) || !bytes ||
+       (bytes&(PAGE_SIZE-1)) || (flags&~mask) || !paging_phys_addressable(physical,bytes))
+        return false;
+    uint64_t first,last,end=physical+bytes;
+    kernel_spin_lock(&mmio_lock);
+    if(paging_kernel_direct_map_next(physical,end,&first,&last) ||
+       !cache_claim_compatible(physical,end,flags)) {
+        kernel_spin_unlock(&mmio_lock);return false;
+    }
+    *claim=(struct paging_cache_claim){.next=cache_claims,.previous=&cache_claims,.start=physical,
+        .end=end,.flags=flags,.active=true};
+    if(cache_claims)cache_claims->previous=&claim->next;
+    cache_claims=claim;cache_claim_tree=cache_tree_insert(cache_claim_tree,claim);
+    kernel_spin_unlock(&mmio_lock);
+    return true;
+}
+
+/** @brief Merge two adjacent equal-policy physical owners atomically.
+ * @param first Earlier owned claim. @param second Later owned claim, consumed
+ * on success. @return True if merged, otherwise both remain unchanged.
+ */
+bool paging_cache_claim_merge(struct paging_cache_claim *first,
+                              struct paging_cache_claim *second)
+{
+    if(!first || !second || first==second)return false;
+    kernel_spin_lock(&mmio_lock);
+    if(!first->active || !second->active || !first->previous || !second->previous ||
+       *first->previous!=first || *second->previous!=second ||
+       first->direct || second->direct || first->end!=second->start ||
+       first->flags!=second->flags) {
+        kernel_spin_unlock(&mmio_lock);return false;
+    }
+    cache_claim_tree=cache_tree_remove(cache_claim_tree,first);
+    cache_claim_tree=cache_tree_remove(cache_claim_tree,second);
+    first->end=second->end;*second->previous=second->next;
+    if(second->next)second->next->previous=second->previous;
+    *second=(struct paging_cache_claim){0};
+    cache_claim_tree=cache_tree_insert(cache_claim_tree,first);
+    kernel_spin_unlock(&mmio_lock);
+    return true;
+}
+
+/**
+ * @brief Find the first contiguous identity-mapped physical run in an interval.
+ * @param start Inclusive page-aligned physical search start.
+ * @param end Exclusive page-aligned physical search end.
+ * @param mapped_start Required output for the first mapped page.
+ * @param mapped_end Required output for its exclusive contiguous mapped end.
+ * @return True for a nonempty mapped run, false for invalid or uncovered input.
+ */
+bool paging_kernel_direct_map_next(uint64_t start, uint64_t end,
+                                   uint64_t *mapped_start, uint64_t *mapped_end)
+{
+    if (!mapped_start || !mapped_end || start >= end || (start | end) & (PAGE_SIZE - 1) ||
+        start >= RELIEFNT_KERNEL_DIRECT_MAP_SIZE) return false;
+    if (end > RELIEFNT_KERNEL_DIRECT_MAP_SIZE) end = RELIEFNT_KERNEL_DIRECT_MAP_SIZE;
+    uint8_t bits = paging_physical_bits();
+    if (!bits) return false;
+    uint64_t limit = 1ULL << bits;
+    if (end > limit) end = limit;
+    bool found = false;
+    while (start < end) {
+        uint64_t span;
+        bool mapped = direct_leaf(start, &span);
+        if (span > end - start) span = end - start;
+        if (mapped && !found) { *mapped_start = start; found = true; }
+        if (!mapped && found) break;
+        start += span;
+    }
+    if (found) *mapped_end = start;
+    return found;
 }
 
 /** @brief Translate an admitted physical byte into the shared supervisor window.
@@ -331,6 +854,24 @@ static uint64_t *mmio_allocate_split_table(uint64_t *physical)
     return table;
 }
 
+/** @brief Find the direct-map PDE through the currently installed kernel root.
+ * @param phys Physical byte in the direct-map window.
+ * @return Borrowed PDE or NULL for an absent or unsupported upper leaf.
+ * Caller serializes mutation; trusted table aliases never invoke coverage.
+ */
+static uint64_t *direct_pde(uint64_t phys)
+{
+    uint64_t address = RELIEFNT_KERNEL_DIRECT_MAP_BASE + phys;
+    uint64_t entry = kernel_pml4[(address >> 39) & 511u];
+    if (!(entry & RELIEFNT_PAGE_PRESENT) || (entry & PAGE_SIZE_FLAG)) return NULL;
+    uint64_t *pdpt = paging_trusted_table_alias(entry & RELIEFNT_PHYS_ADDR_MASK);
+    if (!pdpt) return NULL;
+    entry = pdpt[(address >> 30) & 511u];
+    if (!(entry & RELIEFNT_PAGE_PRESENT) || (entry & PAGE_SIZE_FLAG)) return NULL;
+    uint64_t *pd = paging_trusted_table_alias(entry & RELIEFNT_PHYS_ADDR_MASK);
+    return pd ? &pd[(address >> 21) & 511u] : NULL;
+}
+
 /** @brief Obtain a shared 4 KiB kernel leaf, splitting only its original PDE.
  * @param phys Physical address in the kernel map.
  * @return Borrowed PTE pointer, or NULL on allocation failure. mmio_lock held.
@@ -338,7 +879,8 @@ static uint64_t *mmio_allocate_split_table(uint64_t *physical)
  */
 static uint64_t *mmio_leaf(uint64_t phys)
 {
-    uint64_t *pde = &kernel_pd[phys >> 30][(phys >> 21) & 511];
+    uint64_t *pde = direct_pde(phys);
+    if (!pde || !(*pde & RELIEFNT_PAGE_PRESENT)) return NULL;
     if (*pde & PAGE_SIZE_FLAG) {
         uint64_t page;
         uint64_t *pt = mmio_allocate_split_table(&page);
@@ -351,7 +893,7 @@ static uint64_t *mmio_leaf(uint64_t phys)
         __atomic_store_n(pde, page | RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE, __ATOMIC_RELEASE);
     }
     if (!(*pde & RELIEFNT_PAGE_PRESENT)) return NULL;
-    uint64_t *pt = (uint64_t *)mm_phys_to_virt(*pde & RELIEFNT_PHYS_ADDR_MASK);
+    uint64_t *pt = paging_trusted_table_alias(*pde & RELIEFNT_PHYS_ADDR_MASK);
     return pt ? &pt[(phys >> 12) & 511] : NULL;
 }
 /** @brief Return a leaf only when its PDE has already been split.
@@ -360,10 +902,20 @@ static uint64_t *mmio_leaf(uint64_t phys)
  */
 static uint64_t *mmio_existing_leaf(uint64_t phys)
 {
-    uint64_t *pde = &kernel_pd[phys >> 30][(phys >> 21) & 511];
-    if (!(*pde & RELIEFNT_PAGE_PRESENT) || (*pde & PAGE_SIZE_FLAG)) return NULL;
-    uint64_t *pt = (uint64_t *)mm_phys_to_virt(*pde & RELIEFNT_PHYS_ADDR_MASK);
+    uint64_t *pde = direct_pde(phys);
+    if (!pde || !(*pde & RELIEFNT_PAGE_PRESENT) || (*pde & PAGE_SIZE_FLAG)) return NULL;
+    uint64_t *pt = paging_trusted_table_alias(*pde & RELIEFNT_PHYS_ADDR_MASK);
     return pt ? &pt[(phys >> 12) & 511] : NULL;
+}
+
+/** @brief Keep retained VGA/trampoline identity attributes coherent with aliases.
+ * @param phys Physical page whose direct-map leaf changed.
+ * @param entry New complete direct-map PTE for that physical page.
+ * Only the first MiB retains a low identity alias outside the kernel image.
+ */
+static void mmio_update_low_alias(uint64_t phys, uint64_t entry)
+{
+    if (phys < 0x100000ULL) kernel_low_pt[0][phys >> 12] = entry;
 }
 
 /** @brief Append a sorted run, coalescing only identical adjacent states.
@@ -384,6 +936,19 @@ static bool mmio_run_append(const struct mmio_run *run, uint32_t *count)
     if (*count >= MMIO_RUN_MAX) return false;
     mmio_work[(*count)++] = *run;
     return true;
+}
+
+/** @brief Find deferred original PTE flags for a retained direct-map page.
+ * @param page Aligned physical page. @param flags Receives original flags.
+ * @return True when a claim carries the saved flags. The MMIO lock is held;
+ * overlapping claims receive the same original flags before publication.
+ */
+static bool cache_claim_deferred_original(uint64_t page,uint64_t *flags)
+{
+    struct cache_query query={.start=page,.end=page+PAGE_SIZE,.kind=CACHE_QUERY_ORIGINAL};
+    cache_tree_query(cache_claim_tree,&query);
+    if(query.found)*flags=query.original;
+    return query.found;
 }
 
 /** @brief Add an unowned page-table gap as runs of equal original PTE flags.
@@ -410,6 +975,10 @@ static bool mmio_append_new_range(uint64_t start, uint64_t end, bool permanent,
                 (flags & (RELIEFNT_PAGE_PWT | RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_PAT)))
                 return false;
         }
+        /* A newly acquired lease can follow a closed lease while a DEVICE
+         * claim still owns its UC alias. Preserve the first lease's original
+         * flags rather than adopting the temporarily retained UC PTE. */
+        (void)cache_claim_deferred_original(p,&flags);
         if (have_run && flags != original_flags) {
             struct mmio_run run = {run_start, p, original_flags,
                                    permanent ? 0u : 1u, permanent ? 1u : 0u,
@@ -496,6 +1065,8 @@ static bool mmio_plan_acquire(uint64_t start, uint64_t end, bool permanent,
  * @param end Exclusive aligned range end.
  * @param count Output candidate run count.
  * @return False only when the bounded workspace cannot represent the result.
+ * Last-reference pages leave the bounded run table; independent page-sized
+ * DEVICE claims retain their own deferred original attributes instead.
  */
 static bool mmio_plan_release(uint64_t start, uint64_t end, uint32_t *count)
 {
@@ -635,11 +1206,56 @@ static bool mmio_verify_leaves(uint64_t start, uint64_t end)
     return true;
 }
 
+/** @brief Check whether a page belongs to one explicit framebuffer reservation.
+ * @param page Aligned physical page. @param start Raw display physical start.
+ * @param bytes Display reservation bytes.
+ * @return True when the complete page is within the page-rounded reservation.
+ */
+static bool mmio_display_page(uint64_t page, uint64_t start, uint64_t bytes)
+{
+    if (!start || !bytes || bytes > UINT64_MAX - start ||
+        start + bytes > UINT64_MAX - (PAGE_SIZE - 1)) return false;
+    uint64_t first = start & ~(PAGE_SIZE - 1);
+    uint64_t end = (start + bytes + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    return page >= first && page < end;
+}
+
+/** @brief Prevent cache conversion of ordinary RAM through a device claim.
+ * @param start Aligned physical start. @param end Exclusive aligned end.
+ * @param permanent True for a bootstrap display reservation.
+ * @param policy Requested cache policy.
+ * @return True when every RAM page is an explicitly reserved UC display page;
+ * later leases additionally require its existing permanent UC claim.
+ * Caller holds mmio_lock; topology type does not imply reservation ownership.
+ */
+static bool mmio_ram_authorized(uint64_t start, uint64_t end, bool permanent,
+                                enum mmio_cache_policy policy)
+{
+    const struct framebuffer *display = framebuffer_get();
+    for (uint64_t page = start; page < end; page += PAGE_SIZE) {
+        if (!mm_phys_is_ram(page, PAGE_SIZE)) continue;
+        if (policy != MMIO_CACHE_POLICY_UC || !display ||
+            (!mmio_display_page(page, display->reservation_start, display->reservation_bytes) &&
+             !mmio_display_page(page, display->auxiliary_reservation_start,
+                                display->auxiliary_reservation_bytes))) return false;
+        if (!permanent) {
+            bool claimed = false;
+            for (uint32_t i = 0; i < mmio_run_count; ++i)
+                if (mmio_runs[i].start <= page && mmio_runs[i].end > page &&
+                    mmio_runs[i].permanent && mmio_runs[i].policy == MMIO_CACHE_POLICY_UC)
+                    claimed = true;
+            if (!claimed) return false;
+        }
+    }
+    return true;
+}
+
 /** @brief Set precise device-page UC/NX attributes and claim mapping references.
  * @param phys Page-aligned physical base; BAR validation belongs to PCI service.
  * @param len Page-aligned nonzero length, bounded to the shared direct map.
  * @param permanent Nonzero for bootstrap compatibility mappings.
- * @return True on success, false on malformed range/capacity/ENOMEM/NX absence.
+ * @return True on success, false on cache-policy conflict, malformed range,
+ * capacity, allocation failure or NX absence.
  * Task context, execution transaction or pre-SMP boot; never from IRQ. The
  * sorted interval registry preserves original flags and coalesces identical
  * runs; page-table splits may remain after a failed preflight.
@@ -650,6 +1266,16 @@ static bool mmio_acquire(uint64_t phys, uint64_t len, bool permanent,
     if (!nx_enabled || !mmio_valid_aligned_range(phys, len)) return false;
     uint64_t end = phys + len;
     kernel_spin_lock(&mmio_lock);
+    uint64_t cache = policy == MMIO_CACHE_POLICY_UC ?
+        RELIEFNT_PAGE_PWT|RELIEFNT_PAGE_PCD : 0;
+    if (!cache_claim_compatible(phys,end,cache)) {
+        kernel_spin_unlock(&mmio_lock);
+        return false;
+    }
+    if (!mmio_ram_authorized(phys, end, permanent, policy)) {
+        kernel_spin_unlock(&mmio_lock);
+        return false;
+    }
     uint32_t lease_count = mmio_lease_count;
     if (permanent) {
         for (uint32_t i = 0; i < mmio_lease_count; ++i) mmio_lease_work[i] = mmio_leases[i];
@@ -679,6 +1305,7 @@ static bool mmio_acquire(uint64_t phys, uint64_t len, bool permanent,
                    RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_NOEXEC;
         else
             *pte |= RELIEFNT_PAGE_NOEXEC;
+        mmio_update_low_alias(p, *pte);
     }
     for (uint32_t i = 0; i < run_count; ++i) mmio_runs[i] = mmio_work[i];
     mmio_run_count = run_count;
@@ -705,6 +1332,8 @@ bool paging_acquire_mmio(uint64_t phys, uint64_t len)
  * @param len Page-aligned length, matched exactly by the resource owner.
  * @return None. Task context under execution transaction/pre-SMP, no callback.
  * Flushes all online CPU TLBs before return; shared split tables stay kernel-owned.
+ * Each retained DEVICE page carries its own original flags until its last
+ * overlapping claim; unowned pages restore during this release.
  */
 void paging_release_mmio(uint64_t phys, uint64_t len)
 {
@@ -739,8 +1368,15 @@ void paging_release_mmio(uint64_t phys, uint64_t len)
         uint64_t first = run->start < phys ? phys : run->start;
         uint64_t last = run->end > end ? end : run->end;
         for (uint64_t p = first; p < last; p += PAGE_SIZE) {
+            /* Direct claims are page-sized, so each overlapping owner can
+             * preserve this original leaf without delaying an unrelated page. */
+            struct cache_query query={.start=p,.end=p+PAGE_SIZE,
+                .original=run->original_flags,.kind=CACHE_QUERY_DEFER};
+            cache_tree_query(cache_claim_tree,&query);
+            if(query.found)continue;
             uint64_t *pte = mmio_existing_leaf(p);
             *pte = (p & RELIEFNT_PHYS_ADDR_MASK) | run->original_flags;
+            mmio_update_low_alias(p, *pte);
         }
     }
     for (uint32_t i = 0; i < run_count; ++i) mmio_runs[i] = mmio_work[i];
@@ -748,6 +1384,40 @@ void paging_release_mmio(uint64_t phys, uint64_t len)
     for (uint32_t i = 0; i < lease_count; ++i) mmio_leases[i] = mmio_lease_work[i];
     mmio_lease_count = lease_count;
     smp_flush_user_tlb();
+    kernel_spin_unlock(&mmio_lock);
+}
+
+/** @brief Retire a physical policy claim after its owner's aliases are gone.
+ * @param claim Acquired owner-embedded node; inactive/NULL is a no-op.
+ * The MMIO lock serializes unlink with new claimants and PCI lease release.
+ * Deferred direct-map attributes restore only for this now-unowned page and
+ * only if no PCI/permanent run has since acquired it; backing is untouched.
+ */
+void paging_cache_claim_release(struct paging_cache_claim *claim)
+{
+    if(!claim)return;
+    kernel_spin_lock(&mmio_lock);
+    if(!claim->active || !claim->previous || *claim->previous!=claim) {
+        kernel_spin_unlock(&mmio_lock);return;
+    }
+    struct paging_cache_claim old=*claim;
+    cache_claim_tree=cache_tree_remove(cache_claim_tree,claim);
+    *claim->previous=claim->next;
+    if(claim->next)claim->next->previous=claim->previous;
+    *claim=(struct paging_cache_claim){0};
+    if(old.restore_pending) {
+        bool retained=cache_claim_overlaps(old.start,old.end);
+        for(uint32_t i=0;i<mmio_run_count && !retained;++i)
+            if(mmio_runs[i].start<old.end && old.start<mmio_runs[i].end)retained=true;
+        if(!retained) {
+            uint64_t *pte=mmio_existing_leaf(old.start);
+            if(pte) {
+                *pte=(old.start&RELIEFNT_PHYS_ADDR_MASK)|old.restore_flags;
+                mmio_update_low_alias(old.start,*pte);
+                smp_flush_user_tlb();
+            }
+        }
+    }
     kernel_spin_unlock(&mmio_lock);
 }
 /** @brief Preserve bootstrap MMIO validation API with precise permanent UC/NX.
@@ -836,6 +1506,63 @@ static uint64_t *address_space_pte(const struct address_space *as, uint64_t addr
     return &pt[(address >> 12) & 511u];
 }
 
+/** @brief Classify one user leaf without treating its swap marker as a PFN.
+ * @param as Caller-stabilized address space, nullable.
+ * @param va User byte address. @return Leaf kind, or EMPTY for invalid input.
+ */
+enum paging_user_entry_kind paging_user_entry_kind(const struct address_space *as,
+                                                   uint64_t va)
+{
+    uint64_t *pte = address_space_pte(as, va);
+    uint64_t entry = pte ? *pte : 0;
+    if (!(entry & RELIEFNT_PAGE_USER)) return PAGING_USER_ENTRY_EMPTY;
+    if (entry & RELIEFNT_PAGE_PRESENT) return PAGING_USER_ENTRY_RESIDENT;
+    if (entry & RELIEFNT_PAGE_SWAP) return PAGING_USER_ENTRY_SWAP;
+    if (entry & RELIEFNT_PAGE_PROTNONE) return PAGING_USER_ENTRY_PROTNONE;
+    return PAGING_USER_ENTRY_EMPTY;
+}
+
+/** @brief Inspect one resident candidate or advance over one missing branch.
+ * @param as Execution-owned user root. @param cursor Aligned in/out position.
+ * @param page Receives a candidate address. @return Two candidate, one skip,
+ * zero complete/invalid; at most four hierarchy entries are examined per call.
+ */
+int paging_user_pressure_step(struct address_space *as, uint64_t *cursor, uint64_t *page)
+{
+    if (!as || !as->pml4 || !cursor || !page || (*cursor & (PAGE_SIZE - 1)) ||
+        *cursor < RELIEFNT_USER_BASE || *cursor >= RELIEFNT_USER_TOP) return 0;
+    uint64_t va = *cursor;
+    if (va >= RELIEFNT_KERNEL_HOLE_START && va < RELIEFNT_KERNEL_HOLE_END) {
+        *cursor = RELIEFNT_KERNEL_HOLE_END;
+        return 1;
+    }
+    static const uint8_t shifts[] = {39, 30, 21};
+    uint64_t *table = as->pml4;
+    for (unsigned level = 0; level < 3; ++level) {
+        uint64_t entry = table[(va >> shifts[level]) & 511u];
+        uint64_t required = RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_USER |
+                            RELIEFNT_PAGE_TABLE_OWNED;
+        uint64_t *child = NULL;
+        if ((entry & required) == required &&
+            (level == 0 || !(entry & PAGE_SIZE_FLAG))) child = table_from_entry(entry);
+        if (!child) {
+            uint64_t span = 1ULL << shifts[level];
+            uint64_t next = (va & ~(span - 1)) + span;
+            *cursor = next < RELIEFNT_USER_TOP ? next : RELIEFNT_USER_TOP;
+            return 1;
+        }
+        table = child;
+    }
+    uint64_t entry = table[(va >> 12) & 511u];
+    *cursor = va + PAGE_SIZE;
+    if ((entry & RELIEFNT_PAGE_USER) && (entry & RELIEFNT_PAGE_BACKED) &&
+        !(!(entry & RELIEFNT_PAGE_PRESENT) && (entry & RELIEFNT_PAGE_SWAP))) {
+        *page = va;
+        return 2;
+    }
+    return 1;
+}
+
 /** @brief Search one owned page-table level for its first backed user leaf.
  * @param table Table page at @p level; borrowed through the kernel direct map.
  * @param level 0 for PML4, 1 for PDPT, 2 for PD, or 3 for PT.
@@ -845,6 +1572,7 @@ static uint64_t *address_space_pte(const struct address_space *as, uint64_t addr
  * @param out_page Required output for a found page-aligned user address.
  * @param out_phys Optional output for the mapped physical page.
  * @param out_flags Optional output for the full leaf flags.
+ * @param include_swap Include nonresident swap leaves when true.
  * @return True when a backed user page was found; false otherwise.
  * Branches are visited in virtual-address order, and absent or shared kernel
  * branches are skipped without scanning their virtual coverage.
@@ -852,7 +1580,7 @@ static uint64_t *address_space_pte(const struct address_space *as, uint64_t addr
 static bool find_user_leaf_in_table(const uint64_t *table, uint32_t level,
                                     uint64_t base, uint64_t start, uint64_t end,
                                     uint64_t *out_page, uint64_t *out_phys,
-                                    uint64_t *out_flags)
+                                    uint64_t *out_flags, bool include_swap)
 {
     static const uint8_t index_shifts[] = {39, 30, 21, 12};
     uint32_t shift;
@@ -882,13 +1610,15 @@ static bool find_user_leaf_in_table(const uint64_t *table, uint32_t level,
             child = table_from_entry(entry);
             if (child && find_user_leaf_in_table(child, level + 1, child_base,
                                                  start, end, out_page, out_phys,
-                                                 out_flags)) return true;
+                                                 out_flags, include_swap)) return true;
             continue;
         }
-        if (!(entry & RELIEFNT_PAGE_BACKED) || !(entry & RELIEFNT_PAGE_USER)) continue;
+        bool swapped = !(entry & RELIEFNT_PAGE_PRESENT) && (entry & RELIEFNT_PAGE_SWAP);
+        if (!(entry & RELIEFNT_PAGE_USER) ||
+            (swapped ? !include_swap : !(entry & RELIEFNT_PAGE_BACKED))) continue;
         if (child_base < start || child_base >= end) continue;
         *out_page = child_base;
-        if (out_phys) *out_phys = entry & RELIEFNT_PHYS_ADDR_MASK;
+        if (out_phys) *out_phys = swapped ? 0 : entry & RELIEFNT_PHYS_ADDR_MASK;
         if (out_flags) *out_flags = entry & ~RELIEFNT_PHYS_ADDR_MASK;
         return true;
     }
@@ -913,7 +1643,24 @@ bool address_space_user_page_next(const struct address_space *as, uint64_t start
         start >= end || end > RELIEFNT_USER_TOP)
         return false;
     return find_user_leaf_in_table(as->pml4, 0, 0, start, end, out_page,
-                                   out_phys, out_flags);
+                                   out_phys, out_flags, false);
+}
+
+/** @brief Find the first resident or swapped user leaf in an owned sparse tree.
+ * @param as Caller-stabilized address space. @param start Inclusive user address.
+ * @param end Exclusive user address. @param out_page Required aligned address.
+ * @param out_phys Optional PFN output, zero for swap. @param out_flags Optional flags.
+ * @return True on a found leaf, false for an empty range or invalid input.
+ */
+bool address_space_user_entry_next(const struct address_space *as, uint64_t start,
+                                   uint64_t end, uint64_t *out_page,
+                                   uint64_t *out_phys, uint64_t *out_flags)
+{
+    if (!as || !as->pml4 || !out_page || start < RELIEFNT_USER_BASE ||
+        start >= end || end > RELIEFNT_USER_TOP)
+        return false;
+    return find_user_leaf_in_table(as->pml4, 0, 0, start, end, out_page,
+                                   out_phys, out_flags, true);
 }
 
 /** @brief Check a valid interval for any backed user leaf.
@@ -928,7 +1675,7 @@ bool address_space_user_range_free(const struct address_space *as, uint64_t star
     uint64_t page;
     if (start < RELIEFNT_KERNEL_HOLE_END && end > RELIEFNT_KERNEL_HOLE_START)
         return false;
-    return !address_space_user_page_next(as, start, end, &page, NULL, NULL);
+    return !address_space_user_entry_next(as, start, end, &page, NULL, NULL);
 }
 
 /** @brief Copy a physical page table into another allocated page.
@@ -982,14 +1729,24 @@ static void split_2m_leaf(uint64_t *destination, uint64_t large_entry)
         destination[i] = (base + (uint64_t)i * PAGE_SIZE) | flags;
 }
 
+/** @brief Record one confirmed ordinary allocation failure for fork recovery.
+ * @param exhausted Optional failure output. @param free_pages Optional snapshot
+ * of total free pages at failure. Does not allocate, block or change ownership.
+ */
+static void fork_cow_note_allocation_failure(bool *exhausted, uint64_t *free_pages)
+{
+    if (exhausted) *exhausted = true;
+    if (free_pages) *free_pages = mm_free_memory_kib() / 4;
+}
+
 /** @brief Ensure one private child table exists in a transaction's staged tree.
- * @param parent Parent table in the staged tree.
- * @param parent_level 0 for PML4, 1 for PDPT, or 2 for PD.
- * @param index Entry index to prepare.
+ * @param parent Parent table. @param parent_level Level 0, 1 or 2.
+ * @param index Entry index. @param exhausted Optional allocation-failure hint.
+ * @param free_pages Optional total-free snapshot at failure.
  * @return Private child table pointer, or NULL after freeing failed allocation.
  */
 static uint64_t *ensure_staged_child(uint64_t *parent, uint32_t parent_level,
-                                     uint32_t index)
+                                     uint32_t index, bool *exhausted, uint64_t *free_pages)
 {
     uint64_t old_entry = parent[index];
     uint64_t *child;
@@ -1003,14 +1760,19 @@ static uint64_t *ensure_staged_child(uint64_t *parent, uint32_t parent_level,
         return table_from_entry(old_entry);
     }
     phys = alloc_table();
-    if (!phys) return NULL;
+    if (!phys) {
+        fork_cow_note_allocation_failure(exhausted, free_pages);
+         return NULL;
+    }
     child = (uint64_t *)mm_phys_to_virt(phys);
     if (!child) {
+
         mm_free_page(phys);
         return NULL;
     }
     if ((old_entry & RELIEFNT_PAGE_PRESENT) && !large) {
         if (!copy_table_entries(child, old_entry)) {
+
             mm_free_page(phys);
             return NULL;
         }
@@ -1132,6 +1894,8 @@ static void release_replaced_tables(uint64_t old_entry, uint64_t new_entry,
 
 /** @brief Create an empty user address space with the reserved low kernel window and canonical high-half kernel mappings.
  * @param as Output address space, initialized to zero on entry.
+ * @param exhausted Optional allocation-failure hint. @param free_pages Optional
+ * total-free snapshot for a failed root allocation.
  * @return True after allocating an independent PML4 root.
  * The bootstrap root maps much of low physical RAM as identity-mapped
  * supervisor pages, overlapping legal user addresses and blocking lazy
@@ -1139,15 +1903,20 @@ static void release_replaced_tables(uint64_t old_entry, uint64_t new_entry,
  * kernel-image window, plus canonical high-half mappings for kernel data and
  * the physical direct map.
  */
-bool address_space_create(struct address_space *as)
+static bool address_space_create_internal(struct address_space *as, bool *exhausted,
+                                          uint64_t *free_pages)
 {
     uint64_t phys;
     if (!as) return false;
     for (size_t i = 0; i < sizeof(*as); ++i) ((uint8_t *)as)[i] = 0;
     phys = alloc_table();
-    if (!phys) return false;
+    if (!phys) {
+        fork_cow_note_allocation_failure(exhausted, free_pages);
+         return false;
+    }
     as->pml4 = (uint64_t *)mm_phys_to_virt(phys);
     if (!as->pml4) {
+
         mm_free_page(phys);
         as->pml4 = NULL;
         return false;
@@ -1160,24 +1929,42 @@ bool address_space_create(struct address_space *as)
     return true;
 }
 
+bool address_space_create(struct address_space *as)
+{ return address_space_create_internal(as, NULL, NULL); }
+
 /** @brief Create child mappings with private page tables and shared COW backing.
  * @param source Existing parent address space.
  * @param destination Empty output address space.
+ * @param allocation_exhausted Optional confirmed ordinary-allocation hint.
+ * @param failure_free_pages Optional total-free snapshot at that failure.
  * @return True on a complete clone; failure destroys the child and leaves the
  *         parent PTEs unchanged.
  */
-bool address_space_clone_cow(struct address_space *source,
-                             struct address_space *destination)
+/* The hint is private to the unpublished fork transaction. */
+static bool prepare_user_range_with_stage_hint(struct address_space *as, uint64_t start,
+                                                uint64_t end, bool *allocation_exhausted,
+                                                uint64_t *failure_free_pages);
+
+static bool address_space_clone_cow_internal(struct address_space *source,
+                                             struct address_space *destination,
+                                             bool *allocation_exhausted, uint64_t *failure_free_pages)
 {
-    if (!source || !destination || !source->pml4 || !address_space_create(destination))
+    if (allocation_exhausted) *allocation_exhausted = false;
+    if (!source || !destination || !source->pml4) {
+
         return false;
+    }
+    if (!address_space_create_internal(destination, allocation_exhausted, failure_free_pages)) {
+
+        return false;
+    }
     for (uint32_t pi = 0; pi < 256; ++pi) {
         uint64_t pml4e = source->pml4[pi];
         uint64_t *src_pdpt;
         if (!(pml4e & RELIEFNT_PAGE_PRESENT) ||
             !(pml4e & RELIEFNT_PAGE_TABLE_OWNED)) continue;
         src_pdpt = table_from_entry(pml4e);
-        if (!src_pdpt) goto fail;
+        if (!src_pdpt) {  goto fail; }
         for (uint32_t di = 0; di < 512; ++di) {
             uint64_t pdpte = src_pdpt[di];
             uint64_t *src_pd;
@@ -1185,7 +1972,7 @@ bool address_space_clone_cow(struct address_space *source,
             if (!(pdpte & RELIEFNT_PAGE_PRESENT) || (pdpte & PAGE_SIZE_FLAG) ||
                 !(pdpte & RELIEFNT_PAGE_TABLE_OWNED)) continue;
             src_pd = table_from_entry(pdpte);
-            if (!src_pd) goto fail;
+            if (!src_pd) {  goto fail; }
             for (uint32_t ti = 0; ti < 512; ++ti) {
                 uint64_t pde = src_pd[ti];
                 uint64_t region_2m = region_start + (uint64_t)ti * PAGE_SIZE_2M;
@@ -1193,45 +1980,84 @@ bool address_space_clone_cow(struct address_space *source,
                 if (!(pde & RELIEFNT_PAGE_PRESENT) || (pde & PAGE_SIZE_FLAG) ||
                     !(pde & RELIEFNT_PAGE_TABLE_OWNED)) continue;
                 src_pt = table_from_entry(pde);
-                if (!src_pt) goto fail;
+                if (!src_pt) {  goto fail; }
                 bool have_user_leaf = false;
                 for (uint32_t si = 0; si < 512; ++si) {
                     uint64_t leaf = src_pt[si];
-                    if ((leaf & RELIEFNT_PAGE_BACKED) && (leaf & RELIEFNT_PAGE_USER)) {
+                    if ((leaf & RELIEFNT_PAGE_USER) &&
+                        ((leaf & RELIEFNT_PAGE_BACKED) ||
+                         (!(leaf & RELIEFNT_PAGE_PRESENT) && (leaf & RELIEFNT_PAGE_SWAP)))) {
                         have_user_leaf = true;
                         break;
                     }
                 }
                 if (!have_user_leaf) continue;
-                if (!address_space_prepare_user_range(destination, region_2m,
-                                                     region_2m + PAGE_SIZE_2M))
+                if (!prepare_user_range_with_stage_hint(destination, region_2m,
+                                                       region_2m + PAGE_SIZE_2M,
+                                                       allocation_exhausted, failure_free_pages)) {
+
                     goto fail;
+                }
                 uint64_t *dst_pdpt = table_from_entry(destination->pml4[pi]);
                 uint64_t *dst_pd = dst_pdpt ? table_from_entry(dst_pdpt[di]) : NULL;
                 uint64_t *dst_leaf_table = dst_pd ? table_from_entry(dst_pd[ti]) : NULL;
-                if (!dst_leaf_table) goto fail;
+                if (!dst_leaf_table) {  goto fail; }
                 for (uint32_t si = 0; si < 512; ++si) {
                     uint64_t leaf = src_pt[si];
                     uint64_t flags;
                     uint64_t phys;
+                    if ((leaf & RELIEFNT_PAGE_USER) && !(leaf & RELIEFNT_PAGE_PRESENT) &&
+                        (leaf & RELIEFNT_PAGE_SWAP)) {
+                        uint64_t page = region_2m + (uint64_t)si * PAGE_SIZE;
+                        int rc = mm_swap_clone_leaf ? mm_swap_clone_leaf(source, destination, page) : -1;
+                        if (rc < 0) {
+                            if (rc == -ENOMEM)
+                                fork_cow_note_allocation_failure(allocation_exhausted, failure_free_pages);
+
+                            goto fail;
+                        }
+                        dst_leaf_table[si] = leaf;
+                        continue;
+                    }
                     if (!(leaf & RELIEFNT_PAGE_BACKED) ||
                         !(leaf & RELIEFNT_PAGE_USER)) continue;
                     phys = leaf & RELIEFNT_PHYS_ADDR_MASK;
                     flags = leaf & ~(RELIEFNT_PHYS_ADDR_MASK | RELIEFNT_PAGE_USER |
                                      RELIEFNT_PAGE_PRESENT);
-                    if (!(leaf & (RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_SHARED)) &&
+                    bool copied = !(leaf & (RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_SHARED)) &&
+                                  paging_has_writable_alias(phys);
+                    if(copied) {
+                        uint64_t fresh=mm_alloc_page();
+                        if(!fresh) {
+                            fork_cow_note_allocation_failure(allocation_exhausted, failure_free_pages);
+                             goto fail;
+                        }
+                        if(!mm_phys_to_virt(fresh) || !mm_phys_to_virt(phys)) {
+
+                            mm_free_page(fresh);goto fail;
+                        }
+                        copy_page(fresh,phys);phys=fresh;
+                    } else if (!(leaf & (RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_SHARED)) &&
                         ((leaf & RELIEFNT_PAGE_WRITABLE) ||
                          (leaf & RELIEFNT_PAGE_COW))) {
                         flags &= ~RELIEFNT_PAGE_WRITABLE;
                         flags |= RELIEFNT_PAGE_COW;
                     }
-                    if (!(leaf & RELIEFNT_PAGE_DEVICE) &&
+                    if (!copied && !(leaf & RELIEFNT_PAGE_DEVICE) &&
                         page_cache_retain(phys) != 0) mm_retain_page(phys);
                     dst_leaf_table[si] = phys | RELIEFNT_PAGE_USER | flags |
                         (leaf & RELIEFNT_PAGE_PRESENT);
                     ++destination->user_page_count;
                 }
             }
+        }
+    }
+    if (mm_shared_clone) {
+        int rc = mm_shared_clone(source, destination);
+        if (rc < 0) {
+            if (rc == -ENOMEM)
+                fork_cow_note_allocation_failure(allocation_exhausted, failure_free_pages);
+             goto fail;
         }
     }
     /* Protect the parent only after every child allocation/reference succeeded. */
@@ -1249,9 +2075,12 @@ bool address_space_clone_cow(struct address_space *source,
                     (pd[ti] & PAGE_SIZE_FLAG)) continue;
                 for (uint32_t si = 0; si < 512; ++si) {
                     uint64_t *leaf = &pt[si];
+                    if (!(*leaf & RELIEFNT_PAGE_PRESENT) && (*leaf & RELIEFNT_PAGE_SWAP))
+                        continue;
                     if (!(*leaf & RELIEFNT_PAGE_BACKED) ||
                         !(*leaf & RELIEFNT_PAGE_USER) ||
                         (*leaf & (RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_SHARED))) continue;
+                    if (paging_has_writable_alias(*leaf & RELIEFNT_PHYS_ADDR_MASK)) continue;
                     if ((*leaf & RELIEFNT_PAGE_WRITABLE) || (*leaf & RELIEFNT_PAGE_COW))
                         *leaf = (*leaf & ~RELIEFNT_PAGE_WRITABLE) | RELIEFNT_PAGE_COW;
                 }
@@ -1264,6 +2093,69 @@ bool address_space_clone_cow(struct address_space *source,
 fail:
     address_space_destroy(destination);
     return false;
+}
+
+bool address_space_clone_cow(struct address_space *source, struct address_space *destination)
+{ return address_space_clone_cow_internal(source, destination, NULL, NULL); }
+
+bool address_space_clone_cow_fork(struct address_space *source, struct address_space *destination,
+                                  bool *allocation_exhausted, uint64_t *failure_free_pages)
+{ return address_space_clone_cow_internal(source, destination, allocation_exhausted, failure_free_pages); }
+
+/** @brief Count real user table branches, aliased pages and swap leaves for fork.
+ * @param source Writer-pinned parent root. @param pages Required physical pages
+ * for its child tables, copied writable aliases, and peak range staging.
+ * @param swapped Receives the number of child swap records to allocate.
+ * @return True for a representable valid snapshot; no allocation or ownership
+ * is retained. The caller must repeat after a wait or any MM change.
+ */
+bool address_space_fork_page_cost(const struct address_space *source,
+                                  uint32_t *pages, uint64_t *swapped)
+{
+    if (!source || !source->pml4 || !pages || !swapped) return false;
+    uint64_t need = 1, slots = 0;
+    for (uint32_t pi = 0; pi < 256; ++pi) {
+        uint64_t pml4e = source->pml4[pi];
+        if (!(pml4e & RELIEFNT_PAGE_PRESENT) || !(pml4e & RELIEFNT_PAGE_TABLE_OWNED)) continue;
+        uint64_t *pdpt = table_from_entry(pml4e);
+        if (!pdpt) return false;
+        bool have_pdpt = false;
+        for (uint32_t di = 0; di < 512; ++di) {
+            uint64_t pdpte = pdpt[di];
+            if (!(pdpte & RELIEFNT_PAGE_PRESENT) || (pdpte & PAGE_SIZE_FLAG) ||
+                !(pdpte & RELIEFNT_PAGE_TABLE_OWNED)) continue;
+            uint64_t *pd = table_from_entry(pdpte);
+            if (!pd) return false;
+            bool have_pd = false;
+            for (uint32_t ti = 0; ti < 512; ++ti) {
+                uint64_t pde = pd[ti];
+                if (!(pde & RELIEFNT_PAGE_PRESENT) || (pde & PAGE_SIZE_FLAG) ||
+                    !(pde & RELIEFNT_PAGE_TABLE_OWNED)) continue;
+                uint64_t *pt = table_from_entry(pde);
+                if (!pt) return false;
+                bool have_pt = false;
+                for (uint32_t si = 0; si < 512; ++si) {
+                    uint64_t leaf = pt[si];
+                    if (!(leaf & RELIEFNT_PAGE_USER)) continue;
+                    if (!(leaf & RELIEFNT_PAGE_PRESENT) && (leaf & RELIEFNT_PAGE_SWAP)) {
+                        ++slots; have_pt = true;
+                    } else if (leaf & RELIEFNT_PAGE_BACKED) {
+                        have_pt = true;
+                        if (!(leaf & (RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_SHARED)) &&
+                            paging_has_writable_alias(leaf & RELIEFNT_PHYS_ADDR_MASK)) ++need;
+                    }
+                }
+                if (have_pt) { ++need; have_pd = true; }
+            }
+            if (have_pd) { ++need; have_pdpt = true; }
+        }
+        if (have_pdpt) ++need;
+    }
+    /* One staging root and two copied intermediate branches at peak. */
+    need += 3;
+    if (need > UINT32_MAX) return false;
+    *pages = (uint32_t)need; *swapped = slots;
+    return true;
 }
 
 /** @brief Destroy an owned user page-table branch and release mapped user pages.
@@ -1283,9 +2175,11 @@ static void destroy_user_branch(uint64_t entry, uint32_t table_level)
             if ((child & RELIEFNT_PAGE_PRESENT) && !(child & PAGE_SIZE_FLAG))
                 destroy_user_branch(child, table_level + 1);
         } else if ((child & RELIEFNT_PAGE_BACKED) &&
+                   ((child & RELIEFNT_PAGE_PRESENT) || !(child & RELIEFNT_PAGE_SWAP)) &&
                    (child & RELIEFNT_PAGE_USER)) {
             uint64_t phys = child & RELIEFNT_PHYS_ADDR_MASK;
             if (child & RELIEFNT_PAGE_DEVICE) continue;
+            note_dirty_leaf(child);
             if (page_cache_owns(phys)) page_cache_release(phys);
             else mm_free_page(phys);
         }
@@ -1300,6 +2194,7 @@ void address_space_destroy(struct address_space *as)
 {
     if (!as) return;
     if (as->pml4) {
+        if (mm_context_destroy) mm_context_destroy(as);
         for (uint32_t i = 0; i < 256; ++i)
             destroy_user_branch(as->pml4[i], 1);
         mm_free_page(as->cr3);
@@ -1311,11 +2206,14 @@ void address_space_destroy(struct address_space *as)
  * @param as Address space protected by the caller's execution ownership.
  * @param start Inclusive first byte of the range.
  * @param end Exclusive end, no greater than the canonical low-half boundary.
+ * @param allocation_exhausted Optional ordinary-allocation hint.
+ * @param failure_free_pages Optional total-free snapshot at that failure.
  * @return True when all 4 KiB leaf tables are privately writable; false leaves
  *         existing mappings untouched and frees every staged table page.
  */
-bool address_space_prepare_user_range(struct address_space *as, uint64_t start,
-                                      uint64_t end)
+static bool prepare_user_range_with_stage_hint(struct address_space *as, uint64_t start,
+                                                uint64_t end, bool *allocation_exhausted,
+                                                uint64_t *failure_free_pages)
 {
     uint64_t first_region;
     uint64_t end_region;
@@ -1325,8 +2223,10 @@ bool address_space_prepare_user_range(struct address_space *as, uint64_t start,
     bool needs_change = false;
     if (!as || !as->pml4 || start < RELIEFNT_USER_BASE || start >= end ||
         end > RELIEFNT_USER_TOP ||
-        (start < RELIEFNT_KERNEL_HOLE_END && end > RELIEFNT_KERNEL_HOLE_START))
+        (start < RELIEFNT_KERNEL_HOLE_END && end > RELIEFNT_KERNEL_HOLE_START)) {
+
         return false;
+    }
     first_region = align_down(start, PAGE_SIZE_2M);
     end_region = align_down(end - 1, PAGE_SIZE_2M) + PAGE_SIZE_2M;
     for (uint64_t region = first_region; region < end_region; region += PAGE_SIZE_2M) {
@@ -1337,9 +2237,13 @@ bool address_space_prepare_user_range(struct address_space *as, uint64_t start,
     }
     if (!needs_change) return true;
     stage_phys = alloc_table();
-    if (!stage_phys) return false;
+    if (!stage_phys) {
+        fork_cow_note_allocation_failure(allocation_exhausted, failure_free_pages);
+         return false;
+    }
     stage_root = (uint64_t *)mm_phys_to_virt(stage_phys);
     if (!stage_root) {
+
         mm_free_page(stage_phys);
         return false;
     }
@@ -1354,11 +2258,13 @@ bool address_space_prepare_user_range(struct address_space *as, uint64_t start,
         uint64_t *pdpt;
         uint64_t *pd;
         if (user_region_prepared(stage_root, region)) continue;
-        pdpt = ensure_staged_child(stage_root, 0, pml4_index);
-        if (!pdpt) goto rollback;
-        pd = ensure_staged_child(pdpt, 1, pdpt_index);
-        if (!pd) goto rollback;
-        if (!ensure_staged_child(pd, 2, pd_index)) goto rollback;
+        pdpt = ensure_staged_child(stage_root, 0, pml4_index, allocation_exhausted, failure_free_pages);
+        if (!pdpt) {  goto rollback; }
+        pd = ensure_staged_child(pdpt, 1, pdpt_index, allocation_exhausted, failure_free_pages);
+        if (!pd) {  goto rollback; }
+        if (!ensure_staged_child(pd, 2, pd_index, allocation_exhausted, failure_free_pages)) {
+             goto rollback;
+        }
     }
     for (uint32_t i = 0; i < 512; ++i) as->pml4[i] = stage_root[i];
     publish_staged_children(as->pml4, 0);
@@ -1374,6 +2280,9 @@ rollback:
     mm_free_page(stage_phys);
     return false;
 }
+
+bool address_space_prepare_user_range(struct address_space *as, uint64_t start, uint64_t end)
+{ return prepare_user_range_with_stage_hint(as, start, end, NULL, NULL); }
 
 /** @brief Install one owned user leaf with caller-validated protection flags.
  * @param as Address space receiving the mapping.
@@ -1393,12 +2302,157 @@ bool address_space_map_user_page(struct address_space *as, uint64_t vaddr,
         !nx_enabled) return false;
     if (!address_space_prepare_user_range(as, page, page + PAGE_SIZE)) return false;
     pte = address_space_pte(as, page);
-    if (!pte || (*pte & RELIEFNT_PAGE_BACKED)) return false;
+    if (!pte || (*pte & RELIEFNT_PAGE_BACKED) ||
+        paging_user_entry_kind(as, page) == PAGING_USER_ENTRY_SWAP) return false;
     *pte = phys | RELIEFNT_PAGE_USER | flags |
            ((flags & RELIEFNT_PAGE_PROTNONE) ? 0 : RELIEFNT_PAGE_PRESENT);
     ++as->user_page_count;
+    if ((flags & RELIEFNT_PAGE_DEVICE) && mm_context_device_changed)
+        mm_context_device_changed(as);
     x86_64_invlpg(page);
     paging_note_mm_change();
+    return true;
+}
+
+/** @brief Publish one slot-backed nonpresent user leaf.
+ * @param as Live execution-owned root. @param vaddr User byte address.
+ * @param flags Validated protection bits. @return True when an empty leaf is
+ * installed; caller retains responsibility for its separately prepared slot.
+ */
+bool address_space_map_user_swap(struct address_space *as, uint64_t vaddr,
+                                 uint64_t flags)
+{
+    const uint64_t allowed = RELIEFNT_PAGE_WRITABLE | RELIEFNT_PAGE_NOEXEC |
+        RELIEFNT_PAGE_PROTNONE | RELIEFNT_PAGE_COW | RELIEFNT_PAGE_PWT |
+        RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_PAT;
+    uint64_t page = align_down(vaddr, PAGE_SIZE);
+    if (!as || !user_address_valid(page) || (flags & ~allowed)) return false;
+    if (!address_space_prepare_user_range(as, page, page + PAGE_SIZE)) return false;
+    uint64_t *pte = address_space_pte(as, page);
+    if (!pte || (*pte & RELIEFNT_PAGE_BACKED) ||
+        paging_user_entry_kind(as, page) == PAGING_USER_ENTRY_SWAP) return false;
+    *pte = RELIEFNT_PAGE_USER | RELIEFNT_PAGE_SWAP | flags;
+    x86_64_invlpg(page);
+    paging_note_mm_change();
+    return true;
+}
+
+/** @brief Write-protect a resident user leaf for one synchronous swap write.
+ * @param as Execution-owned root. @param vaddr User byte address.
+ * @return Original PTE, or zero when not an eligible backed user leaf.
+ */
+uint64_t paging_user_swap_freeze(struct address_space *as, uint64_t vaddr)
+{
+    uint64_t page = align_down(vaddr, PAGE_SIZE);
+    uint64_t *pte = address_space_pte(as, page);
+    if (!pte) return 0;
+    uint64_t old = __atomic_load_n(pte, __ATOMIC_SEQ_CST);
+    if (!(old & RELIEFNT_PAGE_USER) || !(old & RELIEFNT_PAGE_BACKED) ||
+        (!(old & RELIEFNT_PAGE_PRESENT) && (old & RELIEFNT_PAGE_SWAP)) ||
+        (old & (RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_SHARED))) return 0;
+    old = __atomic_fetch_and(pte, ~RELIEFNT_PAGE_WRITABLE, __ATOMIC_SEQ_CST);
+    paging_note_mm_change();
+    smp_flush_user_tlb();
+    return old;
+}
+
+/** @brief Restore a frozen leaf after a failed or cancelled slot write.
+ * @param as Execution-owned root. @param vaddr User byte address.
+ * @param original Snapshot returned by paging_user_swap_freeze.
+ * @return True when the same physical leaf was restored.
+ */
+bool paging_user_swap_restore(struct address_space *as, uint64_t vaddr, uint64_t original)
+{
+    uint64_t page = align_down(vaddr, PAGE_SIZE);
+    uint64_t *pte = address_space_pte(as, page);
+    if (!pte || !original) return false;
+    uint64_t current = __atomic_load_n(pte, __ATOMIC_SEQ_CST);
+    if (!(current & RELIEFNT_PAGE_BACKED) ||
+        (!(current & RELIEFNT_PAGE_PRESENT) && (current & RELIEFNT_PAGE_SWAP)) ||
+        (current & RELIEFNT_PHYS_ADDR_MASK) != (original & RELIEFNT_PHYS_ADDR_MASK))
+        return false;
+    __atomic_store_n(pte, original | (current & 0x60ULL), __ATOMIC_SEQ_CST);
+    paging_note_mm_change();
+    smp_flush_user_tlb();
+    return true;
+}
+
+/** @brief Publish a slot marker in place of the same frozen physical frame.
+ * @param as Execution-owned root. @param vaddr User byte address.
+ * @param original PTE before freezing. @return True after TLB synchronization.
+ */
+bool paging_user_swap_commit(struct address_space *as, uint64_t vaddr, uint64_t original)
+{
+    const uint64_t allowed = RELIEFNT_PAGE_WRITABLE | RELIEFNT_PAGE_NOEXEC |
+        RELIEFNT_PAGE_PROTNONE | RELIEFNT_PAGE_COW | RELIEFNT_PAGE_PWT |
+        RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_PAT;
+    uint64_t page = align_down(vaddr, PAGE_SIZE);
+    uint64_t *pte = address_space_pte(as, page);
+    if (!pte || !original) return false;
+    uint64_t current = __atomic_load_n(pte, __ATOMIC_SEQ_CST);
+    if (!(current & RELIEFNT_PAGE_BACKED) || (current & RELIEFNT_PAGE_WRITABLE) ||
+        (!(current & RELIEFNT_PAGE_PRESENT) && (current & RELIEFNT_PAGE_SWAP)) ||
+        (current & RELIEFNT_PHYS_ADDR_MASK) != (original & RELIEFNT_PHYS_ADDR_MASK))
+        return false;
+    __atomic_store_n(pte, RELIEFNT_PAGE_USER | RELIEFNT_PAGE_SWAP | (original & allowed),
+                     __ATOMIC_SEQ_CST);
+    if (as->user_page_count) --as->user_page_count;
+    paging_note_mm_change();
+    smp_flush_user_tlb();
+    return true;
+}
+
+/** @brief Publish one successfully read RAM frame over a swap marker.
+ * @param as Execution-owned root. @param vaddr User byte address.
+ * @param phys Owned aligned RAM frame. @param writable Resolve COW for a write.
+ * @return True on transfer, false when the slot or physical address is invalid.
+ */
+bool paging_user_swap_in(struct address_space *as, uint64_t vaddr, uint64_t phys,
+                         bool writable)
+{
+    const uint64_t allowed = RELIEFNT_PAGE_WRITABLE | RELIEFNT_PAGE_NOEXEC |
+        RELIEFNT_PAGE_COW | RELIEFNT_PAGE_PWT | RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_PAT;
+    uint64_t page = align_down(vaddr, PAGE_SIZE);
+    uint64_t *pte = address_space_pte(as, page);
+    if (!pte || !phys || (phys & ~RELIEFNT_PHYS_ADDR_MASK) ||
+        (phys & (PAGE_SIZE - 1)) || !nx_enabled) return false;
+    uint64_t old = __atomic_load_n(pte, __ATOMIC_SEQ_CST);
+    if (!(old & RELIEFNT_PAGE_USER) || (old & RELIEFNT_PAGE_PRESENT) ||
+        !(old & RELIEFNT_PAGE_SWAP) || (old & RELIEFNT_PAGE_PROTNONE)) return false;
+    uint64_t flags = old & allowed;
+    if (writable && (flags & RELIEFNT_PAGE_COW))
+        flags = (flags & ~RELIEFNT_PAGE_COW) | RELIEFNT_PAGE_WRITABLE;
+    __atomic_store_n(pte, phys | RELIEFNT_PAGE_USER | RELIEFNT_PAGE_PRESENT | flags,
+                     __ATOMIC_SEQ_CST);
+    ++as->user_page_count;
+    paging_note_mm_change();
+    smp_flush_user_tlb();
+    return true;
+}
+
+/** @brief Materialize a swap leaf without changing its access permissions.
+ * @param as Execution-owned root. @param vaddr User byte address.
+ * @param phys Owned aligned RAM frame. @return True after transferring ownership.
+ */
+bool paging_user_swap_materialize(struct address_space *as, uint64_t vaddr,
+                                  uint64_t phys)
+{
+    const uint64_t allowed = RELIEFNT_PAGE_WRITABLE | RELIEFNT_PAGE_NOEXEC |
+        RELIEFNT_PAGE_PROTNONE | RELIEFNT_PAGE_COW | RELIEFNT_PAGE_PWT |
+        RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_PAT;
+    uint64_t page = align_down(vaddr, PAGE_SIZE);
+    uint64_t *pte = address_space_pte(as, page);
+    if (!pte || !phys || (phys & ~RELIEFNT_PHYS_ADDR_MASK) ||
+        (phys & (PAGE_SIZE - 1)) || !nx_enabled) return false;
+    uint64_t old = __atomic_load_n(pte, __ATOMIC_SEQ_CST);
+    if (!(old & RELIEFNT_PAGE_USER) || (old & RELIEFNT_PAGE_PRESENT) ||
+        !(old & RELIEFNT_PAGE_SWAP)) return false;
+    uint64_t flags = old & allowed;
+    if (!(flags & RELIEFNT_PAGE_PROTNONE)) flags |= RELIEFNT_PAGE_PRESENT;
+    __atomic_store_n(pte, phys | RELIEFNT_PAGE_USER | flags, __ATOMIC_SEQ_CST);
+    ++as->user_page_count;
+    paging_note_mm_change();
+    smp_flush_user_tlb();
     return true;
 }
 
@@ -1418,15 +2472,29 @@ bool address_space_protect_user_page(struct address_space *as, uint64_t vaddr,
     if (!as || !user_address_valid(page))
         return false;
     pte = address_space_pte(as, page);
-    if (!pte || !(*pte & RELIEFNT_PAGE_BACKED)) return false;
-    entry = *pte;
+    if (!pte) return false;
+    entry = __atomic_load_n(pte, __ATOMIC_SEQ_CST);
+    bool swapped = !(entry & RELIEFNT_PAGE_PRESENT) && (entry & RELIEFNT_PAGE_SWAP);
+    if (!(entry & RELIEFNT_PAGE_USER) || (!swapped && !(entry & RELIEFNT_PAGE_BACKED)))
+        return false;
     if ((flags & RELIEFNT_PAGE_WRITABLE) && !(entry & RELIEFNT_PAGE_WRITABLE) &&
         !(entry & (RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_SHARED)))
         flags = (flags & ~RELIEFNT_PAGE_WRITABLE) | RELIEFNT_PAGE_COW;
-    flags |= entry & (RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_SHARED | RELIEFNT_PAGE_PWT |
-                      RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_PAT);
-    *pte = (entry & RELIEFNT_PHYS_ADDR_MASK) | RELIEFNT_PAGE_USER | flags |
-           ((flags & RELIEFNT_PAGE_PROTNONE) ? 0 : RELIEFNT_PAGE_PRESENT);
+    uint64_t replacement, observed;
+    do {
+        observed = entry;
+        uint64_t preserved = entry & (RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_SHARED |
+            RELIEFNT_PAGE_PWT | RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_PAT | 0x60ULL);
+        replacement = swapped ? RELIEFNT_PAGE_USER | RELIEFNT_PAGE_SWAP | flags |
+            (preserved & (RELIEFNT_PAGE_PWT | RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_PAT)) :
+            (entry & RELIEFNT_PHYS_ADDR_MASK) | RELIEFNT_PAGE_USER | flags | preserved |
+            ((flags & RELIEFNT_PAGE_PROTNONE) ? 0 : RELIEFNT_PAGE_PRESENT);
+    } while (!__atomic_compare_exchange_n(pte, &entry, replacement, false,
+                                           __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
+    entry = observed;
+    if (!swapped) note_dirty_leaf(entry);
+    if (((entry ^ *pte) & RELIEFNT_PAGE_DEVICE) && mm_context_device_changed)
+        mm_context_device_changed(as);
     x86_64_invlpg(page);
     paging_note_mm_change();
     return true;
@@ -1444,10 +2512,23 @@ uint64_t address_space_unmap_user_page(struct address_space *as, uint64_t vaddr)
     uint64_t entry;
     if (!as || !user_address_valid(page)) return 0;
     pte = address_space_pte(as, page);
-    if (!pte || !(*pte & RELIEFNT_PAGE_BACKED)) return 0;
+    if (!pte) return 0;
     entry = *pte;
-    *pte = 0;
+    if ((entry & RELIEFNT_PAGE_USER) && !(entry & RELIEFNT_PAGE_PRESENT) &&
+        (entry & RELIEFNT_PAGE_SWAP)) {
+        if (!mm_swap_record_remove) return 0;
+        *pte = 0;
+        x86_64_invlpg(page);
+        paging_note_mm_change();
+        mm_swap_record_remove(as, page);
+        return 0;
+    }
+    if (!(entry & RELIEFNT_PAGE_BACKED)) return 0;
+    entry = __atomic_exchange_n(pte, 0, __ATOMIC_SEQ_CST);
+    note_dirty_leaf(entry);
     if (as->user_page_count) --as->user_page_count;
+    if ((entry & RELIEFNT_PAGE_DEVICE) && mm_context_device_changed)
+        mm_context_device_changed(as);
     x86_64_invlpg(page);
     paging_note_mm_change();
     return entry & RELIEFNT_PHYS_ADDR_MASK;
@@ -1461,7 +2542,8 @@ uint64_t address_space_unmap_user_page(struct address_space *as, uint64_t vaddr)
 uint64_t address_space_user_page_phys(const struct address_space *as, uint64_t vaddr)
 {
     uint64_t *pte = address_space_pte(as, vaddr);
-    return pte && (*pte & RELIEFNT_PAGE_BACKED) ?
+    return pte && ((*pte & RELIEFNT_PAGE_PRESENT) || !(*pte & RELIEFNT_PAGE_SWAP)) &&
+           (*pte & RELIEFNT_PAGE_BACKED) ?
            (*pte & RELIEFNT_PHYS_ADDR_MASK) : 0;
 }
 
@@ -1513,17 +2595,87 @@ bool address_space_retry_mapped_user_page(const struct address_space *as,
     return true;
 }
 
-/** @brief Test whether a present user mapping allows writes without resolving COW.
+/** @brief Test whether a present user mapping logically allows writes without resolving COW.
  * @param as Address space, or NULL for an invalid mapping.
  * @param vaddr Address within the queried page.
- * @return True only for a present, user-accessible, writable page.
+ * @return True for a present user-writable leaf, including a shared cache
+ * first-write notification leaf; the latter remains hardware read-only.
  */
 bool address_space_user_page_writable(const struct address_space *as, uint64_t vaddr)
 {
     uint64_t *pte = address_space_pte(as, vaddr);
-    uint64_t required = RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_USER |
-                        RELIEFNT_PAGE_WRITABLE;
-    return pte && ((*pte & required) == required);
+    uint64_t required = RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_USER;
+    return pte && ((*pte & required) == required) &&
+           (*pte & (RELIEFNT_PAGE_WRITABLE | RELIEFNT_PAGE_WRITE_NOTIFY));
+}
+
+/** @brief Check effective write permission on all user page-table branches.
+ * @param as Address space pinned by the caller's execution ownership, nullable.
+ * @param vaddr Low canonical user byte address.
+ * @return True only when all three present user branch entries allow writes;
+ * large, absent and supervisor branches are rejected. No leaf is modified,
+ * no frame is retained and no allocator, provider or sleeping path is entered.
+ */
+static bool address_space_user_write_branches(const struct address_space *as, uint64_t vaddr)
+{
+    if (!as || !as->pml4 || !user_address_valid(vaddr)) return false;
+    const uint64_t required=RELIEFNT_PAGE_PRESENT|RELIEFNT_PAGE_USER|RELIEFNT_PAGE_WRITABLE;
+    uint64_t entry=__atomic_load_n(&as->pml4[(vaddr>>39)&511u],__ATOMIC_SEQ_CST);
+    if ((entry&required)!=required || (entry&PAGE_SIZE_FLAG)) return false;
+    uint64_t *table=table_from_entry(entry); if (!table) return false;
+    entry=__atomic_load_n(&table[(vaddr>>30)&511u],__ATOMIC_SEQ_CST);
+    if ((entry&required)!=required || (entry&PAGE_SIZE_FLAG)) return false;
+    table=table_from_entry(entry); if (!table) return false;
+    entry=__atomic_load_n(&table[(vaddr>>21)&511u],__ATOMIC_SEQ_CST);
+    return (entry&required)==required && !(entry&PAGE_SIZE_FLAG);
+}
+
+/** @brief Resolve an authorized shared-cache write or retry a stale translation.
+ * @param as Address space whose VMA and PTE lifetime the caller stabilizes with
+ * the execution writer; NULL is rejected. @param vaddr Faulting user address.
+ * @return True after notifying dirty before publishing a tracked writable leaf,
+ * or after locally invalidating an already-writable cache leaf; false on an
+ * ineligible branch, leaf or frame. Caller has validated a current writable
+ * shared-file VMA and ordinary present/write fault. The PTE owns the frame;
+ * cache lookup/notification takes the IRQ-safe cache lock, without allocation,
+ * provider I/O, sleeping or reference transfer. Concurrent hardware A/D-bit
+ * changes are tolerated by the atomic PTE update.
+ */
+bool address_space_shared_write_fault(struct address_space *as, uint64_t vaddr)
+{
+    uint64_t page=align_down(vaddr,PAGE_SIZE), *pte=address_space_pte(as,page);
+    if (!pte || !page_cache_note_write || !address_space_user_write_branches(as,page)) return false;
+    uint64_t entry=__atomic_load_n(pte,__ATOMIC_SEQ_CST);
+    const uint64_t required=RELIEFNT_PAGE_PRESENT|RELIEFNT_PAGE_USER|
+                            RELIEFNT_PAGE_SHARED;
+    const uint64_t excluded=RELIEFNT_PAGE_DEVICE|RELIEFNT_PAGE_COW|RELIEFNT_PAGE_PROTNONE;
+    if ((entry&required)!=required || (entry&excluded) ||
+        !page_cache_owns(entry&RELIEFNT_PHYS_ADDR_MASK)) return false;
+    uint64_t write_bits=entry&(RELIEFNT_PAGE_WRITABLE|RELIEFNT_PAGE_WRITE_NOTIFY);
+    if (write_bits==RELIEFNT_PAGE_WRITABLE) {
+        /* Another CPU committed the first write. Its PTE is already writable;
+         * invalidate this CPU's stale restrictive translation before retry. */
+        x86_64_invlpg(page); paging_note_mm_change(); return true;
+    }
+    if (write_bits!=RELIEFNT_PAGE_WRITE_NOTIFY) return false;
+    /* The frame remains pinned by the PTE under the execution writer. This
+     * commits known-dirty under cache_lock before any CPU sees writable PTE. */
+    page_cache_note_write(entry&RELIEFNT_PHYS_ADDR_MASK);
+#ifdef RELIEFNT_DIRTY_PROBE
+    /** @brief Test-only observation immediately before PTE publication.
+     * @param as Borrowed execution-owned address space. @param page User page.
+     * The fixture must not alter the PTE or transfer a frame reference.
+     */
+    extern void paging_test_before_shared_write_publish(struct address_space *as, uint64_t page);
+    paging_test_before_shared_write_publish(as,page);
+#endif
+    do {
+        if ((entry&(required|RELIEFNT_PAGE_WRITE_NOTIFY))!=(required|RELIEFNT_PAGE_WRITE_NOTIFY) ||
+            (entry&(excluded|RELIEFNT_PAGE_WRITABLE))) return false;
+    } while (!__atomic_compare_exchange_n(pte,&entry,
+                 (entry|RELIEFNT_PAGE_WRITABLE)&~RELIEFNT_PAGE_WRITE_NOTIFY,false,
+                 __ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST));
+    x86_64_invlpg(page); paging_note_mm_change(); return true;
 }
 
 /** @brief Test whether a user leaf is a borrowed device PFN mapping.
@@ -1570,6 +2722,7 @@ uint64_t address_space_user_resident_kib(const struct address_space *as)
                     uint64_t leaf = pt[si];
                     if ((leaf & RELIEFNT_PAGE_BACKED) &&
                         (leaf & RELIEFNT_PAGE_USER) &&
+                        ((leaf & RELIEFNT_PAGE_PRESENT) || !(leaf & RELIEFNT_PAGE_SWAP)) &&
                         !(leaf & RELIEFNT_PAGE_DEVICE)) ++pages;
                 }
             }
@@ -1671,7 +2824,7 @@ bool address_space_handle_cow_fault(struct address_space *as, uint64_t vaddr)
  */
 static uint64_t *kernel_shared_leaf(uint64_t address,bool create)
 {
-    uint64_t *pdpte=&kernel_pdpt[(address>>30)&511u];
+    uint64_t *pdpte=&kernel_shared_pdpt[(address>>30)&511u];
     bool new_pd=false;
     if(!(*pdpte&RELIEFNT_PAGE_PRESENT)) {
         if(!create) return NULL;
@@ -1728,20 +2881,32 @@ static bool io_page_address(uint64_t address)
 
 /** @brief Install a high device page UC/RW/NX without constructing a RAM alias.
  * @param address Valid aligned reserved device virtual page, currently absent.
- * @param physical Aligned representable physical BAR page beyond the direct map.
+ * @param physical Aligned representable physical BAR page with no RAM alias.
  * @return True or false; short map lock spans table allocation. The caller owns
  * the range and synchronizes all CPU TLBs before publication; no device RAM owner.
  */
 bool paging_io_map_page(uint64_t address, uint64_t physical)
 {
-    if (!nx_enabled || !io_page_address(address) ||
-        physical < RELIEFNT_KERNEL_DIRECT_MAP_SIZE ||
-        (physical & ~RELIEFNT_PHYS_ADDR_MASK)) return false;
+    if (mm_phys_is_ram(physical, PAGE_SIZE)) return false;
+    return paging_io_map_device_page(address,physical,RELIEFNT_PAGE_PCD|RELIEFNT_PAGE_PWT);
+}
+
+/** @brief Install one supervisor RW/NX DEVICE alias with an admitted policy.
+ * @param address Reserved aligned virtual page. @param physical Retained PFN.
+ * @param cache_bits Exact 4 KiB PWT/PCD/PAT flags. @return True after mapping.
+ * Caller retains physical backing, serializes policy and flushes TLBs before use.
+ */
+bool paging_io_map_device_page(uint64_t address,uint64_t physical,uint64_t cache_bits)
+{
+    const uint64_t cache_mask=RELIEFNT_PAGE_PWT|RELIEFNT_PAGE_PCD|RELIEFNT_PAGE_PAT;
+    if (!nx_enabled || !io_page_address(address) || (physical & (PAGE_SIZE - 1)) ||
+        !physical || !paging_phys_addressable(physical, PAGE_SIZE) ||
+        paging_kernel_direct_map_range(physical, PAGE_SIZE) || (cache_bits&~cache_mask)) return false;
     kernel_spin_lock(&mmio_lock);
     uint64_t *pte = kernel_shared_leaf(address, true);
     if (!pte || *pte) { kernel_spin_unlock(&mmio_lock); return false; }
     *pte = physical | RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE |
-        RELIEFNT_PAGE_NOEXEC | RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_PWT;
+        RELIEFNT_PAGE_NOEXEC | cache_bits;
     kernel_spin_unlock(&mmio_lock);
     return true;
 }
@@ -1768,7 +2933,7 @@ bool paging_io_unmap_range(uint64_t address, uint64_t bytes)
         *kernel_shared_leaf(address + offset, false) = 0;
     uint64_t retired = 0;
     for (uint64_t at = address; at < address + bytes;) {
-        uint64_t *pdpte = &kernel_pdpt[(at >> 30) & 511u];
+        uint64_t *pdpte = &kernel_shared_pdpt[(at >> 30) & 511u];
         if (*pdpte & RELIEFNT_PAGE_PRESENT) {
             uint64_t pd_phys = *pdpte & RELIEFNT_PHYS_ADDR_MASK;
             uint64_t *pd = mm_phys_to_virt(pd_phys);
@@ -1807,8 +2972,8 @@ bool paging_io_unmap_range(uint64_t address, uint64_t bytes)
  * module never requires patching existing process PML4s. Physical aliases
  * share the normal identity/direct-map leaves and are protected together. */
 #include <reliefnt/module_memory.h>
-_Static_assert((RELIEFNT_MODULE_BASE>>39)==(RELIEFNT_KERNEL_DIRECT_MAP_BASE>>39),
-               "module mappings must share the inherited kernel PML4 branch");
+_Static_assert(((RELIEFNT_MODULE_BASE>>39)&511u)==KERNEL_SHARED_PML4_INDEX,
+               "module mappings must use the shared module/device branch");
 _Static_assert(RELIEFNT_MODULE_BASE>=RELIEFNT_KERNEL_DIRECT_MAP_BASE+RELIEFNT_KERNEL_DIRECT_MAP_SIZE,
                "module window overlaps physical direct map");
 _Static_assert(((RELIEFNT_MODULE_END-1)>>39)==(RELIEFNT_MODULE_BASE>>39),
@@ -1832,7 +2997,9 @@ static bool module_page_address(uint64_t address)
 bool paging_module_map_page(uint64_t address,uint64_t physical,uint64_t *original_alias)
 {
     if(!nx_enabled || !module_page_address(address) || !physical ||
-       (physical&(PAGE_SIZE-1)) || !paging_kernel_direct_map_range(physical,PAGE_SIZE) ||
+       (physical&(PAGE_SIZE-1)) || physical < 0x100000ULL ||
+       (physical >= RELIEFNT_KERNEL_HOLE_START && physical < RELIEFNT_KERNEL_HOLE_END) ||
+       !paging_kernel_direct_map_range(physical,PAGE_SIZE) ||
        !original_alias) return false;
     kernel_spin_lock(&mmio_lock);
     for(uint32_t i=0;i<mmio_run_count;++i) if(physical>=mmio_runs[i].start && physical<mmio_runs[i].end) {
@@ -1911,7 +3078,7 @@ uint64_t paging_module_unmap_page(uint64_t address,uint64_t original_alias)
     }
     uint64_t physical=*pte&RELIEFNT_PHYS_ADDR_MASK;
     uint64_t *alias=mmio_existing_leaf(physical);
-    uint64_t *pdpte=&kernel_pdpt[(address>>30)&511u];
+    uint64_t *pdpte=&kernel_shared_pdpt[(address>>30)&511u];
     uint64_t pd_phys=*pdpte&RELIEFNT_PHYS_ADDR_MASK;
     uint64_t *pd=mm_phys_to_virt(pd_phys);
     uint64_t *pde=&pd[(address>>21)&511u];

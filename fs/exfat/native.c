@@ -95,8 +95,11 @@ static int exfat_native_statfs(struct storage_volume *volume,struct linux_statfs
  */
 static int exfat_native_put_inode(struct storage_volume *volume,const struct storage_node *node,bool unlinked)
 {
-    (void)volume;return unlinked ? exfat_free_clusters(node->first_cluster,
+    (void)volume;
+    int ret=unlinked ? exfat_free_clusters(node->first_cluster,
         !!(node->flags&STORAGE_NODE_FLAG_EXFAT_NOFAT),node->size) : 0;
+    if (!ret && unlinked) page_cache_forget_node(node);
+    return ret;
 }
 /** @brief Write an authorized retained native file after core writer admission.
  * @param volume Borrowed selected/pinned instance. @param node Actual mutable inode.
@@ -260,8 +263,12 @@ static int exfat_native_drop_new(struct storage_volume *volume,const struct stor
     (void)volume;struct storage_node found;struct exfat_dir_ref ref;
     int rc=exfat_find_in_dir_ref(parent->first_cluster,!!(parent->flags&STORAGE_NODE_FLAG_EXFAT_NOFAT),name,&found,&ref);
     if(!rc)rc=exfat_delete_entry(&ref);
-    if(!rc && !storage_inode_unlinked(node) && node->first_cluster>=2)
-        rc=exfat_free_clusters(node->first_cluster,!!(node->flags&STORAGE_NODE_FLAG_EXFAT_NOFAT),node->size);
+    if(!rc) {
+        bool retained=storage_inode_unlinked(node);
+        if(!retained && node->first_cluster>=2)
+            rc=exfat_free_clusters(node->first_cluster,!!(node->flags&STORAGE_NODE_FLAG_EXFAT_NOFAT),node->size);
+        if(!rc && !retained)page_cache_forget_node(node);
+    }
     return rc;
 }
 static const struct storage_cluster_ops exfat_native_clusters={

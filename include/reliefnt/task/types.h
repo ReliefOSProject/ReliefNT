@@ -76,6 +76,7 @@ static inline uint32_t sched_exec_argument_limit(uint64_t stack_limit)
 #define TASK_VMA_FLAG_SYSV_SHM 0x00000400u
 #define TASK_VMA_FLAG_VDSO    0x00000800u
 #define TASK_VMA_FLAG_VVAR    0x00001000u
+#define TASK_VMA_FLAG_LOCKONFAULT 0x00002000u
 
 #define TASK_VMA_PROT_READ  0x1u
 #define TASK_VMA_PROT_WRITE 0x2u

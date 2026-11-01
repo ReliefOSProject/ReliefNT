@@ -67,11 +67,29 @@ uint32_t sched_task_vma_capacity(const struct task *task)
 void sched_task_vma_release(struct task *task)
 {
     if (!task) return;
+    /* The address space has already retired. Count every VMA reference first,
+     * so split ranges of the last view remain typed through its final callback. */
+    for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
+        struct task_vma *vma = sched_task_vma_at(task, i);
+        if (vma && vma->device_mapping) device_mapping_retire_begin(vma->device_mapping);
+    }
+    for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
+        struct task_vma *vma = sched_task_vma_at(task, i);
+        if (vma && vma->device_mapping && vma->used && vma->end > vma->start)
+            device_mapping_release_range(vma->device_mapping, vma->device_map_offset,
+                                         vma->end - vma->start, true);
+    }
+    for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
+        struct task_vma *vma = sched_task_vma_at(task, i);
+        if (vma && vma->device_mapping) device_mapping_retire_end(vma->device_mapping);
+    }
     for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
         struct task_vma *vma = sched_task_vma_at(task, i);
         if (vma) {
             sysv_shm_vma_release(task, vma);
-            if (vma->device_mapping) device_mapping_put(vma->device_mapping);
+            if (vma->device_mapping) {
+                device_mapping_put(vma->device_mapping);
+            }
             if (vma->mapping_file) task_file_put(vma->mapping_file);
             vfs_exec_source_put(vma->exec_source);
             (void)storage_inode_put(vma->inode);
@@ -103,6 +121,9 @@ int sched_task_vma_retain_device(struct task_vma *dst,const struct task_vma *src
 {
     if(!dst || !src || !src->device_mapping)return 0;
     int rc=device_mapping_get(src->device_mapping);if(rc)return rc;
+    rc=device_mapping_retain_range(src->device_mapping,src->device_map_offset,
+                                   src->end-src->start);
+    if(rc){device_mapping_put(src->device_mapping);return rc;}
     dst->device_mapping=src->device_mapping;dst->device_map_offset=src->device_map_offset;return 0;
 }
 

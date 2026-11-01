@@ -1,4 +1,16 @@
 #include "../internal.h"
+#include <reliefnt/swap.h>
+
+/** @brief Prepare one bounded argv/envp operand before any loader lock.
+ * @param address User operand. @param length At most one string page or word.
+ * @return Zero, prerequisite contention, or the existing user-access error.
+ */
+static int exec_prepare_user(uint64_t address, uint64_t length)
+{
+    int ret = swap_prepare_user_range(sched_current_task(), address, length, false);
+    if (ret == SWAP_STORAGE_CONTENDED) return KERNEL_SYSCALL_SWAP_CONTENDED;
+    return ret < 0 ? -RELIEFOS_EFAULT : 0;
+}
 
 /** @brief Release all staging allocations, including partially built vectors.
  * @param params Initialized staging object, reset to zero on return.
@@ -51,8 +63,10 @@ static int allocate_exec_params(struct exec_params_kernel *params, uint32_t argc
 static int exec_user_pointer(uint64_t vector, uint32_t index, uint64_t *value)
 {
     uint64_t offset = (uint64_t)index * sizeof(uint64_t);
-    if (vector > UINT64_MAX - offset || !user_range_ok(vector + offset, sizeof(*value)))
-        return -RELIEFOS_EFAULT;
+    if (vector > UINT64_MAX - offset) return -RELIEFOS_EFAULT;
+    int ret = exec_prepare_user(vector + offset, sizeof(*value));
+    if (ret) return ret;
+    if (!user_range_ok(vector + offset, sizeof(*value))) return -RELIEFOS_EFAULT;
     __builtin_memcpy(value, (const void *)(uintptr_t)(vector + offset), sizeof(*value));
     return 0;
 }
@@ -106,6 +120,8 @@ static int copy_exec_string(uint64_t pointer, char *data, uint32_t cap, uint32_t
         uint64_t address = pointer + done;
         uint32_t chunk = 4096u - (uint32_t)(address & 4095u);
         if (chunk > cap - done) chunk = cap - done;
+        int ret = exec_prepare_user(address, chunk);
+        if (ret) return ret;
         if (!user_range_ok(address, chunk)) return -RELIEFOS_EFAULT;
         for (uint32_t i = 0; i < chunk; ++i) {
             char ch = ((const char *)(uintptr_t)address)[i];
@@ -152,6 +168,109 @@ static int copy_exec_vector_user(uint64_t vector, uint32_t count,
     return 0;
 }
 
+#ifdef CONFIG_SWAP
+/* One allocation owns both offset words and imported string bytes. Its cursor
+ * records only numeric user addresses; no user mapping survives a wait. */
+struct exec_import_snapshot {
+    uint64_t argv_ptr,envp_ptr,string_ptr;
+    uint32_t limit,phase,index,argc,envc,bytes,string_start,string_cap;
+    uint32_t offsets_capacity,bytes_capacity;
+    bool string_active;
+    uint32_t payload[];
+};
+
+/** @brief Grow a single scope-owned exec snapshot without losing its prefix.
+ * @param slot Owned scope slot. @param state Updated borrowed snapshot pointer.
+ * @param offsets Required offset count. @param bytes Required packed capacity.
+ * @return Zero or ENOMEM/E2BIG. The old snapshot remains owned on failure.
+ * Capacity grows geometrically and is bounded by the admitted argument limit.
+ */
+static int exec_import_reserve(struct task_lookup_path *slot,struct exec_import_snapshot **state,
+                               uint32_t offsets,uint32_t bytes)
+{
+    struct exec_import_snapshot *old=*state;
+    if(offsets<=old->offsets_capacity && bytes<=old->bytes_capacity)return 0;
+    if(offsets>old->limit/sizeof(char *) || bytes>old->limit)return -RELIEFOS_E2BIG;
+    uint32_t oc=old->offsets_capacity ? old->offsets_capacity : 8;
+    uint32_t bc=old->bytes_capacity ? old->bytes_capacity : 64;
+    while(oc<offsets)oc=oc>old->limit/sizeof(char *)/2 ? old->limit/sizeof(char *) : oc*2;
+    while(bc<bytes)bc=bc>old->limit/2 ? old->limit : bc*2;
+    size_t size=sizeof(*old)+(size_t)oc*sizeof(uint32_t)+(size_t)bc;
+    struct exec_import_snapshot *next=kernel_malloc(size);if(!next)return -RELIEFOS_ENOMEM;
+    *next=*old;next->offsets_capacity=oc;next->bytes_capacity=bc;
+    __builtin_memcpy(next->payload,old->payload,(size_t)(old->argc+old->envc)*sizeof(uint32_t));
+    __builtin_memcpy((uint8_t *)next->payload+(size_t)oc*sizeof(uint32_t),
+                     (uint8_t *)old->payload+(size_t)old->offsets_capacity*sizeof(uint32_t),old->bytes);
+    slot->name=(char *)next;kernel_free(old);*state=next;return 0;
+}
+
+/** @brief Import argv and envp in order, keeping each observed word and byte.
+ * @param task Current execution-owned caller with an armed exec scope.
+ * @param argv_ptr Original nullable argument vector. @param envp_ptr Environment.
+ * @param params Empty output owning final compact vectors on success.
+ * @return Zero, errno or private contention; the scope owns progress until
+ * common cancellation and no old user address is dereferenced on replay.
+ */
+static int exec_import_scoped(struct task *task,uint64_t argv_ptr,uint64_t envp_ptr,
+                              struct exec_params_kernel *params)
+{
+    struct task_lookup_path *slot=NULL;int rc=task_lookup_scope_next(task,&slot);
+    if(rc)return rc;
+    if(!slot)return -RELIEFOS_EINVAL;
+    struct exec_import_snapshot *s;
+    if(slot->name) {
+        if(slot->flags!=TASK_LOOKUP_EXEC_IMPORT_KIND)return -RELIEFOS_EINVAL;
+        s=(struct exec_import_snapshot *)slot->name;
+        if(s->argv_ptr!=argv_ptr || s->envp_ptr!=envp_ptr)return -RELIEFOS_EINVAL;
+    } else {
+        s=kernel_malloc(sizeof(*s));if(!s)return -RELIEFOS_ENOMEM;
+        *s=(struct exec_import_snapshot){.argv_ptr=argv_ptr,.envp_ptr=envp_ptr,
+            .limit=sched_exec_argument_limit(sched_task_limits(task)->stack.rlim_cur)};
+        slot->name=(char *)s;slot->flags=TASK_LOOKUP_EXEC_IMPORT_KIND;
+    }
+    while(s->phase<2) {
+        uint64_t vector=s->phase ? s->envp_ptr : s->argv_ptr;
+        if(!vector){++s->phase;s->index=0;continue;}
+        if(!s->string_active) {
+            uint64_t pointer;rc=exec_user_pointer(vector,s->index,&pointer);if(rc)return rc;
+            if(!pointer){++s->phase;s->index=0;continue;}
+            if(s->index>=SCHED_EXEC_ARG_MAX || s->index>=s->limit/sizeof(char *))return -RELIEFOS_E2BIG;
+            s->string_ptr=pointer;s->string_start=s->bytes;
+            s->string_cap=s->limit-s->bytes;
+            if(s->string_cap>SCHED_EXEC_STR_MAX)s->string_cap=SCHED_EXEC_STR_MAX;
+            s->string_active=true;
+        }
+        uint32_t done=s->bytes-s->string_start;
+        if(done>=s->string_cap)return -RELIEFOS_E2BIG;
+        if(s->string_ptr>UINT64_MAX-done)return -RELIEFOS_EFAULT;
+        uint64_t address=s->string_ptr+done;
+        uint32_t chunk=4096u-(uint32_t)(address&4095u);
+        if(chunk>s->string_cap-done)chunk=s->string_cap-done;
+        rc=exec_prepare_user(address,chunk);if(rc)return rc;
+        if(!user_range_ok(address,chunk))return -RELIEFOS_EFAULT;
+        rc=exec_import_reserve(slot,&s,s->argc+s->envc+1,s->bytes+chunk);if(rc)return rc;
+        char *data=(char *)(s->payload+s->offsets_capacity);
+        for(uint32_t i=0;i<chunk;++i) {
+            char ch=((const char *)(uintptr_t)address)[i];data[s->bytes++]=ch;
+            if(!ch) {
+                ((uint32_t *)s->payload)[s->argc+s->envc]=s->string_start;
+                if(s->phase)++s->envc;else ++s->argc;
+                ++s->index;s->string_active=false;break;
+            }
+        }
+    }
+    rc=allocate_exec_params(params,s->argc,s->envc,s->limit,s->bytes);if(rc)return rc;
+    uint32_t *offsets=(uint32_t *)s->payload;
+    char *data=(char *)(s->payload+s->offsets_capacity);
+    __builtin_memcpy(params->data,data,s->bytes);
+    for(uint32_t i=0;i<s->argc;++i)params->argv[i]=params->data+offsets[i];
+    for(uint32_t i=0;i<s->envc;++i)params->envp[i]=params->data+offsets[s->argc+i];
+    params->argv[s->argc]=NULL;params->envp[s->envc]=NULL;
+    params->argc=s->argc;params->envc=s->envc;params->data_len=s->bytes;
+    return 0;
+}
+#endif
+
 /** @brief Snapshot argv/envp in heap storage using the current Linux stack budget.
  * @param argv_ptr Nullable user argument vector.
  * @param envp_ptr Nullable user environment vector.
@@ -163,6 +282,10 @@ int copy_exec_params_from_user(uint64_t argv_ptr, uint64_t envp_ptr, struct exec
     if (!params) return -RELIEFOS_EINVAL;
     *params = (struct exec_params_kernel){0};
     struct task *task = sched_current_task();
+#ifdef CONFIG_SWAP
+    if(task && task->lookup_scope.armed)
+        return exec_import_scoped(task,argv_ptr,envp_ptr,params);
+#endif
     uint32_t limit = sched_exec_argument_limit(task ? sched_task_limits(task)->stack.rlim_cur : 8u*1024u*1024u);
     uint32_t argc, envc, bytes = 0;
     int ret = count_exec_vector(argv_ptr, limit, &argc, &bytes);

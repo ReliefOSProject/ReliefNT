@@ -1,101 +1,82 @@
 #include "memory_internal.h"
 
-static int syscall_mm_lock_range(uint64_t addr, uint64_t len, bool locked);
+struct retired_user_leaf {
+    uint64_t phys, offset;
+    struct device_mapping *mapping;
+    bool device, final_put;
+};
 
+/** @brief Release a flushed batch, grouping adjacent DEVICE page owners.
+ * @param retired Backed leaves whose translations were synchronously retired.
+ * @param count Number of initialized entries. No VMA pointer survives this call.
+ */
+static void task_release_retired_leaves(struct retired_user_leaf *retired,unsigned count)
+{
+    for(unsigned i=0;i<count;) {
+        if(retired[i].device) {
+            unsigned end=i+1;
+            while(end<count && retired[end].device &&
+                  retired[end].mapping==retired[i].mapping &&
+                  retired[end].final_put==retired[i].final_put &&
+                  retired[end].offset==retired[i].offset+(uint64_t)(end-i)*PAGE_SIZE)
+                ++end;
+            device_mapping_release_range(retired[i].mapping,retired[i].offset,
+                                         (uint64_t)(end-i)*PAGE_SIZE,retired[i].final_put);
+            i=end;continue;
+        }
+        if(page_cache_owns(retired[i].phys))page_cache_release(retired[i].phys);
+        else mm_free_page(retired[i].phys);
+        ++i;
+    }
+}
 
 /** @brief Remove only backed user leaves in a virtual interval and release their owners.
  * @param task User task whose address space is modified; NULL is ignored.
  * @param start Inclusive first virtual byte to unmap.
  * @param end Exclusive virtual range end.
- * @return None. Backed leaves are traversed sparsely and remote user TLBs are
- *         synchronized once after any mapping was removed.
+ * @return None. Backed leaves are traversed sparsely in bounded batches;
+ *         each batch is synchronously retired before its owners are released.
  */
 void task_unmap_pages(struct task *task, uint64_t start, uint64_t end)
 {
     uint64_t cursor = start;
-    bool changed = false;
+    struct retired_user_leaf retired[32];
+    unsigned count = 0;
+    bool invalidated = false;
     if (!task || start >= end) return;
     while (cursor < end) {
         uint64_t page;
         uint64_t flags;
-        if (!address_space_user_page_next(sched_task_as(task), cursor, end,
-                                          &page, NULL, &flags)) break;
+        if (!address_space_user_entry_next(sched_task_as(task), cursor, end,
+                                           &page, NULL, &flags)) break;
         if (page >= end) break;
+        if (!invalidated) {
+            /* A suspended checked prefault may have visited this leaf before
+             * its lock policy was installed, including DONTNEED/truncate. */
+            mm_context_vma_changed(sched_task_as(task));
+            invalidated = true;
+        }
         struct task_vma *vma = task_vma_containing(task, page, page + PAGE_SIZE);
         uint64_t phys = address_space_unmap_user_page(sched_task_as(task), page);
         if (phys) {
-            changed = true;
-            if ((vma && (vma->flags & TASK_VMA_FLAG_DEVICE)) ||
-                (flags & RELIEFNT_PAGE_DEVICE)) {
-                /* Framebuffer mappings borrow reserved VRAM. */
-            } else if (page_cache_owns(phys)) {
-                page_cache_release(phys);
-            } else {
-                mm_free_page(phys);
-            }
+            retired[count++] = (struct retired_user_leaf){.phys=phys,
+                .offset=vma && vma->device_mapping ? vma->device_map_offset+page-vma->start : 0,
+                .mapping=vma ? vma->device_mapping : NULL,
+                .device=(vma && (vma->flags & TASK_VMA_FLAG_DEVICE)) ||
+                    (flags & RELIEFNT_PAGE_DEVICE),
+                .final_put=vma && start<=vma->start && end>=vma->end};
         }
         cursor = page + PAGE_SIZE;
-    }
-    if (changed) smp_flush_user_tlb();
-}
-
-static int syscall_mm_lock_range(uint64_t addr, uint64_t len, bool locked)
-{
-    struct task *task = sched_current_task();
-    uint64_t mapped_len, end;
-    bool found = false;
-    if (!task || task->kind != TASK_KIND_USER || !len ||
-        align_user_len(len, &mapped_len) < 0 || (addr & (PAGE_SIZE - 1ULL)) ||
-        addr < RELIEFNT_USER_BASE || addr >= RELIEFNT_USER_TOP ||
-        mapped_len > RELIEFNT_USER_TOP - addr) return -RELIEFOS_EINVAL;
-    end = addr + mapped_len;
-    for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
-        struct task_vma *vma = sched_task_vma_at(task, i);
-        if (!vma || !vma->used || vma->end <= addr || vma->start >= end) continue;
-        if (vma->start > addr || vma->end < end) return -RELIEFOS_ENOMEM;
-        vma->flags = locked ? (vma->flags | TASK_VMA_FLAG_LOCKED) :
-                              (vma->flags & ~TASK_VMA_FLAG_LOCKED);
-        found = true;
-    }
-    return found ? 0 : -RELIEFOS_ENOMEM;
-}
-
-int64_t syscall_mm_mlock(uint64_t addr, uint64_t len, uint64_t flags)
-{
-    if (flags & ~LINUX_MLOCK_ONFAULT) return -RELIEFOS_EINVAL;
-    return syscall_mm_lock_range(addr, len, true);
-}
-
-int64_t syscall_mm_munlock(uint64_t addr, uint64_t len)
-{
-    return syscall_mm_lock_range(addr, len, false);
-}
-
-int64_t syscall_mm_mlockall(uint64_t flags)
-{
-    struct task *task = sched_current_task();
-    if (!task || (flags & ~(uint64_t)(LINUX_MCL_CURRENT | LINUX_MCL_FUTURE | LINUX_MCL_ONFAULT)) ||
-        !(flags & (LINUX_MCL_CURRENT | LINUX_MCL_FUTURE))) return -RELIEFOS_EINVAL;
-    if (flags & LINUX_MCL_CURRENT) {
-        for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
-            struct task_vma *vma = sched_task_vma_at(task, i);
-            if (vma && vma->used) vma->flags |= TASK_VMA_FLAG_LOCKED;
+        if (count == sizeof(retired) / sizeof(retired[0])) {
+            smp_flush_user_tlb();
+            task_release_retired_leaves(retired,count);
+            count = 0;
         }
     }
-    task->mlockall_flags = (uint32_t)flags;
-    return 0;
-}
-
-int64_t syscall_mm_munlockall(void)
-{
-    struct task *task = sched_current_task();
-    if (!task) return -RELIEFOS_EINVAL;
-    for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
-        struct task_vma *vma = sched_task_vma_at(task, i);
-        if (vma && vma->used) vma->flags &= ~TASK_VMA_FLAG_LOCKED;
+    if (count) {
+        smp_flush_user_tlb();
+        task_release_retired_leaves(retired,count);
     }
-    task->mlockall_flags = 0;
-    return 0;
 }
 
 /** @brief Protect a covered user range while preserving split backing references.
@@ -103,8 +84,8 @@ int64_t syscall_mm_munlockall(void)
  * @param len Byte length rounded to pages; zero is a no-op.
  * @param prot Linux PROT bits bounded by every affected VMA's maximum access.
  * @return Zero or negative EINVAL/ENOMEM/EACCES/EOPNOTSUPP. Metadata slots are
- * reserved before PTE changes; device permission changes synchronously flush
- * remote user TLBs. No graph/module lock spans heap growth or backing release;
+ * reserved before PTE changes; device and shared-cache permission changes
+ * synchronously flush remote user TLBs. No graph/module lock spans heap growth or backing release;
  * successful splits acquire independent core references to the original lease.
  */
 int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
@@ -126,12 +107,18 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
      * VMAs with different attributes, but rejects a range containing a hole. */
     uint64_t cursor = addr;
     uint32_t split_count = 0;
-    bool device_tlb = false;
+    bool device_tlb = false, shared_cache_tlb = false, vma_changed = false;
     while (cursor < end) {
         struct task_vma *vma = task_vma_containing(task, cursor, cursor + PAGE_SIZE);
         if (!vma) return -RELIEFOS_ENOMEM;
         if (vma->device_mapping) device_tlb = true;
         if (prot & ~vma->max_prot) return -RELIEFOS_EACCES;
+#ifdef CONFIG_SWAP
+        if ((prot&LINUX_PROT_WRITE) &&
+            (vma->flags&(TASK_VMA_FLAG_FILE|TASK_VMA_FLAG_SHARED))==
+                (TASK_VMA_FLAG_FILE|TASK_VMA_FLAG_SHARED) &&
+            storage_inode_swap_active(vma->inode)) return -LINUX_ETXTBSY;
+#endif
         uint64_t piece_end = vma->end < end ? vma->end : end;
         /* Device mappings without split capability accept only a whole-VMA no-op change. */
         if ((vma->flags & TASK_VMA_FLAG_DEVICE) && (!vma->device_mapping || !device_mapping_info(vma->device_mapping)->can_split) &&
@@ -139,8 +126,11 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
             return -RELIEFOS_EOPNOTSUPP;
         }
         if (piece_end <= cursor) return -RELIEFOS_ENOMEM;
-        if (cursor > vma->start) ++split_count;
-        if (piece_end < vma->end) ++split_count;
+        if (vma->prot != prot) {
+            vma_changed = true;
+            if (cursor > vma->start) ++split_count;
+            if (piece_end < vma->end) ++split_count;
+        }
         cursor = piece_end;
     }
 
@@ -159,6 +149,9 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
         ++free_slots;
     }
 
+    /* A suspended lock walk must restart if these VMAs or PTEs change. */
+    bool revision_marked = vma_changed;
+    if (revision_marked) mm_context_vma_changed(sched_task_as(task));
     /* Apply the PTE change with each mapping's own device/cache attributes. */
     cursor = addr;
     bool pte_changed = false;
@@ -178,25 +171,51 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
         if (vma->flags & TASK_VMA_FLAG_DEVICE) page_flags |= RELIEFNT_PAGE_DEVICE;
         uint64_t page_cursor = cursor;
         while (page_cursor < piece_end) {
-            uint64_t page;
-            if (!address_space_user_page_next(sched_task_as(task), page_cursor,
-                                              piece_end, &page, NULL, NULL)) break;
+            uint64_t page, phys;
+            if (!address_space_user_entry_next(sched_task_as(task), page_cursor,
+                                               piece_end, &page, &phys, NULL)) break;
+            uint64_t old_flags = address_space_user_page_flags(sched_task_as(task), page);
+            uint64_t leaf_flags=page_flags;
+            if (phys &&
+                (vma->flags & (TASK_VMA_FLAG_FILE | TASK_VMA_FLAG_SHARED)) ==
+                    (TASK_VMA_FLAG_FILE | TASK_VMA_FLAG_SHARED) &&
+                !(vma->flags & (TASK_VMA_FLAG_DEVICE | TASK_VMA_FLAG_SYSV_SHM)) &&
+                !(vma->file_node.flags & STORAGE_NODE_FLAG_TMPFS) && page_cache_owns(phys)) {
+                shared_cache_tlb=true;
+                if (prot & LINUX_PROT_WRITE) {
+                    page_cache_mark_shared_writable(phys);
+                    leaf_flags=(leaf_flags&~RELIEFNT_PAGE_WRITABLE)|RELIEFNT_PAGE_WRITE_NOTIFY;
+                }
+            }
+            if (old_flags & RELIEFNT_PAGE_WRITE_NOTIFY) shared_cache_tlb=true;
             if (!address_space_protect_user_page(sched_task_as(task), page,
-                                                 page_flags)) {
+                                                 leaf_flags)) {
                 /* Earlier pages may already have changed. Revoke stale remote
-                 * DRM translations even though the range operation fails. */
-                if (device_tlb && pte_changed) smp_flush_user_tlb();
+                 * device and cache translations even if this operation fails. */
+                if ((device_tlb || shared_cache_tlb) && pte_changed) smp_flush_user_tlb();
                 return -RELIEFOS_EACCES;
+            }
+            /* PTEs can change even when VMA protection is equal (notably COW).
+             * No suspend, writer release or reentry-permitting callback occurs
+             * between this update and its mark. Hardware accessed/dirty bits
+             * are not lock-relevant. */
+            const uint64_t relevant = RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_USER |
+                RELIEFNT_PAGE_WRITABLE | RELIEFNT_PAGE_NOEXEC | RELIEFNT_PAGE_PROTNONE |
+                RELIEFNT_PAGE_COW | RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_SHARED | RELIEFNT_PAGE_WRITE_NOTIFY |
+                RELIEFNT_PAGE_PWT | RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_PAT;
+            if (!revision_marked && ((old_flags ^
+                address_space_user_page_flags(sched_task_as(task), page)) & relevant)) {
+                mm_context_vma_changed(sched_task_as(task));
+                revision_marked = true;
             }
             pte_changed = true;
             page_cursor = page + PAGE_SIZE;
         }
         cursor = piece_end;
     }
-    /* The page-table helper invalidates only the current CPU. Device protection
-     * changes must not return while a CLONE_VM peer can still write through a
-     * stale translation, so synchronously flush remote user TLBs first. */
-    if (device_tlb && pte_changed) smp_flush_user_tlb();
+    /* The page-table helper invalidates only the current CPU. Device and
+     * shared-cache protection changes synchronously flush remote user TLBs. */
+    if ((device_tlb || shared_cache_tlb) && pte_changed) smp_flush_user_tlb();
 
     /**
  * @brief A partial protection change needs independent VMA metadata. In particular, PT_GNU_RELRO protects only the GOT page while BSS in the same original load segment must remain writable and lazily mappable.
@@ -207,6 +226,10 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
         if (!vma) return -RELIEFOS_ENOMEM;
         struct task_vma original = *vma;
         uint64_t piece_end = original.end < end ? original.end : end;
+        if (original.prot == prot) {
+            cursor = piece_end;
+            continue;
+        }
         if (cursor > original.start) {
             struct task_vma *left = task_vma_free_slot(task);
             if (!left) return -RELIEFOS_ENOMEM;
@@ -266,6 +289,7 @@ int64_t syscall_mm_munmap(uint64_t addr, uint64_t len)
     uint64_t end;
     uint32_t split_count = 0;
     uint32_t free_slots = 0;
+    bool has_vma = false;
 
     if (!task || task->kind != TASK_KIND_USER || (start & (PAGE_SIZE - 1ULL)) != 0 ||
         start < RELIEFNT_USER_BASE || start >= RELIEFNT_USER_TOP) {
@@ -279,6 +303,8 @@ int64_t syscall_mm_munmap(uint64_t addr, uint64_t len)
      * interiors that need a right-hand metadata split. */
     for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
         struct task_vma *vma = sched_task_vma_at(task, i);
+        if (vma && vma->used && start < vma->end && end > vma->start)
+            has_vma = true;
         if (vma && vma->used && (vma->flags & TASK_VMA_FLAG_DEVICE) &&
             (!vma->device_mapping || !device_mapping_info(vma->device_mapping)->can_split) &&
             start < vma->end && end > vma->start &&
@@ -302,7 +328,23 @@ int64_t syscall_mm_munmap(uint64_t addr, uint64_t len)
         }
         ++free_slots;
     }
+    if (mm_shared_forget(sched_task_as(task), start, end) < 0)
+        return -RELIEFOS_ENOMEM;
+    if (has_vma) mm_context_vma_changed(sched_task_as(task));
+    /* All fully covered split VMAs are one retirement operation. Mark their
+     * owned references before releasing any flushed page policy, then clear
+     * all marks before a VMA put can invoke a provider callback. */
+    for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
+        struct task_vma *vma = sched_task_vma_at(task, i);
+        if (vma && vma->used && start <= vma->start && vma->end <= end)
+            device_mapping_retire_begin(vma->device_mapping);
+    }
     task_unmap_pages(task, start, end);
+    for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
+        struct task_vma *vma = sched_task_vma_at(task, i);
+        if (vma && vma->used && start <= vma->start && vma->end <= end)
+            device_mapping_retire_end(vma->device_mapping);
+    }
     for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
         struct task_vma *vma = sched_task_vma_at(task, i);
         if (!vma) continue;

@@ -8,6 +8,7 @@
 #include <reliefnt/driver_manager.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/usercopy.h>
+#include "usercopy.h"
 
 #define AUDIO_OSS_FILE_MAX 64U
 #define AUDIO_OSS_DEFAULT_RATE 48000U
@@ -544,6 +545,13 @@ int audio_oss_read(struct task *task, struct task_file *file,
         if (state->capture_tail_bytes) {
             uint32_t take = count - consumed < state->capture_tail_bytes
                 ? count - consumed : state->capture_tail_bytes;
+#ifdef CONFIG_SWAP
+            int prep = audio_user_prepare(task, (uintptr_t)(output + consumed), take, true);
+            if (prep) {
+                if (consumed) { state->read_bytes += consumed; return (int)consumed; }
+                return prep;
+            }
+#endif
             __builtin_memcpy(output + consumed, state->capture_tail, take);
             state->capture_tail_bytes -= take;
             for (uint32_t i = 0; i < state->capture_tail_bytes; ++i)
@@ -579,9 +587,12 @@ int audio_oss_read(struct task *task, struct task_file *file,
  * @return Accepted bytes or errno. Task context; partial frame tails remain
  * owned by this description, and v1 backpressure uses finite timer retries.
  */
-int audio_oss_write(struct task *task, struct task_file *file,
-                    const void *buffer, uint32_t count)
+static int audio_oss_write_buffer(struct task *task, struct task_file *file,
+                                  const void *buffer, uint32_t count, bool user_buffer)
 {
+#ifndef CONFIG_SWAP
+    (void)user_buffer;
+#endif
     if (task) audio_pcm_wait_remove(task);
     if (!file || !file->audio_oss_file || !file->audio_oss_file->used)
         return -EBADF;
@@ -608,6 +619,10 @@ int audio_oss_write(struct task *task, struct task_file *file,
                 if (chunk_bytes > sizeof(chunk)) chunk_bytes = sizeof(chunk);
                 chunk_bytes -= chunk_bytes % frame_bytes;
                 uint32_t chunk_frames = chunk_bytes / frame_bytes;
+#ifdef CONFIG_SWAP
+                int prep = audio_user_prepare(user_buffer ? task : NULL, (uintptr_t)(input + consumed), chunk_bytes, false);
+                if (prep) return consumed ? (int)consumed : prep;
+#endif
                 __builtin_memcpy(chunk, input + consumed, chunk_bytes);
                 long frames = audio_pcm_transfer(state->playback_pcm, chunk,
                                                  chunk_frames);
@@ -642,6 +657,10 @@ int audio_oss_write(struct task *task, struct task_file *file,
                 frame_from_tail = 1;
                 uint32_t need = frame_bytes - state->tail_bytes;
                 uint32_t take = count - consumed < need ? count - consumed : need;
+#ifdef CONFIG_SWAP
+                int prep = audio_user_prepare(user_buffer ? task : NULL, (uintptr_t)(input + consumed), take, false);
+                if (prep) return consumed ? (int)consumed : prep;
+#endif
                 __builtin_memcpy(state->tail + state->tail_bytes, input + consumed, take);
                 state->tail_bytes += take;
                 consumed += take;
@@ -649,11 +668,19 @@ int audio_oss_write(struct task *task, struct task_file *file,
                 __builtin_memcpy(frame, state->tail, frame_bytes);
                 state->tail_bytes = 0;
             } else if (count - consumed < frame_bytes) {
+#ifdef CONFIG_SWAP
+                int prep = audio_user_prepare(user_buffer ? task : NULL, (uintptr_t)(input + consumed), count - consumed, false);
+                if (prep) return consumed ? (int)consumed : prep;
+#endif
                 __builtin_memcpy(state->tail, input + consumed, count - consumed);
                 state->tail_bytes = count - consumed;
                 consumed = count;
                 break;
             } else {
+#ifdef CONFIG_SWAP
+                int prep = audio_user_prepare(user_buffer ? task : NULL, (uintptr_t)(input + consumed), frame_bytes, false);
+                if (prep) return consumed ? (int)consumed : prep;
+#endif
                 __builtin_memcpy(frame, input + consumed, frame_bytes);
                 frame_from_input = frame_bytes;
             }
@@ -701,6 +728,10 @@ int audio_oss_write(struct task *task, struct task_file *file,
             if(chunk>RELIEFOS_AUDIO_IO_SLICE_BYTES)chunk=RELIEFOS_AUDIO_IO_SLICE_BYTES;
             if(chunk>capacity-queued)chunk=capacity-queued;
             chunk-=chunk%frame_bytes;
+#ifdef CONFIG_SWAP
+            int prep = audio_user_prepare(user_buffer ? task : NULL, (uintptr_t)(input + consumed), chunk, false);
+            if (prep) return consumed ? (int)consumed : prep;
+#endif
             uint32_t status;
             long written=driver_manager_audio_write_bound(state->legacy_generation,
                 input+consumed,chunk,&status);
@@ -718,6 +749,10 @@ int audio_oss_write(struct task *task, struct task_file *file,
         if (state->tail_bytes) {
             uint32_t need = frame_bytes - state->tail_bytes;
             uint32_t take = count - consumed < need ? count - consumed : need;
+#ifdef CONFIG_SWAP
+            int prep = audio_user_prepare(user_buffer ? task : NULL, (uintptr_t)(input + consumed), take, false);
+            if (prep) return consumed ? (int)consumed : prep;
+#endif
             __builtin_memcpy(state->tail + state->tail_bytes, input + consumed, take);
             state->tail_bytes += take;
             consumed += take;
@@ -725,11 +760,19 @@ int audio_oss_write(struct task *task, struct task_file *file,
             __builtin_memcpy(frame, state->tail, frame_bytes);
             state->tail_bytes = 0;
         } else if (count - consumed < frame_bytes) {
+#ifdef CONFIG_SWAP
+            int prep = audio_user_prepare(user_buffer ? task : NULL, (uintptr_t)(input + consumed), count - consumed, false);
+            if (prep) return consumed ? (int)consumed : prep;
+#endif
             __builtin_memcpy(state->tail, input + consumed, count - consumed);
             state->tail_bytes = count - consumed;
             consumed = count;
             break;
         } else {
+#ifdef CONFIG_SWAP
+            int prep = audio_user_prepare(user_buffer ? task : NULL, (uintptr_t)(input + consumed), frame_bytes, false);
+            if (prep) return consumed ? (int)consumed : prep;
+#endif
             __builtin_memcpy(frame, input + consumed, frame_bytes);
             frame_from_input = frame_bytes;
         }
@@ -765,10 +808,31 @@ int audio_oss_write(struct task *task, struct task_file *file,
     return (int)consumed;
 }
 
-/** @brief Validate and copy one OSS integer ioctl argument. */
-static int audio_oss_arg(uint64_t address, int **out)
+int audio_oss_write(struct task *task, struct task_file *file,
+                    const void *buffer, uint32_t count)
 {
-    if (!address || !user_range_writable(address, sizeof(int))) return -EFAULT;
+    return audio_oss_write_buffer(task, file, buffer, count, true);
+}
+
+/** @brief Prepare an OSS ioctl output before accessing it or changing state.
+ * @param task Current task, nullable for a kernel-side probe. @param address
+ * User operand. @param length Actual fixed output bytes, at most 32 KiB.
+ * @return Zero, EFAULT, or prerequisite contention. Execution writer held,
+ * no provider or device spinlock held; this does not retain a user pointer.
+ */
+static int audio_oss_output(struct task *task, uint64_t address, uint32_t length)
+{
+    if (!address) return -EFAULT;
+    int prep = audio_user_prepare(task, address, length, true);
+    if (prep) return prep;
+    return user_range_writable(address, length) ? 0 : -EFAULT;
+}
+
+/** @brief Validate an OSS integer ioctl argument before reading or writing it. */
+static int audio_oss_arg(struct task *task, uint64_t address, int **out)
+{
+    int ret = audio_oss_output(task, address, sizeof(int));
+    if (ret) return ret;
     if (out) *out = (int *)(uintptr_t)address;
     return 0;
 }
@@ -782,7 +846,6 @@ static int audio_oss_arg(uint64_t address, int **out)
 int audio_oss_ioctl(struct task *task, struct task_file *file,
                     uint64_t request, uint64_t address)
 {
-    (void)task;
     if (!file || !file->audio_oss_file || !file->audio_oss_file->used)
         return -EBADF;
     struct audio_oss_file *state = file->audio_oss_file;
@@ -840,7 +903,7 @@ int audio_oss_ioctl(struct task *task, struct task_file *file,
             __builtin_memset(silence, state->format == AFMT_U8 ? 0x80 : 0, sizeof(silence));
             while (padding) {
                 uint32_t count = padding < sizeof(silence) ? padding : sizeof(silence);
-                int written = audio_oss_write(task, &blocking, silence, count);
+                int written = audio_oss_write_buffer(task, &blocking, silence, count, false);
                 if (written <= 0 || written == KERNEL_SYSCALL_BLOCKED) return written;
                 padding -= (uint32_t)written;
             }
@@ -870,12 +933,12 @@ int audio_oss_ioctl(struct task *task, struct task_file *file,
         file->flags |= RELIEFOS_O_NONBLOCK;
         return 0;
     case SNDCTL_DSP_GETFMTS:
-        ret = audio_oss_arg(address, &value);
+        ret = audio_oss_arg(task, address, &value);
         if (ret) return ret;
         *value = audio_oss_core_oss_formats(state);
         return 0;
     case SNDCTL_DSP_GETCAPS:
-        ret = audio_oss_arg(address, &value);
+        ret = audio_oss_arg(task, address, &value);
         if (ret) return ret;
         *value = state->legacy_generation ? 0 : DSP_CAP_TRIGGER;
         if ((state->direction_flags & (PCM_ENABLE_INPUT | PCM_ENABLE_OUTPUT)) ==
@@ -886,13 +949,13 @@ int audio_oss_ioctl(struct task *task, struct task_file *file,
         }
         return 0;
     case SNDCTL_DSP_GETBLKSIZE:
-        ret = audio_oss_arg(address, &value);
+        ret = audio_oss_arg(task, address, &value);
         if (ret) return ret;
         uint32_t frame_bytes = audio_oss_sample_bytes(state->format) * state->channels;
         *value = (int)(state->fragment_bytes / frame_bytes * frame_bytes);
         return 0;
     case SNDCTL_DSP_SETFMT: {
-        ret = audio_oss_arg(address, &value);
+        ret = audio_oss_arg(task, address, &value);
         if (ret) return ret;
         int requested = *value;
         if (requested == AFMT_QUERY) {
@@ -913,7 +976,7 @@ int audio_oss_ioctl(struct task *task, struct task_file *file,
         return 0;
     }
     case SNDCTL_DSP_SPEED: {
-        ret = audio_oss_arg(address, &value);
+        ret = audio_oss_arg(task, address, &value);
         if (ret) return ret;
         if (*value <= 0) {
             *value = (int)state->rate;
@@ -954,7 +1017,7 @@ int audio_oss_ioctl(struct task *task, struct task_file *file,
     }
     case SNDCTL_DSP_STEREO:
     case SNDCTL_DSP_CHANNELS: {
-        ret = audio_oss_arg(address, &value);
+        ret = audio_oss_arg(task, address, &value);
         if (ret) return ret;
         if (request == SNDCTL_DSP_CHANNELS && *value == 0) {
             *value = (int)state->channels;
@@ -980,17 +1043,17 @@ int audio_oss_ioctl(struct task *task, struct task_file *file,
         return 0;
     }
     case SOUND_PCM_READ_CHANNELS:
-        ret = audio_oss_arg(address, &value);
+        ret = audio_oss_arg(task, address, &value);
         if (ret) return ret;
         *value = (int)state->channels;
         return 0;
     case SOUND_PCM_READ_RATE:
-        ret = audio_oss_arg(address, &value);
+        ret = audio_oss_arg(task, address, &value);
         if (ret) return ret;
         *value = (int)state->rate;
         return 0;
     case SNDCTL_DSP_SETFRAGMENT: {
-        ret = audio_oss_arg(address, &value);
+        ret = audio_oss_arg(task, address, &value);
         if (ret) return ret;
         uint32_t encoded = (uint32_t)*value;
         uint32_t exponent = encoded & 0xffffU;
@@ -1015,7 +1078,8 @@ int audio_oss_ioctl(struct task *task, struct task_file *file,
         return 0;
     }
     case SNDCTL_DSP_GETOSPACE: {
-        if (!address || !user_range_writable(address, sizeof(struct audio_buf_info))) return -EFAULT;
+        ret = audio_oss_output(task, address, sizeof(struct audio_buf_info));
+        if (ret) return ret;
         if ((state->trigger & PCM_ENABLE_OUTPUT) &&
             !state->legacy_generation) {
             ret = audio_oss_pcm_prepare(state, AUDIO_PLAYBACK);
@@ -1036,7 +1100,8 @@ int audio_oss_ioctl(struct task *task, struct task_file *file,
     }
     case SNDCTL_DSP_GETISPACE: {
         if (state->legacy_generation) return -ENOTTY;
-        if (!address || !user_range_writable(address, sizeof(struct audio_buf_info))) return -EFAULT;
+        ret = audio_oss_output(task, address, sizeof(struct audio_buf_info));
+        if (ret) return ret;
         if ((state->trigger & PCM_ENABLE_INPUT) &&
             !state->legacy_generation) {
             ret = audio_oss_pcm_prepare(state, AUDIO_CAPTURE);
@@ -1052,16 +1117,16 @@ int audio_oss_ioctl(struct task *task, struct task_file *file,
         return 0;
     }
     case SNDCTL_DSP_GETTRIGGER:
-        ret = audio_oss_arg(address, &value);
+        ret = audio_oss_arg(task, address, &value);
         if (ret) return ret;
         *value = (int)state->trigger;
         return 0;
     case SNDCTL_DSP_SETTRIGGER:
         if (state->legacy_generation) {
-            ret=audio_oss_arg(address,&value);if(ret)return ret;
+            ret=audio_oss_arg(task, address,&value);if(ret)return ret;
             return *value==PCM_ENABLE_OUTPUT?0:-ENOTTY;
         }
-        ret = audio_oss_arg(address, &value);
+        ret = audio_oss_arg(task, address, &value);
         if (ret) return ret;
         if (*value & ~(PCM_ENABLE_INPUT | PCM_ENABLE_OUTPUT)) return -EINVAL;
         uint32_t old_trigger = state->trigger;
@@ -1109,13 +1174,14 @@ int audio_oss_ioctl(struct task *task, struct task_file *file,
             audio_oss_caps(state, AUDIO_CAPTURE, &capture) < 0) return -EIO;
         return 0;
     case SNDCTL_DSP_GETODELAY:
-        ret = audio_oss_arg(address, &value);
+        ret = audio_oss_arg(task, address, &value);
         if (ret) return ret;
         *value = (int)audio_oss_queue(state);
         return 0;
     case SNDCTL_DSP_GETOPTR: {
         if (state->legacy_generation) return -ENOTTY;
-        if (!address || !user_range_writable(address, sizeof(count_info))) return -EFAULT;
+        ret = audio_oss_output(task, address, sizeof(count_info));
+        if (ret) return ret;
         count_info *info = (count_info *)(uintptr_t)address;
         if (state->playback_pcm && audio_oss_pcm_count(state->playback_pcm,
                                                        state->fragment_bytes,
@@ -1134,7 +1200,8 @@ int audio_oss_ioctl(struct task *task, struct task_file *file,
     }
     case SNDCTL_DSP_GETIPTR:
         if (state->legacy_generation) return -ENOTTY;
-        if (!address || !user_range_writable(address, sizeof(count_info))) return -EFAULT;
+        ret = audio_oss_output(task, address, sizeof(count_info));
+        if (ret) return ret;
         count_info *info = (count_info *)(uintptr_t)address;
         if (state->capture_pcm && audio_oss_pcm_count(state->capture_pcm,
                                                       state->fragment_bytes,

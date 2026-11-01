@@ -1,5 +1,8 @@
 #include "memory.h"
 #include "drm_internal.h"
+#ifdef CONFIG_SWAP
+#include "vmwgfx/execbuf_internal.h"
+#endif
 
 #include <drm/drm_mode.h>
 #include <linux/errno.h>
@@ -156,7 +159,10 @@ static void drm_kms_fb_get(struct drm_kms_fb *fb)
  * @param fb Owned framebuffer reference, or NULL.
  * Execution-owned task context under independent caller pin; final surface/BO/heap/module release occurs outside graphics locks.
  */
-static void drm_kms_fb_put(struct drm_kms_fb *fb)
+#ifndef CONFIG_SWAP
+static
+#endif
+void drm_kms_fb_put(struct drm_kms_fb *fb)
 {
     if (!fb || !fb->references || --fb->references) return;
     if (fb->surface) drm_vmwgfx_surface_put(fb->surface);
@@ -543,6 +549,7 @@ static void drm_kms_drop_active(void)
     drm_kms_maybe_restore_framebuffer();
 }
 
+#ifndef CONFIG_SWAP
 static int drm_kms_get_resources(struct task *task, struct drm_file *file,
                                  struct drm_mode_card_res *resources)
 {
@@ -594,6 +601,98 @@ static int drm_kms_get_resources(struct task *task, struct drm_file *file,
     }
     return 0;
 }
+#else
+/** @brief Detach a membership reservation while its original file is pinned.
+ * @param continuation Owned enumeration continuation, nullable. Never touches
+ * the file after detaching; later queued cursor destruction needs no OFD.
+ */
+void drm_kms_enum_unreserve(struct drm_vmwgfx_task_continuation *continuation)
+{
+    if(!continuation || continuation->kind!=DRM_VMW_CONT_KMS_ENUM)return;
+    struct drm_file *file=continuation->file;
+    if(file && file->kms_enumeration==continuation)file->kms_enumeration=NULL;
+    continuation->file=NULL;
+}
+
+/** @brief Release an enumeration after copying its final result or fault.
+ * @param task Current owner. @param continuation Detached state and cursor.
+ * Reservation removal precedes all object release and eventual OFD put.
+ */
+static void drm_kms_enum_finish(struct task *task,struct drm_vmwgfx_task_continuation *continuation)
+{
+    drm_kms_enum_unreserve(continuation);
+    task->drm_vmwgfx_continuation=NULL;
+    drm_vmwgfx_continuation_release(continuation);
+}
+
+/** @brief Continue an owned, stable enumeration without replaying copied IDs.
+ * @param task Current owner. @param file Retained original DRM file.
+ * @param resources Kernel copy of the original request/reply.
+ * @param command Original ioctl. @param user_argument Original user pointer.
+ * @return Zero, errno or private contention. The file membership reservation
+ * excludes same-file add/remove across waits; an owned next-node reference,
+ * numeric copy cursor and bounded original metadata survive the boundary.
+ */
+static int drm_kms_get_resources(struct task *task,struct drm_file *file,
+                                struct drm_mode_card_res *resources,
+                                uint32_t command,uint64_t user_argument)
+{
+    struct drm_vmwgfx_task_continuation *state=task->drm_vmwgfx_continuation;
+    if(!state || state->kind!=DRM_VMW_CONT_KMS_ENUM ||
+       !drm_vmwgfx_continuation_matches(state,task,task->syscall_file,file,command,user_argument)) {
+        const struct framebuffer *display;
+        if(!drm_kms_framebuffer_ready(&display))return -LINUX_ENODEV;
+        state=drm_async_alloc(sizeof(*state));if(!state)return -LINUX_ENOMEM;
+        *state=(struct drm_vmwgfx_task_continuation){.kind=DRM_VMW_CONT_KMS_ENUM,
+            .enum_request=*resources,.enum_output=*resources};
+        drm_vmwgfx_continuation_set_key(state,task,file,command,user_argument);
+        uint32_t count=0;
+        for(struct drm_kms_fb *fb=file->kms_fbs;fb;fb=fb->next)++count;
+        state->enum_output.count_fbs=count;state->enum_output.count_crtcs=1;
+        state->enum_output.count_connectors=1;state->enum_output.count_encoders=1;
+        state->enum_output.min_width=1;state->enum_output.max_width=display->width;
+        state->enum_output.min_height=1;state->enum_output.max_height=display->height;
+        state->enum_limit=state->enum_request.count_fbs<count ? state->enum_request.count_fbs : count;
+        if(state->enum_limit){state->enum_next=file->kms_fbs;drm_kms_fb_get(state->enum_next);}
+        file->kms_enumeration=state;task->drm_vmwgfx_continuation=state;
+    }
+    *resources=state->enum_output;
+    while(state->enum_done<state->enum_limit) {
+        struct drm_kms_fb *fb=state->enum_next;
+        if(!fb){drm_kms_enum_finish(task,state);return -LINUX_EIO;}
+        uint64_t offset=(uint64_t)state->enum_done*sizeof(fb->id);
+        uint64_t pointer=state->enum_request.fb_id_ptr;
+        if(offset>UINT64_MAX-pointer){drm_kms_enum_finish(task,state);return -LINUX_EFAULT;}
+        pointer+=offset;
+        if(drm_user_prepare(task,pointer,sizeof(fb->id),true)==KERNEL_SYSCALL_SWAP_CONTENDED)
+            return KERNEL_SYSCALL_SWAP_CONTENDED;
+        if(user_copy_to_task(task,pointer,&fb->id,sizeof(fb->id))<0) {
+            drm_kms_enum_finish(task,state);return -LINUX_EFAULT;
+        }
+        ++state->enum_done;
+        struct drm_kms_fb *next=state->enum_done<state->enum_limit ? fb->next : NULL;
+        if(next)drm_kms_fb_get(next);
+        state->enum_next=next;drm_kms_fb_put(fb);
+    }
+    const uint64_t pointers[]={state->enum_request.crtc_id_ptr,state->enum_request.connector_id_ptr,
+                               state->enum_request.encoder_id_ptr};
+    const uint32_t capacities[]={state->enum_request.count_crtcs,state->enum_request.count_connectors,
+                                 state->enum_request.count_encoders};
+    const uint32_t ids[]={DRM_KMS_CRTC_ID,DRM_KMS_CONNECTOR_ID,DRM_KMS_ENCODER_ID};
+    while(state->enum_phase<3) {
+        uint32_t i=state->enum_phase;
+        if(capacities[i]) {
+            if(drm_user_prepare(task,pointers[i],sizeof(ids[i]),true)==KERNEL_SYSCALL_SWAP_CONTENDED)
+                return KERNEL_SYSCALL_SWAP_CONTENDED;
+            if(user_copy_to_task(task,pointers[i],&ids[i],sizeof(ids[i]))<0) {
+                drm_kms_enum_finish(task,state);return -LINUX_EFAULT;
+            }
+        }
+        ++state->enum_phase;
+    }
+    drm_kms_enum_finish(task,state);return 0;
+}
+#endif
 
 static int drm_kms_get_connector(struct task *task,
                                  struct drm_mode_get_connector *connector)
@@ -608,6 +707,17 @@ static int drm_kms_get_connector(struct task *task,
     uint64_t encoder_ptr = connector->encoders_ptr;
     uint64_t props_ptr = connector->props_ptr;
     uint64_t prop_values_ptr = connector->prop_values_ptr;
+#ifdef CONFIG_SWAP
+    bool first_ready=true;
+    if(mode_capacity) {
+        int prep=drm_user_prepare(task,mode_ptr,sizeof(mode),true);
+        if(prep==KERNEL_SYSCALL_SWAP_CONTENDED)return prep;
+        first_ready=prep>=0 && user_range_writable(mode_ptr,sizeof(mode));
+    }
+    if(first_ready && encoder_capacity &&
+       drm_user_prepare(task,encoder_ptr,sizeof(uint32_t),true)==KERNEL_SYSCALL_SWAP_CONTENDED)
+        return KERNEL_SYSCALL_SWAP_CONTENDED;
+#endif
     *connector = (struct drm_mode_get_connector){
         .encoders_ptr = encoder_ptr,
         .modes_ptr = mode_ptr,
@@ -675,9 +785,14 @@ static int drm_kms_set_crtc(struct task *task, struct drm_file *file,
     if (!crtc->fb_id || crtc->x || crtc->y || crtc->count_connectors != 1u)
         return -LINUX_EINVAL;
     uint32_t connector_id;
+#ifdef CONFIG_SWAP
+    int import=drm_user_import(task,&connector_id,crtc->set_connectors_ptr,sizeof(connector_id));
+    if(import)return import;
+#else
     if (user_copy_from_task(task, &connector_id, crtc->set_connectors_ptr,
                             sizeof(connector_id)) < 0)
         return -LINUX_EFAULT;
+#endif
     if (connector_id != DRM_KMS_CONNECTOR_ID ||
         !drm_kms_mode_equal(&mode, &crtc->mode)) return -LINUX_EINVAL;
     /* Framebuffers are per-file, while the CRTC is device-global. A caller
@@ -800,9 +915,17 @@ static int drm_kms_dirtyfb(struct task *task, struct drm_file *file,
     if (fb->width != display->width || fb->height != display->height)
         return -LINUX_EINVAL;
     struct drm_clip_rect clips[DRM_MODE_FB_DIRTY_MAX_CLIPS];
+#ifdef CONFIG_SWAP
+    if(arg->num_clips) {
+        int import=drm_user_import(task,clips,arg->clips_ptr,
+                                   arg->num_clips*sizeof(clips[0]));
+        if(import)return import;
+    }
+#else
     if (arg->num_clips && user_copy_from_task(task, clips, arg->clips_ptr,
             (uint64_t)arg->num_clips * sizeof(clips[0])) < 0)
         return -LINUX_EFAULT;
+#endif
     uint32_t x1 = fb->width, y1 = fb->height, x2 = 0, y2 = 0;
     if (!arg->num_clips) {
         x1 = 0;
@@ -877,13 +1000,25 @@ static int drm_kms_get_object_properties(struct drm_mode_obj_get_properties *arg
 }
 
 int drm_kms_ioctl(struct task *task, struct drm_file *file, uint32_t command,
-                  void *data, uint32_t *created_fb_out)
+                  void *data, uint32_t *created_fb_out,uint64_t user_argument)
 {
     if (created_fb_out) *created_fb_out = 0;
     if (!file || !data) return -LINUX_EFAULT;
+#ifdef CONFIG_SWAP
+    if(file->kms_enumeration && file->kms_enumeration!=task->drm_vmwgfx_continuation &&
+       (command==DRM_IOCTL_MODE_GETRESOURCES || command==DRM_IOCTL_MODE_ADDFB ||
+        command==DRM_IOCTL_MODE_ADDFB2 || command==DRM_IOCTL_MODE_RMFB))
+        return KERNEL_SYSCALL_DRM_ENUM_WAIT;
+#else
+    (void)user_argument;
+#endif
     switch (command) {
     case DRM_IOCTL_MODE_GETRESOURCES:
+#ifdef CONFIG_SWAP
+        return drm_kms_get_resources(task,file,data,command,user_argument);
+#else
         return drm_kms_get_resources(task, file, data);
+#endif
     case DRM_IOCTL_MODE_GETCONNECTOR:
         return drm_kms_get_connector(task, data);
     case DRM_IOCTL_MODE_GETENCODER:

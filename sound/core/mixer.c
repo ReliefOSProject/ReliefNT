@@ -8,6 +8,7 @@
 #include <reliefnt/sched.h>
 #include <reliefnt/storage.h>
 #include <reliefnt/usercopy.h>
+#include "usercopy.h"
 
 #define AUDIO_MIXER_FILE_MAX 64U
 #define AUDIO_MIXER_NONE UINT32_MAX
@@ -378,10 +379,24 @@ int audio_mixer_ioctl(struct task *task, struct task_file *file,
     uint32_t direction = _IOC_DIR(request);
     int copy_in = (direction & _IOC_WRITE) != 0;
     int copy_out = (direction & _IOC_READ) != 0;
-    if ((copy_in && !user_range_ok(address, size)) ||
-        (copy_out && !user_range_writable(address, size))) return -EFAULT;
     union { max_align_t align; uint8_t bytes[1024]; } local = {0};
-    if (copy_in) __builtin_memcpy(local.bytes, (const void *)(uintptr_t)address, size);
+#ifdef CONFIG_SWAP
+    if (task && task->kind == TASK_KIND_USER) {
+        if (copy_in) {
+            int ret = audio_user_import(task, address, size, local.bytes);
+            if (ret) return ret;
+        }
+        if (copy_out) {
+            int ret = audio_user_prepare(task, address, size, true);
+            if (ret) return ret;
+        }
+    } else
+#endif
+    {
+        if ((copy_in && !user_range_ok(address, size)) ||
+            (copy_out && !user_range_writable(address, size))) return -EFAULT;
+        if (copy_in) __builtin_memcpy(local.bytes, (const void *)(uintptr_t)address, size);
+    }
     int ret = audio_mixer_ioctl_file(file->audio_mixer_file, request, local.bytes);
     if (!ret && copy_out) __builtin_memcpy((void *)(uintptr_t)address, local.bytes, size);
     return ret;

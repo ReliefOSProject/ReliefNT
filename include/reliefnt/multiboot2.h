@@ -19,6 +19,8 @@
 #define MULTIBOOT2_TAG_TYPE_ACPI_OLD 14
 #define MULTIBOOT2_TAG_TYPE_ACPI_NEW 15
 #define MULTIBOOT2_TAG_TYPE_EFI_MMAP 17
+#define MULTIBOOT2_TAG_TYPE_EFI_BS 18
+#define MULTIBOOT2_TAG_TYPE_EFI64_IH 20
 
 struct multiboot2_info {
     uint32_t total_size;
@@ -128,13 +130,19 @@ struct boot_info {
     uint32_t efi_mmap_entry_size;
     uint32_t efi_mmap_entry_count;
     uint64_t rsdp_addr;
+    uint64_t efi_rsdp_addr; /**< Separately validated EFI configuration-table RSDP. */
     uint64_t efi_system_table;
+    uint64_t efi_image_handle; /**< EFI image handle when supplied by tag 20. */
+    bool efi_boot_services_active; /**< Tag 18 states that boot services remain active. */
+    bool efi_identity_amd64; /**< Active EFI amd64 root remains installed, including after our EBS. */
+    bool bios_identity_4g; /**< The i386 entry installed its own first-4-GiB identity map. */
     struct boot_module modules[16];
     uint32_t module_count;
 };
 
 /**
  * @brief Validate a borrowed bootloader block and publish its decoded fields.
+ * @param magic Multiboot2 loader magic; must equal MULTIBOOT2_BOOTLOADER_MAGIC.
  * @param info_addr Readable eight-byte-aligned information; retained through reservation.
  * @param out Caller-owned output, zero on failure; must not alias the input.
  * @return 0 or -EINVAL. BSP boot context, IRQs disabled; no allocation or locks.

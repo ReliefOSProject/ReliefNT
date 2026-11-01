@@ -8,6 +8,10 @@
 static struct task current;
 static struct unix_socket peers[2];
 static struct task_file endpoints[2], passed;
+#ifdef CONFIG_SWAP
+static struct task_file passed_replacement;
+static bool swap_replace_passed;
+#endif
 static uint64_t readonly;
 static unsigned allocations;
 static unsigned pty_holds;
@@ -37,6 +41,7 @@ int task_pty_export_fd(struct task *task, int fd, struct task_pty_fd *out)
 }
 void task_pty_release_entry(struct task_pty_fd *entry)
 {
+    if (!entry || !entry->used) return;
     assert(entry->pty_id == 7 && entry->endpoint == TASK_PTY_ENDPOINT_SLAVE && pty_holds);
     --pty_holds;
     *entry = (struct task_pty_fd){0};
@@ -55,7 +60,13 @@ struct task *sched_find(uint32_t pid) { return pid == current.pid ? &current : N
 uint64_t time_ticks(void) { return 100; }
 int time_clock_get(int32_t id, struct linux_timespec *out)
 { assert(id == LINUX_CLOCK_MONOTONIC); *out = (struct linux_timespec){1, 0}; return 0; }
-bool user_range_ok(uint64_t p, uint64_t size) { return !size || (p >= 4096 && size <= UINT64_MAX - p); }
+bool user_range_ok(uint64_t p, uint64_t size) {
+#ifdef TASK8_NOSWAP_APERTURE_TEST
+    return !size || (p>=RELIEFNT_USER_BASE && p<RELIEFNT_USER_TOP && size<=RELIEFNT_USER_TOP-p);
+#else
+    return !size || (p >= 4096 && size <= UINT64_MAX - p);
+#endif
+}
 bool user_range_writable(uint64_t p, uint64_t size) { return user_range_ok(p, size) && p != readonly; }
 int user_copy_to_task(struct task *task, uint64_t p, const void *source, uint64_t size)
 { assert(task == &current); if (!user_range_writable(p, size)) return -LINUX_EFAULT; memcpy((void *)p, source, size); return 0; }
@@ -63,7 +74,13 @@ struct kernel_object_table *kernel_objects(void) { return NULL; }
 void *kernel_object_lookup(struct kernel_object_table *table, uint32_t id, enum kernel_object_type type)
 { (void)table; assert(type == KERNEL_OBJECT_SOCKET); return id >= 1 && id <= 2 ? &peers[id - 1] : NULL; }
 struct task_file *task_file_for_fd(struct task *task, int fd)
-{ (void)task; return fd == 3 ? &endpoints[0] : fd == 4 ? &endpoints[1] : fd == 5 ? &passed : NULL; }
+{
+    (void)task;
+#ifdef CONFIG_SWAP
+    if(fd==5 && swap_replace_passed)return &passed_replacement;
+#endif
+    return fd == 3 ? &endpoints[0] : fd == 4 ? &endpoints[1] : fd == 5 ? &passed : NULL;
+}
 struct task_file *task_file_for_io(struct task *task, int fd)
 { return task->syscall_file ? task->syscall_file : task_file_for_fd(task, fd); }
 struct task_file *task_file_get(struct task_file *file) { ++file->references; return file; }
@@ -278,6 +295,7 @@ int main(void)
         assert(!held && !allocations);
     }
     puts("PASS actual Unix mmsg: packet boundaries, WAITFORONE, blocking resume, length faults, SCM_RIGHTS references/CLOEXEC");
+    return 0;
 }
 
 /* Real counted UNIX address parsing runs in this fixture. Only filesystem

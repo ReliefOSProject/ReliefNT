@@ -27,9 +27,30 @@ struct drm_vmwgfx_context;
 struct drm_vmwgfx_surface;
 struct drm_vmwgfx_file_ref;
 struct drm_vmwgfx_exec_work;
+struct drm_vmwgfx_task_continuation;
 struct drm_vmw_synccpu_arg;
 
+#ifdef CONFIG_SWAP
+#include <reliefnt/syscall_internal.h>
+/** @brief Prepare actual DRM user bytes at the outer execution writer.
+ * @param task Live syscall owner. @param address Original user address.
+ * @param length Actual bytes; internally sliced at 32KiB. @param writing
+ * True for output. @return Zero, EFAULT or the private contention marker.
+ * No user pointer or borrowed object survives a returned marker.
+ */
+int drm_user_prepare(struct task *task,uint64_t address,uint64_t length,bool writing);
+/** @brief Import a bounded operand into owned syscall-scope storage.
+ * @param task Live syscall owner. @param destination Required kernel bytes.
+ * @param address Original user address. @param length Counted bytes.
+ * @return Zero, an allocation/fault errno, or private contention. Scoped
+ * prefixes survive a matching retry and common cancellation owns them.
+ */
+int drm_user_import(struct task *task,void *destination,uint64_t address,uint32_t length);
+#endif
+
 #define DRM_FAILDIAG_FIELD_MAX 8u
+#define DRM_VMWARE_VENDOR 0x15adu
+#define DRM_VMWARE_SVGA2 0x0405u
 
 struct drm_faildiag_context {
     uint32_t pid;
@@ -95,6 +116,9 @@ struct drm_file {
     struct drm_bo_handle *bo_handles;
     void *vmwgfx_fences;
     struct drm_kms_fb *kms_fbs;
+#ifdef CONFIG_SWAP
+    struct drm_vmwgfx_task_continuation *kms_enumeration;
+#endif
     struct drm_vmwgfx_file_ref *vmwgfx_resources;
 };
 
@@ -112,6 +136,12 @@ void drm_master_put(struct drm_master *master);
 int drm_file_set_master(struct task *task, struct drm_file *file);
 int drm_file_drop_master(struct task *task, struct drm_file *file);
 
+/** @brief Allocate a per-file BO, respecting the owning device's address mask.
+ * @param file Borrowed file and device. @param diagnostics Optional diagnostics.
+ * @param size Nonzero requested bytes. @param handle_out Required handle output.
+ * @param map_offset_out Required mapping-offset output.
+ * @return Zero with an owned handle, or negative errno with no published BO.
+ */
 int drm_bo_create(struct drm_file *file,
                   struct drm_faildiag_context *diagnostics,
                   uint64_t size, uint32_t *handle_out,
@@ -137,7 +167,13 @@ int drm_bo_synccpu_ioctl(struct drm_file *file,
                          struct drm_vmw_synccpu_arg *arg);
 
 int drm_kms_ioctl(struct task *task, struct drm_file *file, uint32_t command,
-                  void *data, uint32_t *created_fb_out);
+                  void *data, uint32_t *created_fb_out,uint64_t user_argument);
+#ifdef CONFIG_SWAP
+/** @brief End a task's enumeration reservation before its OFD can retire. */
+void drm_kms_enum_unreserve(struct drm_vmwgfx_task_continuation *continuation);
+/** @brief Release one owned enumeration cursor outside graphics locks. */
+void drm_kms_fb_put(struct drm_kms_fb *fb);
+#endif
 void drm_kms_process_retirements(uint32_t budget);
 void drm_kms_vt_release(void);
 void drm_kms_file_release(struct drm_file *file);
@@ -148,7 +184,8 @@ int drm_vmwgfx_caps_ioctl(struct task *task, struct drm_file *file,
                           uint32_t command, void *data);
 int drm_vmwgfx_resource_ioctl(struct task *task, struct drm_file *file,
                               uint32_t command, void *data,
-                              struct drm_vmwgfx_rollback_receipt *receipt);
+                              struct drm_vmwgfx_rollback_receipt *receipt,
+                              uint64_t user_argument);
 void drm_vmwgfx_resource_rollback(
     struct drm_file *file, struct drm_vmwgfx_rollback_receipt *receipt);
 void drm_vmwgfx_resource_file_release(struct drm_file *file);

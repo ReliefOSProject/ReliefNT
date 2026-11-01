@@ -232,7 +232,10 @@ static int fat_native_statfs(struct storage_volume *volume,struct linux_statfs_a
  */
 static int fat_native_put_inode(struct storage_volume *volume,const struct storage_node *node,bool unlinked)
 {
-    (void)volume;return unlinked && node->first_cluster>=2 ? fat32_free_chain(node->first_cluster) : 0;
+    (void)volume;
+    int ret=unlinked && node->first_cluster>=2 ? fat32_free_chain(node->first_cluster) : 0;
+    if (!ret && unlinked) page_cache_forget_node(node);
+    return ret;
 }
 /** @brief Write an authorized retained native file after core writer admission.
  * @param volume Borrowed selected/pinned instance. @param node Actual mutable inode.
@@ -382,7 +385,11 @@ static int fat_native_drop_new(struct storage_volume *volume,const struct storag
                                       const char *name,const struct storage_node *node)
 {
     (void)volume;int rc=fat32_delete_dirent(parent->first_cluster,name,NULL);
-    if(!rc && !storage_inode_unlinked(node) && node->first_cluster>=2)rc=fat32_free_chain(node->first_cluster);
+    if(!rc) {
+        bool retained=storage_inode_unlinked(node);
+        if(!retained && node->first_cluster>=2)rc=fat32_free_chain(node->first_cluster);
+        if(!rc && !retained)page_cache_forget_node(node);
+    }
     return rc;
 }
 static const struct storage_cluster_ops fat_native_clusters={

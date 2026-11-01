@@ -11,4 +11,5 @@
    boot-logo
    vga-text
    panic
+   swap
    limitations

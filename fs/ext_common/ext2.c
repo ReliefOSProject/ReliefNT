@@ -187,6 +187,8 @@ static __attribute__((unused)) int ext2_mark_special(const char *p,const struct 
 __attribute__((unused)) int ext2_destroy_inode(uint32_t ino,uint8_t directory)
 {
     (void)directory; struct ext4_inode_view in; int ret=storage_ext4_read_inode(&g_storage,ino,&in); if (ret<0) return ret;
-    struct storage_node node; storage_ext4_node_from_inode(&g_storage,ino,&in,&node); page_cache_invalidate_node(&node);
-    return storage_ext4_destroy_inode(&g_storage,ino);
+    struct storage_node node; storage_ext4_node_from_inode(&g_storage,ino,&in,&node);
+    ret=storage_ext4_destroy_inode(&g_storage,ino);
+    if(!ret)page_cache_forget_node(&node);
+    return ret;
 }

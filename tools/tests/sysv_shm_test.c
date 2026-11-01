@@ -28,6 +28,36 @@ static bool shm_physical_gate(void)
 #include "../../fs/vfs/mount_internal.h"
 #include "../../kernel/syscall/io/vector_internal.h"
 
+/* The fault dispatcher links file branches which this SysV fixture never enters. */
+/** @brief Reject unexpected file reads. @param path File. @param offset Offset.
+ * @param buffer Destination. @param capacity Bytes. @param read Output. @return Never returns.
+ */
+int vfs_path_read(const struct vfs_path *path, uint64_t offset, void *buffer,
+                  uint32_t capacity, uint32_t *read)
+{ (void)path; (void)offset; (void)buffer; (void)capacity; (void)read; abort(); }
+/** @brief Reject unexpected storage I/O. @param enabled Async setting. */
+void storage_set_io_async_context(bool enabled) { (void)enabled; abort(); }
+/** @brief Reject unexpected storage error. @param ret Status. @return Never returns. */
+int storage_errno(int ret) { (void)ret; abort(); }
+/** @brief Reject unexpected tmpfs I/O. @param node File. @param offset Offset.
+ * @param phys Output. @return Never returns.
+ */
+int storage_tmpfs_get_page(const struct storage_node *node, uint64_t offset, uint64_t *phys)
+{ (void)node; (void)offset; (void)phys; abort(); }
+/** @brief Reject unexpected cache I/O. @param node File. @param offset Offset.
+ * @param loader Loader. @param context State. @param phys Output. @return Never returns.
+ */
+int page_cache_load_fault(const struct storage_node *node, uint64_t offset,
+                    page_cache_loader loader, void *context, uint64_t *phys)
+{ (void)node; (void)offset; (void)loader; (void)context; (void)phys; abort(); }
+/** @brief Reject unexpected loader entry. @param flags Saved state output. */
+void userland_loader_lock(uint64_t *flags) { (void)flags; abort(); }
+/** @brief Reject unexpected loader exit. @param flags Saved state. */
+void userland_loader_unlock(uint64_t flags) { (void)flags; abort(); }
+/** @brief Reject unexpected logs. @param level Severity. @param format Message format. */
+void console_log(enum console_log_level level, const char *format, ...)
+{ (void)level; (void)format; abort(); }
+
 static int shm_fail_heap = -1, shm_fail_page = -1;
 static unsigned shm_heap_live;
 static void *shm_test_malloc(size_t size)
@@ -76,6 +106,9 @@ void graphics_service_cancel_task_continuation(struct task *task) { (void)task; 
 /* Only the focused successful clone below admits these resource-free
  * boundaries. All original rollback cases still abort if they reach them. */
 static bool empty_clone_boundary;
+#ifdef TASK8_FIX3_DEVICE_FORK
+static bool fix3_fail_clone_after_vmas;
+#endif
 void arch_fpu_save(void *state) { (void)state; }
 uint64_t time_uptime_ms(void) { return 1000; }
 uint64_t mm_total_memory_kib(void) { return 1024 * 1024; }
@@ -114,11 +147,32 @@ void kernel_signal_detach_process(struct task *task)
 int task_sysv_sem_clone(struct task *parent, struct task *child, uint64_t flags)
 {
     assert(empty_clone_boundary && parent && child && !parent->sysv_undo && !child->sysv_undo);
-    assert(flags==17 || flags==(CLONE_FS|17));return 0;
+#ifndef TASK8_CLONE_TID_TEST
+    assert(flags==17 || flags==(CLONE_FS|17));
+#else
+    (void)flags;
+#endif
+#ifdef TASK8_FIX3_DEVICE_FORK
+    if(fix3_fail_clone_after_vmas)return -LINUX_ENOMEM;
+#endif
+    return 0;
 }
 int user_copy_to_task(struct task *task, uint64_t address, const void *source, uint64_t size)
 {
+#ifdef TASK8_CLONE_TID_TEST
+    if(task!=sched_current_task()) {
+        for(uint64_t done=0;done<size;) {
+            uint64_t phys=address_space_user_page_phys(sched_task_as(task),address+done);
+            if(!phys)return -LINUX_EFAULT;
+            uint64_t offset=(address+done)&4095u,take=4096-offset;
+            if(take>size-done)take=size-done;
+            memcpy((uint8_t *)mm_phys_to_virt(phys)+offset,(const uint8_t *)source+done,take);done+=take;
+        }
+        return 0;
+    }
+#else
     assert(task == sched_current_task());
+#endif
     if (!user_range_writable(address, size)) return -LINUX_EFAULT;
     memcpy((void *)(uintptr_t)address, source, size);
     return 0;
@@ -156,6 +210,18 @@ static int64_t detach(uint64_t address)
  * owned, even though the child inherits real root/cwd and shared data pages. */
 static void clone_pending_operands(struct task *parent,struct task *child,struct vfs_namespace *ns)
 {
+    struct task_vma *locked = NULL;
+    for (unsigned i = 0; i < SCHED_TASK_VMA_MAX; ++i)
+        if (parent->vmas[i].used) { locked = &parent->vmas[i]; break; }
+    assert(locked);
+    locked->flags |= TASK_VMA_FLAG_LOCKED | TASK_VMA_FLAG_LOCKONFAULT;
+    struct task_vma *extra = sched_task_vma_at(parent, SCHED_TASK_VMA_MAX);
+    assert(extra);
+    *extra = (struct task_vma){.used = 1, .start = 0x71000000, .end = 0x71001000,
+        .prot = 3, .max_prot = 3, .flags = TASK_VMA_FLAG_ANON | TASK_VMA_FLAG_PRIVATE |
+                                              TASK_VMA_FLAG_LOCKED | TASK_VMA_FLAG_LOCKONFAULT};
+    assert(!mm_context_ensure(sched_task_as(parent)));
+    mm_context_set_lock_flags(sched_task_as(parent), LINUX_MCL_FUTURE | LINUX_MCL_ONFAULT);
     struct task_vector_state *vector=kernel_malloc(sizeof(*vector)+sizeof(struct iovec));assert(vector);
     *vector=(struct task_vector_state){.number=__NR_readv,.count=1,.completed=3,.requested=7};
     char *name=kernel_malloc(32);assert(name);strcpy(name,"original-owned-operand");
@@ -183,12 +249,20 @@ static void clone_pending_operands(struct task *parent,struct task *child,struct
         if(mode<2)assert(pid==-LINUX_ENOMEM && ns->root->references==6);
         else {
             assert(pid>0 && child->pid==(uint32_t)pid && child->state==TASK_READY);
+            for (uint32_t i = 0; i < sched_task_vma_capacity(child); ++i) {
+                struct task_vma *v = sched_task_vma_at(child, i);
+                if (v && v->used)
+                    assert(!(v->flags & (TASK_VMA_FLAG_LOCKED | TASK_VMA_FLAG_LOCKONFAULT)));
+            }
+            assert(!mm_lock_flags(sched_task_as(child)));
+            assert(mm_lock_flags(sched_task_as(parent)) == (LINUX_MCL_FUTURE | LINUX_MCL_ONFAULT));
             assert(sched_task_paths(child)->root.mount==ns->root && sched_task_paths(child)->cwd.mount==ns->root);
             if(mode==3)assert(child->shared_fs==parent->shared_fs && parent->shared_fs->references==2 && ns->root->references==6);
             else assert(!child->shared_fs && ns->root->references==8);
             syscall_release_task_files(child);address_space_destroy(sched_task_as(child));sched_task_vma_release(child);
             sched_task_fs_release(child);task_groups_release(child);
             kernel_free(child->exec_argv);kernel_free(child->exec_envp);kernel_free(child->exec_data);
+            sched_task_identity_detach(child);
             task_zero(child);child->state=TASK_EXITED;child->running_cpu=SCHED_CPU_NONE;child->flags=TASK_FLAG_RESOURCES_RELEASED;
             sched_task_fs_unshare(parent);assert(ns->root->references==6);
         }
@@ -197,11 +271,18 @@ static void clone_pending_operands(struct task *parent,struct task *child,struct
     vfs_path_put(&operand->root);vfs_path_put(&operand->start);vfs_path_put(&operand->result.path);
     kernel_free(name);kernel_free(vector);parent->lookup_scope=(struct task_lookup_scope){0};
     parent->vector_io=NULL;parent->syscall_file=NULL;parent->regular_io.active=false;parent->regular_io.done=0;
+    locked->flags &= ~(TASK_VMA_FLAG_LOCKED | TASK_VMA_FLAG_LOCKONFAULT);
+    *sched_task_vma_at(parent, SCHED_TASK_VMA_MAX) = (struct task_vma){0};
+    mm_context_set_lock_flags(sched_task_as(parent), 0);
     assert(ns->root->references==3);
     puts("PASS actual fork/CLONE_FS and page/SHM OOM keep pending operand/vector ownership only in parent");
 }
 
+#ifdef TASK8_CLONE_TID_TEST
+int inherited_task8_sysv_shm_main(void)
+#else
 int main(void)
+#endif
 {
     struct task defaults = {0};
     task_init_limits(&defaults);
@@ -270,6 +351,12 @@ int main(void)
     assert(backing && address_space_user_page_writable(sched_task_as(parent), base));
     for (unsigned i = 0; i < 4096; ++i) assert(!((uint8_t *)mm_phys_to_virt(backing))[i]);
     *(uint8_t *)mm_phys_to_virt(backing) = 0x4d;
+    /* Discard drops this attachment's PTE, while the segment remains owner. */
+    assert(syscall_mm_madvise((uint64_t)base, 4096, LINUX_MADV_DONTNEED) == 0);
+    assert(!address_space_user_page_phys(sched_task_as(parent), base));
+    assert(syscall_handle_task_page_fault(parent, base, 6));
+    assert(address_space_user_page_phys(sched_task_as(parent), base) == backing);
+    assert(*(uint8_t *)mm_phys_to_virt(backing) == 0x4d);
     child->state = TASK_EXITED; child->running_cpu = SCHED_CPU_NONE;
     child->flags = TASK_FLAG_RESOURCES_RELEASED;
     borrowed_mapping=(struct task_file){.used=1,.references=1};
@@ -366,6 +453,14 @@ int main(void)
     assert(!detach(readonly));
     assert(!syscall_mm_mprotect(base + 4096, 4096, LINUX_PROT_NONE));
     assert(!ctl(id, IPC_STAT, &stat) && stat.shm_nattch == 3);
+    uint64_t right_backing = address_space_user_page_phys(sched_task_as(parent), base + 8192);
+    assert(right_backing && right_backing != backing);
+    *(uint8_t *)mm_phys_to_virt(right_backing) = 0x85;
+    assert(!syscall_mm_madvise(base + 8192, 4096, LINUX_MADV_DONTNEED));
+    assert(!address_space_user_page_phys(sched_task_as(parent), base + 8192));
+    assert(syscall_handle_task_page_fault(parent, base + 8192, 6));
+    assert(address_space_user_page_phys(sched_task_as(parent), base + 8192) == right_backing);
+    assert(*(uint8_t *)mm_phys_to_virt(right_backing) == 0x85);
     assert(address_space_clone_cow(sched_task_as(parent), sched_task_as(child)));
     struct sysv_shm_attachment *child_identity = NULL;
     for (unsigned i = 0; i < SCHED_TASK_VMA_MAX; ++i) if (parent->vmas[i].used) {
@@ -499,6 +594,20 @@ int main(void)
     assert(stat.shm_perm.mode & 02000);
     assert(!ctl(id, SHM_UNLOCK, NULL) && !ctl(replacement, SHM_LOCK, NULL));
     assert(!ctl(replacement, IPC_RMID, NULL) && !ctl(id, IPC_RMID, NULL));
+    /* shmat creates a future mapping in this MM and obeys its lock allowance. */
+    parent->limits.memlock.rlim_cur = 4096;
+    assert(!syscall_mm_mlockall(LINUX_MCL_FUTURE | LINUX_MCL_ONFAULT));
+    int locked_id = (int)get(IPC_PRIVATE, 8192, 0600);
+    assert(locked_id >= 0);
+    assert(attach(locked_id, 0, 0) == -LINUX_EAGAIN);
+    parent->limits.memlock.rlim_cur = 8192;
+    long locked_address = attach(locked_id, 0, 0);
+    assert(locked_address > 0);
+    struct task_vma *locked_vma = task_vma_containing(parent, locked_address, locked_address + 8192);
+    assert(locked_vma && (locked_vma->flags & TASK_VMA_FLAG_LOCKED) &&
+           (locked_vma->flags & TASK_VMA_FLAG_LOCKONFAULT));
+    assert(!syscall_mm_munlockall());
+    assert(!detach(locked_address) && !ctl(locked_id, IPC_RMID, NULL));
     assert(get(IPC_PRIVATE, 4096, 0600 | SHM_HUGETLB) == -LINUX_ENOSYS);
     id = (int)get(IPC_PRIVATE, 4096, 0600);
     assert(id >= 0 && !ctl(id, IPC_RMID, NULL));
@@ -538,23 +647,62 @@ int main(void)
     id = (int)get(IPC_PRIVATE, 4096, 0600);
     base = attach(id, 0, 0);
     assert(base > 0 && !ctl(id, IPC_RMID, NULL));
+    /* Real CLONE_VM promotion retains the initial stack, even when a peer
+     * receives a different supplied thread stack. */
+    uint64_t stack_top = RELIEFNT_USER_TOP - 4096;
+    uint64_t stack_low = stack_top - 2 * 4096;
+    parent->stack_top = stack_top;
+    parent->stack_low = stack_low;
+    parent->limits.stack.rlim_cur = child->limits.stack.rlim_cur = LINUX_RLIM_INFINITY;
+    parent->limits.as.rlim_cur = child->limits.as.rlim_cur = LINUX_RLIM_INFINITY;
+    parent->limits.memlock.rlim_cur = child->limits.memlock.rlim_cur = 4096;
+    assert(address_space_map_user_stack_page(sched_task_as(parent), stack_low));
+    assert(address_space_map_user_stack_page(sched_task_as(parent), stack_top - 4096));
+    uint64_t stack_phys = address_space_user_page_phys(sched_task_as(parent), stack_low);
+    *(uint8_t *)mm_phys_to_virt(stack_phys) = 0x69;
+    assert(!syscall_mm_mlockall(LINUX_MCL_FUTURE | LINUX_MCL_ONFAULT));
     assert(!task_promote_shared(parent, CLONE_VM));
     child->shared_mm = parent->shared_mm;
     ++child->shared_mm->references;
+    child->stack_low = RELIEFNT_USER_BASE + 0x100000;
+    child->stack_top = child->stack_low + 4096;
+    assert(!syscall_mm_madvise(stack_low, 4096, LINUX_MADV_DONTNEED));
+    current_pid[0] = child->pid;
+    assert(syscall_handle_task_page_fault(child, stack_low, 6));
+    stack_phys = address_space_user_page_phys(sched_task_as(child), stack_low);
+    assert(stack_phys && !*(uint8_t *)mm_phys_to_virt(stack_phys));
+    assert(!mm_locked_bytes(child));
+    assert(syscall_handle_task_page_fault(child, stack_low - 4096, 6));
+    assert(mm_locked_bytes(child) == 4096);
+    assert(!syscall_handle_task_page_fault(child, stack_low - 8192, 6));
+    assert(!address_space_user_page_phys(sched_task_as(child), stack_low - 8192));
+    assert(!syscall_mm_munlock(stack_low - 4096, 4096));
+    assert(!syscall_mm_madvise(stack_low - 4096, 4096, LINUX_MADV_DONTNEED));
+    assert(syscall_handle_task_page_fault(child, stack_low - 4096, 6));
+    assert(!mm_locked_bytes(child));
+    assert(child->stack_low == RELIEFNT_USER_BASE + 0x100000);
+    current_pid[0] = parent->pid;
+    assert(!syscall_mm_madvise(stack_top - 4096, 4096, LINUX_MADV_DONTNEED));
+    assert(syscall_handle_task_page_fault(parent, stack_top - 4096, 6));
+    assert(mm_lock_flags(sched_task_as(child)) == (LINUX_MCL_FUTURE | LINUX_MCL_ONFAULT));
     assert(!ctl(id, IPC_STAT, &stat) && stat.shm_nattch == 1);
     exec_replacement = (struct address_space){0};
     assert(address_space_create(&exec_replacement));
     sched_exec_replace_mm(child, &exec_replacement);
+    assert(!mm_lock_flags(sched_task_as(child)));
+    assert(mm_lock_flags(sched_task_as(parent)) == (LINUX_MCL_FUTURE | LINUX_MCL_ONFAULT));
     assert(!ctl(id, IPC_STAT, &stat) && stat.shm_nattch == 1);
     assert(address_space_user_page_phys(sched_task_as(parent), base));
     address_space_destroy(sched_task_as(child));
     exec_replacement = (struct address_space){0};
     assert(address_space_create(&exec_replacement));
     sched_exec_replace_mm(parent, &exec_replacement);
+    assert(!mm_lock_flags(sched_task_as(parent)));
     assert(ctl(id, IPC_STAT, &stat) == -LINUX_EINVAL && !shm_heap_live);
     address_space_destroy(sched_task_as(parent));
     assert(!live_pages());
     tasks = NULL; task_count = 0; current_pid[0] = 0;
     puts("PASS real SysV SHM registry/PTE/VMA: zero pages, independent MMs, fork sharing,");
     puts("readonly max_prot, split nattch, RMID live IDs, shmdt pieces, failure rollback and final page reclamation");
+    return 0;
 }

@@ -98,6 +98,7 @@ int storage_fallocate_node(struct storage_node *node,uint32_t mode,uint64_t offs
     if(!node || !(node->flags&STORAGE_NODE_FLAG_EXT_FAMILY))return -EOPNOTSUPP;
     uint64_t flags;kernel_execution_lock_irqsave(&flags);
     struct storage_volume *previous=NULL;int rc=storage_select_node_volume(node,&previous);
+    if(!rc) rc=storage_inode_mutation_allowed(node);
     if(!rc) {
         const struct storage_filesystem_ops *ops=g_storage.fs_ops;
         rc=ops && ops->fallocate ? ops->fallocate(&g_storage,node,mode,offset,len) : -EOPNOTSUPP;

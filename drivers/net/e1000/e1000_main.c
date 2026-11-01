@@ -196,6 +196,10 @@ static void e1000_reg_write(uint32_t offset, uint32_t value)
     *(volatile uint32_t *)(g_e1000.mmio_base + offset) = value;
 }
 
+/** @brief Read the full physical address of an assigned memory BAR0.
+ * @param dev Borrowed PCI identity. @return Physical BAR base, or zero for I/O.
+ * The provider validates and maps the extent before any register is accessed.
+ */
 static uint64_t e1000_bar0_mmio(const struct pci_device *dev)
 {
     uint32_t bar0 = pci_config_read32(dev->bus, dev->slot, dev->function, 0x10);
@@ -207,9 +211,6 @@ static uint64_t e1000_bar0_mmio(const struct pci_device *dev)
     if ((bar0 & 0x6u) == 0x4u) {
         uint32_t high = pci_config_read32(dev->bus, dev->slot, dev->function, 0x14);
         addr |= (uint64_t)high << 32;
-    }
-    if (addr > 0xffffffffULL) {
-        return 0;
     }
     return addr;
 }
@@ -379,7 +380,7 @@ static void e1000_hardware_init(void)
 
     mmio_phys = e1000_bar0_mmio(&dev);
     if (!mmio_phys) {
-        e1000_log(CONSOLE_LOG_ERROR, "BAR0 MMIO is unassigned or outside the supported 32-bit mapping");
+        e1000_log(CONSOLE_LOG_ERROR, "BAR0 MMIO is unassigned or is an I/O BAR");
         return;
     }
     mmio_alias = kernel_api->map_mmio(mmio_phys, E1000_REGISTER_BYTES);

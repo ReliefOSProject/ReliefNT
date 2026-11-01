@@ -59,6 +59,11 @@ void kernel_execution_lock_irqsave(uint64_t *flags);
  * @return None. The caller must be the current owner.
  */
 void kernel_execution_unlock_irqrestore(uint64_t flags);
+/** @brief Check whether the current context owns the outer writer exactly once.
+ * @return True only at depth one. This does not inspect unrelated spinlocks;
+ * callers must prove their own lock ordering before entering synchronous I/O.
+ */
+bool kernel_execution_is_outermost(void);
 
 /** Token for one outer execution transaction suspended around a waitable task phase. */
 struct kernel_execution_suspend_token {

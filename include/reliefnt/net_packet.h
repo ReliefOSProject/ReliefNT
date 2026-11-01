@@ -42,6 +42,19 @@ int task_packet_send(struct task_file *file, const void *data, uint32_t length,
  */
 int task_packet_recv(struct task_file *file, void *data, uint32_t length,
                      uint32_t flags, uint64_t address, uint64_t address_length);
+#ifdef CONFIG_SWAP
+/** @brief Return this packet OFD's native source-address size, or zero. */
+uint32_t task_packet_address_size(const struct task_file *file);
+/** @brief Receive to kernel buffers and capture the native source before dequeue.
+ * @param file Retained packet OFD. @param data Kernel byte output.
+ * @param length Capacity. @param flags Receive flags. @param source Writable
+ * kernel storage for the native address. @param source_length Receives its size.
+ * @return Bytes/errno or the existing blocked marker. Both outputs are owned
+ * by the caller; no user page or borrowed queue pointer survives this call.
+ */
+int task_packet_recv_staged(struct task_file *file,void *data,uint32_t length,
+                            uint32_t flags,void *source,uint32_t *source_length);
+#endif
 /** @brief Query raw/packet readiness.
  * @param file Pinned socket description.
  * @param events Requested poll bits.

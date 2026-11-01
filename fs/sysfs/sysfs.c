@@ -1,6 +1,7 @@
 /* Linux sysfs inventory and descriptor-authorized module parameter files. */
 #include <reliefos/fs_abi.h>
 #include <reliefnt/framebuffer.h>
+#include <reliefnt/blkdev.h>
 #include <reliefnt/graphics_service.h>
 #include <reliefnt/inventory.h>
 #include <reliefnt/pci.h>
@@ -190,6 +191,36 @@ static int sys_block_fs_info(uint32_t disk, int32_t part, char type[8], char ver
     return 1;
 }
 
+/** @brief Match a retained registered PCI block identity to its real PCI parent.
+ * @param disk Stable inventory index. @return Enumerated PCI index or -1 when
+ * the device is non-PCI, vanished, or has no matching parent. The temporary
+ * device/code reference is released before returning; only scalar identity is
+ * compared under the existing execution transaction.
+ */
+static int sys_block_pci_parent(uint32_t disk)
+{
+    struct block_device_ref ref={0};
+    struct block_device_info info;
+    if (storage_disk_block_get(disk,&ref)) return -1;
+    int rc=block_device_info(&ref,&info);
+    block_device_put(&ref);
+    if (rc || (info.transport!=BLOCK_TRANSPORT_AHCI &&
+               info.transport!=BLOCK_TRANSPORT_IDE_PIO &&
+               info.transport!=BLOCK_TRANSPORT_NVME)) return -1;
+    for (uint32_t i=0;i<pci_count;++i) {
+        const struct pci_device *pci=&pci_devices[i];
+        if (pci->bus!=info.bus || pci->slot!=info.slot || pci->function!=info.function) continue;
+        /* Refuse an inconsistent registry/controller identity rather than
+         * placing the disk under an unrelated PCI device. */
+        if (pci->class_code!=1) return -1;
+        if (info.transport==BLOCK_TRANSPORT_AHCI && pci->subclass==6 && pci->prog_if==1) return (int)i;
+        if (info.transport==BLOCK_TRANSPORT_IDE_PIO && pci->subclass==1) return (int)i;
+        if (info.transport==BLOCK_TRANSPORT_NVME && pci->subclass==8 && pci->prog_if==2) return (int)i;
+        return -1;
+    }
+    return -1;
+}
+
 /** @brief Visit registered block geometry using the same identity as devfs.
  * @param visit Borrowed synchronous attribute consumer. @param ctx Consumer context.
  * @return Zero or enumeration/consumer errno. Execution ownership stabilizes
@@ -200,6 +231,7 @@ static int sys_blocks(sys_visit visit, void *ctx)
 {
     struct reliefos_install_disk disks[RELIEFOS_INSTALL_MAX_DISKS];
     uint32_t count = 0;
+    bool pci_block_emitted[SYSFS_PCI_MAX]={0};
     int ret = storage_list_block_disks(disks, RELIEFOS_INSTALL_MAX_DISKS, &count);
     if (ret < 0) return ret;
     if (count > RELIEFOS_INSTALL_MAX_DISKS) return -5;
@@ -207,7 +239,18 @@ static int sys_blocks(sys_visit visit, void *ctx)
         char diskpath[RELIEFOS_FS_PATH_LEN];
         char diskname[RELIEFOS_FS_PATH_LEN];
         if (sys_block_name(diskname, disks[i].id, -1) < 0) return -2;
-        sys_path(diskpath, "/sys/devices/platform/leonos-block/", -1, diskname + 5);
+        int pci=sys_block_pci_parent(disks[i].id);
+        if (pci>=0) {
+            char prefix[RELIEFOS_FS_PATH_LEN];
+            sys_pci_path(prefix,"/sys/devices/pci0000:00/",(uint32_t)pci,"/block");
+            if (!pci_block_emitted[pci]) {
+                if ((ret=sys_emit(visit,ctx,prefix,A_DIR,0,NULL))) return ret;
+                pci_block_emitted[pci]=true;
+            }
+            char directory[RELIEFOS_FS_PATH_LEN];
+            sys_path(directory,prefix,-1,"/");
+            sys_path(diskpath,directory,-1,diskname+5);
+        } else sys_path(diskpath, "/sys/devices/platform/leonos-block/", -1, diskname + 5);
         for (int32_t part = -1; part < (int32_t)RELIEFOS_DISK_MAX_PARTITIONS; ++part) {
             uint64_t start = 0, sectors = disks[i].sector_count;
             if (part >= 0) {

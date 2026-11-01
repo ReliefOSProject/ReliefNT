@@ -1,5 +1,91 @@
 #include "../internal.h"
+#include <reliefnt/swap.h>
 
+/** @brief Identify a scalar buffer consumed by the staged regular-I/O path.
+ * @param file Borrowed admitted descriptor, nullable. @return True for an
+ * ordinary file or genuine block node; special devices keep their own checks.
+ */
+static bool scalar_staged_file(const struct task_file *file)
+{
+    if (!file || file->character_file || file->kind == TASK_FILE_KIND_SIGNALFD ||
+        (file->flags & (TASK_FILE_FLAG_PIPE | TASK_FILE_FLAG_SOCKET_UNIX |
+                        TASK_FILE_FLAG_SOCKET_INET | TASK_FILE_FLAG_EVENTFD |
+                        TASK_FILE_FLAG_TIMERFD | TASK_FILE_FLAG_DEV_SHM |
+                        TASK_FILE_FLAG_DEV_NULL))) return false;
+    if (file->flags & TASK_FILE_FLAG_DEV_NODE) return (file->flags & TASK_FILE_FLAG_DEV_BLOCK) != 0;
+    return file->node.type == RELIEFOS_FS_TYPE_FILE;
+}
+
+/** @brief Check a declared scalar range without faulting any page.
+ * @param address First user byte. @param count Original syscall count.
+ * @return True for an empty request or a nonwrapping user-aperture range.
+ * The original count is checked before provider-specific transfer caps.
+ */
+static bool scalar_address_valid(uint64_t address,uint64_t count)
+{
+    return !count || (address>=RELIEFNT_USER_BASE && address<RELIEFNT_USER_TOP &&
+                      count<=RELIEFNT_USER_TOP-address);
+}
+
+/** @brief Prepare a bounded synchronous scalar operand before provider entry.
+ * @param task Current syscall owner. @param file Admitted OFD, nullable for
+ * an implicit PTY. @param address User address. @param count Requested bytes.
+ * @param writing True for input. @return Zero, EFAULT, or private contention.
+ * Pipe and shared-memory callbacks consume at most 32 KiB, PTY and INET use
+ * their existing smaller slice, and eventfd/timerfd consume one word. Shared
+ * memory checks its full original provider extent for seals before writing.
+ * A matching readiness wait is removed
+ * before the timed prerequisite wait and is re-established by the backend on
+ * retry. No DMA command or retained user pointer belongs to these callbacks.
+ * Other provider classes retain their existing validation until separately
+ * audited; ordinary files use their own owned staging path.
+ */
+static int scalar_prepare_user(struct task *task,const struct task_file *file,
+                               uint64_t address,uint64_t count,bool writing)
+{
+    if(!scalar_address_valid(address,count))return -RELIEFOS_EFAULT;
+    if (scalar_staged_file(file)) return 0;
+    /* The current DRM event provider has no event payload; its empty read
+     * must reach the provider without faulting an unused destination. */
+    if (!writing && file && file->character_file && file->drm_file) return 0;
+#ifdef CONFIG_SWAP
+    /* Sound providers prepare actual frames or emitted events themselves,
+     * before taking their PCM/timer locks. They must see empty queues before
+     * touching an unused capacity and preserve accepted stream prefixes. */
+    if (file && file->character_file &&
+        (file->audio_file || file->audio_control_file || file->audio_mixer_file ||
+         file->audio_timer_file || file->audio_oss_file)) return 0;
+#endif
+    if (file && !file->character_file &&
+        ((file->flags & TASK_FILE_FLAG_DEV_NULL) ||
+         ((file->flags & TASK_FILE_FLAG_DEV_NODE) && task_device_is(file,STORAGE_DEV_KIND_NULL))))
+        return 0;
+    uint64_t size=count;
+    bool bounded=!file || (file->flags & (TASK_FILE_FLAG_PIPE | TASK_FILE_FLAG_SOCKET_INET
+#ifdef CONFIG_SWAP
+                                           | TASK_FILE_FLAG_DEV_SHM
+#endif
+                                           ));
+#ifdef CONFIG_SWAP
+    if(file && (file->flags & TASK_FILE_FLAG_DEV_SHM))size=(uint32_t)count;
+#endif
+    if (file && (file->flags & (TASK_FILE_FLAG_EVENTFD | TASK_FILE_FLAG_TIMERFD)) && count==8)
+        bounded=true;
+    if (bounded) {
+        uint64_t limit=file && (file->flags & (TASK_FILE_FLAG_PIPE | TASK_FILE_FLAG_DEV_SHM)) ? 32768u :
+                       file && (file->flags & (TASK_FILE_FLAG_EVENTFD | TASK_FILE_FLAG_TIMERFD)) ? 8u :
+                       RELIEFOS_FS_IO_SLICE_BYTES;
+        if(size>limit)size=limit;
+        int rc=swap_prepare_user_range(task,address,size,!writing);
+        if(rc==SWAP_STORAGE_CONTENDED) {
+            if(task && task->waiting_queue)kernel_wait_queue_remove(task->waiting_queue,task);
+            return KERNEL_SYSCALL_SWAP_CONTENDED;
+        }
+        if(rc<0)return -RELIEFOS_EFAULT;
+    }
+    return (writing ? user_range_ok(address,size) : user_range_writable(address,size)) ?
+           0 : -RELIEFOS_EFAULT;
+}
 
 
 /**
@@ -21,9 +107,15 @@ int64_t syscall_io_write(uint64_t a0, uint64_t a1, uint64_t a2)
     struct task_file *signal_file = task_file_for_io(task, (int32_t)a0);
     if (signal_file && (signal_file->flags & TASK_FILE_FLAG_PATH)) return -RELIEFOS_EBADF;
     if (signal_file && signal_file->kind == TASK_FILE_KIND_SIGNALFD) return -LINUX_EINVAL;
-    if (!user_range_ok(a1, a2)) {
-        return -RELIEFOS_EFAULT;
+#ifdef CONFIG_SWAP
+    if(signal_file && (signal_file->flags & TASK_FILE_FLAG_SOCKET_UNIX)) {
+        if(!scalar_address_valid(a1,a2))return -RELIEFOS_EFAULT;
+        uint32_t request=a2>0x7ffff000u ? 0x7ffff000u : (uint32_t)a2;
+        return task_socket_send_user(task,signal_file,a1,request);
     }
+#endif
+    int prep=scalar_prepare_user(task,signal_file,a1,a2,true);
+    if(prep)return prep;
     {
         struct task_pty_fd *endpoint = task_pty_for_io(task, (int)a0);
         if (endpoint) {
@@ -45,7 +137,7 @@ int64_t syscall_io_write(uint64_t a0, uint64_t a1, uint64_t a2)
     {
         struct task_file *pipe_file = task_file_for_io(task, (int)a0);
         if (pipe_file && (pipe_file->flags & TASK_FILE_FLAG_PIPE)) {
-            uint32_t request = a2 > TASK_PIPE_CAP ? TASK_PIPE_CAP : (uint32_t)a2;
+            uint32_t request = a2 > 32768u ? 32768u : (uint32_t)a2;
             return task_pipe_write(pipe_file, (const void *)(uintptr_t)a1, request);
         }
         if (pipe_file && (pipe_file->flags & TASK_FILE_FLAG_SOCKET_UNIX)) {
@@ -100,8 +192,15 @@ int64_t syscall_io_write(uint64_t a0, uint64_t a1, uint64_t a2)
         return sizeof(uint64_t);
     }
     if (file->flags & TASK_FILE_FLAG_DEV_SHM) {
+#ifdef CONFIG_SWAP
+        uint32_t request=(uint32_t)a2;
+        int rc=task_shm_write_admit(file,request);if(rc)return rc;
+        if(request>32768u)request=32768u;
+        return task_shm_write(file,(const void *)(uintptr_t)a1,request);
+#else
         if (a2 && !user_range_ok(a1, a2)) return -RELIEFOS_EFAULT;
         return task_shm_write(file, (const void *)(uintptr_t)a1, (uint32_t)a2);
+#endif
     }
     /* A null node can carry DEV_NODE and DEV_NULL together, or only DEV_NODE.
      * Handle it before device chunking; discarding bytes needs no I/O slice. */
@@ -157,9 +256,15 @@ int64_t syscall_io_read(uint64_t a0, uint64_t a1, uint64_t a2)
     file = task_file_for_io(task, (int32_t)a0);
     if (file && (file->flags & TASK_FILE_FLAG_PATH)) return -RELIEFOS_EBADF;
     if (file && file->kind == TASK_FILE_KIND_SIGNALFD) return task_signalfd_read(task, file, a1, a2);
-    if (!user_range_writable(a1, a2)) {
-        return -RELIEFOS_EFAULT;
+#ifdef CONFIG_SWAP
+    if(file && (file->flags & TASK_FILE_FLAG_SOCKET_UNIX)) {
+        if(!scalar_address_valid(a1,a2))return -RELIEFOS_EFAULT;
+        uint32_t request=a2>RELIEFOS_FS_IO_SLICE_BYTES?RELIEFOS_FS_IO_SLICE_BYTES:(uint32_t)a2;
+        return task_socket_receive_user(task,file,a1,request,0,0,0);
     }
+#endif
+    int prep=scalar_prepare_user(task,file,a1,a2,false);
+    if(prep)return prep;
     if(file && file->character_file) {
         if(!file_can_read(file))return -RELIEFOS_EBADF;
         uint32_t count=a2>RELIEFOS_FS_IO_SLICE_BYTES ? RELIEFOS_FS_IO_SLICE_BYTES : (uint32_t)a2;
@@ -197,7 +302,7 @@ int64_t syscall_io_read(uint64_t a0, uint64_t a1, uint64_t a2)
     {
         struct task_file *pipe_file = task_file_for_io(task, (int)a0);
         if (pipe_file && (pipe_file->flags & TASK_FILE_FLAG_PIPE)) {
-            uint32_t request = a2 > TASK_PIPE_CAP ? TASK_PIPE_CAP : (uint32_t)a2;
+            uint32_t request = a2 > 32768u ? 32768u : (uint32_t)a2;
             return task_pipe_read(pipe_file, (void *)(uintptr_t)a1, request);
         }
         if (pipe_file && (pipe_file->flags & TASK_FILE_FLAG_SOCKET_UNIX)) {
@@ -213,7 +318,8 @@ int64_t syscall_io_read(uint64_t a0, uint64_t a1, uint64_t a2)
     }
     pty_stream = task->syscall_file ? -1 : task_pty_stream_for_fd(task, (int)a0);
     if (pty_stream == 0) {
-        return pty_read_input(task->pty_id, (char *)(uintptr_t)a1, (uint32_t)a2);
+        uint32_t count=a2>RELIEFOS_FS_IO_SLICE_BYTES ? RELIEFOS_FS_IO_SLICE_BYTES : (uint32_t)a2;
+        return pty_read_input(task->pty_id, (char *)(uintptr_t)a1, count);
     }
     file = task_file_for_io(task, (int)a0);
     if (!file) {
@@ -241,8 +347,13 @@ int64_t syscall_io_read(uint64_t a0, uint64_t a1, uint64_t a2)
         return sizeof(uint64_t);
     }
     if (file->flags & TASK_FILE_FLAG_DEV_SHM) {
+#ifdef CONFIG_SWAP
+        uint32_t request=(uint32_t)a2;if(request>32768u)request=32768u;
+        return task_shm_read(file,(void *)(uintptr_t)a1,request);
+#else
         if (a2 && !user_range_writable(a1, a2)) return -RELIEFOS_EFAULT;
         return task_shm_read(file, (void *)(uintptr_t)a1, (uint32_t)a2);
+#endif
     }
     if (file->flags & TASK_FILE_FLAG_DEV_NODE) {
         if (!file_can_read(file)) return -RELIEFOS_EBADF;

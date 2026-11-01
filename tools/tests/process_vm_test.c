@@ -14,6 +14,7 @@
 static struct task caller, target;
 static unsigned allocations, faults;
 static int fail_allocations;
+static uint64_t inaccessible_physical;
 static struct { uint64_t address; unsigned refs; } pages[2048];
 void *kernel_malloc(size_t n)
 { if (fail_allocations) return NULL; void *p = malloc(n); if (p) ++allocations; return p; }
@@ -28,7 +29,16 @@ uint64_t mm_alloc_page(void)
     }
     abort();
 }
-void *mm_phys_to_virt(uint64_t physical) { return (void *)(uintptr_t)physical; }
+/** @brief Resolve fixture-owned physical bytes unless their page is inaccessible.
+ * @param physical Fixture physical byte address.
+ * @return Borrowed host alias or NULL for the injected unmapped page.
+ */
+void *mm_phys_to_virt(uint64_t physical)
+{
+    if (inaccessible_physical && physical >= inaccessible_physical &&
+        physical - inaccessible_physical < 4096) return NULL;
+    return (void *)(uintptr_t)physical;
+}
 uint64_t mm_virt_to_phys(const void *address) { return (uint64_t)(uintptr_t)address; }
 void mm_retain_page(uint64_t p)
 {
@@ -80,6 +90,9 @@ static int64_t transfer(int pid, struct iovec *local, uint64_t ln,
                         struct iovec *remote, uint64_t rn, uint64_t flags, bool write)
 { return syscall_process_vm(pid, (uintptr_t)local, ln, (uintptr_t)remote, rn, flags, write); }
 
+/** @brief Exercise cross-task VM copies, permissions, COW and alias holes.
+ * @return Zero after all fixture assertions succeed.
+ */
 int main(void)
 {
     nx_enabled = true;
@@ -95,6 +108,9 @@ int main(void)
     struct iovec remote[2] = {{(void *)va, 7}, {(void *)(va + 7), 9}};
     assert(transfer(20, local, 2, remote, 2, 0, false) == 16);
     assert(!memcmp((void *)lpage, (void *)rpage, 16));
+    inaccessible_physical = rpage;
+    assert(transfer(20, local, 2, remote, 2, 0, false) == -LINUX_EFAULT);
+    inaccessible_physical = 0;
     memcpy((void *)lpage, "abcdefghijklmnop", 16);
     assert(transfer(20, local, 2, remote, 2, 0, true) == 16);
     assert(!memcmp((void *)lpage, (void *)rpage, 16));
@@ -167,4 +183,5 @@ int main(void)
     for (unsigned i = 0; i < 2048; ++i) assert(!pages[i].refs);
     assert(!allocations);
     puts("PASS real process_vm: vector import, credentials, partial copies, pinned pages, protection and COW");
+    return 0;
 }

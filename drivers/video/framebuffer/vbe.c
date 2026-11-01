@@ -20,6 +20,11 @@ static void vbe_write(uint16_t index, uint16_t value)
     x86_64_outw(value, VBE_DISPI_IOPORT_DATA);
 }
 
+/** @brief Probe the VBE aperture while retaining the current boot pixels.
+ * @return 1 when the backend is usable, or 0 with the boot surface unchanged.
+ * The original pixel extent remains an auxiliary UC reservation through the
+ * sparse-map transition and after a later mode switch.
+ */
 int framebuffer_vbe_probe(void)
 {
     struct pci_device device;
@@ -28,8 +33,20 @@ int framebuffer_vbe_probe(void)
     uint64_t vram_bytes;
     uint32_t bar;
     uint32_t lfb_start;
+    uint64_t pixels;
+    uint64_t pixel_bytes;
 
     if (!fb.available) {
+        return 0;
+    }
+    pixels = (uint64_t)(uintptr_t)fb.pixels;
+    pixel_bytes = framebuffer_current_bytes();
+    if (pixels < RELIEFNT_KERNEL_DIRECT_MAP_BASE || !pixel_bytes ||
+        pixel_bytes > UINT32_MAX ||
+        pixels - RELIEFNT_KERNEL_DIRECT_MAP_BASE >= RELIEFNT_KERNEL_DIRECT_MAP_SIZE ||
+        pixel_bytes > RELIEFNT_KERNEL_DIRECT_MAP_SIZE -
+            (pixels - RELIEFNT_KERNEL_DIRECT_MAP_BASE) ||
+        pixels == RELIEFNT_KERNEL_DIRECT_MAP_BASE) {
         return 0;
     }
     vbe_id = vbe_read(VBE_DISPI_INDEX_ID);
@@ -66,6 +83,8 @@ int framebuffer_vbe_probe(void)
     fb.max_bytes = (uint32_t)vram_bytes;
     fb.backend = FRAMEBUFFER_BACKEND_BOCHS_VBE;
     fb.capabilities = FRAMEBUFFER_CAP_MODE_SET;
+    fb.auxiliary_reservation_start = pixels - RELIEFNT_KERNEL_DIRECT_MAP_BASE;
+    fb.auxiliary_reservation_bytes = (uint32_t)pixel_bytes;
     fb.reservation_start = lfb_start;
     fb.reservation_bytes = (uint32_t)vram_bytes;
     return 1;

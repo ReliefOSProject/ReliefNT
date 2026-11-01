@@ -7,6 +7,7 @@
 #include <reliefnt/syscall.h>
 #include <reliefnt/syscall_internal.h>
 #include <reliefnt/usercopy.h>
+#include <reliefnt/socket_usercopy.h>
 #include <reliefnt/time.h>
 #include <reliefnt/futex.h>
 #include <linux/socket.h>
@@ -109,6 +110,8 @@ int task_packet_send(struct task_file *file, const void *data, uint32_t length,
         uint32_t destination = s->remote_ip;
         if (address) {
             if ((int32_t)address_length < 0 || address_length < sizeof(struct sockaddr_in)) return -LINUX_EINVAL;
+            int prep=socket_user_prepare(sched_current_task(),address,sizeof(struct sockaddr_in),false);
+            if(prep)return prep;
             if (!user_range_ok(address, sizeof(struct sockaddr_in))) return -LINUX_EFAULT;
             struct sockaddr_in to;
             __builtin_memcpy(&to, (void *)(uintptr_t)address, sizeof(to));
@@ -123,6 +126,8 @@ int task_packet_send(struct task_file *file, const void *data, uint32_t length,
     struct sockaddr_ll to = {.sll_family = AF_PACKET, .sll_protocol = (uint16_t)s->protocol, .sll_ifindex = s->ifindex};
     if (address) {
         if ((int32_t)address_length < 0 || address_length < sizeof(to)) return -LINUX_EINVAL;
+        int prep=socket_user_prepare(sched_current_task(),address,sizeof(to),false);
+        if(prep)return prep;
         if (!user_range_ok(address, sizeof(to))) return -LINUX_EFAULT;
         __builtin_memcpy(&to, (void *)(uintptr_t)address, sizeof(to));
         if (to.sll_family != AF_PACKET) return -LINUX_EINVAL;
@@ -156,8 +161,9 @@ int task_packet_send(struct task_file *file, const void *data, uint32_t length,
  * @param address_length User socklen_t pointer.
  * @return Message bytes, negative errno or KERNEL_SYSCALL_BLOCKED.
  */
-int task_packet_recv(struct task_file *file, void *data, uint32_t length,
-                     uint32_t flags, uint64_t address, uint64_t address_length)
+static int packet_recv(struct task_file *file, void *data, uint32_t length,
+                       uint32_t flags, uint64_t address, uint64_t address_length,
+                       void *staged_source,uint32_t *staged_length)
 {
     struct packet_socket *s = packet_of(file);
     if (!s) return -LINUX_EBADF;
@@ -176,13 +182,20 @@ int task_packet_recv(struct task_file *file, void *data, uint32_t length,
         return KERNEL_SYSCALL_BLOCKED;
     }
     struct packet_message *m = s->head;
+    if(staged_source && staged_length) {
+        const void *source=s->domain==AF_PACKET ? (const void *)&m->link : (const void *)&m->ip;
+        *staged_length=s->domain==AF_PACKET ? sizeof(m->link) : sizeof(m->ip);
+        __builtin_memcpy(staged_source,source,*staged_length);
+    }
     if (address) {
-        if (!user_range_writable(address_length, 4)) return -LINUX_EFAULT;
-        uint32_t capacity = *(uint32_t *)(uintptr_t)address_length;
+        uint32_t capacity;
+        int prep=socket_user_length(sched_current_task(),address_length,&capacity);
+        if(prep)return prep;
         if ((int32_t)capacity < 0) return -LINUX_EINVAL;
         const void *source = s->domain == AF_PACKET ? (void *)&m->link : (void *)&m->ip;
         uint32_t size = s->domain == AF_PACKET ? sizeof(m->link) : sizeof(m->ip);
         uint32_t copied = capacity < size ? capacity : size;
+        prep=socket_user_prepare(sched_current_task(),address,copied,true);if(prep)return prep;
         if (copied && !user_range_writable(address, copied)) return -LINUX_EFAULT;
         if (copied) __builtin_memcpy((void *)(uintptr_t)address, source, copied);
         *(uint32_t *)(uintptr_t)address_length = size;
@@ -198,6 +211,31 @@ int task_packet_recv(struct task_file *file, void *data, uint32_t length,
     }
     return result;
 }
+
+int task_packet_recv(struct task_file *file,void *data,uint32_t length,
+                     uint32_t flags,uint64_t address,uint64_t address_length)
+{ return packet_recv(file,data,length,flags,address,address_length,NULL,NULL); }
+
+#ifdef CONFIG_SWAP
+/** @brief Determine the native source sockaddr size for a packet endpoint.
+ * @param file Pinned packet OFD. @return Native size, or zero for invalid OFD.
+ */
+uint32_t task_packet_address_size(const struct task_file *file)
+{
+    const struct packet_socket *s=packet_of(file);
+    return !s ? 0 : s->domain==AF_PACKET ? sizeof(struct sockaddr_ll) : sizeof(struct sockaddr_in);
+}
+
+/** @brief Receive packet bytes and source into caller-owned kernel storage.
+ * @param file Pinned packet OFD. @param data Kernel destination. @param length
+ * Destination capacity. @param flags Native receive flags. @param source Optional
+ * kernel sockaddr. @param source_length Receives its size when source is given.
+ * @return Byte count, blocking sentinel, or errno. PEEK retains the queue entry.
+ */
+int task_packet_recv_staged(struct task_file *file,void *data,uint32_t length,
+                            uint32_t flags,void *source,uint32_t *source_length)
+{ return packet_recv(file,data,length,flags,0,0,source,source_length); }
+#endif
 
 /** @brief Query packet readiness under the execution lock.
  * @param file Pinned socket.
@@ -275,13 +313,18 @@ int64_t syscall_packet(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
         file->node.type = RELIEFOS_FS_TYPE_DEVICE;
         return fd;
     }
+#ifdef CONFIG_SWAP
+    struct task_file *file = task_file_for_io(task, (int32_t)a0);
+#else
     struct task_file *file = task_file_for_fd(task, (int32_t)a0);
+#endif
     struct packet_socket *s = packet_of(file);
     if (!s) return -LINUX_EBADF;
     if (number == __NR_bind || number == __NR_connect) {
         if (s->domain == AF_PACKET) {
             if (number == __NR_connect) return -LINUX_EOPNOTSUPP;
             if ((int32_t)a2 < 0 || (uint32_t)a2 < sizeof(struct sockaddr_ll)) return -LINUX_EINVAL;
+            int prep=socket_user_prepare(task,a1,sizeof(struct sockaddr_ll),false);if(prep)return prep;
             if (!user_range_ok(a1, sizeof(struct sockaddr_ll))) return -LINUX_EFAULT;
             struct sockaddr_ll address;
             __builtin_memcpy(&address, (void *)(uintptr_t)a1, sizeof(address));
@@ -291,6 +334,7 @@ int64_t syscall_packet(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
             s->protocol = address.sll_protocol;
         } else {
             if ((int32_t)a2 < 0 || (uint32_t)a2 < sizeof(struct sockaddr_in)) return -LINUX_EINVAL;
+            int prep=socket_user_prepare(task,a1,sizeof(struct sockaddr_in),false);if(prep)return prep;
             if (!user_range_ok(a1, sizeof(struct sockaddr_in))) return -LINUX_EFAULT;
             struct sockaddr_in address;
             __builtin_memcpy(&address, (void *)(uintptr_t)a1, sizeof(address));
@@ -310,6 +354,7 @@ int64_t syscall_packet(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
         if ((int)a1 == SOL_SOCKET && ((int)a2 == SO_RCVTIMEO || (int)a2 == SO_RCVTIMEO_NEW)) {
             int64_t timeout[2];
             if ((uint32_t)a4 < sizeof(timeout)) return -LINUX_EINVAL;
+            int prep=socket_user_prepare(task,a3,sizeof(timeout),false);if(prep)return prep;
             if (!user_range_ok(a3, sizeof(timeout))) return -LINUX_EFAULT;
             __builtin_memcpy(timeout, (void *)(uintptr_t)a3, sizeof(timeout));
             if (timeout[1] < 0 || timeout[1] >= 1000000) return -LINUX_EDOM;
@@ -321,6 +366,7 @@ int64_t syscall_packet(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
         if (!((int)a1 == SOL_SOCKET && (int)a2 == 6) &&
             !((int)a1 == 0 && (int)a2 == 3 && s->domain == AF_INET)) return -LINUX_ENOPROTOOPT;
         if ((uint32_t)a4 < 4) return -LINUX_EINVAL;
+        int prep=socket_user_prepare(task,a3,4,false);if(prep)return prep;
         if (!user_range_ok(a3, 4)) return -LINUX_EFAULT;
         bool value = *(int *)(uintptr_t)a3 != 0;
         if ((int)a1 == SOL_SOCKET) s->broadcast = value;

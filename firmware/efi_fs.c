@@ -1,6 +1,7 @@
 #include <reliefnt/efi_fs.h>
 #include <reliefnt/console.h>
 #include <reliefnt/lock.h>
+#include <reliefnt/multiboot2.h>
 
 #define EFI_BY_PROTOCOL 2ULL
 #define EFI_FILE_MODE_READ 0x0000000000000001ULL
@@ -8,6 +9,7 @@
 
 #define EFI_SUCCESS 0ULL
 #define EFI_BUFFER_TOO_SMALL 0x8000000000000005ULL
+#define EFI_INVALID_PARAMETER 0x8000000000000002ULL
 #define EFI_NOT_FOUND 0x8000000000000014ULL
 
 struct efi_guid {
@@ -59,6 +61,8 @@ typedef efi_status_t (__attribute__((ms_abi)) *efi_get_memory_map_fn)(
     uint64_t *descriptor_size,
     uint32_t *descriptor_version);
 typedef efi_status_t (__attribute__((ms_abi)) *efi_free_pool_fn)(void *buffer);
+typedef efi_status_t (__attribute__((ms_abi)) *efi_exit_boot_services_fn)(
+    efi_handle_t image_handle, uint64_t map_key);
 
 struct efi_boot_services {
     struct efi_table_header hdr;
@@ -83,7 +87,7 @@ struct efi_boot_services {
     efi_status_t (*start_image)(void);
     efi_status_t (*exit)(void);
     efi_status_t (*unload_image)(void);
-    efi_status_t (*exit_boot_services)(void);
+    efi_exit_boot_services_fn exit_boot_services;
     efi_status_t (*get_next_monotonic_count)(void);
     efi_status_t (*stall)(void);
     efi_status_t (*set_watchdog_timer)(void);
@@ -434,6 +438,54 @@ int efi_boot_memory_map(uint64_t system_table_addr, void *buffer,
                                        out_entry_size, out_entry_count);
     kernel_irq_restore(irq_flags);
     return ret;
+}
+
+/**
+ * @brief Capture the current EFI map and exit firmware boot services atomically.
+ * @param system_table_addr Firmware system table, still reachable and live.
+ * @param image_handle Nonzero EFI image handle from the loader's handoff.
+ * @param buffer Caller-owned writable map storage, retained after exit.
+ * @param buffer_bytes Capacity of buffer in bytes.
+ * @param out_entry_size Required output descriptor stride, zero on failure.
+ * @param out_entry_count Required output descriptor count, zero on failure.
+ * @return 0 after successful exit, otherwise a negative errno-style value.
+ * BSP with firmware mappings and boot services live; interrupts stay disabled
+ * for each call sequence. After a stale key only GetMemoryMap and
+ * ExitBootServices are called; a failure requires the caller to stop boot.
+ */
+int efi_boot_exit_services(uint64_t system_table_addr, uint64_t image_handle,
+                           void *buffer, uint64_t buffer_bytes,
+                           uint64_t *out_entry_size, uint32_t *out_entry_count)
+{
+    if (!out_entry_size || !out_entry_count) return -22;
+    *out_entry_size = 0;
+    *out_entry_count = 0;
+    if (!system_table_addr || !image_handle || !buffer || !buffer_bytes) return -22;
+    struct efi_system_table *st = (void *)(uintptr_t)system_table_addr;
+    if (!st->boot_services || !st->boot_services->get_memory_map ||
+        !st->boot_services->exit_boot_services) return -19;
+
+    uint64_t flags = kernel_irq_save();
+    int result = -1;
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        uint64_t size = buffer_bytes, key = 0, stride = 0;
+        uint32_t version = 0;
+        efi_status_t status = st->boot_services->get_memory_map(
+            &size, buffer, &key, &stride, &version);
+        if (status != EFI_SUCCESS || stride < sizeof(struct efi_memory_descriptor) ||
+            size > buffer_bytes || size % stride || size / stride > UINT32_MAX || !size)
+            break;
+        status = st->boot_services->exit_boot_services((efi_handle_t)(uintptr_t)image_handle, key);
+        if (status == EFI_SUCCESS) {
+            *out_entry_size = stride;
+            *out_entry_count = (uint32_t)(size / stride);
+            result = 0;
+            break;
+        }
+        if (status != EFI_INVALID_PARAMETER) break;
+    }
+    kernel_irq_restore(flags);
+    return result;
 }
 
 /** @brief Read a bounded file into caller storage while EFI file protocols are live.

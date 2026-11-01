@@ -36,7 +36,8 @@ bool storage_inode_is_unlinked(const struct storage_node *node)
 /** @brief Intern a FAT/exFAT directory record with stable per-mount inode identity.
  * @param node Borrowed metadata, updated with a unique cache generation.
  * @return Zero or negative errno. Execution transaction required. Unused cache
- * entries may be reclaimed; held entries have no fixed capacity cutoff.
+ * entries may be reclaimed unless a visible page-cache key needs their stable
+ * generation; held and cache-referenced entries have no fixed capacity cutoff.
  */
 int storage_inode_cache_node(struct storage_node *node)
 {
@@ -48,7 +49,7 @@ int storage_inode_cache_node(struct storage_node *node)
     size_t unused=0;struct storage_inode_ref **victim=NULL;
     for(struct storage_inode_ref **link=&storage_inode_refs;*link;link=&(*link)->next)
         if(storage_inode_clustered(&(*link)->node) && !(*link)->references && !(*link)->unlinked) {
-            ++unused;if(!victim)victim=link;
+            ++unused;if(!victim && !page_cache_has_inode(&(*link)->node))victim=link;
         }
     if(unused>=128 && victim) {
         ref=*victim;*victim=ref->next;kernel_free(ref);
@@ -74,6 +75,7 @@ int storage_inode_cache_node(struct storage_node *node)
 void storage_inode_note_data(const struct storage_node *before,const struct storage_node *after)
 {
     struct storage_inode_ref *ref=storage_inode_for_node(before);if(!ref)return;
+    if(ref->node.size!=after->size)page_cache_resize_node(before,ref->node.size,after->size);
     ref->node.first_cluster=after->first_cluster;ref->node.size=after->size;
     ref->node.flags=(ref->node.flags & ~STORAGE_NODE_FLAG_EXFAT_NOFAT) |
         (after->flags & STORAGE_NODE_FLAG_EXFAT_NOFAT);
@@ -105,11 +107,14 @@ bool storage_inode_unlinked(const struct storage_node *node)
 /** @brief Discard unused cluster inode cache records before volume reuse.
  * @param volume Backend slot, under execution ownership.
  * @return Zero or EBUSY if a held/failed-retirement inode prevents reuse.
+ * Success retires volume cache keys; existing physical pins remain owned until
+ * their final release. Failed purge preserves both metadata and cache keys.
  */
 int storage_inode_purge_volume(uint32_t volume)
 {
     for(struct storage_inode_ref *ref=storage_inode_refs;ref;ref=ref->next)
         if(ref->node.volume_id==volume && (ref->references || ref->unlinked))return -16;
+    page_cache_forget_volume(volume);
     struct storage_inode_ref **link=&storage_inode_refs;
     while(*link) {
         struct storage_inode_ref *ref=*link;
@@ -122,7 +127,18 @@ int storage_inode_purge_volume(uint32_t volume)
 int storage_inode_mutation_allowed(const struct storage_node *node)
 {
     struct storage_inode_ref *ref=storage_inode_for_node(node);
-    return ref && ref->write_count<0 ? -26 : 0;
+    return ref && (ref->write_count<0 || ref->swap_active) ? -26 : 0;
+}
+
+/** @brief Observe a retained node's swap claim without acquiring a new inode.
+ * @param node Borrowed actual inode identity. @return True while claimed.
+ * Caller holds storage execution ownership and the node's provider lifetime.
+ */
+bool storage_inode_swap_busy(const struct storage_node *node)
+{
+    if (!node) return false;
+    struct storage_inode_ref *ref=storage_inode_for_node(node);
+    return ref && ref->swap_active;
 }
 
 /**
@@ -159,6 +175,17 @@ bool storage_inode_volume_writers(uint32_t volume)
 {
     for(const struct storage_inode_ref *ref=storage_inode_refs;ref;ref=ref->next)
         if(ref->node.volume_id==volume && ref->write_count>0)return true;
+    return false;
+}
+
+/** @brief Check whether a volume retains any active swap backing inode.
+ * @param volume Native volume identity. @return True while any claim exists.
+ * Caller owns the execution transaction; no inode or lock ownership changes.
+ */
+bool storage_inode_volume_swap_active(uint32_t volume)
+{
+    for(const struct storage_inode_ref *ref=storage_inode_refs;ref;ref=ref->next)
+        if(ref->node.volume_id==volume && ref->swap_active)return true;
     return false;
 }
 

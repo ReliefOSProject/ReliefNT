@@ -31,6 +31,7 @@ extern uint8_t smp_trampoline_start[];
 extern uint8_t smp_trampoline_end[];
 extern uint8_t smp_trampoline_cr3_imm[];
 extern uint8_t smp_trampoline_stack_imm[];
+extern uint8_t smp_trampoline_physbits_imm[];
 extern uint8_t smp_trampoline_cpu_imm[];
 extern uint8_t smp_trampoline_entry_imm[];
 extern uint8_t smp_trampoline_gdtr_base[];
@@ -53,6 +54,11 @@ static uint32_t trampoline_offset(const uint8_t *symbol)
     return (uint32_t)(symbol - smp_trampoline_start);
 }
 
+/** @brief Prepare the low AP trampoline with a checked root and CPU requirements.
+ * @param index Discovered logical CPU index passed to the AP entry.
+ * @param stack_top Exclusive top of its already allocated direct-map stack.
+ * BSP only; caller checks that the shared CR3 fits the 32-bit startup path.
+ */
 static void copy_trampoline_for(uint32_t index, uint64_t stack_top)
 {
     uint8_t *destination = (uint8_t *)(uintptr_t)AP_TRAMPOLINE_PHYS;
@@ -75,6 +81,7 @@ static void copy_trampoline_for(uint32_t index, uint64_t stack_top)
         longmode_address;
     *(uint32_t *)(destination + trampoline_offset(smp_trampoline_cr3_imm)) =
         (uint32_t)paging_kernel_cr3();
+    *(destination + trampoline_offset(smp_trampoline_physbits_imm)) = paging_physical_bits();
     *(uint64_t *)(destination + trampoline_offset(smp_trampoline_stack_imm)) = stack_top;
     *(uint32_t *)(destination + trampoline_offset(smp_trampoline_cpu_imm)) = index;
     *(uint64_t *)(destination + trampoline_offset(smp_trampoline_entry_imm)) =
@@ -201,6 +208,11 @@ const struct smp_cpu_info *smp_cpu_info(uint32_t cpu_index)
  */
 void smp_start_aps(void)
 {
+    if (paging_kernel_cr3() > UINT32_MAX || !paging_physical_bits()) {
+        console_error("[reliefnt] SMP bootstrap root or physical width is unsupported\n");
+        smp_ready = 1;
+        return;
+    }
     if (smp_ready || cpu_count <= 1 || !apic_available()) {
         smp_ready = 1;
         return;

@@ -2,6 +2,7 @@
 #define RELIEFNT_FS_EXFAT_EXFAT_C_INTERNAL_H
 
 #include "../../block/core/storage_internal.h"
+#include <reliefnt/page_cache.h>
 /*
  * exFAT storage backend.
  *

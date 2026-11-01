@@ -4,12 +4,97 @@
 #include <reliefos/driver.h>
 #undef RELIEFNT_KERNEL_DIRECT_MAP_BASE
 #define RELIEFNT_KERNEL_DIRECT_MAP_BASE 0
-#include "../../mm/physical/mm.c"
+#include <reliefnt/mm.h>
+
+/** @brief Host-only page pool for PCI resource lifecycle tests. */
+struct fixture_pages {
+    uint64_t base; /**< Physical base mapped into the host. */
+    uint32_t count; /**< Number of represented pages. */
+    uint32_t refs[512]; /**< Fixture-owned references. */
+};
+static struct fixture_pages fixture_pools[2];
+static uint64_t fixture_free_pages;
+
+/**
+ * @brief Allocate a zeroed fixture run within a complete inclusive DMA mask.
+ * @param count Number of contiguous pages.
+ * @param mask Maximum physical final byte.
+ * @return Owned host-mapped physical base or zero; fixture-only implementation.
+ */
+uint64_t mm_alloc_pages_below(uint32_t count, uint64_t mask)
+{
+    if (!count || count > fixture_free_pages) return 0;
+    uint64_t bytes = (uint64_t)count * 4096;
+    for (unsigned i = 0; i < 2; ++i) {
+        struct fixture_pages *pool = &fixture_pools[i];
+        if (count > pool->count) continue;
+        for (uint32_t start = 0; start <= pool->count - count; ++start) {
+            uint64_t phys = pool->base + (uint64_t)start * 4096;
+            if (phys > mask || bytes - 1 > mask - phys) continue;
+            uint32_t n = 0;
+            while (n < count && !pool->refs[start + n]) ++n;
+            if (n != count) { start += n; continue; }
+            for (n = 0; n < count; ++n) pool->refs[start + n] = 1;
+            fixture_free_pages -= count;
+            __builtin_memset((void *)(uintptr_t)phys, 0, (size_t)bytes);
+            return phys;
+        }
+    }
+    return 0;
+}
+/** @brief Allocate fixture pages. @param count Requested pages. @return Physical base or zero. */
+uint64_t mm_alloc_pages(uint32_t count) { return mm_alloc_pages_below(count, UINT64_MAX); }
+/** @brief Allocate one fixture page. @return Physical base or zero. */
+uint64_t mm_alloc_page(void) { return mm_alloc_pages(1); }
+/**
+ * @brief Release fixture page references.
+ * @param phys Aligned fixture physical base. @param count Number of pages.
+ */
+void mm_free_pages(uint64_t phys, uint32_t count)
+{
+    for (unsigned i = 0; i < 2; ++i) {
+        struct fixture_pages *pool = &fixture_pools[i];
+        if (phys < pool->base || (phys - pool->base) % 4096) continue;
+        uint64_t first = (phys - pool->base) / 4096;
+        if (first >= pool->count || count > pool->count - first) continue;
+        for (uint32_t n = 0; n < count; ++n)
+            if (pool->refs[first + n] && !--pool->refs[first + n]) ++fixture_free_pages;
+        return;
+    }
+}
+/** @brief Release one fixture page. @param phys Physical base. */
+void mm_free_page(uint64_t phys) { mm_free_pages(phys, 1); }
+/** @brief Report free fixture pages in KiB. @return Free capacity without ownership transfer. */
+uint64_t mm_free_memory_kib(void) { return fixture_free_pages * 4; }
+/** @brief Translate fixture physical memory. @param phys Physical byte. @return Borrowed pointer. */
+void *mm_phys_to_virt(uint64_t phys) { return (void *)(uintptr_t)phys; }
+/** @brief Translate a fixture pointer. @param address Host-mapped pointer. @return Physical byte. */
+uint64_t mm_virt_to_phys(const void *address) { return (uint64_t)(uintptr_t)address; }
 #include "../../arch/x86_64/platform/pci_irq.c"
 #include "../../arch/x86_64/platform/pci.c"
 #define align_down paging_align_down
 #include "../../arch/x86_64/mm/paging.c"
 #undef align_down
+/** @brief Resolve the fixture's owned host-backed page tables.
+ * @param physical Fake physical table address. @return Borrowed table pointer.
+ */
+uint64_t *paging_trusted_table_alias(uint64_t physical) { return (void *)(uintptr_t)physical; }
+/** @brief Classify the fixture's currently configured RAM pools.
+ * @param physical First physical byte. @param bytes Length of the extent.
+ * @return True when the entire extent is in a pool.
+ */
+bool mm_phys_is_ram(uint64_t physical, uint64_t bytes)
+{
+    for (unsigned i = 0; i < 2; ++i) {
+        uint64_t size = (uint64_t)fixture_pools[i].count * 4096;
+        if (physical >= fixture_pools[i].base && physical - fixture_pools[i].base < size &&
+            bytes <= size - (physical - fixture_pools[i].base)) return true;
+    }
+    return false;
+}
+/** @brief Return the fixture's empty display reservation. @return Borrowed descriptor. */
+const struct framebuffer *framebuffer_get(void)
+{ static const struct framebuffer display; return &display; }
 #include "../../sound/core/core.c"
 #include "../../kernel/device/driver_resources.c"
 
@@ -63,12 +148,17 @@ void x86_64_outw(uint16_t value,uint16_t port) {
 }
 bool apic_enabled(void) { return true; }
 uint32_t apic_bsp_id(void) { return 3; }
-static uint64_t bitmap[MM_PAGE_COUNT/64];
+/**
+ * @brief Replace the host-only PCI page pools for an independent resource scenario.
+ * @param low First mapped pool base. @param ln First pool page count.
+ * @param high Second mapped pool base. @param hn Second pool page count.
+ */
 static void mm_fixture_init(uint64_t low,uint32_t ln,uint64_t high,uint32_t hn) {
-    free_pages=bitmap; free_page_count=ln+hn; allocation_hint=high/4096; reserved_range_count=0;
-    __builtin_memset(bitmap,0,sizeof bitmap); __builtin_memset(page_refs,0,sizeof page_refs);
-    for(uint32_t n=0;n<ln;n++) bitmap[(low/4096+n)/64]|=1ULL<<((low/4096+n)%64);
-    for(uint32_t n=0;n<hn;n++) bitmap[(high/4096+n)/64]|=1ULL<<((high/4096+n)%64);
+    assert(ln <= 512 && hn <= 512);
+    __builtin_memset(fixture_pools, 0, sizeof(fixture_pools));
+    fixture_pools[0].base = low; fixture_pools[0].count = ln;
+    fixture_pools[1].base = high; fixture_pools[1].count = hn;
+    fixture_free_pages = (uint64_t)ln + hn;
     if(ln) assert(mmap((void*)(uintptr_t)low,ln*4096,3,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0)!=(void*)-1);
     if(hn) assert(mmap((void*)(uintptr_t)high,hn*4096,3,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0)!=(void*)-1);
 }
@@ -98,7 +188,7 @@ static void msi_disable_synchronizes_inflight(void) {
 static void dma_mask_is_enforced(void) {
     mm_fixture_init(0x100000,32,0x100000000ULL,32);
     uint64_t p=mm_alloc_pages_below(2,0xffffffffULL); assert(p && p+8191<=0xffffffffULL);
-    mm_free_pages(p,2); assert(free_page_count==64);
+    mm_free_pages(p,2); assert(mm_free_memory_kib()==64*4);
     mm_fixture_init(0,0,0x100000000ULL,32); assert(!mm_alloc_pages_below(2,0xffffffffULL));
     assert(!mm_alloc_pages_below(0xffffffffu,UINT64_MAX));
 }
@@ -433,12 +523,12 @@ static void mmio_validation_and_page_table_oom_roll_back(void) {
 static void module_resource_failure_rolls_back(void) {
     mm_fixture_init(0x50000000,300,0,0);
     for(unsigned i=0;i<DRIVER_RESOURCE_MAX;i++)assert(driver_alloc_dma_owned(9,1,0xffffffff));
-    uint32_t available=free_page_count;assert(!driver_alloc_dma_owned(9,1,0xffffffff));assert(free_page_count==available);
+    uint64_t available=mm_free_memory_kib();assert(!driver_alloc_dma_owned(9,1,0xffffffff));assert(mm_free_memory_kib()==available);
     assert(!driver_map_mmio_owned(9,0xc0000000,4096));for(unsigned i=0;i<PCI_MMIO_MAX;i++)assert(!pci_mappings[i].refs);
     struct reliefos_driver_pci_device d={0};unsigned count=0;uint32_t handle;
     assert(driver_request_pci_irq_owned(9,&d,handler,&count,&handle)==-28);
     assert(!(cfg[0x40/4]&(1u<<16)));for(unsigned i=0;i<IRQ_COUNT;i++)assert(!pci_irqs[i].live && !pci_irqs[i].retiring);
-    driver_resources_release(9,false);assert(free_page_count==300);
+    driver_resources_release(9,false);assert(mm_free_memory_kib()==300*4);
     for(unsigned i=0;i<DRIVER_RESOURCE_MAX;i++)assert(!driver_resources[i].live);
     void *lease=driver_map_mmio_owned(9,0xc0000000,4096);assert(lease);
     assert(!driver_map_mmio_owned(10,0xc0000000,8192));
@@ -531,12 +621,19 @@ static void pci_high_mmio_preserves_physical_ownership(void) {
     assert(*kernel_shared_leaf((uintptr_t)alias,false)&RELIEFNT_PAGE_PRESENT);
     uint64_t flags;kernel_execution_lock_irqsave(&flags);
     driver_resources_release(13,false);kernel_execution_unlock_irqrestore(flags);
-    assert(!owner_resource_count(13) && !pci_mmio_reference_count() && free_page_count==32 && !mapped_heap_objects);
+    assert(!owner_resource_count(13) && !pci_mmio_reference_count() && mm_free_memory_kib()==32*4 && !mapped_heap_objects);
     cfg[4]=low;cfg[5]=high;bar_masks[4]=mask_low;bar_masks[5]=mask_high;
     puts("high_PCI_BAR_UC_NX_exact_refs_physical_owner_exclusion_and_cleanup PASS");
 }
+/** @brief Exercise PCI resource, cache-lease and DMA ownership contracts.
+ * @return Zero after all fixture assertions succeed.
+ */
 int main(void) {
     setvbuf(stdout,NULL,_IONBF,0);
+    kernel_pml4[0] = (uintptr_t)kernel_pdpt | 3;
+    kernel_pml4[511] = (uintptr_t)kernel_shared_pdpt | 3;
+    for (unsigned i = 0; i < KERNEL_PD_COUNT; ++i)
+        kernel_pdpt[i] = (uintptr_t)kernel_pd[i] | 3;
     /* These MMIO ownership tests model the post-mm_init runtime allocator.
      * Early pinned-table behavior is covered by paging_protection_test. */
     paging_mmio_allocator_ready();

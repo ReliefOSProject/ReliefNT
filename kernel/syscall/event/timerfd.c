@@ -1,6 +1,20 @@
 #include "../internal.h"
+#include <reliefnt/swap.h>
 
 static struct task_timerfd *task_timerfd_for_fd(struct task *task, int fd);
+
+/** @brief Prepare a bounded timer operand at the outer syscall boundary.
+ * @param task Current owner. @param address User operand. @param size Bytes.
+ * @param writing True for output. @return Zero, EFAULT, or private contention.
+ * No pending timer state changes until a contention retry can be scheduled.
+ */
+static int timerfd_prepare_user(struct task *task, uint64_t address, uint64_t size,
+                                bool writing)
+{
+    int rc = swap_prepare_user_range(task, address, size, writing);
+    if (rc == SWAP_STORAGE_CONTENDED) return KERNEL_SYSCALL_SWAP_CONTENDED;
+    return rc < 0 ? -RELIEFOS_EFAULT : 0;
+}
 
 
 int64_t syscall_eventfd_create(uint64_t initial, uint32_t flags)
@@ -30,7 +44,7 @@ int64_t syscall_eventfd_create(uint64_t initial, uint32_t flags)
 
 static struct task_timerfd *task_timerfd_for_fd(struct task *task, int fd)
 {
-    struct task_file *file = task_file_for_fd(task, fd);
+    struct task_file *file = task_file_for_io(task, fd);
     if (!file || !(file->flags & TASK_FILE_FLAG_TIMERFD) || !file->aux) return NULL;
     return (struct task_timerfd *)(uintptr_t)file->aux;
 }
@@ -82,11 +96,26 @@ int64_t syscall_timerfd_settime(uint64_t fd_arg, uint32_t flags,
     uint64_t initial, interval;
     if (!timer) return -RELIEFOS_EBADF;
     if (flags & ~(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET)) return -RELIEFOS_EINVAL;
+#ifdef CONFIG_SWAP
+    if(task && task->lookup_scope.armed) {
+        struct task_user_text snapshot={0};
+        int prep=task_lookup_user_bytes(task,value_ptr,sizeof(value),&snapshot);
+        if(prep)return prep;
+        __builtin_memcpy(&value,snapshot.text,sizeof(value));
+    } else
+#endif
+    {
+    int prep = timerfd_prepare_user(task, value_ptr, sizeof(value), false);
+    if (prep) return prep;
     if (!user_range_ok(value_ptr, sizeof(value))) return -RELIEFOS_EFAULT;
-    value = *(const struct linux_itimerspec *)(uintptr_t)value_ptr;
+    __builtin_memcpy(&value,(const void *)(uintptr_t)value_ptr,sizeof(value));
+    }
     if (value.it_value.tv_sec < 0 || value.it_value.tv_nsec < 0 || value.it_value.tv_nsec >= 1000000000LL ||
         value.it_interval.tv_sec < 0 || value.it_interval.tv_nsec < 0 || value.it_interval.tv_nsec >= 1000000000LL)
         return -RELIEFOS_EINVAL;
+    if (old_ptr && timerfd_prepare_user(task, old_ptr, sizeof(old), true) ==
+                       KERNEL_SYSCALL_SWAP_CONTENDED)
+        return KERNEL_SYSCALL_SWAP_CONTENDED;
     task_timerfd_update(timer);
     if (timer->expiry_tick) {
         uint64_t remaining = timer->expiry_tick > time_ticks() ? timer->expiry_tick - time_ticks() : 0;
@@ -118,7 +147,7 @@ int64_t syscall_timerfd_settime(uint64_t fd_arg, uint32_t flags,
     timer->expiry_tick = initial ? time_ticks() + initial : 0;
     if (old_ptr) {
         if (!user_range_writable(old_ptr, sizeof(old))) return -RELIEFOS_EFAULT;
-        *(struct linux_itimerspec *)(uintptr_t)old_ptr = old;
+        __builtin_memcpy((void *)(uintptr_t)old_ptr,&old,sizeof(old));
     }
     return 0;
 }
@@ -129,6 +158,8 @@ int64_t syscall_timerfd_gettime(uint64_t fd_arg, uint64_t value_ptr)
     struct task_timerfd *timer = task_timerfd_for_fd(task, (int)fd_arg);
     struct linux_itimerspec value = {0};
     if (!timer) return -RELIEFOS_EBADF;
+    int prep = timerfd_prepare_user(task, value_ptr, sizeof(value), true);
+    if (prep) return prep;
     if (!user_range_writable(value_ptr, sizeof(value))) return -RELIEFOS_EFAULT;
     task_timerfd_update(timer);
     if (timer->expiry_tick) {
@@ -164,12 +195,19 @@ int64_t syscall_memfd_create(uint64_t name_ptr, uint32_t flags)
     if (!task ||
         (flags & ~(LINUX_MFD_CLOEXEC | LINUX_MFD_ALLOW_SEALING)))
         return -RELIEFOS_EINVAL;
-    if(!user_range_ok(name_ptr,1))return -RELIEFOS_EFAULT;
-    size_t length=user_strlen((const char *)(uintptr_t)name_ptr,sizeof(name));
-    if(length==sizeof(name))return user_range_ok(name_ptr,sizeof(name)) ? -RELIEFOS_EINVAL : -RELIEFOS_EFAULT;
-    if(!user_range_ok(name_ptr,length+1))return -RELIEFOS_EFAULT;
-    for(size_t i=0;i<=length;++i)name[i]=((const char *)(uintptr_t)name_ptr)[i];
-    if(name[length])return -RELIEFOS_EFAULT;
+#ifdef CONFIG_SWAP
+    if(task->lookup_scope.armed) {
+        struct task_user_text text={0};
+        ret=task_lookup_user_text(task,name_ptr,sizeof(name),false,&text);
+        if(!ret) {
+            size_t i=0;do{name[i]=text.text[i];}while(name[i++] && i<sizeof(name));
+        }
+    } else
+#endif
+        ret = copy_user_path(name, sizeof(name), name_ptr);
+    if (ret) return ret == -RELIEFOS_ENAMETOOLONG ? -RELIEFOS_EINVAL : ret;
+    size_t length = 0;
+    while (name[length]) ++length;
     fd = alloc_task_fd(task, &node, RELIEFOS_O_RDWR, NULL);
     if (fd < 0) return fd;
     file = task_file_for_fd(task, fd);

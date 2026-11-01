@@ -1,3 +1,6 @@
+#ifdef CONFIG_SWAP
+#include <reliefnt/swap_internal.h>
+#endif
 #include "internal.h"
 
 /** @brief Map a supported public format selector to its registered native type.
@@ -323,6 +326,14 @@ int disk_partition_mutable(const struct install_disk_state *disk)
      * physical disks are installation targets, even if probing them first
      * found an existing ReliefOS root. Keep the boot-disk guard for normal disk
      * boots while allowing the ISO's advanced environment to manage targets. */
+#ifdef CONFIG_SWAP
+    if (disk->device) {
+        struct block_device_ref ref={0};int rc=block_device_get(disk->device,&ref);
+        if (rc) return rc;
+        rc=swap_storage_raw_busy(&ref,0,1,true);block_device_put(&ref);
+        if (rc) return rc<0 ? rc : -EBUSY;
+    }
+#endif
     return disk->boot_root && !storage_installer_root_active() ? -16 : 0;
 }
 

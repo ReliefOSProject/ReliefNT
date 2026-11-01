@@ -10,7 +10,8 @@
 
 struct timestamp_fixture {struct tmpfs_super *fs;unsigned lookups,updates;bool wait_update;};
 static struct timestamp_fixture fixture;
-static char empty_path[1];
+/* Text import validates the remainder of each mapped user page. */
+static char empty_path[VFS_PATH_MAX] __attribute__((aligned(4096)));
 static uintptr_t timestamp_input,timestamp_name;
 static size_t timestamp_bytes,timestamp_name_bytes;
 void *kernel_malloc(size_t bytes){return malloc(bytes);}
@@ -23,6 +24,7 @@ void *mm_phys_to_virt(uint64_t page){(void)page;abort();}
 void sched_truncate_file_mappings(const struct storage_node *node,uint64_t size)
 {(void)node;(void)size;abort();}
 void page_cache_invalidate_node(const struct storage_node *node){(void)node;}
+void page_cache_forget_node(const struct storage_node *node){(void)node;}
 int time_wall_clock(struct reliefos_time_info *out)
 {*out=(struct reliefos_time_info){.unix_seconds=1700000000};return 0;}
 bool user_range_ok(uint64_t address,uint64_t bytes)
@@ -126,7 +128,8 @@ int main(void)
         task_file_bind_path(file,&path);file->node=original;vfs_path_put(&path);
         int64_t raw[4]={111,123456,222,654321};
         if(!call)raw[1]=222;
-        char name[]="snapshot";timestamp_name=(uintptr_t)name;timestamp_name_bytes=sizeof(name);
+        char name[VFS_PATH_MAX] __attribute__((aligned(4096)))="snapshot";
+        timestamp_name=(uintptr_t)name;timestamp_name_bytes=sizeof(name);
         timestamp_input=(uintptr_t)raw;timestamp_bytes=call ? sizeof(raw) : 2*sizeof(raw[0]);
         struct trap_frame frame={.rax=calls[call],.rdi=call>=2 ? 3 : (uintptr_t)name,
             .rsi=call>=2 ? 0 : (uintptr_t)raw,.rdx=call>=2 ? (uintptr_t)raw : 0};

@@ -122,19 +122,22 @@ long audio_pcm_move(struct audio_pcm *pcm, uint64_t frames, int forward)
     return (long)frames;
 }
 
-/** @brief Transfer complete frames through the configured interleaved DMA ring.
+/** @brief Check readiness or transfer frames through an interleaved DMA ring.
  * @param pcm Borrowed live PCM, serialized in task context; must be non-NULL.
  * @param kernel_data Kernel-owned sample storage; writable for capture, readable
- * for playback, with at least frames times frame_bytes bytes; NULL only if zero.
+ * for playback, with at least frames times frame_bytes bytes; NULL in probe mode
+ * or when frames is zero.
  * @param frames Requested number of complete frames.
+ * @param probe Return current transferable frames without copying or consuming.
  * @return Frames copied (including short progress), or negative state/driver
  * errno when no progress is made. Auto-start failure after playback progress is
  * latched for the next call; permanent disconnect metadata is never overwritten.
  * No PCM lock spans a driver callback. The caller retains sample ownership.
  */
-long audio_pcm_transfer(struct audio_pcm *pcm, void *kernel_data, uint32_t frames)
+static long audio_pcm_transfer_checked(struct audio_pcm *pcm, void *kernel_data,
+                                       uint32_t frames, bool probe)
 {
-    if (!pcm || (!kernel_data && frames)) return -EINVAL;
+    if (!pcm || (!probe && !kernel_data && frames)) return -EINVAL;
     if (pcm->auto_start && pcm->direction == AUDIO_CAPTURE &&
         pcm->state == AUDIO_PCM_PREPARED && frames >= pcm->start_threshold) {
         int start = audio_pcm_start(pcm);
@@ -176,6 +179,11 @@ long audio_pcm_transfer(struct audio_pcm *pcm, void *kernel_data, uint32_t frame
             audio_pcm_publish_locked(pcm);
             kernel_spin_unlock_irqrestore(&pcm->lock, flags); return -EAGAIN;
         }
+        if (probe) {
+            audio_pcm_publish_locked(pcm);
+            kernel_spin_unlock_irqrestore(&pcm->lock, flags);
+            return take;
+        }
         audio_pcm_copy_in(pcm, pcm->appl_ptr * pcm->params.frame_bytes,
                           kernel_data, take * pcm->params.frame_bytes);
         pcm->appl_ptr = (pcm->appl_ptr + take) % pcm->boundary;
@@ -209,6 +217,11 @@ long audio_pcm_transfer(struct audio_pcm *pcm, void *kernel_data, uint32_t frame
     uint32_t take = frames < available ? frames : (uint32_t)available;
     if (!take) { audio_pcm_publish_locked(pcm);
     kernel_spin_unlock_irqrestore(&pcm->lock, flags); return -EAGAIN; }
+    if (probe) {
+        audio_pcm_publish_locked(pcm);
+        kernel_spin_unlock_irqrestore(&pcm->lock, flags);
+        return take;
+    }
     audio_pcm_copy_out(pcm, pcm->appl_ptr * pcm->params.frame_bytes,
                        kernel_data, take * pcm->params.frame_bytes);
     pcm->appl_ptr = (pcm->appl_ptr + take) % pcm->boundary;
@@ -217,6 +230,28 @@ long audio_pcm_transfer(struct audio_pcm *pcm, void *kernel_data, uint32_t frame
     audio_pcm_publish_locked(pcm);
     kernel_spin_unlock_irqrestore(&pcm->lock, flags);
     return take;
+}
+
+/** @brief Check the current number of transferable frames without consuming them.
+ * @param pcm Borrowed live PCM retained by the calling file description.
+ * @param frames Maximum requested number of complete frames.
+ * @return Positive bounded frame count or the same state/device error as a
+ * transfer. The PCM lock is released before returning; an interrupt may change
+ * availability, so a subsequent transfer must recheck it before committing.
+ * Capture auto-start and provider state checks follow the transfer path.
+ */
+long audio_pcm_transfer_available(struct audio_pcm *pcm, uint32_t frames)
+{
+    return audio_pcm_transfer_checked(pcm, NULL, frames, true);
+}
+
+/** @brief Transfer complete frames after rechecking provider state under lock.
+ * @param pcm Retained live PCM. @param kernel_data Owned sample buffer.
+ * @param frames Maximum complete frames. @return Frames copied or negative errno.
+ */
+long audio_pcm_transfer(struct audio_pcm *pcm, void *kernel_data, uint32_t frames)
+{
+    return audio_pcm_transfer_checked(pcm, kernel_data, frames, false);
 }
 
 int audio_pcm_status(struct audio_pcm *pcm, struct audio_pcm_status *status)

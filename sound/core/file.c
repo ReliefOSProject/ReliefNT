@@ -5,6 +5,7 @@
 #include <linux/errno.h>
 #include "mapping.h"
 #include "services.h"
+#include "usercopy.h"
 
 /** @brief Open the actual ALSA/OSS inode selected by devfs identity.
  * @param task Borrowed current task. @param file Borrowed OFD with canonical node.
@@ -43,7 +44,7 @@ static int64_t audio_character_read(struct task *task,struct task_file *file,voi
     uint32_t count=length>UINT32_MAX ? UINT32_MAX : (uint32_t)length;
     if(file->node.flags&STORAGE_NODE_FLAG_AUDIO_PCM)return audio_device_read(task,file,buffer,count);
     if(file->node.flags&STORAGE_NODE_FLAG_AUDIO_CONTROL)
-        return file->audio_control_file ? audio_control_read_file(file->audio_control_file,buffer,count) :
+        return file->audio_control_file ? audio_control_read_user(task,file->audio_control_file,buffer,count) :
             audio_control_read_task(task,file,buffer,count);
     if(file->node.flags&STORAGE_NODE_FLAG_AUDIO_TIMER)return audio_timer_read(task,file,buffer,count);
     if(file->node.first_cluster==STORAGE_DEV_KIND_AUDIO)return audio_oss_read(task,file,buffer,count);

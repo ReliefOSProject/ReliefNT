@@ -29,6 +29,18 @@ int sysv_shm_vma_clone(struct task *child, struct task_vma *dst, const struct ta
  * @return None. Final RMID piece releases registry pages and attachment storage.
  */
 void sysv_shm_vma_release(struct task *task, struct task_vma *vma);
+/** @brief Reinstall a segment-backed page after its attachment PTE was discarded.
+ * @param task Pinned owning MM. @param vma Borrowed attachment VMA.
+ * @param page Aligned address within the attachment.
+ * @return Zero or negative EFAULT/ENOMEM. The segment retains its independent
+ *         backing owner; a successful PTE acquires a separate PMM reference.
+ */
+int sysv_shm_fault_page(struct task *task, struct task_vma *vma, uint64_t page);
+/** @brief Query whether an attached SysV page has its segment RAM owner.
+ * @param vma Retained attachment VMA. @param page Aligned address in that VMA.
+ * @return True when the backing page exists; does not create or pin a PTE.
+ */
+bool sysv_shm_page_resident(struct task_vma *vma, uint64_t page);
 /** @brief Map retained shared pages through the existing VMA/page-table manager.
  * @param task Current user task. @param address Exact address, or zero for allocation.
  * @param length Page-rounded nonzero bytes. @param prot Initial Linux protection.

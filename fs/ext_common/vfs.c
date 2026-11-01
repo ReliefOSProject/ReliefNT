@@ -73,15 +73,26 @@ static int ev_write(struct storage_volume *v,const struct storage_node *node,uin
     struct ext4_inode_view in; int ret=storage_ext4_check_node(v,node,&in); if (ret<0) return ret;
     if ((in.mode&0170000)!=0100000) return -21;
     ret=ev_drop_privileges(v,node->first_cluster,&in); if (ret<0) return ret;
-    ret=storage_ext4_write_file_range(v,node->first_cluster,offset,data,len,done);
+    uint32_t written=0;
+    ret=storage_ext4_write_file_range(v,node->first_cluster,offset,data,len,&written);
+    if (done) *done=written;
+    if (written && offset<=UINT64_MAX-written && offset+written>in.size)
+        page_cache_resize_node(node,in.size,offset+written);
     storage_cache_invalidate(); return ret;
 }
+/** @brief Truncate a checked ext inode and publish any actual size transition.
+ * @param v Borrowed selected volume. @param node Stable file identity.
+ * @param size Requested logical size. @return Zero or native provider errno.
+ * Caller owns execution and mutation admission; a no-op size avoids a cache scan.
+ */
 static int ev_truncate(struct storage_volume *v,const struct storage_node *node,uint64_t size)
 {
     struct ext4_inode_view in; int ret=storage_ext4_check_node(v,node,&in); if (ret<0) return ret;
     if ((in.mode&0170000)!=0100000) return -21;
     ret=ev_drop_privileges(v,node->first_cluster,&in); if (ret<0) return ret;
-    ret=storage_ext4_truncate(v,node->first_cluster,size); storage_cache_invalidate(); return ret;
+    ret=storage_ext4_truncate(v,node->first_cluster,size);
+    if (!ret && in.size!=size) page_cache_resize_node(node,in.size,size);
+    storage_cache_invalidate(); return ret;
 }
 static int ev_readdir(struct storage_volume *v,const struct storage_node *node,uint64_t *cursor,struct reliefos_dir_entry *out)
 {
@@ -112,9 +123,10 @@ static int ev_unlink_kind(struct storage_volume *v,const char *path,bool dir)
     struct storage_node node; ret=ev_lookup(v,path,&node); if (ret<0) return ret;
     struct storage_inode_ref *ref=storage_inode_find(v->volume_id,node.first_cluster);
     bool held=ref && ref->references;
-    ret=storage_ext4_unlink_held(v,parent,name,dir,held);
+    bool destroyed=false;
+    ret=storage_ext4_unlink_held(v,parent,name,dir,held,&destroyed);
     if (!ret && held) ref->unlinked=true;
-    if (!ret && !held) page_cache_invalidate_node(&node);
+    if (!ret && destroyed) page_cache_forget_node(&node);
     storage_cache_invalidate(); return ret;
 }
 static int ev_unlink(struct storage_volume *v,const char *path) { return ev_unlink_kind(v,path,false); }
@@ -127,9 +139,10 @@ static int ev_rename(struct storage_volume *v,const char *oldpath,const char *ne
     if (ret<0 && ret!=-2) return ret;
     struct storage_inode_ref *ref=exists?storage_inode_find(v->volume_id,replaced.first_cluster):NULL;
     bool held=ref && ref->references;
-    ret=storage_ext4_rename_held(v,op,on,np,nn,held);
+    bool destroyed=false;
+    ret=storage_ext4_rename_held(v,op,on,np,nn,held,&destroyed);
     if (!ret && held) ref->unlinked=true;
-    if (!ret && exists && !held) page_cache_invalidate_node(&replaced);
+    if (!ret && exists && destroyed) page_cache_forget_node(&replaced);
     storage_cache_invalidate(); return ret;
 }
 static int ev_symlink(struct storage_volume *v,const char *target,const char *path)

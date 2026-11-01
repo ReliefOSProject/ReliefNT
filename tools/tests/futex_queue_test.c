@@ -12,8 +12,42 @@ static uint64_t ticks = 100;
 static uint32_t words[1024] __attribute__((aligned(4096)));
 static unsigned blocks, wakes;
 static uint64_t readonly_address;
+static uint64_t inaccessible_page;
+#ifdef CONFIG_SWAP
+static uint64_t swapped_fixture_page;
+static int swap_fixture_error;
+static unsigned swap_fixture_preparations;
+static struct task *cleanup_fixture_task;
+static struct futex_exit_cursor cleanup_cursors[4];
+static uint64_t fixture_generation=1;
+struct futex_exit_cursor *sched_futex_exit_cursor(struct task *task)
+{ assert(task>=tasks_test && task<tasks_test+4); return &cleanup_cursors[task-tasks_test]; }
+uint64_t mm_context_generation_existing(const struct address_space *as)
+{ assert(as); return fixture_generation; }
+/** @brief Model a swapped futex operand becoming resident before futex_lock.
+ * @param task Current task. @param address User start. @param length Bytes.
+ * @param write_access True for an output operand. @return Injected status or zero.
+ */
+int swap_prepare_user_range(struct task *task, uint64_t address, uint64_t length, bool write_access)
+{
+    (void)length; (void)write_access;
+    assert((task == current || task == cleanup_fixture_task) && !futex_lock.state); ++swap_fixture_preparations;
+    if (swap_fixture_error) return swap_fixture_error;
+    if ((address & ~4095ULL) == swapped_fixture_page) swapped_fixture_page = 0;
+    return 0;
+}
+int swap_prepare_user_cleanup(struct task *task,uint64_t address,uint64_t length,bool write_access)
+{ return swap_prepare_user_range(task,address,length,write_access); }
+#endif
 static struct linux_robust_list_head robust;
 static struct { uint64_t next; uint32_t word; } robust_node;
+
+/** @brief Resolve fixture physical bytes except an injected unmapped page.
+ * @param physical Fake physical byte address.
+ * @return Borrowed host alias or NULL for the inaccessible page.
+ */
+void *mm_phys_to_virt(uint64_t physical)
+{ return inaccessible_page && (physical & ~4095ULL) == inaccessible_page ? NULL : (void *)(uintptr_t)physical; }
 
 struct task *sched_current_task(void) { return current; }
 void kernel_spin_lock_irqsave(struct kernel_spinlock *lock, uint64_t *flags)
@@ -31,7 +65,12 @@ int time_wall_clock(struct reliefos_time_info *out)
 int time_clock_get(int32_t clock, struct linux_timespec *out)
 { assert(clock == LINUX_CLOCK_REALTIME); *out = (struct linux_timespec){1000, 700000000}; return 0; }
 bool user_range_ok(uint64_t ptr, uint64_t len)
-{ return ptr >= 4096 && ptr + len >= ptr; }
+{
+#ifdef CONFIG_SWAP
+    if (swapped_fixture_page && (ptr & ~4095ULL) == swapped_fixture_page) return false;
+#endif
+    return ptr >= 4096 && ptr + len >= ptr;
+}
 bool user_range_writable(uint64_t ptr, uint64_t len)
 { return user_range_ok(ptr, len) && ptr != readonly_address; }
 bool address_space_user_page_writable(const struct address_space *as, uint64_t address)
@@ -51,15 +90,82 @@ static long call(unsigned thread, unsigned word, int op, unsigned val,
                         (uintptr_t)&words[word2], val3);
 }
 
+/** @brief Exercise futex queues, robust exit and an inaccessible TID alias.
+ * @return Zero after all fixture assertions succeed.
+ */
 int main(void)
 {
     for (unsigned i = 0; i < 4; ++i) {
         tasks_test[i].pid = i + 1;
         tasks_test[i].as.cr3 = i == 3 ? 8192 : 4096;
     }
+#ifdef CONFIG_SWAP
+    robust = (struct linux_robust_list_head){(uintptr_t)&robust_node, 8, 0};
+    robust_node.next = (uintptr_t)&robust;
+    robust_node.word = tasks_test[1].pid | FUTEX_WAITERS;
+    tasks_test[1].robust_list = (uintptr_t)&robust;
+    current=&tasks_test[0];
+    assert(syscall_futex((uintptr_t)&robust_node.word,FUTEX_WAIT,robust_node.word,0,0,0)==KERNEL_SYSCALL_BLOCKED);
+    cleanup_fixture_task=&tasks_test[1];
+    swapped_fixture_page=(uintptr_t)&robust & ~4095ULL;
+    swap_fixture_error=SWAP_STORAGE_CONTENDED;
+    int cleanup_status=futex_task_exit_step(cleanup_fixture_task);
+    assert(cleanup_status==SWAP_STORAGE_CONTENDED);
+    assert(tasks_test[1].robust_list==(uintptr_t)&robust && tasks_test[0].futex_state==1);
+    swap_fixture_error=0;
+    do { cleanup_status=futex_task_exit_step(cleanup_fixture_task); } while(cleanup_status==0);
+    assert(cleanup_status==1 && robust_node.word==(FUTEX_WAITERS|FUTEX_OWNER_DIED));
+    assert(tasks_test[0].futex_state==2 && wakes==1 && !tasks_test[1].robust_list);
+    assert(syscall_futex((uintptr_t)&robust_node.word,FUTEX_WAIT,0,0,0,0)==0);
+    /* A pending node also present in the list must be updated and woken once. */
+    cleanup_cursors[1]=(struct futex_exit_cursor){0};
+    robust=(struct linux_robust_list_head){(uintptr_t)&robust_node,8,(uintptr_t)&robust_node};
+    robust_node.next=(uintptr_t)&robust;robust_node.word=tasks_test[1].pid|FUTEX_WAITERS;
+    tasks_test[1].robust_list=(uintptr_t)&robust;wakes=0;
+    assert(syscall_futex((uintptr_t)&robust_node.word,FUTEX_WAIT,robust_node.word,0,0,0)==KERNEL_SYSCALL_BLOCKED);
+    do { cleanup_status=futex_task_exit_step(cleanup_fixture_task); } while(cleanup_status==0);
+    assert(cleanup_status==1 && robust_node.word==(FUTEX_WAITERS|FUTEX_OWNER_DIED) && wakes==1);
+    assert(futex_task_exit_step(cleanup_fixture_task)==1 && wakes==1);
+    assert(syscall_futex((uintptr_t)&robust_node.word,FUTEX_WAIT,0,0,0,0)==0);
+    /* Keep clear_child_tid, its waiter and absent context across contention;
+     * adopt the first context generation and wake only after the word is zero. */
+    cleanup_cursors[1]=(struct futex_exit_cursor){0};
+    tasks_test[1].shared_mm=&tasks_test[0].address_space;
+    tasks_test[1].shared_mm->references=2;tasks_test[1].clear_child_tid=(uintptr_t)&words[2];
+    words[2]=tasks_test[1].pid;wakes=0;
+    assert(syscall_futex((uintptr_t)&words[2],FUTEX_WAIT,words[2],0,0,0)==KERNEL_SYSCALL_BLOCKED);
+    fixture_generation=0;swap_fixture_error=SWAP_STORAGE_CONTENDED;
+    assert(futex_task_exit_step(cleanup_fixture_task)==SWAP_STORAGE_CONTENDED);
+    assert(!cleanup_cursors[1].generation && words[2]==tasks_test[1].pid && !wakes);
+    fixture_generation=7;
+    assert(futex_task_exit_step(cleanup_fixture_task)==SWAP_STORAGE_CONTENDED);
+    assert(cleanup_cursors[1].generation==7 && words[2]==tasks_test[1].pid && !wakes);
+    swap_fixture_error=0;swapped_fixture_page=(uintptr_t)&words[2]&~4095ULL;
+    assert(futex_task_exit_step(cleanup_fixture_task)==1 && !words[2] && wakes==1);
+    assert(futex_task_exit_step(cleanup_fixture_task)==1 && wakes==1);
+    assert(syscall_futex((uintptr_t)&words[2],FUTEX_WAIT,0,0,0,0)==0);
+    tasks_test[1].shared_mm=NULL;
+    /* A changed nonzero generation must not follow the saved node or write it. */
+    cleanup_cursors[1]=(struct futex_exit_cursor){0};fixture_generation=8;
+    robust=(struct linux_robust_list_head){(uintptr_t)&robust_node,8,0};
+    robust_node.next=(uintptr_t)&robust;robust_node.word=tasks_test[1].pid;
+    tasks_test[1].robust_list=(uintptr_t)&robust;
+    assert(futex_task_exit_step(cleanup_fixture_task)==0);
+    fixture_generation=9;
+    assert(futex_task_exit_step(cleanup_fixture_task)==1 && robust_node.word==tasks_test[1].pid);
+    assert(!tasks_test[1].robust_list);fixture_generation=1;
+    cleanup_fixture_task=NULL;blocks=wakes=0;
+    swap_fixture_error = SWAP_STORAGE_CONTENDED;
+    assert(call(0, 0, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0) == KERNEL_SYSCALL_SWAP_CONTENDED);
+    swap_fixture_error = 0;
+    swapped_fixture_page = (uintptr_t)&words[0] & ~4095ULL;
+    assert(call(0, 0, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0) == 0);
+    assert(!swapped_fixture_page && swap_fixture_preparations);
+#endif
     assert(call(0, 0, FUTEX_WAIT, 1, 0, 0, 0) == -EAGAIN && !blocks);
     assert(call(0, 0, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 0, 0, 0, 0) == KERNEL_SYSCALL_BLOCKED);
     assert(call(1, 0, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 0, 0, 0, 0) == KERNEL_SYSCALL_BLOCKED);
+    assert(!futex_swap_pinned((uintptr_t)&words[0] & ~4095ULL));
     assert(call(3, 0, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 9, 0, 0, 0) == 0);
     assert(call(2, 0, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0) == 1 && wakes == 1);
     words[0] = 99;
@@ -71,8 +177,10 @@ int main(void)
     assert(call(1, 0, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 0, 0, 0, 0) == 0);
     assert(call(0, 1, FUTEX_WAIT_BITSET, 0, 0, 0, 0) == -EINVAL);
     assert(call(0, 1, FUTEX_WAIT_BITSET, 0, 0, 0, 2) == KERNEL_SYSCALL_BLOCKED);
+    assert(futex_swap_pinned((uintptr_t)&words[1] & ~4095ULL));
     assert(call(1, 1, FUTEX_WAKE_BITSET, 1, 0, 0, 1) == 0);
     assert(call(3, 1, FUTEX_WAKE_BITSET, 1, 0, 0, 2) == 1);
+    assert(!futex_swap_pinned((uintptr_t)&words[1] & ~4095ULL));
     assert(call(0, 1, FUTEX_WAIT_BITSET, 0, 0, 0, 2) == 0);
     int64_t ts[2] = {0, 10000000};
     assert(call(0, 1, FUTEX_WAIT, 0, (uintptr_t)ts, 0, 0) == KERNEL_SYSCALL_BLOCKED);
@@ -87,6 +195,11 @@ int main(void)
     assert(call(0, 1, FUTEX_WAIT, 0, 0, 0, 0) == 0);
     assert(!waiters && !tasks_test[1].clear_child_tid);
     words[1] = 37;
+    inaccessible_page = (uintptr_t)&words[1] & ~4095ULL;
+    tasks_test[1].clear_child_tid = (uintptr_t)&words[1];
+    futex_task_exit(&tasks_test[1]);
+    assert(words[1] == 37 && !tasks_test[1].clear_child_tid);
+    inaccessible_page = 0;
     tasks_test[1].shared_mm->references = 1;
     tasks_test[1].clear_child_tid = (uintptr_t)&words[1];
     futex_task_exit(&tasks_test[1]);

@@ -1,4 +1,18 @@
 #include "../internal.h"
+#include <reliefnt/swap.h>
+
+/** @brief Prepare exactly one bounded epoll operand at the outer syscall gate.
+ * @param task Current task. @param address User operand. @param size Bytes.
+ * @param writing Output access when true. @return Zero, EFAULT, or private
+ * prerequisite contention; no provider or usercopy lock is held here.
+ */
+static int epoll_prepare_user(struct task *task, uint64_t address, uint64_t size,
+                              bool writing)
+{
+    int rc=swap_prepare_user_range(task,address,size,writing);
+    if(rc==SWAP_STORAGE_CONTENDED)return KERNEL_SYSCALL_SWAP_CONTENDED;
+    return rc<0 ? -RELIEFOS_EFAULT : 0;
+}
 
 /** @brief Translate Linux epoll interest bits into poll readiness bits. */
 static uint32_t epoll_to_poll(uint32_t events);
@@ -346,6 +360,10 @@ int64_t syscall_epoll_ctl(uint64_t epfd_arg, uint64_t op_arg,
     epoll = task_epoll_for_fd(task, epfd);
     target = task_file_for_fd(task, fd);
     if (!epoll || fd == epfd) return -RELIEFOS_EBADF;
+    if (op != EPOLL_CTL_DEL && event_ptr) {
+        int prep=epoll_prepare_user(task,event_ptr,sizeof(event),false);
+        if(prep)return prep;
+    }
     if (op != EPOLL_CTL_DEL && (!event_ptr || !user_range_ok(event_ptr, sizeof(event))))
         return -RELIEFOS_EFAULT;
     if (op != EPOLL_CTL_DEL) {
@@ -452,7 +470,9 @@ static int64_t syscall_epoll_wait_common(struct task *task, struct task_epoll *e
      * this epoll instance (which is an internal implementation limit). */
     if (!maxevents || maxevents > INT32_MAX / sizeof(struct epoll_event))
         return -RELIEFOS_EINVAL;
-    if (!user_range_writable(events_ptr, (uint64_t)maxevents * sizeof(struct epoll_event)))
+    uint64_t capacity=(uint64_t)maxevents * sizeof(struct epoll_event);
+    if (events_ptr < RELIEFNT_USER_BASE || events_ptr >= RELIEFNT_USER_TOP ||
+        capacity > RELIEFNT_USER_TOP - events_ptr)
         return -RELIEFOS_EFAULT;
     if (timeout_ms < -1) return -RELIEFOS_EINVAL;
     uint64_t poll_generation = kernel_poll_readiness_generation();
@@ -488,6 +508,7 @@ static int64_t syscall_epoll_wait_common(struct task *task, struct task_epoll *e
             entry->generation = generation;
             continue;
         }
+        uint32_t observed_ready=ready;
         if (entry->events & EPOLLET) {
             /*
              * Edge-triggered readiness is tracked per event bit.  A UNIX
@@ -502,14 +523,25 @@ static int64_t syscall_epoll_wait_common(struct task *task, struct task_epoll *e
              * probe.  The readiness bit then never passes through zero, but
              * rx_written still records a real new input edge. */
             if (input && generation != entry->generation) edge |= input;
-            entry->ready = ready;
-            entry->generation = generation;
-            if (!edge) continue;
+            if (!edge) {
+                entry->ready = ready;
+                entry->generation = generation;
+                continue;
+            }
             ready = edge;
+        }
+        uint64_t output=events_ptr+(uint64_t)written*sizeof(struct epoll_event);
+        int prep=epoll_prepare_user(task,output,sizeof(struct epoll_event),true);
+        if (prep || !user_range_writable(output,sizeof(struct epoll_event))) {
+            if (written) { task->poll_deadline_ticks=0; return written; }
+            return prep ? prep : -RELIEFOS_EFAULT;
         }
         ((struct epoll_event *)(uintptr_t)events_ptr)[written++] =
             (struct epoll_event){.events = ready, .data = entry->data};
-        if (!(entry->events & EPOLLET)) entry->ready = ready;
+        if (entry->events & EPOLLET) {
+            entry->ready = observed_ready;
+            entry->generation = generation;
+        } else entry->ready = ready;
         if (entry->events & EPOLLONESHOT) entry->disabled = 1;
     }
     if (written) {
@@ -560,13 +592,18 @@ int64_t syscall_epoll_pwait2(uint64_t epfd, uint64_t events, uint64_t maxevents,
 {
     int64_t timeout_ms = -1;
     if (sigmask) {
-        if (sigsetsize != sizeof(uint64_t) || !user_range_ok(sigmask, sizeof(uint64_t)))
+        if (sigsetsize != sizeof(uint64_t)) return -RELIEFOS_EINVAL;
+        int prep=epoll_prepare_user(sched_current_task(),sigmask,sizeof(uint64_t),false);
+        if(prep==KERNEL_SYSCALL_SWAP_CONTENDED)return prep;
+        if (prep || !user_range_ok(sigmask, sizeof(uint64_t)))
             return -RELIEFOS_EINVAL;
         /* Atomic temporary signal masks are not yet exposed by the scheduler. */
         return -RELIEFOS_ENOSYS;
     }
     if (timeout) {
         struct linux_timespec value;
+        int prep=epoll_prepare_user(sched_current_task(),timeout,sizeof(value),false);
+        if(prep)return prep;
         if (!user_range_ok(timeout, sizeof(value))) return -RELIEFOS_EFAULT;
         value = *(const struct linux_timespec *)(uintptr_t)timeout;
         if (value.tv_sec < 0 || value.tv_nsec < 0 || value.tv_nsec >= 1000000000LL)

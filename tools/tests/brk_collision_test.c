@@ -15,6 +15,7 @@
 #include <reliefnt/syscall.h>
 #include <reliefnt/framebuffer.h>
 #include <reliefnt/heap.h>
+#include <reliefnt/lock.h>
 #include <reliefnt/mm.h>
 #include <reliefnt/page_cache.h>
 #include <reliefnt/paging.h>
@@ -23,11 +24,20 @@
 #include <reliefnt/storage.h>
 #include <reliefnt/syscall_internal.h>
 #include "sysv_shm_fixture_stubs.h"
+#include "execution_suspend_fixture.h"
 
 int64_t syscall_mm_brk(uint64_t requested);
 int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                         uint64_t flags, uint64_t fd, uint64_t offset);
 int64_t syscall_mm_munmap(uint64_t addr, uint64_t len);
+int64_t syscall_legacy_memory(uint64_t number, uint64_t a0, uint64_t a1,
+                              uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5);
+void mm_context_destroy(struct address_space *as);
+/** @brief Reject memfd creation in this memory-dispatch fixture.
+ * @param name User name address. @param flags Flags. @return Never returns.
+ */
+int64_t syscall_memfd_create(uint64_t name, uint32_t flags)
+{ (void)name; (void)flags; abort(); }
 
 static struct task *current_task;
 static struct task_file framebuffer_file,second_file;
@@ -41,9 +51,27 @@ static unsigned mmap_provider_pins;
 static uint64_t mmap_provider_flags,mmap_provider_size=16384;
 static bool mmap_numeric_replaced;
 static bool mmap_async_requested=true;
-static uint64_t last_device_mapping_phys;
+static int mmap_provider_error;
+static uint64_t last_device_mapping_phys,last_device_mapping_flags;
 static int file_writable = 1;
 struct task *sched_current_task(void) { return current_task; }
+
+/** @brief Reject typed DEVICE policy selection in this FB-only fixture.
+ * @param claim Unused owner. @param physical Unused page. @param flags Unused
+ * output. @return Never returns.
+ */
+bool paging_cache_claim_select(struct paging_cache_claim *claim,uint64_t physical,uint64_t *flags)
+{ (void)claim;(void)physical;(void)flags;abort(); }
+/** @brief Reject typed DEVICE policy coalescing in this FB-only fixture.
+ * @param first Unused owner. @param second Unused owner. @return Never returns.
+ */
+bool paging_cache_claim_merge(struct paging_cache_claim *first,struct paging_cache_claim *second)
+{ (void)first;(void)second;abort(); }
+/** @brief Reject typed DEVICE policy release in this FB-only fixture.
+ * @param claim Unused owner. This function never returns.
+ */
+void paging_cache_claim_release(struct paging_cache_claim *claim)
+{ (void)claim;abort(); }
 
 uint32_t sched_task_vma_capacity(const struct task *task)
 {
@@ -65,12 +93,37 @@ uint64_t address_space_user_page_phys(const struct address_space *as, uint64_t a
 
 bool address_space_user_page_is_device(const struct address_space *as, uint64_t address)
 { (void)as; (void)address; return false; }
+/** @brief Reject unexercised protection in the dispatch fixture.
+ * @param as MM. @param address Page. @param flags Protection. @return Never.
+ */
+bool address_space_protect_user_page(struct address_space *as, uint64_t address, uint64_t flags)
+{ (void)as; (void)address; (void)flags; abort(); }
+/** @brief Reject unexercised user-output checks. @param ptr Address.
+ * @param len Bytes. @return Never.
+ */
+bool user_range_writable(uint64_t ptr, uint64_t len)
+{ (void)ptr; (void)len; abort(); }
+/** @brief Reject unexercised backing residency. @param node Backing.
+ * @param offset File offset. @return Never.
+ */
+bool storage_tmpfs_page_resident(const struct storage_node *node, uint64_t offset)
+{ (void)node; (void)offset; abort(); }
+/** @brief Reject unexercised cache lookup. @param node Backing.
+ * @param offset File offset. @param phys Frame output. @return Never.
+ */
+int page_cache_lookup(const struct storage_node *node, uint64_t offset, uint64_t *phys)
+{ (void)node; (void)offset; (void)phys; abort(); }
+/** @brief Reject unexercised locked file slices. @param dst Copy.
+ * @param src Original. @return Never.
+ */
+int sched_task_vma_retain_file(struct task_vma *dst, const struct task_vma *src)
+{ (void)dst; (void)src; abort(); }
 uint64_t address_space_unmap_user_page(struct address_space *as, uint64_t address)
 { (void)as; (void)address; return 0; }
 bool address_space_prepare_user_range(struct address_space *as, uint64_t start, uint64_t end)
 { (void)as; (void)start; (void)end; ++eager_range_prepares; return true; }
 bool address_space_map_user_page(struct address_space *as, uint64_t address, uint64_t phys, uint64_t flags)
-{ (void)as; (void)address; (void)flags; last_device_mapping_phys = phys; return true; }
+{ (void)as; (void)address; last_device_mapping_phys = phys;last_device_mapping_flags=flags;return true; }
 bool address_space_user_range_free(const struct address_space *as, uint64_t start, uint64_t end)
 { (void)as; (void)start; (void)end; return true; }
 bool address_space_user_page_next(const struct address_space *as, uint64_t start,
@@ -83,11 +136,38 @@ bool address_space_user_page_next(const struct address_space *as, uint64_t start
     if (flags) *flags = 0;
     return false;
 }
+/** @brief Report no resident or swapped leaves in this VMA-only fixture.
+ * @param as Borrowed fixture address space. @param start First address.
+ * @param end Exclusive end. @param page Optional page output.
+ * @param phys Optional physical output. @param flags Optional flags output.
+ * @return False; this fixture does not model page-table leaves.
+ */
+bool address_space_user_entry_next(const struct address_space *as, uint64_t start,
+                                   uint64_t end, uint64_t *page, uint64_t *phys,
+                                   uint64_t *flags)
+{ return address_space_user_page_next(as, start, end, page, phys, flags); }
+/** @brief Classify the VMA-only fixture's unmodeled leaves as empty.
+ * @param as Borrowed fixture address space. @param va User byte address.
+ * @return EMPTY because this fixture models no page-table leaves.
+ */
+enum paging_user_entry_kind paging_user_entry_kind(const struct address_space *as,
+                                                   uint64_t va)
+{ (void)as; (void)va; return PAGING_USER_ENTRY_EMPTY; }
+/** @brief Reject an unreachable swap-leaf installation in this fixture.
+ * @param as Borrowed address space. @param va User address. @param flags Leaf flags.
+ * @return Never; the fixture reports no swap entries to the remap walker.
+ */
+bool address_space_map_user_swap(struct address_space *as, uint64_t va, uint64_t flags)
+{ (void)as; (void)va; (void)flags; abort(); }
 void smp_flush_user_tlb(void) {}
 int page_cache_owns(uint64_t phys) { (void)phys; return 0; }
 void page_cache_release(uint64_t phys) { (void)phys; }
 void mm_free_page(uint64_t phys) { (void)phys; }
 uint64_t mm_alloc_page(void) { ++page_alloc_attempts; return 0; }
+/** @brief Model an exhausted VMA-only fixture page pool for reclaim too.
+ * @return Zero; neither ordinary nor emergency pages exist in this model.
+ */
+uint64_t mm_alloc_emergency_page(void) { return mm_alloc_page(); }
 uint64_t mm_free_memory_kib(void) { return UINT64_MAX; }
 int storage_inode_put(struct storage_inode_ref *reference) { (void)reference; return 0; }
 void storage_inode_retain(struct storage_inode_ref *reference) { (void)reference; }
@@ -117,6 +197,12 @@ bool paging_kernel_direct_map_range(uint64_t phys, uint64_t len)
     return phys < RELIEFNT_KERNEL_DIRECT_MAP_SIZE &&
            len <= RELIEFNT_KERNEL_DIRECT_MAP_SIZE - phys;
 }
+bool paging_kernel_direct_cache_flags(uint64_t physical,uint64_t *flags)
+{
+    *flags=physical>=framebuffer_physical && physical-framebuffer_physical<8192 ?
+        RELIEFNT_PAGE_PWT|RELIEFNT_PAGE_PCD : 0;
+    return true;
+}
 void console_printf(const char *fmt, ...) { (void)fmt; }
 
 void console_log(enum console_log_level level, const char *fmt, ...)
@@ -125,6 +211,58 @@ void console_log(enum console_log_level level, const char *fmt, ...)
 }
 void *kernel_malloc(size_t size) { return __builtin_malloc(size); }
 void kernel_free(void *ptr) { __builtin_free(ptr); }
+/** @brief Enter fixture registry exclusion. @param lock Lock. @param flags Saved state output. */
+void kernel_spin_lock_irqsave(struct kernel_spinlock *lock, uint64_t *flags)
+{ assert(!lock->state); lock->state = 1; *flags = 0; }
+/** @brief Leave fixture registry exclusion. @param lock Lock. @param flags Saved state. */
+void kernel_spin_unlock_irqrestore(struct kernel_spinlock *lock, uint64_t flags)
+{ (void)flags; assert(lock->state); lock->state = 0; }
+/* This admission fixture never populates a user PTE or enters a file fault. */
+/** @brief Reject unexpected frame access. @param phys Frame. @return Never returns. */
+void *mm_phys_to_virt(uint64_t phys) { (void)phys; abort(); }
+/** @brief Reject unexpected physical pin. @param phys Frame. */
+void mm_retain_page(uint64_t phys) { (void)phys; abort(); }
+/** @brief Reject unexpected PTE inspection. @param as MM. @param page Address.
+ * @return Never returns.
+ */
+uint64_t address_space_user_page_flags(const struct address_space *as, uint64_t page)
+{ (void)as; (void)page; abort(); }
+/** @brief Reject unexpected COW fault. @param as MM. @param page Address.
+ * @return Never returns.
+ */
+bool address_space_handle_cow_fault(struct address_space *as, uint64_t page)
+{ (void)as; (void)page; abort(); }
+/** @brief The brk fixture never maps a shared file-cache leaf. */
+bool address_space_shared_write_fault(struct address_space *as, uint64_t page)
+{ (void)as; (void)page; abort(); }
+/** @brief Reject unexpected stack fault. @param as MM. @param page Address.
+ * @return Never returns.
+ */
+bool address_space_map_user_stack_page(struct address_space *as, uint64_t page)
+{ (void)as; (void)page; abort(); }
+/** @brief Reject unexpected cache I/O. @param node File. @param offset Offset.
+ * @param loader Loader. @param context Loader state. @param phys Output. @return Never returns.
+ */
+int page_cache_load_fault(const struct storage_node *node, uint64_t offset,
+                    page_cache_loader loader, void *context, uint64_t *phys)
+{ (void)node; (void)offset; (void)loader; (void)context; (void)phys; abort(); }
+/** @brief The brk fixture never performs ordinary file-cache I/O. */
+int page_cache_load(const struct storage_node *node, uint64_t offset,
+                    page_cache_loader loader, void *context, uint64_t *phys)
+{ (void)node; (void)offset; (void)loader; (void)context; (void)phys; abort(); }
+/** @brief Reject an unexpected shared-file grant. @param page Frame. */
+void page_cache_mark_shared_writable(uint64_t page) { (void)page; abort(); }
+/** @brief Reject unexpected tmpfs I/O. @param node File. @param offset Offset.
+ * @param phys Output. @return Never returns.
+ */
+int storage_tmpfs_get_page(const struct storage_node *node, uint64_t offset, uint64_t *phys)
+{ (void)node; (void)offset; (void)phys; abort(); }
+/** @brief Reject unexpected storage errors. @param error Status. @return Never returns. */
+int storage_errno(int error) { (void)error; abort(); }
+/** @brief Reject unexpected loader entry. @param flags Saved state output. */
+void userland_loader_lock(uint64_t *flags) { (void)flags; abort(); }
+/** @brief Reject unexpected loader exit. @param flags Saved state. */
+void userland_loader_unlock(uint64_t flags) { (void)flags; abort(); }
 struct task_file *task_file_get(struct task_file *source)
 {if(fail_file_pin)return NULL;assert(source && source->references);++source->references;return source;}
 void task_file_put(struct task_file *description)
@@ -138,7 +276,7 @@ static void mmap_provider_release(void *context,const struct storage_node *node,
 static bool mmap_provider_same(void *context,const struct storage_node *left,const struct storage_node *right)
 {(void)context;return left->type==right->type && left->first_cluster==right->first_cluster;}
 static int mmap_provider_stat(void *context,const struct vfs_path *path,struct linux_stat_abi *out)
-{assert(context==&mmap_provider_pins && !mmap_async_requested && vfs_path_node(path)->type==RELIEFOS_FS_TYPE_FILE);*out=(struct linux_stat_abi){.st_size=(int64_t)mmap_provider_size,.st_mode=0100600};return 0;}
+{assert(context==&mmap_provider_pins && !mmap_async_requested && vfs_path_node(path)->type==RELIEFOS_FS_TYPE_FILE);if(mmap_provider_error)return mmap_provider_error;*out=(struct linux_stat_abi){.st_size=(int64_t)mmap_provider_size,.st_mode=0100600};return 0;}
 static uint64_t mmap_provider_policy(void *context)
 {assert(context==&mmap_provider_pins);return mmap_provider_flags;}
 static void bind_mmap_provider(struct task_file *file)
@@ -148,6 +286,37 @@ static void bind_mmap_provider(struct task_file *file)
     struct storage_node root={.type=RELIEFOS_FS_TYPE_DIR};struct vfs_mount *mount=NULL;
     assert(!file->path_ref.mount && !vfs_mount_new(&ops,&mmap_provider_pins,NULL,&root,&mount));
     assert(!vfs_path_anonymous(mount,&file->node,&file->path_ref));vfs_mount_put(mount);
+}
+
+/** @brief Route real checked-population and remap quota errors through legacy dispatch. */
+static void test_memory_legacy_final_errors(void)
+{
+    struct task owner = {0};
+    owner.kind = TASK_KIND_USER;
+    owner.stack_top = RELIEFNT_USER_TOP - 4096;
+    owner.limits.as.rlim_cur = LINUX_RLIM_INFINITY;
+    owner.limits.memlock.rlim_cur = 4096;
+    /* The production checked walk requires a live root identity; this fixture
+     * stubs paging, so supply a distinct synthetic CR3 for the private MM. */
+    sched_task_as(&owner)->cr3 = 0x12345000;
+    uint64_t address = 0x62000000;
+    owner.vmas[0] = (struct task_vma){.used = 1, .start = address, .end = address + 4096,
+        .prot = LINUX_PROT_READ | LINUX_PROT_WRITE,
+        .flags = TASK_VMA_FLAG_ANON | TASK_VMA_FLAG_PRIVATE};
+    current_task = &owner;
+    unsigned initial_attempts = page_alloc_attempts;
+    unsigned attempts = initial_attempts;
+    assert(syscall_legacy_memory(LINUX_SYS_MLOCK, address, 4096, 0, 0, 0, 0) == -EAGAIN);
+    assert(page_alloc_attempts == attempts + 1);
+    attempts = page_alloc_attempts;
+    assert(syscall_legacy_memory(LINUX_SYS_MLOCK2, address, 4096, 0, 0, 0, 0) == -EAGAIN);
+    assert(page_alloc_attempts == attempts + 1);
+    owner.vmas[0].flags |= TASK_VMA_FLAG_LOCKED;
+    assert(syscall_legacy_memory(LINUX_SYS_MREMAP, address, 4096, 8192, 0, 0, 0) == -EAGAIN);
+    mm_context_destroy(sched_task_as(&owner));
+    page_alloc_attempts = initial_attempts;
+    current_task = NULL;
+    puts("PASS normalized memory route preserves real mlock allocation and mremap quota EAGAIN");
 }
 
 static void test_regular_mapping_description(void)
@@ -160,6 +329,16 @@ static void test_regular_mapping_description(void)
         .node={.type=RELIEFOS_FS_TYPE_FILE,.first_cluster=50,.size=16384}};
     bind_mmap_provider(&framebuffer_file);
     const uint64_t base=0x50000000,page=4096;
+    unsigned initial_pins=mmap_provider_pins;
+    mmap_provider_error=-EAGAIN;
+    assert(syscall_mm_mmap(base,page,LINUX_PROT_READ,
+        LINUX_MAP_PRIVATE|LINUX_MAP_FIXED_NOREPLACE,7,0)==-EAGAIN);
+    assert(syscall_mm_mmap_dispatch(base,page,LINUX_PROT_READ,
+        LINUX_MAP_PRIVATE|LINUX_MAP_FIXED_NOREPLACE,7,0)==KERNEL_MMAP_FILE_IO_RETRY);
+    assert(syscall_legacy_memory(LINUX_SYS_MMAP,base,page,LINUX_PROT_READ,
+        LINUX_MAP_PRIVATE|LINUX_MAP_FIXED_NOREPLACE,7,0)==KERNEL_MMAP_FILE_IO_RETRY);
+    assert(framebuffer_file.references==1 && mmap_provider_pins==initial_pins);
+    mmap_provider_error=0;
     assert(syscall_mm_mmap(base,3*page,LINUX_PROT_READ,
         LINUX_MAP_PRIVATE|LINUX_MAP_FIXED_NOREPLACE,7,0)==(int64_t)base);
     task_file_put(&framebuffer_file); /* Numeric close at the OFD boundary. */
@@ -229,6 +408,7 @@ static void test_regular_mapping_provider(void)
 
 int main(void)
 {
+    test_memory_legacy_final_errors();
     test_regular_mapping_provider();
     test_regular_mapping_description();
     const uint64_t page = 4096;
@@ -342,6 +522,8 @@ int main(void)
         fprintf(stderr, "fbdev mmap returned %lld\n", (long long)fb_mapped);
     assert(fb_mapped == (int64_t)fb_vaddr);
     assert(last_device_mapping_phys == framebuffer_physical + page);
+    assert((last_device_mapping_flags&(RELIEFNT_PAGE_PWT|RELIEFNT_PAGE_PCD))==
+           (RELIEFNT_PAGE_PWT|RELIEFNT_PAGE_PCD));
     assert(last_device_mapping_phys < RELIEFNT_KERNEL_DIRECT_MAP_SIZE);
     puts("PASS fbdev mmap converts the high CPU alias to a physical PFN");
 

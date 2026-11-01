@@ -197,6 +197,20 @@ void kernel_execution_unlock_irqrestore(uint64_t flags)
     kernel_irq_restore(flags);
 }
 
+/** @brief Test the current CPU's writer ownership without changing its depth.
+ * @return True only for the sole outer writer. It says nothing about other
+ * locks; callers retain responsibility for their I/O boundary and IRQ rules.
+ */
+bool kernel_execution_is_outermost(void)
+{
+    uint64_t saved = kernel_irq_save();
+    uint32_t cpu = execution_cpu_index(smp_current_cpu());
+    bool outermost = __atomic_load_n(&execution_owner, __ATOMIC_RELAXED) == cpu &&
+                     execution_depth[cpu] == 1;
+    kernel_irq_restore(saved);
+    return outermost;
+}
+
 /**
  * @brief Release only an outermost execution owner while preserving its final IRQ restore state.
  * @param token Zero-initialized storage receiving the transaction, owner CPU and IRQ states.

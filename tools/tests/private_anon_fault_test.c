@@ -8,8 +8,42 @@
 
 static struct task *current_task;
 struct task *sched_current_task(void) { return current_task; }
+static bool fail_kernel_alloc;
+/** @brief Allocate fixture metadata. @param bytes Capacity. @return Host allocation. */
+void *kernel_malloc(size_t bytes) { return fail_kernel_alloc ? NULL : malloc(bytes); }
+/** @brief Release fixture metadata. @param memory Host allocation or NULL. */
+void kernel_free(void *memory) { free(memory); }
+/** @brief Enter the fixture registry lock. @param lock Lock. @param flags Saved state output. */
+void kernel_spin_lock_irqsave(struct kernel_spinlock *lock, uint64_t *flags)
+{ assert(!lock->state); lock->state = 1; *flags = 0; }
+/** @brief Leave the fixture registry lock. @param lock Lock. @param flags Saved state. */
+void kernel_spin_unlock_irqrestore(struct kernel_spinlock *lock, uint64_t flags)
+{ (void)flags; assert(lock->state); lock->state = 0; }
+/** @brief Assert no device owner is present. @param mapping Expected NULL. */
+void device_mapping_put(struct device_mapping *mapping) { assert(!mapping); }
+/** @brief Verify anonymous fixtures never retire a device reference.
+ * @param mapping Optional view; the fixture must supply NULL.
+ */
+void device_mapping_retire_begin(struct device_mapping *mapping) { assert(!mapping); }
+/** @brief Verify anonymous fixtures never finish a device retirement.
+ * @param mapping Optional view; the fixture must supply NULL.
+ */
+void device_mapping_retire_end(struct device_mapping *mapping) { assert(!mapping); }
+/** @brief Anonymous-only fixture cannot own a DEVICE page policy.
+ * @param mapping Expected NULL. @param offset Unused offset. @param length
+ * Unused length. @param final_put Unused release mode.
+ */
+void device_mapping_release_range(struct device_mapping *mapping,uint64_t offset,
+                                  uint64_t length,bool final_put)
+{ assert(!mapping);(void)offset;(void)length;(void)final_put; }
+/** @brief Assert no file owner is present. @param file Expected NULL. */
+void task_file_put(struct task_file *file) { assert(!file); }
+/** @brief Assert no inode owner is present. @param inode Expected NULL. @return Zero. */
+int storage_inode_put(struct storage_inode_ref *inode) { assert(!inode); return 0; }
 static unsigned allocated;
 static bool fail_alloc;
+/* Optional one-based allocation-failure point for rollback controls. */
+static unsigned fail_after_allocation;
 struct host_page_ref {
     uint64_t physical;
     unsigned references;
@@ -17,7 +51,7 @@ struct host_page_ref {
 static struct host_page_ref host_page_refs[64];
 uint64_t mm_alloc_page(void)
 {
-    if (fail_alloc) return 0;
+    if (fail_alloc || (fail_after_allocation && !--fail_after_allocation)) return 0;
     void *p = aligned_alloc(4096, 4096);
     assert(p);
     memset(p, 0, 4096);
@@ -32,6 +66,7 @@ uint64_t mm_alloc_page(void)
     ++allocated;
     return (uintptr_t)p;
 }
+uint64_t mm_alloc_emergency_page(void) { return mm_alloc_page(); }
 void *mm_phys_to_virt(uint64_t physical) { return (void *)(uintptr_t)physical; }
 uint64_t mm_virt_to_phys(const void *address) { return (uint64_t)(uintptr_t)address; }
 void mm_retain_page(uint64_t p)
@@ -78,14 +113,18 @@ int vfs_path_read(const struct vfs_path *path, uint64_t offset, void *buffer,
 void storage_set_io_async_context(bool enabled) { (void)enabled; abort(); }
 void userland_loader_lock(uint64_t *flags) { (void)flags; abort(); }
 void userland_loader_unlock(uint64_t flags) { (void)flags; abort(); }
-int page_cache_load(const struct storage_node *node, uint64_t offset,
+int page_cache_load_fault(const struct storage_node *node, uint64_t offset,
                      page_cache_loader loader, void *context, uint64_t *phys)
 { (void)node; (void)offset; (void)loader; (void)context; (void)phys; abort(); }
 int storage_tmpfs_get_page(const struct storage_node *node, uint64_t offset, uint64_t *phys)
 { (void)node; (void)offset; (void)phys; abort(); }
 int storage_errno(int status) { (void)status; abort(); }
 void console_log(enum console_log_level level, const char *format, ...)
-{ (void)level; (void)format; abort(); }
+{
+    /* Selection fixtures now publish one real victim diagnostic. */
+    if (level==CONSOLE_LOG_WARN && strstr(format,"oom kill signal published pid=")) return;
+    abort();
+}
 
 /* An ordinary syscall can be the first access to any page of a stack buffer.
  * Touching the bottom of a large C frame does not materialize the gap above it. */

@@ -63,6 +63,8 @@ void page_cache_invalidate_node(const struct storage_node *node)
 {
     assert(node->flags & STORAGE_NODE_FLAG_TMPFS);
 }
+void page_cache_forget_node(const struct storage_node *node)
+{ assert(node->flags & STORAGE_NODE_FLAG_TMPFS); }
 uint64_t mm_total_memory_kib(void) { return 65536; }
 int time_wall_clock(struct reliefos_time_info *out)
 {
@@ -223,8 +225,12 @@ int main(void)
     assert(tmpfs_new(3, 0, "size=4k", 0, 0, &fs) == 0);
     assert(tmpfs_create(fs, "/shared", 0100600, NULL, &a) == 0);
     assert(tmpfs_truncate(fs, a.first_cluster, 8192) == 0);
+    assert(!tmpfs_page_resident(fs, a.first_cluster, 0));
+    assert(!tmpfs_page_resident(fs, a.first_cluster, 4096));
     uint64_t first, second;
     assert(tmpfs_get_page(fs, a.first_cluster, 0, &first) == 0);
+    assert(tmpfs_page_resident(fs, a.first_cluster, 0));
+    assert(!tmpfs_page_resident(fs, a.first_cluster, 4096));
     assert(tmpfs_get_page(fs, a.first_cluster, 0, &second) == 0 && first == second);
     assert(tmpfs_get_page(fs, a.first_cluster, 4096, &second) == -28);
     assert(tmpfs_get_page(fs, a.first_cluster, 8192, &second) == -22);

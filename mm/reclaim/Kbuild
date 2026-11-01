@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := pressure.o oom.o wait.o stats.o
+
+include $(srctree)/scripts/Makefile.module

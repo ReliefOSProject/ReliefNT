@@ -1,5 +1,8 @@
 #include "internal.h"
 #include <reliefnt/heap.h>
+#ifdef CONFIG_SWAP
+#include <reliefnt/swap_internal.h>
+#endif
 #include "mbr.h"
 
 /** @brief Read one512-byte DOS metadata sector through the held block transport. */
@@ -472,7 +475,7 @@ static int storage_disk_block_read_owned(uint32_t disk_id, int32_t partition_ind
 
 static int storage_disk_block_write_owned(uint32_t disk_id, int32_t partition_index,
                              uint64_t offset, const void *buffer, uint32_t length,
-                             uint32_t *out_written)
+                             uint32_t *out_written,const struct block_device_ref *reference)
 {
     uint64_t first_lba, sectors;
     uint32_t done = 0;
@@ -492,6 +495,14 @@ static int storage_disk_block_write_owned(uint32_t disk_id, int32_t partition_in
     uint64_t bytes = sectors * 512u;
     if (offset >= bytes) return -28;
     if (length > bytes - offset) length = bytes - offset;
+#ifdef CONFIG_SWAP
+    uint64_t raw_first=first_lba+offset/512u;
+    uint64_t raw_count=((offset%512u)+(uint64_t)length+511u)/512u;
+    int busy=swap_storage_raw_busy(reference,raw_first,raw_count,partition_index<0);
+    if (busy) return busy<0 ? busy : -EBUSY;
+#else
+    (void)reference;
+#endif
     /* Linux raw block I/O follows descriptor DAC/access-mode checks. Mount
      * conflicts apply to exclusive opens, rather than every write to another
      * range on the same disk (for example GRUB embedding beside an ESP). */
@@ -547,6 +558,12 @@ static int storage_disk_block_reread_owned(uint32_t disk_id)
     if (ret < 0) return ret;
     ret = disk_manage_prepare(disk_id, &disk, &sectors);
     if (ret < 0) return ret;
+#ifdef CONFIG_SWAP
+    struct block_device_ref swap_ref={0};
+    ret=block_device_get(disk->device,&swap_ref);if (ret) return ret;
+    ret=swap_storage_raw_busy(&swap_ref,0,1,true);block_device_put(&swap_ref);
+    if (ret) return ret<0 ? ret : -EBUSY;
+#endif
     if ((disk->boot_root && !storage_installer_root_active()) ||
         storage_disk_has_data_mount(disk_id)) {
         return -16;
@@ -624,7 +641,7 @@ int storage_disk_block_write(uint32_t disk_id, int32_t partition_index,
     if(out_written)*out_written=0;
     struct block_device_ref ref={0};int rc=storage_disk_block_get(disk_id,&ref);
     if(!rc && (disk_id&STORAGE_BLOCK_OPTICAL_BIT))rc=-30;
-    else if(!rc)rc=storage_disk_block_write_owned(disk_id,partition_index,offset,buffer,length,out_written);
+    else if(!rc)rc=storage_disk_block_write_owned(disk_id,partition_index,offset,buffer,length,out_written,&ref);
     block_device_put(&ref);return rc;
 }
 

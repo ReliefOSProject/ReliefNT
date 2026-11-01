@@ -22,6 +22,10 @@ static int test_page_alloc_allowed(void)
 #include "../../arch/x86_64/mm/paging.c"
 
 static struct { uint64_t address; unsigned refs; void *host; } pages[1024];
+#ifdef TASK8_CLONE_TID_TEST
+static void *clone_tid_pair;
+static size_t clone_tid_pair_bytes;
+#endif
 
 uint64_t mm_alloc_page(void)
 {
@@ -39,6 +43,7 @@ uint64_t mm_alloc_page(void)
     }
     abort();
 }
+uint64_t mm_alloc_emergency_page(void) { return mm_alloc_page(); }
 
 void *mm_phys_to_virt(uint64_t p)
 {
@@ -51,6 +56,26 @@ void *mm_phys_to_virt(uint64_t p)
             return (uint8_t *)pages[i].host + (p - pages[i].address);
     return NULL;
 }
+
+/** @brief Resolve fixture-owned static or allocated page tables.
+ * @param physical Fake physical table address. @return Borrowed host pointer.
+ */
+uint64_t *paging_trusted_table_alias(uint64_t physical)
+{
+    uintptr_t pdpt = (uintptr_t)kernel_pdpt, pd = (uintptr_t)kernel_pd;
+    if ((physical >= pdpt && physical - pdpt < sizeof(kernel_pdpt)) ||
+        (physical >= pd && physical - pd < sizeof(kernel_pd)))
+        return (void *)(uintptr_t)physical;
+    return mm_phys_to_virt(physical);
+}
+/** @brief Classify MMIO fixture addresses as devices rather than RAM.
+ * @param physical Physical start. @param bytes Extent size. @return False.
+ */
+bool mm_phys_is_ram(uint64_t physical, uint64_t bytes)
+{ (void)physical; (void)bytes; return false; }
+/** @brief Borrow the fixture's empty display reservation. @return Stable descriptor. */
+const struct framebuffer *framebuffer_get(void)
+{ static const struct framebuffer display; return &display; }
 
 uint64_t mm_virt_to_phys(const void *address)
 {
@@ -75,7 +100,13 @@ void mm_retain_page(uint64_t p)
 void mm_free_page(uint64_t p)
 {
     for (unsigned i = 0; i < 1024; ++i) if (pages[i].address == p && pages[i].refs) {
-        if (!--pages[i].refs) free(pages[i].host);
+        if (!--pages[i].refs) {
+#ifdef TASK8_CLONE_TID_TEST
+            if(!clone_tid_pair || (uintptr_t)pages[i].host<(uintptr_t)clone_tid_pair ||
+               (uintptr_t)pages[i].host-(uintptr_t)clone_tid_pair>=clone_tid_pair_bytes)
+#endif
+                free(pages[i].host);
+        }
         return;
     }
     abort();
@@ -83,6 +114,7 @@ void mm_free_page(uint64_t p)
 
 int page_cache_retain(uint64_t p) { (void)p; return -1; }
 int page_cache_owns(uint64_t p) { (void)p; return 0; }
+void page_cache_mark_shared_writable(uint64_t p) { (void)p; abort(); }
 void page_cache_release(uint64_t p) { (void)p; abort(); }
 void x86_64_load_cr3(uint64_t p) { (void)p; }
 void smp_flush_user_tlb(void) { }
@@ -196,6 +228,9 @@ static void test_early_mmio_split_uses_reserved_tables(void)
                       RELIEFNT_PAGE_WRITABLE | PAGE_SIZE_FLAG;
 }
 
+/** @brief Exercise user-page protection, COW and early MMIO table ownership.
+ * @return Zero after all fixture assertions succeed.
+ */
 int main(void)
 {
     struct address_space parent = {0}, child = {0};
@@ -206,6 +241,8 @@ int main(void)
     uint64_t hole_pdpt_phys, hole_pd_phys, hole_pt_phys;
     uint64_t *hole_pdpt, *hole_pd, *hole_pt;
     nx_enabled = true;
+    kernel_pml4[256] = (uintptr_t)kernel_pdpt | RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE;
+    kernel_pdpt[1] = (uintptr_t)kernel_pd[1] | RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_WRITABLE;
 
     /* Keep only the mapped supervisor kernel hole from the bootstrap's low
      * identity hierarchy. Ordinary low user addresses must not inherit its
@@ -389,4 +426,5 @@ int main(void)
     mm_free_page(hole_pdpt_phys);
     for (unsigned i = 0; i < 1024; ++i) assert(!pages[i].refs);
     puts("PASS page protection: PROT_NONE, private COW, shared fork, restore, unmap, ownership");
+    return 0;
 }

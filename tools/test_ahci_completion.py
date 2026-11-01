@@ -6,7 +6,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix="reliefos-ahci-") as directory:
     executable = Path(directory) / "ahci-completion"
-    subprocess.run(["cc", "-std=c11", "-O1", "-g", "-fsanitize=address,undefined",
+    subprocess.run(["cc", "-std=c11", "-O1", "-g", "-pthread", "-fsanitize=address,undefined",
                     "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
                     "-Iinclude", "-Iinclude", "-Iinclude/uapi", "-Iinclude",
                     "tools/tests/ahci_completion_test.c", "kernel/dma/buffer.c", "drivers/storage/ahci/dma.c", "-o", executable], cwd=ROOT, check=True)

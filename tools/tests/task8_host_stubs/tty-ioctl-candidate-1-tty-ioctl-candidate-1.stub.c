@@ -1,0 +1,23 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Unreached host-fixture dependencies trap if invoked. */
+__attribute__((noreturn)) void framebuffer_get(void){__builtin_trap();}
+__attribute__((noreturn)) void pty_acquire_controlling(void){__builtin_trap();}
+__attribute__((noreturn)) void pty_detach_controlling(void){__builtin_trap();}
+__attribute__((noreturn)) void pty_get_foreground_pgid(void){__builtin_trap();}
+__attribute__((noreturn)) void pty_get_linux_winsize(void){__builtin_trap();}
+__attribute__((noreturn)) void pty_get_lock(void){__builtin_trap();}
+__attribute__((noreturn)) void pty_get_session(void){__builtin_trap();}
+__attribute__((noreturn)) void pty_set_foreground_pgid(void){__builtin_trap();}
+__attribute__((noreturn)) void pty_set_linux_winsize(void){__builtin_trap();}
+__attribute__((noreturn)) void pty_set_lock(void){__builtin_trap();}
+__attribute__((noreturn)) void pty_vt_generation(void){__builtin_trap();}
+__attribute__((noreturn)) void pty_vt_get_keyboard_mode(void){__builtin_trap();}
+__attribute__((noreturn)) void pty_vt_graphical(void){__builtin_trap();}
+__attribute__((noreturn)) void pty_vt_release_display(void){__builtin_trap();}
+__attribute__((noreturn)) void pty_vt_set_graphics(void){__builtin_trap();}
+__attribute__((noreturn)) void pty_vt_set_keyboard_mode(void){__builtin_trap();}
+__attribute__((noreturn)) void pty_vt_set_mode(void){__builtin_trap();}
+__attribute__((noreturn)) void pty_vt_switch(void){__builtin_trap();}
+__attribute__((noreturn)) void pty_vt_wait_active(void){__builtin_trap();}
+__attribute__((noreturn)) void task_pty_status(void){__builtin_trap();}
+__attribute__((noreturn)) void task_vt_query_ioctl(void){__builtin_trap();}

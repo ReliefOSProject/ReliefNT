@@ -17,9 +17,11 @@ def main():
                          source + types), "retired window/service authority is present"
     # exec may preserve existing credentials; an executable's group must not
     # introduce the kernel-only service flag into the new image's task flags.
-    match = re.search(r"preserved_flags\s*=\s*task->flags\s*&\s*\(([^;]+)\);", source)
+    match = re.search(
+        r"\b(?P<saved>[A-Za-z_]\w*)\s*=\s*task->flags\s*&\s*\((?P<flags>[^;]+)\);"
+        r"\s*task->flags\s*=\s*(?P=saved)\s*\|\s*TASK_FLAG_STARTED\s*;", source)
     assert match is not None, "exec flag preservation contract is missing"
-    flags = {flag.strip() for flag in match.group(1).split("|")}
+    flags = {flag.strip() for flag in match.group("flags").split("|")}
     assert flags == {"TASK_FLAG_ELEVATED_ADMIN", "TASK_FLAG_WAITABLE_CHILD"}, flags
     print("PASS exec does not grant window/service authority through executable GIDs")
 

@@ -6,6 +6,10 @@
 #include <reliefnt/sched.h>
 #include <reliefnt/usercopy.h>
 #include <reliefnt/paging.h>
+#include <reliefnt/swap.h>
+#ifdef CONFIG_SWAP
+#include <reliefnt/swap_internal.h>
+#endif
 
 #include <reliefnt/arch.h>
 #include <reliefnt/futex.h>
@@ -20,6 +24,11 @@
 #include <reliefnt/time.h>
 #include <reliefnt/power.h>
 #include <reliefnt/graphics_service.h>
+#include <reliefnt/storage.h>
+#ifdef CONFIG_SWAP
+/** @brief Cancel an interrupted fork's scalar-only private reclaim state. */
+extern void sched_fork_reclaim_cancel(struct task *) __attribute__((weak));
+#endif
 
 static struct kernel_signal_action *signal_action(struct task *task, int sig)
 {
@@ -238,6 +247,7 @@ static int signal_setup_frame(struct task *task, int sig,
     uint64_t size = sizeof(user_frame);
     uint64_t base;
     uint64_t bit = 1ULL << (uint32_t)(sig - 1);
+    uint64_t handler_mask = task->blocked_signals;
     uint8_t fpstate[512] __attribute__((aligned(16)));
     uint64_t fpbase;
     bool on_altstack = task->signal_stack_size && frame->rsp >= task->signal_stack_base &&
@@ -268,6 +278,9 @@ static int signal_setup_frame(struct task *task, int sig,
     user_frame.info = *info;
     if (task->restart_syscall) {
         uint64_t nr = task->restart_syscall - 1;
+#ifdef CONFIG_SWAP
+        if (nr == __NR_fork && sched_fork_reclaim_cancel) sched_fork_reclaim_cancel(task);
+#endif
         bool sleeping = nr == __NR_nanosleep || nr == __NR_clock_nanosleep;
         bool interruptible = task->fifo_open_file != NULL || nr == __NR_read || nr == __NR_write || nr == __NR_readv ||
             nr == __NR_pread64 || nr == __NR_pwrite64 ||
@@ -293,6 +306,11 @@ static int signal_setup_frame(struct task *task, int sig,
         if (synccpu_busy) restart = false;
         uint64_t received = task->socket_receive_done;
         bool batch = task->mmsg.active;
+#ifdef CONFIG_SWAP
+        int socket_output_error=batch?0:task_socket_signal_finish(task);
+#else
+        int socket_output_error=0;
+#endif
         int64_t batch_result = batch ? task_socket_mmsg_interrupt(task, received) : 0;
         received = task_socket_cancel_receive(task);
         if (task->regular_io.active) {
@@ -303,10 +321,10 @@ static int signal_setup_frame(struct task *task, int sig,
         int64_t transfer_result=task->transfer_io ? task_transfer_interrupt(task) : 0;
         if(transfer_result>0)received=(uint64_t)transfer_result;
         task_release_syscall_file(task);
-        if (received || transfer_result<0 || (batch && batch_result != -LINUX_EINTR) || (interruptible && !restart)) {
+        if (received || socket_output_error || transfer_result<0 || (batch && batch_result != -LINUX_EINTR) || (interruptible && !restart)) {
             frame->rip += 2;
             frame->rax = synccpu_busy ? (uint64_t)-LINUX_EBUSY :
-                transfer_result<0 ? (uint64_t)transfer_result :
+                socket_output_error ? (uint64_t)socket_output_error : transfer_result<0 ? (uint64_t)transfer_result :
                 batch ? (uint64_t)batch_result : received ? received : (uint64_t)-4LL;
             task->poll_deadline_ticks = 0;
         }
@@ -338,7 +356,7 @@ static int signal_setup_frame(struct task *task, int sig,
     }
     signal_context_save(&user_frame.uc.context, frame);
     user_frame.uc.context.cr2 = task->signal_fault_address;
-    user_frame.uc.context.oldmask = task->blocked_signals;
+    user_frame.uc.context.oldmask = handler_mask;
     user_frame.uc.context.fpstate = fpbase;
     __builtin_memcpy(fpstate, task->fpu_state, sizeof(fpstate));
     /* FXSAVE's software-reserved tail must not advertise an XSAVE extension. */
@@ -354,7 +372,7 @@ static int signal_setup_frame(struct task *task, int sig,
 
     /* The handler runs with the delivered signal and the action mask blocked;
      * SA_NODEFER omits only the automatic current-signal block. */
-    task->blocked_signals |= action->mask & KERNEL_SIGNAL_VALID_MASK;
+    task->blocked_signals = handler_mask | (action->mask & KERNEL_SIGNAL_VALID_MASK);
     if ((action->flags & LINUX_SA_NODEFER) == 0) {
         task->blocked_signals |= bit;
     }
@@ -373,7 +391,63 @@ static int signal_setup_frame(struct task *task, int sig,
 }
 
 /** @brief Dequeue and install a frame while task lifetime and dispositions are serialized. */
-static int signal_deliver_pending_locked(struct task *task, struct trap_frame *frame)
+/** @brief Prepare one signal operand without discarding accepted I/O progress.
+ * @param task Selected current task. @param address User operand. @param size Bytes.
+ * @param write_access True for output. @return Swap preparation status.
+ * If this interrupted task owns an actual provider request, drain it before
+ * retrying page-in; the existing signal settlement still owns its staged data.
+ */
+static int signal_prepare_range(struct task *task, uint64_t address, uint64_t size,
+                                bool write_access)
+{
+    int ret = swap_prepare_user_range(task, address, size, write_access);
+#ifdef CONFIG_SWAP
+    if (ret == -EBUSY && task == sched_current_task() && task->restart_syscall &&
+        swap_storage_current_owner()) {
+        storage_drain_task_io(task->pid);
+        ret = swap_prepare_user_range(task, address, size, write_access);
+    }
+#endif
+    return ret;
+}
+
+/** @brief Prepare only the stack and optional interrupted-sleep output in use.
+ * @param task Selected task. @param action Candidate caught action.
+ * @param frame Original saved frame. @return Prerequisite or ordinary error.
+ * Invalid destinations keep the existing late-copy failure behavior.
+ */
+static int signal_prepare_frame(struct task *task, struct kernel_signal_action *action,
+                                const struct trap_frame *frame)
+{
+    if (!action->restorer) return 0;
+    uint64_t size = sizeof(struct linux_rt_sigframe);
+    bool on_altstack = task->signal_stack_size && frame->rsp >= task->signal_stack_base &&
+        frame->rsp - task->signal_stack_base < task->signal_stack_size;
+    uint64_t top = frame->rsp;
+    if ((action->flags & LINUX_SA_ONSTACK) && task->signal_stack_size && !on_altstack)
+        top = task->signal_stack_base + task->signal_stack_size;
+    if (top < 128 + 512 + size + 80) return 0;
+    uint64_t fpbase = (top - 128 - 512) & ~63ULL;
+    uint64_t base = ((fpbase - size) & ~15ULL) - 8;
+    if (!base || base < RELIEFNT_USER_BASE || base > top) return 0;
+    int ret = signal_prepare_range(task, base, fpbase + 512 - base, true);
+    if (ret) return ret;
+    if (task->restart_syscall && task->nanosleep_remaining) {
+        uint64_t nr = task->restart_syscall - 1;
+        if (nr == __NR_nanosleep || nr == __NR_clock_nanosleep)
+            ret = signal_prepare_range(task, task->nanosleep_remaining,
+                                       sizeof(struct linux_timespec), true);
+    }
+#ifdef CONFIG_SWAP
+    if(!ret)ret=task_socket_signal_prepare(task);
+    if(!ret)ret=task_socket_batch_signal_prepare(task);
+    if(!ret && task->transfer_io)ret=task_transfer_prepare_interrupt(task);
+#endif
+    return ret;
+}
+
+static int signal_deliver_pending_locked(struct task *task, struct trap_frame *frame,
+                                         bool prepare)
 {
     struct kernel_signal_action *action;
     struct linux_siginfo info;
@@ -398,7 +472,21 @@ static int signal_deliver_pending_locked(struct task *task, struct trap_frame *f
     if (task->restart_syscall && task_sysv_sem_ready(task)) return 0;
     if (graphics_service_task_uninterruptible(task)) return 0;
     int sig;
-    while ((sig = kernel_signal_dequeue(task, ~(task->blocked_signals | task->sigwait_mask), &info))) {
+    for (;;) {
+        uint64_t allowed = ~(task->blocked_signals | task->sigwait_mask);
+        if (prepare) {
+            sig = kernel_signal_peek(task, allowed);
+            if (!sig) break;
+            action = signal_action(task, sig);
+            if (action && action->handler && action->handler != 1) {
+                ret = signal_prepare_frame(task, action, frame);
+                if (ret == SWAP_STORAGE_CONTENDED) return ret;
+            }
+            /* Do not consume a newly queued, unprepared signal. */
+            allowed &= 1ULL << (sig - 1);
+        }
+        sig = kernel_signal_dequeue(task, allowed, &info);
+        if (!sig) { if (prepare) continue; break; }
         uint64_t bit = 1ULL << (uint32_t)(sig - 1);
         action = signal_action(task, sig);
         if (!action || action->handler == 0 || action->handler == 1) {
@@ -442,9 +530,46 @@ int kernel_signal_deliver_pending(struct task *task, struct trap_frame *frame)
 {
     uint64_t flags;
     kernel_execution_lock_irqsave(&flags);
-    int result = signal_deliver_pending_locked(task, frame);
+    int result = signal_deliver_pending_locked(task, frame, false);
     kernel_execution_unlock_irqrestore(flags);
     return result;
+}
+
+/** @brief Prepare and deliver a signal at the outer execution-writer gate.
+ * @param task Live target. @param frame Saved user registers.
+ * @return One for handler delivery, zero for no delivery, or a private wait /
+ * terminal preparation error. Accepted work keeps caught signals queued;
+ * default fatal, stop, continue and ignored actions remain effective.
+ */
+int kernel_signal_deliver_pending_outer(struct task *task, struct trap_frame *frame)
+{
+    if (!kernel_execution_is_outermost()) return -EDEADLK;
+#ifdef CONFIG_SWAP
+    if (task && (sched_exec_staged(task) || task_socket_stage_receive_accepted(task) ||
+                 task_socket_batch_accepted(task) ||
+                 (task->restart_syscall && task->sysv_msg.completed))) {
+        /* A committed exec cannot return to the old handler image; an
+         * accepted socket or SysV message must finish its bounded copy first. Keep
+         * caught signals queued; preserve ignore and default actions. */
+        uint64_t allowed = ~task->blocked_signals | (1ULL << 8) | (1ULL << 18);
+        for (;;) {
+            int sig = kernel_signal_peek(task, allowed);
+            if (!sig) break;
+            uint64_t bit = 1ULL << (sig - 1);
+            struct kernel_signal_action *action = signal_action(task, sig);
+            if (action && action->handler > 1) {
+                allowed &= ~bit;
+                continue;
+            }
+            struct linux_siginfo info;
+            if (kernel_signal_dequeue(task, bit, &info) && (!action || !action->handler))
+                signal_default_action(task, sig);
+            if (task->state == TASK_EXITED || task->state == TASK_STOPPED) break;
+        }
+        return 0;
+    }
+#endif
+    return signal_deliver_pending_locked(task, frame, true);
 }
 
 void kernel_signal_force_fault(struct task *task, int sig, int code, uint64_t address)
@@ -474,6 +599,9 @@ int64_t kernel_signal_rt_sigreturn(struct task *task, struct trap_frame *frame)
         return -14;
     }
     base = frame->rsp - 8U;
+    int prep = signal_prepare_range(task, base, size, false);
+    if (prep == SWAP_STORAGE_CONTENDED) return KERNEL_SYSCALL_SWAP_CONTENDED;
+    if (prep < 0) return -14;
     if (!user_range_ok(base, size)) return -14;
     __builtin_memcpy(&user_frame, (const void *)(uintptr_t)base, size);
     const struct linux_sigcontext *context = &user_frame.uc.context;
@@ -483,6 +611,9 @@ int64_t kernel_signal_rt_sigreturn(struct task *task, struct trap_frame *frame)
         return -22;
     }
     if (context->fpstate) {
+        prep = signal_prepare_range(task, context->fpstate, sizeof(fpstate), false);
+        if (prep == SWAP_STORAGE_CONTENDED) return KERNEL_SYSCALL_SWAP_CONTENDED;
+        if (prep < 0) return -14;
         if (!user_range_ok(context->fpstate, sizeof(fpstate))) return -14;
         __builtin_memcpy(fpstate, (const void *)(uintptr_t)context->fpstate, sizeof(fpstate));
         uint32_t mxcsr;

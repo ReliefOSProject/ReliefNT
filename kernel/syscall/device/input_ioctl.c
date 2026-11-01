@@ -1,4 +1,22 @@
 #include "../internal.h"
+#include <reliefnt/swap.h>
+
+/** @brief Prepare an actually consumed bounded evdev/VT operand at syscall entry.
+ * @param address User address. @param size Bytes consumed by this command.
+ * @param writing True for device output. @return Zero, EFAULT or a private
+ * prerequisite-wait marker. No device or input lock is held across page-in.
+ */
+static int input_ioctl_prepare(uint64_t address, uint64_t size, bool writing)
+{
+#ifdef CONFIG_SWAP
+    int rc = swap_prepare_user_range(sched_current_task(), address, size, writing);
+    if (rc == SWAP_STORAGE_CONTENDED) return KERNEL_SYSCALL_SWAP_CONTENDED;
+    if (rc < 0) return -RELIEFOS_EFAULT;
+#else
+    (void)address; (void)size; (void)writing;
+#endif
+    return 0;
+}
 
 static void evdev_copy_text(char *dst, uint32_t capacity, const char *src);
 
@@ -70,11 +88,15 @@ static void evdev_copy_text(char *dst, uint32_t capacity, const char *src)
 int task_vt_query_ioctl(uint64_t request, uint64_t user_arg)
 {
     if (request == VT_OPENQRY) {
+        int rc = input_ioctl_prepare(user_arg, sizeof(int), true);
+        if (rc) return rc;
         if (!user_range_writable(user_arg, sizeof(int))) return -RELIEFOS_EFAULT;
         int free_vt = pty_vt_open_query();
         *(int *)(uintptr_t)user_arg = free_vt;
         return 0;
     }
+    int rc = input_ioctl_prepare(user_arg, sizeof(struct vt_stat), true);
+    if (rc) return rc;
     if (!user_range_writable(user_arg, sizeof(struct vt_stat))) return -RELIEFOS_EFAULT;
     struct vt_stat *state = (struct vt_stat *)(uintptr_t)user_arg;
     state->v_active = (unsigned short)pty_vt_active();
@@ -95,6 +117,8 @@ int task_evdev_ioctl(struct task_file *file, uint64_t request,
     device_kind = file->node.first_cluster;
     if (request == RELIEFOS_EVIOCSVT) {
         uint32_t number;
+        int rc = input_ioctl_prepare(user_arg, sizeof(number), false);
+        if (rc) return rc;
         if (!user_range_ok(user_arg, sizeof(number))) return -RELIEFOS_EFAULT;
         __builtin_memcpy(&number, (const void *)(uintptr_t)user_arg, sizeof(number));
         if (number && !pty_vt_id(number)) return -RELIEFOS_EINVAL;
@@ -104,7 +128,9 @@ int task_evdev_ioctl(struct task_file *file, uint64_t request,
         return 0;
     }
     if (request == EVIOCGVERSION) {
-        if (!user_range_ok(user_arg, sizeof(int))) return -RELIEFOS_EFAULT;
+        int rc = input_ioctl_prepare(user_arg, sizeof(int), true);
+        if (rc) return rc;
+        if (!user_range_writable(user_arg, sizeof(int))) return -RELIEFOS_EFAULT;
         *(int *)(uintptr_t)user_arg = 0x00010001;
         return 0;
     }
@@ -115,7 +141,9 @@ int task_evdev_ioctl(struct task_file *file, uint64_t request,
             .product = device_kind == STORAGE_DEV_KIND_KEYBOARD ? 0x0001 : 0x0002,
             .version = 0x0100,
         };
-        if (!user_range_ok(user_arg, sizeof(id))) return -RELIEFOS_EFAULT;
+        int rc = input_ioctl_prepare(user_arg, sizeof(id), true);
+        if (rc) return rc;
+        if (!user_range_writable(user_arg, sizeof(id))) return -RELIEFOS_EFAULT;
         *(struct input_id *)(uintptr_t)user_arg = id;
         return 0;
     }
@@ -135,7 +163,10 @@ int task_evdev_ioctl(struct task_file *file, uint64_t request,
     if (_IOC_NR(request) == 0x03 && _IOC_DIR(request) == _IOC_READ) {
         /* EVIOCGREP: the default key repeat delay and period. */
         unsigned int rep[2] = {250u, 667u};
-        if (size < sizeof(rep) || !user_range_writable(user_arg, sizeof(rep)))
+        if (size < sizeof(rep)) return -RELIEFOS_EFAULT;
+        int rc = input_ioctl_prepare(user_arg, sizeof(rep), true);
+        if (rc) return rc;
+        if (!user_range_writable(user_arg, sizeof(rep)))
             return -RELIEFOS_EFAULT;
         __builtin_memcpy((void *)(uintptr_t)user_arg, rep, sizeof(rep));
         return 0;
@@ -148,6 +179,8 @@ int task_evdev_ioctl(struct task_file *file, uint64_t request,
         uint64_t leds = device_kind == STORAGE_DEV_KIND_KEYBOARD && input_caps_lock_active()
                             ? 1ULL << LED_CAPSL : 0;
         uint32_t count = size < sizeof(leds) ? size : sizeof(leds);
+        int rc = input_ioctl_prepare(user_arg, count, true);
+        if (rc) return rc;
         if (count && !user_range_writable(user_arg, count)) return -RELIEFOS_EFAULT;
         for (uint32_t i = 0; i < count; ++i)
             ((uint8_t *)(uintptr_t)user_arg)[i] = (uint8_t)(leds >> (8U * i));
@@ -158,12 +191,23 @@ int task_evdev_ioctl(struct task_file *file, uint64_t request,
         /* EVIOCGSND and EVIOCGSW: no sounds or switch states exist on these
          * devices, so the bitmaps are all zeroes. */
         uint32_t count = size < sizeof(uint64_t) ? size : sizeof(uint64_t);
+        int rc = input_ioctl_prepare(user_arg, count, true);
+        if (rc) return rc;
         if (count && !user_range_writable(user_arg, count)) return -RELIEFOS_EFAULT;
         for (uint32_t i = 0; i < count; ++i)
             ((uint8_t *)(uintptr_t)user_arg)[i] = 0;
         return (int)count;
     }
-    if (!size || !user_range_ok(user_arg, size)) {
+    uint32_t nr = _IOC_NR(request);
+    bool writes = nr == 0x06 || nr == 0x07 || nr == 0x08 || nr == 0x09 || nr == 0x0a ||
+                  nr == 0x18 || (nr >= 0x20 && nr <= 0x20 + EV_MAX) ||
+                  (nr >= 0x40 && nr < 0x80 && device_kind == STORAGE_DEV_KIND_MOUSE &&
+                   size == sizeof(struct input_absinfo));
+    if (size && writes) {
+        int rc = input_ioctl_prepare(user_arg, size, true);
+        if (rc) return rc;
+    }
+    if (!size || !(writes ? user_range_writable(user_arg, size) : user_range_ok(user_arg, size))) {
         return -RELIEFOS_EFAULT;
     }
     if (_IOC_NR(request) == 0x06 || _IOC_NR(request) == 0x07 ||

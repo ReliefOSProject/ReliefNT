@@ -105,7 +105,9 @@ int fat32_remove_child(const struct storage_node *parent,const char *name,bool d
     ret=fat32_delete_dirent(parent->first_cluster,name,NULL);if(ret)return ret;
     bool retained=storage_inode_unlinked(&node);
     storage_cache_invalidate();
-    return !retained && node.first_cluster>=2 ? fat32_free_chain(node.first_cluster) : 0;
+    if (!retained && node.first_cluster>=2) ret=fat32_free_chain(node.first_cluster);
+    if (!ret && !retained) page_cache_forget_node(&node);
+    return ret;
 }
 
 /* FAT specifies dot and dot-dot as the first two directory records. Update
@@ -201,6 +203,7 @@ int fat32_rename_child(const struct storage_node *parent,const char *old_name,
         moved.entry_id=(uint64_t)target.entry_cluster<<32 | target.entry_offset;
         storage_inode_note_move(&node,&moved);
         if (!ret && !retained && existing.first_cluster >= 2) ret = fat32_free_chain(existing.first_cluster);
+        if (!ret && !retained) page_cache_forget_node(&existing);
         storage_cache_invalidate();
         return ret;
     }

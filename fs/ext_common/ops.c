@@ -82,18 +82,18 @@ int storage_ext4_read_inode(struct storage_volume *v, uint64_t ino, struct ext4_
         v->ext4.inode_size < 128 || v->ext4.inode_size > EXT4_MAX_BLOCK_SIZE ||
         !v->ext4.block_size) return -RELIEFOS_EINVAL;
     int ret = storage_ext4_read_group(v, (ino - 1) / v->ext4.inodes_per_group, &group);
-    if (ret < 0) return ret;
+    if (ret < 0) { return ret; }
     uint64_t offset = ((ino - 1) % v->ext4.inodes_per_group) * v->ext4.inode_size;
     uint64_t block = group.inode_table + offset / v->ext4.block_size;
     uint32_t inside = offset % v->ext4.block_size, size = v->ext4.inode_size;
     uint8_t *data, *owned = NULL;
     ret = storage_ext4_cache_get(v, block, &data, false);
-    if (ret < 0) return ret;
+    if (ret < 0) { return ret; }
     const uint8_t *raw = data + inside;
     if (inside + size > v->ext4.block_size) {
         uint32_t first = v->ext4.block_size - inside;
         owned = kernel_malloc(size);
-        if (!owned) return -RELIEFOS_ENOMEM;
+        if (!owned) { return -RELIEFOS_ENOMEM; }
         storage_memcpy(owned, raw, first);
         ret = storage_ext4_cache_get(v, block + 1, &data, false);
         if (ret < 0) { kernel_free(owned); return ret; }
@@ -357,7 +357,14 @@ int storage_ext4_recover_orphans(struct storage_volume *v)
     }
     return -RELIEFOS_EIO;
 }
-int storage_ext4_fallocate(struct storage_volume *v,uint64_t ino,uint32_t mode,uint64_t offset,uint64_t len)
+/** @brief Apply native allocation and report each known committed zero range.
+ * @param v Borrowed instance. @param ino Inode. @param mode Allocation flags.
+ * @param offset First byte. @param len Byte length. @param observe Optional observer.
+ * @param context Borrowed observer state. @return Zero or native error; earlier
+ * reports remain valid on error. Caller owns execution and serializes faults.
+ */
+int storage_ext4_fallocate_observed(struct storage_volume *v,uint64_t ino,uint32_t mode,uint64_t offset,uint64_t len,
+                                    storage_ext4_zero_observer observe,void *context)
 {
     if (mode&~(1u|2u|16u)) return -RELIEFOS_EOPNOTSUPP;
     if ((mode&2) && (!(mode&1) || (mode&16))) return -RELIEFOS_EOPNOTSUPP;
@@ -368,10 +375,19 @@ int storage_ext4_fallocate(struct storage_volume *v,uint64_t ino,uint32_t mode,u
     uint64_t end=offset+len;
     if (mode&2) {
         uint64_t first=(offset+bs-1)/bs,last=end/bs;
-        int ret=ext4_ops_zero_edge(v,ino,offset,end<(offset/bs+1)*bs?end:(offset/bs+1)*bs);
-        if (ret<0) return ret;
-        if (end%bs && end/bs!=offset/bs) { ret=ext4_ops_zero_edge(v,ino,end/bs*bs,end); if (ret<0) return ret; }
-        return first<last ? storage_ext4_remove_range(v,ino,first,last) : 0;
+        int ret=0;
+        if (offset%bs || end<(offset/bs+1)*bs) {
+            uint64_t edge=end<(offset/bs+1)*bs?end:(offset/bs+1)*bs;
+            ret=ext4_ops_zero_edge(v,ino,offset,edge);
+            if (ret<0) return ret;
+            if (observe) observe(context,offset,edge-offset);
+        }
+        if (end%bs && end/bs!=offset/bs) {
+            uint64_t edge=end/bs*bs;
+            ret=ext4_ops_zero_edge(v,ino,edge,end); if (ret<0) return ret;
+            if (observe) observe(context,edge,end-edge);
+        }
+        return first<last ? storage_ext4_remove_range_observed(v,ino,first,last,observe,context) : 0;
     }
     uint8_t *zeros=kernel_malloc(bs*EXT4_READAHEAD_BLOCKS); if (!zeros) return -RELIEFOS_ENOMEM;
     storage_memzero(zeros,bs*EXT4_READAHEAD_BLOCKS); int ret=0;
@@ -379,7 +395,7 @@ int storage_ext4_fallocate(struct storage_volume *v,uint64_t ino,uint32_t mode,u
         struct storage_ext4_handle h; struct ext4_inode_view in; struct storage_ext4_map_result map;
         ret=storage_ext4_journal_start(v,EXT4_JOURNAL_CREDITS,&h); if (ret<0) break;
         ret=storage_ext4_read_inode(v,ino,&in); if (ret<0) { ext4_ops_stop(&h,ret); break; }
-        ret=storage_ext4_map_block(v,ino,&in,at,false,&map); uint32_t n=0;
+        ret=storage_ext4_map_block(v,ino,&in,at,false,&map); uint32_t n=0; bool deferred_zero=false;
         if (!ret) {
             n=(end+bs-1)/bs-at; if (n>EXT4_READAHEAD_BLOCKS) n=EXT4_READAHEAD_BLOCKS;
             if (n>map.length) n=map.length;
@@ -390,18 +406,33 @@ int storage_ext4_fallocate(struct storage_volume *v,uint64_t ino,uint32_t mode,u
                 if (!ret) ret=storage_ext4_change_mapping(v,ino,&in,at,b,n,extents,false);
             }
             if (!ret && (mode&16)) {
+                deferred_zero=map.hole || map.unwritten;
                 /* Zero full initialized ranges; edges preserve outside bytes. */
                 if (!map.hole && !map.unwritten) {
                     for (uint32_t j=0;j<n && !ret;j++) {
                         uint64_t a=(at+j)*bs,z=a+bs;
                         if (a<offset) a=offset; if (z>end) z=end;
                         ret=ext4_ops_zero_edge(v,ino,a,z);
+                        if (!ret && observe) observe(context,a,z-a);
                     }
                 }
             }
             if (!ret && !(mode&1) && in.size<end) { in.size=end; ret=storage_ext4_write_inode(v,ino,&in); }
         }
-        ret=ext4_ops_stop(&h,ret); if (ret<0) break; at+=n;
+        ret=ext4_ops_stop(&h,ret); if (ret<0) break;
+        if (deferred_zero && observe) {
+            uint64_t a=at*(uint64_t)bs,z=(at+n)*(uint64_t)bs;
+            if (a<offset) a=offset; if (z>end) z=end;
+            if (a<z) observe(context,a,z-a);
+        }
+        at+=n;
     }
     kernel_free(zeros); return ret;
 }
+
+/** @brief Apply native fallocate without a progress observer.
+ * @param v Borrowed instance. @param ino Inode. @param mode Allocation flags.
+ * @param offset First byte. @param len Byte length. @return Zero or native error.
+ */
+int storage_ext4_fallocate(struct storage_volume *v,uint64_t ino,uint32_t mode,uint64_t offset,uint64_t len)
+{ return storage_ext4_fallocate_observed(v,ino,mode,offset,len,NULL,NULL); }

@@ -7,6 +7,7 @@
 #include <reliefnt/syscall.h>
 #include <reliefnt/syscall_internal.h>
 #include <reliefnt/usercopy.h>
+#include <reliefnt/socket_usercopy.h>
 #include <reliefnt/time.h>
 #include <reliefnt/futex.h>
 #include <linux/socket.h>
@@ -108,6 +109,8 @@ void net_udp_input(uint32_t source, uint32_t destination, uint16_t source_port,
 static int import_address(uint64_t pointer, uint32_t length, struct sockaddr_in *out)
 {
     if ((int32_t)length < 0 || length < sizeof(*out)) return -LINUX_EINVAL;
+    int prep=socket_user_prepare(sched_current_task(),pointer,sizeof(*out),false);
+    if(prep)return prep;
     if (!user_range_ok(pointer, sizeof(*out))) return -LINUX_EFAULT;
     __builtin_memcpy(out, (void *)(uintptr_t)pointer, sizeof(*out));
     return out->sin_family == AF_INET ? 0 : -LINUX_EAFNOSUPPORT;
@@ -115,10 +118,11 @@ static int import_address(uint64_t pointer, uint32_t length, struct sockaddr_in 
 
 static int export_address(uint64_t pointer, uint64_t length_pointer, uint32_t ip, uint16_t port)
 {
-    if (!user_range_writable(length_pointer, 4)) return -LINUX_EFAULT;
-    uint32_t length = *(uint32_t *)(uintptr_t)length_pointer;
+    uint32_t length;int prep=socket_user_length(sched_current_task(),length_pointer,&length);
+    if(prep)return prep;
     if ((int32_t)length < 0) return -LINUX_EINVAL;
     if (length > sizeof(struct sockaddr_in)) length = sizeof(struct sockaddr_in);
+    prep=socket_user_prepare(sched_current_task(),pointer,length,true);if(prep)return prep;
     if (length && !user_range_writable(pointer, length)) return -LINUX_EFAULT;
     struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = swap16(port),
                                   .sin_addr = {.s_addr = swap32(ip)}};
@@ -169,8 +173,9 @@ int task_udp_send(struct task_file *file, const void *data, uint32_t length,
  * @note A negative timeval seconds value is stored as immediate timeout, distinct
  *       from the all-zero value, which keeps the default infinite wait.
  */
-int task_udp_recv(struct task_file *file, void *data, uint32_t length,
-                   uint32_t flags, uint64_t address, uint64_t address_length)
+static int udp_recv(struct task_file *file, void *data, uint32_t length,
+                    uint32_t flags, uint64_t address, uint64_t address_length,
+                    struct sockaddr_in *source)
 {
     struct udp_socket *s = udp_from_file(file);
     if (!s) return -LINUX_EBADF;
@@ -195,6 +200,8 @@ int task_udp_recv(struct task_file *file, void *data, uint32_t length,
         int ret = export_address(address, address_length, packet->source, packet->port);
         if (ret < 0) return ret;
     }
+    if(source)*source=(struct sockaddr_in){.sin_family=AF_INET,.sin_port=swap16(packet->port),
+                                           .sin_addr={.s_addr=swap32(packet->source)}};
     uint32_t copied = length < packet->length ? length : packet->length;
     __builtin_memcpy(data, packet->data, copied);
     int ret = (flags & MSG_TRUNC) ? (int)packet->length : (int)copied;
@@ -206,6 +213,21 @@ int task_udp_recv(struct task_file *file, void *data, uint32_t length,
     }
     return ret;
 }
+
+int task_udp_recv(struct task_file *file, void *data, uint32_t length,
+                  uint32_t flags, uint64_t address, uint64_t address_length)
+{ return udp_recv(file,data,length,flags,address,address_length,NULL); }
+
+#ifdef CONFIG_SWAP
+/** @brief Receive one datagram into owned kernel payload and source buffers.
+ * @param file Pinned UDP OFD. @param data Kernel destination. @param length
+ * Capacity. @param flags Native receive flags. @param source Optional kernel
+ * sockaddr. @return Byte count, blocking sentinel, or errno; PEEK retains it.
+ */
+int task_udp_recv_staged(struct task_file *file,void *data,uint32_t length,
+                         uint32_t flags,struct sockaddr_in *source)
+{ return udp_recv(file,data,length,flags,0,0,source); }
+#endif
 
 short task_udp_poll(struct task_file *file, short events)
 {
@@ -281,10 +303,20 @@ int64_t syscall_udp(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
         file->node.type = RELIEFOS_FS_TYPE_DEVICE;
         return fd;
     }
+#ifdef CONFIG_SWAP
+    struct task_file *file = task_file_for_io(task, (int32_t)a0);
+#else
     struct task_file *file = task_file_for_fd(task, (int32_t)a0);
+#endif
     struct udp_socket *s = udp_from_file(file);
     if (!s) return -LINUX_EBADF;
     if (number == __NR_bind || number == __NR_connect) {
+#ifdef CONFIG_SWAP
+        if(number==__NR_connect && a2>=2) {
+            int prep=socket_user_prepare(task,a1,2,false);
+            if(prep==KERNEL_SYSCALL_SWAP_CONTENDED)return prep;
+        }
+#endif
         if (number == __NR_connect && a2 >= 2 && user_range_ok(a1, 2) &&
             *(uint16_t *)(uintptr_t)a1 == AF_UNSPEC) { s->connected = false; return 0; }
         struct sockaddr_in address;
@@ -312,8 +344,7 @@ int64_t syscall_udp(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
         uint32_t length;
         if (set) length = (uint32_t)a4;
         else {
-            if (!user_range_writable(a4, 4)) return -LINUX_EFAULT;
-            length = *(uint32_t *)(uintptr_t)a4;
+            int prep=socket_user_length(task,a4,&length);if(prep)return prep;
         }
         if ((int32_t)length < 0) return -LINUX_EINVAL;
         if (a2 == SO_BINDTODEVICE) {
@@ -322,6 +353,7 @@ int64_t syscall_udp(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
                 if (!(task->cap_effective & (1ULL << CAP_NET_RAW))) return -LINUX_EPERM;
                 char name[16] = {0};
                 uint32_t size = length < sizeof(name) - 1 ? length : sizeof(name) - 1;
+                int prep=socket_user_prepare(task,a3,size,false);if(prep)return prep;
                 if (size && !user_range_ok(a3, size)) return -LINUX_EFAULT;
                 if (size) __builtin_memcpy(name, (void *)(uintptr_t)a3, size);
                 int index = !name[0] ? 0 : !__builtin_strcmp(name, "eth0") ? 2 : !__builtin_strcmp(name, "lo") ? 1 : -1;
@@ -332,6 +364,7 @@ int64_t syscall_udp(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
             const char *name = s->ifindex == 2 ? "eth0" : s->ifindex == 1 ? "lo" : "";
             uint32_t size = s->ifindex == 2 ? 5 : s->ifindex == 1 ? 3 : 0;
             if (size && length < 16) return -LINUX_EINVAL;
+            int prep=socket_user_prepare(task,a3,size,true);if(prep)return prep;
             if (size && !user_range_writable(a3, size)) return -LINUX_EFAULT;
             if (size) __builtin_memcpy((void *)(uintptr_t)a3, name, size);
             *(uint32_t *)(uintptr_t)a4 = size;
@@ -343,6 +376,7 @@ int64_t syscall_udp(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
             uint64_t *timeout = &s->receive_timeout;
             if (set) {
                 if (length < sizeof(tv)) return -LINUX_EINVAL;
+                int prep=socket_user_prepare(task,a3,sizeof(tv),false);if(prep)return prep;
                 if (!user_range_ok(a3, sizeof(tv))) return -LINUX_EFAULT;
                 __builtin_memcpy(tv, (void *)(uintptr_t)a3, sizeof(tv));
                 if (tv[1] < 0 || tv[1] >= 1000000) return -LINUX_EDOM;
@@ -361,6 +395,7 @@ int64_t syscall_udp(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
             tv[0] = *timeout / RELIEFNT_TICK_HZ;
             tv[1] = (*timeout % RELIEFNT_TICK_HZ) * 1000000 / RELIEFNT_TICK_HZ;
             if (length > sizeof(tv)) length = sizeof(tv);
+            int prep=socket_user_prepare(task,a3,length,true);if(prep)return prep;
             if (length && !user_range_writable(a3, length)) return -LINUX_EFAULT;
             __builtin_memcpy((void *)(uintptr_t)a3, tv, length);
             *(uint32_t *)(uintptr_t)a4 = length;
@@ -368,6 +403,7 @@ int64_t syscall_udp(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
         }
         if (set) {
             if (length < 4) return -LINUX_EINVAL;
+            int prep=socket_user_prepare(task,a3,4,false);if(prep)return prep;
             if (!user_range_ok(a3, 4)) return -LINUX_EFAULT;
             value = *(int *)(uintptr_t)a3;
             if (a2 == SO_REUSEADDR) s->reuse = value != 0;
@@ -383,6 +419,7 @@ int64_t syscall_udp(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
         else if (a2 == UDP_SO_BROADCAST) value = s->broadcast;
         else return -LINUX_ENOPROTOOPT;
         if (length > 4) length = 4;
+        int prep=socket_user_prepare(task,a3,length,true);if(prep)return prep;
         if (length && !user_range_writable(a3, length)) return -LINUX_EFAULT;
         __builtin_memcpy((void *)(uintptr_t)a3, &value, length);
         *(uint32_t *)(uintptr_t)a4 = length;

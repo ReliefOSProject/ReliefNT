@@ -403,7 +403,14 @@ int storage_ext4_insert_extent(struct storage_volume *v,uint64_t ino,uint64_t lo
     if (ret<0) storage_ext4_journal_abort(&h,ret);
     int stop=storage_ext4_journal_stop(&h); return ret<0?ret:stop;
 }
-int storage_ext4_remove_range(struct storage_volume *v,uint64_t ino,uint64_t start,uint64_t end)
+/** @brief Remove a range in bounded transactions and report completed ranges.
+ * @param v Borrowed instance. @param ino Inode. @param start First logical block.
+ * @param end Exclusive logical block. @param observe Optional byte observer.
+ * @param context Borrowed observer state. @return Zero or provider errno; prior
+ * successful reports survive a later error. Caller owns storage execution.
+ */
+int storage_ext4_remove_range_observed(struct storage_volume *v,uint64_t ino,uint64_t start,uint64_t end,
+                                       storage_ext4_zero_observer observe,void *context)
 {
     if (end>(uint64_t)EXT4_MAX_LOGICAL_BLOCK+1 || start>end) return -RELIEFOS_EINVAL;
     while (start<end) {
@@ -420,10 +427,18 @@ int storage_ext4_remove_range(struct storage_volume *v,uint64_t ino,uint64_t sta
         }
         if (ret<0) storage_ext4_journal_abort(&h,ret);
         int stop=storage_ext4_journal_stop(&h); if (ret<0 || stop<0) return ret<0?ret:stop;
+        if (observe && n) observe(context,start*(uint64_t)v->ext4.block_size,n*(uint64_t)v->ext4.block_size);
         start+=n;
     }
     return 0;
 }
+
+/** @brief Remove a range without observing completed transactions.
+ * @param v Borrowed instance. @param ino Inode. @param start First logical block.
+ * @param end Exclusive logical block. @return Zero or native error.
+ */
+int storage_ext4_remove_range(struct storage_volume *v,uint64_t ino,uint64_t start,uint64_t end)
+{ return storage_ext4_remove_range_observed(v,ino,start,end,NULL,NULL); }
 
 int storage_ext4_fiemap(struct storage_volume *v, uint64_t ino, uint64_t start, uint64_t len,
                         struct storage_ext4_fiemap_extent *out, uint32_t capacity, uint32_t *count)

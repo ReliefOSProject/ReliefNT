@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "../internal.h"
+#include <reliefnt/swap.h>
 
 /* One original invocation owns both OFDs and any bytes read before a queue
  * wait. Filesystem callbacks are synchronous for this kernel staging buffer;
@@ -10,6 +11,10 @@ struct task_transfer_state {
     uint64_t input_position,output_position,count,total;
     uint32_t buffered,consumed;
     bool range,locked,prepared,waiting_io,done;
+#ifdef CONFIG_SWAP
+    uint8_t offsets_captured,publish_index;
+    bool sync_done;
+#endif
     int error;
     uint8_t bytes[RELIEFOS_FS_IO_SLICE_BYTES];
 };
@@ -56,9 +61,16 @@ void task_transfer_enter(struct task *task,const struct trap_frame *frame)
  * @return Zero or negative EFAULT/EINVAL. Execution-owned usercopy may fault;
  * no filesystem/module/graph lock is held and no pointer is retained as data.
  */
-static int transfer_offset(uint64_t address,uint64_t *position)
+static int transfer_offset(struct task *task,uint64_t address,uint64_t *position)
 {
     if(!address)return 0;
+#ifdef CONFIG_SWAP
+    int prep=swap_prepare_user_range(task,address,sizeof(int64_t),true);
+    if(prep==SWAP_STORAGE_CONTENDED)return KERNEL_SYSCALL_SWAP_CONTENDED;
+    if(prep<0)return -EFAULT;
+#else
+    (void)task;
+#endif
     if(!user_range_ok(address,sizeof(int64_t)) || !user_range_writable(address,sizeof(int64_t)))return -EFAULT;
     int64_t value=*(const int64_t *)(uintptr_t)address;
     if(value<0)return -EINVAL;
@@ -77,8 +89,15 @@ static int transfer_begin(struct task *task,bool range,const uint64_t args[6])
 {
     uint64_t number=range ? LINUX_SYS_COPY_FILE_RANGE : LINUX_SYS_SENDFILE;
     struct task_transfer_state *state=task->transfer_io;
+    int rc=0;
     if(state) {
-        if(state->number==number && !__builtin_memcmp(state->args,args,sizeof(state->args)))return 0;
+        if(state->number==number && !__builtin_memcmp(state->args,args,sizeof(state->args))) {
+#ifdef CONFIG_SWAP
+            goto capture_offsets;
+#else
+            return 0;
+#endif
+        }
         task_transfer_cancel(task);
     }
     if(range && (uint32_t)args[5])return -EINVAL;
@@ -103,8 +122,23 @@ static int transfer_begin(struct task *task,bool range,const uint64_t args[6])
     task->transfer_io=state;
     state->input=task_file_get(input);
     if(state->input)state->output=task_file_get(output);
-    int rc=(!state->input || !state->output) ? -ENOMEM : transfer_offset(state->input_user,&state->input_position);
-    if(!rc)rc=transfer_offset(state->output_user,&state->output_position);
+    rc=(!state->input || !state->output) ? -ENOMEM : 0;
+    if(rc){task_transfer_cancel(task);return rc;}
+#ifdef CONFIG_SWAP
+capture_offsets:
+    if(!(state->offsets_captured&1u)) {
+        rc=transfer_offset(task,state->input_user,&state->input_position);
+        if(!rc)state->offsets_captured|=1u;
+    }
+    if(!rc && !(state->offsets_captured&2u)) {
+        rc=transfer_offset(task,state->output_user,&state->output_position);
+        if(!rc)state->offsets_captured|=2u;
+    }
+    if(rc==KERNEL_SYSCALL_SWAP_CONTENDED)return rc;
+#else
+    rc=transfer_offset(task,state->input_user,&state->input_position);
+    if(!rc)rc=transfer_offset(task,state->output_user,&state->output_position);
+#endif
     if(rc)task_transfer_cancel(task);
     return rc;
 }
@@ -150,16 +184,58 @@ static int transfer_prepare(struct task *task)
  * ownership is required; usercopy may fault without graph/module spinlocks.
  * This helper neither releases state nor acquires new filesystem references.
  */
-static int transfer_publish_offsets(struct task *task,const struct task_transfer_state *state)
+static int transfer_publish_offsets(struct task *task,struct task_transfer_state *state,
+                                    bool prepare)
 {
     const uint64_t pointers[]={state->input_user,state->output_user};
     const uint64_t positions[]={state->input_position,state->output_position};
-    for(unsigned i=0;i<2;++i)if(pointers[i]) {
-        int64_t value=(int64_t)positions[i];
-        if(user_copy_to_task(task,pointers[i],&value,sizeof(value))<0)return -EFAULT;
+    unsigned first=0;
+#ifdef CONFIG_SWAP
+    first=state->publish_index;
+    if(prepare && !state->waiting_io)storage_release_task_io(task->pid);
+#else
+    (void)prepare;
+#endif
+    for(unsigned i=first;i<2;++i) {
+        if(pointers[i]) {
+#ifdef CONFIG_SWAP
+            if(prepare) {
+                int prep=swap_prepare_user_range(task,pointers[i],sizeof(int64_t),true);
+                if(prep==SWAP_STORAGE_CONTENDED)return KERNEL_SYSCALL_SWAP_CONTENDED;
+                if(prep<0)return -EFAULT;
+            }
+#endif
+            int64_t value=(int64_t)positions[i];
+            if(user_copy_to_task(task,pointers[i],&value,sizeof(value))<0)return -EFAULT;
+        }
+#ifdef CONFIG_SWAP
+        state->publish_index=(uint8_t)(i+1);
+#endif
     }
     return 0;
 }
+
+#ifdef CONFIG_SWAP
+/** @brief Prepare outstanding transfer offsets before dequeuing a caught signal.
+ * @param task Live transfer owner at the outer execution writer.
+ * @return Zero, SWAP_STORAGE_CONTENDED, or a terminal page error. A real
+ * pending transfer is drained before release; no user alias survives a wait.
+ * Permanent errors retain the ordinary interrupted-copy EFAULT behavior.
+ */
+int task_transfer_prepare_interrupt(struct task *task)
+{
+    if(!task || !task->transfer_io || !task->transfer_io->total)return 0;
+    struct task_transfer_state *state=task->transfer_io;
+    if(state->waiting_io){storage_drain_task_io(task->pid);state->waiting_io=false;}
+    storage_release_task_io(task->pid);
+    const uint64_t pointers[]={state->input_user,state->output_user};
+    for(unsigned i=state->publish_index;i<2;++i)if(pointers[i]) {
+        int ret=swap_prepare_user_range(task,pointers[i],sizeof(int64_t),true);
+        if(ret)return ret;
+    }
+    return 0;
+}
+#endif
 
 /** @brief Keep accepted copy bytes visible to an interrupted syscall's caller.
  * @param task Current execution-owned task, nullable.
@@ -173,7 +249,7 @@ int64_t task_transfer_interrupt(struct task *task)
     struct task_transfer_state *state=task->transfer_io;
     if(state->waiting_io){storage_drain_task_io(task->pid);state->waiting_io=false;}
     if(!state->total)return 0;
-    int rc=transfer_publish_offsets(task,state);return rc ? rc : (int64_t)state->total;
+    int rc=transfer_publish_offsets(task,state,false);return rc ? rc : (int64_t)state->total;
 }
 
 /** @brief Publish final offset outputs and release a completed copy exactly once.
@@ -187,12 +263,24 @@ static int64_t transfer_complete(struct task *task)
 {
     struct task_transfer_state *state=task->transfer_io;
     int64_t result=state->total ? (int64_t)state->total : state->error;
-    if(state->total && state->output->node.type==RELIEFOS_FS_TYPE_FILE && (state->output->flags&LINUX_O_DSYNC)) {
+    if(state->total && state->output->node.type==RELIEFOS_FS_TYPE_FILE && (state->output->flags&LINUX_O_DSYNC)
+#ifdef CONFIG_SWAP
+       && !state->sync_done
+#endif
+       ) {
         int rc=vfs_path_sync_after_write(&state->output->path_ref,(state->output->flags&LINUX_O_SYNC)==LINUX_O_DSYNC);
         if(rc==-EAGAIN){state->waiting_io=true;return rc;}
+        state->waiting_io=false;
         if(rc)result=rc;
+#ifdef CONFIG_SWAP
+        else state->sync_done=true;
+#endif
     }
-    if(result>=0){int rc=transfer_publish_offsets(task,state);if(rc)result=rc;}
+    if(result>=0){int rc=transfer_publish_offsets(task,state,true);
+#ifdef CONFIG_SWAP
+        if(rc==KERNEL_SYSCALL_SWAP_CONTENDED)return rc;
+#endif
+        if(rc)result=rc;}
     task_transfer_cancel(task);return result;
 }
 

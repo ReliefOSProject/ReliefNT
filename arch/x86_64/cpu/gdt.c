@@ -121,6 +121,11 @@ static void set_tss_descriptor(uint64_t *table, uint32_t index,
     table[index + 1] = high;
 }
 
+/** @brief Install per-CPU descriptors and a fully mapped private syscall stack.
+ * @param cpu_index Logical CPU index, clamped to the boot CPU if out of range.
+ * @param kernel_stack_top Borrowed supervisor stack top for privilege entry.
+ * Called during CPU bring-up; an unavailable syscall stack halts that CPU.
+ */
 static void arch_setup_cpu(uint32_t cpu_index, void *kernel_stack_top)
 {
     uint64_t *table;
@@ -164,9 +169,14 @@ static void arch_setup_cpu(uint32_t cpu_index, void *kernel_stack_top)
             for (;;) __asm__ volatile("cli; hlt");
         }
     }
+    void *syscall_stack = mm_phys_to_virt(syscall_entry_stack[cpu_index]);
+    if (!syscall_stack || !paging_kernel_direct_map_range(syscall_entry_stack[cpu_index],
+                                                          ARCH_SYSCALL_STACK_SIZE)) {
+        console_error("[reliefnt] CPU%u syscall stack is not fully mapped\n", cpu_index);
+        for (;;) __asm__ volatile("cli; hlt");
+    }
     x86_64_syscall_cpu_data[cpu_index].kernel_stack_top =
-        RELIEFNT_KERNEL_DIRECT_MAP_BASE + syscall_entry_stack[cpu_index] +
-        ARCH_SYSCALL_STACK_SIZE;
+        (uintptr_t)syscall_stack + ARCH_SYSCALL_STACK_SIZE;
     /* STAR encodes kernel CS=0x08 and the user base selector=0x10, producing
      * user CS=0x23 and SS=0x1b for this GDT. */
     /* EFER.SCE is required before LSTAR/STAR can execute SYSCALL in ring 3;

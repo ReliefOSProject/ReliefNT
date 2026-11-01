@@ -9,7 +9,14 @@ struct block_device;
 #define BLOCK_DEVICE_REMOVABLE 2u
 #define BLOCK_DEVICE_OPTICAL 4u
 #define BLOCK_DEVICE_WRITE_THROUGH 8u
-/* Scalar inventory transport for reserved boot-image backing, not a pointer. */
+/* In forced synchronous storage context every callback is bounded, owns no
+ * caller buffer after return, never leaves a resumable command, and allocates
+ * no memory. Failed hardware STOP retains/quarantines driver-owned DMA. */
+#define BLOCK_DEVICE_SWAP_SAFE 16u
+/* Immutable scalar inventory transports, not provider pointers. */
+#define BLOCK_TRANSPORT_AHCI 1u
+#define BLOCK_TRANSPORT_IDE_PIO 2u
+#define BLOCK_TRANSPORT_NVME 3u
 #define BLOCK_TRANSPORT_MEMORY 4u
 #define BLOCK_TRANSPORT_USB 5u
 

@@ -17,7 +17,79 @@
 
 #define STACK_ADDRESS 0x0f400000ULL
 static unsigned char target_pages[8192] __attribute__((aligned(4096)));
+/** @brief Resolve the fixture's physical bytes to their borrowed host alias.
+ * @param physical Fake physical byte address. @return Identical host pointer.
+ */
+void *mm_phys_to_virt(uint64_t physical) { return (void *)(uintptr_t)physical; }
 static struct task target;
+#ifdef TASK8_REAL_SYSV_SIGNAL
+static struct task signal_sender;
+static struct task *signal_running = &target;
+#endif
+#if defined(TASK8_REAL_SYSV_SIGNAL) || defined(TASK8_PROCESS_SIGNAL_TEST)
+static unsigned signal_allocations;
+#endif
+#ifdef CONFIG_SWAP
+static uint64_t signal_swapped_page;
+static int signal_prep_error;
+#ifdef TASK8_TRANSFER_SIGNAL
+static uint64_t signal_transfer_blocked;
+#endif
+#if defined(TASK8_REAL_INET_SIGNAL) || defined(TASK8_PROCESS_SIGNAL_TEST)
+static uint64_t signal_inet_blocked;
+#endif
+static unsigned signal_prep_calls;
+static bool signal_owned_provider;
+static bool signal_exec_pending;
+static bool signal_socket_pending;
+/** @brief Model bounded stack page-in before the signal queue is touched.
+ * @param task Delivery target. @param address Start. @param length Bytes.
+ * @param writing Output access. @return Injected status or success.
+ */
+int swap_prepare_user_range(struct task *task,uint64_t address,uint64_t length,bool writing)
+{
+    (void)writing;
+#ifdef TASK8_REAL_SYSV_SIGNAL
+    assert((task==&target || task==&signal_sender) && length<=32768);
+#else
+    assert(task==&target && length<=32768);
+#endif
+    ++signal_prep_calls;
+#ifdef TASK8_TRANSFER_SIGNAL
+    if(signal_transfer_blocked && address==signal_transfer_blocked)
+        return SWAP_STORAGE_CONTENDED;
+#endif
+#if defined(TASK8_REAL_INET_SIGNAL) || defined(TASK8_PROCESS_SIGNAL_TEST)
+    if(signal_inet_blocked && address==signal_inet_blocked)
+        return SWAP_STORAGE_CONTENDED;
+#endif
+    if(signal_prep_error)return signal_prep_error;
+    if(signal_swapped_page && address<=signal_swapped_page+4095 &&
+       address+length>signal_swapped_page)signal_swapped_page=0;
+    return 0;
+}
+struct task *sched_current_task(void) {
+#ifdef TASK8_REAL_SYSV_SIGNAL
+    return signal_running;
+#else
+    return &target;
+#endif
+}
+struct task *sched_exec_staged(const struct task *task)
+{ assert(task==&target); return signal_exec_pending ? &target : NULL; }
+#ifndef TASK8_REAL_INET_SIGNAL
+bool task_socket_stage_receive_accepted(const struct task *task)
+{ assert(task==&target);return signal_socket_pending; }
+int task_socket_signal_prepare(struct task *task) { assert(task==&target);return 0; }
+int task_socket_signal_finish(struct task *task) { assert(task==&target);return 0; }
+#endif
+#ifndef TASK8_REAL_LOOKUP_SCOPE
+struct task_lookup_path *task_lookup_scope_at(struct task *task,uint64_t index)
+{ (void)task;(void)index;return NULL; }
+#endif
+bool swap_storage_current_owner(void) { return signal_owned_provider; }
+bool kernel_execution_is_outermost(void) { return true; }
+#endif
 static unsigned translated_pages;
 static unsigned exits;
 static int deferred_error;
@@ -29,11 +101,32 @@ static unsigned fpu_restore_calls;
 static uint8_t restored_fpu_state[512];
 void power_reboot(void) { abort(); }
 void power_shutdown(void) { abort(); }
-void storage_drain_task_io(uint32_t pid) { assert(pid==target.pid); ++drained_io; }
+void storage_drain_task_io(uint32_t pid) {
+#ifdef TASK8_REAL_SYSV_SIGNAL
+    assert(pid==target.pid || pid==signal_sender.pid);
+#else
+    assert(pid==target.pid);
+#endif
+    ++drained_io;
+#ifdef CONFIG_SWAP
+    if(signal_owned_provider){signal_owned_provider=false;signal_prep_error=0;}
+#endif
+}
 void kernel_execution_lock_irqsave(uint64_t *flags) { *flags = 0; }
 void kernel_execution_unlock_irqrestore(uint64_t flags) { (void)flags; }
-void *kernel_malloc(size_t size) { return malloc(size); }
-void kernel_free(void *p) { free(p); }
+void *kernel_malloc(size_t size) {
+    void *p=malloc(size);
+#if defined(TASK8_REAL_SYSV_SIGNAL) || defined(TASK8_PROCESS_SIGNAL_TEST)
+    if(p)++signal_allocations;
+#endif
+    return p;
+}
+void kernel_free(void *p) {
+#if defined(TASK8_REAL_SYSV_SIGNAL) || defined(TASK8_PROCESS_SIGNAL_TEST)
+    if(p){assert(signal_allocations);--signal_allocations;}
+#endif
+    free(p);
+}
 void kernel_spin_lock_irqsave(struct kernel_spinlock *lock, uint64_t *flags)
 { assert(!lock->state); lock->state = 1; *flags = 0; }
 void kernel_spin_unlock_irqrestore(struct kernel_spinlock *lock, uint64_t flags)
@@ -47,12 +140,17 @@ void arch_fpu_restore(const void *state)
 void kernel_wait_queue_remove(struct kernel_wait_queue *queue, struct task *task)
 { (void)queue; (void)task; assert(0); }
 void futex_cancel_wait(struct task *task) { (void)task; assert(0); }
+#ifndef TASK8_REAL_INET_SIGNAL
 uint64_t task_socket_cancel_receive(struct task *task)
 { uint64_t n = task->socket_receive_done; task->socket_receive_done = 0; return n; }
 int task_socket_message_error(struct task_file *file, int error, bool setting)
 { (void)file; assert(setting); deferred_error = error; return 0; }
+#endif
 int time_clock_get(int32_t id, struct linux_timespec *out)
 {
+#ifdef TASK8_REAL_SYSV_SIGNAL
+    if(id == LINUX_CLOCK_REALTIME) { *out=(struct linux_timespec){123,0};return 0; }
+#endif
     assert(id == LINUX_CLOCK_MONOTONIC);
     *out = (struct linux_timespec){clock_ticks / RELIEFNT_TICK_HZ,
         clock_ticks % RELIEFNT_TICK_HZ * (1000000000ULL / RELIEFNT_TICK_HZ)};
@@ -61,18 +159,51 @@ int time_clock_get(int32_t id, struct linux_timespec *out)
 /* Disk/OFD ownership is covered by its real descriptor fixture. These
  * synthetic completed states exercise real transfer offset publication into
  * the signal target MM, while an unrelated old MM remains mapped at host VA. */
+#ifndef TASK8_REAL_DESCRIPTOR_CLEANUP
 void task_release_syscall_file(struct task *task)
 {
     if(task->regular_io.active || task->vector_io)storage_drain_task_io(task->pid);
+#ifdef TASK8_REAL_LOOKUP_SCOPE
+    task_lookup_scope_cancel(task);
+#endif
     memset(&task->regular_io,0,sizeof(task->regular_io));task->transfer_io=NULL;
     task->vector_io=NULL; /* Synthetic completed vector/transfer states are stack-owned here. */
 }
+#endif
+#ifdef TASK8_REAL_LOOKUP_SCOPE
+void vfs_walk_cancel(struct vfs_walk **walk) { assert(!*walk); }
+void vfs_path_put(struct vfs_path *path) { assert(!path->mount); }
+void storage_inode_allow_write(struct storage_inode_ref *inode) { (void)inode; assert(0); }
+int storage_inode_put(struct storage_inode_ref *inode) { (void)inode; assert(0); return 0; }
+void task_process_vm_scope_release(void *state) { (void)state; assert(0); }
+#endif
 struct task *sched_find(uint32_t pid) { (void)pid; return &target; }
 void sched_exit_group(uint32_t pid, uint64_t code)
-{ assert(pid == 1 && code == 139); target.state = TASK_EXITED; ++exits; }
-void sched_signal_job_control(uint32_t pid, int sig) { (void)pid; (void)sig; assert(0); }
+{
+    assert(pid == 1 && code == 139); target.state = TASK_EXITED; ++exits;
+#ifdef TASK8_REAL_SYSV_SIGNAL
+    task_sysv_msg_cancel(&target);
+#endif
+}
+void sched_signal_job_control(uint32_t pid, int sig)
+{
+#ifdef CONFIG_SWAP
+    if((signal_exec_pending || signal_socket_pending
+#ifdef TASK8_REAL_SYSV_SIGNAL
+        || (target.restart_syscall && target.sysv_msg.completed)
+#endif
+       ) && pid==target.pid && (sig==19 || sig==18)) {
+        target.state=sig==19 ? TASK_STOPPED : TASK_READY;return;
+    }
+#endif
+    (void)pid; (void)sig; assert(0);
+}
 void sched_alarm_rearm(struct task *task) { (void)task; assert(0); }
 void sched_notify_runnable(void) { }
+#ifdef TASK8_REAL_SYSV_SIGNAL
+void sched_signal_wait_current(uint64_t deadline)
+{ assert(!deadline);signal_running->state=TASK_BLOCKED; }
+#endif
 void sched_wake_interruptible(struct task *task)
 {
     if (task && task->state == TASK_BLOCKED && !task->vfork_child) {
@@ -88,7 +219,11 @@ void sched_signal_discard(struct task *task, int sig)
 { task->pending_signals &= ~(1ULL << (sig - 1)); *sched_task_process_pending(task) &= ~(1ULL << (sig - 1)); }
 
 bool address_space_user_page_writable(const struct address_space *as, uint64_t address)
-{ assert(as == &target.as); return (address & ~4095ULL) != lazy_page && user_range_writable(address, 1); }
+{ assert(as == &target.as);
+#ifdef CONFIG_SWAP
+  if ((address & ~4095ULL)==signal_swapped_page) return false;
+#endif
+  return (address & ~4095ULL) != lazy_page && user_range_writable(address, 1); }
 bool address_space_handle_cow_fault(struct address_space *as, uint64_t address)
 { (void)as; (void)address; return false; }
 int syscall_handle_task_page_fault(struct task *task, uint64_t address, uint64_t error)
@@ -127,6 +262,60 @@ int main(void)
     target.limits.sigpending.rlim_cur = 8;
     target.signal_actions[2] = (struct kernel_signal_action){
         .handler = 0x410000, .restorer = 0x420000, .flags = LINUX_SA_SIGINFO};
+#ifdef CONFIG_SWAP
+    struct linux_siginfo queued = {.signo=2,.code=LINUX_SI_QUEUE,.fields.realtime.value=0xabc};
+    struct trap_frame original = {.rsp=STACK_ADDRESS+4096+800,.rip=0x430000,.cs=0x23};
+    struct trap_frame contended = original;
+    assert(!kernel_signal_queue_task_info(&target,2,&queued));
+    signal_swapped_page=STACK_ADDRESS+4096;signal_prep_error=-4100;
+    signal_exec_pending=true;
+    /* Thread-directed STOP precedes a process-directed lower-numbered fatal
+     * signal, while the caught thread signal remains queued across the gate. */
+    assert(!kernel_signal_enqueue(&target,false,19,NULL));
+    assert(!kernel_signal_enqueue(&target,true,11,NULL));
+    assert(!kernel_signal_deliver_pending_outer(&target,&contended));
+    assert(target.state==TASK_STOPPED && (target.process_pending_signals&(1ULL<<10)) && !exits);
+    kernel_signal_flush(&target,true,UINT64_MAX);target.state=TASK_READY;
+    assert(!kernel_signal_deliver_pending_outer(&target,&contended));
+    assert(target.pending_signals==(1ULL<<1) && !memcmp(&contended,&original,sizeof(original)));
+    assert(!kernel_signal_enqueue(&target,false,19,NULL));
+    assert(!kernel_signal_deliver_pending_outer(&target,&contended) && target.state==TASK_STOPPED);
+    assert(target.pending_signals==(1ULL<<1) && !memcmp(&contended,&original,sizeof(original)));
+    assert(!kernel_signal_queue_task(&target,18) && target.state==TASK_READY);
+    signal_exec_pending=false;
+    int delivery=kernel_signal_deliver_pending_outer(&target,&contended);
+    assert(delivery==-4100 && !memcmp(&contended,&original,sizeof(original)));
+    assert(target.pending_signals==(1ULL<<1) && target.state!=TASK_EXITED);
+    signal_prep_error=0;
+    assert(kernel_signal_deliver_pending_outer(&target,&contended)==1);
+    struct linux_rt_sigframe replayed;
+    memcpy(&replayed,target_pages+(contended.rsp-STACK_ADDRESS),sizeof(replayed));
+    assert(!memcmp(&replayed.info,&queued,sizeof(queued)) && signal_prep_calls && !signal_swapped_page);
+    target.blocked_signals=0;
+    target.restart_syscall=__NR_read+1;target.regular_io.active=1;target.regular_io.done=7;
+    signal_owned_provider=true;signal_prep_error=-EBUSY;
+    assert(!kernel_signal_queue_task_info(&target,2,&queued));
+    contended=original;
+    assert(kernel_signal_deliver_pending_outer(&target,&contended)==1);
+    memcpy(&replayed,target_pages+(contended.rsp-STACK_ADDRESS),sizeof(replayed));
+    assert(!signal_owned_provider && replayed.uc.context.rax==7 && !target.regular_io.active && drained_io==2);
+    target.blocked_signals=0;drained_io=0;
+    signal_exec_pending=true;
+    assert(!kernel_signal_enqueue(&target,false,11,NULL));
+    assert(!kernel_signal_deliver_pending_outer(&target,&contended) && target.state==TASK_EXITED);
+    assert(target.exit_signal==11 && exits==1);
+    signal_exec_pending=false;target.state=TASK_READY;target.exit_signal=0;exits=0;
+    signal_socket_pending=true;target.blocked_signals=0;contended=original;
+    assert(!kernel_signal_queue_task_info(&target,2,&queued));
+    assert(!kernel_signal_enqueue(&target,false,19,NULL));
+    assert(!kernel_signal_deliver_pending_outer(&target,&contended) && target.state==TASK_STOPPED);
+    assert(target.pending_signals==(1ULL<<1) && !memcmp(&contended,&original,sizeof(original)));
+    assert(!kernel_signal_queue_task(&target,18) && target.state==TASK_READY);
+    assert(!kernel_signal_deliver_pending_outer(&target,&contended) && target.pending_signals==(1ULL<<1));
+    signal_socket_pending=false;signal_prep_error=0;
+    assert(kernel_signal_deliver_pending_outer(&target,&contended)==1);
+    target.blocked_signals=0;
+#endif
     struct task vfork_child = {0};
     target.vfork_child = &vfork_child;
     target.state = TASK_BLOCKED;
@@ -149,7 +338,7 @@ int main(void)
     assert(kernel_signal_deliver_pending(&target, &frame) == 1);
     assert(!lazy_page && demand_faults == 1);
     struct linux_rt_sigframe saved;
-    memcpy(&saved, target_pages + frame.rsp - STACK_ADDRESS, sizeof(saved));
+    memcpy(&saved, target_pages + (frame.rsp - STACK_ADDRESS), sizeof(saved));
     assert(saved.restorer == 0x420000 && saved.uc.context.rip == 0x430000);
     assert(!memcmp(&saved.info, &sent, sizeof(sent)));
     assert(frame.rsi == frame.rsp + offsetof(struct linux_rt_sigframe, info));
@@ -169,24 +358,38 @@ int main(void)
     frame = (struct trap_frame){.rsp = saved_rsp, .rip = 0x430000, .cs = 0x23};
     assert(kernel_signal_queue_task(&target, 2) == 0);
     assert(kernel_signal_deliver_pending(&target, &frame) == 1);
-    memcpy(&saved, target_pages + frame.rsp - STACK_ADDRESS, sizeof(saved));
+    memcpy(&saved, target_pages + (frame.rsp - STACK_ADDRESS), sizeof(saved));
     assert(saved.uc.context.rip == 0x430002 && (int64_t)saved.uc.context.rax == -4);
     struct linux_timespec remaining;
     memcpy(&remaining, target_pages + 64, sizeof(remaining));
     assert(remaining.tv_sec == 0 && remaining.tv_nsec == 200000000);
     assert(!target.nanosleep_deadline && !target.nanosleep_remaining);
     clock_ticks = 100;
+#ifdef TASK8_REAL_LOOKUP_SCOPE
+    target.blocked_signals = 1ULL << 10;
+    target.sigsuspend_saved_mask = 1ULL << 3;
+    target.lookup_scope.armed = true;
+    target.lookup_scope.number = __NR_pselect6;
+#else
     target.blocked_signals = 0;
     target.sigsuspend_saved_mask = 1ULL << 1;
+#endif
     target.sigsuspend_active = 1;
     target.restart_syscall = __NR_pselect6 + 1;
     target.poll_deadline_ticks = 200;
     frame = (struct trap_frame){.rsp = saved_rsp, .rip = 0x430000, .cs = 0x23};
     assert(kernel_signal_queue_task(&target, 2) == 0);
     assert(kernel_signal_deliver_pending(&target, &frame) == 1);
-    memcpy(&saved, target_pages + frame.rsp - STACK_ADDRESS, sizeof(saved));
+    memcpy(&saved, target_pages + (frame.rsp - STACK_ADDRESS), sizeof(saved));
     assert(saved.uc.context.rip == 0x430002 && (int64_t)saved.uc.context.rax == -LINUX_EINTR);
+#ifdef TASK8_REAL_LOOKUP_SCOPE
+    assert(saved.uc.mask == (1ULL << 3));
+    assert((target.blocked_signals & (1ULL << 10)) && !(target.blocked_signals & (1ULL << 3)));
+    assert(!target.lookup_scope.armed);
+    drained_io = 0;
+#else
     assert(saved.uc.mask == (1ULL << 1));
+#endif
     assert(!target.sigsuspend_active && !target.restart_syscall && !target.poll_deadline_ticks);
     target.blocked_signals = 0;
     target.restart_syscall = __NR_ppoll + 1;
@@ -195,7 +398,7 @@ int main(void)
     frame = (struct trap_frame){.rsp = saved_rsp, .rip = 0x430000, .cs = 0x23};
     assert(kernel_signal_queue_task(&target, 2) == 0);
     assert(kernel_signal_deliver_pending(&target, &frame) == 1);
-    memcpy(&saved, target_pages + frame.rsp - STACK_ADDRESS, sizeof(saved));
+    memcpy(&saved, target_pages + (frame.rsp - STACK_ADDRESS), sizeof(saved));
     assert(saved.uc.context.rip == 0x430002 &&
            (int64_t)saved.uc.context.rax == -LINUX_EINTR);
     assert(!target.restart_syscall && !target.poll_deadline_ticks);
@@ -208,7 +411,7 @@ int main(void)
         frame = (struct trap_frame){.rsp = saved_rsp, .rip = 0x430000, .cs = 0x23};
         assert(kernel_signal_queue_task(&target, 2) == 0);
         assert(kernel_signal_deliver_pending(&target, &frame) == 1);
-        memcpy(&saved, target_pages + frame.rsp - STACK_ADDRESS, sizeof(saved));
+        memcpy(&saved, target_pages + (frame.rsp - STACK_ADDRESS), sizeof(saved));
         assert(saved.uc.context.rip == 0x430002 &&
                (int64_t)saved.uc.context.rax == -LINUX_EINTR);
         assert(!target.restart_syscall && !target.poll_deadline_ticks);
@@ -222,7 +425,7 @@ int main(void)
         assert(kernel_signal_queue_task(&target,2)==0);
         frame=(struct trap_frame){.rsp=saved_rsp,.rip=0x430000,.cs=0x23};
         assert(kernel_signal_deliver_pending(&target,&frame)==1);
-        memcpy(&saved,target_pages+frame.rsp-STACK_ADDRESS,sizeof(saved));
+        memcpy(&saved,target_pages+(frame.rsp-STACK_ADDRESS),sizeof(saved));
         assert(saved.uc.context.rax==65536 && saved.uc.context.rip==0x430002);
         assert(drained_io==restart+1 && !target.regular_io.active);
     }
@@ -237,7 +440,7 @@ int main(void)
             assert(!kernel_signal_queue_task(&target,2));
             frame=(struct trap_frame){.rsp=saved_rsp,.rip=0x430000,.rax=ordinary_vector_calls[call],.cs=0x23};
             assert(kernel_signal_deliver_pending(&target,&frame)==1);
-            memcpy(&saved,target_pages+frame.rsp-STACK_ADDRESS,sizeof(saved));
+            memcpy(&saved,target_pages+(frame.rsp-STACK_ADDRESS),sizeof(saved));
             int64_t expected=progress ? 5 : restart ? (int64_t)ordinary_vector_calls[call] : -LINUX_EINTR;
             assert((int64_t)saved.uc.context.rax==expected);
             assert(saved.uc.context.rip==(progress || !restart ? 0x430002u : 0x430000u));
@@ -259,7 +462,7 @@ int main(void)
             assert(!kernel_signal_queue_task(&target,2));
             frame=(struct trap_frame){.rsp=saved_rsp,.rip=0x430000,.rax=copy_calls[call],.cs=0x23};
             assert(kernel_signal_deliver_pending(&target,&frame)==1);
-            memcpy(&saved,target_pages+frame.rsp-STACK_ADDRESS,sizeof(saved));
+            memcpy(&saved,target_pages+(frame.rsp-STACK_ADDRESS),sizeof(saved));
             int64_t expected=copy_results[value] ? copy_results[value] : restart ? (int64_t)copy_calls[call] : -LINUX_EINTR;
             assert((int64_t)saved.uc.context.rax==expected);
             assert(saved.uc.context.rip==(copy_results[value] || !restart ? 0x430002u : 0x430000u));
@@ -295,7 +498,7 @@ int main(void)
     assert(kernel_signal_queue_task(&target, 2) == 0);
     frame = (struct trap_frame){.rsp = saved_rsp, .rip = 0x430000, .cs = 0x23};
     assert(kernel_signal_deliver_pending(&target, &frame) == 1);
-    memcpy(&saved, target_pages + frame.rsp - STACK_ADDRESS, sizeof(saved));
+    memcpy(&saved, target_pages + (frame.rsp - STACK_ADDRESS), sizeof(saved));
     assert((int64_t)saved.uc.context.rax == -4 && saved.uc.context.rip == 0x430002);
     assert(!target.sigwait_active && !target.sigwait_mask && !target.sigwait_deadline);
     /* A parked signalfd read resumes dequeue before handling an unblocked signal. */
@@ -323,7 +526,7 @@ int main(void)
             frame = (struct trap_frame){.rsp = saved_rsp, .rip = 0x430000,
                                        .rax = vector_calls[i], .cs = 0x23};
             assert(kernel_signal_deliver_pending(&target, &frame) == 1);
-            memcpy(&saved, target_pages + frame.rsp - STACK_ADDRESS, sizeof(saved));
+            memcpy(&saved, target_pages + (frame.rsp - STACK_ADDRESS), sizeof(saved));
             assert(saved.uc.context.rip == 0x430000 + (restart ? 0 : 2));
             assert(saved.uc.context.rax == (restart ? vector_calls[i] : (uint64_t)-4LL));
         }
@@ -341,7 +544,7 @@ int main(void)
         assert(target.pending_signals == (1ULL << 1) && frame.rip == 0x430000);
         target.sysv_msg.completed = false;
         assert(kernel_signal_deliver_pending(&target, &frame) == 1);
-        memcpy(&saved, target_pages + frame.rsp - STACK_ADDRESS, sizeof(saved));
+        memcpy(&saved, target_pages + (frame.rsp - STACK_ADDRESS), sizeof(saved));
         assert(saved.uc.context.rip == 0x430002 && (int64_t)saved.uc.context.rax == -LINUX_EINTR);
     }
     target.blocked_signals = 0;
@@ -363,7 +566,7 @@ int main(void)
         assert(kernel_signal_deliver_pending(&target, &frame) == 0);
         target.sysv_sem.deadline++;
         assert(kernel_signal_deliver_pending(&target, &frame) == 1);
-        memcpy(&saved, target_pages + frame.rsp - STACK_ADDRESS, sizeof(saved));
+        memcpy(&saved, target_pages + (frame.rsp - STACK_ADDRESS), sizeof(saved));
         assert(saved.uc.context.rip == 0x430002 && (int64_t)saved.uc.context.rax == -LINUX_EINTR);
         target.sysv_sem = (struct task_sysv_sem_state){0};
     }
@@ -377,7 +580,7 @@ int main(void)
     assert(kernel_signal_queue_task(&target, 2) == 0);
     frame = (struct trap_frame){.rsp = saved_rsp, .rip = 0x430000, .cs = 0x23};
     assert(kernel_signal_deliver_pending(&target, &frame) == 1);
-    memcpy(&saved, target_pages + frame.rsp - STACK_ADDRESS, sizeof(saved));
+    memcpy(&saved, target_pages + (frame.rsp - STACK_ADDRESS), sizeof(saved));
     assert(saved.uc.context.rax == 2 && saved.uc.context.rip == 0x430002);
     struct mmsghdr second;
     memcpy(&second, target_pages + 128 + sizeof(second), sizeof(second));
@@ -401,7 +604,7 @@ int main(void)
         .vector = 14, .error = 6};
     kernel_signal_force_fault(&target, 11, LINUX_SEGV_MAPERR, 0x1234);
     assert(kernel_signal_deliver_pending(&target, &frame) == 1);
-    memcpy(&saved, target_pages + frame.rsp - STACK_ADDRESS, sizeof(saved));
+    memcpy(&saved, target_pages + (frame.rsp - STACK_ADDRESS), sizeof(saved));
     assert(saved.info.code == LINUX_SEGV_MAPERR && saved.info.fields.fault.address == 0x1234);
     assert(saved.uc.context.cr2 == 0x1234 && saved.uc.context.vector == 14 && saved.uc.context.error == 6);
 
@@ -432,7 +635,7 @@ int main(void)
     const uint64_t interrupted_rsp = frame.rsp;
     kernel_signal_force_fault(&target, LINUX_SIGSEGV, LINUX_SI_KERNEL, 0);
     assert(kernel_signal_deliver_pending(&target, &frame) == 1);
-    memcpy(&saved, target_pages + frame.rsp - STACK_ADDRESS, sizeof(saved));
+    memcpy(&saved, target_pages + (frame.rsp - STACK_ADDRESS), sizeof(saved));
     assert(saved.info.signo == LINUX_SIGSEGV && saved.info.code == LINUX_SI_KERNEL);
     assert(saved.info.fields.fault.address == 0 && saved.uc.context.cr2 == 0);
     assert(saved.uc.context.vector == 13 && saved.uc.context.error == 0);
@@ -459,6 +662,13 @@ int main(void)
     for (unsigned i = 0; i < 16; ++i) user_fpstate[160 + i] = (uint8_t)(0x80 + i);
     memcpy(user_fpstate + 24, &mxcsr, sizeof(mxcsr));
     frame.rsp += 8; /* The signal trampoline's ret popped the restorer. */
+#ifdef CONFIG_SWAP
+    struct trap_frame before_sigreturn=frame;
+    signal_prep_error=-4100;
+    assert(kernel_signal_rt_sigreturn(&target,&frame)==-4099);
+    assert(!memcmp(&frame,&before_sigreturn,sizeof(frame)) && !fpu_restore_calls);
+    signal_prep_error=0;
+#endif
     assert(kernel_signal_rt_sigreturn(&target, &frame) == 0);
     assert(frame.rip == 0x440100 && frame.rsp == interrupted_rsp);
     assert(frame.r12 == 0xfeed123456789abcULL && frame.rax == 0x1234abcd5678ef90ULL);

@@ -29,6 +29,10 @@ void signal_fixture_job_control(uint32_t tgid, int signal_number);
 
 static struct task *fixture_task;
 static unsigned char user_stack[8192] __attribute__((aligned(4096)));
+/** @brief Resolve the fixture's physical bytes to their borrowed host alias.
+ * @param physical Fake physical byte address. @return Identical host pointer.
+ */
+void *mm_phys_to_virt(uint64_t physical) { return (void *)(uintptr_t)physical; }
 static uint32_t fake_cpu;
 static uint64_t fake_time;
 static unsigned futex_cancellations;

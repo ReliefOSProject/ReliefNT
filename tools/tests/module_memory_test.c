@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <reliefnt/module_memory.h>
+#include <reliefnt/framebuffer.h>
 #include "../../arch/x86_64/mm/paging.c"
 static struct { uint64_t phys; void *data; unsigned refs; } pages[1024];
 static int fail_after=-1;
@@ -27,11 +28,30 @@ void *mm_phys_to_virt(uint64_t p)
     if(p>=start && p-start<sizeof(kernel_low_pt)) return (void *)(uintptr_t)p;
     start=(uintptr_t)kernel_pdpt;
     if(p>=start && p-start<sizeof(kernel_pdpt)) return (void *)(uintptr_t)p;
+    start=(uintptr_t)kernel_shared_pdpt;
+    if(p>=start && p-start<sizeof(kernel_shared_pdpt)) return (void *)(uintptr_t)p;
+    start=(uintptr_t)kernel_pd;
+    if(p>=start && p-start<sizeof(kernel_pd)) return (void *)(uintptr_t)p;
     for(unsigned i=0;i<1024;++i)
         if(pages[i].refs && p>=pages[i].phys && p-pages[i].phys<4096)
             return (char *)pages[i].data+(p-pages[i].phys);
     return NULL;
 }
+/** @brief Resolve a fixture-owned table without calling public coverage.
+ * @param physical Fixture table's physical address.
+ * @return Borrowed writable table or NULL outside fixture ownership.
+ */
+uint64_t *paging_trusted_table_alias(uint64_t physical) { return mm_phys_to_virt(physical); }
+/** @brief Treat all fixture MMIO requests as outside trusted RAM.
+ * @param physical Physical byte start. @param bytes Complete requested length.
+ * @return False because this fixture only exercises module RAM.
+ */
+bool mm_phys_is_ram(uint64_t physical, uint64_t bytes)
+{ (void)physical; (void)bytes; return false; }
+/** @brief Supply an empty framebuffer to the MMIO authorization fixture.
+ * @return NULL because no display is owned by this scenario.
+ */
+const struct framebuffer *framebuffer_get(void) { return NULL; }
 void mm_free_page(uint64_t p) { for(unsigned i=0;i<1024;++i) if(pages[i].phys==p && pages[i].refs){if(!--pages[i].refs)free(pages[i].data);return;} abort(); }
 void mm_retain_page(uint64_t p) { for(unsigned i=0;i<1024;++i) if(pages[i].phys==p && pages[i].refs){++pages[i].refs;return;} abort(); }
 uint64_t mm_virt_to_phys(const void *p) { (void)p; return 0; }
@@ -44,10 +64,15 @@ void smp_flush_user_tlb(void) { ++tlb_flushes; }
 void kernel_spin_lock(struct kernel_spinlock *p) { assert(!p->state);p->state=1; }
 void kernel_spin_unlock(struct kernel_spinlock *p) { assert(p->state);p->state=0; }
 static unsigned live_pages(void) { unsigned n=0; for(unsigned i=0;i<1024;++i)n+=pages[i].refs!=0; return n; }
+/** @brief Exercise module permissions, shared mappings and allocation rollback.
+ * @return Zero after all fixture assertions succeed.
+ */
 int main(void)
 {
     nx_enabled=true; mmio_dynamic_tables_ready=true;
-    kernel_pml4[511]=(uintptr_t)kernel_pdpt|3;
+    kernel_pml4[256]=(uintptr_t)kernel_pdpt|3;
+    kernel_pml4[511]=(uintptr_t)kernel_shared_pdpt|3;
+    kernel_pdpt[0]=(uintptr_t)kernel_pd[0]|3;
     for(unsigned i=0;i<512;++i){
         kernel_pd[0][i]=(uintptr_t)kernel_low_pt[i]|3;
         for(unsigned j=0;j<512;++j)kernel_low_pt[i][j]=((uint64_t)i<<21)+j*4096+3;
@@ -60,7 +85,7 @@ int main(void)
     assert(m && m->size==12288 && !(m->address&8191));
     assert(m->address>=RELIEFNT_MODULE_BASE && m->address+m->size<=RELIEFNT_MODULE_END);
     uint64_t *pdpt=mm_phys_to_virt(parent.pml4[511]&RELIEFNT_PHYS_ADDR_MASK);
-    assert(pdpt==kernel_pdpt);
+    assert(pdpt==kernel_shared_pdpt);
     assert(pdpt[(m->address>>30)&511]&RELIEFNT_PAGE_PRESENT);
     assert(!(pdpt[(m->address>>30)&511]&RELIEFNT_PAGE_USER));
     assert(address_space_clone_cow(&parent,&child));

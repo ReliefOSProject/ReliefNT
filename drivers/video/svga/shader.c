@@ -76,7 +76,8 @@ static uint32_t shader_backing_table_pages(uint32_t pages)
  * @param ops Captured allocator callbacks owned by the staging transaction.
  * @param bytes Shader bytecode length in bytes.
  * @param mob Writable output describing the allocated backing.
- * @return Zero on success or SVGA_ENOMEM if any allocation or mapping fails.
+ * @return Zero on success or SVGA_ENOMEM if allocation, mapping or complete
+ * PPN32 validation fails; the inclusive final PPN is permitted.
  */
 static int shader_backing_alloc(const struct svga_ops *ops, uint32_t bytes,
                                 struct svga_mob *mob)
@@ -87,14 +88,13 @@ static int shader_backing_alloc(const struct svga_ops *ops, uint32_t bytes,
     uint32_t tables = shader_backing_table_pages(pages);
     uint64_t phys = ops->alloc(pages);
     if (!phys) return SVGA_ENOMEM;
-    if ((phys & 4095u) || (phys >> 12) > UINT32_MAX - pages ||
+    if (!svga_ppn32_run(phys, pages) ||
         !ops->pointer(phys)) {
         ops->free(phys, pages);
         return SVGA_ENOMEM;
     }
     uint64_t pt_phys = tables ? ops->alloc(tables) : 0;
-    if (tables && (!pt_phys || (pt_phys & 4095u) ||
-                   (pt_phys >> 12) > UINT32_MAX - tables ||
+    if (tables && (!svga_ppn32_run(pt_phys, tables) ||
                    !ops->pointer(pt_phys))) {
         if (pt_phys) ops->free(pt_phys, tables);
         ops->free(phys, pages);

@@ -11,12 +11,14 @@
 
 static unsigned char file_bytes[8192];
 static uint64_t mapped;
+static uint64_t mapped_flags;
 static unsigned allocations;
 static bool io_async;
 static int read_error;
 static bool short_read;
 static unsigned reads;
 static bool fail_metadata;
+static bool verify_shared_grant;
 
 void console_log(enum console_log_level level, const char *format, ...)
 { (void)level; (void)format; }
@@ -57,21 +59,131 @@ int storage_tmpfs_get_page(const struct storage_node *node, uint64_t offset, uin
 int storage_errno(int status) { return status; }
 bool address_space_map_user_page(struct address_space *as, uint64_t va,
                                  uint64_t phys, uint64_t flags)
-{ (void)as; (void)va; (void)flags; mapped = phys; return true; }
+{
+    (void)as; (void)va;
+    if (verify_shared_grant) {
+        assert((flags & (RELIEFNT_PAGE_WRITE_NOTIFY | RELIEFNT_PAGE_SHARED | RELIEFNT_PAGE_WRITABLE)) ==
+               (RELIEFNT_PAGE_WRITE_NOTIFY | RELIEFNT_PAGE_SHARED));
+        page_cache_release(phys);
+        assert(page_cache_reclaim(1) == 0);
+        assert(!page_cache_retain(phys));
+        verify_shared_grant = false;
+    }
+    mapped_flags = flags; mapped = phys; return true;
+}
 void kernel_spin_init(struct kernel_spinlock *lock) { (void)lock; }
 void kernel_spin_lock_irqsave(struct kernel_spinlock *lock, uint64_t *flags)
 { (void)lock; *flags = 0; }
 void kernel_spin_unlock_irqrestore(struct kernel_spinlock *lock, uint64_t flags)
 { (void)lock; (void)flags; }
 
-int main(void)
+/** @brief A shared writable fault retains changed data after unmap and invalidation.
+ * @return None; assertions exercise the actual file-fault and cache paths.
+ */
+static void test_shared_writable_invalidation(void)
 {
+    struct task task = {0};
+    struct task_vma vma = {
+        .used = 1, .prot = LINUX_PROT_READ | LINUX_PROT_WRITE,
+        .flags = TASK_VMA_FLAG_FILE | TASK_VMA_FLAG_MMAP |
+                 TASK_VMA_FLAG_SHARED | TASK_VMA_FLAG_SHARED_FILE,
+        .start = 0x5000000, .end = 0x5001000, .file_limit = sizeof(file_bytes),
+        .file_node = {.type = RELIEFOS_FS_TYPE_FILE, .flags = STORAGE_NODE_FLAG_FAT32,
+                      .size = sizeof(file_bytes)}
+    };
+    struct vfs_exec_source *source = exec_fixture_open(&vma.file_node);
+    vma.exec_source = source;
+    memset(file_bytes, 0x53, sizeof(file_bytes));
+    page_cache_init();
+    verify_shared_grant = true;
+    assert(task_map_file_vma_page(&task, &vma, vma.start) == 0);
+    assert(!verify_shared_grant);
+    assert((mapped_flags & (RELIEFNT_PAGE_WRITE_NOTIFY | RELIEFNT_PAGE_WRITABLE)) ==
+           RELIEFNT_PAGE_WRITE_NOTIFY);
+    struct page_cache_report report; page_cache_report(&report); assert(!report.dirty);
+    uint64_t original = mapped, alias = 0;
+    ((unsigned char *)(uintptr_t)original)[42] = 0xa7;
+    page_cache_note_write(original); /* This fixture writes via the physical alias. */
+    page_cache_report(&report); assert(report.dirty==1);
+    page_cache_release(original);
+    page_cache_invalidate_node(&vma.file_node);
+    assert(page_cache_lookup(&vma.file_node, 0, &alias) == 0);
+    assert(alias == original && ((unsigned char *)(uintptr_t)alias)[42] == 0xa7);
+    page_cache_release(alias);
+    vfs_exec_source_put(source);
+}
+
+/** @brief A writable private cached mapping is installed copy-on-write.
+ * @return None; the shared cache frame remains clean and independently owned.
+ */
+static void test_private_cache_cow(void)
+{
+    struct task task = {0};
+    struct task_vma vma = {
+        .used = 1, .prot = LINUX_PROT_READ | LINUX_PROT_WRITE,
+        .flags = TASK_VMA_FLAG_FILE | TASK_VMA_FLAG_PRIVATE | TASK_VMA_FLAG_SHARED_FILE,
+        .start = 0x5000000, .end = 0x5001000, .file_limit = sizeof(file_bytes),
+        .file_node = {.type = RELIEFOS_FS_TYPE_FILE, .flags = STORAGE_NODE_FLAG_FAT32,
+                      .size = sizeof(file_bytes)}
+    };
+    struct vfs_exec_source *source = exec_fixture_open(&vma.file_node);
+    vma.exec_source = source; page_cache_init();
+    assert(!task_map_file_vma_page(&task, &vma, vma.start));
+    assert((mapped_flags & RELIEFNT_PAGE_COW) && !(mapped_flags & RELIEFNT_PAGE_WRITABLE));
+    page_cache_release(mapped); assert(page_cache_reclaimable_pages() == 1);
+    page_cache_invalidate_node(&vma.file_node); assert(!allocations);
+    vfs_exec_source_put(source);
+}
+
+/** @brief A clean reclaimed page can be reconstructed from the real VFS source.
+ * @return None; verifies another provider read and every byte of the new frame.
+ */
+static void test_clean_reload(void)
+{
+    struct task task = {0};
+    struct task_vma vma = {
+        .used = 1, .prot = LINUX_PROT_READ,
+        .flags = TASK_VMA_FLAG_FILE | TASK_VMA_FLAG_SHARED_FILE,
+        .start = 0x5000000, .end = 0x5001000, .file_limit = sizeof(file_bytes),
+        .file_node = {.type = RELIEFOS_FS_TYPE_FILE, .flags = STORAGE_NODE_FLAG_FAT32,
+                      .size = sizeof(file_bytes)}
+    };
+    for (unsigned i=0;i<sizeof(file_bytes);++i) file_bytes[i]=(unsigned char)(i%251);
+    struct vfs_exec_source *source=exec_fixture_open(&vma.file_node);
+    vma.exec_source=source; page_cache_init();
+    assert(!task_map_file_vma_page(&task,&vma,vma.start));
+    assert(!memcmp((void *)(uintptr_t)mapped,file_bytes,4096));
+    page_cache_release(mapped); unsigned before=reads;
+    assert(page_cache_reclaim(1)==1 && !allocations);
+    assert(!task_map_file_vma_page(&task,&vma,vma.start));
+    assert(reads==before+1 && !memcmp((void *)(uintptr_t)mapped,file_bytes,4096));
+    page_cache_release(mapped); page_cache_invalidate_node(&vma.file_node);
+    assert(!allocations); vfs_exec_source_put(source);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc == 2 && !strcmp(argv[1], "shared-writable")) {
+        test_shared_writable_invalidation();
+        puts("PASS shared writable fault preserves modified cache data");
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "private-cow")) {
+        test_private_cache_cow();
+        puts("PASS writable private cache mapping uses copy-on-write");
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "clean-reload")) {
+        test_clean_reload();
+        puts("PASS reclaimed clean file page reloads from the VFS provider");
+        return 0;
+    }
     struct task task = {0};
     struct task_vma prefix = {
         .used = 1, .prot = LINUX_PROT_READ,
         .flags = TASK_VMA_FLAG_FILE | TASK_VMA_FLAG_LAZY | TASK_VMA_FLAG_SHARED_FILE,
         .start = 0x5000000, .end = 0x5001000, .file_offset = 0,
-        .file_limit = 0x800, .file_node = {.type=RELIEFOS_FS_TYPE_FILE,.size = sizeof(file_bytes)}
+        .file_limit = 0x800, .file_node = {.type=RELIEFOS_FS_TYPE_FILE,.flags=STORAGE_NODE_FLAG_FAT32,.size = sizeof(file_bytes)}
     };
     struct vfs_exec_source *source=exec_fixture_open(&prefix.file_node);
     prefix.exec_source=source;
