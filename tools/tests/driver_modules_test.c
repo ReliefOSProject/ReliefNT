@@ -70,6 +70,19 @@ int main(void)
 {
     uint64_t flags; kernel_execution_lock_irqsave(&flags);
     driver_manager_init();
+    /* Reject old/future ABI and malformed descriptors before init or ownership. */
+    struct reliefos_driver_module invalid=descriptor;
+    const uint32_t versions[]={0,RELIEFOS_DRIVER_ABI_VERSION-1,RELIEFOS_DRIVER_ABI_VERSION+1};
+    for(unsigned i=0;i<sizeof(versions)/sizeof(versions[0]);i++) {
+        invalid.abi_version=versions[i];
+        assert(driver_module_register(&invalid,&owner)==-8 && !starts && !resource.stop);
+    }
+    invalid=descriptor;
+    const uint32_t sizes[]={0,sizeof(descriptor)-1,sizeof(descriptor)+1};
+    for(unsigned i=0;i<sizeof(sizes)/sizeof(sizes[0]);i++) {
+        invalid.struct_size=sizes[i];
+        assert(driver_module_register(&invalid,&owner)==-8 && !starts && !resource.stop);
+    }
     resource_error=-12;
     assert(driver_module_register(&descriptor,&owner)==-12 && !starts && !resource.stop);
     resource_error=0;
@@ -94,5 +107,5 @@ int main(void)
     init_result=0; assert(!driver_module_register(&descriptor,NULL));
     assert(e1000_is_ready() && !resource.stop && (driver_slots[0].info.flags&RELIEFOS_DRIVER_FLAG_BUILTIN));
     kernel_execution_unlock_irqrestore(flags);
-    puts("PASS native driver owner bindings: reserve-before-init, duplicate, callback drain, failed STOP retained, absent hardware, rollback and builtin path");
+    puts("PASS native driver owner bindings: ABI/size rejection before init, reserve-before-init, duplicate, callback drain, failed STOP retained, absent hardware, rollback and builtin path");
 }

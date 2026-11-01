@@ -13,7 +13,7 @@
 
 module-layout 检查本地 Kbuild、重复/遗漏对象、生产实现包含和上游引擎摘要。
 宿主工具/ASan/UBSan、头导出、自包含 C/C++、ELF 和真实运行是不同层次。
-总测试中的已知 ABI golden 差异不得静默更新期望值。
+ABI 变化必须明确审查，不通过重生成历史 golden 消除差异。
 
 测试归属
 ========
@@ -56,11 +56,23 @@ POSIX I/O 检查。宿主 Linux 参考运行与 ReliefNT 来宾执行分别记�
 兼容性基线
 ==========
 
-``tools/tests/abi_layout_golden.json`` 是当前布局校验的基线；
+``tools/tests/abi_layout_golden.json`` 保留原始布局基线；
 ``tools/tests/fixtures/legacy-abi-layout.json`` 保存旧导出面的原始布局记录，
 迁移时逐字保留，两份均不能通过重生成来掩盖布局变化。
+驱动服务表版本 2 的 17 个追加字段在
+``tools/tests/fixtures/driver-api-v2.json`` 单独冻结：168 字节旧前缀的类型与
+偏移仍与原始基线比较，当前服务表总长为 304 字节、对齐为 8。
+``make test-abi`` 同时检查旧前缀与追加字段，版本、大小、偏移和类型变化
+均需显式审查。``abi_layout_checks`` 套件包含对应的失败反例；驱动管理器的
+``driver_modules`` 套件验证旧版本、未知版本和错误描述符大小在 init 前被拒绝。
+这不表示版本 1 驱动二进制能在版本 2 内核运行。
+
 音频 ioctl 支持清单为 ``configs/audio-abi-support.json``。
-验证范围和标志保持原值，断言与清单的既有分歧必须作为失败报告。
+宿主门禁检查标志类型、构建前提、证据路径和验证范围；来宾、上游 ALSA 与
+硬件声明必须有对应说明，缺少证据声明的反例应失败。清单保留已有的验证标志
+和未解决项；这些静态检查不重新执行历史来宾测试，不构成新的运行验收。
+``linux_audio`` 的 ASan/UBSan 探针遇到未定义行为立即失败，不将带有
+sanitizer 错误的零退出状态计为通过；PCM 回归覆盖尚无 DMA 缓冲区时的 DROP。
 
 
 目标运行

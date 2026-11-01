@@ -512,8 +512,8 @@ static void public_value_usercopy(struct audio_control_file *file)
     assert(sizeof(storage.value) == 1224);
     int ret = audio_control_ioctl(NULL, &ofd, SNDRV_CTL_IOCTL_ELEM_READ,
                                   (uintptr_t)&storage.value);
-    if (ret) fprintf(stderr, "public ELEM_READ ret=%d size=%u\n", ret,
-                     _IOC_SIZE(SNDRV_CTL_IOCTL_ELEM_READ));
+    if (ret) fprintf(stderr, "public ELEM_READ ret=%d size=%zu\n", ret,
+                     (size_t)_IOC_SIZE(SNDRV_CTL_IOCTL_ELEM_READ));
     assert(!ret);
     struct snd_ctl_elem_value original = storage.value;
     storage.value.value.integer.value[0] = 30;

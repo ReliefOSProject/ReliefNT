@@ -1,4 +1,5 @@
 # Explicit kernel host suites. Guest image/SDK/application orchestration is in ReliefOS.
+abi_layout_checks tools/test_abi_layout_checks.py
 acpi_pm_timer tools/test_acpi_pm_timer.py
 ahci_completion tools/test_ahci_completion.py
 apic_timer tools/test_apic_timer.py

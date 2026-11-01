@@ -1,0 +1,25 @@
+{
+  "abi_version": 2,
+  "prefix_size": 168,
+  "size": 304,
+  "align": 8,
+  "members": [
+    [168, "int (*)(uint32_t, struct reliefos_driver_pci_device *) pci_enumerate"],
+    [176, "void *(*)(uint64_t, uint64_t) map_mmio"],
+    [184, "void (*)(void *, uint64_t) unmap_mmio"],
+    [192, "uint64_t (*)(uint32_t, uint64_t) alloc_dma"],
+    [200, "void (*)(uint64_t, uint32_t) free_dma"],
+    [208, "int (*)(const struct reliefos_driver_pci_device *, void (*)(void *), void *, uint32_t *) request_pci_irq"],
+    [216, "void (*)(uint32_t) free_pci_irq"],
+    [224, "int (*)(const struct audio_card_identity *, const struct audio_card_ops *, void *, uint32_t *) audio_register_card"],
+    [232, "int (*)(uint32_t, uint32_t) audio_unregister_card"],
+    [240, "void (*)(uint32_t, uint32_t, uint64_t, int) audio_period_elapsed"],
+    [248, "void (*)(uint32_t, uint32_t) audio_control_changed"],
+    [256, "void (*)(uint8_t, uint8_t, uint8_t, uint8_t, uint32_t) pci_write32"],
+    [264, "int (*)(uint32_t, audio_service_fn, void *) audio_set_service"],
+    [272, "void (*)(int) report_teardown_failure"],
+    [280, "int (*)(uint32_t) audio_request_disconnect"],
+    [288, "void (*)(enum console_log_level, const char *, ...) console_log"],
+    [296, "void *(*)(uint64_t) phys_to_virt"]
+  ]
+}

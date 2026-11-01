@@ -79,8 +79,6 @@ static bool empty_clone_boundary;
 void arch_fpu_save(void *state) { (void)state; }
 uint64_t time_uptime_ms(void) { return 1000; }
 uint64_t mm_total_memory_kib(void) { return 1024 * 1024; }
-uint32_t smp_cpu_count(void) { return 1; }
-bool smp_cpu_online(uint32_t cpu) { return cpu == 0; }
 int syscall_clone_task_files(const struct task *parent, struct task *child)
 {
     assert(empty_clone_boundary && parent && child && !parent->shared_files && !child->shared_files);

@@ -14,10 +14,8 @@
 #undef mm_virt_to_phys
 #undef RELIEFNT_PAGING_FIXTURE_EXTERNAL_SPINLOCKS
 
-/* This fixture models one BSP and no DRM/file-backed VMAs. Poison those
- * absent-provider boundaries instead of inventing successful backing refs. */
-uint32_t smp_cpu_count(void){return 1;}
-bool smp_cpu_online(uint32_t cpu){return cpu==0;}
+/* The audio fixture provides the single BSP. Poison absent DRM/file-backed
+ * VMA providers instead of inventing successful backing references. */
 struct task_file *task_file_get(struct task_file *file){(void)file;assert(0);return NULL;}
 void task_file_put(struct task_file *file){(void)file;assert(0);}
 

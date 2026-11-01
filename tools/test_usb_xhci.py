@@ -10,6 +10,31 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def check_capability_header_load(ir):
+    """Check volatile access width before machine-register allocation."""
+    mapped = re.search(r"^\s*(%[\w.]+) = .*\bcall\b[^\n]*@pci_map_firmware_bar0\(", ir, re.M)
+    assert mapped is not None, "missing firmware MMIO mapping"
+    offsets = {mapped.group(1): 0}
+    loads = []
+    for line in ir[mapped.end():].split("\n}", 1)[0].splitlines():
+        cast = re.search(r"(%[\w.]+) = bitcast \S+ (%[\w.]+) to ", line)
+        if cast and cast.group(2) in offsets:
+            offsets[cast.group(1)] = offsets[cast.group(2)]
+        address = re.search(
+            r"(%[\w.]+) = getelementptr(?: inbounds| nuw| nusw)* i(\d+), "
+            r"(?:ptr|i\d+\*) (%[\w.]+), i\d+ (-?\d+)\b", line)
+        if address and address.group(3) in offsets:
+            offsets[address.group(1)] = (offsets[address.group(3)] +
+                int(address.group(2)) // 8 * int(address.group(4)))
+        load = re.search(r"load volatile i(\d+), (?:ptr|i\d+\*) (%[\w.]+), align (\d+)", line)
+        if load and load.group(2) in offsets:
+            offset, width = offsets[load.group(2)], int(load.group(1))
+            if offset < 4 and offset + width // 8 > 0:
+                loads.append((offset, width, int(load.group(3))))
+    assert len(loads) == 1 and loads[0][:2] == (0, 32) and loads[0][2] >= 4, (
+        f"capability header must be read once as an aligned dword; got {loads}")
+
+
 class USBXHCI(unittest.TestCase):
     def test_connection_scoped_port_lifecycle(self):
         with tempfile.TemporaryDirectory(prefix="reliefnt-xhci-port-lifecycle-") as directory:
@@ -172,21 +197,37 @@ class USBXHCI(unittest.TestCase):
     def test_probe_reads_capability_header_as_one_dword(self):
         # The QEMU xHCI MMIO register accepts the architected dword read;
         # a byte/halfword read of the same header can return a different value.
+        # LLVM retains access widths and SSA pointer identities without tying
+        # this hardware contract to a particular machine-register allocation.
+        production = (ROOT / "drivers/usb/xhci/controller.c").read_text()
+        original = "uint32_t header=*(volatile uint32_t *)initial;"
+        self.assertEqual(production.count(original), 1)
         with tempfile.TemporaryDirectory(prefix="reliefnt-xhci-cap-width-") as directory:
-            assembly = Path(directory) / "controller.s"
-            command = [os.environ.get("CC", "clang"), "-std=gnu11", "-O1", "-fno-inline",
-                       "-Iinclude", "-Iinclude/uapi", "-S", "drivers/usb/xhci/controller.c", "-o", str(assembly)]
-            build = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
-            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
-            after_map = assembly.read_text().split("callq\tpci_map_firmware_bar0", 1)[1]
-            region = after_map.split("callq\tkernel_malloc", 1)[0]
-            pointer = re.search(r"movq\s+%rax,\s*(%r\w+)", region)
-            self.assertIsNotNone(pointer, "expected compiler to retain the MMIO mapping address")
-            address = re.escape(pointer.group(1))
-            self.assertRegex(region, r"movl\s+\(" + address + r"\)",
-                             "capability header must be read as an aligned dword")
-            self.assertNotRegex(region, r"movz[wb]l\s+\d*\(" + address + r"\)",
-                                "do not access this MMIO header as a byte or halfword")
+            for width, extra_read in ((32, False), (8, False), (16, False), (32, True)):
+                with self.subTest(width=width, extra_read=extra_read):
+                    source = Path(directory) / "controller.c"
+                    ir = Path(directory) / "controller.ll"
+                    text = production
+                    if width != 32:
+                        # Negative controls still read the version, but use an
+                        # invalid narrow access for the first capability bytes.
+                        text = text.replace(original,
+                            f"uint32_t header=*(volatile uint{width}_t *)initial | "
+                            "((uint32_t)*(volatile uint16_t *)(initial+2)<<16);")
+                    elif extra_read:
+                        text = text.replace(original, original +
+                            "\n    (void)*(volatile uint16_t *)(initial+2);")
+                    source.write_text(text)
+                    command = ["clang", "-std=gnu11", "-O1", "-fno-inline",
+                               "-Iinclude", "-Iinclude/uapi", "-Idrivers/usb/xhci",
+                               "-S", "-emit-llvm", str(source), "-o", str(ir)]
+                    build = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
+                    self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+                    if width == 32 and not extra_read:
+                        check_capability_header_load(ir.read_text())
+                    else:
+                        with self.assertRaisesRegex(AssertionError, "aligned dword"):
+                            check_capability_header_load(ir.read_text())
 
     def test_controller_failure_revokes_classes(self):
         with tempfile.TemporaryDirectory(prefix="reliefnt-xhci-failure-") as directory:
