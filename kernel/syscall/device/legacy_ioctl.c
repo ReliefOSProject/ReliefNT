@@ -1,5 +1,8 @@
 #include "../internal.h"
 #include <reliefnt/swap.h>
+#include <reliefnt/net_ipv6.h>
+#include <linux/if.h>
+#include <linux/socket.h>
 
 /** @brief Prepare one actual fixed ioctl operand before device side effects.
  * @param address User address. @param size Exact bounded length.
@@ -325,8 +328,16 @@ int64_t syscall_legacy_ioctl(uint64_t number, uint64_t a0, uint64_t a1, uint64_t
             /* Generic ioctl requests have already been handled. */
             return -LINUX_ENOTTY;
         }
+        /* Linux interface ioctls are independent of socket protocol. musl
+         * uses an AF_UNIX datagram socket for if_nametoindex/if_indextoname. */
+        if (file && (file->flags & TASK_FILE_FLAG_SOCKET_UNIX) &&
+            a1 >= 0x8900 && a1 <= 0x89ff)
+            return net_interface_ioctl((uint32_t)a1, a2);
         if (file && (file->flags & TASK_FILE_FLAG_SOCKET_UNIX))
             return task_socket_ioctl(file, a1, a2);
+        if (file && (file->flags & TASK_FILE_FLAG_SOCKET_INET) && task_inet_family(file) == AF_INET6 &&
+            (a1 == SIOCSIFADDR || a1 == SIOCDIFADDR || a1 == SIOCADDRT || a1 == SIOCDELRT))
+            return net_ipv6_interface_ioctl((uint32_t)a1, a2);
         if (file && (file->flags & TASK_FILE_FLAG_SOCKET_INET))
             return task_net_control(file, (uint32_t)a1, a2);
         if (file && (file->node.flags & STORAGE_NODE_FLAG_DEV_NODE) &&

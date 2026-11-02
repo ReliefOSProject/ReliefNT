@@ -2,6 +2,7 @@
 #include <reliefnt/net.h>
 #include <reliefnt/net_udp.h>
 #include <reliefnt/net_packet.h>
+#include <reliefnt/netlink.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/syscall.h>
 #include <reliefnt/usercopy.h>
@@ -11,6 +12,10 @@
 #include <linux/tty.h>
 #include <linux/if.h>
 
+/** @brief Dispatch network socket ioctls against the pinned open description.
+ * @param file Borrowed socket OFD under execution ownership.
+ * @param request Native ioctl number. @param address User argument address.
+ * @return Zero, negative errno, or a user-memory prerequisite wait marker. */
 int task_net_control(struct task_file *file, uint32_t request, uint64_t address)
 {
     if (!file || !(file->flags & TASK_FILE_FLAG_SOCKET_INET)) return -LINUX_ENOTTY;
@@ -25,7 +30,8 @@ int task_net_control(struct task_file *file, uint32_t request, uint64_t address)
         int rc=socket_user_prepare(task,address,sizeof(int),true);if(rc)return rc;
         if (!user_range_writable(address, sizeof(int))) return -LINUX_EFAULT;
         net_poll_packets();
-        int bytes = file->kind == TASK_FILE_KIND_PACKET ? task_packet_available(file) : file->kind == TASK_FILE_KIND_UDP ? task_udp_available(file) :
+        int bytes = file->kind == TASK_FILE_KIND_NETLINK ? task_netlink_available(file) :
+            file->kind == TASK_FILE_KIND_PACKET ? task_packet_available(file) : file->kind == TASK_FILE_KIND_UDP ? task_udp_available(file) :
             net_socket_available((int32_t)file->aux);
         if (bytes < 0) return bytes;
         *(int *)(uintptr_t)address = bytes;

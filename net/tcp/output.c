@@ -1,5 +1,24 @@
 #include "../internal.h"
 
+struct tcp_loop_frame { uint32_t length; uint8_t bytes[NET_FRAME_MAX]; };
+static struct tcp_loop_frame tcp_loop_frames[32];
+static uint32_t tcp_loop_head, tcp_loop_count;
+
+/** @brief Report pending task-context IPv4 loopback delivery.
+ * @return True while at least one complete TCP frame is queued. */
+bool net_tcp_loop_pending(void) { return tcp_loop_count != 0; }
+
+/** @brief Deliver a bounded batch of deferred IPv4 TCP loopback frames.
+ * Frames are copied before dispatch so a reply may safely reuse a ring slot. */
+void net_tcp_loop_service(void)
+{
+    for (unsigned n = 0; n < 16 && tcp_loop_count; ++n) {
+        struct tcp_loop_frame frame = tcp_loop_frames[tcp_loop_head];
+        tcp_loop_head = (tcp_loop_head + 1u) % 32u; --tcp_loop_count;
+        const uint8_t *ip = frame.bytes + 14;
+        net_handle_tcp(ip, frame.length - 14u, 20u, net_get_u32(ip + 12), NULL, NULL);
+    }
+}
 
 
 /**
@@ -118,11 +137,71 @@ int net_send_tcp_to_mac(const uint8_t *dst_mac, uint32_t src_ip,
         net_memcpy(tcp + tcp_header_len, payload, payload_len);
     }
     net_put_u16(tcp + 16, net_tcp_checksum(src_ip, dst_ip, tcp, tcp_len));
-    int result = net_interface_up ? e1000_send(frame, 14u + total_len) : -LINUX_ENETDOWN;
+    int result;
+    if ((dst_ip >> 24) == 127 || (dst_ip && dst_ip == net_config.local_ip)) {
+        if (tcp_loop_count == 32) return -LINUX_ENOBUFS;
+        struct tcp_loop_frame *queued = &tcp_loop_frames[(tcp_loop_head + tcp_loop_count) % 32u];
+        queued->length = 14u + total_len;
+        net_memcpy(queued->bytes, frame, queued->length);
+        ++tcp_loop_count; result = (int)queued->length;
+    } else result = net_interface_up ? e1000_send(frame, 14u + total_len) : -LINUX_ENETDOWN;
     if (result >= 0 && receiver && (flags & TCP_FLAG_ACK)) {
         receiver->rx_window_ack = ack;
         receiver->rx_window = window;
         receiver->rx_window_valid = true;
     }
     return result;
+}
+
+/** @brief Return a TCP segment payload limit bounded by peer MSS and IPv6 path MTU.
+ * @param socket Registered socket. @return Positive payload size no larger than the IPv4 default. */
+uint32_t net_socket_mss(const struct net_socket *socket)
+{
+    uint32_t mss = NET_TCP_MSS;
+    if (socket->ipv6 && !socket->mapped) {
+        uint32_t mtu = socket->mtu6 ? socket->mtu6 : 1280;
+        mss = mtu > 60 ? mtu - 60 : 1;
+        if (mss > NET_TCP_MSS) mss = NET_TCP_MSS;
+    }
+    if (socket->peer_mss && socket->peer_mss < mss) mss = socket->peer_mss;
+    return mss;
+}
+
+/** @brief Emit one TCP segment for a stable socket, using IPv6 pseudo-header checksums.
+ * @param socket Endpoint under execution ownership. @param seq Sequence number.
+ * @param ack Acknowledgment. @param flags TCP control flags. @param payload Optional data.
+ * @param length Payload bytes. @return Lower-layer result or negative errno. */
+int net_send_tcp_socket(struct net_socket *socket, uint32_t seq, uint32_t ack,
+                        uint8_t flags, const uint8_t *payload, uint32_t length)
+{
+    if (!socket->ipv6 || socket->mapped)
+        return net_send_tcp_to_mac(socket->dst_mac, socket->local_ip, socket->remote_ip,
+            socket->local_port, socket->remote_port, seq, ack, flags, payload, length);
+    struct net_ipv6_path path;
+    int ret = net_ipv6_route(&socket->remote6, socket->remote_scope6, &socket->local6, &path);
+    if (ret < 0) return ret;
+    socket->mtu6 = path.mtu;
+    uint32_t header = (flags & TCP_FLAG_SYN) ? 24u : 20u;
+    if (length > net_socket_mss(socket) || (length && !payload)) return -LINUX_EMSGSIZE;
+    uint8_t tcp[NET_TCP_MSS + 24];
+    net_memzero(tcp, header + length);
+    net_put_u16(tcp, socket->local_port); net_put_u16(tcp + 2, socket->remote_port);
+    net_put_u32(tcp + 4, seq); net_put_u32(tcp + 8, ack);
+    tcp[12] = (uint8_t)((header / 4u) << 4); tcp[13] = flags;
+    uint32_t window = net_socket_select_window(socket);
+    net_put_u16(tcp + 14, (uint16_t)window);
+    if (flags & TCP_FLAG_SYN) {
+        tcp[20] = 2; tcp[21] = 4;
+        uint32_t local_mss = path.mtu > 60 ? path.mtu - 60 : 1;
+        if (local_mss > NET_TCP_MSS) local_mss = NET_TCP_MSS;
+        net_put_u16(tcp + 22, (uint16_t)local_mss);
+    }
+    if (length) net_memcpy(tcp + header, payload, length);
+    net_put_u16(tcp + 16, net_ipv6_checksum(&path.source, &path.destination, 6, tcp, header + length));
+    ret = net_ipv6_output(&path, 6, tcp, header + length, socket->unicast_hops, 0,
+                          socket->dont_fragment || socket->mtu_discover == IPV6_PMTUDISC_DO, true);
+    if (ret >= 0 && (flags & TCP_FLAG_ACK)) {
+        socket->rx_window_ack = ack; socket->rx_window = window; socket->rx_window_valid = true;
+    }
+    return ret;
 }

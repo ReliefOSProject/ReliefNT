@@ -1,5 +1,17 @@
 #include "../internal.h"
 #include <reliefnt/swap.h>
+#include <reliefnt/net_udp.h>
+#include <reliefnt/net_packet.h>
+#include <reliefnt/netlink.h>
+
+/** @brief Identify INET datagrams which must retain whole-message semantics.
+ * @param file Borrowed pinned OFD, nullable. @return True for UDP, raw or netlink. */
+static bool scalar_inet_datagram(const struct task_file *file)
+{
+    return file && (file->flags & TASK_FILE_FLAG_SOCKET_INET) &&
+        (file->kind == TASK_FILE_KIND_UDP || file->kind == TASK_FILE_KIND_PACKET ||
+         file->kind == TASK_FILE_KIND_NETLINK);
+}
 
 /** @brief Identify a scalar buffer consumed by the staged regular-I/O path.
  * @param file Borrowed admitted descriptor, nullable. @return True for an
@@ -96,6 +108,7 @@ static int scalar_prepare_user(struct task *task,const struct task_file *file,
  * @return Accepted byte count, negative errno, or internal blocking/retry result.
  * Null writes discard the full capped request without accessing its bytes.
  * Ordinary writes use the actual OFD provider independently of display text;
+ * network datagrams use the staged socket send path as one complete message;
  * entry owns its lifetime through waits under execution ownership, without
  * graph/module locks spanning provider callbacks.
  */
@@ -114,6 +127,8 @@ int64_t syscall_io_write(uint64_t a0, uint64_t a1, uint64_t a2)
         return task_socket_send_user(task,signal_file,a1,request);
     }
 #endif
+    if (scalar_inet_datagram(signal_file))
+        return syscall_socket_dispatch(LINUX_SYS_SENDTO, a0, a1, a2, 0, 0, 0);
     int prep=scalar_prepare_user(task,signal_file,a1,a2,true);
     if(prep)return prep;
     {
@@ -238,7 +253,7 @@ int64_t syscall_io_write(uint64_t a0, uint64_t a1, uint64_t a2)
 }
 
 /**
- * @brief Run the shared read backend without unrelated legacy syscall locals.
+ * @brief Run the shared read backend, preserving network datagram boundaries.
  * @param a0 Descriptor number; entry may already pin its open description.
  * @param a1 User buffer, validated by the backend before accessing its bytes.
  * @param a2 Requested byte count, subject to each backend's existing limits.
@@ -263,6 +278,10 @@ int64_t syscall_io_read(uint64_t a0, uint64_t a1, uint64_t a2)
         return task_socket_receive_user(task,file,a1,request,0,0,0);
     }
 #endif
+    if (scalar_inet_datagram(file)) {
+        if (!a2) return 0;
+        return syscall_socket_dispatch(LINUX_SYS_RECVFROM, a0, a1, a2, 0, 0, 0);
+    }
     int prep=scalar_prepare_user(task,file,a1,a2,false);
     if(prep)return prep;
     if(file && file->character_file) {

@@ -21,12 +21,12 @@ static int net_ip_for_us(uint32_t dst_ip)
 }
 
 /**
- * Net handle ipv4.
- * @param frame Value supplied by the caller.
- * @param len Maximum number of elements available in the related buffer.
- * @param ping_wait Value supplied by the caller.
- * @param udp_wait Value supplied by the caller.
- * @param tcp_wait Value supplied by the caller.
+ * @brief Validate and dispatch an IPv4 Ethernet frame under network execution ownership.
+ * @param frame Borrowed complete Ethernet frame, including its source MAC.
+ * @param len Available frame bytes.
+ * @param ping_wait Optional legacy ICMP waiter.
+ * @param udp_wait Optional legacy UDP waiter.
+ * @param tcp_wait Optional legacy TCP waiter.
  */
 void net_handle_ipv4(const uint8_t *frame, uint32_t len,
                             struct net_ping_wait *ping_wait,
@@ -68,7 +68,7 @@ void net_handle_ipv4(const uint8_t *frame, uint32_t len,
         return;
     }
     if (ip[9] == IPV4_PROTO_TCP) {
-        net_handle_tcp(ip, total_len, ihl, src_ip, tcp_wait);
+        net_handle_tcp(ip, total_len, ihl, src_ip, frame + 6, tcp_wait);
         return;
     }
     if (ip[9] != IPV4_PROTO_ICMP || total_len < ihl + 8u) {

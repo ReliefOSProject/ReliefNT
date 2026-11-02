@@ -10,4 +10,5 @@
    abi
    exec
    descriptors
+   ipv6
    procfs

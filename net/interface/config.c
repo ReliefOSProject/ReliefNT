@@ -1,5 +1,7 @@
 #include <reliefnt/kernel_file.h>
 #include <reliefnt/socket_usercopy.h>
+#include <reliefnt/net_ipv6.h>
+#include <linux/ipv6_route.h>
 #include "../internal.h"
 
 /**
@@ -439,8 +441,8 @@ void net_device_info(uint32_t *flags, uint64_t *mac_value, uint32_t *local_ip)
     }
 }
 
-/** @brief Apply/query eth0 through the Linux native interface ioctl ABI.
- * Only the real Ethernet interface and the supported default route are exposed.
+/** @brief Apply/query network interfaces through the Linux native ioctl ABI.
+ * Loopback name/index and the real Ethernet interface/default route are exposed.
  * Unsupported routing/features return an error rather than retaining inert state.
  */
 int net_interface_ioctl(uint32_t request, uint64_t address)
@@ -524,15 +526,25 @@ int net_interface_ioctl(uint32_t request, uint64_t address)
         rc=socket_user_prepare(task,address,sizeof(req),true);if(rc)return rc;
         if(!user_range_writable(address,sizeof(req)))return -LINUX_EFAULT;
     }
-    if (!e1000_is_ready()) return -LINUX_ENODEV;
     if (request == SIOCGIFNAME) {
-        if (req.data.value != 2) return -LINUX_ENODEV;
+        const char *name;
+        uint32_t size;
+        if (req.data.value == 1) { name = "lo"; size = 3; }
+        else if (req.data.value == 2 && e1000_is_ready()) { name = "eth0"; size = 5; }
+        else return -LINUX_ENODEV;
         net_memzero(req.ifr_name, sizeof(req.ifr_name));
-        net_memcpy(req.ifr_name, "eth0", 5);
-    } else {
-        req.ifr_name[IFNAMSIZ - 1] = 0;
-        if (__builtin_memcmp(req.ifr_name, "eth0", 5)) return -LINUX_ENODEV;
-        switch (request) {
+        net_memcpy(req.ifr_name, name, size);
+        net_memcpy((void *)(uintptr_t)address, &req, sizeof(req));
+        return 0;
+    }
+    req.ifr_name[IFNAMSIZ - 1] = 0;
+    if (request == SIOCGIFINDEX && !__builtin_memcmp(req.ifr_name, "lo", 3)) {
+        req.data.value = 1;
+        net_memcpy((void *)(uintptr_t)address, &req, sizeof(req));
+        return 0;
+    }
+    if (!e1000_is_ready() || __builtin_memcmp(req.ifr_name, "eth0", 5)) return -LINUX_ENODEV;
+    switch (request) {
         case SIOCGIFINDEX: req.data.value = 2; break;
         case SIOCGIFHWADDR:
             net_memzero(&req.data, sizeof(req.data));
@@ -544,7 +556,12 @@ int net_interface_ioctl(uint32_t request, uint64_t address)
         case SIOCSIFFLAGS:
             if (req.data.flags & ~(IFF_UP | IFF_RUNNING | IFF_BROADCAST | IFF_MULTICAST))
                 return -LINUX_EOPNOTSUPP;
-            net_interface_up = !!(req.data.flags & IFF_UP); break;
+            if (net_interface_up != !!(req.data.flags & IFF_UP)) {
+                net_interface_up = !!(req.data.flags & IFF_UP);
+                net_ipv6_link_changed(net_interface_up);
+                netlink_ipv6_changed();
+            }
+            break;
         case SIOCGIFMTU: req.data.value = 1500; break;
         case SIOCSIFMTU:
             if (req.data.value != 1500) return -LINUX_EOPNOTSUPP;
@@ -571,7 +588,6 @@ int net_interface_ioctl(uint32_t request, uint64_t address)
                 net_put_u32((uint8_t *)&req.data.addr + 4, *value);
             }
         } break;
-        }
     }
     if (!change) net_memcpy((void *)(uintptr_t)address, &req, sizeof(req));
     return 0;
@@ -579,3 +595,48 @@ int net_interface_ioctl(uint32_t request, uint64_t address)
 
 /** @brief Report the real administrative and hardware state of eth0. */
 bool net_interface_ready(void) { return net_interface_up && e1000_is_ready(); }
+
+/** @brief Apply Linux IPv6 address and route ioctls for an IPv6 socket.
+ * @param request Supported address or route mutation command.
+ * @param address User pointer to a native in6_ifreq or in6_rtmsg.
+ * @return Zero or negative errno. The current task must hold CAP_NET_ADMIN;
+ * imported bytes are owned locally and no user reference crosses a wait.
+ */
+int net_ipv6_interface_ioctl(uint32_t request, uint64_t address)
+{
+    struct task *task = sched_current_task();
+    if (request != SIOCSIFADDR && request != SIOCDIFADDR &&
+        request != SIOCADDRT && request != SIOCDELRT)
+        return net_interface_ioctl(request, address);
+    if (!task || !(task->cap_effective & (1ULL << CAP_NET_ADMIN))) return -LINUX_EPERM;
+    if (request == SIOCSIFADDR || request == SIOCDIFADDR) {
+        struct in6_ifreq input;
+        int rc = socket_user_import(task, address, &input, sizeof(input));
+        if (rc) return rc;
+        if (input.ifr6_prefixlen > 128 || input.ifr6_ifindex <= 0) return -LINUX_EINVAL;
+        struct net_ipv6_address entry = {.address = input.ifr6_addr,
+            .ifindex = (uint32_t)input.ifr6_ifindex, .prefix_length = input.ifr6_prefixlen,
+            .flags = NET_IPV6_ADDR_PERMANENT, .preferred_until = UINT64_MAX,
+            .valid_until = UINT64_MAX};
+        if (entry.address.s6_addr[0] == 0xfe && (entry.address.s6_addr[1] & 0xc0) == 0x80)
+            entry.scope = 253;
+        else if (!__builtin_memcmp(entry.address.s6_addr,
+                    (const uint8_t[16]){0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},16))
+            entry.scope = 254;
+        return net_ipv6_address_update(&entry, request == SIOCDIFADDR);
+    }
+    struct in6_rtmsg input;
+    int rc = socket_user_import(task, address, &input, sizeof(input));
+    if (rc) return rc;
+    if (input.rtmsg_dst_len > 128 || input.rtmsg_src_len || input.rtmsg_type ||
+        input.rtmsg_info || input.rtmsg_ifindex <= 0 ||
+        (input.rtmsg_flags & ~(RTF_UP | RTF_GATEWAY | RTF_HOST))) return -LINUX_EINVAL;
+    static const struct in6_addr zero;
+    if (__builtin_memcmp(&input.rtmsg_src, &zero, sizeof(zero))) return -LINUX_EOPNOTSUPP;
+    if ((input.rtmsg_flags & RTF_GATEWAY) &&
+        !__builtin_memcmp(&input.rtmsg_gateway, &zero, sizeof(zero))) return -LINUX_EINVAL;
+    struct net_ipv6_route route = {.destination = input.rtmsg_dst, .gateway = input.rtmsg_gateway,
+        .prefix_length = input.rtmsg_dst_len, .ifindex = (uint32_t)input.rtmsg_ifindex,
+        .metric = input.rtmsg_metric, .flags = input.rtmsg_flags, .valid_until = UINT64_MAX};
+    return net_ipv6_route_update(&route, request == SIOCDELRT);
+}

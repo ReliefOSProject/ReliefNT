@@ -4,6 +4,7 @@
  */
 #ifndef RELIEFNT_NET_H
 #define RELIEFNT_NET_H
+#include <linux/in6.h>
 
 #include <reliefos/net_abi.h>
 #include <reliefos/system_abi.h>
@@ -209,6 +210,53 @@ int net_socket_available(int32_t handle);
  * @return Zero or a negative Linux errno.
  */
 int net_socket_connect_fd(int32_t handle, uint32_t ip, uint16_t port, bool nonblock);
+/** @brief Assign the Linux socket family to a newly allocated stream endpoint.
+ * @param handle Internal handle. @param ipv6 True for AF_INET6. @return Zero or errno. */
+int net_socket_set_ipv6(int32_t handle,bool ipv6);
+/** @brief Query the native family of a TCP endpoint.
+ * @param handle Internal handle. @return AF_INET/AF_INET6 or negative errno. */
+int net_socket_family(int32_t handle);
+/** @brief Bind a native or mapped stream endpoint with cross-family conflict checks.
+ * @param handle Socket. @param address Network-order native address. @return Zero or errno. */
+int net_socket_bind6_fd(int32_t handle,const struct sockaddr_in6 *address);
+/** @brief Connect a TCP endpoint to a native or mapped IPv6 address.
+ * @param handle Socket. @param address Peer native address. @param nonblock Nonblocking OFD.
+ * @return Zero, errno, or internal blocked marker. */
+int net_socket_connect6_fd(int32_t handle,const struct sockaddr_in6 *address,bool nonblock);
+/** @brief Copy the local or peer native IPv6 endpoint.
+ * @param handle Socket. @param peer Select peer. @param out Caller-owned output.
+ * @return Zero, ENOTCONN, or negative errno. */
+int net_socket_address6(int32_t handle,bool peer,struct sockaddr_in6 *out);
+/** @brief Configure a bound TCP endpoint for passive connections.
+ * @param handle Socket. @param backlog Maximum queued children. @return Zero or errno. */
+int net_socket_listen_fd(int32_t handle,int backlog);
+/** @brief Find an established child without consuming a listener queue entry.
+ * @param handle Listener. @return Positive child handle or negative errno. */
+int net_socket_accept_peek(int32_t handle);
+/** @brief Transfer an established child from its listener to a newly allocated OFD.
+ * @param handle Listener. @param child Child handle. @return Zero or errno. */
+int net_socket_accept_commit(int32_t handle,int32_t child);
+/** @brief Get or update an implemented IPv6 stream option.
+ * @param handle Socket. @param set True to update. @param option IPv6 option.
+ * @param value Input/output integer. @return Zero or negative errno. */
+int net_socket_ipv6_option(int32_t handle,bool set,uint32_t option,int *value);
+/** @brief Query whether a socket is accepting new connections.
+ * @param handle Socket. @return One, zero, or negative errno. */
+int net_socket_is_listening(int32_t handle);
+/** @brief Read or set TCP address reuse before binding.
+ * @param handle Socket. @param set Select update. @param value Input/output flag.
+ * @return Zero or negative errno. */
+int net_socket_reuse(int32_t handle,bool set,int *value);
+struct text_stream;
+/** @brief Apply a validated quoted IPv6 TCP error to the matching tuple.
+ * @param source Original local address. @param destination Original peer.
+ * @param source_port Local port. @param destination_port Peer port.
+ * @param error Positive errno. @param mtu Reported path MTU or zero. */
+void net_tcp6_error(const struct in6_addr *source,const struct in6_addr *destination,
+                    uint16_t source_port,uint16_t destination_port,int error,uint32_t mtu);
+/** @brief Render the live native IPv6 TCP registry.
+ * @param stream Caller-owned proc output. */
+void net_tcp6_proc_emit(struct text_stream *stream);
 /**
  * @brief Shut down a TCP socket direction and queue a FIN after pending writes.
  * @param handle Internal socket handle.

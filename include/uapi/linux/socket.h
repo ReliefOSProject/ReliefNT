@@ -33,6 +33,7 @@ struct sockaddr_un {
 #define AF_UNIX 1
 #define AF_INET 2
 #define AF_INET6 10
+#define AF_NETLINK 16
 #define AF_PACKET 17
 
 #define SOCK_STREAM 1
@@ -41,6 +42,7 @@ struct sockaddr_un {
 #define SOCK_SEQPACKET 5
 
 #define SOL_SOCKET 1
+#define SOL_RAW 255
 #define SO_ERROR 4
 #define SO_TYPE 3
 #define SO_REUSEADDR 2

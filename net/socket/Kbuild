@@ -1,4 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-obj-y := control.o packet.o udp.o
+obj-y := control.o netlink.o packet.o udp.o
 
 include $(srctree)/scripts/Makefile.module

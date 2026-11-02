@@ -1,10 +1,37 @@
 #include <reliefnt/console.h>
 #include <assert.h>
+#include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "modules/network.h"
 #include "../../kernel/syscall/ipc/socket.c"
 #include "../../net/proc.c"
+
+/* IPv4-only legacy state fixture: native IPv6 transport has its own link model. */
+__attribute__((weak)) uint32_t net_ipv6_addresses(struct net_ipv6_address *out,uint32_t cap)
+{ (void)out; (void)cap; return 0; }
+__attribute__((weak)) uint32_t net_ipv6_routes(struct net_ipv6_route *out,uint32_t cap)
+{ (void)out; (void)cap; return 0; }
+__attribute__((weak)) int net_ipv6_route(const struct in6_addr *dst,uint32_t scope,
+                                         const struct in6_addr *bound,struct net_ipv6_path *path)
+{ (void)dst; (void)scope; (void)bound; (void)path; return -LINUX_ENETUNREACH; }
+__attribute__((weak)) uint16_t net_ipv6_checksum(const struct in6_addr *src,const struct in6_addr *dst,
+                                                  uint8_t protocol,const void *data,uint32_t length)
+{ (void)src; (void)dst; (void)protocol; (void)data; (void)length; return 0; }
+__attribute__((weak)) int net_ipv6_output(const struct net_ipv6_path *path,uint8_t protocol,const void *data,
+                                           uint32_t length,int hops,uint32_t flowinfo,bool df,bool loop)
+{ (void)path; (void)protocol; (void)data; (void)length; (void)hops; (void)flowinfo; (void)df; (void)loop; return -LINUX_ENETUNREACH; }
+__attribute__((weak)) bool net_ipv6_maintenance_pending(void) { return false; }
+__attribute__((weak)) void net_ipv6_poll(void) {}
+__attribute__((weak)) void net_ipv6_input(const uint8_t *frame,uint32_t length) { (void)frame; (void)length; }
+__attribute__((weak)) void net_ipv6_transport_proc_emit(struct text_stream *stream,const char *leaf)
+{ (void)stream; (void)leaf; }
+__attribute__((weak)) int task_netlink_send(struct task_file *file,const void *data,uint32_t length,
+                                            uint32_t flags,uint64_t address,uint32_t size)
+{ (void)file; (void)data; (void)length; (void)flags; (void)address; (void)size; return -LINUX_EBADF; }
+__attribute__((weak)) int task_netlink_recv(struct task_file *file,void *data,uint32_t length,
+                                            uint32_t flags,uint64_t address,uint64_t size)
+{ (void)file; (void)data; (void)length; (void)flags; (void)address; (void)size; return -LINUX_EBADF; }
 
 static uint64_t now_ms;
 static uint8_t sent_frame[2048];
@@ -186,7 +213,7 @@ static void test_small_reads(struct net_socket *s)
     uint8_t incoming[NET_TCP_MSS];
     for (unsigned i = 0; i < sizeof(incoming); ++i) incoming[i] = i % 251;
     for (unsigned round = 0; round < 100; ++round) {
-        net_socket_handle_tcp(s->remote_ip, s->remote_port, s->local_port,
+        net_socket_handle_tcp(s,
             s->remote_seq, s->local_seq, 65535, TCP_FLAG_ACK, incoming, sizeof(incoming));
         request.length = 17;
         assert(net_socket_recv(&request, 0) == 0 && request.transferred == 17);
@@ -206,7 +233,7 @@ static void test_window_edges(struct net_socket *s)
         s->local_port, s->remote_port, s->local_seq, s->remote_seq, TCP_FLAG_ACK, 0, 0) == 0);
     uint32_t end = net_get_u32(sent_frame + 42) + net_get_u16(sent_frame + 48);
     uint8_t input[20] = {0};
-    net_socket_handle_tcp(s->remote_ip, s->remote_port, s->local_port,
+    net_socket_handle_tcp(s,
         s->remote_seq, s->local_seq, 65535, TCP_FLAG_ACK, input, sizeof(input));
     assert(s->remote_seq == 4);
     uint32_t next_end = net_get_u32(sent_frame + 42) + net_get_u16(sent_frame + 48);
@@ -273,8 +300,7 @@ static void test_nonblocking_tcp_send_without_ack(void)
     assert(!__builtin_memcmp(sent_frame + 54, payload, NET_TCP_MSS));
 
     uint16_t partial_ack = 100;
-    net_socket_handle_tcp(socket->remote_ip, socket->remote_port,
-                          socket->local_port, socket->remote_seq,
+    net_socket_handle_tcp(socket, socket->remote_seq,
                           first_seq + partial_ack, 65535, TCP_FLAG_ACK, NULL, 0);
     assert(socket->acked_seq == first_seq + partial_ack);
     assert(socket->tx_sent == 3u * NET_TCP_MSS - partial_ack);
@@ -298,8 +324,7 @@ static void test_nonblocking_tcp_send_without_ack(void)
     assert(net_get_u32(sent_frame + 38) == first_seq + partial_ack);
     assert(net_get_u16(sent_frame + 16) - 40u == NET_TCP_MSS);
 
-    net_socket_handle_tcp(socket->remote_ip, socket->remote_port,
-                          socket->local_port, socket->remote_seq,
+    net_socket_handle_tcp(socket, socket->remote_seq,
                           socket->local_seq, 65535, TCP_FLAG_ACK, NULL, 0);
     net_poll_packets();
     assert(socket->tx_sent == 2u * NET_TCP_MSS);
@@ -314,8 +339,7 @@ static void test_nonblocking_tcp_send_without_ack(void)
     assert(wait_queue_adds == adds_before + 1 && sleep_deadlines == sleeps_before + 1);
     uint32_t ack = socket->acked_seq + 1u;
     unsigned wakes_before = wait_queue_wakes;
-    net_socket_handle_tcp(socket->remote_ip, socket->remote_port,
-                          socket->local_port, socket->remote_seq,
+    net_socket_handle_tcp(socket, socket->remote_seq,
                           ack, 65535, TCP_FLAG_ACK, NULL, 0);
     assert(wait_queue_wakes > wakes_before);
     assert(socket->tx_len == NET_SOCKET_TX_CAP - 1u);
@@ -356,8 +380,7 @@ static void test_tcp_peer_window_and_persist(void)
            12000u + NET_TCP_MSS);
     assert(net_get_u16(sent_frames[(before + 1u) % 128u] + 16) - 40u ==
            2000u - NET_TCP_MSS);
-    net_socket_handle_tcp(socket->remote_ip, socket->remote_port,
-        socket->local_port, socket->remote_seq, socket->acked_seq + 100u,
+    net_socket_handle_tcp(socket, socket->remote_seq, socket->acked_seq + 100u,
         0, TCP_FLAG_ACK, NULL, 0);
     net_poll_packets();
     assert(socket->peer_window == 0 && socket->tx_sent == 1900);
@@ -390,8 +413,7 @@ static void test_tcp_peer_window_and_persist(void)
     assert(net_get_u32(sent_frame + 38) == 33000);
     assert(net_get_u16(sent_frame + 16) - 40u == 1);
     assert(sent_frame[54] == payload[0]);
-    net_socket_handle_tcp(socket->remote_ip, socket->remote_port,
-        socket->local_port, socket->remote_seq, socket->acked_seq,
+    net_socket_handle_tcp(socket, socket->remote_seq, socket->acked_seq,
         0, TCP_FLAG_ACK, NULL, 0);
     now_ms += NET_TCP_INITIAL_RTO_MS;
     net_poll_packets();
@@ -406,16 +428,14 @@ static void test_tcp_peer_window_and_persist(void)
     assert(sent_count == before + 3);
     assert(net_get_u32(sent_frame + 38) == 33000);
     assert(net_get_u16(sent_frame + 16) - 40u == 1);
-    net_socket_handle_tcp(socket->remote_ip, socket->remote_port,
-        socket->local_port, socket->remote_seq, socket->acked_seq,
+    net_socket_handle_tcp(socket, socket->remote_seq, socket->acked_seq,
         4096, TCP_FLAG_ACK, NULL, 0);
     net_poll_packets();
     assert(socket->peer_window == 4096 && socket->tx_sent == 8);
     assert(sent_count == before + 4);
     assert(net_get_u32(sent_frame + 38) == 33001);
     assert(net_get_u16(sent_frame + 16) - 40u == 7);
-    net_socket_handle_tcp(socket->remote_ip, socket->remote_port,
-        socket->local_port, socket->remote_seq, socket->local_seq,
+    net_socket_handle_tcp(socket, socket->remote_seq, socket->local_seq,
         4096, TCP_FLAG_ACK, NULL, 0);
     assert(socket->tx_sent == 0 && socket->tx_len == 0);
     net_socket_clear(socket);
@@ -646,8 +666,7 @@ static void test_tcp_release_then_owner_exit_drains_queued_bytes(void)
         uint32_t ack;
         assert(socket->tx_sent > 0);
         ack = socket->acked_seq + socket->tx_sent;
-        net_socket_handle_tcp(socket->remote_ip, socket->remote_port,
-            socket->local_port, socket->remote_seq, ack, 65535,
+        net_socket_handle_tcp(socket, socket->remote_seq, ack, 65535,
             TCP_FLAG_ACK, NULL, 0);
         /* Simulate a timer boundary after process exit. No descriptor or
          * socket syscall is made to advance the accepted queue or FIN. */
@@ -677,8 +696,7 @@ static void test_tcp_release_then_owner_exit_drains_queued_bytes(void)
         verified += frame_payload;
     }
     assert(verified == length);
-    net_socket_handle_tcp(socket->remote_ip, socket->remote_port,
-        socket->local_port, socket->remote_seq, socket->local_seq, 65535,
+    net_socket_handle_tcp(socket, socket->remote_seq, socket->local_seq, 65535,
         TCP_FLAG_ACK, NULL, 0);
     net_tcp_service_sockets();
     assert(socket->fin_acked);
@@ -729,8 +747,7 @@ static void test_tcp_fin_retransmit_ack_and_half_close(void)
     assert(net_get_u32(sent_frame + 38) == fin_sequence);
 
     /* A duplicate ACK that omits FIN must leave it outstanding for RTO. */
-    net_socket_handle_tcp(socket->remote_ip, socket->remote_port,
-        socket->local_port, socket->remote_seq, fin_sequence, 65535,
+    net_socket_handle_tcp(socket, socket->remote_seq, fin_sequence, 65535,
         TCP_FLAG_ACK, NULL, 0);
     assert(net_tcp_maintenance_pending());
     now_ms += NET_TCP_INITIAL_RTO_MS * 2u - 1u;
@@ -743,8 +760,7 @@ static void test_tcp_fin_retransmit_ack_and_half_close(void)
            net_get_u32(sent_frame + 38) == fin_sequence);
 
     /* An ACK-only segment may complete the FIN without inventing EOF. */
-    net_socket_handle_tcp(socket->remote_ip, socket->remote_port,
-        socket->local_port, socket->remote_seq, fin_sequence + 1u, 65535,
+    net_socket_handle_tcp(socket, socket->remote_seq, fin_sequence + 1u, 65535,
         TCP_FLAG_ACK, NULL, 0);
     assert(socket->fin_acked && socket->rx_len == 0);
     net_tcp_service_sockets();
@@ -752,8 +768,7 @@ static void test_tcp_fin_retransmit_ack_and_half_close(void)
     assert(!(net_socket_poll_fd(socket->handle, 0, POLLHUP) & POLLHUP));
 
     /* The read half remains active after the local FIN is acknowledged. */
-    net_socket_handle_tcp(socket->remote_ip, socket->remote_port,
-        socket->local_port, socket->remote_seq, fin_sequence + 1u, 65535,
+    net_socket_handle_tcp(socket, socket->remote_seq, fin_sequence + 1u, 65535,
         TCP_FLAG_ACK, peer_data, sizeof(peer_data));
     assert(socket->rx_len == sizeof(peer_data));
     assert(socket->fin_received == 0);
@@ -768,8 +783,7 @@ static void test_tcp_fin_retransmit_ack_and_half_close(void)
     assert(!(net_socket_poll_fd(socket->handle, 0, POLLIN) & POLLHUP));
 
     /* A peer FIN is the only event that turns the read side into EOF. */
-    net_socket_handle_tcp(socket->remote_ip, socket->remote_port,
-        socket->local_port, socket->remote_seq, fin_sequence + 1u, 65535,
+    net_socket_handle_tcp(socket, socket->remote_seq, fin_sequence + 1u, 65535,
         TCP_FLAG_FIN | TCP_FLAG_ACK, NULL, 0);
     assert(socket->fin_received && socket->state == RELIEFOS_NET_TCP_TIME_WAIT);
     assert((net_socket_poll_fd(socket->handle, 0, POLLIN) &
@@ -809,8 +823,7 @@ static void test_tcp_peer_half_close_allows_reply(void)
     net_socket_pin_fd(handle);
 
     /* Peer SHUT_WR gives EOF on reads while leaving our write side open. */
-    net_socket_handle_tcp(socket->remote_ip, socket->remote_port,
-        socket->local_port, socket->remote_seq, socket->local_seq, 65535,
+    net_socket_handle_tcp(socket, socket->remote_seq, socket->local_seq, 65535,
         TCP_FLAG_FIN | TCP_FLAG_ACK, NULL, 0);
     assert(socket->fin_received && socket->state == RELIEFOS_NET_TCP_TIME_WAIT);
     request.socket = handle;
@@ -842,8 +855,7 @@ static void test_tcp_peer_half_close_allows_reply(void)
     ready = net_socket_poll_fd(handle, 0, POLLIN | POLLOUT | POLLRDHUP);
     assert((ready & (POLLIN | POLLOUT | POLLRDHUP | POLLHUP)) ==
            (POLLIN | POLLOUT | POLLRDHUP | POLLHUP));
-    net_socket_handle_tcp(socket->remote_ip, socket->remote_port,
-        socket->local_port, socket->remote_seq, socket->local_seq, 65535,
+    net_socket_handle_tcp(socket, socket->remote_seq, socket->local_seq, 65535,
         TCP_FLAG_ACK, NULL, 0);
     assert(socket->tx_len == 0 && socket->tx_sent == 0);
     now_ms += 10;
@@ -854,8 +866,7 @@ static void test_tcp_peer_half_close_allows_reply(void)
 
     /* The FIN remains active until acknowledged, then owner exit can collect it. */
     assert(net_tcp_maintenance_pending());
-    net_socket_handle_tcp(socket->remote_ip, socket->remote_port,
-        socket->local_port, socket->remote_seq, socket->local_seq, 65535,
+    net_socket_handle_tcp(socket, socket->remote_seq, socket->local_seq, 65535,
         TCP_FLAG_ACK, NULL, 0);
     assert(socket->fin_acked);
     now_ms += 10;
@@ -927,8 +938,7 @@ static void test_tcp_out_of_window_segment_cannot_ack_data(void)
     original_ack = socket->acked_seq;
     original_window = socket->peer_window;
 
-    net_socket_handle_tcp(socket->remote_ip, socket->remote_port,
-        socket->local_port, socket->remote_seq + NET_SOCKET_RX_CAP + 1u,
+    net_socket_handle_tcp(socket, socket->remote_seq + NET_SOCKET_RX_CAP + 1u,
         socket->local_seq, 0, TCP_FLAG_ACK, NULL, 0);
 
     assert(socket->local_seq == original_seq);
@@ -959,14 +969,14 @@ int main(void)
     s->remote_seq = 500; s->local_seq = s->acked_seq = 100;
     s->rx_len = NET_SOCKET_RX_CAP - 2;
     const uint8_t bytes[] = {1, 2, 3, 4};
-    net_socket_handle_tcp(s->remote_ip, s->remote_port, s->local_port,
+    net_socket_handle_tcp(s,
                           500, 100, 65535, TCP_FLAG_ACK, bytes, sizeof(bytes));
     assert(s->rx_len == NET_SOCKET_RX_CAP);
     assert(s->remote_seq == 502);
     assert(sent_length >= 54 && net_get_u16(sent_frame + 48) == 0);
     s->rx_len = 0;
     s->rx_window_valid = false; /* The fixture manually drained the receive ring. */
-    net_socket_handle_tcp(s->remote_ip, s->remote_port, s->local_port,
+    net_socket_handle_tcp(s,
                           500, 100, 65535, TCP_FLAG_ACK, bytes, sizeof(bytes));
     assert(s->rx_len == 2 && s->remote_seq == 504 && s->rx[0] == 3 && s->rx[1] == 4);
     test_proc_network(s);
@@ -978,7 +988,7 @@ int main(void)
     net_socket_release_fd(handle);
     assert(!s->fd_owned);
     assert(s->fin_sent && !s->fin_acked);
-    net_socket_handle_tcp(s->remote_ip, s->remote_port, s->local_port,
+    net_socket_handle_tcp(s,
                           s->remote_seq, s->local_seq, 65535,
                           TCP_FLAG_ACK, NULL, 0);
     net_tcp_service_sockets();

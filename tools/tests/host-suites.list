@@ -59,6 +59,9 @@ linux_time tools/test_linux_time.py
 linux_vfork_stack tools/test_linux_vfork_stack.py
 loadavg tools/test_loadavg.py
 network tools/test_network.py
+ipv6_protocol tools/test_ipv6_protocol.py
+ipv6_transport tools/test_ipv6_transport.py
+ipv6_control tools/test_ipv6_control.py
 openrc_network tools/test_openrc_network.py
 page_cache_growth tools/test_page_cache_growth.py
 memory_reclaim tools/test_memory_reclaim.py

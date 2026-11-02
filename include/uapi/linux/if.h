@@ -4,6 +4,7 @@
 #define IFNAMSIZ 16
 #define IFF_UP 0x1
 #define IFF_BROADCAST 0x2
+#define IFF_LOOPBACK 0x8
 #define IFF_RUNNING 0x40
 #define IFF_MULTICAST 0x1000
 /* Native x86-64 Linux v6.12 ifreq/ifconf layouts. */
@@ -38,6 +39,7 @@ struct rtentry {
 #define SIOCSIFMTU 0x8922
 #define SIOCGIFHWADDR 0x8927
 #define SIOCGIFINDEX 0x8933
+#define SIOCDIFADDR 0x8936
 _Static_assert(sizeof(struct ifreq) == 40, "Linux native ifreq");
 _Static_assert(sizeof(struct ifconf) == 16, "Linux native ifconf");
 _Static_assert(sizeof(struct rtentry) == 120, "Linux native rtentry");

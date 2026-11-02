@@ -29,6 +29,24 @@ struct task_file *task_file_for_fd(struct task *task, int fd)
 int net_get_config(struct reliefos_net_config *config)
 { *config = (struct reliefos_net_config){.local_ip = 0x0a00020f}; return 0; }
 void net_poll_packets(void) {}
+#ifndef IPV6_TRANSPORT_FIXTURE
+/* This legacy fixture exercises IPv4 only; IPv6 dependencies are supplied by
+ * the dedicated IPv6 transport fixture with an actual deferred link model. */
+__attribute__((weak)) void kernel_poll_readiness_notify(void) {}
+__attribute__((weak)) uint32_t net_ipv6_addresses(struct net_ipv6_address *out,uint32_t capacity)
+{ (void)out; (void)capacity; return 0; }
+__attribute__((weak)) int net_ipv6_route(const struct in6_addr *destination,uint32_t scope,
+                                         const struct in6_addr *bound,struct net_ipv6_path *path)
+{ (void)destination; (void)scope; (void)bound; (void)path; return -LINUX_ENETUNREACH; }
+__attribute__((weak)) uint16_t net_ipv6_checksum(const struct in6_addr *source,const struct in6_addr *destination,
+                                                  uint8_t protocol,const void *data,uint32_t length)
+{ (void)source; (void)destination; (void)protocol; (void)data; (void)length; return 0; }
+__attribute__((weak)) int net_ipv6_output(const struct net_ipv6_path *path,uint8_t protocol,const void *data,
+                                           uint32_t length,int hops,uint32_t flowinfo,bool df,bool multicast_loop)
+{ (void)path; (void)protocol; (void)data; (void)length; (void)hops; (void)flowinfo; (void)df; (void)multicast_loop; return -LINUX_ENETUNREACH; }
+__attribute__((weak)) int net_ipv6_multicast_change(const struct in6_addr *address,uint32_t ifindex,int delta)
+{ (void)address; (void)ifindex; (void)delta; return -LINUX_ENETUNREACH; }
+#endif
 int net_ipv4_send_udp(uint32_t source, uint32_t destination, uint16_t source_port,
                        uint16_t destination_port, const void *data, uint32_t length)
 { (void)source; (void)destination; (void)source_port; (void)destination_port; (void)data; (void)length; return -LINUX_ENETDOWN; }

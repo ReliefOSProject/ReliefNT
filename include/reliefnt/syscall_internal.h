@@ -378,6 +378,11 @@ struct socket_message_result {
 int64_t task_socket_message(struct task *task, struct task_file *file, uint64_t message,
                             uint32_t flags, bool receiving, bool batch,
                             struct socket_message_result *result);
+/** @brief Transfer one INET datagram from a retry-stable native iovec array.
+ * @param task Current task. @param file Admitted socket OFD. @param address User vectors.
+ * @param count Vector count. @param writing Select writev. @return Bytes, errno or retry marker. */
+int64_t task_inet_vector_user(struct task *task,struct task_file *file,uint64_t address,
+                              uint32_t count,bool writing);
 /** @brief Read and clear, or set, a socket's deferred receive error. */
 int task_socket_message_error(struct task_file *file, int error, bool setting);
 /** @brief Iterate a message batch while retaining its current operand cursor.
@@ -499,6 +504,9 @@ int task_inet_recv(struct task_file *file, void *buffer, uint32_t length, uint32
  * no descriptor flags or ownership are transferred by this wrapper.
  */
 int task_inet_read(struct task_file *file, void *buffer, uint32_t length);
+/** @brief Query the native family of a pinned network socket.
+ * @param file Borrowed socket OFD. @return Linux family or negative errno. */
+int task_inet_family(const struct task_file *file);
 int task_net_control(struct task_file *file, uint32_t request, uint64_t address);
 int task_inet_write(struct task_file *file, const void *buffer, uint32_t length);
 short task_inet_poll(const struct task_file *file, short events);

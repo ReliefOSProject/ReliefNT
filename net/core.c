@@ -1,4 +1,5 @@
 #include "internal.h"
+#include <reliefnt/net_ipv6.h>
 
 /**
  * Net log config.
@@ -47,6 +48,7 @@ void net_init(void)
 {
     net_load_dns_policy();
     e1000_init();
+    net_ipv6_init();
     net_set_static_fallback();
     if (!e1000_is_ready()) {
         console_info("[reliefnt] net unavailable: no active e1000\n");
@@ -76,6 +78,7 @@ void net_driver_detached(void)
             net_socket_mark_closed(s, RELIEFOS_NET_STATUS_NO_DEVICE);
         }
     }
+    net_ipv6_detached();
     net_arp_cache_clear();
     net_set_static_fallback();
     net_update_config_flags();

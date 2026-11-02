@@ -1,6 +1,9 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "../internal.h"
 #include "vector_internal.h"
+#include <reliefnt/net_udp.h>
+#include <reliefnt/net_packet.h>
+#include <reliefnt/netlink.h>
 #include <reliefnt/swap.h>
 
 /** @brief Canonicalize only ABI arguments consumed by a vector syscall.
@@ -183,6 +186,12 @@ int64_t syscall_vector_io(struct task *task,uint64_t number,uint64_t a0,uint64_t
     if (a2 > UIO_MAXIOV) return -RELIEFOS_EINVAL;
     if (!a2) return provider_readv ? character_file_readv(file->character_file,task,file,NULL,0,
         positional && !current_position,position,positional_flags) : 0;
+    if (file && (file->flags & TASK_FILE_FLAG_SOCKET_INET) &&
+        (file->kind == TASK_FILE_KIND_UDP || file->kind == TASK_FILE_KIND_PACKET ||
+         file->kind == TASK_FILE_KIND_NETLINK)) {
+        if (positional && !current_position) return -RELIEFOS_ESPIPE;
+        return task_inet_vector_user(task,file,a1,(uint32_t)a2,writing);
+    }
 #ifdef CONFIG_SWAP
     if(file && (file->flags & TASK_FILE_FLAG_SOCKET_UNIX)) {
         if(positional && !current_position)return -RELIEFOS_ESPIPE;

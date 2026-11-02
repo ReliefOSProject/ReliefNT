@@ -42,9 +42,17 @@ int task_packet_send(struct task_file *file, const void *data, uint32_t length,
  */
 int task_packet_recv(struct task_file *file, void *data, uint32_t length,
                      uint32_t flags, uint64_t address, uint64_t address_length);
-#ifdef CONFIG_SWAP
 /** @brief Return this packet OFD's native source-address size, or zero. */
 uint32_t task_packet_address_size(const struct task_file *file);
+struct net_udp_rx_info;
+/** @brief Receive a packet and its native source and IPv6 ancillary metadata.
+ * @param file Retained OFD. @param data Kernel buffer. @param length Capacity.
+ * @param flags Receive flags. @param source Optional sockaddr storage.
+ * @param source_length Optional source size. @param info Optional IPv6 metadata.
+ * @return Bytes, negative errno, or blocked sentinel. */
+int task_packet_recv_ex(struct task_file *file,void *data,uint32_t length,uint32_t flags,
+                        void *source,uint32_t *source_length,struct net_udp_rx_info *info);
+#ifdef CONFIG_SWAP
 /** @brief Receive to kernel buffers and capture the native source before dequeue.
  * @param file Retained packet OFD. @param data Kernel byte output.
  * @param length Capacity. @param flags Receive flags. @param source Writable

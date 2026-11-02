@@ -1,0 +1,2 @@
+# IPv6 host protocol and bounded state machines.
+obj-y += core.o

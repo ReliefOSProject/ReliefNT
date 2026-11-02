@@ -11,6 +11,7 @@
 #include <reliefnt/net.h>
 #include <reliefnt/net_packet.h>
 #include <reliefnt/net_udp.h>
+#include <reliefnt/net_ipv6.h>
 #include <linux/errno.h>
 #include <linux/if.h>
 #include <linux/capability.h>
@@ -60,6 +61,8 @@
 #define NET_BOOT_DHCP_ATTEMPTS 3u
 #define NET_BOOT_DHCP_TIMEOUT_MS 4000u
 #define NET_TCP_MSS 1460u
+#define NET_TCP_LISTEN 4u
+#define NET_TCP_SYN_RECEIVED 5u
 #define NET_TCP_SYN_RETRANSMIT_MS 500u
 #define NET_TCP_INITIAL_RTO_MS 1000u
 #define NET_TCP_MAX_RTO_MS 60000u
@@ -156,6 +159,13 @@ struct net_socket {
     uint32_t status;
     uint32_t local_ip;
     uint32_t remote_ip;
+    struct in6_addr local6, remote6;
+    uint32_t scope6, remote_scope6, mtu6;
+    uint16_t peer_mss;
+    bool ipv6, mapped, v6only, bound, reuse, dont_fragment;
+    int unicast_hops, mtu_discover;
+    uint32_t backlog;
+    struct net_socket *listener;
     uint16_t local_port;
     uint16_t remote_port;
     uint32_t local_seq;
@@ -674,6 +684,36 @@ uint32_t net_socket_receive_window(const struct net_socket *socket);
  * @return Window bytes bounded by local receive-ring capacity.
  */
 uint32_t net_socket_select_window(const struct net_socket *socket);
+/** @brief Send a TCP segment through the socket's selected IPv4 or IPv6 route.
+ * @param socket Registered endpoint. @param seq Sequence. @param ack Acknowledgment.
+ * @param flags TCP flags. @param payload Optional bytes. @param length Payload size.
+ * @return Accepted byte count or negative errno. */
+int net_send_tcp_socket(struct net_socket *socket, uint32_t seq, uint32_t ack,
+                        uint8_t flags, const uint8_t *payload, uint32_t length);
+/** @brief Check for deferred IPv4 loopback TCP segments.
+ * @return True when the task-context network pump must deliver a segment. */
+bool net_tcp_loop_pending(void);
+/** @brief Deliver a bounded number of queued IPv4 loopback segments under execution ownership. */
+void net_tcp_loop_service(void);
+/** @brief Calculate the current safe TCP payload limit including peer MSS and IPv6 PMTU.
+ * @param socket Registered endpoint. @return Positive payload byte limit. */
+uint32_t net_socket_mss(const struct net_socket *socket);
+/** @brief Create an IPv6 passive child after a validated initial SYN.
+ * @param listener Registered listening endpoint. @param source Peer address.
+ * @param destination Local address. @param source_port Peer port. @param ifindex Interface.
+ * @param seq Peer initial sequence. @param window Peer window. @param mss Peer MSS or zero.
+ * @return Child on successful SYN/ACK submission, otherwise null. */
+struct net_socket *net_tcp_passive6(struct net_socket *listener,const struct in6_addr *source,
+                                    const struct in6_addr *destination,uint16_t source_port,
+                                    uint32_t ifindex,uint32_t seq,uint16_t window,uint16_t mss);
+/** @brief Create an IPv4 or mapped passive child without resolving ARP in receive context.
+ * @param listener Listening endpoint. @param source Peer IPv4. @param destination Local IPv4.
+ * @param source_port Peer port. @param source_mac Received next-hop Ethernet address.
+ * @param seq Peer sequence. @param window Peer window. @param mss Peer MSS or zero.
+ * @return Child on success, otherwise null. */
+struct net_socket *net_tcp_passive4(struct net_socket *listener,uint32_t source,uint32_t destination,
+                                    uint16_t source_port,const uint8_t *source_mac,
+                                    uint32_t seq,uint16_t window,uint16_t mss);
 
 /**
  * @brief Build and send one TCP segment with the socket's selected receive window.
@@ -723,10 +763,12 @@ void net_handle_udp(const uint8_t *ip, uint32_t total_len,
  * @param total_len Value supplied by the caller.
  * @param ihl Value supplied by the caller.
  * @param src_ip Value supplied by the caller.
+ * @param source_mac Borrowed Ethernet source/next-hop MAC, nullable for loopback.
  * @param tcp_wait Value supplied by the caller.
  */
 void net_handle_tcp(const uint8_t *ip, uint32_t total_len,
                            uint32_t ihl, uint32_t src_ip,
+                           const uint8_t *source_mac,
                            struct net_tcp_wait *tcp_wait);
 
 /**

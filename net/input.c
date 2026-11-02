@@ -1,4 +1,5 @@
 #include "internal.h"
+#include <reliefnt/net_ipv6.h>
 
 #define NET_TCP_MAINTENANCE_POLL_BUDGET 4u
 
@@ -45,6 +46,8 @@ static void net_process_frame(const uint8_t *frame, uint32_t len,
         net_handle_arp(frame, len, arp_wait);
     } else if (type == ETH_TYPE_IPV4) {
         net_handle_ipv4(frame, len, ping_wait, udp_wait, tcp_wait);
+    } else if (type == 0x86dd) {
+        net_ipv6_input(frame, len);
     }
 }
 
@@ -70,6 +73,7 @@ void net_poll_once(struct net_arp_wait *arp_wait,
         net_process_frame(frame, len, arp_wait, ping_wait, udp_wait, tcp_wait);
     }
     net_tcp_service_sockets();
+    net_ipv6_poll();
 }
 
 void net_poll_packets(void)
@@ -78,23 +82,24 @@ void net_poll_packets(void)
 }
 
 /**
- * @brief Test whether active TCP work is due for its next maintenance batch.
- * @return True when the current tick permits a bounded poll pass.
+ * @brief Test whether TCP or IPv6 work is due for its next maintenance batch.
+ * @return True when active work and the current tick permit a bounded poll pass.
  * @note Constant-time, requires kernel execution ownership, and never scans
  *       idle sockets.
  */
 bool net_tcp_maintenance_due(void)
 {
-    return net_tcp_maintenance_pending() && net_interface_up &&
+    return ((net_tcp_maintenance_pending() && net_interface_up) ||
+            net_ipv6_maintenance_pending()) &&
         (!net_tcp_maintenance_tick_valid ||
          time_ticks() != net_tcp_maintenance_last_tick);
 }
 
 /**
- * @brief Run the bounded timer-paced TCP receive/transmit maintenance pump.
+ * @brief Run the bounded timer-paced TCP and IPv6 network maintenance pump.
  * @note Called from task-context scheduler boundaries with the kernel execution
- *       transaction held. An active-work hint and tick gate avoid scanning
- *       idle sockets or polling the NIC on every user return.
+ *       transaction held. A tick gate bounds NIC polling, including unsolicited
+ *       IPv6 discovery traffic when no TCP socket has active work.
  */
 void net_tcp_maintenance(void)
 {
@@ -103,7 +108,7 @@ void net_tcp_maintenance(void)
     net_tcp_maintenance_last_tick = time_ticks();
 
     for (uint32_t i = 0; i < NET_TCP_MAINTENANCE_POLL_BUDGET &&
-         net_tcp_maintenance_pending(); ++i) {
+         (net_tcp_maintenance_pending() || net_ipv6_maintenance_pending()); ++i) {
         net_poll_once(0, 0, 0, 0);
     }
 }

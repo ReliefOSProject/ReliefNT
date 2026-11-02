@@ -12,7 +12,8 @@
 #include <linux/fcntl.h>
 #include <linux/time.h>
 
-static const char *net_leaves[] = {"dev", "route", "arp", "tcp", "udp", "unix"};
+static const char *net_leaves[] = {"dev", "route", "arp", "tcp", "udp", "unix",
+                                   "if_inet6", "ipv6_route", "tcp6", "udp6", "raw6"};
 static const char *fs_leaves[] = {"nr_open",
                                   "file-nr",
                                   "file-max",
