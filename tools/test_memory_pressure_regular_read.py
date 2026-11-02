@@ -38,7 +38,8 @@ def main():
               "-Wl,--gc-sections", "-I" + str(directory), "-Iinclude", "-Iinclude/uapi"]
     sources = ["tools/tests/memory_pressure_regular_read_test.c", "kernel/exec/usercopy.c",
                "tools/tests/task8_host_stubs/device_page_unreached.c",
-               "kernel/syscall/fs/lookup_state.c", "kernel/sched/core.c", "kernel/sched/wait.c",
+               "kernel/syscall/fs/lookup_state.c", "kernel/sched/core.c", "kernel/sched/accounting.c",
+               "kernel/sched/wait.c",
                "kernel/sched/oom.c", "kernel/sync/wait.c", "mm/reclaim/pressure.c",
                "mm/reclaim/wait.c", "mm/cache/page_cache.c", "fs/vfs/mount_tree.c",
                "fs/vfs/file.c", "fs/vfs/open.c", "fs/vfs/attributes.c", "fs/vfs/exec_file.c",

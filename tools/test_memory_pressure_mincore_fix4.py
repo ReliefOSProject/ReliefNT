@@ -44,7 +44,8 @@ def main():
               "-Wl,--gc-sections", "-I" + str(directory), "-Iinclude", "-Iinclude/uapi"]
     sources = ["tools/tests/memory_pressure_mincore_fix4_test.c", "kernel/exec/usercopy.c",
                "kernel/syscall/fs/lookup_state.c",
-               "kernel/sched/core.c", "kernel/sched/wait.c", "kernel/sched/oom.c", "kernel/sync/wait.c",
+               "kernel/sched/core.c", "kernel/sched/accounting.c", "kernel/sched/wait.c",
+               "kernel/sched/oom.c", "kernel/sync/wait.c",
                "mm/reclaim/pressure.c", "mm/reclaim/wait.c", "mm/cache/page_cache.c",
                "fs/vfs/mount_tree.c", "fs/vfs/file.c", "fs/vfs/open.c", "fs/vfs/attributes.c",
                "fs/vfs/exec_file.c", "mm/swap/area.c", "mm/swap/slot.c", "mm/swap/paging.c",

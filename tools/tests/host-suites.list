@@ -186,6 +186,8 @@ memory_pressure_mincore_fix4 tools/test_memory_pressure_mincore_fix4.py
 memory_pressure_headroom_fix4 tools/test_memory_pressure_headroom_fix4.py
 memory_pressure_fix5 tools/test_memory_pressure_fix5.py
 memory_pressure_swapoff_recovery tools/test_memory_pressure_swapoff_recovery.py
+memory_pressure_open_path tools/test_memory_pressure_open_path.py --output {output}/memory-pressure-open-path
+memory_pressure_regular_read tools/test_memory_pressure_regular_read.py --output {output}/memory-pressure-regular-read
 memory_reporting tools/test_memory_reporting.py
 task8_frontdoors tools/test_task8_frontdoors.py
 task8_user_return tools/test_task8_user_return.py

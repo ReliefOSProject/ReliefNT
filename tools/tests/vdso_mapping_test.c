@@ -83,6 +83,12 @@ static unsigned live_pages(void)
     return count;
 }
 
+/* Report the remaining modeled physical pool for fork allocation snapshots. */
+uint64_t mm_free_memory_kib(void)
+{
+    return (sizeof(pool) / sizeof(pool[0]) - live_pages()) * 4;
+}
+
 int page_cache_retain(uint64_t physical) { (void)physical; return -1; }
 int page_cache_owns(uint64_t physical) { (void)physical; return 0; }
 void page_cache_release(uint64_t physical) { (void)physical; abort(); }
