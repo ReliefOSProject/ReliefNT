@@ -359,6 +359,20 @@ int64_t task_signalfd_read(struct task *task, struct task_file *file, uint64_t b
 int64_t task_signalfd_readv(struct task *task, struct task_file *file, uint64_t vectors,
                            uint64_t count, uint32_t flags);
 
+/** @brief Create an inotify OFD with Linux init1 flags. */
+int64_t syscall_inotify_init(uint32_t flags);
+/** @brief Add/replace an inode watch using a checked user pathname. */
+int64_t syscall_inotify_add_watch(int fd, uint64_t pathname, uint32_t mask);
+/** @brief Remove a watch and enqueue its IN_IGNORED event. */
+int64_t syscall_inotify_rm_watch(int fd, int wd);
+/** @brief Snapshot readable poll bits on the pinned inotify OFD. */
+short task_inotify_poll(const struct task_file *file);
+/** @brief Copy FIONREAD's queued byte count to checked user memory. */
+int64_t task_inotify_fionread(struct task *task, const struct task_file *file, uint64_t output);
+/** @brief Read complete inotify records with Linux copy-fault semantics. */
+int64_t task_inotify_read(struct task *task, struct task_file *file,
+                          uint64_t buffer, uint64_t count);
+
 struct socket_message_result {
     uint64_t requested;
     uint32_t flags;

@@ -8,6 +8,12 @@ extern void memory_wait_cancel(struct task *) __attribute__((weak));
 #include "../internal.h"
 #include <reliefnt/module.h>
 #include <reliefnt/proc_stats.h>
+#include <reliefnt/fsnotify.h>
+#include <reliefnt/fsnotify_vfs.h>
+#include <linux/inotify.h>
+
+/* Standalone descriptor fixtures may omit the inotify core. */
+extern void fsnotify_put(struct fsnotify_instance *) __attribute__((weak));
 
 static uint64_t proc_files;
 
@@ -69,6 +75,10 @@ int clear_task_file_result(struct task_file *file)
     }
     if (file->references == 0) task_epoll_remove_file_description(file);
     syscall_flock_release_owner(file);
+    if (file->notify_open && file->path_ref.mount && vfs_notify_event) {
+        vfs_notify_event(&file->path_ref, file_can_write(file) ? IN_CLOSE_WRITE : IN_CLOSE_NOWRITE);
+        file->notify_open = false;
+    }
     struct character_file *character_file=file->character_file;file->character_file=NULL;
     character_file_close(character_file,file);
     if (file->flags & TASK_FILE_FLAG_DEV_NODE) {
@@ -93,6 +103,8 @@ int clear_task_file_result(struct task_file *file)
     if ((file->flags & TASK_FILE_FLAG_TIMERFD) && file->aux) {
         kernel_free((void *)(uintptr_t)file->aux);
     }
+    if (file->kind == TASK_FILE_KIND_INOTIFY && file->aux && fsnotify_put)
+        fsnotify_put((struct fsnotify_instance *)(uintptr_t)file->aux);
     if ((file->flags & TASK_FILE_FLAG_DEV_NODE) &&
         (file->node.first_cluster == STORAGE_DEV_KIND_KEYBOARD ||
          file->node.first_cluster == STORAGE_DEV_KIND_MOUSE) &&

@@ -111,6 +111,10 @@ struct storage_node;
 #define LINUX_SYS_TIMER_DELETE __NR_timer_delete
 #define LINUX_SYS_RT_SIGTIMEDWAIT __NR_rt_sigtimedwait
 #define LINUX_SYS_EVENTFD __NR_eventfd
+#define LINUX_SYS_INOTIFY_INIT __NR_inotify_init
+#define LINUX_SYS_INOTIFY_INIT1 __NR_inotify_init1
+#define LINUX_SYS_INOTIFY_ADD_WATCH __NR_inotify_add_watch
+#define LINUX_SYS_INOTIFY_RM_WATCH __NR_inotify_rm_watch
 #define LINUX_SYS_SIGNALFD __NR_signalfd
 #define LINUX_SYS_SIGNALFD4 __NR_signalfd4
 #define LINUX_SYS_PROCESS_VM_READV __NR_process_vm_readv

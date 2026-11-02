@@ -120,6 +120,7 @@ int64_t syscall_io_write(uint64_t a0, uint64_t a1, uint64_t a2)
     struct task_file *signal_file = task_file_for_io(task, (int32_t)a0);
     if (signal_file && (signal_file->flags & TASK_FILE_FLAG_PATH)) return -RELIEFOS_EBADF;
     if (signal_file && signal_file->kind == TASK_FILE_KIND_SIGNALFD) return -LINUX_EINVAL;
+    if (signal_file && signal_file->kind == TASK_FILE_KIND_INOTIFY) return -LINUX_EBADF;
 #ifdef CONFIG_SWAP
     if(signal_file && (signal_file->flags & TASK_FILE_FLAG_SOCKET_UNIX)) {
         if(!scalar_address_valid(a1,a2))return -RELIEFOS_EFAULT;
@@ -264,6 +265,8 @@ int64_t syscall_io_write(uint64_t a0, uint64_t a1, uint64_t a2)
  */
 int64_t syscall_io_read(uint64_t a0, uint64_t a1, uint64_t a2)
 {
+    /* Standalone scalar-I/O fixtures may omit the anonymous inotify provider. */
+    extern int64_t task_inotify_read(struct task *, struct task_file *, uint64_t, uint64_t) __attribute__((weak));
     struct task *task = sched_current_task();
     struct task_file *file;
     uint32_t request_len;
@@ -271,6 +274,8 @@ int64_t syscall_io_read(uint64_t a0, uint64_t a1, uint64_t a2)
     file = task_file_for_io(task, (int32_t)a0);
     if (file && (file->flags & TASK_FILE_FLAG_PATH)) return -RELIEFOS_EBADF;
     if (file && file->kind == TASK_FILE_KIND_SIGNALFD) return task_signalfd_read(task, file, a1, a2);
+    if (file && file->kind == TASK_FILE_KIND_INOTIFY)
+        return task_inotify_read ? task_inotify_read(task, file, a1, a2) : -RELIEFOS_ENOSYS;
 #ifdef CONFIG_SWAP
     if(file && (file->flags & TASK_FILE_FLAG_SOCKET_UNIX)) {
         if(!scalar_address_valid(a1,a2))return -RELIEFOS_EFAULT;

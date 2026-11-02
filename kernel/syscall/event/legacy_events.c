@@ -1,6 +1,10 @@
 #include "../internal.h"
 #include <reliefnt/swap.h>
 
+/* Narrow fixtures may link this dispatcher without the inotify adapter. */
+extern int64_t syscall_inotify_init(uint32_t) __attribute__((weak));
+extern int64_t syscall_inotify_add_watch(int, uint64_t, uint32_t) __attribute__((weak));
+extern int64_t syscall_inotify_rm_watch(int, int) __attribute__((weak));
 
 
 
@@ -20,6 +24,13 @@
 int64_t syscall_legacy_events(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
 {
     (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+
+    if (number == LINUX_SYS_INOTIFY_INIT || number == LINUX_SYS_INOTIFY_INIT1)
+        return syscall_inotify_init ? syscall_inotify_init(number == LINUX_SYS_INOTIFY_INIT1 ? (uint32_t)a0 : 0) : -RELIEFOS_ENOSYS;
+    if (number == LINUX_SYS_INOTIFY_ADD_WATCH)
+        return syscall_inotify_add_watch ? syscall_inotify_add_watch((int32_t)a0, a1, (uint32_t)a2) : -RELIEFOS_ENOSYS;
+    if (number == LINUX_SYS_INOTIFY_RM_WATCH)
+        return syscall_inotify_rm_watch ? syscall_inotify_rm_watch((int32_t)a0, (int32_t)a1) : -RELIEFOS_ENOSYS;
 
     if (number == LINUX_SYS_EPOLL_CREATE)
         return syscall_epoll_create(a0, 0);

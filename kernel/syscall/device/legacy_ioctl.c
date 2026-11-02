@@ -1,4 +1,6 @@
 #include "../internal.h"
+/* Standalone ioctl fixtures may omit the anonymous inotify provider. */
+extern int64_t task_inotify_fionread(struct task *, const struct task_file *, uint64_t) __attribute__((weak));
 #include <reliefnt/swap.h>
 #include <reliefnt/net_ipv6.h>
 #include <linux/if.h>
@@ -324,6 +326,11 @@ int64_t syscall_legacy_ioctl(uint64_t number, uint64_t a0, uint64_t a1, uint64_t
     if (number == LINUX_SYS_IOCTL) {
         struct task *task = sched_current_task();
         struct task_file *file = task_file_for_io(task, (int)a0);
+        if (file && file->kind == TASK_FILE_KIND_INOTIFY) {
+            if ((uint32_t)a1 == FIONREAD)
+                return task_inotify_fionread ? task_inotify_fionread(task, file, a2) : -RELIEFOS_ENOSYS;
+            return -LINUX_ENOTTY;
+        }
         if (file && file->kind == TASK_FILE_KIND_SIGNALFD) {
             /* Generic ioctl requests have already been handled. */
             return -LINUX_ENOTTY;

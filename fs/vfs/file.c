@@ -89,7 +89,9 @@ int vfs_path_permissions(const struct vfs_path *path,struct reliefos_permissions
 {
     if(!vfs_path_valid(path) || !value)return -EINVAL;
     if(!path->mount->ops->permissions)return -EOPNOTSUPP;
-    return path->mount->ops->permissions(path->mount->context,path,value,write);
+    int rc=path->mount->ops->permissions(path->mount->context,path,value,write);
+    if(!rc && write && vfs_notify_event)vfs_notify_event(path,IN_ATTRIB);
+    return rc;
 }
 
 /** @brief Read attachment policy combined with current shared backing flags.
@@ -190,9 +192,11 @@ int vfs_path_create_node(const struct vfs_path *parent,const char *name,uint32_t
         if(reserved){kernel_free(reserved->name);kernel_free(reserved);}
         return rc;
     }
+    if(vfs_notify_child)vfs_notify_child(parent,IN_CREATE,0,name,type==LINUX_S_IFDIR);
     if(!out)return 0;
     reserved->node=node;reserved->backend_pin=pin;
     ++parent->dentry->references;
     reserved->next=parent->dentry->children;parent->dentry->children=reserved;
+    if(vfs_notify_dentry_created)vfs_notify_dentry_created(parent->mount,reserved);
     struct vfs_path created={parent->mount,reserved};vfs_path_get(&created,out);return 0;
 }

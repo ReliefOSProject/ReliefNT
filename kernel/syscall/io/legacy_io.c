@@ -52,7 +52,7 @@ int64_t syscall_legacy_io(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2
         struct task_file *file = task_file_for_io(task, (int)a0);
         uint64_t saved;
         int64_t result;
-        if (file && file->kind == TASK_FILE_KIND_SIGNALFD)
+        if (file && (file->kind == TASK_FILE_KIND_SIGNALFD || file->kind == TASK_FILE_KIND_INOTIFY))
             return (int64_t)a3 < 0 ? -LINUX_EINVAL : -LINUX_ESPIPE;
         if ((int64_t)a3 < 0) return -RELIEFOS_EINVAL;
         if (file && (file->flags & TASK_FILE_FLAG_PIPE)) return -LINUX_ESPIPE;
@@ -96,6 +96,7 @@ int64_t syscall_legacy_io(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2
             return -RELIEFOS_EBADF;
         }
         if(file->character_file)return character_file_seek(file->character_file,file,offset,(uint32_t)a2);
+        if (file->kind == TASK_FILE_KIND_INOTIFY) return (uint32_t)a2 > 4 ? -LINUX_EINVAL : 0;
         if (file->flags & TASK_FILE_FLAG_PIPE) return -LINUX_ESPIPE;
         if (task_device_is(file, STORAGE_DEV_KIND_CONSOLE)) return -LINUX_ESPIPE;
         if (file->io_owner && file->io_owner != task->pid) return -RELIEFOS_EAGAIN;

@@ -1,5 +1,19 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "../internal.h"
+#include <reliefnt/fsnotify_vfs.h>
+#include <linux/inotify.h>
+
+/** @brief Publish OPEN only after an authorized descriptor is installed.
+ * @param task Owner of the published slot. @param fd Successful descriptor.
+ * The description retains its path through final CLOSE; O_PATH has no events.
+ */
+static void inotify_open_published(struct task *task, int fd)
+{
+    struct task_file *file = task_file_for_fd(task, fd);
+    if (!file || (file->flags & TASK_FILE_FLAG_PATH) || !file->path_ref.mount) return;
+    file->notify_open = true;
+    if (vfs_notify_event) vfs_notify_event(&file->path_ref, IN_OPEN);
+}
 
 /** @brief Apply open-time truncation with inode-wide writer admission.
  * @param file Newly authorized canonical description with an owned provider path.
@@ -73,7 +87,11 @@ int64_t syscall_open_object(struct vfs_namespace *ns,struct task *task,int32_t d
                                uint64_t pathname,uint32_t flags,uint32_t mode)
 {
     if(!task)return -RELIEFOS_ESRCH;
-    if(task->fifo_open_file)return task_fifo_open(task,NULL,0,NULL);
+    if(task->fifo_open_file) {
+        int fd = task_fifo_open(task,NULL,0,NULL);
+        if(fd >= 0)inotify_open_published(task,fd);
+        return fd;
+    }
     flags&=LINUX_O_ACCMODE|LINUX_O_CREAT|LINUX_O_EXCL|LINUX_O_NOCTTY|LINUX_O_TRUNC|
         LINUX_O_APPEND|LINUX_O_NONBLOCK|LINUX_O_DSYNC|LINUX_O_ASYNC|LINUX_O_DIRECT|
         LINUX_O_LARGEFILE|LINUX_O_DIRECTORY|LINUX_O_NOFOLLOW|LINUX_O_NOATIME|
@@ -133,5 +151,6 @@ int64_t syscall_open_object(struct vfs_namespace *ns,struct task *task,int32_t d
             } else if(!rc)rc=open_inode_path(task,&found.path,flags,diagnostic);
         }
     }
+    if(rc >= 0)inotify_open_published(task,rc);
     vfs_path_put(&found.path);return rc;
 }

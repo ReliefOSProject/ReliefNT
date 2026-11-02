@@ -248,7 +248,7 @@ static int pseudo_node_permissions(void *value,const struct vfs_path *path,
 static uint64_t pseudo_mount_flags(void *value)
 {return ((const struct pseudo_mount *)value)->provider->mount_flags;}
 
-/** @brief Admit proc diagnostic readonly changes without altering providers.
+/** @brief Admit proc control readonly changes without altering providers.
  * @param value Required borrowed pinned pseudo mount context.
  * @param flags Requested shared policy bits.
  * @return Zero or unsupported/readonly errno. Other pseudo filesystems retain
@@ -257,12 +257,10 @@ static uint64_t pseudo_mount_flags(void *value)
 static int pseudo_remount(void *value, uint64_t flags)
 {
     const struct pseudo_mount *mount = value;
-#ifdef CONFIG_LOCK_STAT
     if (mount->provider->filesystem && !__builtin_strcmp(mount->provider->filesystem, "proc")) {
         if (flags & ~MS_RDONLY) return -EOPNOTSUPP;
         return 0;
     }
-#endif
     uint64_t current = mount->provider->mount_flags & VFS_SUPER_POLICY_MASK;
     if (flags == current) return 0;
     return (current & MS_RDONLY) && !(flags & MS_RDONLY) ? -EROFS : -EOPNOTSUPP;

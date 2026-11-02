@@ -65,6 +65,7 @@ int vfs_path_write(const struct vfs_path *path,uint64_t offset,const void *bytes
     char empty;int rc=path->mount->ops->write(path->mount->context,&path->dentry->node,offset,
                                                bytes ? bytes : &empty,length,written);
     if(*written>length){*written=0;return -EIO;}
+    if(*written && vfs_notify_event)vfs_notify_event(path,IN_MODIFY);
     return rc;
 }
 
@@ -74,8 +75,10 @@ int vfs_path_truncate(const struct vfs_path *path,uint64_t length)
     if(path->dentry->node.type==RELIEFOS_FS_TYPE_DIR)return -EISDIR;
     if(path->dentry->node.type!=RELIEFOS_FS_TYPE_FILE)return -EINVAL;
     if(vfs_path_mount_flags(path)&MS_RDONLY)return -EROFS;
-    return path->mount->ops->truncate ?
+    int rc=path->mount->ops->truncate ?
         path->mount->ops->truncate(path->mount->context,&path->dentry->node,length) : -EOPNOTSUPP;
+    if(!rc && vfs_notify_event)vfs_notify_event(path,IN_MODIFY);
+    return rc;
 }
 
 int vfs_path_fallocate(const struct vfs_path *path,uint32_t mode,uint64_t offset,uint64_t length)
@@ -86,8 +89,10 @@ int vfs_path_fallocate(const struct vfs_path *path,uint32_t mode,uint64_t offset
     if(path->dentry->node.type==RELIEFOS_FS_TYPE_FIFO)return -ESPIPE;
     if(path->dentry->node.type!=RELIEFOS_FS_TYPE_FILE)return -ENODEV;
     if(vfs_path_mount_flags(path)&MS_RDONLY)return -EROFS;
-    return path->mount->ops->fallocate ? path->mount->ops->fallocate(path->mount->context,
+    int rc=path->mount->ops->fallocate ? path->mount->ops->fallocate(path->mount->context,
         &path->dentry->node,mode,offset,length) : -EOPNOTSUPP;
+    if(!rc && vfs_notify_event)vfs_notify_event(path,IN_MODIFY);
+    return rc;
 }
 
 int vfs_path_sync(const struct vfs_path *path,bool filesystem,bool data_only)
@@ -127,8 +132,13 @@ int vfs_path_utimens(const struct vfs_path *path,int64_t atime,int64_t mtime,boo
 {
     if(!vfs_path_valid(path))return -EINVAL;
     if(vfs_path_mount_flags(path)&MS_RDONLY)return -EROFS;
-    return path->mount->ops->utimens ?
+    int rc=path->mount->ops->utimens ?
         path->mount->ops->utimens(path->mount->context,&path->dentry->node,atime,mtime,set_atime,set_mtime) : -EOPNOTSUPP;
+    if(!rc && vfs_notify_event && (set_atime || set_mtime)) {
+        uint32_t event=set_atime && set_mtime ? IN_ATTRIB : set_atime ? IN_ACCESS : IN_MODIFY;
+        vfs_notify_event(path,event);
+    }
+    return rc;
 }
 
 int vfs_path_readlink(const struct vfs_path *path,char *buffer,size_t capacity,size_t *length)

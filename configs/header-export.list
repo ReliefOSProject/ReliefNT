@@ -35,6 +35,7 @@ include/uapi/linux/if_link.h
 include/uapi/linux/if_packet.h
 include/uapi/linux/in6.h
 include/uapi/linux/input.h
+include/uapi/linux/inotify.h
 include/uapi/linux/ioctl.h
 include/uapi/linux/ipc.h
 include/uapi/linux/kd.h

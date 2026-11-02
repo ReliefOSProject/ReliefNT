@@ -427,6 +427,7 @@ static int proc_mount_view(const char *path,struct task **target)
 struct proc_open_view {
     struct vfs_namespace *ns; struct vfs_path root; bool mountinfo;
     void *memory;
+    const char *inotify_control;
     bool score_valid; int score;
     char *text;
     uint64_t text_size;
@@ -440,7 +441,8 @@ struct proc_open_view {
  * @param flags Sanitized status flags, borrowed and unchanged.
  * @param out Required owned output; legacy stateless files return NULL.
  * @return Zero or negative errno with empty output on failure. Mount views
- * retain a root path; generated leaves and diagnostic readers capture bytes.
+ * retain a root path; generated leaves and diagnostic readers capture bytes,
+ * while inotify controls retain a static key and read the current policy.
  * Namespace ownership outlives its retained paths; final release drops this
  * path even after task exit. Execution-owned, without graph locks across
  * renderers; partition metadata may perform I/O and return its native errno.
@@ -472,6 +474,14 @@ int proc_file_open(const char *name,uint32_t flags,void **out)
 #endif
     if (((flags & LINUX_O_ACCMODE) != LINUX_O_RDONLY || (flags & LINUX_O_TRUNC)) &&
         !proc_control_immediate(name)) return -RELIEFOS_EROFS;
+    const char *inotify_key = proc_inotify_key ? proc_inotify_key(name) : NULL;
+    if (inotify_key) {
+        if ((flags & LINUX_O_ACCMODE) == LINUX_O_WRONLY) return 0;
+        struct proc_open_view *state = kernel_malloc(sizeof(*state));
+        if (!state) return -RELIEFOS_ENOMEM;
+        *state = (struct proc_open_view){.inotify_control = inotify_key};
+        *out = state; return 0;
+    }
     struct task *score_task = NULL;
     if (proc_oom_key(name, &score_task) == 2) {
         int score = oom_proc_score_for_task(score_task);
@@ -523,7 +533,7 @@ int proc_file_open(const char *name,uint32_t flags,void **out)
     *state=(struct proc_open_view){.ns=ns,.mountinfo=view==2};vfs_path_get(root,&state->root);*out=state;return 0;
 }
 
-/** @brief Read a captured mount view or diagnostic snapshot.
+/** @brief Read a captured mount view, live control or diagnostic snapshot.
  * @param value Required borrowed capture, independent of target PID liveness.
  * @param offset Byte position in the mount graph or fixed diagnostic view.
  * @param buffer Kernel-accessible destination, nullable at zero capacity.
@@ -537,6 +547,13 @@ int proc_file_read(void *value,uint64_t offset,void *buffer,uint32_t capacity,ui
 {
     if(!read)return -RELIEFOS_EINVAL;*read=0;
     struct proc_open_view *state=value;if(!state)return -RELIEFOS_EINVAL;
+    if (state->inotify_control) {
+        if (!buffer && capacity) return -RELIEFOS_EINVAL;
+        struct text_stream stream = {.offset=offset,.buffer=buffer,.capacity=capacity};
+        int rc = proc_inotify_emit(state->inotify_control, &stream);
+        if (!rc) *read = stream.written;
+        return rc;
+    }
     if (state->memory) return proc_memory_read(state->memory,offset,buffer,capacity,read);
     if (state->score_valid) {
         if (!buffer && capacity) return -RELIEFOS_EINVAL;
@@ -1284,6 +1301,7 @@ int proc_control_permissions(const char *name, const struct storage_node *node,
     int rc = fs_virtual_permissions(name, node, value, write);
 #endif
     if (rc || write) return rc;
+    if (proc_inotify_key && proc_inotify_key(name)) value->mode = 0644;
     struct task *task = NULL; int which = proc_oom_key(name, &task);
     if (which) {
         if (!task || task->kind != TASK_KIND_USER || (task->flags & TASK_FLAG_RESOURCES_RELEASED))
@@ -1339,6 +1357,7 @@ static int proc_oom_parse(const void *buffer, uint32_t length, int *out)
  */
 bool proc_control_immediate(const char *name)
 {
+    if (proc_inotify_key && proc_inotify_key(name)) return true;
     if (proc_oom_key(name, NULL) == 1) return true;
 #ifdef CONFIG_LOCK_STAT
     if (proc_text_eq(name, "/proc/reliefnt/lock_stats")) return true;
@@ -1352,6 +1371,7 @@ bool proc_control_immediate(const char *name)
  */
 int proc_control_truncate(const char *name, uint64_t length)
 {
+    if (proc_inotify_key && proc_inotify_key(name)) return length ? -EINVAL : 0;
     if (proc_oom_key(name, NULL) == 1) return length ? -EINVAL : 0;
 #ifdef CONFIG_LOCK_STAT
     return proc_lock_stats_truncate(name, length);
@@ -1372,6 +1392,8 @@ int proc_control_write(const char *name, uint64_t offset, const void *buffer,
 {
     if (!written) return -EINVAL;
     *written = 0;
+    if (proc_inotify_key && proc_inotify_key(name))
+        return proc_inotify_write(name, offset, buffer, length, written);
     struct task *task = NULL;
     if (proc_oom_key(name, &task) == 1) {
         int value, rc = proc_oom_parse(buffer, length, &value);

@@ -36,6 +36,11 @@ futimens tools/test_futimens.py
 gpu tools/test_gpu.py
 hda tools/test_hda.py
 input tools/test_input.py
+inotify_abi tools/test_inotify_abi.py
+inotify_adapter tools/test_inotify_adapter.py
+inotify_core tools/test_inotify_core.py
+inotify_proc tools/test_inotify_proc.py
+inotify_vfs tools/test_inotify_vfs.py
 input_routing tools/test_input_routing.py
 installer_ramdisk tools/test_installer_ramdisk.py
 kernel_memory tools/test_kernel_memory.py

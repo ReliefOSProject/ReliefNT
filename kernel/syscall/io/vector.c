@@ -6,6 +6,8 @@
 #include <reliefnt/netlink.h>
 #include <reliefnt/swap.h>
 
+/* Standalone vector fixtures may omit the anonymous inotify provider. */
+extern short task_inotify_poll(const struct task_file *) __attribute__((weak));
 /** @brief Canonicalize only ABI arguments consumed by a vector syscall.
  * @param number Native operation selector.
  * @param raw Borrowed six-register argument array.
@@ -175,6 +177,10 @@ int64_t syscall_vector_io(struct task *task,uint64_t number,uint64_t a0,uint64_t
         if (writing) return -LINUX_EINVAL;
         return task_signalfd_readv(task, file, a1, a2, (uint32_t)positional_flags);
     }
+    if (file && file->kind == TASK_FILE_KIND_INOTIFY) {
+        if (positional && !current_position) return (int64_t)position < 0 ? -LINUX_EINVAL : -LINUX_ESPIPE;
+        if (writing) return -LINUX_EBADF;
+    }
     if (positional && !current_position && (int64_t)position < 0)
         return -RELIEFOS_EINVAL;
     if (positional_flags && !provider_readv)
@@ -222,14 +228,19 @@ int64_t syscall_vector_io(struct task *task,uint64_t number,uint64_t a0,uint64_t
         if ((int64_t)iov[i].iov_len < 0) return -RELIEFOS_EINVAL;
 #ifdef CONFIG_SWAP
         if (iov[i].iov_len &&
-            ((uint64_t)(uintptr_t)iov[i].iov_base<RELIEFNT_USER_BASE ||
+            (((!file || file->kind != TASK_FILE_KIND_INOTIFY) &&
+              (uint64_t)(uintptr_t)iov[i].iov_base<RELIEFNT_USER_BASE) ||
              (uint64_t)(uintptr_t)iov[i].iov_base>=RELIEFNT_USER_TOP ||
              iov[i].iov_len>RELIEFNT_USER_TOP-(uint64_t)(uintptr_t)iov[i].iov_base))
             return -RELIEFOS_EFAULT;
 #endif
         if (iov[i].iov_len > 0x7ffff000u - requested) iov[i].iov_len = 0x7ffff000u - requested;
 #ifndef CONFIG_SWAP
-        if (iov[i].iov_len && !(writing ? user_range_ok((uintptr_t)iov[i].iov_base, iov[i].iov_len) :
+        if (iov[i].iov_len && file && file->kind == TASK_FILE_KIND_INOTIFY) {
+            uint64_t address = (uintptr_t)iov[i].iov_base;
+            if (address >= RELIEFNT_USER_TOP || iov[i].iov_len > RELIEFNT_USER_TOP - address)
+                return -RELIEFOS_EFAULT;
+        } else if (iov[i].iov_len && !(writing ? user_range_ok((uintptr_t)iov[i].iov_base, iov[i].iov_len) :
             user_range_writable((uintptr_t)iov[i].iov_base, iov[i].iov_len))) return -RELIEFOS_EFAULT;
 #endif
         requested += iov[i].iov_len;
@@ -251,6 +262,9 @@ int64_t syscall_vector_io(struct task *task,uint64_t number,uint64_t a0,uint64_t
     total = 0;
     for (uint64_t i = 0; i < a2; ++i) {
         if (!iov[i].iov_len) continue;
+        /* Once a vector copied a record, never park on a later empty vector. */
+        if (total && file && file->kind == TASK_FILE_KIND_INOTIFY &&
+            task_inotify_poll && !task_inotify_poll(file)) break;
         /* The vector loop already validated its request. Reuse the same
          * scalar checks without recursively allocating the large legacy
          * dispatcher frame for every iovec. */

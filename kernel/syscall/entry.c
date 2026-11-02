@@ -4,6 +4,8 @@
 #include <reliefnt/proc_stats.h>
 #include <reliefnt/module.h>
 #include <reliefnt/usb.h>
+#include <reliefnt/fsnotify_vfs.h>
+#include <linux/inotify.h>
 
 /** @brief Distinguish a nonblocking stream result from an internal I/O wait.
  * @param task Current task under execution ownership, nullable.
@@ -95,7 +97,7 @@ static int syscall_eagain_is_nonblocking_device(struct task *task,
                            TASK_FILE_FLAG_EVENTFD)) {
             return 1;
         }
-        if (file->kind == TASK_FILE_KIND_SIGNALFD) return 1;
+        if (file->kind == TASK_FILE_KIND_SIGNALFD || file->kind == TASK_FILE_KIND_INOTIFY) return 1;
         if ((file->flags & TASK_FILE_FLAG_DEV_NODE) &&
             (task_device_is(file, STORAGE_DEV_KIND_KEYBOARD) ||
              task_device_is(file, STORAGE_DEV_KIND_MOUSE) ||
@@ -158,6 +160,7 @@ static int task_begin_syscall_io(struct task *task, uint64_t number, int32_t fd,
         number == LINUX_SYS_FSYNC || number == LINUX_SYS_FDATASYNC ||
         number == LINUX_SYS_SYNCFS || number == LINUX_SYS_LSEEK ||
         number == LINUX_SYS_TIMERFD_SETTIME || number == LINUX_SYS_TIMERFD_GETTIME ||
+        number == LINUX_SYS_INOTIFY_ADD_WATCH || number == LINUX_SYS_INOTIFY_RM_WATCH ||
         number == LINUX_SYS_UTIMENSAT || number == LINUX_SYS_FUTIMESAT ||
         number == LINUX_SYS_IOCTL ||
         number == LINUX_SYS_PREAD64 || number == LINUX_SYS_PWRITE64 ||
@@ -445,6 +448,16 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
                 calling_task->proc_write_chars += (uint64_t)result;
             ++calling_task->proc_write_calls;
         }
+        /* Linux reports successful vectored and directory reads even at EOF;
+         * scalar reads publish ACCESS only when they transferred bytes. */
+        bool scalar_access = (number == LINUX_SYS_READ || number == LINUX_SYS_PREAD64) && result > 0;
+        bool vector_access = (number == LINUX_SYS_READV || number == LINUX_SYS_PREADV ||
+                              number == LINUX_SYS_PREADV2 || number == LINUX_SYS_GETDENTS ||
+                              number == LINUX_SYS_GETDENTS64) && result >= 0;
+        struct task_file *access_file = calling_task->syscall_file;
+        if ((scalar_access || vector_access) && access_file && access_file->path_ref.mount &&
+            !(access_file->flags & TASK_FILE_FLAG_PATH) && vfs_notify_event)
+            vfs_notify_event(&access_file->path_ref, IN_ACCESS);
     }
     if (restored_signal_frame) {
         /* sigreturn and successful exec already supplied the user context. */

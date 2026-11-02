@@ -132,6 +132,7 @@ struct task_file {
     struct vfs_open_file *provider_file; /* Optional state shared by this canonical OFD. */
     struct character_file *character_file; /* Exact character provider owned once per canonical OFD. */
     bool inode_write_access; /* One writable lease per canonical OFD. */
+    bool notify_open; /* OPEN was published for this OFD; emit CLOSE only once. */
     uint64_t offset;
     uint64_t aux;
     /* Per-descriptor device state; currently the evdev EVIOCGRAB token. */
@@ -162,6 +163,7 @@ struct task_file {
 
 #define TASK_FILE_KIND_SIGNALFD 1u
 #define TASK_FILE_KIND_DRM_PRIME 4u
+#define TASK_FILE_KIND_INOTIFY 5u
 
 static inline struct task_file *task_file_description(struct task_file *file)
 {

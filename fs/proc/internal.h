@@ -45,6 +45,40 @@ int proc_control_truncate(const char *name, uint64_t length);
 bool proc_control_immediate(const char *name);
 struct task;
 struct text_stream;
+/* Standalone legacy proc fixtures omit optional producers. Production Kbuild
+ * always links inotify.o and the fs/notify core; its definitions are strong. */
+#ifdef RELIEFNT_PROC_INOTIFY_IMPLEMENTATION
+#define PROC_INOTIFY_LINKAGE
+#else
+#define PROC_INOTIFY_LINKAGE __attribute__((weak))
+#endif
+/** @brief Identify an inotify sysctl directory or value by intrinsic key.
+ * @param name Nullable borrowed key. @return File=1, directory=2, absent=0.
+ */
+int proc_inotify_kind(const char *name) PROC_INOTIFY_LINKAGE;
+/** @brief Borrow the static canonical key for a supported inotify value.
+ * @param name Nullable intrinsic key. @return Static key or NULL, no ownership.
+ */
+const char *proc_inotify_key(const char *name) PROC_INOTIFY_LINKAGE;
+/** @brief Stream the current inotify limit while execution ownership is held.
+ * @param name Intrinsic value key. @param stream Required output stream.
+ * @return Zero or -ENOENT; no references or state are changed.
+ */
+int proc_inotify_emit(const char *name, struct text_stream *stream) PROC_INOTIFY_LINKAGE;
+/** @brief Enumerate inotify's three sysctl values with a rewindable cookie.
+ * @param offset Required in/out cookie. @param entry Required output.
+ * @return Entry=1 or EOF=0; no references escape.
+ */
+int proc_inotify_readdir(uint64_t *offset, struct reliefos_dir_entry *entry) PROC_INOTIFY_LINKAGE;
+/** @brief Apply a numeric inotify sysctl under the caller's execution writer.
+ * @param name Intrinsic key. @param offset Byte position; later writes are ignored.
+ * @param buffer Validated input bytes. @param length Byte count.
+ * @param written Required actual count, cleared on failure.
+ * @return Zero or negative errno; VFS enforces root-owned mode and mount policy.
+ */
+int proc_inotify_write(const char *name, uint64_t offset, const void *buffer,
+                       uint32_t length, uint32_t *written) PROC_INOTIFY_LINKAGE;
+#undef PROC_INOTIFY_LINKAGE
 /** @brief Resolve a validated proc process/thread path; no references escape.
  * @param path Intrinsic path. @param leaf Required borrowed remaining name.
  * @return Borrowed live task or NULL, under caller execution ownership. */

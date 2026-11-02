@@ -160,6 +160,10 @@ static int64_t syscall_dispatch_normalized_inner(const struct syscall_frame *fra
     case LINUX_SYS_COPY_FILE_RANGE:
     case LINUX_SYS_EVENTFD:
     case LINUX_SYS_EVENTFD2:
+    case LINUX_SYS_INOTIFY_INIT:
+    case LINUX_SYS_INOTIFY_INIT1:
+    case LINUX_SYS_INOTIFY_ADD_WATCH:
+    case LINUX_SYS_INOTIFY_RM_WATCH:
     case LINUX_SYS_SIGNALFD:
     case LINUX_SYS_SIGNALFD4:
     case LINUX_SYS_PROCESS_VM_READV:
@@ -488,6 +492,9 @@ int64_t syscall_dispatch_regs_legacy(uint64_t number, uint64_t a0, uint64_t a1, 
     if (number == LINUX_SYS_EPOLL_PWAIT2)
         return syscall_legacy_events(number, a0, a1, a2, a3, a4, a5);
     if (number == LINUX_SYS_EVENTFD || number == LINUX_SYS_EVENTFD2)
+        return syscall_legacy_events(number, a0, a1, a2, a3, a4, a5);
+    if (number == LINUX_SYS_INOTIFY_INIT || number == LINUX_SYS_INOTIFY_INIT1 ||
+        number == LINUX_SYS_INOTIFY_ADD_WATCH || number == LINUX_SYS_INOTIFY_RM_WATCH)
         return syscall_legacy_events(number, a0, a1, a2, a3, a4, a5);
     if (number == LINUX_SYS_SIGNALFD || number == LINUX_SYS_SIGNALFD4)
         return syscall_legacy_events(number, a0, a1, a2, a3, a4, a5);

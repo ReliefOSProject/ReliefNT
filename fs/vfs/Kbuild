@@ -4,6 +4,6 @@ obj-y := attributes.o cluster_inode.o dentry.o exec_file.o file.o initial.o inod
 
 obj-y += cluster_times.o storage_access.o kernel_file.o kernel_path.o open.o storage_mount.o
 obj-y += filesystems.o
-obj-y += filesystem_instance.o
+obj-y += filesystem_instance.o notify.o
 
 include $(srctree)/scripts/Makefile.module

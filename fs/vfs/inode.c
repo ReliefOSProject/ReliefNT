@@ -2,6 +2,7 @@
 #include "../../block/core/storage_internal.h"
 #include <reliefnt/page_cache.h>
 #include <reliefnt/permissions.h>
+#include <reliefnt/fsnotify_vfs.h>
 
 /* Reference backing objects independently of directory links. The storage
  * execution lock protects this list, lookup, unlink and inode allocation. */
@@ -49,7 +50,8 @@ int storage_inode_cache_node(struct storage_node *node)
     size_t unused=0;struct storage_inode_ref **victim=NULL;
     for(struct storage_inode_ref **link=&storage_inode_refs;*link;link=&(*link)->next)
         if(storage_inode_clustered(&(*link)->node) && !(*link)->references && !(*link)->unlinked) {
-            ++unused;if(!victim && !page_cache_has_inode(&(*link)->node))victim=link;
+            ++unused;if(!victim && !page_cache_has_inode(&(*link)->node) &&
+                (!vfs_notify_storage_node_watched || !vfs_notify_storage_node_watched(&(*link)->node)))victim=link;
         }
     if(unused>=128 && victim) {
         ref=*victim;*victim=ref->next;kernel_free(ref);

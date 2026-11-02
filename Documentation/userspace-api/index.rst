@@ -10,5 +10,6 @@
    abi
    exec
    descriptors
+   inotify
    ipv6
    procfs

@@ -41,6 +41,7 @@ static bool lookup_path_call(uint64_t number)
 {
     switch(number) {
     case __NR_open: case __NR_openat: case __NR_openat2: case __NR_creat:
+    case __NR_inotify_add_watch:
     case __NR_stat: case __NR_lstat: case __NR_fstat: case __NR_newfstatat: case __NR_statx:
     case __NR_chdir: case __NR_fchdir: case __NR_chroot:
     case __NR_mkdir: case __NR_mkdirat: case __NR_rmdir:

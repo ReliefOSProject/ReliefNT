@@ -19,7 +19,7 @@ static const char *fs_leaves[] = {"nr_open",
                                   "file-max",
                                   "pipe-max-size",
                                   "pipe-user-pages-soft",
-                                  "pipe-user-pages-hard"};
+                                  "pipe-user-pages-hard", "inotify"};
 static const char *task_leaves[] = {"status",       "statm",  "maps", "smaps",
                                     "smaps_rollup", "limits", "auxv", "io"};
 
@@ -68,6 +68,10 @@ int proc_extra_kind(const char *path)
 {
     if (!path)
         return 0;
+    if (proc_inotify_kind) {
+        int kind = proc_inotify_kind(path);
+        if (kind) return kind;
+    }
     if (!__builtin_strcmp(path, "/proc/self") || !__builtin_strcmp(path, "/proc/thread-self"))
         return sched_current_task() ? 3 : 0;
     if (!__builtin_strcmp(path, "/proc/net") || !__builtin_strcmp(path, "/proc/sys/fs"))
@@ -648,6 +652,8 @@ int proc_extra_emit(const char *path, struct text_stream *s)
         return 0;
     }
     if (!__builtin_strncmp(path, "/proc/sys/fs/", 13)) {
+        if (proc_inotify_key && proc_inotify_key(path))
+            return proc_inotify_emit(path, s);
         const char *name = path + 13;
         if (!__builtin_strcmp(name, "nr_open"))
             field(s, "", SCHED_NR_OPEN, "\n");
@@ -806,8 +812,14 @@ int proc_extra_readdir(const char *path, uint64_t *offset, struct reliefos_dir_e
 {
     if (!__builtin_strcmp(path, "/proc/net"))
         return entries(net_leaves, sizeof(net_leaves) / sizeof(*net_leaves), offset, entry);
-    if (!__builtin_strcmp(path, "/proc/sys/fs"))
-        return entries(fs_leaves, sizeof(fs_leaves) / sizeof(*fs_leaves), offset, entry);
+    if (!__builtin_strcmp(path, "/proc/sys/fs")) {
+        int rc = entries(fs_leaves, sizeof(fs_leaves) / sizeof(*fs_leaves), offset, entry);
+        if (rc == 1 && !__builtin_strcmp(entry->name, "inotify"))
+            entry->type = RELIEFOS_FS_TYPE_DIR;
+        return rc;
+    }
+    if (!__builtin_strcmp(path, "/proc/sys/fs/inotify") && proc_inotify_readdir)
+        return proc_inotify_readdir(offset, entry);
     const char *leaf = NULL;
     struct task *t = proc_view_task(path, &leaf);
     if (!t || !leaf)

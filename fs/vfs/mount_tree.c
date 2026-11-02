@@ -26,6 +26,7 @@ static void vfs_queue_retirement(struct vfs_mount *mount)
 static bool vfs_finish_retirement(struct vfs_mount *mount)
 {
     if(mount->ops->finish && mount->ops->finish(mount->context))return false;
+    if(vfs_notify_mount_retired)vfs_notify_mount_retired(mount);
     struct module *owner=mount->owner;
     if(mount->ops->destroy)mount->ops->destroy(mount->context);
     kernel_free(mount->source);kernel_free(mount);module_put(owner);return true;
@@ -81,6 +82,7 @@ void vfs_dentry_put(struct vfs_mount *mount,struct vfs_dentry *dentry)
             while(*link && *link!=dentry)link=&(*link)->next;
             if(*link)*link=dentry->next;
         }
+        if(vfs_notify_dentry_retired)vfs_notify_dentry_retired(mount,dentry);
         mount->ops->release(mount->context,&dentry->node,dentry->backend_pin);
         if(parent)kernel_free(dentry->name);
         kernel_free(dentry);dentry=parent;
@@ -154,6 +156,8 @@ int vfs_mount_new(const struct vfs_backend_ops *ops,void *context,struct module 
     int rc=ops->retain(context,root,&mount->root->backend_pin);
     if(rc){kernel_free(mount->root);kernel_free(mount);module_put(owner);return rc;}
     mount->policy=ops->mount_flags ? vfs_policy_bits(ops->mount_flags(context)) : 0;
+    if(vfs_notify_mount_created)vfs_notify_mount_created(mount);
+    if(vfs_notify_dentry_created)vfs_notify_dentry_created(mount,mount->root);
     *out=mount;return 0;
 }
 
@@ -166,6 +170,7 @@ int vfs_path_anonymous(struct vfs_mount *mount,const struct storage_node *node,s
     int rc=mount->ops->retain(mount->context,node,&dentry->backend_pin);
     if(rc){kernel_free(dentry);return rc;}
     ++mount->root->references;
+    if(vfs_notify_dentry_created)vfs_notify_dentry_created(mount,dentry);
     struct vfs_path value={mount,dentry};vfs_path_get(&value,out);return 0;
 }
 
@@ -318,6 +323,7 @@ int vfs_bind_child(const struct vfs_path *parent,const char *name,
         if(rc){kernel_free(dentry->name);kernel_free(dentry);return rc;}
         ++parent->dentry->references;
         dentry->next=parent->dentry->children;parent->dentry->children=dentry;
+        if(vfs_notify_dentry_created)vfs_notify_dentry_created(mount,dentry);
     }
     /* The inode identity stays pinned, while size/type/permission metadata
      * may have changed since an older directory handle was acquired. */

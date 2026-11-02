@@ -123,6 +123,7 @@ PID inode 保留任务身份令牌，PID 被复用后不会自动指向新任务
 dup 共享已打开的视图，重新打开会生成新视图。快照不采用固定 4 KiB 截断；
 分配失败返回 ``ENOMEM``。这与 Linux 各 proc 文件的实时/seq_file 行为存在差异。
 原有 ``cmdline``、``environ``、mount view 和诊断文件仍遵守各自既有读取规则。
+``/proc/sys/fs/inotify`` 下的控制值在读取时取当前策略，不使用打开时快照。
 
 策略节点
 ========
@@ -137,6 +138,10 @@ dup 共享已打开的视图，重新打开会生成新视图。快照不采用�
   仍受内存和每进程 rlimit 限制。
 * ``/proc/sys/fs/pipe-max-size``、``pipe-user-pages-soft``、``pipe-user-pages-hard``：
   来自管道实现的现行容量、软限制及零值的未设置硬限制。
+
+``/proc/sys/fs/inotify/{max_user_instances,max_user_watches,max_queued_events}``
+是可写策略，root 可调整实例、监听和新队列的容量，普通用户只读。
+默认值、超限错误及事件丢失恢复见 :doc:`inotify`。
 
 验证入口
 ========
