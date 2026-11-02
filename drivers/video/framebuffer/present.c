@@ -33,6 +33,8 @@ static void framebuffer_present_region_internal(uint32_t x, uint32_t y,
         svga_unlock(flags);
         return;
     }
+    /* A pixel aperture may be WC while FIFO/register storage stays UC. */
+    vmware_svga_memory_fence();
     if (timer_refresh && svga.traces_enabled) {
         svga_unlock(flags);
         return;
@@ -215,8 +217,10 @@ int framebuffer_drm_present_region(const void *pixels, uint32_t pitch,
     for (uint32_t y = y1; y < y2; ++y) {
         uint8_t *destination = framebuffer_pixel_ptr(x1, y);
         const uint8_t *row = source + (uint64_t)y * pitch + (uint64_t)x1 * 4u;
-        __builtin_memcpy(destination, row, (uint64_t)(x2 - x1) * 4u);
+        framebuffer_copy_io32(destination, row, x2 - x1);
     }
+    /* Drain even when FIFO pressure defers publication to another CPU/tick. */
+    vmware_svga_memory_fence();
 
     uint64_t flags = svga_lock();
     if (!framebuffer_drm_owned()) {

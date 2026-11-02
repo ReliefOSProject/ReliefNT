@@ -12,6 +12,12 @@ struct svga_device svga;
 static uint32_t registers[64], selected;
 static uint32_t enable_writes[8], enable_write_count;
 static bool deny_alias, deny_uc, invalid_after_enable, deny_enable_ack;
+static bool pat_ready=true, wc_retained, deny_wc;
+static uint32_t pixel_bar=DEVICE_BASE|8u, pixel_bar_high;
+static unsigned wc_promotions;
+bool arch_pat_writecombine_ready(void){return pat_ready;}
+bool paging_mmio_writecombine_boot(uint64_t physical,uint64_t bytes)
+{ assert(physical==DEVICE_BASE && bytes==65536);++wc_promotions;return wc_retained=!deny_wc; }
 
 /** @brief Emulate SVGA register writes, requiring disabled geometry changes.
  * @param value Register index or data. @param port I/O port.
@@ -51,7 +57,8 @@ int pci_find_device(uint16_t vendor, uint16_t device, struct pci_device *out)
  * @param reg Config offset. @return I/O BAR.
  */
 uint32_t pci_config_read32(uint8_t b, uint8_t s, uint8_t f, uint8_t reg)
-{ (void)b; (void)s; (void)f; assert(reg == 0x10); return 0x1001; }
+{ (void)b; (void)s; (void)f; if(reg==0x14)return pixel_bar;
+  if(reg==0x18)return pixel_bar_high;assert(reg == 0x10); return 0x1001; }
 /** @brief Supply PCI command state. @param b Bus. @param s Slot. @param f Function.
  * @param reg Config offset. @return Zero initial command.
  */
@@ -163,7 +170,29 @@ int main(int argc, char **argv)
                registers[VMWARE_SVGA_REG_PSEUDOCOLOR] == 0);
         if (already_enabled) assert(!enable_write_count);
         else assert(enable_write_count == 2 && enable_writes[0] == 0 && enable_writes[1] == 1);
+        pat_ready=false;assert(!framebuffer_enable_writecombine_boot());pat_ready=true;
+        pixel_bar=DEVICE_BASE;assert(!framebuffer_enable_writecombine_boot());
+        pixel_bar=(DEVICE_BASE+4096)|8u;assert(!framebuffer_enable_writecombine_boot());
+        pixel_bar=DEVICE_BASE|10u;assert(!framebuffer_enable_writecombine_boot());
+        pixel_bar=DEVICE_BASE|12u;pixel_bar_high=1;
+        assert(!framebuffer_enable_writecombine_boot());pixel_bar_high=0;
+        pixel_bar=DEVICE_BASE|8u;
+        registers[VMWARE_SVGA_REG_MEM_START]=DEVICE_BASE;
+        registers[VMWARE_SVGA_REG_MEM_SIZE]=4096;
+        assert(!framebuffer_enable_writecombine_boot() && !wc_promotions);
+        registers[VMWARE_SVGA_REG_MEM_START]=DEVICE_BASE+65536;
+        deny_wc=already_enabled;
+        assert(framebuffer_enable_writecombine_boot()==!deny_wc && wc_promotions==1);
+        if(!deny_wc) {
+            deny_uc=true;
+            assert(vmware_map_pixels(DEVICE_BASE,65536));
+            assert(wc_promotions==1);
+        }
     }
     printf("PASS VMware probe %s\n", scenario);
     return 0;
 }
+
+/* These non-PAT fixtures retain the original UC-only aperture. */
+bool paging_mmio_writecombined(uint64_t physical,uint64_t bytes)
+{ return wc_retained && physical==DEVICE_BASE && bytes==65536; }

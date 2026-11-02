@@ -27,11 +27,11 @@ uint64_t *paging_kernel_root_table(void);
 bool paging_nx_ready(void);
 /** @brief Read one preexisting boot MMIO cache claim before root publication.
  * @param index Zero-based claim index. @param start Required inclusive output.
- * @param end Required exclusive output. @param uncached Required policy output.
+ * @param end Required exclusive output. @param cache_flags Exact PAT selector output.
  * @return True for a claim, false past the last. BSP boot context only.
  */
 bool paging_boot_mmio_run(uint32_t index, uint64_t *start, uint64_t *end,
-                          bool *uncached);
+                          uint64_t *cache_flags);
 /** @brief Publish new direct-map roots and retain the minimal low identity map.
  * @param branches 128 caller-owned, image-resident PDPT page arrays.
  * BSP boot context before user roots and APs; reloads CR3 after publication.

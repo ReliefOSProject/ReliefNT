@@ -524,6 +524,7 @@ IRQ_STUB irq14_stub 0x2e
 IRQ_STUB irq15_stub 0x2f
 IRQ_STUB irq32_stub 0x40
 IRQ_STUB irq_membarrier_stub 0x41
+IRQ_STUB irq_reschedule_stub 0x42
 IRQ_STUB irq_msi_50_stub 0x50
 IRQ_STUB irq_msi_51_stub 0x51
 IRQ_STUB irq_msi_52_stub 0x52

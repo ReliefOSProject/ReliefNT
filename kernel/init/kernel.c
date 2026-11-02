@@ -14,6 +14,7 @@
 #include <reliefnt/inventory.h>
 #include <reliefnt/kernel_debug.h>
 #include <reliefnt/kernel.h>
+#include <reliefnt/lock.h>
 #include <reliefnt/mm.h>
 #include <reliefnt/memory_topology.h>
 #include <reliefnt/heap.h>
@@ -26,6 +27,7 @@
 #include <reliefnt/platform.h>
 #include <reliefnt/power.h>
 #include <reliefnt/paging.h>
+#include <reliefnt/pat.h>
 #include <reliefnt/pty.h>
 #include <reliefnt/page_cache.h>
 #include <reliefnt/object.h>
@@ -346,6 +348,10 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
                 (uint64_t)(uintptr_t)boot.modules[i].name);
         }
     }
+    /* Boot strings now use retained aliases. Only this BSP exists and no user
+     * roots exist; later APs/users must inherit the same final PAT policy. */
+    if (arch_pat_boot_init(!cmdline_has(&boot,"nopat")))
+        (void)framebuffer_enable_writecombine_boot();
     console_info("[memory] total_kib=%llu free_kib=%llu page_bytes=4096\n",
                  (unsigned long long)mm_total_memory_kib(),
                  (unsigned long long)mm_free_memory_kib());
@@ -375,7 +381,7 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
     idt_init();
     console_info("[boot] GDT/TSS/IDT installed; probing VMware graphics acceleration\n");
     /* Bootstrap page tables are complete. svga3d_init drains the legacy FIFO,
-     * keeps scan-out VRAM UC, and validates the FIFO BAR mapping policy before
+     * retains the selected VRAM policy, and validates the FIFO BAR before
      * issuing 3D FIFO or guest-memory commands. */
     int svga_ret = svga3d_init();
     struct svga_info boot_svga_info;
@@ -483,6 +489,12 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
     }
     console_info("[boot] virtual terminals tty1-tty6 ready; preparing PID 1\n");
     userland_init(&boot);
+    /* The PM clock and task table are ready, with no shared locks held.
+     * Give the BSP the same local preemption checks as the APs while the PIT
+     * remains the sole source of the public 100 Hz tick clock. */
+    uint64_t preempt_flags = kernel_irq_save();
+    apic_timer_init(0x40u, APIC_SCHED_TICK_HZ, APIC_SCHED_FALLBACK_COUNT);
+    kernel_irq_restore(preempt_flags);
     /* All initial task objects are now present. APs may enter the shared
      * scheduler without racing the bootstrap task construction above. */
     console_info("[boot] starting secondary CPUs discovered=%u\n", smp_cpu_count());

@@ -97,11 +97,12 @@ static void test_measured_period_and_wrap(void)
 {
     const uint64_t rates[] = {4200000, 62500000};
     const uint32_t masks[] = {0x00ffffff, UINT32_MAX};
-    for (unsigned i = 0; i < 2; ++i) for (unsigned j = 0; j < 2; ++j) {
+    const uint32_t frequencies[] = {100, 250, 1000};
+    for (unsigned i = 0; i < 2; ++i) for (unsigned j = 0; j < 2; ++j) for (unsigned k = 0; k < 3; ++k) {
         reset(); fixture_rate = rates[i]; reference_mask = masks[j];
         reference_offset = masks[j] - 10000; /* cross a real 24/32-bit wrap */
-        apic_timer_init(0x40, 1000000);
-        uint32_t expected = (uint32_t)(fixture_rate / 100);
+        apic_timer_init(0x40, frequencies[k], 1000000);
+        uint32_t expected = (uint32_t)(fixture_rate / frequencies[k]);
         assert(programmed_count >= expected - 1 && programmed_count <= expected + 1);
         assert(programmed_lvt == (0x40u | (1u << 17)) && programmed_divide == 3);
         assert(barrier_polls && barrier_polls <= APIC_TIMER_CALIBRATION_POLL_LIMIT);
@@ -122,24 +123,25 @@ static void test_bounded_failures(void)
         case 6: fixture_rate = 1; break;
         case 7: slow_snapshot = true; break;
         }
-        apic_timer_init(0x40, 1000000);
+        apic_timer_init(0x40, 100, 1000000);
         assert_periodic(1000000);
         assert(barrier_polls <= APIC_TIMER_CALIBRATION_POLL_LIMIT);
         if (fault == 0 || fault == 7) assert(barrier_polls == APIC_TIMER_CALIBRATION_POLL_LIMIT);
     }
     reset(); fixture_rate = 60000000000ULL; /* one-shot expires within the window */
-    apic_timer_init(0x40, 1000000); assert_periodic(1000000);
+    apic_timer_init(0x40, 100, 1000000); assert_periodic(1000000);
     reset(); stalled_reference = true;
-    apic_timer_init(0x40, 0); assert_periodic(1000000);
+    apic_timer_init(0x40, 100, 0); assert_periodic(1000000);
+    reset(); apic_timer_init(0x40, 0, 1000000); assert(!writes && !barrier_polls);
     reset(); local_apic_enabled = false;
-    apic_timer_init(0x40, 1000000); assert(!writes && !barrier_polls);
+    apic_timer_init(0x40, 100, 1000000); assert(!writes && !barrier_polls);
 }
 static void test_single_pm_wrap_pause(void)
 {
     const uint64_t pauses[] = {25000, 75000};
     for (unsigned i = 0; i < sizeof(pauses) / sizeof(pauses[0]); ++i) {
         reset(); pause_at_us = pauses[i];
-        apic_timer_init(0x40, 1000000);
+        apic_timer_init(0x40, 100, 1000000);
         assert(pause_done);
         assert_periodic(1000000);
     }

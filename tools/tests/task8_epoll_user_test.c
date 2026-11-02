@@ -27,6 +27,8 @@ bool user_range_writable(uint64_t address,uint64_t length)
 }
 uint64_t kernel_poll_readiness_generation(void) { return 0; }
 uint64_t task_socket_event_generation(const struct task_file *file) { (void)file;return 0; }
+uint64_t input_evdev_event_generation_vt(uint32_t kind,uint64_t token,uint32_t vt)
+{ (void)kind;(void)token;(void)vt;return 0; }
 uint64_t time_ticks(void) { return 100; }
 int64_t syscall_poll_impl(struct task *task,struct pollfd *p,uint32_t count,int64_t timeout,uint64_t generation)
 { assert(task==&current && count==1 && !timeout);(void)generation;p->revents=POLLIN;return 1; }

@@ -20,6 +20,10 @@ static int64_t expected_realtime_minus_monotonic_ns;
 
 uint64_t time_test_rdtsc(void) { return fake_tsc; }
 bool time_test_tsc_safe(void) { return fake_tsc_safe; }
+uint8_t x86_64_inb(uint16_t port)
+{ (void)port; assert(!"unexpected PIT/CMOS access in counter fixture"); return 0; }
+void x86_64_outb(uint8_t value, uint16_t port)
+{ (void)value; (void)port; assert(!"unexpected PIT/CMOS access in counter fixture"); }
 
 void kernel_spin_lock_irqsave(struct kernel_spinlock *lock, uint64_t *flags)
 {
@@ -415,6 +419,31 @@ int main(void)
     }
     assert(tsc_ready == 1);
     assert(tsc_per_us == 2400);
+
+    /* A short kernel work budget must keep progressing while PIT delivery is
+     * delayed. This compares only one CPU's counter; SMP user-TSC clocks stay
+     * disabled and the legacy uptime contract remains unchanged. */
+    fake_cpu_count = fake_online_cpus = 4;
+    tsc_trusted = 0;
+    tsc_ready = 1;
+    tsc_per_us = 2000;
+    pit_divisor = 0;
+    ticks = 20;
+    fake_tsc = 1000000000000ULL;
+    uptime_tsc_anchor = fake_tsc;
+    uint64_t work_start = time_work_counter_us();
+    fake_tsc += 200000 * tsc_per_us;
+    assert(time_uptime_us() == 210000); /* old interpolation saturated */
+    assert(time_work_counter_us() - work_start == 200000);
+    ++ticks;
+    uptime_tsc_anchor = fake_tsc;
+    fake_tsc += 2000 * tsc_per_us;
+    assert(time_work_counter_us() - work_start == 202000);
+    tsc_ready = 0;
+    assert(time_work_counter_us() == 210000);
+    tsc_ready = 1;
+    tsc_per_us = 0;
+    assert(time_work_counter_us() == 210000);
 
     assert(!held);
     puts("PASS real timekeeper/vvar: continuous tick and adjtime, settime, coarse data, and unsafe fallback");

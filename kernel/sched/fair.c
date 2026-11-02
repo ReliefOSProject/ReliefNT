@@ -1,4 +1,5 @@
 #include "internal.h"
+#include <reliefnt/power.h>
 
 static struct task *fair_task(struct eevdf_entity *entity);
 
@@ -11,10 +12,40 @@ static uint32_t fair_choose_cpu(const struct task *task);
 static struct task *fair_pick_cpu(uint32_t cpu);
 
 
+/**
+ * @brief Sample nondecreasing fairness time independent of pending PIT IRQs.
+ * @return Microseconds in the shared scheduling domain, with legacy fallback.
+ * Caller holds scheduler_lock or exclusive bootstrap ownership. The ACPI PM
+ * register is shared by CPUs and needs no TSC offset assumption. Preserve
+ * fractional cycles and extend 24/32-bit wrap; ordinary scheduling samples
+ * within one wrap. Source loss/mask changes reanchor at the previous floor.
+ * No allocation, callback or clock/user ABI update occurs.
+ */
 uint64_t fair_now(void)
 {
     uint64_t now = time_uptime_us();
-    /* PIT interpolation can cross an unserviced tick with IRQs masked. */
+    uint32_t reference, mask;
+    if (power_acpi_pm_timer_read(&reference, &mask) &&
+        (mask == 0x00ffffffu || mask == UINT32_MAX)) {
+        reference &= mask;
+        if (!fair_reference.valid || fair_reference.mask != mask) {
+            fair_reference = (struct fair_clock_reference){
+                .microseconds = now > fair_clock ? now : fair_clock,
+                .last = reference, .mask = mask, .valid = true};
+        } else {
+            uint64_t cycles = (reference - fair_reference.last) & mask;
+            uint64_t scaled = cycles * 1000000u + fair_reference.remainder;
+            uint64_t elapsed = scaled / ACPI_PM_TIMER_HZ;
+            fair_reference.remainder = scaled % ACPI_PM_TIMER_HZ;
+            fair_reference.last = reference;
+            if (UINT64_MAX - fair_reference.microseconds < elapsed)
+                fair_reference.microseconds = UINT64_MAX;
+            else fair_reference.microseconds += elapsed;
+        }
+        if (fair_reference.microseconds > now)
+            now = fair_reference.microseconds;
+    } else fair_reference.valid = false;
+    /* Neither a source transition nor legacy interpolation can rewind V. */
     if (now > fair_clock) fair_clock = now;
     return fair_clock;
 }

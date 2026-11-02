@@ -15,6 +15,13 @@ struct pci_device;
  * allocation, I/O, optional-provider dependency or ownership transfer.
  */
 int framebuffer_vmware_pci_identity(struct pci_device *out);
+/** @brief Enable WC for a verified, prefetchable SVGA pixel aperture at boot.
+ * @return True after conversion; false retains the current conservative policy.
+ * BSP only after sparse-map setup and before APs/users. Requires PAT, rejects
+ * overlap with FIFO/register storage and never retypes ordinary RAM or live
+ * aliases. Later modesets preserve this permanent policy.
+ */
+bool framebuffer_enable_writecombine_boot(void);
 
 struct framebuffer {
     uint32_t *pixels;

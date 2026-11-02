@@ -974,6 +974,19 @@ uint64_t time_uptime_us(void)
     return (ticks * 1000000ULL) / RELIEFNT_TICK_HZ;
 }
 
+/** @brief Read a CPU-local elapsed-work counter without a one-tick cap.
+ * @return Raw local TSC scaled by the settled calibration, or legacy uptime
+ * when the rate is unavailable. Caller compares only within one fixed-CPU
+ * invocation; counter/clock-source changes may cause an early checkpoint.
+ * No lock, allocation, migration or user-clock update occurs. Cross-CPU TSC
+ * synchronization is deliberately not assumed and this is not a clock ID.
+ */
+uint64_t time_work_counter_us(void)
+{
+    uint64_t rate = tsc_ready ? tsc_per_us : 0;
+    return rate ? time_rdtsc() / rate : time_uptime_us();
+}
+
 /**
  * @brief Copy a consistent wall-clock calendar and uptime snapshot.
  * @param info Required writable kernel output, updated only when the clock is valid.
@@ -1063,3 +1076,4 @@ EXPORT_SYMBOL(time_clock_get);
 
 EXPORT_SYMBOL(time_clock_getres);
 EXPORT_SYMBOL(time_uptime_us);
+EXPORT_SYMBOL(time_work_counter_us);

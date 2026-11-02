@@ -48,7 +48,7 @@ static int64_t syscall_getdents_staged(struct task *task,uint64_t number,int32_t
     buffer=task->regular_io.buffer;capacity=(uint32_t)task->regular_io.count;
     uint32_t written=(uint32_t)task->regular_io.done;int error=0;
     file->io_owner=task->pid;
-    storage_set_io_async_context(false);uint64_t started=time_uptime_us();
+    storage_set_io_async_context(false);uint64_t started=time_work_counter_us();
     while(!error) {
         if(!stage->ready) {
             if(!stage->named) {
@@ -72,7 +72,7 @@ static int64_t syscall_getdents_staged(struct task *task,uint64_t number,int32_t
             if(rc==-RELIEFOS_EAGAIN || rc==KERNEL_SYSCALL_BLOCKED)return rc;
             if(rc==-RELIEFOS_ENOENT) {
                 file->offset=stage->next;stage->named=false;
-                if(time_uptime_us()-started>=2000) {
+                if(time_work_counter_us()-started>=2000) {
                     storage_release_task_io(task->pid);return -RELIEFOS_EAGAIN;
                 }
                 continue;
@@ -99,7 +99,7 @@ static int64_t syscall_getdents_staged(struct task *task,uint64_t number,int32_t
         if(rc<0 || !user_range_writable(buffer+written,stage->length)){error=-RELIEFOS_EFAULT;break;}
         __builtin_memcpy((void *)(uintptr_t)(buffer+written),stage->bytes,stage->length);
         file->offset=stage->next;written+=stage->length;task->regular_io.done=written;stage->ready=false;
-        if(time_uptime_us()-started>=2000)return -RELIEFOS_EAGAIN;
+        if(time_work_counter_us()-started>=2000)return -RELIEFOS_EAGAIN;
     }
     task->regular_io.active=false;if(file->io_owner==task->pid)file->io_owner=0;
     return written ? (int64_t)written : error;
@@ -140,7 +140,7 @@ int64_t syscall_getdents_object(struct task *task,uint64_t number,int32_t fd,uin
     uint32_t written=(uint32_t)task->regular_io.done;int error=0;
     file->io_owner=task->pid;
     if(!user_range_writable(buffer,capacity))error=-RELIEFOS_EFAULT;
-    storage_set_io_async_context(false);uint64_t started=time_uptime_us();
+    storage_set_io_async_context(false);uint64_t started=time_work_counter_us();
     while(!error) {
         struct reliefos_dir_entry entry;uint64_t next=file->offset;
         int rc=vfs_path_readdir(&file->path_ref,&next,&entry);
@@ -158,7 +158,7 @@ int64_t syscall_getdents_object(struct task *task,uint64_t number,int32_t fd,uin
         if(rc==-RELIEFOS_EAGAIN || rc==KERNEL_SYSCALL_BLOCKED)return rc;
         if(rc==-RELIEFOS_ENOENT) {
             file->offset=next;
-            if(time_uptime_us()-started>=2000) {
+            if(time_work_counter_us()-started>=2000) {
                 storage_release_task_io(task->pid);return -RELIEFOS_EAGAIN;
             }
             continue;
@@ -172,7 +172,7 @@ int64_t syscall_getdents_object(struct task *task,uint64_t number,int32_t fd,uin
         __builtin_memcpy(destination+name_offset,entry.name,length+1);
         destination[wide ? 18 : record-1]=(uint8_t)((status.st_mode&LINUX_S_IFMT)>>12);
         file->offset=next;written+=record;task->regular_io.done=written;
-        if(time_uptime_us()-started>=2000) {
+        if(time_work_counter_us()-started>=2000) {
             storage_release_task_io(task->pid);return -RELIEFOS_EAGAIN;
         }
     }

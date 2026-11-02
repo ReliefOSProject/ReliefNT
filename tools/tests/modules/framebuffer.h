@@ -1,6 +1,7 @@
 /* Test-only white-box composition of the separately built production units. */
 #ifndef RELIEFNT_TEST_MODULE_FRAMEBUFFER_H
 #define RELIEFNT_TEST_MODULE_FRAMEBUFFER_H
+#include "../../../drivers/video/framebuffer/copy.c"
 #include "../../../drivers/video/framebuffer/glyph.c"
 #include "../../../drivers/video/framebuffer/present.c"
 #include "../../../drivers/video/framebuffer/color.c"

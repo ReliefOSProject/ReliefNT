@@ -9,6 +9,15 @@
 #include "framebuffer_fifo.h"
 #include "../svga/device.h"
 
+/** @brief Copy complete pixels into a UC/WC 32-bit scanout aperture.
+ * @param destination Four-byte-aligned writable pixel extent, borrowed.
+ * @param source Nonoverlapping readable source, possibly unaligned, borrowed.
+ * @param pixels Exact count, zero allowed. Caller retains mappings and display
+ * exclusion and orders WC writes before publication; no readback, padding
+ * access, allocation, lock or SIMD use.
+ */
+void framebuffer_copy_io32(void *destination, const void *source, size_t pixels);
+
 
 
 

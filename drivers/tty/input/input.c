@@ -689,6 +689,37 @@ int input_evdev_available_vt(uint32_t device_kind, uint64_t cursor,
     return available;
 }
 
+/**
+ * @brief Snapshot the newest event allowed by the reader's origin and grab.
+ * @param device_kind Keyboard or mouse kind.
+ * @param grab_token Reader's open-description grab token.
+ * @param number VT filter, or zero for raw input.
+ * @return Newest matching retained sequence, or zero for no visible event.
+ * IRQ/task safe; acquires input_lock and scans at most the bounded ring once.
+ * No pointer escapes. Ordinary active readers match the newest slot directly.
+ */
+uint64_t input_evdev_event_generation_vt(uint32_t device_kind,
+                                        uint64_t grab_token, uint32_t number)
+{
+    uint32_t index = evdev_device_index(device_kind);
+    uint64_t flags, generation = 0;
+    if (index >= INPUT_EVDEV_DEVICES) return 0;
+    kernel_spin_lock_irqsave(&input_lock, &flags);
+    if (evdev_present[index]) {
+        uint32_t slot = evdev_next_slot;
+        for (uint32_t count = evdev_record_count; count; --count) {
+            slot = (slot + INPUT_EVDEV_QUEUE_CAP - 1u) % INPUT_EVDEV_QUEUE_CAP;
+            const struct input_evdev_record *record = &evdev_queue[slot];
+            if (evdev_record_matches(record, device_kind, grab_token, number)) {
+                generation = record->sequence;
+                break;
+            }
+        }
+    }
+    kernel_spin_unlock_irqrestore(&input_lock, flags);
+    return generation;
+}
+
 int64_t input_evdev_grab(uint32_t device_kind, uint64_t current_token,
                          int enable, uint32_t pid)
 {

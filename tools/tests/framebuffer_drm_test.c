@@ -1,15 +1,31 @@
+#define _GNU_SOURCE
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
+
+static uint32_t gfb[16u * 16u];
+static unsigned byte_copies_to_scanout;
+static __attribute__((unused)) void *fixture_ram_copy(void *destination, const void *source, size_t bytes)
+{
+    uintptr_t address = (uintptr_t)destination;
+    if (address >= (uintptr_t)gfb && address < (uintptr_t)(gfb + 16u * 16u))
+        ++byte_copies_to_scanout;
+    unsigned char *out = destination;
+    const unsigned char *in = source;
+    for (size_t i = 0; i < bytes; ++i) out[i] = in[i];
+    return destination;
+}
 
 #include <reliefnt/port.h>
 #include <reliefnt/svga.h>
+#define __builtin_memcpy fixture_ram_copy
 #include "modules/framebuffer.h"
+#undef __builtin_memcpy
 
 struct svga_device svga;
 
-static uint32_t gfb[16u * 16u];
 static uint32_t fifo_words[16];
 static uint32_t doorbells;
 
@@ -67,6 +83,7 @@ static void setup_fifo_full(void)
     framebuffer_drm_scanout_owned = false;
     framebuffer_drm_damage_pending = false;
     doorbells = 0;
+    byte_copies_to_scanout = 0;
 }
 
 static void test_full_fifo_damage_is_retained_and_retried(void)
@@ -80,6 +97,9 @@ static void test_full_fifo_damage_is_retained_and_retried(void)
     assert(framebuffer_drm_damage_pending);
     assert(gfb[2u * 16u + 1u] == source[2u * 16u + 1u]);
     assert(gfb[3u * 16u + 3u] == 0);
+    /* Generic RAM memcpy uses REP MOVSB in the native kernel. UC video
+     * memory needs wide pixel stores, not byte-at-a-time scanout uploads. */
+    assert(byte_copies_to_scanout == 0);
 
     source[10u * 16u + 8u] = 0xffabcdefu;
     assert(framebuffer_drm_present_region(source, 16u * 4u, 0x34325258u,
@@ -107,8 +127,33 @@ static void test_full_fifo_damage_is_retained_and_retried(void)
            fifo_words[7] == 16 && fifo_words[8] == 16);
 }
 
+static void test_exact_pixel_extents(void)
+{
+    unsigned char *pages = mmap(NULL, 8192, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(pages != MAP_FAILED && !mprotect(pages + 4096, 4096, PROT_NONE));
+    framebuffer_copy_io32(NULL, NULL, 0);
+    for (unsigned pixels = 1; pixels <= 17; ++pixels) {
+        unsigned char *source = pages + 4096 - pixels * 4;
+        for (unsigned i = 0; i < pixels * 4; ++i) source[i] = (unsigned char)(i ^ pixels);
+        for (unsigned left = 0; left < 2; ++left) {
+            memset(gfb, 0xa5, sizeof(gfb));
+            framebuffer_copy_io32(gfb + left, source, pixels);
+            assert(!memcmp(gfb + left, source, pixels * 4));
+            if (left) assert(gfb[0] == 0xa5a5a5a5u);
+            assert(gfb[left + pixels] == 0xa5a5a5a5u);
+        }
+    }
+    unsigned char unaligned[69];
+    for (unsigned i = 0; i < sizeof(unaligned); ++i) unaligned[i] = (unsigned char)i;
+    framebuffer_copy_io32(gfb + 1, unaligned + 1, 17);
+    assert(!memcmp(gfb + 1, unaligned + 1, 68));
+    assert(!munmap(pages, 8192));
+}
+
 int main(void)
 {
+    test_exact_pixel_extents();
     test_full_fifo_damage_is_retained_and_retried();
     puts("framebuffer-drm: PASS");
     return 0;

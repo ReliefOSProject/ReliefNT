@@ -14,6 +14,7 @@
 #include <reliefnt/paging.h>
 #include <reliefnt/pty.h>
 #include <reliefnt/sched.h>
+#include <reliefnt/smp.h>
 #include <reliefnt/syscall.h>
 #include <reliefnt/swap.h>
 #include <reliefnt/time.h>
@@ -100,6 +101,7 @@ extern void irq14_stub(void);
 extern void irq15_stub(void);
 extern void irq32_stub(void);
 extern void irq_membarrier_stub(void);
+extern void irq_reschedule_stub(void);
 /** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
 extern void irq_msi_50_stub(void);
 /** @brief MSI vector stub; IRQ entry, no arguments/ownership. */
@@ -240,6 +242,7 @@ void idt_init(void)
      * discards the interrupt; otherwise the CPU raises #GP with an IDT error
      * code of (0xff << 3) | 2. */
     idt_set(0x41, irq_membarrier_stub, 0);
+    idt_set(SMP_RESCHEDULE_VECTOR, irq_reschedule_stub, 0);
     idt_set(0x50, irq_msi_50_stub, 0);
     idt_set(0x51, irq_msi_51_stub, 0);
     idt_set(0x52, irq_msi_52_stub, 0);
@@ -529,7 +532,9 @@ static int user_fault_pressure(struct task *task, struct trap_frame *frame, uint
  * @return NULL to resume directly or the task selected by the scheduler.
  * IRQ/fault context: private non-I/O user faults use a read gate when available
  * or the FIFO writer when queued; shared and backing-I/O faults retain the
- * exclusive fault lock. Kernel usercopy faults use recursive writer ownership.
+ * exclusive fault lock. Resolved private non-I/O faults may resume the current
+ * task only through the normal user-return predicate, under either gate.
+ * Kernel usercopy faults use recursive writer ownership.
  * A pending private fault with no MM generation may acquire its first one
  * while parked; task teardown and committed exec invalidate its scalar token.
  */
@@ -561,14 +566,15 @@ struct task *page_fault_dispatch(struct trap_frame *frame)
         if(!memory_headroom_needed(sched_current_task()))
 #endif
             handled=syscall_handle_private_page_fault(sched_current_task(),cr2,frame->error);
-        bool resume = handled == SYSCALL_PRIVATE_FAULT_ANON &&
-                      sched_try_resume_current_user_frame(frame);
-        if (handled == SYSCALL_PRIVATE_FAULT_ANON || handled == SYSCALL_PRIVATE_FAULT_RESIDENT) {
+        bool resolved = handled == SYSCALL_PRIVATE_FAULT_ANON ||
+                        handled == SYSCALL_PRIVATE_FAULT_RESIDENT;
+        if (resolved) {
             sched_pressure_fault_resolved(sched_current_task(), frame->rip, cr2);
             memory_wait_cancel(sched_current_task());
         }
+        bool resume = resolved && sched_try_resume_current_user_frame(frame);
         kernel_execution_read_unlock_irqrestore(execution_flags);
-        if (handled == SYSCALL_PRIVATE_FAULT_ANON || handled == SYSCALL_PRIVATE_FAULT_RESIDENT)
+        if (resolved)
             return resume ? NULL : userland_schedule_from_frame(frame);
     }
 
@@ -579,8 +585,9 @@ struct task *page_fault_dispatch(struct trap_frame *frame)
      * occurs while the same CPU copies user memory inside a syscall. */
     kernel_execution_lock_scoped_irqsave(&execution_flags, LOCK_SCOPE_FAULT);
 
-    /* A queued writer may have denied reader admission. Resolve the same
-     * non-I/O work under its FIFO successor, then take the normal checkpoint. */
+    /* A queued writer may have denied reader admission. Resolving the same
+     * non-I/O work under its FIFO successor does not itself require yielding.
+     * Signals, affinity, ownership and pending preemption still decide return. */
     if (frame && (frame->cs & 3ULL) == 3ULL) {
         user_fault_event_enter(frame, cr2);
         struct task *task = sched_current_task();
@@ -620,8 +627,9 @@ struct task *page_fault_dispatch(struct trap_frame *frame)
 #endif
             sched_pressure_fault_resolved(task, frame->rip, cr2);
             memory_wait_cancel(task);
+            bool resume = sched_try_resume_current_user_frame(frame);
             kernel_execution_unlock_irqrestore(execution_flags);
-            return userland_schedule_from_frame(frame);
+            return resume ? NULL : userland_schedule_from_frame(frame);
         }
         if (handled == SYSCALL_PRIVATE_FAULT_OOM) {
             int pressure = user_fault_pressure(task, frame, cr2);

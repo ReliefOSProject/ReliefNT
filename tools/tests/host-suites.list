@@ -83,6 +83,9 @@ record_locks tools/test_record_locks.py
 regular_file_io tools/test_regular_file_io.py
 rootfs tools/test_rootfs.py
 sched_resume tools/test_sched_resume.py
+sched_wakeup tools/test_sched_wakeup.py
+process_priority tools/test_process_priority.py
+pat tools/test_pat.py
 service_roles tools/test_service_roles.py
 signal_address_space tools/test_signal_address_space.py
 smp_cpu_id tools/test_smp_cpu_id.py

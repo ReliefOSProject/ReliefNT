@@ -9,6 +9,7 @@
 
 #define SMP_MAX_CPUS 64u
 #define SMP_MEMBARRIER_VECTOR 0x41u
+#define SMP_RESCHEDULE_VECTOR 0x42u
 
 struct smp_cpu_info {
     uint32_t apic_id;
@@ -28,6 +29,15 @@ void smp_release_aps(void);
 void smp_ap_entry(uint32_t cpu_index) __attribute__((noreturn));
 bool smp_cpu_online(uint32_t cpu_index);
 const struct smp_cpu_info *smp_cpu_info(uint32_t cpu_index);
+
+/** @brief Interrupt an online remote CPU after publishing a reschedule request.
+ * @param cpu_index Logical destination CPU, not its physical APIC ID.
+ * IRQ/task context with scheduler state already published; no allocation,
+ * scheduling or completion wait. Preserves local IRQ state around the bounded
+ * APIC submission. Self/offline/invalid targets and the bootstrap phase are
+ * ignored; the periodic timer remains a backstop for delivery failures.
+ */
+void smp_send_reschedule(uint32_t cpu_index);
 
 /** @brief Acknowledge a pending local CPU barrier without taking locks.
  * @return None. IPI/task/spin context, including masked IRQs. Published mode is

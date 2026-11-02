@@ -91,6 +91,28 @@ POSIX I/O 检查。宿主 Linux 参考运行与 ReliefNT 来宾执行分别记�
 ``linux_audio`` 的 ASan/UBSan 探针遇到未定义行为立即失败，不将带有
 sanitizer 错误的零退出状态计为通过；PCM 回归覆盖尚无 DMA 缓冲区时的 DROP。
 
+``sched_wakeup`` 套件覆盖生产调度唤醒与 SMP IPI 的逻辑 CPU/APIC 映射、启动
+交接、合并通知、本地 IRQ 状态、离线/单核及停止/vfork 任务边界。输入 IRQ
+夹具另检查重新调度向量不会被当成 timer 或 PIC 中断。I/O 预算测试在旧
+uptime 停止增长时检查续传、偏移与完整结果；vDSO/timekeeper 测试区分内部
+CPU 本地工作计数与用户可见时钟。framebuffer 的 guard-page 夹具检查精确
+像素范围、未对齐来源和行尾边界，既有 FIFO 满时的损伤重试仍须通过。
+
+同一调度套件检查 IRQ 延迟时的公平时间计费、ACPI PM 回绕及源切换；APIC
+夹具检查 100/250/1000 Hz 的计数与失败回退。``private_fault_transactions``
+使用真实缺页分发、页表和返回谓词，检查无抢占请求时的私有页直接恢复，
+以及远端通知、信号、停止、亲和性和失效帧仍进入调度路径。
+
+``process_priority`` 使用真实 syscall 分发验证 PRIO_PROCESS 的同属主父进程
+降优先级、跨属主拒绝、CAP_SYS_NICE、升优先级拒绝、数值钳制、ESRCH 和
+Linux 返回值编码；不修改宿主进程的调度状态。整机还需验证 XDM/IceWM
+与用户终端分别继承预期优先级，不能以临时 root 提权实验代替启动链检查。
+
+``pat`` 套件覆盖生产 PAT 引导/AP 策略及真实页表的 UC 到 WC 转换：
+功能缺失、固件布局、写回读失败、冲突别名/租约、RAM、用户页表阶段与
+失败原子性。VMware 引导夹具检查可预取 BAR、FIFO 交叠和模式切换策略；
+SVGA 夹具检查 FIFO 初始化不把已保留的 WC 显存重新声明为 UC。
+
 
 目标运行
 ========

@@ -266,19 +266,23 @@ struct task *irq_dispatch(struct trap_frame *frame)
         driver_manager_mouse_poll();
         irq_send_eoi(12);
     } else if (vector == 0x40) {
-        /* LAPIC timer interrupts are local to APs. The BSP remains the sole
-         * owner of wall-clock/PIT wakeups and device IRQs; each AP uses this
-         * vector only to account and preempt its own Ring-3 task. */
+        /* Every CPU uses its LAPIC for preemption independently of the PIT.
+         * Only the BSP's vector 0x20 advances global time and CPU tick stats;
+         * this vector requests scheduling without manufacturing wall time. */
         apic_eoi();
-        if (smp_current_cpu() != 0) {
-            sched_on_cpu_tick();
-            if (from_user) {
-                struct task *next = userland_schedule_from_timer(frame);
-                return next;
-            }
-            return NULL;
+        sched_on_cpu_tick();
+        if (from_user) {
+            struct task *next = userland_schedule_from_timer(frame);
+            return next;
         }
         return NULL;
+    } else if (vector == SMP_RESCHEDULE_VECTOR) {
+        /* Readiness is already published by the sender. Never switch a
+         * kernel frame: an idle hlt resumes its normal selection loop, and
+         * a syscall completes its transaction before observing the flag.
+         * This is a wakeup, not a timer tick or pressure-reclaim admission. */
+        apic_eoi();
+        return from_user ? userland_schedule_from_frame(frame) : NULL;
     } else if (vector == SMP_MEMBARRIER_VECTOR) {
         smp_membarrier_poll();
         apic_eoi();

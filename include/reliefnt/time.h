@@ -56,6 +56,15 @@ uint64_t time_uptime_ms(void);
  * Task/IRQ context after time setup; no allocation or retained pointer. Retries preserve paired tick anchors; failed interpolation falls back to the existing lower-resolution clock path.
  */
 uint64_t time_uptime_us(void);
+/** @brief Sample an approximate CPU-local counter for short work budgets.
+ * @return Calibrated local TSC microseconds, or legacy uptime before calibration.
+ * Compare only within one nonmigrating, non-sleeping invocation. This is not
+ * an absolute timestamp or a cross-CPU clock. A calibration transition or
+ * backward counter may expire a budget early; no public clock is changed.
+ * IRQ/task safe with no allocation or timekeeper lock. Unlike the legacy
+ * uptime interpolation, a calibrated counter does not stop at a pending tick.
+ */
+uint64_t time_work_counter_us(void);
 /**
  * @brief Publish the active PIT divisor for sub-tick uptime interpolation.
  */

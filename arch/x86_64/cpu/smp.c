@@ -11,6 +11,7 @@
 #include <reliefnt/console.h>
 #include <reliefnt/mm.h>
 #include <reliefnt/paging.h>
+#include <reliefnt/pat.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/smp.h>
 #include <reliefnt/inventory.h>
@@ -25,7 +26,6 @@
 /* Conservative periodic preemption rate for a virtual LAPIC. The BSP PIT
  * remains the authoritative 100 Hz wall clock; this only prevents an AP's
  * compute-bound user task from monopolising that CPU. */
-#define AP_LAPIC_TIMER_FALLBACK_COUNT 1000000u
 
 extern uint8_t smp_trampoline_start[];
 extern uint8_t smp_trampoline_end[];
@@ -203,6 +203,23 @@ const struct smp_cpu_info *smp_cpu_info(uint32_t cpu_index)
     return cpu_index < cpu_count ? &cpus[cpu_index] : 0;
 }
 
+/** @brief Submit a remote scheduler IPI only after the bootstrap handoff.
+ * @param cpu_index Logical destination; invalid, offline and self are no-ops.
+ * Caller publishes its reschedule flag before entry. Preserves local IRQs and
+ * serializes this CPU's APIC ICR writes against maskable interrupt senders.
+ * No scheduling, allocation, acknowledgement wait or task ownership transfer.
+ */
+void smp_send_reschedule(uint32_t cpu_index)
+{
+    uint64_t flags = kernel_irq_save();
+    if (__atomic_load_n(&smp_scheduler_started, __ATOMIC_ACQUIRE) &&
+        cpu_index < cpu_count && cpu_index < SMP_MAX_CPUS &&
+        __atomic_load_n(&cpus[cpu_index].online, __ATOMIC_ACQUIRE) &&
+        cpu_index != smp_current_cpu())
+        apic_send_ipi(cpus[cpu_index].apic_id, SMP_RESCHEDULE_VECTOR);
+    kernel_irq_restore(flags);
+}
+
 /** @brief Start application processors with allocator-backed direct-map stacks.
  * @return None; failed AP startup retains its stack for delayed SIPI safety.
  */
@@ -292,6 +309,10 @@ void smp_ap_entry(uint32_t cpu_index)
      * sufficient; rebuilding entries here races the BSP and can expose a
      * partially written interrupt gate. */
     idt_load();
+    if (!arch_pat_ap_init()) {
+        console_error("[reliefnt] AP %u cannot honor the boot PAT policy; keeping it offline\n",cpu_index);
+        for (;;) __asm__ volatile("hlt");
+    }
     apic_enable();
     if (cpu_index < cpu_count) {
         cpu_inventory_capture(cpu_index);
@@ -306,7 +327,7 @@ void smp_ap_entry(uint32_t cpu_index)
     }
     /* No device IRQ is routed to an AP. Its local timer is sufficient for
      * preemption and sends vector 0x40 through the shared, immutable IDT. */
-    apic_timer_init(0x40u, AP_LAPIC_TIMER_FALLBACK_COUNT);
+    apic_timer_init(0x40u, APIC_SCHED_TICK_HZ, APIC_SCHED_FALLBACK_COUNT);
     for (;;) {
         struct task *next;
         struct trap_frame *frame;

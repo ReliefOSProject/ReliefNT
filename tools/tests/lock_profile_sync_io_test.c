@@ -19,6 +19,7 @@ void console_log(enum console_log_level level, const char *format, ...)
 { (void)level; (void)format; abort(); }
 uint64_t lock_profile_test_clock(void) { return 0; }
 uint64_t time_uptime_us(void) { return 0; }
+uint64_t time_work_counter_us(void) { return time_uptime_us(); }
 bool user_range_ok(uint64_t p, uint64_t n) { return p || !n; }
 bool user_range_writable(uint64_t p, uint64_t n) { return p || !n; }
 void storage_release_task_io(uint32_t pid) { (void)pid; }

@@ -74,10 +74,10 @@ bool paging_phys_addressable(uint64_t p, uint64_t n)
 { return n && p < (1ULL << 46) && n <= (1ULL << 46) - p; }
 /** @brief Replay the real VBE probe's early UC claim into staging.
  * @param index Claim index. @param start Physical base output. @param end Exclusive end.
- * @param uncached Policy output. @return True only for the captured VBE claim.
+ * @param cache_flags Policy output. @return True only for the captured VBE claim.
  */
-bool paging_boot_mmio_run(uint32_t index, uint64_t *start, uint64_t *end, bool *uncached)
-{ if (index || !vbe_claimed) return false; *start=VBE_BASE; *end=VBE_BASE+65536; *uncached=true; return true; }
+bool paging_boot_mmio_run(uint32_t index, uint64_t *start, uint64_t *end, uint64_t *cache_flags)
+{ if (index || !vbe_claimed) return false; *start=VBE_BASE; *end=VBE_BASE+65536; *cache_flags=RELIEFNT_PAGE_PWT|RELIEFNT_PAGE_PCD; return true; }
 /** @brief Retain the staged root for inspection without changing the host CR3.
  * @param branches Image-owned page-directory pointer tables.
  */
@@ -153,3 +153,7 @@ int main(int argc, char **argv)
                 "PASS GOP RAM retained through VBE, bootstrap and UC/NX staging");
     return 0;
 }
+
+/* These non-PAT fixtures retain the original UC-only aperture. */
+bool paging_mmio_writecombined(uint64_t physical,uint64_t bytes)
+{ (void)physical;(void)bytes;return false; }

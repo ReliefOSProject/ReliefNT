@@ -341,9 +341,18 @@ static bool apic_timer_sample(struct apic_timer_sample *sample, uint32_t mask,
     return false;
 }
 
-void apic_timer_init(uint8_t vector, uint32_t fallback_count)
+/**
+ * @brief Program a CPU-local preemption period from two ACPI PM samples.
+ * @param vector Installed timer interrupt vector.
+ * @param hz Requested periodic rate; zero performs no MMIO or calibration.
+ * @param fallback_count Initial count on bounded measurement failure, or zero
+ * for the conservative default. Caller retains masked IRQs and holds no locks.
+ * Global PIT time/accounting frequency is unchanged. Logs the measured result
+ * after calibration, with its execution transaction confined to that log.
+ */
+void apic_timer_init(uint8_t vector, uint32_t hz, uint32_t fallback_count)
 {
-    if (!local_apic_enabled) return;
+    if (!local_apic_enabled || !hz) return;
     struct apic_timer_sample samples[3] = {{0}};
     uint32_t budget = APIC_TIMER_CALIBRATION_POLL_LIMIT;
     uint32_t initial_count = fallback_count ? fallback_count : 1000000u;
@@ -382,7 +391,7 @@ void apic_timer_init(uint8_t vector, uint32_t fallback_count)
                 failure = "counter-invalid"; break;
             }
             uint64_t delta = (uint64_t)start->count - end->count;
-            uint64_t denominator = (uint64_t)elapsed * RELIEFNT_TICK_HZ;
+            uint64_t denominator = (uint64_t)elapsed * hz;
             uint64_t measured = (delta * ACPI_PM_TIMER_HZ + denominator / 2u) / denominator;
             if (measured < APIC_TIMER_MIN_COUNT || measured > UINT32_MAX) {
                 failure = "count-out-of-range"; break;
@@ -403,7 +412,7 @@ void apic_timer_init(uint8_t vector, uint32_t fallback_count)
     }
     elapsed = (samples[2].reference - samples[0].reference) & mask;
     uint64_t delta = (uint64_t)samples[0].count - samples[2].count;
-    uint64_t denominator = (uint64_t)elapsed * RELIEFNT_TICK_HZ;
+    uint64_t denominator = (uint64_t)elapsed * hz;
     initial_count = (uint32_t)((delta * ACPI_PM_TIMER_HZ + denominator / 2u) / denominator);
     failure = NULL;
 program_periodic:
@@ -421,7 +430,7 @@ program_periodic:
     kernel_execution_lock_irqsave(&log_flags);
     console_log(failure ? CONSOLE_LOG_WARN : CONSOLE_LOG_INFO,
         "[reliefnt] LAPIC timer APIC=%u target_hz=%u count=%u %s clock=acpi-pm window_us=%llu start=%u end=%u polls=%u\n",
-        (unsigned)apic_id(), (unsigned)RELIEFNT_TICK_HZ, (unsigned)initial_count,
+        (unsigned)apic_id(), (unsigned)hz, (unsigned)initial_count,
         failure ? failure : "calibrated",
         (unsigned long long)((uint64_t)elapsed * 1000000u / ACPI_PM_TIMER_HZ),
         (unsigned)samples[0].count, (unsigned)samples[2].count,

@@ -42,7 +42,7 @@ class SvgaTests(unittest.TestCase):
             "kernel_spin_unlock_irqrestore", "kernel_irq_save", "kernel_irq_restore",
             "mm_alloc_pages", "mm_alloc_pages_below", "mm_free_pages", "mm_virt_to_phys",
             "paging_kernel_direct_map", "paging_kernel_direct_map_range",
-            "paging_mmio_uncached",
+            "paging_mmio_uncached", "paging_mmio_writecombined",
             "paging_mmio_writeback_nx", "pci_device_bar_contains",
             "framebuffer_vmware_pci_identity", "x86_64_inl",
             "x86_64_outl", "memcpy", "memset", "memmove", "kernel_malloc",

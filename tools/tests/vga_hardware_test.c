@@ -121,3 +121,7 @@ int main(int argc,char **argv)
     if(fb.backend==FRAMEBUFFER_BACKEND_VMWARE_SVGA) assert(!svga_regs[1]);
     puts("PASS VGA hardware: text register/font setup, 16-color attributes, aperture bounds, cursor and graphic-mode restore");
 }
+
+/* These non-PAT fixtures retain the original UC-only aperture. */
+bool paging_mmio_writecombined(uint64_t physical,uint64_t bytes)
+{ (void)physical;(void)bytes;return false; }

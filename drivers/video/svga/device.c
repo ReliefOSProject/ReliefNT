@@ -216,7 +216,7 @@ static int svga_quiesce_fifo_for_bar_probe_locked(void)
  *        records diagnostics there but does not print while svga_lock is held.
  * @return Zero when WB or legacy UC/NX is installed, otherwise ENOTSUP.
  * Called only after shutdown and legacy FIFO drain under svga_lock. The
- * scan-out reservation remains UC/NX; the FIFO keeps its supervisor mapping
+ * scan-out retains its boot-selected WC/NX or UC/NX; the FIFO keeps its supervisor mapping
  * and is made non-executable when WB+NX succeeds.
  */
 static int svga_prepare_fifo_cache_policy(const struct framebuffer *fb,
@@ -238,8 +238,9 @@ static int svga_prepare_fifo_cache_policy(const struct framebuffer *fb,
         return SVGA_ENOTSUP;
     }
 
-    if (!paging_mmio_uncached(fb->reservation_start, fb->reservation_bytes)) {
-        if (report) report->reason = "vram-uc-pin";
+    if (!paging_mmio_writecombined(fb->reservation_start, fb->reservation_bytes) &&
+        !paging_mmio_uncached(fb->reservation_start, fb->reservation_bytes)) {
+        if (report) report->reason = "vram-cache-pin";
         return SVGA_ENOTSUP;
     }
 

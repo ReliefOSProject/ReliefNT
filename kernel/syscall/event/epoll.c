@@ -1,6 +1,23 @@
 #include "../internal.h"
 #include <reliefnt/swap.h>
 
+/**
+ * @brief Snapshot input progress for providers with edge-triggered readiness.
+ * @param file Pinned watched description, or NULL for a PTY watch.
+ * @return Visible evdev sequence or the socket's existing receive generation.
+ * Execution-owned context. Evdev filtering matches read/poll and does not
+ * expose other VTs, devices or exclusive grabs. No UAPI state is modified.
+ */
+static uint64_t epoll_event_generation(const struct task_file *file)
+{
+    if (file && (file->flags & TASK_FILE_FLAG_DEV_NODE) &&
+        (file->node.first_cluster == STORAGE_DEV_KIND_MOUSE ||
+         file->node.first_cluster == STORAGE_DEV_KIND_KEYBOARD))
+        return input_evdev_event_generation_vt(file->node.first_cluster,
+                                               file->aux2, file->input_vt);
+    return task_socket_event_generation(file);
+}
+
 /** @brief Prepare exactly one bounded epoll operand at the outer syscall gate.
  * @param task Current task. @param address User operand. @param size Bytes.
  * @param writing Output access when true. @return Zero, EFAULT, or private
@@ -266,7 +283,7 @@ bool task_epoll_poll_ready(struct task *task, struct task_file *file)
 
         ready = poll_to_epoll(pollfd.revents);
         if (!ready) continue;
-        generation = task_socket_event_generation(watch->file);
+        generation = epoll_event_generation(watch->file);
         if (entry->events & EPOLLET) {
             uint32_t edge = ready & ~entry->ready;
             uint32_t input = ready & (EPOLLIN | EPOLLPRI | EPOLLRDNORM |
@@ -502,7 +519,7 @@ static int64_t syscall_epoll_wait_common(struct task *task, struct task_epoll *e
         if (timeout_ms != 0 && deadline)
             task->poll_deadline_ticks = deadline;
         ready = poll_to_epoll(pollfd.revents);
-        generation = task_socket_event_generation(entry->watch ? entry->watch->file : NULL);
+        generation = ready ? epoll_event_generation(entry->watch ? entry->watch->file : NULL) : 0;
         if (!ready) {
             entry->ready = 0;
             entry->generation = generation;
@@ -519,9 +536,9 @@ static int64_t syscall_epoll_wait_common(struct task *task, struct task_epoll *e
             uint32_t edge = ready & ~entry->ready;
             uint32_t input = ready & (EPOLLIN | EPOLLPRI | EPOLLRDNORM |
                                       EPOLLRDBAND | EPOLLMSG | EPOLLRDHUP);
-            /* A stream can be drained and refilled before the next epoll
-             * probe.  The readiness bit then never passes through zero, but
-             * rx_written still records a real new input edge. */
+            /* A stream or evdev queue can drain and refill before the next
+             * probe. The readiness bit then never passes through zero, but
+             * the provider generation still records new visible input. */
             if (input && generation != entry->generation) edge |= input;
             if (!edge) {
                 entry->ready = ready;

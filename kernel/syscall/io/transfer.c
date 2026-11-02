@@ -323,7 +323,7 @@ static int64_t transfer_run(struct task *task)
     int rc=transfer_prepare(task);
     if(rc==-EAGAIN)return rc;
     if(rc){state->error=rc;state->done=true;return transfer_complete(task);}
-    uint64_t started=time_uptime_us();
+    uint64_t started=time_work_counter_us();
     while(state->total<state->count) {
         if(!state->buffered) {
             uint64_t remaining=state->count-state->total;
@@ -363,7 +363,7 @@ static int64_t transfer_run(struct task *task)
         if(!written)break;
         if(state->consumed<state->buffered)continue;
         state->buffered=state->consumed=0;
-        if(time_uptime_us()-started>=2000)break;
+        if(time_work_counter_us()-started>=2000)break;
     }
     state->done=true;return transfer_complete(task);
 }

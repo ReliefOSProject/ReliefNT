@@ -205,7 +205,7 @@ int64_t syscall_regular_io(struct task *task, struct task_file *file, uint64_t b
                            uint64_t position, bool writing, bool positional)
 {
     uint64_t done = 0;
-    uint64_t started = time_uptime_us();
+    uint64_t started = time_work_counter_us();
     bool block = file->flags & TASK_FILE_FLAG_DEV_BLOCK;
     if (block && (!(file->flags & TASK_FILE_FLAG_DEV_NODE) ||
                   (file->node.flags & (STORAGE_NODE_FLAG_DEV_NODE | STORAGE_NODE_FLAG_DEV_BLOCK)) !=
@@ -338,7 +338,7 @@ int64_t syscall_regular_io(struct task *task, struct task_file *file, uint64_t b
             break;
         /* Yield only after a completed storage operation, with no DMA pending.
          * The dispatcher resumes this blocking syscall with its saved progress. */
-        if (resumable && done < count && time_uptime_us() - started >= 2000) {
+        if (resumable && done < count && time_work_counter_us() - started >= 2000) {
             storage_release_task_io(task->pid);
             return -LINUX_EAGAIN;
         }

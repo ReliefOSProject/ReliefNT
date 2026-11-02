@@ -79,13 +79,16 @@ static int direct_stage_range(uint64_t start, uint64_t end, uint64_t flags)
         if (!pde) return -ENOMEM;
         if (!(*pde & RELIEFNT_PAGE_PRESENT) && !(start & (DIRECT_LARGE - 1)) &&
             end - start >= DIRECT_LARGE) {
-            *pde = start | flags | DIRECT_LARGE_FLAG;
+            uint64_t large_flags=flags & ~RELIEFNT_PAGE_PAT;
+            if(flags & RELIEFNT_PAGE_PAT)large_flags|=1ULL<<12;
+            *pde = start | large_flags | DIRECT_LARGE_FLAG;
             start += DIRECT_LARGE;
             continue;
         }
         uint64_t *pt;
         if (*pde & DIRECT_LARGE_FLAG) {
             uint64_t old_flags = *pde & ~RELIEFNT_PHYS_ADDR_MASK & ~DIRECT_LARGE_FLAG;
+            if(*pde & (1ULL<<12))old_flags|=RELIEFNT_PAGE_PAT;
             if (old_flags == flags) {
                 uint64_t span = DIRECT_LARGE - (start & (DIRECT_LARGE - 1));
                 start += span < end - start ? span : end - start;
@@ -304,8 +307,8 @@ int paging_direct_map_init(const struct mm_topology *topology)
     }
     for (uint32_t i = 0;; ++i) {
         uint64_t start, end;
-        bool uncached;
-        if (!paging_boot_mmio_run(i, &start, &end, &uncached)) break;
+        uint64_t cache_flags;
+        if (!paging_boot_mmio_run(i, &start, &end, &cache_flags)) break;
         if (end < start || !direct_boot_data_disjoint(boot, start, end - start)) return -EINVAL;
         for (uint32_t j = 0; j < power_acpi_resource_count(); ++j) {
             uint64_t base, bytes;
@@ -313,8 +316,9 @@ int paging_direct_map_init(const struct mm_topology *topology)
                 return -EINVAL;
             if (start < base + bytes && end > base) return -EINVAL;
         }
-        if (!direct_claim_safe(topology, display, start, end, uncached)) return -EINVAL;
-        uint64_t flags = wb | (uncached ? RELIEFNT_PAGE_PWT | RELIEFNT_PAGE_PCD : 0);
+        if (!direct_claim_safe(topology, display, start, end,
+                cache_flags==(RELIEFNT_PAGE_PWT|RELIEFNT_PAGE_PCD))) return -EINVAL;
+        uint64_t flags = wb | cache_flags;
         rc = direct_stage_range(start, end, flags);
         if (rc) return rc;
     }

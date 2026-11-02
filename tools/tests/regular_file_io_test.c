@@ -60,11 +60,14 @@ bool user_range_writable(uint64_t address, uint64_t len) { return !fixture_reado
 static uint64_t disk_size = sizeof(disk), error_offset = UINT64_MAX;
 static int injected_error;
 static uint64_t clock_step, clock_us;
+static bool clamp_uptime;
 static unsigned disk_syncs, volume_syncs;
 static int sync_error;
 int storage_sync_disk(uint32_t id) { (void)id; ++disk_syncs; return sync_error; }
 int storage_sync_volume(uint32_t id) { (void)id; abort(); }
-uint64_t time_uptime_us(void) { clock_us += clock_step; return clock_us; }
+uint64_t time_uptime_us(void)
+{ clock_us += clock_step; return clamp_uptime && clock_us > 10000 ? 10000 : clock_us; }
+uint64_t time_work_counter_us(void) { clock_us += clock_step; return clock_us; }
 void storage_release_task_io(uint32_t pid) { assert(pid == 10); }
 /** @brief Drain the fixture provider before releasing a staged chunk.
  * @param pid Fixture task identity.
@@ -224,6 +227,7 @@ int main(void)
     assert(!memcmp(data, disk, sizeof(disk)) && file.offset == 123);
     assert(syscall_regular_io(task, &file, (uintptr_t)data, 2, INT64_MAX, true, true) == -LINUX_EINVAL);
     clock_step = 2000;
+    clamp_uptime = true; /* A delayed PIT saturates the old uptime interpolation. */
     unsigned yields = 0;
     int64_t result;
     do {
@@ -234,6 +238,7 @@ int main(void)
     assert(!memcmp(data, disk, sizeof(data)) && file.offset == 123);
     assert(!task->regular_io.active);
     clock_step = 0;
+    clamp_uptime = false;
     /* A completed vector element is not the end of its parent operation.
      * Another execution context must not interleave on the same OFD. */
     const uint64_t vectors[]={LINUX_SYS_READV,LINUX_SYS_WRITEV,LINUX_SYS_PREADV,

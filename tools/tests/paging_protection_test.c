@@ -71,8 +71,10 @@ uint64_t *paging_trusted_table_alias(uint64_t physical)
 /** @brief Classify MMIO fixture addresses as devices rather than RAM.
  * @param physical Physical start. @param bytes Extent size. @return False.
  */
+#ifndef RELIEFNT_PAGING_FIXTURE_EXTERNAL_RAM
 bool mm_phys_is_ram(uint64_t physical, uint64_t bytes)
 { (void)physical; (void)bytes; return false; }
+#endif
 /** @brief Borrow the fixture's empty display reservation. @return Stable descriptor. */
 const struct framebuffer *framebuffer_get(void)
 { static const struct framebuffer display; return &display; }

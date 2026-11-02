@@ -1,6 +1,17 @@
 /* Test-only white-box composition of the separately built production units. */
 #ifndef RELIEFNT_TEST_MODULE_SCHEDULER_H
 #define RELIEFNT_TEST_MODULE_SCHEDULER_H
+#include <reliefnt/types.h>
+#ifndef RELIEFNT_TEST_SCHED_CLOCK
+/* Most scheduler fixtures deliberately model the legacy clock fallback. */
+bool power_acpi_pm_timer_read(uint32_t *count, uint32_t *mask)
+{ (void)count; (void)mask; return false; }
+#endif
+#ifndef RELIEFNT_TEST_RESCHEDULE_IPI
+/* Fixtures without an interrupt controller retain the real scheduler state
+ * transitions; sched_wakeup_test supplies a recording IPI backend instead. */
+void smp_send_reschedule(uint32_t cpu) { (void)cpu; }
+#endif
 #ifdef RELIEFNT_TEST_EXEC_EXIT_BOUNDARY
 static void fixture_exec_other_exit(uint32_t pid, uint64_t code);
 #define sched_exit fixture_exec_other_exit

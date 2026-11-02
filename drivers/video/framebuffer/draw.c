@@ -25,9 +25,18 @@ uint8_t *framebuffer_pixel_ptr(uint32_t x, uint32_t y)
            (uint64_t)x * fb.bytes_per_pixel;
 }
 
+/** @brief Store exactly one already converted pixel in the active scanout.
+ * @param x Valid column. @param y Valid row. @param color Native pixel value.
+ * Caller retains display exclusion. An aligned 32-bit format uses one device
+ * store; other formats preserve exact byte writes without padding accesses.
+ */
 static void framebuffer_write_native(uint32_t x, uint32_t y, uint32_t color)
 {
     uint8_t *pixel = framebuffer_pixel_ptr(x, y);
+    if (fb.bytes_per_pixel == 4u && !((uintptr_t)pixel & 3u)) {
+        *(volatile uint32_t *)pixel = color;
+        return;
+    }
     for (uint8_t byte = 0; byte < fb.bytes_per_pixel; ++byte) {
         pixel[byte] = (uint8_t)(color >> (byte * 8u));
     }
@@ -45,6 +54,10 @@ static void framebuffer_write_native_to(const struct framebuffer *target,
 {
     uint8_t *pixel = (uint8_t *)target->pixels + (uint64_t)y * target->pitch +
                      (uint64_t)x * target->bytes_per_pixel;
+    if (target->bytes_per_pixel == 4u && !((uintptr_t)pixel & 3u)) {
+        *(volatile uint32_t *)pixel = color;
+        return;
+    }
     for (uint8_t byte = 0; byte < target->bytes_per_pixel; ++byte) {
         pixel[byte] = (uint8_t)(color >> (byte * 8u));
     }

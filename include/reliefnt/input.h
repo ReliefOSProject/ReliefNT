@@ -119,6 +119,17 @@ int input_evdev_read_vt(uint32_t device_kind, uint64_t *cursor,
 int input_evdev_available_vt(uint32_t device_kind, uint64_t cursor,
                              uint64_t grab_token, uint32_t number);
 /**
+ * @brief Identify the newest retained event visible to an evdev reader.
+ * @param device_kind Keyboard or mouse device kind.
+ * @param grab_token Open description's EVIOCGRAB token.
+ * @param number Graphical VT filter, or zero for all VTs.
+ * @return Sequence of the newest matching event, or zero if none is retained.
+ * Takes input_lock without allocation or callbacks; caller must not hold it.
+ * Hidden device, VT and grab traffic does not advance this reader's value.
+ */
+uint64_t input_evdev_event_generation_vt(uint32_t device_kind,
+                                        uint64_t grab_token, uint32_t number);
+/**
  * @brief Acquire or release EVIOCGRAB ownership for an event node.
  * @param device_kind Keyboard or mouse device kind.
  * @param current_token Stable open file description token, zero before its first grab.

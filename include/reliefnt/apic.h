@@ -26,10 +26,19 @@ uint32_t apic_cpu_id_at(uint32_t index);
 void apic_enable(void);
 bool apic_enabled(void);
 void apic_enable_legacy_pic(void);
-/** Calibrate the calling AP's periodic timer against the ACPI PM counter.
- * Caller has local IRQs masked, holds no shared locks, and has passed the BSP
- * scheduler-start barrier. On bounded calibration failure use fallback_count. */
-void apic_timer_init(uint8_t vector, uint32_t fallback_count);
+/* Scheduler preemption is independent of the 100 Hz PIT/public tick clock. */
+#define APIC_SCHED_TICK_HZ 250u
+#define APIC_SCHED_FALLBACK_COUNT 400000u
+/**
+ * @brief Calibrate a local periodic timer against the free-running ACPI PM clock.
+ * @param vector Scheduler interrupt vector installed in this CPU's IDT.
+ * @param hz Requested interrupts per second; zero leaves the timer unchanged.
+ * @param fallback_count Nominal initial count on bounded calibration failure;
+ * zero selects the conservative default, without certifying an actual rate.
+ * Caller masks local IRQs and holds no shared locks. BSP calls after platform
+ * and scheduler initialization; APs call after the scheduler-start barrier.
+ */
+void apic_timer_init(uint8_t vector, uint32_t hz, uint32_t fallback_count);
 void apic_eoi(void);
 void apic_send_init(uint32_t destination);
 void apic_send_startup(uint32_t destination, uint8_t vector);

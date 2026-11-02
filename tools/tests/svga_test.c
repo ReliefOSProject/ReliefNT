@@ -255,9 +255,14 @@ uint64_t mm_virt_to_phys(const void *address)
     }
     return 0;
 }
+static bool vram_wc;
+static unsigned vram_downgrade_attempts;
 bool paging_mmio_uncached(uint64_t phys, uint64_t bytes)
 {
-    (void)phys;
+    const struct framebuffer *fb=framebuffer_get();
+    if(vram_wc && phys==fb->reservation_start && bytes==fb->reservation_bytes) {
+        ++vram_downgrade_attempts;return false;
+    }
     return bytes != 0;
 }
 static uint8_t *host_gmr_byte_pointer(uint32_t gmr, uint64_t offset)
@@ -1327,6 +1332,17 @@ static void test_cache_policy_failure_restores_legacy_fifo(void)
     ret = svga_restore_legacy_after_cache_error_locked(SVGA_ENOTSUP);
     svga_unlock(flags);
     assert(ret == SVGA_EIO);
+}
+/** @brief Keep the boot WC pixel aperture when configuring the independent FIFO.
+ * @return None; the real SVGA initialization must not try to downgrade VRAM.
+ */
+static void test_cache_policy_preserves_wc_vram(void)
+{
+    setup(SVGA_CAP_3D | SVGA_CAP_EXTENDED_FIFO | SVGA_CAP_GMR,
+          SVGA_FIFO_CAP_FENCE | SVGA_FIFO_CAP_RESERVE, SVGA3D_HWVERSION_WS8_B1);
+    vram_wc=true;vram_downgrade_attempts=0;
+    assert(svga3d_init()==0 && !vram_downgrade_attempts);
+    vram_wc=false;
 }
 static void test_cache_policy_reports_with_svga_lock_released(void)
 {
@@ -4399,6 +4415,7 @@ int main(void)
     test_fifo(); test_nonblocking_batch();
     test_mode_lease_preserves_live_backend(); test_fallback();
     test_cache_policy_failure_restores_legacy_fifo();
+    test_cache_policy_preserves_wc_vram();
     test_cache_policy_reports_with_svga_lock_released();
     test_fifo_reservation_matches_physical_alias();
     test_effective_surface_limit_snapshot();
@@ -4436,4 +4453,11 @@ int main(void)
     test_idle_shader_retirement();
     printf("SVGA tests passed: %u commands, %u presents; no live DMA pages\n", command_count, present_count);
     return 0;
+}
+
+/* These non-PAT fixtures retain the original UC-only aperture. */
+bool paging_mmio_writecombined(uint64_t physical,uint64_t bytes)
+{
+    const struct framebuffer *fb=framebuffer_get();
+    return vram_wc && physical==fb->reservation_start && bytes==fb->reservation_bytes;
 }

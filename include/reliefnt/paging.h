@@ -271,6 +271,22 @@ void paging_mmio_allocator_ready(void);
  * registry or page-table preparation cannot represent the request.
  */
 bool paging_mmio_uncached(uint64_t phys, uint64_t len);
+/** @brief Promote a fully retained, unleased UC device aperture to PAT WC/NX.
+ * @param phys Page-aligned device start, validated by the framebuffer driver.
+ * @param len Nonzero page-aligned bytes wholly outside ordinary RAM.
+ * @return True after atomically validating/updating registry and kernel aliases;
+ * false without changing any mapping on unsupported PAT, conflict or bad input.
+ * BSP only after sparse-map/allocator setup and before users/APs. The first
+ * attempt or first user-root creation permanently closes retyping admission.
+ * No allocation, callback or I/O; local caches/TLBs are flushed on both sides.
+ */
+bool paging_mmio_writecombine_boot(uint64_t phys, uint64_t len);
+/** @brief Check that an aperture retains its permanent WC cache policy.
+ * @param phys Page-aligned start. @param len Nonzero page-aligned bytes.
+ * @return True for complete retained WC coverage, false otherwise.
+ * Takes only the MMIO policy lock; never changes cache policy or allocates.
+ */
+bool paging_mmio_writecombined(uint64_t phys, uint64_t len);
 /** @brief Permanently pin an exact page-aligned default-cache device range WB/NX.
  * @param phys Page-aligned physical start.
  * @param len Page-aligned nonzero length.
@@ -328,7 +344,10 @@ bool paging_module_protect_page(uint64_t address, uint64_t flags);
 uint64_t paging_module_unmap_page(uint64_t address, uint64_t original_alias);
 
 /**
- * @brief Allocate and initialize an empty address space; true on success.
+ * @brief Allocate an empty user root and close bootstrap cache retyping.
+ * @param as Required writable descriptor.
+ * @return True on construction; false on invalid output or allocation failure.
+ * Even an unsuccessful attempt permanently seals the boot retyping phase.
  */
 bool address_space_create(struct address_space *as);
 /**

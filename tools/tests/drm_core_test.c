@@ -710,6 +710,7 @@ static uint32_t displayed_pixels[DRM_TEST_WIDTH * DRM_TEST_HEIGHT];
 static unsigned scanout_begin_calls;
 static unsigned scanout_release_calls;
 static unsigned scanout_present_calls;
+static uint64_t scanout_present_pixels;
 
 const struct framebuffer *framebuffer_get(void)
 {
@@ -740,6 +741,7 @@ int framebuffer_drm_present_region(const void *pixels, uint32_t pitch,
                source + (uint64_t)y * pitch + (uint64_t)x1 * 4u,
                (x2 - x1) * 4u);
     ++scanout_present_calls;
+    scanout_present_pixels += (uint64_t)(x2-x1)*(y2-y1);
     return 0;
 }
 
@@ -1875,6 +1877,30 @@ static void test_kms_resources_properties_and_scanout(void)
     assert(ioctl_call(&master_task, &master, DRM_IOCTL_MODE_DIRTYFB,
                       &dirty) == -LINUX_EINVAL);
     assert(scanout_present_calls == presents_before_bad_clip);
+
+    /* Sparse cursor/window damage must not upload the empty bounding box. */
+    struct drm_clip_rect sparse[2] = {{1, 1, 3, 3},
+        {DRM_TEST_WIDTH-3, DRM_TEST_HEIGHT-3, DRM_TEST_WIDTH-1, DRM_TEST_HEIGHT-1}};
+    dirty.num_clips = 2;
+    dirty.clips_ptr = (uint64_t)(uintptr_t)sparse;
+    uint64_t pixels_before = scanout_present_pixels;
+    source[DRM_TEST_WIDTH+1] = 0xff876543u;
+    source[(DRM_TEST_HEIGHT-3)*DRM_TEST_WIDTH+DRM_TEST_WIDTH-3] = 0xffabcdefu;
+    assert(ioctl_call(&master_task, &master, DRM_IOCTL_MODE_DIRTYFB, &dirty) == 0);
+    assert(scanout_present_pixels-pixels_before == 8);
+    assert(displayed_pixels[DRM_TEST_WIDTH+1] == 0xff876543u);
+    assert(displayed_pixels[(DRM_TEST_HEIGHT-3)*DRM_TEST_WIDTH+DRM_TEST_WIDTH-3] == 0xffabcdefu);
+
+    /* Validate the entire request before publishing even its first rectangle. */
+    pixels_before = scanout_present_pixels;
+    sparse[1].x2 = DRM_TEST_WIDTH+1;
+    assert(ioctl_call(&master_task, &master, DRM_IOCTL_MODE_DIRTYFB, &dirty) == -LINUX_EINVAL);
+    assert(scanout_present_pixels == pixels_before);
+
+    /* Overlapping/fullscreen clips must not multiply the total copy volume. */
+    sparse[0] = sparse[1] = (struct drm_clip_rect){0, 0, DRM_TEST_WIDTH, DRM_TEST_HEIGHT};
+    assert(ioctl_call(&master_task, &master, DRM_IOCTL_MODE_DIRTYFB, &dirty) == 0);
+    assert(scanout_present_pixels-pixels_before == DRM_TEST_WIDTH*DRM_TEST_HEIGHT);
 
     struct drm_mode_destroy_dumb destroy = {.handle = create.handle};
     assert(ioctl_call(&master_task, &master, DRM_IOCTL_MODE_DESTROY_DUMB,

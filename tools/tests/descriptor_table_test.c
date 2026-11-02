@@ -322,6 +322,12 @@ int64_t drm_prime_file_llseek(struct task_file *file,int64_t offset,uint32_t whe
 int task_shm_attach(struct task_file *file,uint32_t flags){(void)file;(void)flags;abort();}
 int task_shm_reopen(struct task_file *file,const struct vfs_path *path){(void)file;(void)path;abort();}
 uint64_t input_evdev_cursor_now(void){abort();}
+uint64_t input_evdev_event_generation_vt(uint32_t kind,uint64_t token,uint32_t vt)
+{(void)kind;(void)token;(void)vt;return 0;}
+/* The descriptor fixture does not model APIC delivery. */
+void smp_send_reschedule(uint32_t cpu) { (void)cpu; }
+bool power_acpi_pm_timer_read(uint32_t *count,uint32_t *mask)
+{(void)count;(void)mask;return false;}
 /* The inode/backend boundary for the regular-OFD writer lifetime regression. */
 int storage_inode_get(const struct storage_node *node,struct storage_inode_ref **out)
 {
@@ -2504,6 +2510,7 @@ int storage_write_held_node(struct storage_node *node,uint64_t offset,const void
 {(void)node;(void)offset;(void)buffer;(void)length;(void)written;abort();}
 void storage_drain_task_io(uint32_t pid){assert(descriptor_dispatch_task && pid==descriptor_dispatch_task->pid);++transfer_drains;descriptor_dirent_io_pending=false;descriptor_stage_drained=true;}
 uint64_t time_uptime_us(void){return 0;}
+uint64_t time_work_counter_us(void) { return time_uptime_us(); }
 /* Transfer completion is in this current task; the signal fixture exercises
  * the real destination-MM copy while an unrelated CR3 remains active. */
 int user_copy_to_task(struct task *task,uint64_t address,const void *bytes,uint64_t length)

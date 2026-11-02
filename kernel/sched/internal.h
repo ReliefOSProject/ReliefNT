@@ -460,6 +460,13 @@ extern struct eevdf_queue fair_queues[SMP_MAX_CPUS];
 extern struct task *fair_running[SMP_MAX_CPUS];
 extern uint64_t fair_started[SMP_MAX_CPUS];
 extern uint64_t fair_clock;
+/* Scheduler-lock-owned extension of the shared ACPI PM clock. */
+struct fair_clock_reference {
+    uint64_t microseconds, remainder;
+    uint32_t last, mask;
+    bool valid;
+};
+extern struct fair_clock_reference fair_reference;
 
 void sched_truncate_file_mappings(const struct storage_node *node, uint64_t size);
 
@@ -467,6 +474,11 @@ bool thread_group_pending(uint32_t tgid, const struct task *except);
 
 uint32_t scheduler_cpu_index(void);
 
+/** @brief Publish readiness and coalesce remote reschedule IPIs until selection.
+ * IRQ/task callers hold scheduler_lock or the execution transaction around the
+ * state change. Local CPU needs no IPI; offline CPUs are ignored. No remote
+ * completion wait, allocation or task/frame ownership transfer.
+ */
 void sched_request_reschedule_all_online(void);
 
 void sched_notify_runnable(void);
@@ -483,6 +495,11 @@ bool task_cpu_allowed(const struct task *task, uint32_t cpu);
 
 uint32_t scheduler_current_pid(void);
 
+/**
+ * @brief Read nondecreasing fairness microseconds from the shared PM clock.
+ * @return Global scheduling time, retaining the legacy floor on source loss.
+ * Caller holds scheduler_lock or exclusive boot ownership; never a user clock.
+ */
 uint64_t fair_now(void);
 
 void fair_account_cpu(uint32_t cpu, uint64_t now);

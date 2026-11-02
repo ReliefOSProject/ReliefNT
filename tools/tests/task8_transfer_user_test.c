@@ -52,6 +52,7 @@ void storage_set_io_async_context(bool enabled) { assert(!enabled); }
 void storage_release_task_io(uint32_t pid) { assert(pid == current.pid); ++releases; }
 void storage_drain_task_io(uint32_t pid) { assert(pid == current.pid); ++drains; }
 uint64_t time_uptime_us(void) { return 0; }
+uint64_t time_work_counter_us(void) { return time_uptime_us(); }
 bool user_range_ok(uint64_t address, uint64_t length)
 { return address >= 4096 && length <= UINT64_MAX - address && !(contended && address == blocked); }
 bool user_range_writable(uint64_t address, uint64_t length) { return user_range_ok(address, length); }

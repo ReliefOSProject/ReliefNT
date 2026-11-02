@@ -37,6 +37,7 @@ struct task *fair_running[SMP_MAX_CPUS];
 uint64_t fair_started[SMP_MAX_CPUS];
 
 uint64_t fair_clock;
+struct fair_clock_reference fair_reference;
 
 uint32_t scheduler_cpu_index(void)
 {
@@ -50,13 +51,23 @@ static void sched_request_reschedule_cpu(uint32_t cpu)
         __atomic_store_n(&sched_resched_pending[cpu], 1, __ATOMIC_RELEASE);
 }
 
+/** @brief Publish runnable work and interrupt remote CPUs once per pending flag.
+ * IRQ/task callers serialize the readiness transition with scheduler_lock or
+ * execution ownership. Local returns observe their own flag without an IPI;
+ * repeated notifications coalesce until the destination schedules. No wait
+ * for remote scheduling and no change to task/frame ownership or fair policy.
+ */
 void sched_request_reschedule_all_online(void)
 {
     uint32_t count = smp_cpu_count();
     uint32_t current = scheduler_cpu_index();
     if (count > SMP_MAX_CPUS) count = SMP_MAX_CPUS;
-    for (uint32_t cpu = 0; cpu < count; ++cpu)
-        if (cpu == current || smp_cpu_online(cpu)) sched_request_reschedule_cpu(cpu);
+    for (uint32_t cpu = 0; cpu < count; ++cpu) {
+        if (cpu != current && !smp_cpu_online(cpu)) continue;
+        uint32_t pending = __atomic_exchange_n(&sched_resched_pending[cpu], 1,
+                                               __ATOMIC_ACQ_REL);
+        if (cpu != current && !pending) smp_send_reschedule(cpu);
+    }
     if (current >= count) sched_request_reschedule_cpu(current);
 }
 
@@ -131,6 +142,7 @@ void sched_init(void)
             .started = smp_cpu_online(i)};
     }
     fair_clock = 0;
+    fair_reference = (struct fair_clock_reference){0};
     console_info("[reliefnt] EEVDF scheduler initialized\n");
 }
 

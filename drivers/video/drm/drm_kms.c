@@ -903,6 +903,16 @@ static int drm_kms_rmfb(struct drm_file *file, uint32_t id)
     return 0;
 }
 
+/** @brief Validate damage and update the active framebuffer without spare uploads.
+ * @param task Calling task pinned by the execution transaction.
+ * @param file Borrowed DRM open-file description under execution ownership.
+ * @param arg Imported, writable kernel copy of the DIRTYFB request.
+ * @return Zero after accepted damage, or a lookup, validation, import or scanout error.
+ * All clips are checked before copying. Software scanout uses separate clips
+ * when their combined area is smaller than the bounding rectangle; overlapping
+ * damage cannot multiply copy volume beyond the previous bounding-box path.
+ * Surface-backed asynchronous jobs retain their existing coalescing/lifetime.
+ */
 static int drm_kms_dirtyfb(struct task *task, struct drm_file *file,
                            struct drm_mode_fb_dirty_cmd *arg)
 {
@@ -927,6 +937,7 @@ static int drm_kms_dirtyfb(struct task *task, struct drm_file *file,
         return -LINUX_EFAULT;
 #endif
     uint32_t x1 = fb->width, y1 = fb->height, x2 = 0, y2 = 0;
+    uint64_t clip_pixels = 0;
     if (!arg->num_clips) {
         x1 = 0;
         y1 = 0;
@@ -941,6 +952,8 @@ static int drm_kms_dirtyfb(struct task *task, struct drm_file *file,
             if (clips[i].y1 < y1) y1 = clips[i].y1;
             if (clips[i].x2 > x2) x2 = clips[i].x2;
             if (clips[i].y2 > y2) y2 = clips[i].y2;
+            clip_pixels += (uint64_t)(clips[i].x2 - clips[i].x1) *
+                           (clips[i].y2 - clips[i].y1);
         }
     }
     if (drm_kms_active_fb != fb) return 0;
@@ -982,6 +995,14 @@ static int drm_kms_dirtyfb(struct task *task, struct drm_file *file,
     uint8_t *pixels = physical ? paging_kernel_direct_map(physical) : NULL;
     if (!pixels) return -LINUX_EFAULT;
     pixels += fb->offset;
+    if (arg->num_clips > 1 && clip_pixels < (uint64_t)(x2 - x1) * (y2 - y1)) {
+        for (uint32_t i = 0; i < arg->num_clips; ++i) {
+            int ret = framebuffer_drm_present_region(pixels, fb->pitch, fb->format,
+                clips[i].x1, clips[i].y1, clips[i].x2, clips[i].y2);
+            if (ret) return ret;
+        }
+        return 0;
+    }
     return framebuffer_drm_present_region(pixels, fb->pitch, fb->format,
                                           x1, y1, x2, y2);
 }

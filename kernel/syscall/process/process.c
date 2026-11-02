@@ -1152,12 +1152,24 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
         if (target == 0 && current) {
             target = current->pid;
         }
-        if (!current || (number == LINUX_SYS_SETPRIORITY &&
-                         target != current->pid && current->uid != 0)) {
-            return -RELIEFOS_EPERM;
+        struct task *selected = sched_find(target);
+        if (!current || !selected || selected->kind != TASK_KIND_USER ||
+            selected->state == TASK_EXITED) return -LINUX_ESRCH;
+        int requested = (int)a2;
+        if (requested < -20) requested = -20;
+        if (requested > 19) requested = 19;
+        if (number == LINUX_SYS_SETPRIORITY) {
+            /* Execution ownership pins credentials/lifetime. Linux permits
+             * a renice child to lower its same-owner parent's priority; PID
+             * inequality alone is not a privilege boundary. RLIMIT_NICE is
+             * currently unsupported, so raising requires CAP_SYS_NICE. */
+            bool privileged = (current->cap_effective & (1ULL << CAP_SYS_NICE)) != 0;
+            if (!privileged && current->euid != selected->uid &&
+                current->euid != selected->euid) return -LINUX_EPERM;
+            if (!privileged && requested < selected->priority) return -LINUX_EACCES;
         }
         {
-            int priority = sched_task_priority(target, (int)a2,
+            int priority = sched_task_priority(target, requested,
                                                 number == LINUX_SYS_SETPRIORITY);
             if (priority < -20 || priority > 19) {
                 return -RELIEFOS_ENOENT;

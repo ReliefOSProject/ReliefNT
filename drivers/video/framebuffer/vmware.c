@@ -3,6 +3,7 @@
 
 #include <reliefnt/mm.h>
 #include <reliefnt/paging.h>
+#include <reliefnt/pat.h>
 #include <linux/errno.h>
 
 /** @brief Copy the immutable identity established by successful boot binding.
@@ -14,6 +15,43 @@ int framebuffer_vmware_pci_identity(struct pci_device *out)
 {
     if(!out || !vmware_svga.present)return -ENODEV;
     *out=vmware_svga.pci;return 0;
+}
+
+/** @brief Keep a retained WC pixel aperture, or establish its initial UC map.
+ * @param physical Device pixel base. @param bytes Aperture byte extent.
+ * @return True for compatible permanent coverage, false on a mapping failure.
+ * Called under boot or existing modeset serialization; never changes WC to UC.
+ */
+static bool vmware_map_pixels(uint64_t physical,uint64_t bytes)
+{
+    return paging_mmio_writecombined(physical,bytes) || paging_mmio_uncached(physical,bytes);
+}
+
+/** @brief Promote only a prefetchable PCI pixel BAR during single-CPU boot.
+ * @return True for a verified WC aperture; false preserves its existing mapping.
+ * Sparse-map/allocator setup is complete, APs/users have not started. The FIFO
+ * must be disjoint; PCI config space and SVGA registers keep their UC mappings.
+ */
+bool framebuffer_enable_writecombine_boot(void)
+{
+    if (!arch_pat_writecombine_ready() || !vmware_svga.present ||
+        fb.backend!=FRAMEBUFFER_BACKEND_VMWARE_SVGA) return false;
+    const struct pci_device *pci=&vmware_svga.pci;
+    uint32_t bar=pci_config_read32(pci->bus,pci->slot,pci->function,0x14);
+    uint64_t physical=bar & ~0xfULL;
+    if ((bar&1u) || !(bar&8u)) return false;
+    uint32_t type=bar&6u;
+    if (type==4u) physical|=(uint64_t)pci_config_read32(pci->bus,pci->slot,pci->function,0x18)<<32;
+    else if (type!=0) return false;
+    if (physical!=fb.reservation_start || !fb.reservation_bytes) return false;
+    uint64_t fifo=vmware_svga_read(VMWARE_SVGA_REG_MEM_START);
+    uint64_t fifo_bytes=vmware_svga_read(VMWARE_SVGA_REG_MEM_SIZE);
+    uint64_t bytes=fb.reservation_bytes;
+    if (fifo_bytes && physical<fifo+fifo_bytes && fifo<physical+bytes) return false;
+    if (!paging_mmio_writecombine_boot(physical,bytes)) return false;
+    console_info("[framebuffer] VMware SVGA pixel cache=WC physical=%p bytes=%llu\n",
+        (void *)(uintptr_t)physical,(unsigned long long)bytes);
+    return true;
 }
 
 
@@ -337,7 +375,7 @@ int framebuffer_vmware_probe(void)
                                     (uint64_t)pitch * height);
     }
     if (device_mode_valid && (enabled & 1u) != 0u) {
-        if (!paging_mmio_uncached(fb_start, fb_max_size)) goto restore_scanout;
+        if (!vmware_map_pixels(fb_start, fb_max_size)) goto restore_scanout;
         device_pixels = (uint32_t *)mm_phys_to_virt((uint64_t)fb_start + fb_offset);
         if (!device_pixels) goto restore_scanout;
     } else {
@@ -472,7 +510,7 @@ int framebuffer_vmware_set_mode(uint32_t width, uint32_t height)
         else svga_unlock(legacy_flags);
         return 0;
     }
-    if (!paging_mmio_uncached(fb_start, fb_max_size)) {
+    if (!vmware_map_pixels(fb_start, fb_max_size)) {
         if (restart_3d) svga_mode_end(svga_flags);
         else svga_unlock(legacy_flags);
         return 0;

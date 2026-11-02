@@ -10,6 +10,7 @@
 #include <reliefnt/lock.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/framebuffer.h>
+#include <reliefnt/pat.h>
 #include <linux/errno.h>
 #include "internal.h"
 
@@ -94,6 +95,7 @@ static uint64_t kernel_low_pt[512][512] __attribute__((aligned(4096)));
 enum mmio_cache_policy {
     MMIO_CACHE_POLICY_UC = 1,
     MMIO_CACHE_POLICY_WB = 2,
+    MMIO_CACHE_POLICY_WC = 3,
 };
 struct mmio_run {
     uint64_t start, end, original_flags;
@@ -108,6 +110,16 @@ static struct kernel_spinlock mmio_lock = KERNEL_SPINLOCK_INIT;
  * intrusive nodes outlive every installed alias and are guarded by mmio_lock. */
 static struct paging_cache_claim *cache_claims, *cache_claim_tree;
 static bool nx_enabled;
+static bool mmio_boot_retype_closed;
+
+/** @brief Translate a registry policy to its exact four-KiB PAT selector.
+ * @param policy Valid registry cache mode. @return PWT/PCD/PAT leaf bits.
+ */
+static uint64_t mmio_policy_flags(enum mmio_cache_policy policy)
+{
+    return policy==MMIO_CACHE_POLICY_UC ? RELIEFNT_PAGE_PWT|RELIEFNT_PAGE_PCD :
+           policy==MMIO_CACHE_POLICY_WC ? RELIEFNT_PAGE_PAT : 0;
+}
 /* Owner-embedded nodes require no allocation and are mutated only under the
  * execution writer, which also excludes fork while this list is inspected. */
 static struct paging_writable_alias *writable_aliases;
@@ -307,17 +319,17 @@ bool paging_nx_ready(void) { return nx_enabled; }
 
 /** @brief Borrow one boot-time MMIO cache claim for transfer to the new map.
  * @param index Zero-based claim index. @param start Inclusive physical output.
- * @param end Exclusive physical output. @param uncached Output cache policy.
+ * @param end Exclusive physical output. @param cache_flags Exact PAT selector.
  * @return True for an existing claim, false for the end or invalid output.
  * BSP only before user address spaces or APs; the registry remains owned here.
  */
 bool paging_boot_mmio_run(uint32_t index, uint64_t *start, uint64_t *end,
-                          bool *uncached)
+                          uint64_t *cache_flags)
 {
-    if (index >= mmio_run_count || !start || !end || !uncached) return false;
+    if (index >= mmio_run_count || !start || !end || !cache_flags) return false;
     *start = mmio_runs[index].start;
     *end = mmio_runs[index].end;
-    *uncached = mmio_runs[index].policy == MMIO_CACHE_POLICY_UC;
+    *cache_flags = mmio_policy_flags(mmio_runs[index].policy);
     return true;
 }
 
@@ -1266,8 +1278,7 @@ static bool mmio_acquire(uint64_t phys, uint64_t len, bool permanent,
     if (!nx_enabled || !mmio_valid_aligned_range(phys, len)) return false;
     uint64_t end = phys + len;
     kernel_spin_lock(&mmio_lock);
-    uint64_t cache = policy == MMIO_CACHE_POLICY_UC ?
-        RELIEFNT_PAGE_PWT|RELIEFNT_PAGE_PCD : 0;
+    uint64_t cache = mmio_policy_flags(policy);
     if (!cache_claim_compatible(phys,end,cache)) {
         kernel_spin_unlock(&mmio_lock);
         return false;
@@ -1300,11 +1311,8 @@ static bool mmio_acquire(uint64_t phys, uint64_t len, bool permanent,
 
     for (uint64_t p = phys; p < end; p += PAGE_SIZE) {
         uint64_t *pte = mmio_existing_leaf(p);
-        if (policy == MMIO_CACHE_POLICY_UC)
-            *pte = (*pte & ~RELIEFNT_PAGE_PAT) | RELIEFNT_PAGE_PWT |
-                   RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_NOEXEC;
-        else
-            *pte |= RELIEFNT_PAGE_NOEXEC;
+        *pte = (*pte & ~(RELIEFNT_PAGE_PAT|RELIEFNT_PAGE_PWT|RELIEFNT_PAGE_PCD)) |
+               cache | RELIEFNT_PAGE_NOEXEC;
         mmio_update_low_alias(p, *pte);
     }
     for (uint32_t i = 0; i < run_count; ++i) mmio_runs[i] = mmio_work[i];
@@ -1316,6 +1324,93 @@ static bool mmio_acquire(uint64_t phys, uint64_t len, bool permanent,
     smp_flush_user_tlb();
     kernel_spin_unlock(&mmio_lock);
     return true;
+}
+
+/** @brief Reclassify one unleased permanent UC aperture during BSP bootstrap.
+ * @param phys Aligned device start. @param len Aligned, nonzero extent.
+ * @return True on a complete registry/PTE transition; false before any changes
+ * on malformed input, RAM, PAT absence, live aliases/leases or capacity failure.
+ * Boot only before user roots/APs. All page-table leaves must already exist;
+ * the first attempt seals admission. Caches and both kernel aliases transition
+ * under the MMIO lock with IRQs masked; no allocation or callback occurs.
+ */
+bool paging_mmio_writecombine_boot(uint64_t phys,uint64_t len)
+{
+    if (__atomic_exchange_n(&mmio_boot_retype_closed,true,__ATOMIC_ACQ_REL) ||
+        !arch_pat_writecombine_ready() || !nx_enabled ||
+        !mmio_valid_aligned_range(phys,len)) return false;
+    uint64_t flags=kernel_irq_save(), end=phys+len, cursor=phys;
+    kernel_spin_lock(&mmio_lock);
+    bool valid=cache_claim_compatible(phys,end,RELIEFNT_PAGE_PAT);
+    uint32_t count=0;
+    for (uint64_t p=phys;valid && p<end;p+=PAGE_SIZE) {
+        uint64_t *pte=mmio_existing_leaf(p);
+        uint64_t entry=pte ? *pte : 0;
+        uint64_t cache=RELIEFNT_PAGE_PWT|RELIEFNT_PAGE_PCD|RELIEFNT_PAGE_PAT;
+        valid=!mm_phys_is_ram(p,PAGE_SIZE) && pte &&
+            (entry&RELIEFNT_PHYS_ADDR_MASK)==p &&
+            (entry&(RELIEFNT_PAGE_PRESENT|RELIEFNT_PAGE_WRITABLE|RELIEFNT_PAGE_USER))==
+                (RELIEFNT_PAGE_PRESENT|RELIEFNT_PAGE_WRITABLE) &&
+            (entry&cache)==(RELIEFNT_PAGE_PWT|RELIEFNT_PAGE_PCD);
+    }
+    for (uint32_t i=0;valid && i<mmio_run_count;++i) {
+        const struct mmio_run *old=&mmio_runs[i];
+        if (old->end<=phys || old->start>=end) {
+            valid=mmio_run_append(old,&count);continue;
+        }
+        uint64_t first=old->start>phys ? old->start : phys;
+        uint64_t last=old->end<end ? old->end : end;
+        if (first!=cursor || old->refs || !old->permanent ||
+            old->policy!=MMIO_CACHE_POLICY_UC) { valid=false;break; }
+        struct mmio_run part=*old;
+        if (old->start<first) {
+            part.end=first;
+            if (!mmio_run_append(&part,&count)) { valid=false;break; }
+        }
+        part=*old;part.start=first;part.end=last;part.policy=MMIO_CACHE_POLICY_WC;
+        if (!mmio_run_append(&part,&count)) { valid=false;break; }
+        if (last<old->end) {
+            part=*old;part.start=last;
+            if (!mmio_run_append(&part,&count)) { valid=false;break; }
+        }
+        cursor=last;
+    }
+    if (valid && cursor==end) {
+        arch_pat_flush_boot();
+        for (uint64_t p=phys;p<end;p+=PAGE_SIZE) {
+            uint64_t *pte=mmio_existing_leaf(p);
+            *pte=(*pte & ~(RELIEFNT_PAGE_PWT|RELIEFNT_PAGE_PCD|RELIEFNT_PAGE_PAT)) |
+                RELIEFNT_PAGE_PAT|RELIEFNT_PAGE_NOEXEC;
+            mmio_update_low_alias(p,*pte);
+        }
+        for (uint32_t i=0;i<count;++i)mmio_runs[i]=mmio_work[i];
+        mmio_run_count=count;
+        smp_flush_user_tlb();
+        arch_pat_flush_boot();
+    } else valid=false;
+    kernel_spin_unlock(&mmio_lock);
+    kernel_irq_restore(flags);
+    return valid;
+}
+
+/** @brief Confirm complete permanent WC coverage without retyping live aliases.
+ * @param phys Aligned physical start. @param len Nonzero aligned extent.
+ * @return True only when every byte remains a permanently retained WC claim.
+ * Task/boot context, MMIO policy lock only; no allocation, I/O or mutation.
+ */
+bool paging_mmio_writecombined(uint64_t phys,uint64_t len)
+{
+    if(!mmio_valid_aligned_range(phys,len))return false;
+    uint64_t end=phys+len,cursor=phys;
+    kernel_spin_lock(&mmio_lock);
+    for(uint32_t i=0;i<mmio_run_count && cursor<end;++i) {
+        const struct mmio_run *run=&mmio_runs[i];
+        if(run->end<=cursor)continue;
+        if(run->start>cursor || !run->permanent || run->policy!=MMIO_CACHE_POLICY_WC)break;
+        cursor=run->end<end ? run->end : end;
+    }
+    kernel_spin_unlock(&mmio_lock);
+    return cursor==end;
 }
 /** @brief Claim a precise shared UC/NX device mapping.
  * @param phys Aligned physical device base, validated against PCI BAR by caller.
@@ -1901,11 +1996,13 @@ static void release_replaced_tables(uint64_t old_entry, uint64_t new_entry,
  * supervisor pages, overlapping legal user addresses and blocking lazy
  * faults. User roots therefore inherit only the separately built supervisor
  * kernel-image window, plus canonical high-half mappings for kernel data and
- * the physical direct map.
+ * the physical direct map. The first construction attempt also seals bootstrap
+ * cache retyping before any independently retained user alias can exist.
  */
 static bool address_space_create_internal(struct address_space *as, bool *exhausted,
                                           uint64_t *free_pages)
 {
+    __atomic_store_n(&mmio_boot_retype_closed,true,__ATOMIC_RELEASE);
     uint64_t phys;
     if (!as) return false;
     for (size_t i = 0; i < sizeof(*as); ++i) ((uint8_t *)as)[i] = 0;
@@ -1929,8 +2026,15 @@ static bool address_space_create_internal(struct address_space *as, bool *exhaus
     return true;
 }
 
+/** @brief Allocate a user root and permanently close bootstrap cache retyping.
+ * @param as Required writable address-space descriptor.
+ * @return True on construction, false on invalid output or allocation failure.
+ * Execution-owned context; even an unsuccessful attempt seals the boot phase.
+ */
 bool address_space_create(struct address_space *as)
-{ return address_space_create_internal(as, NULL, NULL); }
+{
+    return address_space_create_internal(as, NULL, NULL);
+}
 
 /** @brief Create child mappings with private page tables and shared COW backing.
  * @param source Existing parent address space.
@@ -3099,3 +3203,4 @@ uint64_t paging_module_unmap_page(uint64_t address,uint64_t original_alias)
 EXPORT_SYMBOL(paging_kernel_direct_map);
 
 EXPORT_SYMBOL(paging_kernel_direct_map_range);
+EXPORT_SYMBOL(paging_mmio_writecombined);
