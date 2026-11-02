@@ -63,9 +63,11 @@ proc 的原有只读挂载属性不变；开启配置时 proc 默认挂载为可
 此控制节点，其余生成节点仍拒绝写入和元数据修改。显式只读挂载或
 重挂载仍拒绝控制节点写入；一般 proc 节点不会因此变成可写文件。
 
-格式头部为 ``reliefnt_lock_stats 1 unit=tsc_cycles enabled=<0|1>
- epoch=<n> histogram=log2_cycles irq=gate_masked_window``。其后每个
-非空 CPU/固定作用域一行，包含 ``cpu``、``scope``、``acquisitions``、
+格式头部为::
+
+    reliefnt_lock_stats 1 unit=tsc_cycles enabled=<0|1> epoch=<n> histogram=log2_cycles irq=gate_masked_window
+
+其后每个非空 CPU/固定作用域一行，包含 ``cpu``、``scope``、``acquisitions``、
 ``contentions``、``wait_total``、``wait_max``、``hold_total``、
 ``hold_max``、``irq_total``、``irq_max``、``clock_errors`` 以及三个
 ``wait_hist``、``hold_hist``、``irq_hist`` 逗号分隔的 32 桶计数。

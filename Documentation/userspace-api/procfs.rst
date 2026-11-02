@@ -21,12 +21,14 @@ procfs 由内核生成，通过 VFS 挂载在 ``/proc``；不需要用户态守�
      - 总计及每 CPU 的 user/system/idle、外部中断总数、上下文切换、启动时间、
        创建任务数和当前可运行任务数。
    * - ``meminfo``
-     - 物理分配器的总量/空闲量、只读页缓存和 tmpfs 数据页。
-       ``MemAvailable`` 保守地等于空闲量，不承诺缓存一定可回收。
+     - 物理内存总量/空闲量、页缓存、tmpfs、Dirty 和已启用 swap 容量。
+       ``MemAvailable`` 扣除应急保留并计入可证明能回收的缓存，不包含 swap。
    * - ``vmstat``
-     - 空闲/缓存/tmpfs 页数、成功分配和最终释放的物理页数、用户页错误异常数。
+     - 空闲/缓存/tmpfs 页数、实际物理页分配/释放、逻辑用户 fault、换入/换出、
+       direct/background 回收及 OOM kill 信号发布计数。
    * - ``swaps``
-     - 仅有表头；当前没有交换子系统。相关 swap 容量和事件计数为零。
+     - 已发布 swap 文件/分区的保留路径、KiB 容量/使用量及优先级，包含正在
+       drain 的区域；每次打开捕获固定视图。激活条件见 :doc:`../admin-guide/swap`。
    * - ``partitions``
      - 当前注册整盘、GPT/MBR 分区和光驱的设备号、KiB 容量及设备名称。
    * - ``diskstats``
