@@ -18,6 +18,7 @@ static uint64_t fix2_device_user_start,fix2_device_user_end;
 #endif
 static struct task *test_current_task(void) { return current; }
 #define sched_current_task test_current_task
+#include "paging_cpu_fixture.h"
 #include "../../arch/x86_64/mm/paging.c"
 #define RELIEFNT_MM_TEST_STATS
 #include "../../mm/user/context.c"

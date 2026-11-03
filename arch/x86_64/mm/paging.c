@@ -171,21 +171,50 @@ static void copy_page(uint64_t destination, uint64_t source)
     }
 }
 
+#ifdef RELIEFNT_PHYSICAL_BITS_HOST_TEST
+extern uint32_t paging_test_extended_cpuid_eax(uint32_t leaf);
+#endif
+
+/** @brief Read EAX from an extended CPU feature leaf without retaining state.
+ * @param leaf Extended CPUID function number; subleaf is zero.
+ * @return EAX reported by the local CPU. No allocation or ownership transfer.
+ */
+static uint32_t paging_extended_cpuid_eax(uint32_t leaf)
+{
+#ifdef RELIEFNT_PHYSICAL_BITS_HOST_TEST
+    return paging_test_extended_cpuid_eax(leaf);
+#else
+    uint32_t a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                     : "a"(leaf), "c"(0));
+    return a;
+#endif
+}
+
 /**
- * @brief Read the architectural physical-address width from extended CPUID.
+ * @brief Cache the local CPU's immutable physical-address width after probing.
  * @return Width from 32 through 52, or zero when the leaf is absent or invalid.
- * No allocation, locks, privileged instructions, or ownership transfer.
+ * Boot/task/IRQ context without CPU migration; no allocation, locks or mapping
+ * changes. Zero is unprobed and one caches an unsupported result. Atomic byte
+ * accesses allow a nested cold query to publish the same immutable value.
+ * Invalid CPU identities retain the uncached query rather than aliasing CPU0.
  */
 uint8_t paging_physical_bits(void)
 {
-    uint32_t a, b, c, d;
-    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
-                     : "a"(0x80000000u), "c"(0));
-    if (a < 0x80000008u) return 0;
-    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
-                     : "a"(0x80000008u), "c"(0));
-    uint8_t bits = (uint8_t)a;
-    return bits >= 32 && bits <= 52 ? bits : 0;
+    static uint8_t physical_bits_cache[SMP_MAX_CPUS];
+    uint32_t cpu = smp_current_cpu();
+    uint8_t cached = cpu < SMP_MAX_CPUS ?
+        __atomic_load_n(&physical_bits_cache[cpu], __ATOMIC_RELAXED) : 0;
+    if (cached) return cached == 1 ? 0 : cached;
+
+    uint8_t bits = 0;
+    if (paging_extended_cpuid_eax(0x80000000u) >= 0x80000008u) {
+        uint8_t width = (uint8_t)paging_extended_cpuid_eax(0x80000008u);
+        if (width >= 32 && width <= 52) bits = width;
+    }
+    if (cpu < SMP_MAX_CPUS)
+        __atomic_store_n(&physical_bits_cache[cpu], bits ? bits : 1, __ATOMIC_RELAXED);
+    return bits;
 }
 
 /**

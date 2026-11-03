@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #define address_space_map_user_page real_map_user_page
+#include "paging_cpu_fixture.h"
 #include "../../arch/x86_64/mm/paging.c"
 #undef address_space_map_user_page
 bool address_space_map_user_page(struct address_space *, uint64_t, uint64_t, uint64_t);

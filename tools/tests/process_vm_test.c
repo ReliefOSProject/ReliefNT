@@ -8,6 +8,7 @@
 #include <linux/capability.h>
 #undef RELIEFNT_KERNEL_DIRECT_MAP_BASE
 #define RELIEFNT_KERNEL_DIRECT_MAP_BASE 0
+#include "paging_cpu_fixture.h"
 #include "../../arch/x86_64/mm/paging.c"
 #include "../../kernel/syscall/process/process_vm.c"
 

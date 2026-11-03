@@ -5,6 +5,7 @@
 #include "swap_activation_test.c"
 #undef main
 #include <linux/mman.h>
+#include "paging_cpu_fixture.h"
 #include "../../arch/x86_64/mm/paging.c"
 
 static struct { uint64_t physical; unsigned refs; } host_pages[64];

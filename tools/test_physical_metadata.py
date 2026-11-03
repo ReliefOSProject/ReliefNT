@@ -25,6 +25,11 @@ with tempfile.TemporaryDirectory(prefix="reliefnt-pmm-") as work:
         subprocess.run([*common, "-Wl,--gc-sections", "tools/tests/physical_bits_test.c",
                         "arch/x86_64/mm/paging.c", "-o", str(bits_binary)], cwd=ROOT, check=True)
         subprocess.run([str(bits_binary)], cwd=ROOT, check=True, timeout=30)
+        cache_binary = Path(work) / "physical_bits_cache_test"
+        subprocess.run([*common, "-Wl,--gc-sections", "-DRELIEFNT_PHYSICAL_BITS_HOST_TEST",
+                        "tools/tests/physical_bits_cache_test.c", "arch/x86_64/mm/paging.c",
+                        "-o", str(cache_binary)], cwd=ROOT, check=True)
+        subprocess.run([str(cache_binary)], cwd=ROOT, check=True, timeout=30)
     heap_object = Path(work) / "heap.o"
     subprocess.run([*common, "-Dmm_virt_to_phys=fixture_heap_virt_to_phys", "-c",
                     "mm/heap/heap.c", "-o", str(heap_object)], cwd=ROOT, check=True)

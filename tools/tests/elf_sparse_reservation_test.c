@@ -10,6 +10,7 @@
 
 #include "../../kernel/exec/elf.c"
 #define align_down paging_align_down
+#include "paging_cpu_fixture.h"
 #include "../../arch/x86_64/mm/paging.c"
 #undef align_down
 

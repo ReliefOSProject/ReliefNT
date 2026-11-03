@@ -8,6 +8,7 @@
 #include <reliefnt/multiboot2.h>
 #include <reliefnt/framebuffer.h>
 
+#include "paging_cpu_fixture.h"
 #include "../../arch/x86_64/mm/paging.c"
 
 static uint64_t pdpt0[512] __attribute__((aligned(4096)));

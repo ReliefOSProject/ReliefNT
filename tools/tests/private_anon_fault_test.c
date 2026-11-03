@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "paging_cpu_fixture.h"
 #include "../../arch/x86_64/mm/paging.c"
 #include "modules/user_memory.h"
 #include "sysv_shm_fixture_stubs.h"

@@ -4,6 +4,7 @@
 #include <string.h>
 #include <reliefnt/module_memory.h>
 #include <reliefnt/framebuffer.h>
+#include "paging_cpu_fixture.h"
 #include "../../arch/x86_64/mm/paging.c"
 static struct { uint64_t phys; void *data; unsigned refs; } pages[1024];
 static int fail_after=-1;

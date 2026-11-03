@@ -98,9 +98,11 @@ enum paging_user_entry_kind paging_user_entry_kind(const struct address_space *a
 int paging_user_pressure_step(struct address_space *as, uint64_t *cursor, uint64_t *page);
 
 /**
- * @brief Query the CPU's architectural physical-address width.
+ * @brief Query and cache the local CPU's architectural physical-address width.
  * @return CPUID physical width from 32 through 52, or zero when unavailable/invalid.
- * Safe before the PMM starts; no allocation or ownership transfer.
+ * Safe before the PMM starts and in task/IRQ context without CPU migration;
+ * no allocation or ownership transfer. Only immutable capabilities are cached:
+ * direct-map coverage and page permissions are still inspected on each call.
  */
 uint8_t paging_physical_bits(void);
 /**

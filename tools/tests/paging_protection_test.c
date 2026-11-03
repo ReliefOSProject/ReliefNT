@@ -19,6 +19,7 @@ static int test_page_alloc_allowed(void)
 
 /* Exercise the real page-table implementation; only physical allocation and
  * privileged CPU operations are replaced by host fixtures. */
+#include "paging_cpu_fixture.h"
 #include "../../arch/x86_64/mm/paging.c"
 
 static struct { uint64_t address; unsigned refs; void *host; } pages[1024];
