@@ -11,6 +11,7 @@
    modules
    execution
    memory
+   path-cache
    resource-limits
    drivers
    usb

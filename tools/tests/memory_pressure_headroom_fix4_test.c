@@ -9,6 +9,17 @@
 #undef mm_total_memory_kib
 #include "../../mm/reclaim/internal.h"
 
+static bool churn_names;
+static unsigned name_evictions;
+uint32_t __real_vfs_lookup_cache_reclaim(uint32_t budget);
+uint32_t __wrap_vfs_lookup_cache_reclaim(uint32_t budget)
+{
+    if(!churn_names)return __real_vfs_lookup_cache_reclaim(budget);
+    /* Model an indefinitely replenished name cache whose objects share slab
+     * pages with live allocations. Eviction frees no physical frame. */
+    assert(budget<=8);name_evictions+=budget;return budget;
+}
+
 static unsigned probe_allocations;
 uint64_t __real_mm_alloc_page(void);
 uint64_t __wrap_mm_alloc_page(void)
@@ -492,7 +503,11 @@ static void shared_change(void)
 int main(int argc,char **argv)
 {
     assert(argc==2);nx_enabled=true;page_cache_init();
-    if(!strcmp(argv[1],"early"))early_refill();
+    if(!strcmp(argv[1],"name-churn")) {
+        churn_names=true;early_refill();assert(name_evictions);
+        puts("PASS continuous name-cache churn cannot starve page/swap reclaim");
+    }
+    else if(!strcmp(argv[1],"early"))early_refill();
     else if(!strcmp(argv[1],"above-low"))above_low();
     else if(!strcmp(argv[1],"partial"))partial_fallback();
     else if(!strcmp(argv[1],"swapon"))swap_activation();

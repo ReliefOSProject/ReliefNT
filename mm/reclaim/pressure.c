@@ -5,6 +5,7 @@
 #include <reliefnt/memory_stats.h>
 #include <reliefnt/mm.h>
 #include <reliefnt/page_cache.h>
+#include <reliefnt/lookup_cache.h>
 #include <reliefnt/paging.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/swap.h>
@@ -119,11 +120,32 @@ static int pressure_batch(struct pressure_cursor *cursor, uint64_t target, uint3
                           uint32_t release_limit, uint32_t *released_count)
 {
     bool released = false;
+    bool names_scanned = false;
     uint32_t count = 0;
     if (released_count) *released_count = 0;
     if (cursor->flags != flags) *cursor = (struct pressure_cursor){.flags = flags};
     while (budget && (ordinary_free() < target || (require_release && !released))) {
         if (cursor->stage == PRESSURE_CACHE) {
+            /* Name snapshots have no backing pins and never perform I/O.
+             * Charge every eviction to this batch even when its slab page
+             * remains shared with other allocations. The remaining batch
+             * budget reaches file pages even while new names keep arriving. */
+            uint64_t before_names=ordinary_free();
+            uint32_t name_budget=names_scanned ? 0 : budget<8 ? budget : 8;
+            if(released_count && name_budget>release_limit-count)name_budget=release_limit-count;
+            names_scanned=true;
+            uint32_t names=vfs_lookup_cache_reclaim(name_budget);
+            if(names) {
+                uint64_t after_names=ordinary_free();
+                uint64_t released_names=after_names>before_names ? after_names-before_names : 0;
+                uint32_t frames=released_names>names ? names : (uint32_t)released_names;
+                if(released_count && frames>release_limit-count)frames=release_limit-count;
+                if(frames)released=true;
+                count+=frames;if(released_count)*released_count=count;
+                budget-=names;
+                if(released_count && count==release_limit)return -EAGAIN;
+                continue;
+            }
             uint32_t inspected = 0, candidates = 0; bool complete = false;
             uint32_t slice = budget;
             if (released_count && slice > release_limit - count) slice = release_limit - count;

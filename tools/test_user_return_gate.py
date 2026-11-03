@@ -82,7 +82,7 @@ def main():
                 "-Wl,--gc-sections", "-I" + str(work), "-Iinclude", "-Iinclude",
                 "-Iinclude/uapi", "-Iinclude",
                 "tools/tests/" + fixture + ".c",
-                *(["kernel/syscall/fs/lookup_state.c", "kernel/syscall/io/vector.c", "fs/vfs/mount_tree.c", "fs/vfs/path.c",
+                *(["kernel/syscall/fs/lookup_state.c", "kernel/syscall/io/vector.c", "fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c", "fs/vfs/path.c",
                    "drivers/usb/core/registry.c", "drivers/usb/core/work.c", "kernel/device/driver_manager_phase.c",
                    "block/device/registry.c"]
                   if fixture == "user_return_gate_test" else []), "-o", str(executable),

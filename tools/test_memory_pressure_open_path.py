@@ -43,7 +43,7 @@ def main():
                "kernel/sched/core.c", "kernel/sched/accounting.c", "kernel/sched/wait.c",
                "kernel/sched/oom.c", "kernel/sync/wait.c",
                "mm/reclaim/pressure.c", "mm/reclaim/wait.c", "mm/cache/page_cache.c",
-               "fs/vfs/mount_tree.c", "fs/vfs/path.c", "fs/vfs/file.c", "fs/vfs/open.c", "fs/vfs/attributes.c",
+               "fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c", "fs/vfs/path.c", "fs/vfs/file.c", "fs/vfs/open.c", "fs/vfs/attributes.c",
                "fs/vfs/exec_file.c", "mm/swap/area.c", "mm/swap/slot.c", "mm/swap/paging.c",
                "-Wl,--wrap=vfs_exec_source_get", "-Wl,--wrap=vfs_exec_source_put",
                "-Wl,--wrap=swap_backend_page_io", "-o", binary]

@@ -26,7 +26,7 @@ class PrivateFaultTransactions(unittest.TestCase):
         subprocess.run([*common, "tools/tests/private_fault_dispatch_test.c",
                         "arch/x86_64/interrupt/idt.c", "kernel/sched/core.c",
                         "kernel/sched/accounting.c", "mm/cache/page_cache.c",
-                        "fs/vfs/mount_tree.c", "fs/vfs/file.c", "fs/vfs/open.c",
+                        "fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c", "fs/vfs/file.c", "fs/vfs/open.c",
                         "fs/vfs/attributes.c", "fs/vfs/exec_file.c",
                         "-Wl,--wrap=vfs_exec_source_get", "-Wl,--wrap=vfs_exec_source_put",
                         "-o", cls.dispatch],

@@ -1,5 +1,9 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include <assert.h>
+#include <reliefnt/storage_cache.h>
+/* No filesystem is mounted in this device-revocation fixture. */
+void storage_filesystem_cache_event_device(const struct block_device *device,uint64_t lba,uint32_t sectors)
+{(void)device;(void)lba;(void)sectors;}
 #include <stdio.h>
 #include <stdlib.h>
 #include <reliefnt/blkdev.h>
@@ -53,7 +57,9 @@ int main(void)
     struct block_device_ref held={0},other={0};uint8_t bytes[512];
     assert(!register_block_device(&registration));
     assert(!block_device_get(registration.info.device,&held));
+    assert(block_device_lookup_generation(&held));
     assert(!disconnect_block_device(&registration));
+    assert(!block_device_lookup_generation(&held));
     assert(block_device_get(registration.info.device,&other)==-ENODEV);
     assert(block_device_read(&held,0,1,bytes)==-ENODEV);
     assert(block_device_write(&held,0,1,bytes)==-ENODEV);

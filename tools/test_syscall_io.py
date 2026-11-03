@@ -93,7 +93,7 @@ def main():
                 "-fno-omit-frame-pointer", "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
                 "-I" + str(work), "-Iinclude",
                 "-Iinclude", "-Iinclude", "-Iinclude/uapi",
-                "tools/tests/syscall_io_test.c", "fs/vfs/file.c", "fs/vfs/open.c", "fs/vfs/mount_tree.c",
+                "tools/tests/syscall_io_test.c", "fs/vfs/file.c", "fs/vfs/open.c", "fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c",
                 "-o", str(executable),
             ], cwd=ROOT, env={**os.environ, "TMPDIR": str(temporary)})
             run([str(executable)], cwd=ROOT, timeout=30)

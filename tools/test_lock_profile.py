@@ -21,7 +21,7 @@ with tempfile.TemporaryDirectory(prefix="reliefnt-lock-profile-") as directory:
 
 with tempfile.TemporaryDirectory(prefix="reliefnt-lock-proc-") as directory:
     binary = str(Path(directory) / "proc")
-    sources = ["tools/tests/lock_profile_proc_test.c", "fs/vfs/mount_tree.c", "fs/vfs/mount_table.c",
+    sources = ["tools/tests/lock_profile_proc_test.c", "fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c", "fs/vfs/mount_table.c",
                "fs/vfs/path.c", "fs/vfs/file.c", "fs/vfs/open.c", "fs/vfs/pseudo.c", "fs/vfs/attributes.c",
                "fs/proc/mount.c", "fs/proc/views.c", "kernel/syscall/fd/proc.c", "fs/vfs/exec_file.c", "kernel/sched/identity.c", "fs/security/access.c"]
     if (ROOT / "kernel/sync/profile.c").exists():
@@ -49,7 +49,7 @@ with tempfile.TemporaryDirectory(prefix="reliefnt-lock-sync-") as directory:
                     "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
                     "-DCONFIG_LOCK_STAT", "-DRELIEFNT_LOCK_PROFILE_TEST",
                     "-Iinclude", "-Iinclude/uapi", "tools/tests/lock_profile_sync_io_test.c", "tools/tests/task8_host_stubs/writable_alias_model.c", "tools/tests/task8_host_stubs/device_page_unreached.c", "tools/tests/task8_host_stubs/user_ram_unreached.c",
-                    "fs/vfs/mount_tree.c", "fs/vfs/mount_table.c", "fs/vfs/path.c", "fs/vfs/file.c",
+                    "fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c", "fs/vfs/mount_table.c", "fs/vfs/path.c", "fs/vfs/file.c",
                     "fs/vfs/open.c", "fs/vfs/pseudo.c", "fs/vfs/attributes.c", "fs/proc/mount.c", "fs/proc/views.c", "kernel/syscall/fd/proc.c", "fs/vfs/exec_file.c",
                     "kernel/sched/identity.c", "fs/security/access.c", "kernel/sync/profile.c",
                     "-o", binary], cwd=ROOT, check=True)

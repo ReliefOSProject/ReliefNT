@@ -485,6 +485,7 @@ static int ext_native_swap_initialize(struct storage_volume *volume,const struct
 #endif
 
 const struct storage_filesystem_ops storage_ext_ops={
+    .flags=STORAGE_FS_LOOKUP_EPOCH,
 #ifdef CONFIG_SWAP
     .swap_extent=ext_native_swap_extent,
     .swap_initialize=ext_native_swap_initialize,

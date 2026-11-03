@@ -2,6 +2,13 @@
 #include <reliefnt/blkdev.h>
 #include "../../kernel/module/internal.h"
 #include <assert.h>
+#include <reliefnt/storage_cache.h>
+/* No filesystem is mounted in this block/module boundary fixture. */
+static unsigned cache_notifications;
+static uint64_t cache_lba;
+static uint32_t cache_sectors;
+void storage_filesystem_cache_event_device(const struct block_device *device,uint64_t lba,uint32_t sectors)
+{assert(device);++cache_notifications;cache_lba=lba;cache_sectors=sectors;}
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -120,9 +127,13 @@ int main(void)
     assert(block_device_read(&ref,0,0,bytes)==-EINVAL);
     assert(block_device_read(&ref,UINT64_MAX,2,bytes)==-EINVAL);
     assert(block_device_read(&ref,0,1,NULL)==-EINVAL && !reads);
+    uint64_t lookup_generation=block_device_lookup_generation(&ref);assert(lookup_generation);
     assert(!block_device_read(&ref,0,4,bytes) && reads==1 && !runtime->executing);
+    assert(block_device_lookup_generation(&ref)==lookup_generation);
     for(unsigned i=0;i<sizeof(bytes);++i)assert(bytes[i]==0x42);
     memset(bytes,0x73,512);assert(!block_device_write(&ref,2,1,bytes) && writes==1);
+    assert(cache_notifications==1 && cache_lba==2 && cache_sectors==1);
+    assert(block_device_lookup_generation(&ref)!=lookup_generation);
     assert(media[1023]==0x42 && media[1024]==0x73 && media[1535]==0x73 && media[1536]==0x42);
     struct block_io_stats stats;
     assert(!block_device_statistics(&ref, &stats));

@@ -22,6 +22,7 @@ struct tmpfs_entry {
     char name[RELIEFOS_FS_NAME_LEN];
 };
 struct tmpfs_inode {
+    struct tmpfs_super *owner;
     struct tmpfs_inode *next, *parent;
     struct linux_stat_abi stat;
     struct tmpfs_page *pages[TMPFS_HASH];
@@ -33,6 +34,7 @@ struct tmpfs_super {
     struct tmpfs_inode *inodes[TMPFS_HASH], *root;
     uint64_t max_pages, used_pages, max_inodes, used_inodes, flags;
     uint32_t volume, next_ino;
+    uint64_t lookup_generation;
 };
 
 static int64_t tmpfs_now(void)
@@ -42,6 +44,7 @@ static int64_t tmpfs_now(void)
 }
 static void tmpfs_changed(struct tmpfs_inode *inode, bool data)
 {
+    if(!++inode->owner->lookup_generation)++inode->owner->lookup_generation;
     inode->stat.ctime_sec = tmpfs_now();
     if (data)
         inode->stat.mtime_sec = inode->stat.ctime_sec;
@@ -129,6 +132,7 @@ static int tmpfs_alloc_inode(struct tmpfs_super *fs, uint32_t mode, struct tmpfs
     if (!n)
         return -12;
     __builtin_memset(n, 0, sizeof(*n));
+    n->owner=fs;
     n->stat = (struct linux_stat_abi){.st_ino = fs->next_ino++,
                                       .st_dev = fs->volume + 1,
                                       .st_mode = mode,
@@ -241,6 +245,7 @@ int tmpfs_new(uint32_t volume, uint64_t flags, const char *options, uint32_t uid
     __builtin_memset(fs, 0, sizeof(*fs));
     fs->volume = volume;
     fs->next_ino = 1;
+    fs->lookup_generation = 1;
     fs->flags = flags;
     fs->max_pages = fs->max_inodes = mm_total_memory_kib() / 8; /* Half RAM, in pages. */
     uint32_t mode = 01777;
@@ -1112,3 +1117,6 @@ void tmpfs_statfs(struct tmpfs_super *fs, struct linux_statfs_abi *out)
     out->f_fsid[0] = fs->volume + 1;
 }
 void tmpfs_set_flags(struct tmpfs_super *fs, uint64_t flags) { fs->flags = flags; }
+
+uint64_t tmpfs_lookup_generation(const struct tmpfs_super *fs)
+{return fs->lookup_generation;}

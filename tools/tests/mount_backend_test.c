@@ -1123,7 +1123,10 @@ static void held_task_paths(struct vfs_namespace *ns,const struct vfs_path *root
     struct trap_frame retry={.rax=LINUX_SYS_OPENAT,.rdi=3,.rsi=0x1234};
     task_lookup_scope_begin(&actor,&retry);
     const struct vfs_backend_ops *native=old_dir->mount->ops;
-    struct vfs_backend_ops waiting=*native;waiting.lookup=lookup_with_wait;old_dir->mount->ops=&waiting;
+    struct vfs_backend_ops waiting=*native;waiting.lookup=lookup_with_wait;
+    /* This wrapper injects a backend I/O wait on every selected lookup. Warm
+     * name hits would correctly avoid that I/O, so explicitly test misses. */
+    waiting.lookup_generation=NULL;old_dir->mount->ops=&waiting;
     lookup_should_wait=true;
     char original_name[]="old";
     assert(resolve_kernel_object_at_flags(ns,&actor,3,original_name,false,false,VFS_LOOKUP_FOLLOW,&found)==-EAGAIN);
@@ -1181,6 +1184,7 @@ static void held_task_paths(struct vfs_namespace *ns,const struct vfs_path *root
     retry.rax=LINUX_SYS_READ;task_lookup_scope_begin(&actor,&retry);assert(!actor.lookup_scope.armed);
     const struct vfs_backend_ops *upper_native=replacement.mount->ops;
     struct vfs_backend_ops upper_wait=*upper_native;upper_wait.lookup=lookup_with_wait;
+    upper_wait.lookup_generation=NULL; /* Force the injected native I/O path. */
     replacement.mount->ops=&upper_wait;
     retry=(struct trap_frame){.rax=LINUX_SYS_OPENAT,.rdi=(uint64_t)(int64_t)LINUX_AT_FDCWD,.rsi=0x5678};
     task_lookup_scope_begin(&actor,&retry);
@@ -2424,6 +2428,18 @@ int main(int argc,char **argv)
     struct vfs_path root={0},old_dir={0},old_file={0},top={0},file={0};
     assert(!vfs_namespace_root(&ns,&root));
     real_mount_description(&ns,&root,"tmpfs","rw");
+    /* A registered storage codec without the audited epoch capability must
+     * remain live even when it uses the common native VFS adapter. */
+    const struct storage_filesystem_ops *audited=g_volumes[0].fs_ops;
+    struct storage_filesystem_ops dynamic=*audited;dynamic.flags&=~STORAGE_FS_LOOKUP_EPOCH;
+    g_volumes[0].fs_ops=&dynamic;
+    assert(!root.mount->ops->lookup_generation(root.mount->context));
+    struct vfs_path dynamic_file={0};
+    assert(vfs_path_lookup_child(&root,"dynamic-codec",&dynamic_file)==-ENOENT);
+    assert(!tmpfs_create(fs,"/dynamic-codec",LINUX_S_IFREG|0644,NULL,NULL));
+    assert(!vfs_path_lookup_child(&root,"dynamic-codec",&dynamic_file));vfs_path_put(&dynamic_file);
+    assert(!tmpfs_unlink(fs,"/dynamic-codec",false));g_volumes[0].fs_ops=audited;
+    assert(root.mount->ops->lookup_generation(root.mount->context));
     runtime_boot_objects(&ns,&root,fs);
     runtime_mount_objects(&ns,&root,fs);
     runtime_failed_teardown();

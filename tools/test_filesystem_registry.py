@@ -18,7 +18,7 @@ class FilesystemRegistry(unittest.TestCase):
                 "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
                 "-fno-pie", "-no-pie", "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
                 "-Iinclude", "-Iinclude/uapi", "tools/tests/filesystem_registry_test.c",
-                "fs/vfs/filesystems.c", "fs/vfs/filesystem_instance.c", "fs/vfs/mount_tree.c", "kernel/module/lifecycle.c", "kernel/params/value.c",
+                "fs/vfs/filesystems.c", "fs/vfs/filesystem_instance.c", "fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c", "kernel/module/lifecycle.c", "kernel/params/value.c",
                 "kernel/module/layout.c", "kernel/module/symbols.c", "-o", str(binary),
             ], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             self.assertEqual(result.returncode, 0, result.stdout)

@@ -7,6 +7,7 @@
 #include <linux/errno.h>
 #include <reliefnt/time.h>
 #include <reliefnt/sched.h>
+#include <reliefnt/storage_cache.h>
 
 struct block_io_request {
     struct block_io_request *next;
@@ -19,6 +20,7 @@ struct block_device {
     struct block_device *next;
     const struct block_device_registration *registration;
     uint64_t references,users,serial;
+    uint64_t lookup_generation;
     struct block_io_stats statistics;
     struct block_io_request *requests;
     uint64_t statistics_at;
@@ -138,7 +140,7 @@ int register_block_device(const struct block_device_registration *registration)
 {
     if(!device_valid(registration))return -EINVAL;
     struct block_device *device=kernel_malloc(sizeof(*device));if(!device)return -ENOMEM;
-    *device=(struct block_device){.registration=registration,.references=1};
+    *device=(struct block_device){.registration=registration,.references=1,.lookup_generation=1};
     uint64_t flags;kernel_spin_lock_irqsave(&device_lock,&flags);
     for(struct block_device *at=devices;at;at=at->next)
         if(at->registration->info.device==registration->info.device){
@@ -266,6 +268,15 @@ int block_device_info(const struct block_device_ref *reference,struct block_devi
     *out=reference->device->registration->info;return 0;
 }
 
+uint64_t block_device_lookup_generation(const struct block_device_ref *reference)
+{
+    if(!reference || !reference->device)return 0;
+    uint64_t flags;kernel_spin_lock_irqsave(&device_lock,&flags);
+    uint64_t generation=reference->device->active ? reference->device->lookup_generation : 0;
+    kernel_spin_unlock_irqrestore(&device_lock,flags);return generation;
+}
+EXPORT_SYMBOL(block_device_lookup_generation);
+
 /** @brief Dispatch a complete extent with external and executing code ownership.
  * @param reference Borrowed stable nonempty token, kept through the callback.
  * @param first First logical block. @param count Nonzero bounded block count.
@@ -294,6 +305,9 @@ static int device_transfer(const struct block_device_ref *reference,uint64_t fir
     struct block_io_request local = {
         .first = first, .count = count, .pid = pid, .write = write, .started = now};
     kernel_spin_lock_irqsave(&device_lock, &flags);
+    /* Advance before transport entry, including partial/error/retry writes.
+     * Direct .ko users of block_device_write cannot bypass name invalidation. */
+    if(write && !++device->lookup_generation)++device->lookup_generation;
     struct block_io_request *request = device->requests;
     while (request && (request->pid != pid || request->first != first || request->count != count ||
                        request->write != write))
@@ -307,6 +321,21 @@ static int device_transfer(const struct block_device_ref *reference,uint64_t fir
         device->requests = request;
     }
     kernel_spin_unlock_irqrestore(&device_lock, flags);
+    if(write) {
+        uint64_t ratio=info->block_size/512u;
+        /* Native filesystems address media in 512-byte sectors. Writes beyond
+         * that representable space cannot overlap one of their cache keys. */
+        if(first<=UINT64_MAX/ratio) {
+            uint64_t sector=first*ratio,remaining=(uint64_t)count*ratio;
+            while(remaining) {
+                uint32_t chunk=remaining>UINT32_MAX ? UINT32_MAX : (uint32_t)remaining;
+                if(chunk>UINT64_MAX-sector)chunk=(uint32_t)(UINT64_MAX-sector);
+                if(!chunk)break;
+                storage_filesystem_cache_event_device(device,sector,chunk);
+                remaining-=chunk;sector+=chunk;
+            }
+        }
+    }
     int result=write ? registration->operations->write(registration->context,first,count,buffer) :
         registration->operations->read(registration->context,first,count,buffer);
     if (result == -EAGAIN && !retained) {

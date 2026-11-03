@@ -4,6 +4,11 @@
 
 /* Callers serialize these operations with the storage execution lock. */
 struct tmpfs_super;
+/** @brief Observe this instance's name/metadata epoch, including direct users.
+ * @param fs Borrowed live filesystem. @return Nonzero generation advancing on
+ * namespace or lookup-metadata changes. Execution writer required, no I/O.
+ */
+uint64_t tmpfs_lookup_generation(const struct tmpfs_super *fs);
 int tmpfs_new(uint32_t volume, uint64_t flags, const char *options, uint32_t uid, uint32_t gid,
               struct tmpfs_super **out);
 void tmpfs_destroy(struct tmpfs_super *fs);

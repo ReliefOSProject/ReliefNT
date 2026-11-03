@@ -160,7 +160,12 @@ void storage_filesystem_cache_event(const struct storage_volume *writer,uint64_t
 void storage_filesystem_cache_event_device(const struct block_device *device,
                                            uint64_t lba,uint32_t sectors)
 {
-    if(device && sectors)storage_filesystem_cache_dispatch(NULL,device,true,lba,sectors);
+    if(device && sectors) {
+        /* Also retire the legacy FAT/exFAT directory/sector indexes: direct
+         * block_device_write callers bypass filesystem-level mutation entry. */
+        storage_sector_cache_invalidate();
+        storage_filesystem_cache_dispatch(NULL,device,true,lba,sectors);
+    }
 }
 
 /**

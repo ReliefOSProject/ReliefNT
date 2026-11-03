@@ -29,7 +29,7 @@ class Initramfs(unittest.TestCase):
                 "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-Iinclude", "-Iinclude/uapi",
                 "tools/tests/initramfs_test.c", "fs/initramfs/archive.c", "fs/initramfs/unpack.c",
                 "fs/initramfs/view.c", "fs/initramfs/records.c", "fs/tmpfs/core.c", "mm/physical/proc.c",
-                "fs/vfs/mount_tree.c", "fs/vfs/path.c", "fs/vfs/dentry.c",
+                "fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c", "fs/vfs/path.c", "fs/vfs/dentry.c",
                 "-o", str(binary)], cwd=ROOT, check=True)
             subprocess.run([str(binary), str(archive)], check=True, timeout=30)
 

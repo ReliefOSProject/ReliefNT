@@ -137,6 +137,12 @@ void block_device_put(struct block_device_ref *reference);
  * @return Zero or -EINVAL; no allocation, callback or I/O.
  */
 int block_device_info(const struct block_device_ref *reference,struct block_device_info *out);
+/** @brief Query an owned device's write/admission epoch under registry exclusion.
+ * @param reference Borrowed live token. @return Zero when invalid/revoked,
+ * otherwise a nonzero epoch advanced before every admitted write attempt.
+ * No callback, allocation, I/O or reference transfer. IRQ/task-safe query.
+ */
+uint64_t block_device_lookup_generation(const struct block_device_ref *reference);
 /** @brief Read one complete bounded transport extent with provider execution pinned.
  * @param reference Borrowed owned device reference, held through the callback.
  * @param first First logical block. @param count Nonzero blocks<=max_blocks.

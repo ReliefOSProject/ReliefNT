@@ -52,6 +52,14 @@ void vfs_file_close(struct vfs_open_file *file);
  * lookup returns borrowed metadata; retain transfers one opaque owned pin only
  * on success, and release consumes exactly that pin after dentry retirement. */
 struct vfs_backend_ops {
+    /* Optional opt-in for name-result caching. A nonzero generation promises
+     * that every change to lookup results or returned storage_node metadata
+     * advances the token, including partial mutations and out-of-band writes.
+     * Zero disables caching. Nonallocating serialized query, no I/O; scalar
+     * bookkeeping may combine independently changing provider/device epochs.
+     * Dynamic providers must omit it unless they can uphold this contract.
+     * Metadata is borrowed: cached results do not retain an inode. */
+    uint64_t (*lookup_generation)(void *context);
     int (*lookup)(void *context,const struct storage_node *parent,
                   const char *name,struct storage_node *out);
     int (*retain)(void *context,const struct storage_node *node,void **pin);

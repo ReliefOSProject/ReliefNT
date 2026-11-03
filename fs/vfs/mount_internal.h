@@ -8,6 +8,8 @@
 #include <reliefnt/fsnotify_vfs.h>
 #include <linux/inotify.h>
 
+struct vfs_lookup_cache_entry;
+
 struct vfs_dentry {
     struct vfs_dentry *parent,*children,*next,*notify_next;
     struct vfs_dentry **notify_link;
@@ -19,6 +21,7 @@ struct vfs_dentry {
     char *name;
 };
 struct vfs_mount {
+    struct vfs_lookup_cache_entry *lookup_cache;
     struct vfs_namespace *ns;
     struct vfs_mount *next,*notify_next;
     struct vfs_mount **notify_link;
@@ -141,6 +144,13 @@ void vfs_follow_mounts(const struct vfs_namespace *ns,struct vfs_path *path);
 int vfs_bind_child(const struct vfs_path *parent,const char *name,
                        const struct storage_node *value,struct vfs_path *out);
 void vfs_dentry_put(struct vfs_mount *mount,struct vfs_dentry *dentry);
+/* Generation-guarded borrowed metadata, never cached authorization. Get returns
+ * 1 for a positive result, -ENOENT for a negative hit, or 0 for a miss. */
+int vfs_lookup_cache_get(const struct vfs_path *parent,const char *name,uint64_t generation,
+                          struct storage_node *out);
+void vfs_lookup_cache_store(const struct vfs_path *parent,const char *name,uint64_t generation,
+                             const struct storage_node *node);
+void vfs_lookup_cache_purge(struct vfs_mount *mount);
 void vfs_path_parent(const struct vfs_path *root,struct vfs_path *path);
 /* Initialize common type/size/identity fields before provider-specific stat. */
 int vfs_stat_basic(const struct storage_node *node,struct linux_stat_abi *out);

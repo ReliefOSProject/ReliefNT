@@ -6,7 +6,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = [
-    "fs/vfs/mount_tree.c", "fs/vfs/mount_table.c", "fs/vfs/path.c",
+    "fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c", "fs/vfs/mount_table.c", "fs/vfs/path.c",
     "fs/vfs/dentry.c", "fs/vfs/file.c", "fs/vfs/open.c", "fs/vfs/attributes.c",
     "fs/vfs/mutation.c", "fs/security/access.c", "kernel/syscall/fs/create.c",
     "kernel/syscall/fs/mutation.c",

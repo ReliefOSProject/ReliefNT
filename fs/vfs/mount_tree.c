@@ -97,6 +97,7 @@ void vfs_dentry_put(struct vfs_mount *mount,struct vfs_dentry *dentry)
 void vfs_mount_put(struct vfs_mount *mount)
 {
     if(!mount || --mount->references)return;
+    vfs_lookup_cache_purge(mount);
     vfs_dentry_put(mount,mount->root);
     mount->root=NULL;
     if(!vfs_finish_retirement(mount))vfs_queue_retirement(mount);
@@ -292,8 +293,24 @@ int vfs_path_lookup_child_for_walk(const struct vfs_path *parent,const char *nam
         if(i>=VFS_NAME_MAX)return -ENAMETOOLONG;
     }
     struct vfs_mount *mount=parent->mount;struct storage_node node;
+    uint64_t generation=mount->ops->lookup_generation ? mount->ops->lookup_generation(mount->context) : 0;
+    int cached=vfs_lookup_cache_get(parent,name,generation,&node);
+    if(cached<0)return cached;
+    if(cached) {
+        int rc=vfs_bind_child(parent,name,&node,out);
+        if(rc!=-ENOENT && rc!=-ESTALE)return rc;
+        /* Clustered providers may recycle an unused inode-key cache record
+         * without changing the directory. Revalidate the name rather than
+         * exposing a stale cached incarnation as a missing existing file. */
+        vfs_lookup_cache_purge(mount);
+        generation=mount->ops->lookup_generation(mount->context);
+    }
     int rc=mount->ops->lookup(mount->context,&parent->dentry->node,name,&node);
-    return rc ? rc : vfs_bind_child(parent,name,&node,out);
+    bool absent=rc==-ENOENT;
+    if(!rc)rc=vfs_bind_child(parent,name,&node,out);
+    if(generation && (!rc || absent) && generation==mount->ops->lookup_generation(mount->context))
+        vfs_lookup_cache_store(parent,name,generation,absent ? NULL : &node);
+    return rc;
 }
 
 int vfs_path_lookup_child(const struct vfs_path *parent,const char *name,struct vfs_path *out)

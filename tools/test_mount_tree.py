@@ -16,7 +16,7 @@ class MountTree(unittest.TestCase):
                 "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
                 "-fno-pie", "-no-pie", "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
                 "-Iinclude", "-Iinclude/uapi", "tools/tests/mount_tree_test.c",
-                "fs/vfs/mount_tree.c", "fs/vfs/mount_table.c", "fs/vfs/path.c", "fs/vfs/dentry.c", "fs/vfs/file.c", "fs/vfs/open.c",
+                "fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c", "fs/vfs/mount_table.c", "fs/vfs/path.c", "fs/vfs/dentry.c", "fs/vfs/file.c", "fs/vfs/open.c",
                 "fs/vfs/pseudo.c", "fs/vfs/attributes.c", "kernel/module/lifecycle.c", "kernel/params/value.c",
                 "kernel/module/layout.c", "kernel/module/symbols.c", "-o", str(binary)
             ], cwd=ROOT, check=True)

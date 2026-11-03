@@ -46,7 +46,7 @@ def run_cases(output, cases):
     if "swap-stream" in cases:
         binary = str(output / "memory_reporting_swap")
         sources = ["tools/tests/memory_reporting_swap_test.c", "fs/proc/memory.c",
-                   "mm/swap/area.c", "mm/swap/slot.c", "fs/vfs/mount_tree.c", "fs/vfs/mount_table.c",
+                   "mm/swap/area.c", "mm/swap/slot.c", "fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c", "fs/vfs/mount_table.c",
                    "fs/vfs/path.c", "fs/vfs/dentry.c", "fs/vfs/file.c", "fs/vfs/open.c",
                    "fs/vfs/pseudo.c", "fs/vfs/attributes.c", "kernel/module/lifecycle.c",
                    "kernel/params/value.c", "kernel/module/layout.c", "kernel/module/symbols.c"]
@@ -70,7 +70,7 @@ def run_cases(output, cases):
         failures += bool(run([binary]))
     if proc_cases:
         binary = str(output / "memory_reporting_proc")
-        proc_sources = ["tools/tests/memory_reporting_proc_test.c", "fs/vfs/mount_tree.c",
+        proc_sources = ["tools/tests/memory_reporting_proc_test.c", "fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c",
                         "fs/vfs/mount_table.c", "fs/vfs/path.c", "fs/vfs/file.c", "fs/vfs/open.c",
                         "fs/vfs/pseudo.c", "fs/vfs/attributes.c", "fs/proc/mount.c",
                         "fs/proc/views.c", "kernel/syscall/fd/proc.c", "fs/vfs/exec_file.c",
@@ -92,7 +92,7 @@ def run_cases(output, cases):
               "-fno-pie", "-no-pie", "-Wl,--gc-sections", "-Iinclude", "-Iinclude/uapi"]
     sources = ["tools/tests/memory_reporting_test.c", "kernel/sched/core.c", "kernel/sched/wait.c",
                "kernel/sched/oom.c", "kernel/sync/wait.c", "mm/reclaim/pressure.c", "mm/reclaim/wait.c",
-               "mm/cache/page_cache.c", "mm/reclaim/stats.c", "kernel/exec/usercopy.c", "kernel/exec/usercopy_task.c", "fs/vfs/mount_tree.c", "fs/vfs/file.c", "fs/vfs/open.c",
+               "mm/cache/page_cache.c", "mm/reclaim/stats.c", "kernel/exec/usercopy.c", "kernel/exec/usercopy_task.c", "fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c", "fs/vfs/file.c", "fs/vfs/open.c",
                "fs/vfs/attributes.c", "fs/vfs/exec_file.c", "mm/swap/area.c", "mm/swap/slot.c",
                "mm/swap/paging.c", "-Wl,--wrap=vfs_exec_source_get", "-Wl,--wrap=vfs_exec_source_put",
                "-o", binary]

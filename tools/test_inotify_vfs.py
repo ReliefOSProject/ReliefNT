@@ -13,7 +13,7 @@ subprocess.run([
     "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
     "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
     "-Iinclude", "-Iinclude/uapi", "tools/tests/inotify_vfs_test.c",
-    "fs/tmpfs/core.c", "mm/physical/proc.c", "fs/vfs/mount_tree.c", "fs/vfs/dentry.c",
+    "fs/tmpfs/core.c", "mm/physical/proc.c", "fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c", "fs/vfs/dentry.c",
     "fs/vfs/file.c", "fs/vfs/mutation.c", "fs/vfs/attributes.c", "fs/vfs/notify.c", "fs/vfs/inode.c",
     "fs/notify/core.c", "fs/notify/queue.c", "fs/notify/watch.c", "fs/notify/limits.c",
     "-o", str(binary),

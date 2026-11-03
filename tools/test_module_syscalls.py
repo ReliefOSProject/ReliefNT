@@ -18,7 +18,7 @@ class ModuleSyscalls(unittest.TestCase):
                             "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections", *definitions,
                             "-Iinclude", "-Iinclude/uapi",
                             "tools/tests/module_syscalls_test.c", "kernel/syscall/system/modules.c",
-                            "kernel/module/file.c", "fs/vfs/write_access.c", "fs/vfs/mount_tree.c", "fs/vfs/path.c",
+                            "kernel/module/file.c", "fs/vfs/write_access.c", "fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c", "fs/vfs/path.c",
                             "fs/vfs/dentry.c", "fs/vfs/file.c", "fs/vfs/open.c", "fs/vfs/attributes.c", "-o", str(binary)], cwd=ROOT, check=True)
                 subprocess.run([str(binary)], check=True, timeout=20)
 

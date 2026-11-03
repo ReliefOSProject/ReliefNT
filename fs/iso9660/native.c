@@ -94,7 +94,7 @@ static int iso_native_statfs(struct storage_volume *volume,struct linux_statfs_a
     return 0;
 }
 const struct storage_filesystem_ops storage_iso_ops={
-    .flags=STORAGE_FS_READONLY,
+    .flags=STORAGE_FS_READONLY|STORAGE_FS_LOOKUP_EPOCH,
     .statfs=iso_native_statfs,
     .name="iso9660",
     .owner=THIS_MODULE,

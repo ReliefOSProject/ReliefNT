@@ -186,6 +186,7 @@ static int tmpfs_native_link(struct storage_volume *volume,const struct storage_
     return tmpfs_link_child(volume->tmpfs,source->first_cluster,parent->first_cluster,name);
 }
 const struct storage_filesystem_ops storage_tmpfs_ops={
+    .flags=STORAGE_FS_LOOKUP_EPOCH,
     .create=tmpfs_native_create,
     .remove=tmpfs_native_remove,
     .rename=tmpfs_native_rename,

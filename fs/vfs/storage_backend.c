@@ -190,7 +190,28 @@ static int storage_vfs_finish(void *context)
 }
 static void storage_vfs_destroy(void *context)
 {storage_volume_mount_put(context);}
+/** @brief Opt native volumes into generation-guarded name lookup caching.
+ * @param context Borrowed mounted volume. @return Zero for a retired instance,
+ * its own tmpfs epoch for direct memory-file mutations, or the conservative
+ * native storage epoch for disk providers. No I/O or native selection change.
+ */
+static uint64_t storage_vfs_lookup_generation(void *context)
+{
+    struct storage_volume *volume=context;
+    if(!volume->ready || !volume->fs_ops || !(volume->fs_ops->flags&STORAGE_FS_LOOKUP_EPOCH))return 0;
+    if(volume->tmpfs)return tmpfs_lookup_generation(volume->tmpfs);
+    uint64_t device=block_device_lookup_generation(&volume->device_ref);
+    if(!device)return 0;
+    uint64_t metadata=storage_metadata_generation();
+    if(!volume->lookup_generation || metadata!=volume->lookup_metadata_generation ||
+       device!=volume->lookup_device_generation) {
+        volume->lookup_metadata_generation=metadata;volume->lookup_device_generation=device;
+        if(!++volume->lookup_generation)++volume->lookup_generation;
+    }
+    return volume->lookup_generation;
+}
 static const struct vfs_backend_ops storage_vfs_ops={
+    .lookup_generation=storage_vfs_lookup_generation,
     .lookup=storage_backend_lookup_vfs,.retain=storage_vfs_retain,.release=storage_vfs_release,
     .same_node=storage_backend_same_node,.readlink=storage_vfs_readlink,
     .finish=storage_vfs_finish,.destroy=storage_vfs_destroy,.can_unmount=storage_vfs_can_unmount,.remount=storage_vfs_remount,

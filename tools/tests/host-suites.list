@@ -209,3 +209,4 @@ svga_ppn_alloc tools/test_svga_ppn_alloc.py
 vmwgfx_ppn_bo tools/test_vmwgfx_ppn_bo.py
 physical_metadata tools/test_physical_metadata.py
 heap_slab tools/test_heap_slab.py
+vfs_lookup_cache tools/test_vfs_lookup_cache.py

@@ -37,10 +37,10 @@ class LinuxMemoryTests(unittest.TestCase):
         cases = (("paging_protection", []),
                  ("private_anon_fault", ["kernel/exec/usercopy.c"]),
                  ("memfd_truncate", ["mm/user/cache.c", "mm/user/mapping.c"]), ("elf_interpreter", []),
-                 ("elf_sparse_reservation", ["fs/vfs/mount_tree.c","fs/vfs/file.c", "fs/vfs/open.c","fs/vfs/attributes.c","fs/vfs/exec_file.c"]),
-                 ("elf_file_page", ["mm/cache/page_cache.c","fs/vfs/mount_tree.c","fs/vfs/file.c", "fs/vfs/open.c","fs/vfs/attributes.c","fs/vfs/exec_file.c"]), ("user_mmap_arena", []),
+                 ("elf_sparse_reservation", ["fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c","fs/vfs/file.c", "fs/vfs/open.c","fs/vfs/attributes.c","fs/vfs/exec_file.c"]),
+                 ("elf_file_page", ["mm/cache/page_cache.c","fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c","fs/vfs/file.c", "fs/vfs/open.c","fs/vfs/attributes.c","fs/vfs/exec_file.c"]), ("user_mmap_arena", []),
                  ("mprotect_vma_growth", [*kernel_sources("scheduler"),"kernel/device/character.c","fs/vfs/file.c", "fs/vfs/open.c","fs/vfs/attributes.c","fs/vfs/exec_file.c"]),
-                 ("brk_collision", [*kernel_sources("user_memory"),"kernel/syscall/memory/legacy_memory.c","kernel/syscall/memory/swap.c","fs/vfs/mount_tree.c","fs/vfs/file.c", "fs/vfs/open.c","fs/vfs/attributes.c"]))
+                 ("brk_collision", [*kernel_sources("user_memory"),"kernel/syscall/memory/legacy_memory.c","kernel/syscall/memory/swap.c","fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c","fs/vfs/file.c", "fs/vfs/open.c","fs/vfs/attributes.c"]))
         for name, sources in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory(prefix="reliefos-mm-") as tmp:
                 executable = str(Path(tmp) / name)

@@ -79,6 +79,9 @@ struct storage_filesystem_ops;
  */
 struct storage_volume {
     bool ready;
+    /* Serialized lookup-cache bookkeeping combines native metadata and exact
+     * device write epochs without a lossy hash or arithmetic cancellation. */
+    uint64_t lookup_generation,lookup_metadata_generation,lookup_device_generation;
     const struct storage_filesystem_ops *fs_ops;
     struct fs_type_ref fs_type;
     struct block_device_ref device_ref; /* Owned until final native/cache retirement. */

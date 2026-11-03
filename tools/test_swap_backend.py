@@ -66,7 +66,7 @@ class SwapBackendTests(unittest.TestCase):
                             "-fsanitize=address,undefined", "-no-pie", "-ffunction-sections",
                             "-fdata-sections", "-Wl,--gc-sections", "-Iinclude", "-Iinclude/uapi",
                             "tools/tests/swap_vma_test.c", *(s for s in kernel_sources("user_memory") if s.endswith(".c")),
-                            "kernel/syscall/memory/legacy_memory.c", "fs/vfs/mount_tree.c",
+                            "kernel/syscall/memory/legacy_memory.c", "fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c",
                             "fs/vfs/file.c", "fs/vfs/open.c", "fs/vfs/attributes.c",
                             "fs/vfs/write_access.c", "-o", binary],
                            cwd=ROOT, check=True)

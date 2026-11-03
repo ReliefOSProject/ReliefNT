@@ -26,7 +26,7 @@ def main():
         (output / name).write_text(body)
     sources = ["tools/tests/user_return_gate_test.c", "kernel/syscall/fs/lookup_state.c",
                "tools/tests/task8_host_stubs/no_prlimit_identity.c",
-               "kernel/syscall/io/vector.c", "fs/vfs/mount_tree.c", "fs/vfs/path.c",
+               "kernel/syscall/io/vector.c", "fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c", "fs/vfs/path.c",
                "drivers/usb/core/registry.c", "drivers/usb/core/work.c", "kernel/device/driver_manager_phase.c",
                "block/device/registry.c"]
     binary = output / "user-return-swap"

@@ -12,6 +12,10 @@ struct storage_cluster_ops;
 struct swap_storage_extent;
 #define STORAGE_FS_READONLY 1u
 #define STORAGE_FS_SIDECAR 2u
+/* Explicit codec opt-in: all lookup/metadata mutations advance the storage
+ * epoch (or the native tmpfs instance epoch), including direct codec users.
+ * Unmarked third-party/dynamic providers always perform live lookups. */
+#define STORAGE_FS_LOOKUP_EPOCH 4u
 
 /* Every operand is an execution-owned retained object or validated literal
  * component. target may be NULL; committed reports irreversible native rename
