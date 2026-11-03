@@ -41,6 +41,8 @@ int xhci_timer_start(struct xhci_timer *timer){*timer=(struct xhci_timer){0};ret
 bool xhci_timer_expired(struct xhci_timer *timer,uint64_t us){(void)timer;(void)us;return true;}
 int __wrap_xhci_device_attach(struct xhci_controller *c,uint8_t p,uint8_t s,enum xhci_port_rejection *r)
 {(void)c;(void)p;(void)s;*r=XHCI_REJECT_NONE;return 0;}
+int __wrap_xhci_device_attach_child(struct xhci_device *p,uint8_t n,uint8_t s,enum xhci_port_rejection *r)
+{(void)p;(void)n;(void)s;(void)r;assert(0);return -EIO;}
 int __wrap_xhci_hid_arm(struct xhci_device *d,unsigned e){(void)d;(void)e;return 0;}
 void __wrap_xhci_hid_event(struct xhci_device *d,unsigned e){(void)d;(void)e;assert(0);}
 int xhci_endpoint_recover(struct xhci_device *d,unsigned e,bool h)

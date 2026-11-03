@@ -24,6 +24,8 @@
 #define XHCI_RING_COUNT 64u
 #define XHCI_EVENT_COUNT 256u
 #define XHCI_BOUNCE_BYTES 65536u
+#define XHCI_HUB_MAX_PORTS 255u
+#define XHCI_HUB_BITMAP_WORDS 8u
 
 struct xhci_trb { uint32_t lo, hi, status, control; };
 struct xhci_ring {
@@ -72,6 +74,14 @@ struct xhci_dma {
 };
 struct xhci_controller;
 struct xhci_device;
+struct xhci_hub {
+    struct xhci_port_state state[XHCI_HUB_MAX_PORTS+1u];
+    uint32_t pending[XHCI_HUB_BITMAP_WORDS];
+    uint64_t rx_rates[16], tx_rates[16];
+    uint16_t characteristics;
+    uint8_t ports, dci, power_good, bitmap_bytes;
+    bool superspeed, extended_status, blocked;
+};
 struct xhci_endpoint_state {
     struct xhci_dma dma, replacement;
     struct xhci_ring ring;
@@ -79,16 +89,19 @@ struct xhci_endpoint_state {
     struct usb_endpoint endpoint;
     struct usb_hid_state hid_state;
     uint8_t hid_protocol, interface_number;
-    bool active, configured, hid, needs_recovery;
+    bool active, configured, hid, hub_status, needs_recovery;
 };
 struct xhci_device {
     struct usb_device usb;
     struct xhci_device *next;
+    struct xhci_device *parent;
+    struct xhci_hub *hub;
     struct xhci_controller *controller;
     struct xhci_dma input, output;
     struct xhci_endpoint_state endpoints[XHCI_ENDPOINTS];
     struct usb_storage *storage[USB_MAX_INTERFACES];
-    uint8_t slot_id, speed_id, storage_count;
+    uint32_t route;
+    uint8_t slot_id, speed_id, storage_count, parent_port, depth, tt_slot, tt_port;
     bool disabled;
 };
 struct xhci_controller {
@@ -135,6 +148,33 @@ int xhci_context_address(uint32_t *context, uint32_t bytes, unsigned stride,
 int xhci_context_endpoint(uint32_t *context, uint32_t bytes, unsigned stride,
                           uint8_t speed, const struct usb_endpoint *endpoint,
                           bool interrupt, uint64_t endpoint_ring);
+/** @brief Validate and inherit a downstream device's route and transaction translator. */
+int xhci_topology_child(struct xhci_device *device, struct xhci_device *parent, uint8_t port);
+/** @brief Populate initialized input slot topology, including known Hub fields. */
+void xhci_context_topology(struct xhci_device *device);
+/** @brief Parse a complete class Hub descriptor and validate status bitmap capacity. */
+int xhci_hub_descriptor(struct xhci_hub *hub, const uint8_t *bytes, unsigned length,
+                         uint8_t speed, const struct usb_endpoint *endpoint);
+/** @brief Parse SSP lane-speed metadata used by extended downstream port status. */
+int xhci_hub_bos(struct xhci_hub *hub, const uint8_t *bytes, unsigned length);
+/** @brief Read Hub metadata before its first Configure Endpoint command. */
+int xhci_hub_prepare(struct xhci_device *device, const struct usb_config_interface *interface,
+                     const uint8_t descriptor[18]);
+/** @brief Power and start a configured Hub; enumeration runs later in service context. */
+int xhci_hub_start(struct xhci_device *device);
+/** @brief Clear the HS Hub's single-TT nonperiodic buffer after an aborted child transfer. */
+int xhci_tt_clear(struct xhci_device *device, unsigned dci);
+/** @brief Consume a Hub bitmap while holding event_lock, without waiting or allocating. */
+void xhci_hub_event(struct xhci_device *device, unsigned dci);
+/** @brief Schedule bounded downstream retries without issuing control requests. */
+void xhci_hubs_poll(struct xhci_controller *controller);
+/** @brief Process queued Hub status requests while owning the controller busy gate. */
+void xhci_hubs_service(struct xhci_controller *controller);
+/** @brief Execute a standard or class control request using the host-owned device. */
+int xhci_request(struct usb_device *device, uint8_t type, uint8_t code, uint16_t value,
+                  uint16_t index, void *data, uint16_t length, uint32_t *actual);
+/** @brief Queue one interrupt IN report while holding event_lock. */
+int xhci_interrupt_arm(struct xhci_device *device, unsigned dci);
 int xhci_scratchpad_layout(uint64_t *dcbaa, uint64_t *array, uint32_t count,
                            uint64_t array_dma, uint64_t pages_dma, bool ac64);
 int xhci_protocol_parse(const volatile uint32_t *registers, uint32_t bytes,
@@ -174,6 +214,9 @@ void xhci_poll(void *context);
 void xhci_service(void *context);
 int xhci_device_attach(struct xhci_controller *controller, uint8_t root_port, uint8_t speed_id,
                        enum xhci_port_rejection *rejection);
+/** @brief Address and bind one downstream connection with a validated raw PSI speed ID. */
+int xhci_device_attach_child(struct xhci_device *parent, uint8_t port, uint8_t speed_id,
+                             enum xhci_port_rejection *rejection);
 void xhci_device_disconnect(struct xhci_device *device);
 void xhci_devices_collect(struct xhci_controller *controller);
 void xhci_devices_release(struct xhci_controller *controller);

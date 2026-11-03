@@ -38,6 +38,8 @@ void console_log(enum console_log_level level,const char *format,...)
 }
 const struct framebuffer *framebuffer_get(void)
 {static const struct framebuffer fb={0};return &fb;}
+uint64_t time_ticks(void){return 0;}
+void xhci_delay(unsigned milliseconds){(void)milliseconds;}
 void usb_host_request_service(struct usb_host *host){(void)host;}
 void usb_hid_boot_release(struct usb_hid_state *state){(void)state;}
 void usb_hid_boot_keyboard(struct usb_hid_state *state,const uint8_t *report,uint32_t length)

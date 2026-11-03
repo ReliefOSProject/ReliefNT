@@ -27,5 +27,11 @@ int main(void)
     i.protocol=2;i.interrupt.max_packet=3;assert(xhci_classify_interface(&i)==3);
     i.unsupported_endpoint=true;assert(!xhci_classify_interface(&i));
     i.class_code=9;assert(xhci_classify_interface(&i)==-EOPNOTSUPP);
+    i=(struct usb_config_interface){.class_code=9,.subclass=0,.protocol=0,.endpoint_count=1,
+        .interrupt={.address=0x81,.max_packet=1,.interval=12}};
+    assert(xhci_classify_interface(&i)==4); /* USB2 default/single-TT Hub. */
+    i.protocol=2;assert(xhci_classify_interface(&i)==4); /* Multi-TT capable, alternate zero. */
+    i.protocol=3;assert(xhci_classify_interface(&i)==4); /* SuperSpeed Hub. */
+    i.protocol=4;assert(xhci_classify_interface(&i)==-EOPNOTSUPP);
     puts("USB xHCI device class and EP0 validation tests passed");
 }

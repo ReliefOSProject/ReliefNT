@@ -8,6 +8,8 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+HUB_SOURCES = [f"drivers/usb/xhci/{name}.c" for name in
+               ("topology", "hub_descriptor", "hub", "hub_ports", "hub_tt", "interrupt")]
 
 
 def check_capability_header_load(ir):
@@ -36,6 +38,36 @@ def check_capability_header_load(ir):
 
 
 class USBXHCI(unittest.TestCase):
+    def test_hub_routes_and_descriptor_bounds(self):
+        with tempfile.TemporaryDirectory(prefix="reliefnt-xhci-hub-layout-") as directory:
+            binary = Path(directory) / "hub-layout"
+            sources = ["tools/tests/usb_xhci_hub_layout_test.c", "drivers/usb/xhci/topology.c",
+                       "drivers/usb/xhci/hub_descriptor.c", "drivers/usb/xhci/hub_tt.c"]
+            build = subprocess.run([os.environ.get("CC", "clang"), "-std=gnu11", "-O1", "-g",
+                                    "-Wall", "-Wextra", "-Werror", "-fno-pie", "-no-pie",
+                                    "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
+                                    "-Iinclude", "-Iinclude/uapi", *sources, "-o", str(binary)],
+                                   cwd=ROOT, text=True, capture_output=True)
+            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+            run = subprocess.run([str(binary)], cwd=ROOT, text=True, capture_output=True, timeout=20)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
+    def test_hub_tree_lifecycle(self):
+        with tempfile.TemporaryDirectory(prefix="reliefnt-xhci-hub-tree-") as directory:
+            binary = Path(directory) / "hub-tree"
+            sources = ["tools/tests/usb_xhci_hub_test.c", "drivers/usb/xhci/devices.c",
+                       "drivers/usb/xhci/context.c", "drivers/usb/xhci/classes.c",
+                       "drivers/usb/xhci/ring.c", "drivers/usb/xhci/trb.c",
+                       "drivers/usb/core/descriptors.c", *HUB_SOURCES]
+            build = subprocess.run([os.environ.get("CC", "clang"), "-std=gnu11", "-O1", "-g",
+                                    "-Wall", "-Wextra", "-Werror", "-fno-pie", "-no-pie",
+                                    "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
+                                    "-Iinclude", "-Iinclude/uapi", *sources, "-o", str(binary)],
+                                   cwd=ROOT, text=True, capture_output=True)
+            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+            run = subprocess.run([str(binary)], cwd=ROOT, text=True, capture_output=True, timeout=20)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
     def test_connection_scoped_port_lifecycle(self):
         with tempfile.TemporaryDirectory(prefix="reliefnt-xhci-port-lifecycle-") as directory:
             binary = Path(directory) / "ports"
@@ -44,6 +76,7 @@ class USBXHCI(unittest.TestCase):
                        "drivers/usb/xhci/ring.c", "drivers/usb/xhci/completion.c",
                        "drivers/usb/xhci/context.c", "drivers/usb/xhci/classes.c",
                        "drivers/usb/xhci/trb.c", "drivers/usb/core/descriptors.c"]
+            sources += HUB_SOURCES
             command = [os.environ.get("CC", "clang"), "-std=gnu11", "-O1", "-g",
                        "-Wall", "-Wextra", "-Werror", "-fno-pie", "-no-pie",
                        "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
@@ -148,6 +181,7 @@ class USBXHCI(unittest.TestCase):
                        "drivers/usb/xhci/protocol.c", "drivers/usb/xhci/context.c",
                        "drivers/usb/xhci/classes.c", "drivers/usb/xhci/ring.c",
                        "drivers/usb/xhci/trb.c", "drivers/usb/core/descriptors.c"]
+            sources += HUB_SOURCES
             command = [os.environ.get("CC", "clang"), "-std=gnu11", "-O1", "-g",
                        "-Wall", "-Wextra", "-Werror", "-fno-pie", "-no-pie",
                        "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
@@ -237,10 +271,11 @@ class USBXHCI(unittest.TestCase):
                        "drivers/usb/xhci/ring.c", "drivers/usb/xhci/completion.c",
                        "drivers/usb/storage/bulk_only.c", "drivers/usb/core/registry.c",
                        "drivers/usb/core/hid.c", "block/device/registry.c"]
+            sources += HUB_SOURCES + ["drivers/usb/xhci/trb.c"]
             command = [os.environ.get("CC", "clang"), "-std=gnu11", "-O1", "-g",
                        "-Wall", "-Wextra", "-Werror", "-DCONFIG_MODULES=1", "-fno-pie", "-no-pie",
                        "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
-                       "-Wl,--wrap=xhci_device_attach", "-Wl,--wrap=xhci_hid_arm",
+                       "-Wl,--wrap=xhci_device_attach", "-Wl,--wrap=xhci_device_attach_child", "-Wl,--wrap=xhci_hid_arm",
                        "-Wl,--wrap=xhci_hid_event", "-fsanitize=address,undefined",
                        "-fno-sanitize-recover=all", "-Iinclude", "-Iinclude/uapi", *sources, "-o", str(binary)]
             build = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
@@ -256,10 +291,11 @@ class USBXHCI(unittest.TestCase):
             sources = ["tools/tests/usb_xhci_retire_test.c", "drivers/usb/xhci/ports.c",
                        "drivers/usb/xhci/devices.c", "drivers/usb/storage/bulk_only.c",
                        "drivers/usb/core/registry.c", "block/device/registry.c"]
+            sources += HUB_SOURCES + ["drivers/usb/xhci/ring.c", "drivers/usb/xhci/trb.c"]
             command = [os.environ.get("CC", "clang"), "-std=gnu11", "-O1", "-g",
                        "-Wall", "-Wextra", "-Werror", "-DCONFIG_MODULES=1", "-fno-pie", "-no-pie",
                        "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
-                       "-Wl,--wrap=xhci_device_attach", "-Wl,--wrap=xhci_hid_arm",
+                       "-Wl,--wrap=xhci_device_attach", "-Wl,--wrap=xhci_device_attach_child", "-Wl,--wrap=xhci_hid_arm",
                        "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
                        "-Iinclude", "-Iinclude/uapi", *sources, "-o", str(binary)]
             build = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
@@ -324,6 +360,7 @@ class USBXHCI(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="reliefnt-xhci-recovery-") as directory:
             binary = Path(directory) / "recovery"
             sources = ["tools/tests/usb_xhci_recovery_test.c", "drivers/usb/xhci/transfer.c",
+                       "drivers/usb/xhci/hub_tt.c",
                        "drivers/usb/xhci/trb.c", "drivers/usb/xhci/ring.c",
                        "drivers/usb/xhci/context.c", "drivers/usb/xhci/completion.c"]
             command = [os.environ.get("CC", "clang"), "-std=gnu11", "-O1", "-g",

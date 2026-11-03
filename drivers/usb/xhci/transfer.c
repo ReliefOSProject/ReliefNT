@@ -15,6 +15,7 @@ int xhci_endpoint_recover(struct xhci_device *device,unsigned dci,bool halted)
     struct xhci_trb command={.control=XHCI_TRB_TYPE(halted ? 14u : 15u)|
         ((uint32_t)dci<<16)|((uint32_t)device->slot_id<<24)};
     int rc=xhci_command(controller,command,NULL);
+    if(!rc)rc=xhci_tt_clear(device,dci);
     if (!rc && halted && dci!=1) {
         uint8_t setup[8]={2,1,0,0,endpoint->endpoint.address,0,0,0};
         uint32_t actual=0;
@@ -174,7 +175,7 @@ static int reset_idle_endpoint(struct xhci_device *device,unsigned dci)
         input[0]=1u<<dci;input[1]=1u;
         input[stride]=output[0];input[stride+1]=output[1];input[stride+2]=output[2];
         rc=xhci_context_endpoint(input,4096,controller->stride,device->usb.speed,
-                                  &state->endpoint,state->hid,state->replacement.physical);
+                                  &state->endpoint,state->hid || state->hub_status,state->replacement.physical);
     }
     if(!rc) {
         struct xhci_trb command={.lo=(uint32_t)device->input.physical,
@@ -192,6 +193,8 @@ static int reset_idle_endpoint(struct xhci_device *device,unsigned dci)
     state->replacement=(struct xhci_dma){0};state->ring=replacement;
     kernel_spin_unlock_irqrestore(&controller->event_lock,flags);
     xhci_dma_release(&old);
+    rc=xhci_tt_clear(device,dci);
+    if(rc){__atomic_store_n(&controller->stop.failed,true,__ATOMIC_RELEASE);return rc;}
     uint8_t setup[8]={2,1,0,0,state->endpoint.address,0,0,0};uint32_t actual=0;
     rc=device->usb.operations->control(&device->usb,setup,NULL,0,&actual);
     if(!rc && actual)rc=-EPROTO;

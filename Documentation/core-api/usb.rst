@@ -11,7 +11,7 @@ boot HID 解码和 BOT/SCSI 协议代码内置；控制器、设备绑定与 DMA
 owner，不产生无法卸载的自引用。
 
 ``CONFIG_USB_XHCI_HCD`` 选择 PCI xHCI 主机驱动，``y`` 内置、``m`` 生成
-``drivers/usb/xhci/xhci.ko``，defconfig 默认内置。xHCI 支持直接连接根端口的
+``drivers/usb/xhci/xhci.ko``，defconfig 默认内置。xHCI 支持根端口或 Hub 后的
 SuperSpeed/SuperSpeedPlus BOT 存储，以及 USB 2.0/1.x BOT 存储和 boot HID
 键盘/相对鼠标。xHCI 根据控制器的 Supported Protocol 能力和端口报告的原始
 Protocol Speed ID 选择速度，不能由控制器存在推断设备速度。``speed=SUPER``
@@ -36,7 +36,7 @@ Gbit/s）。这些值是协议能力声明，不是实测吞吐量；驱动不�
 高速设备由 EHCI 处理。低速/全速设备直接接在 EHCI 根端口时，交给 companion
 控制器；VMware USB 2.0 配置应同时启用 ``CONFIG_USB_UHCI_HCD``。USB 2.0 Hub
 后的低速/全速设备使用 transaction translator。USB 端口归 xHCI 控制器所有
-时不能使用 EHCI 驱动。xHCI 当前不支持 Hub 路由；不支持的 Hub、类或端点被
+时不能使用 EHCI 驱动。不支持的 Hub 描述符、类或端点被
 明确拒绝，不影响控制器继续枚举其他根端口。这项功能不包含 OHCI、UAS、
 streams、等时传输或任意 HID report descriptor 解释器，也不涵盖 USB4、Type-C
 供电/角色切换或 USB 电气认证。
@@ -45,6 +45,41 @@ HID 支持 boot subclass 的键盘和相对鼠标，选择 boot protocol 后使�
 8 字节键盘报告和至少 3 字节鼠标报告。鼠标 Y 方向为 USB 的向下为正，
 移除设备时释放仍按下的键和按钮，输出使用已有 Linux evdev 输入 ABI。
 非 boot/NKRO 键盘、仅支持绝对坐标的数位板不属于当前支持范围。
+
+xHCI Hub
+========
+
+USB 2.0 全速／高速 Hub 和 USB 3.x Hub 使用现有 HCD 的同一模块 owner，
+不需要额外的用户态 USB 服务。按 USB 拓扑生成最多五个 nibble 的 Route
+String；USB2 Hub 超过 14 的端口编码为 15，真实端口号仍保留在 TT 上下文。
+低速／全速设备经过高速 Hub 时，Slot Context 指向隔离该低速段的高速 Hub，
+跨越全速 Hub 仍继承正确的 TT slot 和端口。支持 multi-TT 的 Hub 保持
+alternate zero 的 single-TT 配置，不在没有 SET_INTERFACE 的情况下设置 MTT。
+
+USB SET_CONFIGURATION 先于 Hub 类描述符请求；第一次 xHC Configure Endpoint
+命令同时设置 Hub、Number of Ports 和高速 Hub 的 TT Think Time。USB3 Hub
+配置后发送 SET_HUB_DEPTH。SSP Hub 的 BOS 描述符和扩展端口状态共同决定下游
+对称链路的速率，再匹配根端口协议能力里的原始 PSI ID；不能从 Hub 的上行速率
+猜测下游设备速度。未支持或非对称链路明确拒绝。相同速率链路继承上游转换路径，
+较低速率设备引用隔离该链路的父 Hub。
+
+Hub interrupt IN 只将状态位图合并为待办；GET_STATUS、变化位确认、供电、
+100 ms 连接去抖、端口复位和枚举由持有主机事务 gate 的维护任务执行。
+普通／热复位等待有界，连接稳定期间的失败最多尝试三次，连接变化后重新计数。
+USB2／USB3 使用各自的变化位和 feature selector；全局过流或本地电源丢失
+撤销下游设备。控制／bulk 端点恢复先清理实际高速 Hub 的 TT 缓冲；控制端点
+清除两个方向，single-TT 请求的 index 为 1。无法证明恢复成功时不继续复用 DMA。
+
+拔掉 Hub 立即标记全部后代 disconnected，并释放按下的键／鼠标按钮。
+先停止和回收叶节点；旧块设备 OFD／挂载排空之前保留父 Hub 对象及其 slot，
+避免悬空的父指针和 TT 引用。重新连接创建新身份，旧打开保持 ENODEV 语义。
+USB2 Hub 的端口数保留完整 8 位范围、USB3 Hub 最多 15 个端口；还受控制器实际
+slot 数和 USB 拓扑层数约束。描述符长度和中断位图容量在配置硬件前校验。
+
+QEMU ``usb-hub`` 仅实现全速 Hub；多级路由、BOT 读写、boot HID、整树拔插及
+模块装卸可由该模型验证。高速 TT、SS／SSP Hub 的描述符、上下文与端口请求
+有宿主硬件边界测试；不能据此宣称真实 Hub 或 10／20 Gbit/s 链路已验证。
+VMware 验证未完成。
 
 存储协议
 ========
@@ -149,7 +184,9 @@ think time 估算带宽。高速每微帧最多使用 100 微秒；同一 TT 的
 ``tools/tests/usb_input_probe.c`` 是使用 Linux evdev/POSIX 文件操作的来宾探针。
 完整镜像与虚拟机编排由操作系统仓库提供，不能用宿主脚本通过代替硬件验证。
 
-协议依据为 `Intel xHCI 1.2c
+Hub 采用 USB2 第 11 章及 `USB 3.2 第 10 章
+<https://www.usb.org/document-library/usb-32-revision-11-june-2022>`_ 的类协议。
+其余协议依据为 `Intel xHCI 1.2c
 <https://cdrdv2.intel.com/v1/dl/getContent/868295>`_、`Intel EHCI 1.0
 <https://www.intel.com/content/dam/www/public/us/en/documents/technical-specifications/ehci-specification-for-usb.pdf>`_、
 `USB-IF Bulk-Only Transport 1.0

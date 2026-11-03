@@ -3,6 +3,7 @@ config USB_XHCI_HCD
     tristate "xHCI USB host controller"
     default y
     help
-      PCI xHCI root-port host for SuperSpeed Bulk-Only SCSI storage and
-      USB2/1.x Bulk-Only storage and boot HID keyboard/mouse. M builds xhci.ko.
-      Hub routing, streams, isochronous endpoints and UAS are unsupported.
+      PCI xHCI host for SuperSpeed Bulk-Only SCSI storage and USB2/1.x
+      Bulk-Only storage and boot HID keyboard/mouse, directly or through
+      USB2/USB3 hubs. Supports hub status interrupts, TT routes and hotplug.
+      M builds xhci.ko. Streams, isochronous endpoints and UAS are unsupported.

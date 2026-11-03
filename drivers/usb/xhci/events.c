@@ -28,8 +28,10 @@ void xhci_events(struct xhci_controller *controller)
                 if (device->slot_id!=slot || device->disabled || !dci)continue;
                 struct xhci_endpoint_state *endpoint=&device->endpoints[dci];
                 if (endpoint->active && xhci_complete_event(&endpoint->completion,&event) &&
-                    endpoint->completion.done && endpoint->hid)
-                    xhci_hid_event(device,dci);
+                    endpoint->completion.done) {
+                    if(endpoint->hid)xhci_hid_event(device,dci);
+                    else if(endpoint->hub_status)xhci_hub_event(device,dci);
+                }
                 break;
             }
         } else if (type==34u) {

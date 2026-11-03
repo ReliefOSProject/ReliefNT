@@ -20,6 +20,9 @@ void xhci_write(struct xhci_controller *controller,uint32_t offset,uint32_t valu
     port_value&=~(value&(0x7fu<<17)); /* emulate W1C change bits */
 }
 void usb_host_request_service(struct usb_host *host){(void)host;++requested;}
+void xhci_hubs_poll(struct xhci_controller *c){(void)c;}
+void xhci_hubs_service(struct xhci_controller *c){(void)c;}
+int xhci_interrupt_arm(struct xhci_device *d,unsigned e){(void)d;(void)e;assert(0);return -EIO;}
 void xhci_events(struct xhci_controller *controller){(void)controller;}
 void xhci_delay(unsigned milliseconds){(void)milliseconds;}
 int xhci_wait(struct xhci_controller *c,uint32_t o,uint32_t m,uint32_t v,unsigned ms)

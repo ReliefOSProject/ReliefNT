@@ -28,7 +28,7 @@ static void port_write(struct xhci_controller *controller,unsigned port,uint32_t
 static struct xhci_device *child_at(struct xhci_controller *controller,unsigned port)
 {
     for(struct xhci_device *device=controller->devices;device;device=device->next)
-        if(device->usb.root_port==port && !device->usb.disconnected)return device;
+        if(!device->parent && device->usb.root_port==port && !device->usb.disconnected)return device;
     return NULL;
 }
 static int port_reset(struct xhci_controller *controller,unsigned port,uint8_t *speed_id,
@@ -146,6 +146,7 @@ void xhci_poll(void *context)
     }
     xhci_events(controller);
     if(__atomic_load_n(&controller->stop.failed,__ATOMIC_ACQUIRE)){failure_poll(controller);return;}
+    xhci_hubs_poll(controller);
     for(unsigned i=0;i<8;++i)if(__atomic_load_n(&controller->port_work[i],__ATOMIC_ACQUIRE))work=true;
     /* A revoked disk can outlive its port event through an open FD/mount.
      * Retry in task context at a bounded polling cadence until users drain. */
@@ -216,15 +217,17 @@ void xhci_service(void *context)
             else {state->phase=XHCI_PORT_RETRY;state->failed_at=time_ticks();}
         }
     }
+    xhci_hubs_service(controller);
     for(struct xhci_device *device=controller->devices;device && !controller->stop.failed;device=device->next) {
         if(device->usb.disconnected)continue;
         for(unsigned dci=2;dci<XHCI_ENDPOINTS && !controller->stop.failed;++dci) {
             struct xhci_endpoint_state *endpoint=&device->endpoints[dci];
-            if(!endpoint->hid || !endpoint->needs_recovery)continue;
+            if((!endpoint->hid && !endpoint->hub_status) || !endpoint->needs_recovery)continue;
             int rc=endpoint->active ? xhci_endpoint_recover(device,dci,true) : 0;
             if(!rc) {
                 uint64_t flags;kernel_spin_lock_irqsave(&controller->event_lock,&flags);
-                endpoint->needs_recovery=false;rc=xhci_hid_arm(device,dci);
+                endpoint->needs_recovery=false;
+                rc=endpoint->hid ? xhci_hid_arm(device,dci) : xhci_interrupt_arm(device,dci);
                 kernel_spin_unlock_irqrestore(&controller->event_lock,flags);
             }
             if(rc)endpoint->needs_recovery=true;
