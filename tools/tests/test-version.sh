@@ -41,7 +41,7 @@ ${HOSTCC:-cc} -std=c11 -O1 -g -fsanitize=address,undefined \
     -ffunction-sections -fdata-sections -Wl,--gc-sections \
     -I"$kernel/include" -I"$kernel/include/uapi" \
     "$kernel/tools/tests/procfs_directories_test.c" \
-    "$kernel/fs/vfs/mount_tree.c" "$kernel/fs/vfs/mount_table.c" "$kernel/fs/vfs/path.c" \
+    "$kernel/fs/vfs/mount_tree.c" "$kernel/fs/vfs/lookup_cache.c" "$kernel/fs/vfs/mount_table.c" "$kernel/fs/vfs/path.c" \
     "$kernel/fs/vfs/file.c" "$kernel/fs/vfs/open.c" "$kernel/fs/vfs/pseudo.c" \
     "$kernel/fs/vfs/attributes.c" "$kernel/fs/proc/mount.c" "$kernel/fs/proc/views.c" \
     "$kernel/kernel/syscall/fd/proc.c" "$kernel/fs/vfs/exec_file.c" \

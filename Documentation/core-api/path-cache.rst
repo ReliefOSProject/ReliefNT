@@ -9,7 +9,7 @@ This is an internal optimization.  Linux syscall numbers, errno values,
 pathname resolution and POSIX permission checks do not change.
 
 Coherency and ownership
-======================
+=======================
 
 A provider opts in with ``vfs_backend_ops.lookup_generation``.  A nonzero
 64-bit token identifies a period in which names and the metadata returned by
