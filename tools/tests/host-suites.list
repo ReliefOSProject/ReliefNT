@@ -10,6 +10,7 @@ vga_text tools/test_vga_text.py
 cpu_accounting tools/test_cpu_accounting.py
 drm tools/test_drm.py
 e1000 tools/test_e1000.py
+e1000e tools/test_e1000e.py
 efi_fs_early tools/test_efi_fs_early.py
 efi_handoff tools/test_efi_handoff.py
 efi_acpi_bootstrap tools/test_efi_acpi_bootstrap.py

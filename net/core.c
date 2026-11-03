@@ -51,7 +51,7 @@ void net_init(void)
     net_ipv6_init();
     net_set_static_fallback();
     if (!e1000_is_ready()) {
-        console_info("[reliefnt] net unavailable: no active e1000\n");
+        console_info("[reliefnt] net unavailable: no active Ethernet link\n");
         return;
     }
     net_log_config("[reliefnt] interface ready; OpenRC DHCP client owns configuration");

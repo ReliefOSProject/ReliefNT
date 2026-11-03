@@ -28,6 +28,10 @@ drivers/ 按 console、tty、video、storage、net、input、usb、sound 等设�
    * - ``E1000``
      - ``e1000``
      - PRO/1000 设备；网络协议栈和回调入口保留内置。
+   * - ``E1000E``
+     - ``e1000e``
+     - Intel 82574L/82574IT、82583V PCIe 千兆网卡；共用单 eth0 服务，
+       不替换已有网络 owner。设备范围和验证边界见 :doc:`e1000e`。
    * - ``MOUSE_PS2`` / ``USB_UHCI_HCD``
      - ``mouse`` / ``uhci``
      - PS/2、VMware 鼠标与 UHCI HID；键盘基础输入和分发入口内置。

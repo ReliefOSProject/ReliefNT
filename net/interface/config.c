@@ -469,7 +469,7 @@ int net_interface_ioctl(uint32_t request, uint64_t address)
             }
             if (__builtin_memcmp(name, "eth0", 5)) return -LINUX_ENODEV;
         }
-        if (!e1000_is_ready()) return -LINUX_ENODEV;
+        if (!net_interface_present()) return -LINUX_ENODEV;
         uint32_t dst = net_get_u32((uint8_t *)&route.rt_dst + 4);
         uint32_t mask = net_get_u32((uint8_t *)&route.rt_genmask + 4);
         uint32_t gateway = route.rt_gateway.sa_family == AF_INET ?
@@ -498,7 +498,7 @@ int net_interface_ioctl(uint32_t request, uint64_t address)
         rc=socket_user_prepare(task,address,sizeof(conf),true);if(rc)return rc;
         if(!user_range_writable(address,sizeof(conf)))return -LINUX_EFAULT;
         if (conf.ifc_len < 0) return -LINUX_EINVAL;
-        int available = e1000_is_ready() && net_config.local_ip ? sizeof(struct ifreq) : 0;
+        int available = net_interface_present() && net_config.local_ip ? sizeof(struct ifreq) : 0;
         if (!conf.ifc_buf) conf.ifc_len = available;
         else {
             conf.ifc_len = conf.ifc_len >= available ? available : 0;
@@ -530,7 +530,7 @@ int net_interface_ioctl(uint32_t request, uint64_t address)
         const char *name;
         uint32_t size;
         if (req.data.value == 1) { name = "lo"; size = 3; }
-        else if (req.data.value == 2 && e1000_is_ready()) { name = "eth0"; size = 5; }
+        else if (req.data.value == 2 && net_interface_present()) { name = "eth0"; size = 5; }
         else return -LINUX_ENODEV;
         net_memzero(req.ifr_name, sizeof(req.ifr_name));
         net_memcpy(req.ifr_name, name, size);
@@ -543,7 +543,7 @@ int net_interface_ioctl(uint32_t request, uint64_t address)
         net_memcpy((void *)(uintptr_t)address, &req, sizeof(req));
         return 0;
     }
-    if (!e1000_is_ready() || __builtin_memcmp(req.ifr_name, "eth0", 5)) return -LINUX_ENODEV;
+    if (!net_interface_present() || __builtin_memcmp(req.ifr_name, "eth0", 5)) return -LINUX_ENODEV;
     switch (request) {
         case SIOCGIFINDEX: req.data.value = 2; break;
         case SIOCGIFHWADDR:
@@ -552,7 +552,8 @@ int net_interface_ioctl(uint32_t request, uint64_t address)
             net_memcpy(req.data.addr.sa_data, e1000_mac(), 6); break;
         case SIOCGIFFLAGS:
             req.data.flags = IFF_BROADCAST | IFF_MULTICAST |
-                (net_interface_up ? IFF_UP | IFF_RUNNING : 0); break;
+                (net_interface_up ? IFF_UP : 0) |
+                (net_interface_ready() ? IFF_RUNNING : 0); break;
         case SIOCSIFFLAGS:
             if (req.data.flags & ~(IFF_UP | IFF_RUNNING | IFF_BROADCAST | IFF_MULTICAST))
                 return -LINUX_EOPNOTSUPP;
@@ -595,6 +596,22 @@ int net_interface_ioctl(uint32_t request, uint64_t address)
 
 /** @brief Report the real administrative and hardware state of eth0. */
 bool net_interface_ready(void) { return net_interface_up && e1000_is_ready(); }
+
+/** @brief Report a registered Ethernet device independently of carrier state.
+ * @return True while a retained provider publishes a present PCI device;
+ * false before registration or after detach. Caller owns network execution.
+ */
+bool net_interface_present(void)
+{
+    struct e1000_info info;
+    e1000_get_info(&info);
+    return info.present!=0;
+}
+
+/** @brief Report the administrative IFF_UP setting independently of carrier.
+ * @return Current eth0 administrative flag; caller owns network execution.
+ */
+bool net_interface_admin_up(void) { return net_interface_up; }
 
 /** @brief Apply Linux IPv6 address and route ioctls for an IPv6 socket.
  * @param request Supported address or route mutation command.

@@ -18,7 +18,6 @@
 static uint64_t blocked;
 static bool block_output;
 static struct task_file net_file={.used=1,.flags=TASK_FILE_FLAG_SOCKET_INET};
-void e1000_get_info(struct e1000_info *info) { *info=(struct e1000_info){.present=1,.active=1}; }
 void *kernel_malloc(size_t size) { return malloc(size); }
 void kernel_free(void *memory) { free(memory); }
 int swap_prepare_user_range(struct task *task,uint64_t address,uint64_t length,bool output)

@@ -12,3 +12,4 @@
    documentation
    releasing
    module-support-plan
+   e1000e-plan

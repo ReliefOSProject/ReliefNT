@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+config E1000E
+    tristate "Intel PCIe Gigabit Ethernet (82574L/IT and 82583V)"
+    default y
+    help
+      Native PCIe Ethernet for Intel 82574L/82574IT (8086:10d3) and 82583V
+      (8086:150c), including QEMU's e1000e model. Other Intel e1000e-family
+      controllers, such as I217/I219, are not bound by this driver.
+      Uses the existing single eth0 network backend, coherent 64-bit DMA,
+      full-duplex copper autonegotiation and bounded polling queues.
+      With M, build e1000e.ko with native owner-aware DMA STOP and cleanup.

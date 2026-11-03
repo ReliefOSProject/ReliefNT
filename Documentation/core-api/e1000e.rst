@@ -1,0 +1,102 @@
+================================
+Intel PCIe 千兆以太网驱动
+================================
+
+设备范围
+========
+
+``drivers/net/e1000e/`` 提供独立的原生 PCIe 网络驱动，精确匹配下列设备。
+旧 8254x 设备继续由 ``drivers/net/e1000/`` 管理。
+
+.. list-table:: PCI 设备表
+   :header-rows: 1
+   :widths: 35 25 40
+
+   * - 控制器
+     - PCI Vendor:Device
+     - 验证边界
+   * - Intel 82574L / 82574IT
+     - ``8086:10d3``
+     - QEMU 的 e1000e 模拟 82574L；实体硬件仍需单独验证。
+   * - Intel 82583V
+     - ``8086:150c``
+     - 宿主硬件边界模型覆盖识别和生命周期；实体硬件未验证。
+
+I217、I218、I219、82571/82572/82573 以及其他未列出的设备不在本驱动设备表中。
+不能由 Linux 驱动名称同为 e1000e 推导出这些芯片也受支持。
+
+配置与使用
+==========
+
+``CONFIG_E1000E`` 为 tristate，defconfig 默认 ``y``。选择 ``m`` 后由原版
+Kbuild/modpost 生成 ``drivers/net/e1000e/e1000e.ko``；``n`` 不编译该驱动。
+模块携带精确 PCI 别名，ReliefOS 按实际硬件通过普通 modprobe 加载。
+
+网络继续使用现有 ``eth0`` 和 Linux socket、ioctl、netlink、proc 网络接口。
+内核当前只有一个外部 Ethernet 提供者；后来的不同 owner 注册返回
+``-EBUSY``，不替换先前的网卡或回调。内部历史名称 ``register_e1000`` 和
+``e1000_*`` 服务函数也承载 e1000e，不代表绑定硬件仍是 8254x；本次没有改变
+这些服务结构的布局、Linux UAPI 或 BusyBox。
+
+接口存在性不依赖网线或 PHY 协商：无载波时仍能查询名称、index、MAC、MTU
+和已配置地址，也能设置 ``IFF_UP``。ioctl 与 rtnetlink 分别报告管理状态和
+``IFF_RUNNING``/``IFF_LOWER_UP`` 载波状态；只有提供者卸载后接口才消失。
+
+在 ReliefOS 中可使用普通命令查看或管理模块及网络：
+
+.. code-block:: sh
+
+   modinfo e1000e
+   modprobe e1000e
+   ip link show eth0
+   ip addr show dev eth0
+   cat /proc/net/dev
+   rmmod e1000e
+
+内置配置不能通过 rmmod 卸载。卸载可加载配置会断开该网卡上的现有连接；
+重新加载后由现有网络配置服务重新配置地址，不能继续使用旧连接。
+
+硬件和生命周期
+==============
+
+BAR0 经 PCI 映射服务校验并映射为 UC/NX，支持 32 位和 64 位内存 BAR。
+DMA 页与 CPU 虚拟地址分别保留，描述符只写物理总线地址。当前 x86_64
+一致性 DMA 平台无需软件 cache flush，描述符交接使用 acquire/release 屏障。
+
+复位前屏蔽中断、关闭收发、禁用 PCIe master 请求并等待已有请求排空。
+复位及 EEPROM 自动加载均有界等待。有效 RAR 优先保留设备地址，否则按
+82574/82583 的 EERD 地址、完成位读取 NVM，绝不生成随机 MAC 或写入 NVM。
+82574 的 MDIO/NVM 操作遵守硬件/管理固件信号量；82583 保留位不写，等待
+配置加载完成后使用 MDIC。通过 Clause 22 MDIO 唤醒 PHY，并启动
+10/100/1000 Mb/s 全双工自动协商。无网线时驱动可加载，接口报告真实 link down。
+
+接收使用 256 个 legacy 描述符，发送使用 64 个，缓冲区各为 2048 字节。
+发送复制数据后异步交给硬件，队列保留一个空槽；队列满返回 ``-EAGAIN``，
+不持锁等待硬件。接收校验长度和错误，并丢弃完整的非 EOP 分片链，不能把其
+尾片作为新帧。独立收发锁保护并发访问。当前使用单队列轮询，MTU 为 1500；
+不提供 jumbo、TSO、RSS、多队列或校验和卸载。
+
+所有回调和 DMA/MMIO 由原生模块 owner 保留。退出必须先关闭回调准入、排空
+在途调用，确认 DMA 和复位停止后才能释放页和 BAR。停止超时会保留代码和
+全部 backing，并报告失败供重试，不能用释放内存掩盖硬件未停止。
+
+测试与资料
+==========
+
+ReliefNT 宿主测试为 ``tools/test_e1000e.py``，分别编译真实驱动对象，只替代
+PCI/MMIO/DMA 硬件边界。覆盖设备表、独立 CPU/DMA 地址、MAC 回退、PHY、
+无网线、满队列、回绕、错误帧、部分初始化回滚和失败 STOP 保留。
+``tools/test_driver_modules.py`` 覆盖 owner 冲突及回调排空；旧 E1000 的回归
+仍由 ``tools/test_e1000.py`` 持有。
+
+``tools/tests/ethernet_guest.c`` 使用 Linux/POSIX socket 接口，校验 IPv4/IPv6
+双并发 TCP 流和 UDP 数据。完整 OS 的私有镜像、DHCP、ping、两次模块重载
+由 ReliefOS 的 ``tools/test_e1000e_qemu.py`` 编排。QEMU 成功不代表物理
+PHY、电源管理或 VMware 硬件模拟均已经验证；VMware 验证未完成。
+
+寄存器定义依据 Intel 编程手册；实现为本项目 Apache-2.0 源码，没有导入
+Linux GPL 驱动源码：
+
+* `Intel 82574 GbE Controller Family Datasheet <https://www.mouser.com/pdfdocs/82574datasheet.pdf>`_
+* `Intel 82583V GbE Controller Datasheet <https://cdrdv2-public.intel.com/613460/82583v-gbe-controller-datasheet.pdf>`_
+* `QEMU 网络设备文档 <https://www.qemu.org/docs/master/system/devices/net.html>`_

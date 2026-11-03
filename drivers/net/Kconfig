@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 menu "Network device drivers"
 source "drivers/net/e1000/Kconfig"
+source "drivers/net/e1000e/Kconfig"
 endmenu

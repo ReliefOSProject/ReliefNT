@@ -106,6 +106,11 @@ int main(void)
     release_binding(); assert(!driver_slots[0].info.file[0]);
     init_result=0; assert(!driver_module_register(&descriptor,NULL));
     assert(e1000_is_ready() && !resource.stop && (driver_slots[0].info.flags&RELIEFOS_DRIVER_FLAG_BUILTIN));
+    /* A second NIC driver must not silently replace the retained eth0 owner. */
+    loading_slot=1;
+    assert(driver_register_e1000(&ops)==-16);
+    assert(e1000_owner==0 && e1000_is_ready());
+    loading_slot=-1;
     kernel_execution_unlock_irqrestore(flags);
     puts("PASS native driver owner bindings: ABI/size rejection before init, reserve-before-init, duplicate, callback drain, failed STOP retained, absent hardware, rollback and builtin path");
 }

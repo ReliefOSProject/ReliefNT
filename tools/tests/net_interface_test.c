@@ -5,7 +5,12 @@
 
 static struct task current;
 struct task *sched_current_task(void) { return &current; }
-int e1000_is_ready(void) { return true; }
+static bool nic_present=true, nic_carrier=true;
+int e1000_is_ready(void) { return nic_present && nic_carrier; }
+void e1000_get_info(struct e1000_info *info)
+{ *info=(struct e1000_info){.present=nic_present,.active=nic_present && nic_carrier}; }
+void net_ipv6_link_changed(bool up) { (void)up; }
+void netlink_ipv6_changed(void) { }
 const uint8_t *e1000_mac(void) { static const uint8_t mac[6] = {2,3,4,5,6,7}; return mac; }
 bool user_range_ok(uint64_t address, uint64_t size) { return address >= 4096 && size <= 4096; }
 bool user_range_writable(uint64_t address, uint64_t size) { return user_range_ok(address, size); }
@@ -43,6 +48,23 @@ int main(void)
     assert(call(SIOCSIFFLAGS, &req) == 0 && !net_interface_ready());
     req.data.flags = IFF_UP;
     assert(call(SIOCSIFFLAGS, &req) == 0 && net_interface_ready());
+    nic_carrier=false;
+    assert(call(SIOCGIFINDEX,&req)==0 && req.data.value==2);
+    assert(call(SIOCGIFNAME,&req)==0 && !strcmp(req.ifr_name,"eth0"));
+    assert(call(SIOCGIFFLAGS,&req)==0 && (req.data.flags&IFF_UP) &&
+           !(req.data.flags&IFF_RUNNING) && !net_interface_ready());
+    req.data.flags=0;
+    assert(call(SIOCSIFFLAGS,&req)==0);
+    req.data.flags=IFF_UP;
+    assert(call(SIOCSIFFLAGS,&req)==0);
+    assert(call(SIOCGIFMTU,&req)==0 && req.data.value==1500);
+    conf.ifc_len=sizeof(output);
+    assert(!net_interface_ioctl(SIOCGIFCONF,(uintptr_t)&conf) && conf.ifc_len==sizeof(output));
+    nic_present=false;
+    assert(call(SIOCGIFINDEX,&req)==-LINUX_ENODEV);
+    conf.ifc_len=sizeof(output);
+    assert(!net_interface_ioctl(SIOCGIFCONF,(uintptr_t)&conf) && !conf.ifc_len);
+    nic_present=nic_carrier=true;
     strcpy(req.ifr_name, "absent");
     assert(call(SIOCGIFINDEX, &req) == -LINUX_ENODEV);
     assert(net_interface_ioctl(SIOCGIFINDEX, 0) == -LINUX_EFAULT);

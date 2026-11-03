@@ -14,5 +14,6 @@
    path-cache
    resource-limits
    drivers
+   e1000e
    usb
    svga

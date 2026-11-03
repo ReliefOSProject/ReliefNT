@@ -59,7 +59,10 @@ int driver_register_serial(const struct reliefos_driver_serial_ops *ops)
 }
 
 /**
- * @brief Bind the currently-loading driver's e1000 ops as the active network backend.
+ * @brief Bind the loading driver's Ethernet ops without replacing another owner.
+ * @param ops Validated callbacks retained by the current loading driver slot.
+ * @return Zero, -EINVAL for invalid registration, or -EBUSY when eth0 already
+ * belongs to another provider. Task init; IRQ-safe service lock, no callback.
  */
 int driver_register_e1000(const struct reliefos_driver_e1000_ops *ops)
 {
@@ -69,6 +72,10 @@ int driver_register_e1000(const struct reliefos_driver_e1000_ops *ops)
     }
     uint64_t flags;
     kernel_spin_lock_irqsave(&manager_service_lock, &flags);
+    if (e1000_ops && e1000_owner != (uint32_t)loading_slot) {
+        kernel_spin_unlock_irqrestore(&manager_service_lock, flags);
+        return -16;
+    }
     e1000_ops = ops;
     e1000_owner = (uint32_t)loading_slot;
     kernel_spin_unlock_irqrestore(&manager_service_lock, flags);

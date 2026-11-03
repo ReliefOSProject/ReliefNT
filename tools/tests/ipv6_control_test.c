@@ -13,6 +13,7 @@ static struct task_file files[4];
 static unsigned allocations, updates, link_changes;
 static bool additional_address;
 static bool nic_ready=true;
+static bool nic_present=true;
 struct reliefos_net_config net_config = {.local_ip=0x0a00020f,.subnet_mask=0xffffff00};
 bool net_interface_up=true;
 struct net_socket *net_sockets;
@@ -37,7 +38,7 @@ struct task_file *task_file_for_fd(struct task *task, int fd)
 { (void)task; return fd >= 0 && fd < 4 && files[fd].used ? &files[fd] : NULL; }
 int e1000_is_ready(void) { return nic_ready; }
 const uint8_t *e1000_mac(void) { static const uint8_t mac[6] = {2,3,4,5,6,7}; return mac; }
-void e1000_get_info(struct e1000_info *info) { *info = (struct e1000_info){.present=nic_ready,.active=nic_ready,.mac={2,3,4,5,6,7}}; }
+void e1000_get_info(struct e1000_info *info) { *info = (struct e1000_info){.present=nic_present,.active=nic_ready,.mac={2,3,4,5,6,7}}; }
 void net_memcpy(void *dst,const void *src,uint32_t size) { memcpy(dst,src,size); }
 void net_memzero(void *dst,uint32_t size) { memset(dst,0,size); }
 uint32_t net_get_u32(const uint8_t *p) { return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]; }
@@ -104,6 +105,23 @@ int main(void)
         }
     }
     assert(count == -LINUX_EAGAIN && found_lo && found_eth && done);
+    /* A present Ethernet device remains enumerable while PHY negotiates. */
+    nic_ready=false;
+    assert(send_req(fd,&link,sizeof(link))==sizeof(link));
+    count=receive(fd,output,sizeof(output));
+    assert(count>0);
+    found_eth=0;
+    for (unsigned pos=0;pos+sizeof(struct nlmsghdr)<=(unsigned)count;) {
+        struct nlmsghdr *h=(void *)(output+pos);
+        if (h->nlmsg_type==RTM_NEWLINK && ((struct ifinfomsg *)(h+1))->ifi_index==2) {
+            struct ifinfomsg *m=(void *)(h+1);
+            assert((m->ifi_flags&IFF_UP) && !(m->ifi_flags&(IFF_RUNNING|0x10000u)));
+            found_eth=1;
+        }
+        pos+=NLMSG_ALIGN(h->nlmsg_len);
+    }
+    assert(found_eth);
+    nic_ready=true;
     /* musl and BusyBox issue rtgenmsg dumps, only one payload byte plus padding. */
     struct { struct nlmsghdr h; uint8_t family, pad[3]; } generic = {
         .h={.nlmsg_len=sizeof(generic),.nlmsg_type=RTM_GETLINK,
@@ -193,14 +211,14 @@ int main(void)
     assert(net_interface_ioctl(SIOCGIFINDEX,(uintptr_t)&ifr)==0 && ifr.data.value==1);
     memset(&ifr,0,sizeof(ifr)); ifr.data.value=1;
     assert(net_interface_ioctl(SIOCGIFNAME,(uintptr_t)&ifr)==0 && !strcmp(ifr.ifr_name,"lo"));
-    nic_ready=false;
+    nic_ready=nic_present=false;
     strcpy(ifr.ifr_name,"lo");
     assert(net_interface_ioctl(SIOCGIFINDEX,(uintptr_t)&ifr)==0 && ifr.data.value==1);
     memset(&ifr,0,sizeof(ifr)); ifr.data.value=1;
     assert(net_interface_ioctl(SIOCGIFNAME,(uintptr_t)&ifr)==0 && !strcmp(ifr.ifr_name,"lo"));
     strcpy(ifr.ifr_name,"eth0");
     assert(net_interface_ioctl(SIOCGIFINDEX,(uintptr_t)&ifr)==-LINUX_ENODEV);
-    nic_ready=true;
+    nic_ready=nic_present=true;
     memset(&ifr,0,sizeof(ifr)); ifr.data.value=2;
     assert(net_interface_ioctl(SIOCGIFNAME,(uintptr_t)&ifr)==0 && !strcmp(ifr.ifr_name,"eth0"));
     strcpy(ifr.ifr_name,"eth0");

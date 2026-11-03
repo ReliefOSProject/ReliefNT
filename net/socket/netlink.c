@@ -170,7 +170,7 @@ static uint8_t nl_prefix4(uint32_t mask)
 /** @brief Emit one interface from a copied link state.
  * @param b Builder. @param seq Sequence. @param index Interface index.
  * @param multi Multipart flag. @param type Native event. @param info Ethernet snapshot.
- * @param up Administrative and device readiness. @return Zero or ENOBUFS. */
+ * @param up Administrative IFF_UP flag, independent of carrier. @return Zero or ENOBUFS. */
 static int nl_link_snapshot(struct nl_builder *b, uint32_t seq, int index, bool multi,
                             uint16_t type, const struct e1000_info *info, bool up)
 {
@@ -180,7 +180,8 @@ static int nl_link_snapshot(struct nl_builder *b, uint32_t seq, int index, bool 
     m->ifi_index = index;
     m->ifi_type = index == 1 ? 772 : 1; /* ARPHRD_LOOPBACK / ARPHRD_ETHER */
     m->ifi_flags = index == 1 ? IFF_UP | IFF_LOOPBACK | IFF_RUNNING | 0x10000u :
-        IFF_BROADCAST | IFF_MULTICAST | (up ? IFF_UP | IFF_RUNNING : 0) |
+        IFF_BROADCAST | IFF_MULTICAST | (up ? IFF_UP : 0) |
+        (up && info->active ? IFF_RUNNING : 0) |
         (info->active ? 0x10000u : 0);
     m->ifi_change = UINT32_MAX;
     uint32_t mtu = index == 1 ? 65536 : 1500;
@@ -200,7 +201,7 @@ static int nl_link(struct nl_builder *b, uint32_t seq, int index, bool multi)
 {
     struct e1000_info info={0};
     if (index==2) { e1000_get_info(&info); if (!info.present) return -LINUX_ENODEV; }
-    return nl_link_snapshot(b,seq,index,multi,RTM_NEWLINK,&info,net_interface_ready());
+    return nl_link_snapshot(b,seq,index,multi,RTM_NEWLINK,&info,net_interface_admin_up());
 }
 
 /** @brief Emit one IPv4 address using its actual configured mask.
@@ -326,7 +327,7 @@ static int nl_initial_snapshot(void)
     rc=nl_routes(&routes,&rcount); if (rc) { kernel_free(addresses); return rc; }
     nl_previous_addresses=addresses; nl_previous_address_count=acount;
     nl_previous_routes=routes; nl_previous_route_count=rcount;
-    e1000_get_info(&nl_previous_link); nl_previous_link_up=net_interface_ready();
+    e1000_get_info(&nl_previous_link); nl_previous_link_up=net_interface_admin_up();
     nl_snapshot_ready=true; return 0;
 }
 
@@ -443,7 +444,7 @@ void netlink_ipv6_changed(void)
             if (nl_equal_route(&routes[i],&nl_previous_routes[j])) { same=true; break; }
         if (!same) nl_publish(RTMGRP_IPV6_ROUTE,RTM_NEWROUTE,&routes[i],false);
     }
-    struct e1000_info link={0}; e1000_get_info(&link); bool up=net_interface_ready();
+    struct e1000_info link={0}; e1000_get_info(&link); bool up=net_interface_admin_up();
     if (link.present!=nl_previous_link.present || link.active!=nl_previous_link.active ||
         up!=nl_previous_link_up || __builtin_memcmp(link.mac,nl_previous_link.mac,6)) {
         if (link.present) nl_publish(RTMGRP_LINK,RTM_NEWLINK,&link,up);
@@ -472,7 +473,7 @@ static int nl_dump(struct nl_builder *b, const struct nlmsghdr *h)
             return nl_link(b,h->nlmsg_seq,req.ifi_index,false);
         }
         int rc=nl_link(b,h->nlmsg_seq,1,true); if (rc) return rc;
-        if (e1000_is_ready()) { rc=nl_link(b,h->nlmsg_seq,2,true); if (rc) return rc; }
+        if (net_interface_present()) { rc=nl_link(b,h->nlmsg_seq,2,true); if (rc) return rc; }
         return nl_done(b,h->nlmsg_seq);
     }
     if (!multi) return -LINUX_EOPNOTSUPP;
@@ -487,7 +488,7 @@ static int nl_dump(struct nl_builder *b, const struct nlmsghdr *h)
             if ((!req.ifa_index || req.ifa_index==1) &&
                 (rc=nl_address4(b,h->nlmsg_seq,1,0x7f000001u,8,0))) return rc;
             struct reliefos_net_config config; net_get_config(&config);
-            if ((!req.ifa_index || req.ifa_index==2) && e1000_is_ready() && config.local_ip &&
+            if ((!req.ifa_index || req.ifa_index==2) && net_interface_present() && config.local_ip &&
                 (rc=nl_address4(b,h->nlmsg_seq,2,config.local_ip,nl_prefix4(config.subnet_mask),
                                 config.local_ip | ~config.subnet_mask))) return rc;
         }

@@ -294,4 +294,15 @@ int net_interface_ioctl(uint32_t request, uint64_t address);
 /** @brief Report whether eth0 is administratively up and ready. */
 bool net_interface_ready(void);
 
+/** @brief Report a registered Ethernet device independently of carrier state.
+ * @return True while a retained provider publishes a present PCI device;
+ * false before registration or after detach. Caller owns network execution.
+ */
+bool net_interface_present(void);
+
+/** @brief Report the administrative IFF_UP setting independently of carrier.
+ * @return Current eth0 administrative flag; caller owns network execution.
+ */
+bool net_interface_admin_up(void);
+
 #endif
