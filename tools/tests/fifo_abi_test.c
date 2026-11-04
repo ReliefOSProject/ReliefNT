@@ -79,11 +79,16 @@ static void exercise(const char *base)
         }
         CHECK(child > 0);
         usleep(30000);
+        /* A blocking open must not complete before a peer has opened. This
+         * catches accidentally routing FIFO inodes through regular-file I/O. */
+        int early_status = 0;
+        pid_t early = waitpid(child, &early_status, WNOHANG);
+        CHECK(early == 0);
         int fd = openat(dir, "pipe", reverse ? O_RDONLY : O_WRONLY);
         CHECK(fd >= 0);
         CHECK(reverse ? read(fd, &byte, 1) == 1 && byte == 'q' : write(fd, "q", 1) == 1);
         close(fd);
-        child_done(child);
+        if (!early) child_done(child);
     }
     pid_t child = fork();
     if (!child) {
@@ -112,11 +117,16 @@ static void exercise(const char *base)
     unlinkat(dir, "pipe", 0); close(dir); rmdir(directory);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
-    exercise("/tmp");
-    exercise(getpid() == 1 ? "/run" : "/dev/shm");
+    if (argc > 1) {
+        for (int i = 1; i < argc; ++i) exercise(argv[i]);
+    } else {
+        const char *temporary = getenv("TMPDIR");
+        exercise(temporary && *temporary ? temporary : "/tmp");
+        exercise(getpid() == 1 ? "/run" : "/dev/shm");
+    }
     printf("[fifo] DONE failures=%d\n", failures);
     if (getpid() == 1) {
         execl("/sbin/init", "/sbin/init", (char *)NULL);

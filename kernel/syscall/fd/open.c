@@ -142,14 +142,14 @@ int64_t syscall_open_object(struct vfs_namespace *ns,struct task *task,int32_t d
         }
         if(flags&TASK_FILE_FLAG_PATH)rc=open_inode_path(task,&found.path,flags,diagnostic);
         else if(node->flags&STORAGE_NODE_FLAG_DEV_NODE)rc=task_open_device_path(task,&found.path,flags,diagnostic);
-        else {
-            struct reliefos_permissions value;rc=vfs_path_permissions(&found.path,&value,false);
-            if(!rc && (value.mode&LINUX_S_IFMT)==LINUX_S_IFIFO) {
-                rc=task_fifo_open(task,node,flags,diagnostic);
-                if(task->fifo_open_file)task_file_bind_path(task->fifo_open_file,&found.path);
-                else if(rc>=0)task_file_bind_path(task_file_for_fd(task,rc),&found.path);
-            } else if(!rc)rc=open_inode_path(task,&found.path,flags,diagnostic);
-        }
+        /* Permissions contain chmod bits, not the inode's S_IF* type. Use
+         * the resolved inode so named pipes retain their rendezvous and
+         * stream semantics on both memory and disk filesystems. */
+        else if(node->type==RELIEFOS_FS_TYPE_FIFO) {
+            rc=task_fifo_open(task,node,flags,diagnostic);
+            if(task->fifo_open_file)task_file_bind_path(task->fifo_open_file,&found.path);
+            else if(rc>=0)task_file_bind_path(task_file_for_fd(task,rc),&found.path);
+        } else rc=open_inode_path(task,&found.path,flags,diagnostic);
     }
     if(rc >= 0)inotify_open_published(task,rc);
     vfs_path_put(&found.path);return rc;
