@@ -74,6 +74,7 @@ memory_reclaim tools/test_memory_reclaim.py
 cache_clustered_lifetime tools/test_cache_clustered_lifetime.py
 cache_ext_partial tools/test_cache_ext_partial.py
 private_fault_transactions tools/test_private_fault_transactions.py
+pipe_parallel tools/test_pipe_parallel.py
 pipe_wake tools/test_pipe_wake.py
 poll_wakeup tools/test_poll_wakeup.py
 power tools/test_power.py

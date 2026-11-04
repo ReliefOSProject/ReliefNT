@@ -2763,6 +2763,25 @@ static bool address_space_user_write_branches(const struct address_space *as, ui
     return (entry&required)==required && !(entry&PAGE_SIZE_FLAG);
 }
 
+/** @brief Test ordinary resident user RAM without resolving any page fault.
+ * @param as Execution-pinned address space. @param vaddr User byte address.
+ * @param writing True when kernel copyout needs hardware write permission.
+ * @return True only for a present accessible RAM leaf, with every branch
+ * writable on copyout. COW and first-write notification destinations are
+ * rejected before taking a data lock. No allocation, TLB update or reference
+ * transfer; the caller keeps MM/page ownership stable throughout the copy.
+ */
+bool address_space_user_page_copyable(const struct address_space *as, uint64_t vaddr, bool writing)
+{
+    if (writing && !address_space_user_write_branches(as, vaddr)) return false;
+    uint64_t flags = address_space_user_page_flags(as, vaddr);
+    uint64_t required = RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_USER |
+                        (writing ? RELIEFNT_PAGE_WRITABLE : 0);
+    uint64_t excluded = RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_PROTNONE |
+                       (writing ? RELIEFNT_PAGE_COW | RELIEFNT_PAGE_WRITE_NOTIFY : 0);
+    return (flags & required) == required && !(flags & excluded);
+}
+
 /** @brief Resolve an authorized shared-cache write or retry a stale translation.
  * @param as Address space whose VMA and PTE lifetime the caller stabilizes with
  * the execution writer; NULL is rejected. @param vaddr Faulting user address.

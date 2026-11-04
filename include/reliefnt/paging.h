@@ -485,6 +485,14 @@ bool address_space_user_page_readable(const struct address_space *as, uint64_t v
  * @return Leaf flags, or zero if the address is unmapped or outside user range.
  */
 uint64_t address_space_user_page_flags(const struct address_space *as, uint64_t vaddr);
+/** @brief Check present ordinary user RAM without faulting or allocating.
+ * @param as Execution-pinned address space. @param vaddr User byte address.
+ * @param writing True for copyout requiring hardware-writable branches/leaf.
+ * @return True for directly copyable RAM. Devices and inaccessible pages fail;
+ * copyout also rejects COW/first-write notification. Caller keeps MM/page
+ * ownership stable through the copy; no page or mapping reference transfers.
+ */
+bool address_space_user_page_copyable(const struct address_space *as, uint64_t vaddr, bool writing);
 /**
  * @brief Find the first backed user leaf in a sparse virtual range.
  * @param as Address space whose owned page tables are searched.

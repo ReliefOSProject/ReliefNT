@@ -207,6 +207,75 @@ static int task_begin_syscall_io(struct task *task, uint64_t number, int32_t fd,
     return 0;
 }
 
+/** @brief Check current private-MM user pages without faulting or allocating.
+ * @param task Current task pinned by execution read ownership.
+ * @param address User buffer address. @param length Bounded bytes to copy.
+ * @param writing True for a pipe write/source, false for a read/destination.
+ * @return True only when every page is already accessible with the needed
+ * permission; a missing/COW page falls back before taking a pipe data lock.
+ */
+static bool syscall_pipe_buffer_resident(struct task *task, uint64_t address,
+                                          uint32_t length, bool writing)
+{
+    for (uint64_t page = address & ~4095ULL, end = address + length;
+         length && page < end; page += 4096u) {
+        if (!address_space_user_page_copyable(sched_task_as(task), page, !writing)) return false;
+    }
+    return true;
+}
+
+/** @brief Admit ready scalar anonymous-pipe I/O without the exclusive gate.
+ * @param frame Current syscall frame, changed only after completing an I/O.
+ * @param resume Required output; NULL retains ordinary return scheduling.
+ * @return True after completing the call, false without consuming user bytes.
+ * The reader gate pins the task, private MM, descriptor/OFD and pipe ring
+ * against close, resizing and reclaim. Per-pipe locks serialize data only;
+ * missing pages, shared MM, tracing and every suspended call retain the full
+ * dispatcher. Queued writers reject admission, preserving lifecycle progress.
+ * No user fault, allocator, inode notification or provider callback is allowed.
+ */
+static bool syscall_try_pipe_io(struct trap_frame *frame, struct task **resume)
+{
+    bool writing = frame->rax == LINUX_SYS_WRITE;
+    if (!writing && frame->rax != LINUX_SYS_READ) return false;
+    uint64_t flags;
+    if (!kernel_execution_try_read_lock_scoped_irqsave(&flags,
+            lock_profile_syscall_scope(frame->rax))) return false;
+    bool completed = false;
+    struct task *task = sched_current_task();
+    if (!task || task->kind != TASK_KIND_USER || task->state != TASK_RUNNING ||
+        task->running_cpu != smp_current_cpu() || task->shared_mm ||
+        (task->flags & TASK_FLAG_PENDING_LOAD) || task->syscall_file || task->syscall_pty.used ||
+        task->restart_syscall || task->fifo_open_file || task->waiting_queue || syscall_trace_task(task)) goto out;
+    struct task_file *file = task_file_for_fd(task, (int32_t)frame->rdi);
+    if (!file || !(file->flags & TASK_FILE_FLAG_PIPE) || (file->flags & TASK_FILE_FLAG_PATH) ||
+        file->character_file || file->path_ref.mount) goto out;
+    uint64_t address = frame->rsi, count = frame->rdx;
+    if (count && (address < RELIEFNT_USER_BASE || address >= RELIEFNT_USER_TOP ||
+                  count > RELIEFNT_USER_TOP - address)) goto out;
+    uint32_t length = count > 32768u ? 32768u : (uint32_t)count;
+    if (!syscall_pipe_buffer_resident(task, address, length, writing)) goto out;
+    int result;
+    if (!task_pipe_try_io(file, (void *)(uintptr_t)address, length, writing, &result)) goto out;
+    if (writing) {
+        task->proc_write_chars += (uint64_t)result;
+        ++task->proc_write_calls;
+    } else {
+        task->proc_read_chars += (uint64_t)result;
+        ++task->proc_read_calls;
+    }
+    frame->rax = (uint64_t)result;
+    *resume = NULL;
+    if (sched_try_resume_current_user_frame(frame)) {
+        *resume = task;
+        arch_set_user_fs(task->fs_base);
+    }
+    completed = true;
+out:
+    kernel_execution_read_unlock_irqrestore(flags);
+    return completed;
+}
+
 /**
  * @brief Dispatch one int 0x80 request while serializing kernel execution.
  * @param frame Validated syscall frame, updated with the result or restart state.
@@ -227,6 +296,8 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
         return NULL;
     }
     sched_account_mode(true);
+    struct task *pipe_resume = NULL;
+    if (syscall_try_pipe_io(frame, &pipe_resume)) return pipe_resume;
     /* Several storage and GUI services still own global scratch buffers. */
     kernel_execution_lock_scoped_irqsave(&lock_flags, lock_profile_syscall_scope(frame->rax));
 #ifdef CONFIG_SWAP

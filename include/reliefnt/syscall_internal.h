@@ -472,19 +472,30 @@ void task_pipe_retain(struct task_file *file);
  */
 void task_pipe_release(struct task_file *file);
 /** @brief Read buffered bytes, EOF or an interruptible empty-pipe retry.
- * @param file Pinned readable description under execution ownership.
+ * @param file Pinned readable description under exclusive execution ownership.
  * @param buffer Validated writable destination for length bytes.
  * @param length Maximum byte count.
  * @return Byte count, zero at EOF, or negative EBADF/EAGAIN.
  */
 int task_pipe_read(struct task_file *file, void *buffer, uint32_t length);
 /** @brief Write pipe bytes atomically up to PIPE_BUF and signal absent readers.
- * @param file Pinned writable description under execution ownership.
+ * @param file Pinned writable description under exclusive execution ownership.
  * @param buffer Validated source for length bytes.
  * @param length Requested byte count.
  * @return Bytes accepted or negative EBADF/EPIPE/EAGAIN; EPIPE also raises SIGPIPE.
  */
 int task_pipe_write(struct task_file *file, const void *buffer, uint32_t length);
+/** @brief Try a resident anonymous-pipe transfer using a per-pipe data lock.
+ * @param file Borrowed OFD pinned by shared or exclusive execution ownership.
+ * @param buffer Prepared resident bytes, writable for reads; zero length may be NULL.
+ * @param length Bounded bytes to copy. @param writing True to write, false to read.
+ * @param result Required output, unchanged on fallback.
+ * @return True on completion; false without mutation for waits, SIGPIPE,
+ * named pipes or invalid access. Gate ownership excludes close/resize/reclaim;
+ * no allocator, user fault or provider callback is permitted while data is locked.
+ */
+bool task_pipe_try_io(struct task_file *file, void *buffer, uint32_t length,
+                       bool writing, int *result);
 /** @brief Query readiness without parking; include terminal HUP/ERR conditions.
  * @param file Pinned description under execution ownership.
  * @param events Requested Linux poll bits.

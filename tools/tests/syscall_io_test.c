@@ -9,6 +9,9 @@
 #include <reliefos/auth_abi.h>
 #include <reliefos/text.h>
 #include <reliefnt/swap.h>
+#include <reliefnt/net_udp.h>
+#include <reliefnt/net_packet.h>
+#include <reliefnt/netlink.h>
 
 static _Noreturn int io_unexpected(const char *name, ...)
 {
@@ -34,6 +37,7 @@ static _Noreturn int io_unexpected(const char *name, ...)
 #define task_socket_read IO_UNAVAILABLE
 #define task_inet_write IO_UNAVAILABLE
 #define task_inet_read IO_UNAVAILABLE
+#define syscall_socket_dispatch IO_UNAVAILABLE
 #define console_write_len IO_UNAVAILABLE
 #define task_shm_write IO_UNAVAILABLE
 #define task_shm_read IO_UNAVAILABLE

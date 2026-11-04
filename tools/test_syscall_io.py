@@ -70,7 +70,9 @@ def main():
         end = source.index("\n};", start) + 3
         bodies = [source[start:end]]
         backends = [io_backend(source, operation) for operation in ("read", "write")]
-        for name in ("copy_text", "task_file_for_io", "task_pty_for_io", "task_pty_status", "file_can_read", "file_can_write", "task_device_is"):
+        for name in ("copy_text", "task_file_for_io", "task_pty_for_io", "task_pty_status", "file_can_read", "file_can_write", "task_device_is", "scalar_inet_datagram"):
+            if name == "scalar_inet_datagram" and not any("scalar_inet_datagram(" in body for body in backends):
+                continue
             if name == "copy_text" and not any("copy_text(" in body for body in backends):
                 continue
             if name == "task_device_is" and not any(

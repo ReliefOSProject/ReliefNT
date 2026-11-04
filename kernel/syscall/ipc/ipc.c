@@ -33,6 +33,7 @@ struct pipe_user {
 static struct pipe_user *pipe_users;
 
 struct task_pipe {
+    struct kernel_spinlock data_lock;
     uint8_t used;
     uint8_t reserved[3];
     uint32_t readers;
@@ -241,40 +242,120 @@ static int alloc_task_pipe_fd(struct task *task, uint32_t pipe_handle, int write
     return fd;
 }
 
-/**
- * @brief Read available pipe bytes, distinguishing EOF and a waiting writer.
- * @param file Pinned description under the kernel execution lock.
- * @param buffer Validated writable destination for length bytes.
- * @param length Maximum byte count.
- * @return Byte count, negative errno, or an interruptible retry.
+/** @brief Count buffered bytes with the pipe data lock held.
+ * @param pipe Live pipe protected by execution ownership and data_lock.
+ * @return Current buffered byte count; no waits or reference changes.
  */
-int task_pipe_read(struct task_file *file, void *buffer, uint32_t length)
+static uint32_t pipe_buffered(const struct task_pipe *pipe)
 {
-    struct task_pipe *pipe = task_pipe_for_file(file);
+    return (pipe->head + pipe->capacity + 1u - pipe->tail) % (pipe->capacity + 1u);
+}
+
+/** @brief Copy buffered bytes while serializing this pipe's ring only.
+ * @param pipe Live data-locked pipe. @param buffer Prepared writable memory.
+ * @param length Available destination bytes. @return Bytes consumed.
+ * Caller prevents page faults while holding data_lock; no wait or allocation.
+ */
+static uint32_t pipe_copy_read(struct task_pipe *pipe, void *buffer, uint32_t length)
+{
     uint32_t count = 0;
-    bool was_full;
-    if (!pipe || (file->flags & RELIEFOS_O_ACCMODE) == RELIEFOS_O_WRONLY) return -RELIEFOS_EBADF;
-    if (length == 0) return 0;
-    was_full = (pipe->head + 1u) % (pipe->capacity + 1u) == pipe->tail;
-    kernel_wait_queue_remove(&pipe->wait_read, sched_current_task());
-    /* Copy contiguous runs per iteration: a 64 KiB ring drained byte-by-byte
-     * costs more than the syscalls it serves. */
     while (pipe->tail != pipe->head && count < length) {
         uint32_t chunk = pipe->tail < pipe->head ? pipe->head - pipe->tail
-                                                : (pipe->capacity + 1u) - pipe->tail;
+                                                : pipe->capacity + 1u - pipe->tail;
         if (chunk > length - count) chunk = length - count;
         __builtin_memcpy((uint8_t *)buffer + count, pipe->data + pipe->tail, chunk);
         pipe->tail = (pipe->tail + chunk) % (pipe->capacity + 1u);
         count += chunk;
     }
+    return count;
+}
+
+/** @brief Copy a bounded accepted write while holding one pipe's data lock.
+ * @param pipe Live data-locked pipe. @param buffer Prepared readable bytes.
+ * @param length Requested bytes; caller has checked atomic-write admission.
+ * @return Bytes published, capped by free space. No wait or allocation;
+ * caller prevents page faults and keeps the entire atomic record locked.
+ */
+static uint32_t pipe_copy_write(struct task_pipe *pipe, const void *buffer, uint32_t length)
+{
+    uint32_t count = 0, available = pipe->capacity - pipe_buffered(pipe);
+    if (length > available) length = available;
+    while (count < length) {
+        uint32_t chunk = pipe->capacity + 1u - pipe->head;
+        if (chunk > length - count) chunk = length - count;
+        __builtin_memcpy(pipe->data + pipe->head, (const uint8_t *)buffer + count, chunk);
+        pipe->head = (pipe->head + chunk) % (pipe->capacity + 1u);
+        count += chunk;
+    }
+    return count;
+}
+
+/** @brief Complete a ready anonymous-pipe transfer under shared execution ownership.
+ * @param file Borrowed stable OFD; the execution gate excludes close/resize.
+ * @param buffer Resident user bytes, writable for a read operation.
+ * @param length Bounded transfer count, already fully checked without faults.
+ * @param writing True to write into the pipe, false to consume it.
+ * @param result Required completion output, untouched on fallback.
+ * @return True after an ordinary completion; false without changing the pipe
+ * when a waiter, signal, invalid endpoint or named inode needs the full path.
+ * Lock order is execution gate -> data_lock. Queue/scheduler locks are acquired
+ * only after releasing data_lock; gate ownership pins the pipe and waiters.
+ * Endpoint counts and buffer replacement remain exclusive-gate operations.
+ */
+bool task_pipe_try_io(struct task_file *file, void *buffer, uint32_t length,
+                       bool writing, int *result)
+{
+    struct task_pipe *pipe = task_pipe_for_file(file);
+    if (!pipe || pipe->named || !result || (file->flags & TASK_FILE_FLAG_PATH) ||
+        (writing ? (file->flags & RELIEFOS_O_ACCMODE) == RELIEFOS_O_RDONLY :
+                   (file->flags & RELIEFOS_O_ACCMODE) == RELIEFOS_O_WRONLY)) return false;
+    if (!length) { *result = 0; return true; }
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&pipe->data_lock, &flags);
+    uint32_t used = pipe_buffered(pipe), available = pipe->capacity - used;
+    uint32_t minimum = (file->flags & RELIEFOS_O_NONBLOCK) && length > TASK_PIPE_BUF ? 1u : length;
+    if (writing ? (!pipe->readers || !available ||
+                    (length <= pipe->capacity && available < minimum)) : (!used && pipe->writers)) {
+        kernel_spin_unlock_irqrestore(&pipe->data_lock, flags);
+        return false;
+    }
+    uint32_t count = writing ? pipe_copy_write(pipe, buffer, length) : pipe_copy_read(pipe, buffer, length);
+    available = pipe->capacity - pipe_buffered(pipe);
+    kernel_spin_unlock_irqrestore(&pipe->data_lock, flags);
     if (count) {
-        uint32_t used = (pipe->head + (pipe->capacity + 1u) - pipe->tail) % (pipe->capacity + 1u);
-        /* Retrying an atomic writer before its complete request fits only
-         * switches to a task that immediately blocks again. Wake every
-         * satisfiable writer so cancellation cannot strand available space. */
-        (void)kernel_wait_queue_wake_satisfied(&pipe->wait_write, pipe->capacity - used);
-        /* Only full -> nonfull adds POLLOUT readiness. Atomic writers can
-         * require more space; their threshold wakeups above are independent. */
+        if (writing) {
+            (void)kernel_wait_queue_wake_all(&pipe->wait_read);
+            kernel_poll_readiness_notify();
+        } else {
+            (void)kernel_wait_queue_wake_satisfied(&pipe->wait_write, available);
+            if (used == pipe->capacity) kernel_poll_readiness_notify();
+        }
+    }
+    *result = (int)count;
+    return true;
+}
+
+/** @brief Read available pipe bytes, distinguishing EOF and a waiting writer.
+ * @param file Pinned description under exclusive execution ownership.
+ * @param buffer Prepared writable destination for length bytes.
+ * @param length Maximum byte count. @return Bytes, EOF or EBADF/EAGAIN.
+ * The data lock covers the copy only. Exclusive gate ownership serializes
+ * condition checks with wait registration, preventing check-to-sleep races.
+ */
+int task_pipe_read(struct task_file *file, void *buffer, uint32_t length)
+{
+    struct task_pipe *pipe = task_pipe_for_file(file);
+    if (!pipe || (file->flags & RELIEFOS_O_ACCMODE) == RELIEFOS_O_WRONLY) return -RELIEFOS_EBADF;
+    if (!length) return 0;
+    kernel_wait_queue_remove(&pipe->wait_read, sched_current_task());
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&pipe->data_lock, &flags);
+    bool was_full = pipe_buffered(pipe) == pipe->capacity;
+    uint32_t count = pipe_copy_read(pipe, buffer, length);
+    uint32_t available = pipe->capacity - pipe_buffered(pipe);
+    kernel_spin_unlock_irqrestore(&pipe->data_lock, flags);
+    if (count) {
+        (void)kernel_wait_queue_wake_satisfied(&pipe->wait_write, available);
         if (was_full) kernel_poll_readiness_notify();
         return (int)count;
     }
@@ -284,61 +365,44 @@ int task_pipe_read(struct task_file *file, void *buffer, uint32_t length)
     return -RELIEFOS_EAGAIN;
 }
 
-/**
- * @brief Write pipe data atomically up to PIPE_BUF and signal a missing reader.
- * @param file Pinned description under the kernel execution lock.
- * @param buffer Validated source for length bytes.
- * @param length Requested byte count.
- * @return Byte count or negative errno, including EPIPE and EAGAIN.
+/** @brief Write atomically up to PIPE_BUF and signal a missing reader.
+ * @param file Pinned description under exclusive execution ownership.
+ * @param buffer Prepared readable source for length bytes.
+ * @param length Requested bytes. @return Bytes or EBADF/EPIPE/EAGAIN.
+ * The data lock covers admission and the complete copy. No scheduler or
+ * wait-queue lock is nested inside it; exclusive gate ownership makes sleep
+ * registration atomic relative to every parallel data transaction.
  */
 int task_pipe_write(struct task_file *file, const void *buffer, uint32_t length)
 {
     struct task_pipe *pipe = task_pipe_for_file(file);
-    uint32_t count = 0;
     if (!pipe || (file->flags & RELIEFOS_O_ACCMODE) == RELIEFOS_O_RDONLY) return -RELIEFOS_EBADF;
-    if (length == 0) return 0;
+    if (!length) return 0;
     if (!pipe->readers) {
-        (void)sched_signal_user_task(sched_current_pid(), 13); /* SIGPIPE */
+        (void)sched_signal_user_task(sched_current_pid(), 13);
         return -RELIEFOS_EPIPE;
     }
     kernel_wait_queue_remove(&pipe->wait_write, sched_current_task());
-    {
-        uint32_t used = (pipe->head + (pipe->capacity + 1u) - pipe->tail) % (pipe->capacity + 1u);
-        uint32_t free_bytes = pipe->capacity - used;
-        /* Small nonblocking writes are all-or-nothing. Larger ones may
-         * consume the available space, as Linux/POSIX require. Blocking
-         * writes retain their existing full-request wait policy. */
-        uint32_t minimum = (file->flags & RELIEFOS_O_NONBLOCK) && length > TASK_PIPE_BUF
-                               ? 1u : length;
-        if (length <= pipe->capacity && free_bytes < minimum) {
-            if (file->flags & RELIEFOS_O_NONBLOCK) return -RELIEFOS_EAGAIN;
-            kernel_wait_queue_block_current_minimum(&pipe->wait_write, length);
-            return -RELIEFOS_EAGAIN;
-        }
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&pipe->data_lock, &flags);
+    uint32_t available = pipe->capacity - pipe_buffered(pipe);
+    uint32_t minimum = (file->flags & RELIEFOS_O_NONBLOCK) && length > TASK_PIPE_BUF ? 1u : length;
+    if (length <= pipe->capacity && available < minimum) {
+        kernel_spin_unlock_irqrestore(&pipe->data_lock, flags);
+        if (file->flags & RELIEFOS_O_NONBLOCK) return -RELIEFOS_EAGAIN;
+        kernel_wait_queue_block_current_minimum(&pipe->wait_write, length);
+        return -RELIEFOS_EAGAIN;
     }
-    while (count < length) {
-        uint32_t next = (pipe->head + 1U) % (pipe->capacity + 1u);
-        if (next == pipe->tail) {
-            if (count) {
-                (void)kernel_wait_queue_wake_all(&pipe->wait_read);
-                kernel_poll_readiness_notify();
-                return (int)count;
-            }
-            if (file->flags & RELIEFOS_O_NONBLOCK) return -RELIEFOS_EAGAIN;
-            kernel_wait_queue_block_current_minimum(&pipe->wait_write, 1);
-            return -RELIEFOS_EAGAIN;
-        }
-        uint32_t used = (pipe->head + (pipe->capacity + 1u) - pipe->tail) % (pipe->capacity + 1u);
-        uint32_t chunk = pipe->capacity - used;
-        if (chunk > (pipe->capacity + 1u) - pipe->head) chunk = (pipe->capacity + 1u) - pipe->head;
-        if (chunk > length - count) chunk = length - count;
-        __builtin_memcpy(pipe->data + pipe->head, (const uint8_t *)buffer + count, chunk);
-        pipe->head = (pipe->head + chunk) % (pipe->capacity + 1u);
-        count += chunk;
+    uint32_t count = pipe_copy_write(pipe, buffer, length);
+    kernel_spin_unlock_irqrestore(&pipe->data_lock, flags);
+    if (count) {
+        (void)kernel_wait_queue_wake_all(&pipe->wait_read);
+        kernel_poll_readiness_notify();
+        return (int)count;
     }
-    (void)kernel_wait_queue_wake_all(&pipe->wait_read);
-    kernel_poll_readiness_notify();
-    return (int)count;
+    if (file->flags & RELIEFOS_O_NONBLOCK) return -RELIEFOS_EAGAIN;
+    kernel_wait_queue_block_current_minimum(&pipe->wait_write, 1);
+    return -RELIEFOS_EAGAIN;
 }
 
 /**
