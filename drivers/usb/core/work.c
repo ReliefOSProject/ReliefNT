@@ -3,7 +3,7 @@
 #include <reliefnt/driver_manager_phase.h>
 
 /** @brief Service USB maintenance outside IRQ and the global execution owner.
- * Called at a scheduler boundary or before a syscall pins user I/O. Manager admission excludes load/unload;
+ * Called on the scheduler-owned service stack. Manager admission excludes load/unload;
  * the registry pins each LIVE callback. A busy gate preserves queued work.
  * No scheduler/registry spinlock spans port debounce, transfer or DMA teardown.
  */

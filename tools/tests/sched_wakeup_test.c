@@ -63,5 +63,10 @@ int main(void)
     fixture_cpus = 1;
     sched_notify_runnable();
     assert(ipis[1] == 2);
+    struct task *table[]={&task};tasks=table;task_count=1;
+    task.affinity_mask=1;task.kind=TASK_KIND_KERNEL;
+    assert(sched_set_task_affinity(7,1)==-22 && task.affinity_mask==1);
+    task.kind=TASK_KIND_USER;assert(!sched_set_task_affinity(7,1));
+    tasks=NULL;task_count=0;
     puts("PASS scheduler wake: remote interrupt, coalescing, offline/UP, ownership and stopped/vfork state");
 }

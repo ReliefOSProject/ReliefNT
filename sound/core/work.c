@@ -3,7 +3,7 @@
 #include <reliefnt/audio.h>
 #include <reliefnt/driver_manager_phase.h>
 
-/** @brief Drain deferred audio work before a syscall admits its user I/O pin.
+/** @brief Drain deferred audio work from a scheduler workqueue callback.
  * Depth-one execution-owned task context; service admission retains sound-core
  * code across explicit execution suspension. Manager admission protects hardware
  * resources while IRQs progress; busy/failed admission preserves pending work.

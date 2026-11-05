@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "mount_internal.h"
 #include <reliefnt/syscall_internal.h>
+#include <reliefnt/deferred.h>
 
 /* Detached mounts reuse next only after losing namespace membership. The
  * private queue retains context/ops/module lifetime without any public path. */
@@ -15,7 +16,13 @@ static bool reclaim_active;
 static void vfs_queue_retirement(struct vfs_mount *mount)
 {
     mount->next=NULL;*retired_tail=mount;retired_tail=&mount->next;++retired_count;
+    if(!reclaim_active)kernel_deferred_schedule(DEFERRED_VFS);
 }
+
+/** @brief Query execution-owned detached mounts awaiting a successful finish.
+ * @return True while the retirement FIFO retains at least one mount/provider.
+ */
+bool vfs_reclaim_pending(void) {return retired_count!=0;}
 
 /** @brief Finish a rootless mount without releasing failed provider state.
  * @param mount Privately owned detached mount retaining its code/context.

@@ -45,6 +45,7 @@ inotify_vfs tools/test_inotify_vfs.py
 input_routing tools/test_input_routing.py
 installer_ramdisk tools/test_installer_ramdisk.py
 kernel_memory tools/test_kernel_memory.py
+kthread tools/test_kthread.py
 linux_abi_contract tools/test_linux_abi_contract.py
 linux_audio tools/test_linux_audio.py abi pcm vma device params ioctl mmap control oss mixer
 linux_capabilities tools/test_linux_capabilities.py
@@ -101,6 +102,7 @@ storage_sync tools/test_storage_sync.py
 storage_write_batch tools/test_storage_write_batch.py
 svga tools/test_svga.py
 syscall_io tools/test_syscall_io.py
+workqueue tools/test_workqueue.py
 uapi tools/test_uapi.py
 user_return_gate tools/test_user_return_gate.py
 vdso_mapping tools/test_vdso_mapping.py

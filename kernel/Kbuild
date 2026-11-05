@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Objects are owned by this directory; child modules own their own lists.
-obj-y := device/ dma/ exec/ init/ ipc/ params/ random/ sched/ signal/ sync/ syscall/ time/
+obj-y := device/ dma/ exec/ init/ ipc/ kthread/ params/ random/ sched/ signal/ sync/ syscall/ time/ workqueue/
 obj-$(CONFIG_MODULES) += module/
 
 include $(srctree)/scripts/Makefile.module

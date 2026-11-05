@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := core.o services.o worker.o
+
+include $(srctree)/scripts/Makefile.module

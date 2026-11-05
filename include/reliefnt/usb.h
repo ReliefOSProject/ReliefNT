@@ -39,13 +39,14 @@ bool usb_service_pending(void);
  * No registry lock spans callbacks; closing/COMING/GOING entries are skipped.
  */
 void usb_service_run(void);
-/** @brief Drain deferred USB work at a depth-one syscall or scheduler boundary. */
+/** @brief Drain USB work from a depth-one workqueue/explicit task context. */
 void usb_process_work(void);
 
 /** @brief Close callback admission and synchronously drain one owned host handle.
  * @param host Exclusive registration handle returned by usb_host_register.
  * @return Zero after the handle is freed, -ENOENT for an unknown handle, or
- * -EBUSY if a concurrent unregister already owns it. NULL is an idempotent no-op.
+ * -EBUSY if a callback is active or a concurrent unregister already owns it.
+ * Busy callbacks keep the original handle retryable. NULL is an idempotent no-op.
  * Task teardown without IRQ/execution locks needed by the callback. The caller
  * stops hardware separately before freeing DMA or controller context.
  */

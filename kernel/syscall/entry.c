@@ -280,8 +280,8 @@ out:
  * @brief Dispatch one int 0x80 request while serializing kernel execution.
  * @param frame Validated syscall frame, updated with the result or restart state.
  * @return A task for direct user return, or NULL when scheduler handling is required.
- * @note Bounded TCP maintenance runs under the execution transaction; the
- *       tick gate limits packet polling to one small batch per timer tick.
+ * @note Device/protocol maintenance is deferred to scheduler service stacks;
+ *       input publication retains its immediate user-return checks.
  * Path operands retain their checked copy and exact directory references over
  * pre-I/O retries; final return, signal handoff or replacement cancels ownership.
  */
@@ -312,14 +312,8 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
         return NULL;
     }
 #endif
-    net_tcp_maintenance();
-    /* Drain small fair batches after taking execution ownership. Failed
-     * filesystem cleanup retains its provider until a later successful flush;
-     * final DRM close queues work, including closes from signal return. */
-    vfs_reclaim_mounts(2);
-    graphics_service_process_retirements(2);
-    driver_manager_process_audio_faults();
-    usb_process_work();
+    /* Device/protocol maintenance is queued onto scheduler service stacks;
+     * syscall admission only processes latency-sensitive pending input. */
     input_process_pending();
     number = frame->rax;
     struct task *calling_task = sched_current_task();

@@ -3,6 +3,7 @@
 #include <reliefnt/heap.h>
 #include <reliefnt/lock.h>
 #include <reliefnt/export.h>
+#include <reliefnt/deferred.h>
 #include <linux/errno.h>
 
 struct usb_host {
@@ -79,6 +80,7 @@ void usb_host_request_service(struct usb_host *host)
         __atomic_store_n(&usb_queued,true,__ATOMIC_RELEASE);
     }
     kernel_spin_unlock_irqrestore(&usb_hosts_lock,flags);
+    kernel_deferred_schedule(DEFERRED_USB);
 }
 EXPORT_SYMBOL(usb_host_request_service);
 
@@ -125,7 +127,7 @@ void usb_service_run(void)
     kernel_spin_unlock_irqrestore(&usb_hosts_lock,flags);
 }
 
-/** @brief Revoke a host's poll source, then drain code pins before releasing its handle.
+/** @brief Revoke an idle host source without waiting on a preempted callback.
  * @param host Exclusive live handle or NULL for no-op.
  * @return Zero, -ENOENT or -EBUSY; task context without callback-required locks.
  * DMA and device state remain caller-owned and must be stopped separately.
@@ -136,12 +138,11 @@ int usb_host_unregister(struct usb_host *host)
     uint64_t flags;kernel_spin_lock_irqsave(&usb_hosts_lock,&flags);
     struct usb_host *found=usb_hosts;
     while(found && found!=host) found=found->next;
-    int error=!found ? -ENOENT : (host->closing ? -EBUSY : 0);
+    int error=!found ? -ENOENT :
+        (host->closing || __atomic_load_n(&host->active,__ATOMIC_ACQUIRE) ? -EBUSY : 0);
     if(!error) host->closing=true;
     kernel_spin_unlock_irqrestore(&usb_hosts_lock,flags);
     if(error) return error;
-    while(__atomic_load_n(&host->active,__ATOMIC_ACQUIRE))
-        __asm__ volatile("pause" ::: "memory");
     kernel_spin_lock_irqsave(&usb_hosts_lock,&flags);
     struct usb_host **at=&usb_hosts;
     while(*at!=host) at=&(*at)->next;

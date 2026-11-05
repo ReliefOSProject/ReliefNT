@@ -36,6 +36,9 @@
 #include <reliefnt/net.h>
 #include <reliefnt/usb.h>
 #include <reliefnt/mount.h>
+#include <reliefnt/workqueue.h>
+#include <reliefnt/deferred.h>
+#include <reliefnt/kthread.h>
 #include "runtime.h"
 #include "pending.h"
 #include "../init/init_program.h"
@@ -67,41 +70,35 @@ static void sched_idle_service_wait(void *opaque)
     kernel_execution_unlock_irqrestore(state->execution_flags);
     __asm__ volatile("sti; hlt; cli" ::: "memory");
     kernel_execution_lock_scoped_irqsave(&state->execution_flags, LOCK_SCOPE_SCHED);
-    net_tcp_maintenance();
-    usb_process_work();
-    vfs_reclaim_mounts(2);
-    uint32_t retired = graphics_service_process_retirements(2);
-    if (retired)
-        console_debug("[reliefnt] drm idle retirement resources=%u\n", retired);
+    if(kthread_runnable())kernel_deferred_run();
 }
 
 /**
- * @brief Run deferred TCP and USB maintenance on the scheduler-owned kernel stack.
+ * @brief Dispatch retained kernel contexts from the scheduler-owned service stack.
  * @param opaque Unused stack-call context.
  * @note Caller holds kernel execution ownership; network polling stays out of
  *       the timer's device-IRQ top half.
  */
-static void sched_network_maintenance(void *opaque)
+static void sched_deferred_maintenance(void *opaque)
 {
     (void)opaque;
-    net_tcp_maintenance();
-    usb_process_work();
+    kernel_deferred_run();
 }
 
 /**
- * @brief Switch to the scheduler-owned stack when TCP or USB work is pending.
- * @note Caller holds kernel execution ownership. When neither service has
- *       work, the path returns without a stack switch.
+ * @brief Switch to the scheduler-owned dispatcher stack for runnable kernel threads.
+ * @note Caller holds kernel execution ownership; an idle queue performs no
+ *       stack switch and never scans optional service registries.
  */
-static void sched_run_network_maintenance(void)
+static void sched_run_deferred_maintenance(void)
 {
     uint32_t cpu;
     void *stack_top;
-    if (!net_tcp_maintenance_due() && !usb_service_pending()) return;
+    if (!kthread_runnable()) return;
     cpu = smp_current_cpu();
     if (cpu >= SMP_MAX_CPUS) cpu = 0;
     stack_top = &sched_idle_service_stacks[cpu][SCHED_IDLE_SERVICE_STACK_BYTES];
-    arch_call_on_stack(stack_top, sched_network_maintenance, 0);
+    arch_call_on_stack(stack_top, sched_deferred_maintenance, 0);
 }
 
 /** @brief Execute one pressure batch on the existing per-CPU service stack.
@@ -867,7 +864,7 @@ static struct task *userland_schedule_entry(struct trap_frame *frame, bool timer
     kernel_execution_lock_scoped_irqsave(&execution_flags, LOCK_SCOPE_SCHED);
     if (timer) sched_run_pressure_maintenance(frame);
     /* Pure-CPU user tasks reach this scheduler boundary from timer return. */
-    sched_run_network_maintenance();
+    sched_run_deferred_maintenance();
     input_process_pending();
     struct task *current;
     struct task *next;
@@ -1118,6 +1115,8 @@ void userland_enter_first(void)
     /* Load and reserve the first task on the BSP before releasing APs. This
      * avoids concurrent lazy ELF mapping and gives every AP a stable initial
      * task table/address space to observe. */
+    /* PID 1 must already belong to init before workers allocate their PIDs. */
+    kernel_deferred_start();
     first = userland_schedule_from_frame(NULL);
     userland_enter_task(first);
 }

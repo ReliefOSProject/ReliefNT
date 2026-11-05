@@ -64,6 +64,12 @@ void kernel_execution_unlock_irqrestore(uint64_t flags);
  * callers must prove their own lock ordering before entering synchronous I/O.
  */
 bool kernel_execution_is_outermost(void);
+/** @brief Test local non-schedulable plain-spinlock or execution-writer scopes.
+ * @return True while a critical section prohibits kernel-thread switching.
+ * IRQ-safe snapshot; the caller also requires enabled interrupted/task IRQs.
+ * irqsave locks and reader transactions remain protected by their masked IRQs.
+ */
+bool kernel_preempt_disabled(void);
 
 /** Token for one outer execution transaction suspended around a waitable task phase. */
 struct kernel_execution_suspend_token {

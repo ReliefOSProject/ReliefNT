@@ -12,11 +12,13 @@ void audio_timer_period_elapsed(uint32_t card, uint32_t device,
 }
 
 static unsigned opens, closes, stops, service, module_unloaded, stop_error;
+static unsigned close_while_stopping,close_while_pointer;
+static uint32_t interleaved_streams[2];
 static int caps(void *o,uint32_t d,enum audio_direction dir,struct audio_caps *c){(void)o;(void)d;(void)dir; *c=(struct audio_caps){.formats=AUDIO_FORMAT_S16_LE,.rates=AUDIO_RATE_48000,.channels_min=2,.channels_max=2};return 0;}
 static int open_stream(void *o,uint32_t d,enum audio_direction dir,struct audio_hw_stream *s){(void)o;(void)d;(void)dir;++opens;s->id=17;return 0;}
 static int prepare(void *o,struct audio_hw_stream *s,const struct audio_params *p,const struct audio_dma *d){(void)o;(void)s;(void)p;(void)d;return 0;}
-static int trigger(void *o,struct audio_hw_stream *s,enum audio_trigger t){(void)o;(void)s;assert(!module_unloaded);if(t==AUDIO_STOP){++stops;if(stop_error)return -5;}return 0;}
-static int pointer(void *o,struct audio_hw_stream *s,uint64_t *p){(void)o;(void)s;*p=123;return 0;}
+static int trigger(void *o,struct audio_hw_stream *s,enum audio_trigger t){(void)o;(void)s;assert(!module_unloaded);if(t==AUDIO_STOP){if(close_while_stopping){close_while_stopping=0;assert(audio_stream_close(interleaved_streams[0])==-EAGAIN);assert(audio_stream_close(interleaved_streams[1])==-EAGAIN);}++stops;if(stop_error)return -5;}return 0;}
+static int pointer(void *o,struct audio_hw_stream *s,uint64_t *p){(void)o;(void)s;if(close_while_pointer){close_while_pointer=0;assert(audio_stream_close(interleaved_streams[0])==-EAGAIN);}*p=123;return 0;}
 static void close_stream(void *o,struct audio_hw_stream *s){(void)o;(void)s;assert(!module_unloaded);++closes;}
 static uint32_t controls(void *o){(void)o;return 0;}
 static uint32_t tick(void *o,uint32_t budget){(void)o;assert(!module_unloaded);assert(budget<=32 && budget);__atomic_add_fetch(&service,1,__ATOMIC_RELAXED);return 1;}
@@ -181,6 +183,21 @@ static void fatal_disconnect_retains_failed_stop_and_retries(void)
     opens=closes=stops=0;
     puts("fatal_disconnect_BDF_owner_generation_IRQ_safe_STOP_failure_close_retry PASS");
 }
+/* A paused disconnect/pointer callback cannot finish until a same-CPU close
+ * returns. Nonblocking failure retains the real stream lease for later retry. */
+static void preempted_close_defers(void)
+{
+    struct audio_card_identity identity={.id="preempt-close",.name="preempt-close"};
+    uint32_t card;assert(!audio_register_card_owned(&identity,&ops,NULL,11,&card));
+    assert(!audio_stream_open(card,0,AUDIO_PLAYBACK,&interleaved_streams[0]));
+    assert(!audio_stream_open(card,0,AUDIO_PLAYBACK,&interleaved_streams[1]));
+    close_while_pointer=1;uint64_t frame;
+    assert(!audio_stream_pointer(interleaved_streams[0],&frame));
+    close_while_stopping=1;assert(!audio_unregister_card(card,1));
+    assert(!audio_stream_close(interleaved_streams[0]));
+    assert(!audio_stream_close(interleaved_streams[1]));
+    puts("preempted_audio_close_defers_without_spinning PASS");
+}
 int main(void){
     setvbuf(stdout,NULL,_IONBF,0);
     fatal_disconnect_retains_failed_stop_and_retries();
@@ -234,5 +251,6 @@ int main(void){
     stop_error=0;assert(!audio_unregister_card(card,1));audio_stream_close(stream);
     puts("STOP_failure_keeps_module_alive PASS");
     for(unsigned i=0;i<CARD_MAX;i++)assert(!cards[i].live);for(unsigned i=0;i<STREAM_MAX;i++)assert(!streams[i].live);
+    preempted_close_defers();
     puts("metadata_is_copied PASS\nregistration_failure_rollback PASS\nactive_stream_busy PASS\nforced_disconnect_no_stale_callbacks PASS\nservice_1_4_cpu_generation PASS");return 0;
 }

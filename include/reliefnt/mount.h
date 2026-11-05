@@ -453,6 +453,10 @@ void vfs_mount_put(struct vfs_mount *mount);
  * fast path; no namespace attachment or public path survives here.
  */
 uint32_t vfs_reclaim_mounts(uint32_t budget);
+/** @brief Query pending rootless mount retirement under execution ownership.
+ * @return True while a failed finish retains its backend/provider references.
+ */
+bool vfs_reclaim_pending(void);
 /** @brief Set initial policy on one detached, owned mount without changing its backend.
  * @param mount Owned unpublished mount, required; no namespace membership.
  * @param flags Per-attachment MS flags, with optional MS_STRICTATIME input.

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include <reliefnt/sound_service.h>
 #include <reliefnt/export.h>
+#include <reliefnt/deferred.h>
 #include <linux/errno.h>
 static struct kernel_service_slot sound_service_slot;
 /** @brief Attach the exact immutable sound table to its permanent core slot.
@@ -165,6 +166,7 @@ void sound_service_tick(void)
     const struct sound_service_operations *provider_ops=call.operations;
     if(provider_ops->tick)provider_ops->tick();
     kernel_service_release(&call);
+    kernel_deferred_schedule(DEFERRED_AUDIO);
 }
 /** @brief Run deferred sound work under a provider execution pin.
  * Depth-one execution-owned task context; the provider may temporarily suspend execution for STOP and callbacks.

@@ -33,6 +33,8 @@
 #include <linux/fcntl.h>
 #include <linux/fb.h>
 #include <reliefnt/futex.h>
+#include <reliefnt/fsnotify_vfs.h>
+#include <linux/inotify.h>
 #define RELIEFOS_FLOCK_NB 4u
 
 /* Real execution admission, including queued-writer exclusion. Privileged
@@ -100,6 +102,10 @@ void net_tcp_maintenance(void)
     if (network_stack_active) ++network_stack_maintenance_calls;
     network_due = false;
 }
+/* Model the executor boundary here; the actual queue/pin state machine has
+ * separate workqueue coverage. Actual USB registry and wait scopes are linked. */
+bool kthread_runnable(void) {assert(exclusive());return network_due || usb_service_pending();}
+void kernel_deferred_run(void) {assert(exclusive() && network_stack_active);net_tcp_maintenance();usb_process_work();}
 void arch_call_on_stack(void *stack_top, void (*callback)(void *), void *argument)
 {
     assert(exclusive());
@@ -258,6 +264,9 @@ static int64_t backend(struct task *task, uint64_t nr, uint64_t a0,
     if (inject_input) atomic_store(&key_pending,true);
     return backend_result;
 }
+/* Pipe reader admission is tested against real concurrent rings separately. */
+static bool syscall_try_pipe_io(struct trap_frame *frame,struct task **resume)
+{(void)frame;(void)resume;return false;}
 #define RELIEFOS_SYSCALL_FRAME_DISPATCH backend
 #include "syscall_return_body.inc"
 #include "int80_return_body.inc"
@@ -275,7 +284,7 @@ static void test_one_transaction_for_completed_syscall(void)
     assert(frame.rax==123 && current.frame.rax==123);
     assert(!accounting_kernel);
     assert(installed_fs==current.fs_base && io_releases==1 && !async_io);
-    assert(network_maintenance_calls==1 && network_stack_maintenance_calls==0 &&
+    assert(network_maintenance_calls==0 && network_stack_maintenance_calls==0 &&
            network_stack_calls==0);
     assert(!network_stack_active);
     assert(!fpu_saved && !fpu_restored && !irq_state);

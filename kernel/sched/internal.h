@@ -608,9 +608,11 @@ uint32_t task_allocate_pid(void);
 struct task *alloc_task_slot(void);
 
 /**
- * @brief Allocate and initialize a kernel task with an entry point, no stack, and cleared identity.
+ * @brief Allocate a stopped kernel task retaining its supplied stack and CPU.
+ * @param name Task name. @param entry Kernel entry. @param low Stack start.
+ * @param top Exclusive stack top. @param cpu Bound CPU. @return Task or NULL.
  */
-uint32_t sched_create_kernel_task(const char *name, uint64_t entry);
+struct task *sched_create_kernel_task(const char *name,uint64_t entry,uint64_t low,uint64_t top,uint32_t cpu);
 
 /**
  * @brief Allocate a user task, build its address space and stack, and inherit cwd/identity from parent.

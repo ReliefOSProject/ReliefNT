@@ -28,6 +28,12 @@ int kernel_service_register(struct kernel_service_slot *slot,const struct kernel
  * detach. No callback, I/O or heap allocation occurs under the service lock.
  */
 int kernel_service_unregister(struct kernel_service_slot *slot,const struct kernel_service_descriptor *descriptor);
+/** @brief Observe a linked provider without entering or pinning its code.
+ * @param slot Permanent core slot, nullable. @return True for an active binding,
+ * including an owner still COMING; this does not authorize any callback.
+ * IRQ/task-safe registry snapshot; no borrowed provider pointer escapes.
+ */
+bool kernel_service_present(struct kernel_service_slot *slot);
 /** @brief Snapshot a LIVE table with user/execution pins before entering its code.
  * @param slot Permanent core slot, nullable for an unavailable service.
  * @param call Empty caller-owned output, populated only on successful admission.

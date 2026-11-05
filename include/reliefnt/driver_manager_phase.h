@@ -22,7 +22,7 @@ int driver_manager_phase_try_enter(void);
  * lifetime. No service/module registry lock spans execution suspension or resume.
  */
 void driver_manager_phase_leave(void);
-/** @brief Process deferred audio work before admitting a syscall's I/O pin.
+/** @brief Process queued audio work on the scheduler service stack.
  * @return None. Task context with depth-one execution ownership. Nonblocking
  * manager admission protects module images; STOP/close and card task callbacks
  * run with execution ownership suspended and IRQs enabled. Busy or failed

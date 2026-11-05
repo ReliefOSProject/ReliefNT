@@ -10,6 +10,8 @@
 
    modules
    execution
+   workqueue
+   kthread
    memory
    path-cache
    resource-limits

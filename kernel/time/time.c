@@ -9,6 +9,8 @@
 #include <reliefnt/sched.h>
 #include <reliefnt/time.h>
 #include <reliefnt/usb.h>
+#include <reliefnt/workqueue.h>
+#include <reliefnt/kthread.h>
 #include <linux/time.h>
 #include <linux/timex.h>
 #include <reliefnt/time_discipline.h>
@@ -705,6 +707,8 @@ void time_on_tick(void)
     sound_service_tick();
     usb_poll();
     sched_on_tick();
+    kthread_tick();
+    kernel_workqueue_tick();
     /* Fallback scanout refresh cadence for hosts without framebuffer traces.
      * This schedules 50 Hz updates at a 100 Hz PIT tick; it is not a hardware
      * presentation-rate measurement. Trace-capable hosts skip the work in the

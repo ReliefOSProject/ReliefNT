@@ -13,9 +13,12 @@
  */
 void sched_init(void);
 /**
- * @brief Create a kernel task named name that starts at entry; returns its pid.
+ * @brief Allocate a stopped kernel task retaining its supplied stack bounds.
+ * @param name Task name. @param entry Kernel entry identity. @param low Stack start.
+ * @param top Exclusive stack top. @param cpu Fixed discovered CPU.
+ * @return Stable task record or NULL; caller holds execution ownership.
  */
-uint32_t sched_create_kernel_task(const char *name, uint64_t entry);
+struct task *sched_create_kernel_task(const char *name,uint64_t entry,uint64_t low,uint64_t top,uint32_t cpu);
 /**
  * @brief Create a user task named name with the given entry, stack, parent, and flags; returns pid.
  */

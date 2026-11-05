@@ -19,6 +19,7 @@ static uint32_t execution_owner = UINT32_MAX;
 static uint32_t execution_readers;
 static uint32_t execution_depth[SMP_MAX_CPUS];
 static uint64_t execution_outer_flags[SMP_MAX_CPUS];
+static uint32_t plain_spin_depth[SMP_MAX_CPUS];
 
 /** @brief Clamp the CPU index used by the existing gate state arrays.
  * @param cpu Raw CPU index returned by the platform, possibly out of range.
@@ -45,7 +46,7 @@ void kernel_spin_init(struct kernel_spinlock *lock)
  * IRQ exclusion and lock order, never waits on an IRQ that needs this lock.
  * No scheduling/allocation or ownership transfer; release on the same path.
  */
-void kernel_spin_lock(struct kernel_spinlock *lock)
+static void spin_lock_raw(struct kernel_spinlock *lock)
 {
     uint32_t busy = 1;
     if (!lock) {
@@ -63,6 +64,19 @@ void kernel_spin_lock(struct kernel_spinlock *lock)
     }
 }
 
+/** @brief Acquire a plain lock while excluding scheduling even during contention.
+ * @param lock Stable nullable lock; same-context release must use plain unlock.
+ * IRQ state is unchanged. irqsave callers use the raw path to avoid adding
+ * CPU lookup/atomic accounting to the IRQ-masked descriptor hot paths.
+ */
+void kernel_spin_lock(struct kernel_spinlock *lock)
+{
+    if(!lock)return;
+    uint32_t cpu=execution_cpu_index(smp_current_cpu());
+    __atomic_fetch_add(&plain_spin_depth[cpu],1,__ATOMIC_RELAXED);
+    spin_lock_raw(lock);
+}
+
 /** @brief Publish prior protected accesses before relinquishing lock ownership.
  * @param lock Stable lock owned by this execution context, NULL accepted.
  * No wait/allocation/IRQ change; does not release unrelated lifetime references.
@@ -71,6 +85,8 @@ void kernel_spin_unlock(struct kernel_spinlock *lock)
 {
     if (lock) {
         __asm__ volatile("movl $0, %0" : "=m"(lock->state) : : "memory");
+        uint32_t cpu=execution_cpu_index(smp_current_cpu());
+        __atomic_fetch_sub(&plain_spin_depth[cpu],1,__ATOMIC_RELAXED);
     }
 }
 
@@ -86,7 +102,7 @@ void kernel_spin_lock_irqsave(struct kernel_spinlock *lock, uint64_t *flags)
     if (flags) {
         *flags = saved;
     }
-    kernel_spin_lock(lock);
+    spin_lock_raw(lock);
 }
 
 /** @brief Release a spinlock before restoring the matching caller IRQ state.
@@ -97,7 +113,7 @@ void kernel_spin_lock_irqsave(struct kernel_spinlock *lock, uint64_t *flags)
  */
 void kernel_spin_unlock_irqrestore(struct kernel_spinlock *lock, uint64_t flags)
 {
-    kernel_spin_unlock(lock);
+    if(lock)__asm__ volatile("movl $0, %0" : "=m"(lock->state) : : "memory");
     kernel_irq_restore(flags);
 }
 
@@ -209,6 +225,17 @@ bool kernel_execution_is_outermost(void)
                      execution_depth[cpu] == 1;
     kernel_irq_restore(saved);
     return outermost;
+}
+
+/** @brief Reject local plain-lock or execution-writer scheduling boundaries.
+ * @return True for a non-schedulable scope; IRQ masking is checked by callers.
+ * No global queue/gate acquisition; read transactions always keep IRQs masked.
+ */
+bool kernel_preempt_disabled(void)
+{
+    uint32_t cpu=execution_cpu_index(smp_current_cpu());
+    return __atomic_load_n(&plain_spin_depth[cpu],__ATOMIC_RELAXED)!=0 ||
+           __atomic_load_n(&execution_depth[cpu],__ATOMIC_RELAXED)!=0;
 }
 
 /**

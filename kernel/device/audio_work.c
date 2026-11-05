@@ -2,7 +2,7 @@
 #include <reliefnt/driver_manager_phase.h>
 #include <reliefnt/sound_service.h>
 
-/** @brief Process deferred audio work before admitting a syscall's I/O pin.
+/** @brief Process queued audio work on the scheduler service stack.
  * @return None. Task context with depth-one execution ownership. Nonblocking
  * manager admission protects module images; STOP/close and card task callbacks
  * run with execution ownership suspended and IRQs enabled. Busy or failed

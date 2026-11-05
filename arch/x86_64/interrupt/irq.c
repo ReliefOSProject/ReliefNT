@@ -1,3 +1,4 @@
+#include <reliefnt/kthread.h>
 /*
  * ReliefOS x86_64 IRQ handling: services hardware interrupt requests.
  * Routes timer, input, storage, and device interrupts to kernel subsystems.
@@ -213,6 +214,7 @@ struct task *irq_dispatch(struct trap_frame *frame)
             smp_release_aps();
             return next;
         }
+        (void)kthread_preempt(frame);
         return NULL;
     } else if (vector == 0x21) {
         /* A polled controller reply may leave a latched IRQ1 after its byte
@@ -275,14 +277,15 @@ struct task *irq_dispatch(struct trap_frame *frame)
             struct task *next = userland_schedule_from_timer(frame);
             return next;
         }
+        (void)kthread_preempt(frame);
         return NULL;
     } else if (vector == SMP_RESCHEDULE_VECTOR) {
-        /* Readiness is already published by the sender. Never switch a
-         * kernel frame: an idle hlt resumes its normal selection loop, and
-         * a syscall completes its transaction before observing the flag.
-         * This is a wakeup, not a timer tick or pressure-reclaim admission. */
+        /* Readiness is already published. Only an unlocked retained kernel
+         * thread may switch its private CPL0 stack here; syscall/idle/IRQ
+         * stacks keep the original return path. No pressure reclaim here. */
         apic_eoi();
-        return from_user ? userland_schedule_from_frame(frame) : NULL;
+        if(from_user)return userland_schedule_from_frame(frame);
+        (void)kthread_preempt(frame);return NULL;
     } else if (vector == SMP_MEMBARRIER_VECTOR) {
         smp_membarrier_poll();
         apic_eoi();

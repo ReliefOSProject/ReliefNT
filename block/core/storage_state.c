@@ -1,9 +1,24 @@
 #include "storage_internal.h"
 #include <reliefnt/export.h>
+#include <reliefnt/storage_context.h>
 #ifdef CONFIG_SWAP
 #include <reliefnt/swap_internal.h>
 #endif
 static uint64_t storage_metadata_epoch = 1;
+
+/** @brief Enter synchronous background I/O without borrowing user retry flags.
+ * @param saved Required snapshot. Execution-owned; pending DMA/owner retained.
+ */
+void storage_kernel_context_enter(struct storage_io_context *saved)
+{
+    *saved=(struct storage_io_context){storage_io_async_context,storage_io_write_started};
+    storage_io_async_context=false;storage_io_write_started=true;
+}
+/** @brief Restore the reserved caller's exact storage retry/commit flags.
+ * @param saved Matching snapshot; caller holds execution ownership.
+ */
+void storage_kernel_context_leave(const struct storage_io_context *saved)
+{storage_io_async_context=saved->asynchronous;storage_io_write_started=saved->write_started;}
 
 uint64_t storage_metadata_generation(void)
 {
@@ -33,6 +48,10 @@ int storage_acquire_task_io(void)
 #ifdef CONFIG_SWAP
     if (swap_storage_slot_active()) return -RELIEFOS_EBUSY;
 #endif
+    /* A synchronous kernel context must not reuse another task's pending DMA
+     * command just because its own asynchronous retry mode is disabled. */
+    if(storage_task_io_owner && storage_task_io_owner!=sched_current_pid())
+        return -RELIEFOS_EAGAIN;
     if (!storage_io_async_context) {
         return 0;
     }

@@ -42,6 +42,15 @@ void driver_manager_mouse_poll(void) {}
 uint32_t smp_current_cpu(void) { return fixture_cpu; }
 void sched_on_cpu_tick(void) { ++local_ticks; }
 void smp_membarrier_poll(void) {}
+/* The retained-stack engine is covered separately; this boundary verifies
+ * only acknowledged kernel timer/reschedule returns reach its hook. */
+bool kthread_preempt(struct trap_frame *frame)
+{
+    assert(frame && !(frame->cs&3));
+    assert(frame->vector==0x20 || frame->vector==0x40 || frame->vector==0x42);
+    if(frame->vector==0x20)assert(eois);else assert(apic_eois);
+    return false;
+}
 
 int main(void)
 {

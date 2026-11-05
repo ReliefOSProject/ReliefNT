@@ -66,6 +66,11 @@ void graphics_service_kms_vt_release(void);
  * The core drops both pins only after optional code returns; nothing escapes.
  */
 uint32_t graphics_service_process_retirements(uint32_t budget);
+/** @brief Observe a graphics table binding, including initialization in progress.
+ * @return True until actual detach; does not authorize entering provider code.
+ * IRQ/task-safe core registry snapshot, no optional callback or retained pin.
+ */
+bool graphics_service_present(void);
 /** @brief Cancel optional graphics syscall continuation ownership for one task.
  * @param task Execution-owned task, nullable; core never dereferences optional state.
  * Execution-owned task context; no registry lock spans the callback or wait.

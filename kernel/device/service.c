@@ -110,6 +110,17 @@ bool kernel_service_acquire(struct kernel_service_slot *slot,struct kernel_servi
     }
     kernel_spin_unlock_irqrestore(&service_binding_lock,flags);return available;
 }
+/** @brief Snapshot binding presence without requiring a LIVE provider callback.
+ * @param slot Permanent core slot, nullable. @return True while linked/active.
+ * Presence permits maintenance retry during COMING, never entering its code.
+ */
+bool kernel_service_present(struct kernel_service_slot *slot)
+{
+    if(!slot)return false;
+    uint64_t flags;kernel_spin_lock_irqsave(&service_binding_lock,&flags);
+    bool present=slot->binding && slot->binding->active;
+    kernel_spin_unlock_irqrestore(&service_binding_lock,flags);return present;
+}
 /** @brief Consume one returned callback's binding/user/execution reference set.
  * @param call Owned admitted record, nullable; cleared before any final put.
  * IRQ/task safe without callbacks or waits. Owner is captured before releasing
@@ -129,3 +140,4 @@ EXPORT_SYMBOL(kernel_service_register);
 EXPORT_SYMBOL(kernel_service_unregister);
 EXPORT_SYMBOL(kernel_service_acquire);
 EXPORT_SYMBOL(kernel_service_release);
+EXPORT_SYMBOL(kernel_service_present);

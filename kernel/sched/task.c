@@ -313,24 +313,32 @@ struct socket_send_stage *sched_socket_stage_take(struct task *task)
 }
 
 /**
- * @brief Allocate and initialize a kernel task with an entry point, no stack, and cleared identity.
+ * @brief Allocate a stopped kernel task retaining a real stack and fixed CPU.
+ * @param name Task name. @param entry Kernel entry identity. @param low Stack start.
+ * @param top Exclusive stack top. @param cpu Bound discovered CPU.
+ * @return Stable task or NULL. Caller holds execution ownership; the retained
+ * stack and record are released only after their owning thread has joined.
  */
-uint32_t sched_create_kernel_task(const char *name, uint64_t entry)
+struct task *sched_create_kernel_task(const char *name,uint64_t entry,uint64_t low,uint64_t top,uint32_t cpu)
 {
+    struct task_identity *identity=sched_task_identity_prepare();
+    if(!identity)return NULL;
     uint64_t lock_flags;
     kernel_spin_lock_irqsave(&scheduler_lock, &lock_flags);
     struct task *task = alloc_task_slot();
     uint32_t pid;
     if (!task) {
         kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
-        return 0;
+        sched_task_identity_put(identity);
+        return NULL;
     }
     pid = task_allocate_pid();
     if (!pid) {
         task_zero(task);
         task->state = TASK_EXITED;
         kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
-        return 0;
+        sched_task_identity_put(identity);
+        return NULL;
     }
     task_zero(task);
     task->pid = pid;
@@ -340,11 +348,11 @@ uint32_t sched_create_kernel_task(const char *name, uint64_t entry)
     task->process_session = 0;
     task_copy_name(task, name);
     task->entry = entry;
-    task->stack_top = 0;
-    task->stack_low = 0;
+    task->stack_top = top;
+    task->stack_low = low;
     task->wake_tick = 0;
     task->priority = 0;
-    task->affinity_mask = sched_all_cpu_mask();
+    task->affinity_mask = 1ULL << cpu;
     task->pending_signals = 0;
     task->timer_pending_signals = 0;
     task_init_limits(task);
@@ -358,19 +366,20 @@ uint32_t sched_create_kernel_task(const char *name, uint64_t entry)
     for (size_t i = 0; i < sizeof(task->frame); ++i) {
         ((uint8_t *)&task->frame)[i] = 0;
     }
-    task->state = TASK_READY;
+    task->state = TASK_BLOCKED;
     task->running_cpu = SCHED_CPU_NONE;
     task->kind = TASK_KIND_KERNEL;
     task->flags = 0;
     task->pty_id = 0;
     task_clear_identity(task);
     task_copy_cwd(task, "/");
+    sched_task_identity_bind(task,identity);
     sched_request_reschedule_all_online();
     console_debug("[reliefnt] task pid=%u name=%s entry=0x%llx\n",
                    task->pid, task->name, (unsigned long long)task->entry);
     ++proc_created;
     kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
-    return task->pid;
+    return task;
 }
 
 /**

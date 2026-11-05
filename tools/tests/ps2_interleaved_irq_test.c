@@ -81,6 +81,7 @@ void driver_manager_mouse_poll(void) { mouse_hardware_poll(); }
 uint32_t smp_current_cpu(void) { return 0; }
 void sched_on_cpu_tick(void) {}
 void smp_membarrier_poll(void) {}
+bool kthread_preempt(struct trap_frame *frame){(void)frame;return false;}
 
 static void dispatch_keyboard_irq(void)
 {

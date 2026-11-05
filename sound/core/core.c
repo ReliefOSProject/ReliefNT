@@ -470,8 +470,8 @@ int audio_stream_period_poll(uint32_t id, uint64_t *frames, int *error)
 }
 /** @brief Close a stream lease after the last fd/VMA owner drops it.
  * @param id Core-owned stream token. Caller serializes last-reference close.
- * @return 0, queued disconnect errno or STOP error; failure retains the lease
- * and module. Task context
+ * @return 0, EAGAIN for an active/preempted callback, queued disconnect errno
+ * or STOP error; failure retains the lease and module for deferred retry. Task context
  * without execution lock; detached leases call no module.
  * DMA page release belongs to the PCM owner, after this returns.
  */
@@ -484,7 +484,7 @@ int audio_stream_close(uint32_t id)
         if (!s) { kernel_spin_unlock_irqrestore(&audio_lock, flags); return 0; }
         struct card_entry *c = find_card(s->card);
         if (s->detached || !c) {
-            if (s->calls) { kernel_spin_unlock_irqrestore(&audio_lock, flags); continue; }
+            if (s->calls) { kernel_spin_unlock_irqrestore(&audio_lock, flags); return -EAGAIN; }
             struct module *drop=s->code_owner; s->code_owner=NULL;
             s->live = 0; kernel_spin_unlock_irqrestore(&audio_lock, flags);
             module_put(drop); return 0;
@@ -494,13 +494,15 @@ int audio_stream_close(uint32_t id)
                 int ret=c->error ? c->error : -ENODEV;
                 kernel_spin_unlock_irqrestore(&audio_lock,flags);return ret;
             }
-            kernel_spin_unlock_irqrestore(&audio_lock, flags); continue;
+            kernel_spin_unlock_irqrestore(&audio_lock, flags); return -EAGAIN;
         }
+        /* A same-CPU caller may have preempted an admitted callback. Final
+         * PCM release queues retries while retaining its lease/code/DMA. */
+        if(s->calls){kernel_spin_unlock_irqrestore(&audio_lock,flags);return -EAGAIN;}
         __atomic_add_fetch(&c->calls, 1, __ATOMIC_ACQUIRE);
         s->detached = 1;
         __atomic_add_fetch(&s->calls, 1, __ATOMIC_ACQUIRE);
         kernel_spin_unlock_irqrestore(&audio_lock, flags);
-        while (__atomic_load_n(&s->calls,__ATOMIC_ACQUIRE)>1) __asm__ volatile("pause" ::: "memory");
         int ret = c->ops.trigger(c->opaque, &s->hw, AUDIO_STOP);
         if (ret) {
             kernel_spin_lock_irqsave(&audio_lock,&flags);

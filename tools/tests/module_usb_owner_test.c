@@ -43,7 +43,7 @@ static int quiesce(void *context)
 }
 static void release(void *context) { assert(context==&host && !host);++releases; }
 static void *unload_thread(void *unused)
-{ (void)unused;assert(!module_unload("test_usb",0));atomic_store(&finished,true);return NULL; }
+{ (void)unused;assert(module_unload("test_usb",0)==-EBUSY);atomic_store(&finished,true);return NULL; }
 int main(void)
 {
     struct module_runtime *runtime=kernel_malloc(sizeof(*runtime));assert(runtime);
@@ -60,10 +60,12 @@ int main(void)
     while(!atomic_load(&entered)){}
     assert(!pthread_create(&unloader,NULL,unload_thread,NULL));
     while(!atomic_load(&stopping)){}
-    assert(!atomic_load(&finished) && !module_get_by_name("test_usb"));
+    assert(!pthread_join(unloader,NULL));
+    assert(atomic_load(&finished) && owner.runtime && !module_get_by_name("test_usb"));
     unsigned saved=calls;usb_poll();assert(calls==saved);
     atomic_store(&unblock,true);
-    assert(!pthread_join(reader,NULL) && !pthread_join(unloader,NULL));
+    assert(!pthread_join(reader,NULL));
+    assert(!module_unload("test_usb",0));
     assert(!host && releases==1 && !owner.runtime && !module_list && !allocations);
     struct usb_host *builtins[40];unsigned counts[40]={0};
     for(unsigned i=0;i<40;++i)assert(!usb_host_register(counted_poll,&counts[i],NULL,&builtins[i]));

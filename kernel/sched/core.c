@@ -355,6 +355,9 @@ int sched_set_task_affinity(uint32_t pid, uint64_t mask)
     kernel_spin_lock_irqsave(&scheduler_lock, &flags);
     for (uint32_t i = 0; i < task_count; ++i) {
         if (tasks[i]->pid == pid && tasks[i]->state != TASK_EXITED) {
+            /* Retained per-CPU kernel contexts cannot migrate. As with
+             * Linux PF_NO_SETAFFINITY, external setters receive EINVAL. */
+            if(tasks[i]->kind==TASK_KIND_KERNEL){result=-22;break;}
             tasks[i]->affinity_mask = mask;
             result = 0;
             break;

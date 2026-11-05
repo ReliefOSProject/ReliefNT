@@ -1,15 +1,24 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include <reliefnt/graphics_service.h>
 #include <reliefnt/export.h>
+#include <reliefnt/deferred.h>
 #include <linux/errno.h>
 static struct kernel_service_slot graphics_service_slot;
+/** @brief Keep maintenance queued while a provider initializes or owns the slot.
+ * @return Core binding presence without entering optional code.
+ */
+bool graphics_service_present(void) {return kernel_service_present(&graphics_service_slot);}
 /** @brief Publish one graphics table without taking a permanent self-reference.
  * @param provider Persistent immutable table and owner descriptor.
  * @return Zero or generic registration errno. Init/task context; the core ledger
  * detaches/drains before code release. No lock spans allocation or callbacks.
  */
 int graphics_service_register(const struct kernel_service_descriptor *provider)
-{return kernel_service_register(&graphics_service_slot,provider);}
+{
+    int rc=kernel_service_register(&graphics_service_slot,provider);
+    if(!rc)kernel_deferred_schedule(DEFERRED_GRAPHICS);
+    return rc;
+}
 /** @brief Detach one idle exact graphics table without entering its code.
  * @param provider Exact persistent registration identity.
  * @return Zero or ENOENT/EBUSY/EINVAL. Task context; active calls preserve binding.
