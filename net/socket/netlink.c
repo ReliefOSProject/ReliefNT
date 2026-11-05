@@ -20,8 +20,8 @@
 #include <linux/poll.h>
 #include <linux/rtnetlink.h>
 
-/* One complete dump is one datagram; both its size and outstanding bytes are
- * bounded. A linked registry has no artificial process/socket count limit. */
+/* Dump data and its terminal NLMSG_DONE use separate, bounded datagrams.
+ * A linked registry has no artificial process/socket count limit. */
 #define NL_MESSAGE_MAX 8192u
 #define NL_QUEUE_BUDGET (8u * NL_MESSAGE_MAX)
 struct netlink_message { struct netlink_message *next; uint32_t length, groups; uint8_t data[]; };
@@ -32,7 +32,10 @@ struct netlink_socket {
     int type;
     bool bound, connected, overrun;
 };
-struct nl_builder { struct netlink_message *message; uint32_t used, port; };
+struct nl_builder {
+    struct netlink_message *message, *completion;
+    uint32_t used, port;
+};
 static struct netlink_socket *netlink_sockets;
 static uint32_t netlink_auto_port = 0x80000000u;
 static uint64_t netlink_ino;
@@ -131,9 +134,14 @@ static int nl_error(struct nl_builder *b, const struct nlmsghdr *request, int er
  * @param b Builder. @param seq Request sequence. @return Zero or ENOBUFS. */
 static int nl_done(struct nl_builder *b, uint32_t seq)
 {
-    int32_t *status = nl_begin(b, NLMSG_DONE, NLM_F_MULTI, seq, sizeof(*status));
+    /* Match Linux route dumps: a reader that finishes scanning a data datagram
+     * early must still receive the terminator on its next recv. */
+    if (!b->completion) return -LINUX_ENOBUFS;
+    struct nl_builder end = {.message=b->completion,.port=b->port};
+    int32_t *status = nl_begin(&end, NLMSG_DONE, NLM_F_MULTI, seq, sizeof(*status));
     if (!status) return -LINUX_ENOBUFS;
     *status = 0;
+    b->completion->length = end.used;
     return 0;
 }
 
@@ -699,7 +707,7 @@ int task_netlink_send(struct task_file *file,const void *data,uint32_t length,ui
     }
     const uint8_t *input=data;
     uint32_t pos=0, maximum_reply=0, requests=0;
-    bool has_dump=false;
+    bool has_dump=false, multipart=false;
     while (pos<length) {
         if (length-pos < sizeof(struct nlmsghdr)) return -LINUX_EINVAL;
         struct nlmsghdr h; __builtin_memcpy(&h,input+pos,sizeof(h));
@@ -710,33 +718,53 @@ int task_netlink_send(struct task_file *file,const void *data,uint32_t length,ui
                                          h.nlmsg_len-sizeof(struct nlmsghdr));
         if (error_size > NL_MESSAGE_MAX-maximum_reply) return -LINUX_ENOBUFS;
         maximum_reply+=error_size; ++requests;
-        if (h.nlmsg_type==RTM_GETLINK || h.nlmsg_type==RTM_GETADDR || h.nlmsg_type==RTM_GETROUTE)
+        if (h.nlmsg_type==RTM_GETLINK || h.nlmsg_type==RTM_GETADDR || h.nlmsg_type==RTM_GETROUTE) {
             has_dump=true;
+            multipart |= (h.nlmsg_flags & NLM_F_DUMP)==NLM_F_DUMP;
+        }
         pos+=advance;
     }
     if (has_dump && requests>1) return -LINUX_EOPNOTSUPP;
-    if (s->queued_bytes > NL_QUEUE_BUDGET - NL_MESSAGE_MAX) return -LINUX_ENOBUFS;
+    uint32_t reserved=NL_MESSAGE_MAX*(multipart ? 2u : 1u);
+    if (s->queued_bytes > NL_QUEUE_BUDGET-reserved) return -LINUX_ENOBUFS;
     uint8_t *bytes=kernel_malloc(length);
     if (!bytes) return -LINUX_ENOMEM;
     __builtin_memcpy(bytes,input,length);
     struct netlink_message *message=kernel_malloc(sizeof(*message)+NL_MESSAGE_MAX);
     if (!message) { kernel_free(bytes); return -LINUX_ENOMEM; }
+    struct netlink_message *completion=NULL;
+    if (multipart) {
+        completion=kernel_malloc(sizeof(*completion)+sizeof(struct nlmsghdr)+sizeof(int32_t));
+        if (!completion) { kernel_free(message); kernel_free(bytes); return -LINUX_ENOMEM; }
+        *completion=(struct netlink_message){0};
+    }
     int rc=nl_autobind(s,sched_current_task());
-    if (rc) { kernel_free(message); kernel_free(bytes); return rc; }
-    /* Reserve the response slot before mutations can publish notifications. */
-    s->queued_bytes+=NL_MESSAGE_MAX;
-    struct nl_builder builder={.message=message,.port=s->port};
+    if (rc) { kernel_free(completion); kernel_free(message); kernel_free(bytes); return rc; }
+    /* Reserve both slots before publishing any reply. The small terminator is
+     * conservatively charged one full slot, as other queued datagrams are. */
+    s->queued_bytes+=reserved;
+    struct nl_builder builder={.message=message,.completion=completion,.port=s->port};
     for (pos=0;pos<length;) {
         const struct nlmsghdr *h=(const void *)(bytes+pos);
         rc=nl_request(&builder,h);
-        if (rc) { s->queued_bytes-=NL_MESSAGE_MAX; kernel_free(message); kernel_free(bytes); return rc; }
+        if (rc) {
+            s->queued_bytes-=reserved;
+            kernel_free(completion); kernel_free(message); kernel_free(bytes); return rc;
+        }
         pos+=NLMSG_ALIGN(h->nlmsg_len);
     }
     kernel_free(bytes);
-    if (!builder.used) { s->queued_bytes-=NL_MESSAGE_MAX; kernel_free(message); return (int)length; }
     message->next=NULL; message->length=builder.used; message->groups=0;
-    if (s->tail) s->tail->next=message; else s->head=message;
-    s->tail=message;
+    struct netlink_message *replies[2]={message,completion};
+    for (unsigned i=0;i<2;++i) {
+        struct netlink_message *reply=replies[i];
+        if (!reply) continue;
+        if (!reply->length) {
+            s->queued_bytes-=NL_MESSAGE_MAX; kernel_free(reply); continue;
+        }
+        if (s->tail) s->tail->next=reply; else s->head=reply;
+        s->tail=reply;
+    }
     kernel_poll_readiness_notify();
     return (int)length;
 }

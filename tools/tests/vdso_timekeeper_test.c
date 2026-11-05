@@ -40,6 +40,8 @@ void kernel_spin_unlock_irqrestore(struct kernel_spinlock *lock, uint64_t flags)
 void sound_service_tick(void) { assert(!held); }
 void usb_poll(void) { assert(!held); }
 void sched_on_tick(void) { assert(!held); }
+void kthread_tick(void) { assert(!held); }
+void kernel_workqueue_tick(void) { assert(!held); }
 void console_display_tick(void) { assert(!held); }
 void console_printf(const char *format, ...) { (void)format; }
 void console_log(enum console_log_level level, const char *format, ...)

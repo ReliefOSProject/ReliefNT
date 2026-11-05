@@ -32,6 +32,10 @@ hop-limit 辅助数据及 raw ICMPv6 checksum/filter 选项。未知选项返回
 获取 IPv6 地址。保留 Linux IPv6 地址、路由 ioctl，并根据 socket family
 选择相应参数布局。
 
+多部分查询的数据与 ``NLMSG_DONE`` 结束标记分开发送为数据报；结束标记保留
+请求序号和接收端口 ID。即使查询没有数据，也会发送结束标记。接收方仍应遍历
+每个数据报内的全部消息，直到收到对应序号的 ``NLMSG_DONE`` 或错误。
+
 ``/proc/net/if_inet6``、``ipv6_route``、``tcp6``、``udp6``、``raw6`` 使用
 Linux 文本布局；其中地址 scope 的编码与 rtnetlink 的 scope 值不同。
 快照复制出内部状态，不借出跨等待有效的内核指针。

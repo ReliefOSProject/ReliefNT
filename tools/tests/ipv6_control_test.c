@@ -83,10 +83,90 @@ static int send_req(int fd, const void *message, unsigned length)
 { return task_netlink_send(&files[fd],message,length,0,0,0); }
 static int receive(int fd, void *buffer, unsigned capacity)
 { return task_netlink_recv(&files[fd],buffer,capacity,MSG_DONTWAIT,0,0); }
+
+static int receive_dump(int fd, void *buffer, unsigned capacity)
+{
+    int count=receive(fd,buffer,capacity);
+    assert(count>0 && ((struct nlmsghdr *)buffer)->nlmsg_type!=NLMSG_DONE);
+    unsigned char end[sizeof(struct nlmsghdr)+sizeof(int32_t)];
+    assert(receive(fd,end,sizeof(end))==sizeof(end));
+    assert(((struct nlmsghdr *)(void *)end)->nlmsg_type==NLMSG_DONE);
+    return count;
+}
+
+/* A route reader may stop scanning a data datagram after finding a zero-metric
+ * default route. Linux delivers the dump terminator in a later datagram, so a
+ * subsequent recv must still observe completion (as fastfetch expects). */
+static void check_route_completion(int fd)
+{
+    struct { struct nlmsghdr h; struct rtmsg m; struct rtattr table; uint32_t id; } request = {
+        .h={.nlmsg_len=sizeof(request),.nlmsg_type=RTM_GETROUTE,
+            .nlmsg_flags=NLM_F_REQUEST|NLM_F_DUMP,.nlmsg_seq=91},
+        .m={.rtm_family=AF_INET},.table={.rta_len=8,.rta_type=RTA_TABLE},.id=RT_TABLE_MAIN};
+    uint32_t gateway=net_config.gateway_ip;
+    net_config.gateway_ip=0x0a000202u;
+    assert(send_req(fd,&request,sizeof(request))==sizeof(request));
+    unsigned char output[8192];
+    int count=receive(fd,output,sizeof(output));
+    assert(count>0);
+    bool found=false;
+    for (unsigned pos=0;pos+sizeof(struct nlmsghdr)<=(unsigned)count;) {
+        struct nlmsghdr *h=(void *)(output+pos);
+        assert(h->nlmsg_len>=sizeof(*h) && h->nlmsg_len<=(unsigned)count-pos);
+        if (h->nlmsg_type==RTM_NEWROUTE && !((struct rtmsg *)(h+1))->rtm_dst_len) {
+            found=true;
+            break;
+        }
+        pos+=NLMSG_ALIGN(h->nlmsg_len);
+    }
+    assert(found);
+    assert(task_netlink_poll(&files[fd],POLLIN)&POLLIN);
+    assert(task_netlink_recv(&files[fd],output,1,MSG_DONTWAIT|MSG_PEEK|MSG_TRUNC,0,0)==20);
+    count=receive(fd,output,sizeof(output));
+    assert(count==(int)(sizeof(struct nlmsghdr)+sizeof(int32_t)));
+    struct nlmsghdr *done=(void *)output;
+    assert(done->nlmsg_type==NLMSG_DONE && done->nlmsg_seq==91 &&
+           done->nlmsg_pid==nl_socket(&files[fd])->port && (done->nlmsg_flags&NLM_F_MULTI));
+    assert(*(int32_t *)(done+1)==0);
+    assert(receive(fd,output,sizeof(output))==-LINUX_EAGAIN);
+    assert(!(task_netlink_poll(&files[fd],POLLIN)&POLLIN));
+    net_config.gateway_ip=gateway;
+}
+
+static void check_dump_boundaries(int fd)
+{
+    struct { struct nlmsghdr h; struct ifaddrmsg m; } request = {
+        .h={.nlmsg_len=sizeof(request),.nlmsg_type=RTM_GETADDR,
+            .nlmsg_flags=NLM_F_REQUEST|NLM_F_DUMP,.nlmsg_seq=92},
+        .m={.ifa_family=AF_INET,.ifa_index=77}};
+    unsigned char output[8192];
+    /* An empty dump still completes; an invalid request only returns an error. */
+    assert(send_req(fd,&request,sizeof(request))==sizeof(request));
+    assert(receive(fd,output,sizeof(output))==20);
+    assert(((struct nlmsghdr *)output)->nlmsg_type==NLMSG_DONE);
+    assert(receive(fd,output,sizeof(output))==-LINUX_EAGAIN);
+    request.m.ifa_family=255;
+    assert(send_req(fd,&request,sizeof(request))==sizeof(request));
+    assert(receive(fd,output,sizeof(output))>0);
+    assert(((struct nlmsghdr *)output)->nlmsg_type==NLMSG_ERROR);
+    assert(receive(fd,output,sizeof(output))==-LINUX_EAGAIN);
+    request.m.ifa_family=AF_INET; request.m.ifa_index=0;
+    unsigned accepted=0;
+    int rc;
+    while ((rc=send_req(fd,&request,sizeof(request)))==(int)sizeof(request))
+        assert(++accepted<=NL_QUEUE_BUDGET/NL_MESSAGE_MAX);
+    assert(rc==-LINUX_ENOBUFS && accepted);
+    for (unsigned i=0;i<accepted;++i) assert(receive_dump(fd,output,sizeof(output))>0);
+    assert(receive(fd,output,sizeof(output))==-LINUX_EAGAIN);
+    assert(nl_socket(&files[fd])->queued_bytes==0);
+}
+
 int main(void)
 {
     int fd = (int)call(__NR_socket,AF_NETLINK,SOCK_RAW|SOCK_NONBLOCK,NETLINK_ROUTE,0,0);
     assert(fd >= 0 && files[fd].socket_ino);
+    check_route_completion(fd);
+    check_dump_boundaries(fd);
     struct { struct nlmsghdr h; struct ifinfomsg m; } link = {
         .h={.nlmsg_len=sizeof(link),.nlmsg_type=RTM_GETLINK,.nlmsg_flags=NLM_F_REQUEST|NLM_F_DUMP,.nlmsg_seq=42},
         .m={.ifi_family=AF_UNSPEC}};
@@ -108,7 +188,7 @@ int main(void)
     /* A present Ethernet device remains enumerable while PHY negotiates. */
     nic_ready=false;
     assert(send_req(fd,&link,sizeof(link))==sizeof(link));
-    count=receive(fd,output,sizeof(output));
+    count=receive_dump(fd,output,sizeof(output));
     assert(count>0);
     found_eth=0;
     for (unsigned pos=0;pos+sizeof(struct nlmsghdr)<=(unsigned)count;) {
@@ -127,30 +207,30 @@ int main(void)
         .h={.nlmsg_len=sizeof(generic),.nlmsg_type=RTM_GETLINK,
             .nlmsg_flags=NLM_F_REQUEST|NLM_F_DUMP,.nlmsg_seq=71},.family=AF_UNSPEC};
     assert(send_req(fd,&generic,sizeof(generic)) == sizeof(generic));
-    count=receive(fd,output,sizeof(output));
+    count=receive_dump(fd,output,sizeof(output));
     assert(count>0 && ((struct nlmsghdr *)output)->nlmsg_type==RTM_NEWLINK);
     generic.family=AF_INET6;
     assert(send_req(fd,&generic,sizeof(generic)) == sizeof(generic));
-    count=receive(fd,output,sizeof(output));
+    count=receive_dump(fd,output,sizeof(output));
     assert(count>0 && ((struct nlmsghdr *)output)->nlmsg_type==RTM_NEWLINK);
     generic.family=AF_INET;
     assert(send_req(fd,&generic,sizeof(generic)) == sizeof(generic));
-    count=receive(fd,output,sizeof(output));
+    count=receive_dump(fd,output,sizeof(output));
     assert(count>0 && ((struct nlmsghdr *)output)->nlmsg_type==RTM_NEWLINK);
     generic.family=AF_UNSPEC;
     generic.h.nlmsg_type=RTM_GETADDR; generic.h.nlmsg_seq=72;
     assert(send_req(fd,&generic,sizeof(generic)) == sizeof(generic));
-    count=receive(fd,output,sizeof(output));
+    count=receive_dump(fd,output,sizeof(output));
     assert(count>0 && ((struct nlmsghdr *)output)->nlmsg_type==RTM_NEWADDR);
     generic.h.nlmsg_type=RTM_GETROUTE; generic.h.nlmsg_seq=73; generic.family=AF_INET6;
     assert(send_req(fd,&generic,sizeof(generic)) == sizeof(generic));
-    count=receive(fd,output,sizeof(output));
+    count=receive_dump(fd,output,sizeof(output));
     assert(count>0 && ((struct nlmsghdr *)output)->nlmsg_type==RTM_NEWROUTE);
     struct { struct nlmsghdr h; struct ifaddrmsg m; } addr = {
         .h={.nlmsg_len=sizeof(addr),.nlmsg_type=RTM_GETADDR,.nlmsg_flags=NLM_F_REQUEST|NLM_F_DUMP,.nlmsg_seq=43},
         .m={.ifa_family=AF_INET6}};
     assert(send_req(fd,&addr,sizeof(addr)) == sizeof(addr));
-    count=receive(fd,output,sizeof(output));
+    count=receive_dump(fd,output,sizeof(output));
     assert(count>0 && ((struct nlmsghdr *)output)->nlmsg_type==RTM_NEWADDR);
     while (receive(fd,output,sizeof(output))>0) {}
     struct { struct nlmsghdr h; struct ifaddrmsg m; struct rtattr a; unsigned char ip[16]; } change = {
