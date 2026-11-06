@@ -2703,19 +2703,26 @@ bool address_space_user_page_readable(const struct address_space *as, uint64_t v
                    (RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_USER));
 }
 
+static bool address_space_user_write_branches(const struct address_space *as, uint64_t vaddr);
+
 /** @brief Retry a fault after another thread installed adequate page permissions.
  * @param as Address space sharing the mapping.
  * @param vaddr Fault address.
  * @param fault_error x86 page-fault error flags.
- * @return True after invalidating a now-usable stale translation.
+ * @return True after invalidating a now-usable stale translation. A queued
+ * COW write fault can retain PRESENT after a sibling made the leaf writable;
+ * retry it only when all current user branches also authorize the write.
  */
 bool address_space_retry_mapped_user_page(const struct address_space *as,
                                           uint64_t vaddr, uint64_t fault_error)
 {
     uint64_t *pte;
     uint64_t entry;
-    if (!as || (fault_error & (1ULL | 8ULL)) || !user_address_valid(vaddr))
+    if (!as || (fault_error & ~0x17ULL) || !user_address_valid(vaddr))
         return false;
+    if ((fault_error & 1ULL) &&
+        ((fault_error & ~4ULL) != 3ULL ||
+         !address_space_user_write_branches(as, vaddr))) return false;
     pte = address_space_pte(as, vaddr);
     if (!pte) return false;
     entry = *pte;

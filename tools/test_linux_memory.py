@@ -13,6 +13,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class LinuxMemoryTests(unittest.TestCase):
+    def test_stale_cow_fault_retry(self):
+        with tempfile.TemporaryDirectory(prefix="reliefnt-stale-cow-") as tmp:
+            executable = str(Path(tmp) / "stale-cow")
+            subprocess.run([
+                "cc", "-std=c11", "-O1", "-g", "-fsanitize=address,undefined",
+                "-fno-omit-frame-pointer", "-ffunction-sections", "-fdata-sections",
+                "-Wl,--gc-sections", "-Iinclude", "-Iinclude/uapi",
+                "tools/tests/stale_cow_fault_test.c", "-o", executable,
+            ], cwd=ROOT, check=True)
+            subprocess.run([executable], cwd=ROOT, check=True, timeout=30)
+
     def test_mprotect_linux_reference(self):
         with tempfile.TemporaryDirectory(prefix="reliefos-mprotect-reference-") as tmp:
             executable = str(Path(tmp) / "mprotect-runtime")
