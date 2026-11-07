@@ -159,14 +159,12 @@ struct storage_volume {
     uint32_t iso_root_size;
     uint64_t iso_sector_count;
     uint32_t next_free_cluster;
-    uint8_t gpt_disk_guid[16];
     uint8_t esp_unique_guid[16];
     uint8_t ext2_unique_guid[16];
     uint8_t exfat_unique_guid[16];
     uint64_t esp_device;
     uint64_t ext_device;
     uint64_t exfat_device;
-    uint8_t has_gpt_identity;
     uint32_t source_disk_id;
     uint32_t source_partition_index;
     uint8_t data_partition_mount;

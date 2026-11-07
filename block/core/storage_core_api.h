@@ -277,7 +277,6 @@ void storage_copy_text(char *dst, uint32_t cap, const char *src);
  */
 void storage_dir_index_store(uint32_t directory_cluster, const char *name,
                              const struct storage_node *node);
-void storage_format_guid(const uint8_t guid[16], char *out, uint32_t cap);
 void storage_make_guid(uint8_t guid[16], uint64_t tag,
                        const struct install_disk_state *disk,
                        uint64_t sector_count);

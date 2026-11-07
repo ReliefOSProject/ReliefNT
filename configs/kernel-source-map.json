@@ -536,9 +536,6 @@
       "block/partition/partition_install.c",
       "block/partition/partition_mount.c"
     ],
-    "block/storage_identity.c": [
-      "block/partition/storage_identity.c"
-    ],
     "block/storage_installer.c": [
       "block/install/storage_installer.c"
     ],

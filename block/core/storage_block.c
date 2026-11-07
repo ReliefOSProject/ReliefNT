@@ -385,13 +385,8 @@ int gpt_find_esp(void)
         if (storage_memcmp(entry->type_guid, esp_guid, 16) == 0) {
             g_storage.esp_start_lba = entry->first_lba;
             g_storage.esp_sector_count = entry->last_lba - entry->first_lba + 1u;
-            storage_memcpy(g_storage.gpt_disk_guid, hdr->disk_guid,
-                           sizeof(g_storage.gpt_disk_guid));
             storage_memcpy(g_storage.esp_unique_guid, entry->unique_guid,
                            sizeof(g_storage.esp_unique_guid));
-            g_storage.has_gpt_identity =
-                storage_guid_valid(g_storage.gpt_disk_guid) &&
-                storage_guid_valid(g_storage.esp_unique_guid);
             esp_found = 1;
             console_info("[reliefnt] GPT ESP found lba=%llu\n",
                            (unsigned long long)entry->first_lba);

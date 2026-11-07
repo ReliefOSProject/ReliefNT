@@ -90,7 +90,6 @@ int fixture_native_inode_read(struct storage_volume *volume,uint64_t ino,struct 
 #include "../../fs/exfat/mkfs.c"
 #include "../../fs/ext_common/mkfs.c"
 #include "modules/disk.h"
-#include "../../block/partition/storage_identity.c"
 #include "memory_block_fixture.h"
 
 static int test_fail_cache_alloc;

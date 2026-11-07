@@ -446,18 +446,6 @@ void storage_make_guid(uint8_t guid[16], uint64_t tag,
     guid[8] = (uint8_t)((guid[8] & 0x3fU) | 0x80U);
 }
 
-static void storage_guid_append_hex2(char *dst, uint32_t *pos,
-                                     uint32_t cap, uint8_t value)
-{
-    static const char hex[] = "0123456789abcdef";
-    if (!dst || !pos || *pos + 2U >= cap) {
-        return;
-    }
-    dst[(*pos)++] = hex[value >> 4];
-    dst[(*pos)++] = hex[value & 0x0fU];
-    dst[*pos] = 0;
-}
-
 int storage_guid_valid(const uint8_t guid[16])
 {
     uint8_t or_all = 0;
@@ -467,25 +455,6 @@ int storage_guid_valid(const uint8_t guid[16])
         and_all &= guid[i];
     }
     return or_all != 0 && and_all != 0xffU;
-}
-
-void storage_format_guid(const uint8_t guid[16], char *out, uint32_t cap)
-{
-    uint32_t pos = 0;
-    if (!out || cap < RELIEFOS_MACHINE_IDENTITY_UUID_LEN) {
-        if (out && cap) {
-            out[0] = 0;
-        }
-        return;
-    }
-    out[0] = 0;
-    for (uint32_t i = 0; i < 16U; ++i) {
-        if (i == 4U || i == 6U || i == 8U || i == 10U) {
-            out[pos++] = '-';
-            out[pos] = 0;
-        }
-        storage_guid_append_hex2(out, &pos, cap, guid[i]);
-    }
 }
 
 /**

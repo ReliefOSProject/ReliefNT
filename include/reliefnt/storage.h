@@ -566,9 +566,4 @@ int storage_disk_unmount_partition(const struct reliefos_disk_partition_unmount 
 int storage_disk_edit_partition(const struct reliefos_disk_partition_edit *request);
 /** Initialize an empty primary/backup GPT on a managed disk. */
 int storage_disk_initialize_gpt(const struct reliefos_disk_gpt_initialize *request);
-/**
- * @brief Fill identity with the boot disk/model information known to storage.
- */
-void storage_boot_identity(struct reliefos_machine_identity *identity);
-
 #endif

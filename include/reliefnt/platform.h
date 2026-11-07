@@ -5,20 +5,14 @@
 #ifndef RELIEFNT_PLATFORM_H
 #define RELIEFNT_PLATFORM_H
 
-#include <reliefos/system_abi.h>
 #include <reliefnt/multiboot2.h>
 
 /**
- * @brief Capture firmware identity using proven EFI handoff mappings.
+ * @brief Capture SMBIOS inventory for DMI sysfs using proven EFI handoff mappings.
  * @param boot Borrowed parsed handoff and EFI memory map, or NULL.
  * BSP before the kernel root switch; unavailable spans remain absent.
  */
 void platform_identity_init(const struct boot_info *boot);
-/**
- * @brief Copy the cached machine identity into identity.
- */
-void platform_machine_identity(struct reliefos_machine_identity *identity);
-
 #define PLATFORM_DMI_FIELDS 15u
 struct platform_dmi_info {
     /* bios vendor/version/date; system vendor/name/version/serial/uuid/sku/family;

@@ -30,9 +30,7 @@ int main(void)
                               .efi_mmap_entry_count = 1, .efi_mmap_entry_size = sizeof(missing_descriptor),
                               .bios_identity_4g = true};
     platform_identity_init(&ended);
-    struct reliefos_machine_identity absent;
-    platform_machine_identity(&absent);
-    assert(!(absent.flags & RELIEFOS_MACHINE_IDENTITY_FLAG_PLATFORM_UUID));
+    assert(!platform_dmi()->values[7][0]);
     struct efi_memory_descriptor low = {.type = 6, .physical_start = 0xfffff000ULL,
                                         .number_of_pages = 2};
     ended.efi_mmap_addr = (uintptr_t)&low;
@@ -58,11 +56,14 @@ int main(void)
     config->vendor_table = entry;
     memcpy(entry->anchor, "_SM3_", 5);
     entry->length = sizeof(*entry);
+    entry->major = 3; entry->minor = 2;
     entry->table_address = (uintptr_t)table;
     entry->table_max_size = 64;
     table[0] = 1; table[1] = 27;
     for (unsigned i = 0; i < 16; ++i) table[8 + i] = i + 1;
-    table[27] = 0; table[28] = 0;
+    table[4] = 1; table[5] = 2;
+    const char strings[] = "Test Vendor\0Test Machine\0";
+    memcpy(table + 27, strings, sizeof(strings));
     uint8_t sum = 0;
     for (unsigned i = 0; i < sizeof(*entry); ++i) sum += ((uint8_t *)entry)[i];
     entry->checksum = (uint8_t)(0 - sum);
@@ -72,40 +73,33 @@ int main(void)
                              .efi_mmap_addr = (uintptr_t)&descriptor,
                              .efi_mmap_entry_size = sizeof(descriptor), .efi_mmap_entry_count = 1,
                              .efi_identity_amd64 = true};
-    struct reliefos_machine_identity identity;
     platform_identity_init(&boot);
-    platform_machine_identity(&identity);
-    assert(identity.flags & RELIEFOS_MACHINE_IDENTITY_FLAG_PLATFORM_UUID);
-    assert(identity.firmware_revision == 42 && !strcmp(identity.firmware_vendor, "EFI"));
+    assert(!strcmp(platform_dmi()->values[7], "04030201-0605-0807-090a-0b0c0d0e0f10"));
+    assert(!strcmp(platform_dmi()->values[3], "Test Vendor"));
+    assert(!strcmp(platform_dmi()->values[4], "Test Machine"));
     boot.efi_system_table = FIXTURE_BASE + 0x100000;
     platform_identity_init(&boot);
-    platform_machine_identity(&identity);
-    assert(!(identity.flags & RELIEFOS_MACHINE_IDENTITY_FLAG_PLATFORM_UUID));
+    assert(!platform_dmi()->values[7][0]);
     boot.efi_system_table = FIXTURE_BASE;
     descriptor.number_of_pages = 1;
     st->configuration_table = config;
     descriptor.type = 11;
     platform_identity_init(&boot);
-    platform_machine_identity(&identity);
-    assert(!(identity.flags & RELIEFOS_MACHINE_IDENTITY_FLAG_PLATFORM_UUID));
+    assert(!platform_dmi()->values[7][0]);
     descriptor.type = 6;
     entry->table_address = FIXTURE_BASE + 4096;
     platform_identity_init(&boot);
-    platform_machine_identity(&identity);
-    assert(!(identity.flags & RELIEFOS_MACHINE_IDENTITY_FLAG_PLATFORM_UUID));
+    assert(!platform_dmi()->values[7][0]);
     entry->table_address = (uintptr_t)table;
     st->firmware_vendor = (void *)(FIXTURE_BASE + 4096);
     platform_identity_init(&boot);
-    platform_machine_identity(&identity);
-    assert(identity.flags & RELIEFOS_MACHINE_IDENTITY_FLAG_PLATFORM_UUID);
-    assert(!identity.firmware_vendor[0]);
+    assert(!strcmp(platform_dmi()->values[7], "04030201-0605-0807-090a-0b0c0d0e0f10"));
     boot.efi_system_table = FIXTURE_BASE;
     descriptor.number_of_pages = 1;
     st->configuration_table = (void *)(FIXTURE_BASE + 4096);
     platform_identity_init(&boot);
-    platform_machine_identity(&identity);
-    assert(!(identity.flags & RELIEFOS_MACHINE_IDENTITY_FLAG_PLATFORM_UUID));
+    assert(!platform_dmi()->values[7][0]);
     assert(!munmap(memory, 8192));
-    puts("PASS EFI identity accepts proven high tables and rejects missing coverage");
+    puts("PASS DMI sysfs inventory preserves UUID/vendor/model and rejects unproved EFI spans");
     return 0;
 }

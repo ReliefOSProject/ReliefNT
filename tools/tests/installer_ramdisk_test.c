@@ -58,7 +58,6 @@
 #include "../../fs/exfat/mkfs.c"
 #include "../../fs/ext_common/mkfs.c"
 #include "modules/disk.h"
-#include "../../block/partition/storage_identity.c"
 #include "../../block/partition/boot_root.c"
 #include "../../lib/text_utf16.c"
 
