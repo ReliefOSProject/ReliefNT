@@ -553,10 +553,6 @@ struct task_snapshot_user {
  * fixed-width bitsets and native timeout conversion around it. */
 
 
-/* ppoll shares poll's descriptor ABI but carries a nanosecond timeout.  The
- * scheduler currently has no atomic signal-mask handoff for a parked poll;
- * reject a non-null mask instead of silently widening the interrupt window. */
-
 
 
 
@@ -1556,6 +1552,17 @@ int64_t syscall_select_common(uint64_t nfds_arg, uint64_t read_ptr,
                                      uint64_t write_ptr, uint64_t except_ptr,
                                      uint64_t timeout_ptr, bool pselect_timeout);
 
+/**
+ * @brief Wait for poll readiness with a temporary signal mask across retries.
+ * @param fds_ptr User pollfd array, nullable for a zero count.
+ * @param count Number of descriptors, subject to the caller's RLIMIT_NOFILE.
+ * @param timeout_ptr Optional user timespec, rounded up to the poll timeout unit.
+ * @param signal_mask_ptr Optional user pointer to the native 64-bit signal mask.
+ * @param signal_mask_size Eight for a nonnull mask; zero or eight otherwise.
+ * @return Ready count, zero on timeout, negative errno or an owned retry token.
+ * @note Called under syscall execution ownership. Restores the original mask on
+ * final completion; blocking retries, cancellation and signal frames own its lifetime.
+ */
 int64_t syscall_ppoll(uint64_t fds_ptr, uint64_t count, uint64_t timeout_ptr,
                              uint64_t signal_mask_ptr, uint64_t signal_mask_size);
 

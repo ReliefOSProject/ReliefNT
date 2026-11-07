@@ -32,12 +32,20 @@ static int64_t pselect_call(uint64_t *fds, uint64_t *mask_arg, bool frame_scope)
                                  (uintptr_t)mask_arg);
 }
 
-static int64_t ppoll_call(struct pollfd *fds, struct linux_timespec *timeout)
+static int64_t ppoll_mask_call(struct pollfd *fds, uint64_t count,
+                               struct linux_timespec *timeout, uint64_t *mask,
+                               uint64_t mask_size, bool frame_scope)
 {
     struct trap_frame frame = {.rax = LINUX_SYS_PPOLL, .rdi = (uintptr_t)fds,
-                               .rsi = 1, .rdx = (uintptr_t)timeout};
-    task_lookup_scope_begin(&current, &frame);
-    return syscall_ppoll((uintptr_t)fds, 1, (uintptr_t)timeout, 0, 0);
+        .rsi = count, .rdx = (uintptr_t)timeout, .r10 = (uintptr_t)mask, .r8 = mask_size};
+    if (frame_scope) task_lookup_scope_begin(&current, &frame);
+    return syscall_legacy_events(LINUX_SYS_PPOLL, (uintptr_t)fds, count,
+                                 (uintptr_t)timeout, (uintptr_t)mask, mask_size, 0);
+}
+
+static int64_t ppoll_call(struct pollfd *fds, struct linux_timespec *timeout)
+{
+    return ppoll_mask_call(fds, 1, timeout, NULL, 0, true);
 }
 
 int main(void)
@@ -95,7 +103,86 @@ int main(void)
     assert(syscall_ppoll(0, 0, 0, (uintptr_t)&sigmask, 4) == -RELIEFOS_EINVAL);
     assert(syscall_ppoll(0, 0, 0, (uintptr_t)&sigmask, 8) == KERNEL_SYSCALL_SWAP_CONTENDED);
     blocked = false;
-    assert(syscall_ppoll(0, 0, 0, (uintptr_t)&sigmask, 8) == -RELIEFOS_EOPNOTSUPP);
+    struct linux_timespec immediate = {0};
+    assert(syscall_ppoll(0, 0, (uintptr_t)&immediate, (uintptr_t)&sigmask, 8) == 0);
+    assert(!current.sigsuspend_active && current.blocked_signals == original);
+
+    set_readable_file(5);
+    request = (struct pollfd){.fd = 5, .events = POLLIN};
+    sigmask = 1ULL << 11;
+    assert(ppoll_mask_call(&request, 1, &immediate, &sigmask, 8, true) == 1);
+    assert(request.revents == POLLIN && !current.sigsuspend_active &&
+           current.blocked_signals == original);
+    clear_scope();
+    assert(ppoll_mask_call(NULL, 17, &immediate, &sigmask, 8, true) == -RELIEFOS_EINVAL);
+    assert(!current.sigsuspend_active && current.blocked_signals == original);
+    clear_scope();
+    timeout.tv_sec = -1;
+    assert(ppoll_mask_call(NULL, 0, &timeout, &sigmask, 8, true) == -RELIEFOS_EINVAL);
+    assert(!current.sigsuspend_active && current.blocked_signals == original);
+    clear_scope();
+
+    request = (struct pollfd){.fd = -1, .events = POLLIN};
+    timeout.tv_sec = 2;
+    sigmask = (1ULL << 11) | (1ULL << 8) | (1ULL << 18);
+    assert(ppoll_mask_call(&request, 1, &timeout, &sigmask, 8, true) == KERNEL_SYSCALL_BLOCKED);
+    assert(current.sigsuspend_active && current.sigsuspend_saved_mask == original &&
+           current.blocked_signals == (1ULL << 11));
+    sigmask = UINT64_MAX;
+    assert(ppoll_mask_call(&request, 1, &timeout, &sigmask, 8, true) == KERNEL_SYSCALL_BLOCKED);
+    assert(current.sigsuspend_saved_mask == original && current.blocked_signals == (1ULL << 11));
+    clear_scope();
+    assert(!current.sigsuspend_active && current.blocked_signals == original &&
+           !current.poll_deadline_ticks);
+
+    sigmask = 0;
+    assert(ppoll_mask_call(NULL, 0, &timeout, &sigmask, 8, true) == -RELIEFOS_EAGAIN);
+    assert(current.sigsuspend_active && !current.blocked_signals &&
+           current.sigsuspend_saved_mask == original);
+    clear_scope();
+    assert(!current.sigsuspend_active && current.blocked_signals == original);
+
+    request = (struct pollfd){.fd = 5, .events = POLLIN};
+    block_address = (uintptr_t)&request;
+    block_write = false;
+    block_after = preparations + 1;
+    blocked = true;
+    assert(ppoll_mask_call(&request, 1, &timeout, &sigmask, 8, true) == KERNEL_SYSCALL_SWAP_CONTENDED);
+    assert(current.sigsuspend_active && !current.blocked_signals);
+    sigmask = UINT64_MAX;
+    timeout.tv_sec = -1;
+    blocked = false;
+    assert(ppoll_mask_call(&request, 1, &timeout, &sigmask, 8, true) == 1);
+    assert(!current.sigsuspend_active && current.blocked_signals == original);
+    clear_scope();
+
+    request = (struct pollfd){.fd = 5, .events = POLLIN};
+    timeout.tv_sec = 2;
+    sigmask = 0;
+    block_write = true;
+    block_after = preparations + 5;
+    blocked = true;
+    assert(ppoll_mask_call(&request, 1, &timeout, &sigmask, 8, true) == KERNEL_SYSCALL_SWAP_CONTENDED);
+    assert(current.sigsuspend_active && !current.blocked_signals);
+    files[5].used = 0;
+    blocked = false;
+    assert(ppoll_mask_call(&request, 1, &timeout, &sigmask, 8, true) == 1);
+    assert(request.revents == POLLIN && !current.sigsuspend_active &&
+           current.blocked_signals == original);
+    clear_scope();
+
+    set_readable_file(5);
+    blocked = true;
+    assert(ppoll_mask_call(&request, 1, &timeout, &sigmask, 8, false) == KERNEL_SYSCALL_SWAP_CONTENDED);
+    assert(!current.sigsuspend_active && current.blocked_signals == original);
+    blocked = false;
+
+    request.fd = -1;
+    assert(ppoll_mask_call(&request, 1, &timeout, &sigmask, 8, true) == KERNEL_SYSCALL_BLOCKED);
+    struct trap_frame replacement = {.rax = LINUX_SYS_GETPID};
+    task_lookup_scope_begin(&current, &replacement);
+    assert(!current.sigsuspend_active && current.blocked_signals == original &&
+           !current.poll_deadline_ticks && !current.lookup_scope.armed);
     puts("PASS pselect/ppoll: masks, bounded inputs, owned retry and cancel/no-frame restore");
     return 0;
 }

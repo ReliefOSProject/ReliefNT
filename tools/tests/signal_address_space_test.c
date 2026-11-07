@@ -391,17 +391,38 @@ int main(void)
     assert(saved.uc.mask == (1ULL << 1));
 #endif
     assert(!target.sigsuspend_active && !target.restart_syscall && !target.poll_deadline_ticks);
-    target.blocked_signals = 0;
+    target.blocked_signals = 1ULL << 10;
+    target.sigsuspend_saved_mask = 1ULL << 3;
+    target.sigsuspend_active = 1;
+#ifdef TASK8_REAL_LOOKUP_SCOPE
+    target.lookup_scope.armed = true;
+    target.lookup_scope.number = __NR_ppoll;
+#endif
     target.restart_syscall = __NR_ppoll + 1;
     target.poll_deadline_ticks = 200;
     target.signal_actions[2].flags = LINUX_SA_RESTART;
-    frame = (struct trap_frame){.rsp = saved_rsp, .rip = 0x430000, .cs = 0x23};
+    frame = (struct trap_frame){.rsp = saved_rsp, .rip = 0x430000, .cs = 0x23, .ss = 0x1b};
     assert(kernel_signal_queue_task(&target, 2) == 0);
     assert(kernel_signal_deliver_pending(&target, &frame) == 1);
     memcpy(&saved, target_pages + (frame.rsp - STACK_ADDRESS), sizeof(saved));
     assert(saved.uc.context.rip == 0x430002 &&
            (int64_t)saved.uc.context.rax == -LINUX_EINTR);
-    assert(!target.restart_syscall && !target.poll_deadline_ticks);
+    assert(saved.uc.mask == (1ULL << 3) && (target.blocked_signals & (1ULL << 10)) &&
+           !(target.blocked_signals & (1ULL << 3)));
+    assert(!target.sigsuspend_active && !target.restart_syscall && !target.poll_deadline_ticks);
+#ifdef TASK8_REAL_LOOKUP_SCOPE
+    assert(!target.lookup_scope.armed);
+    drained_io = 0;
+#endif
+    uint8_t ppoll_stack_backup[sizeof(target_pages)];
+    memcpy(ppoll_stack_backup, previous_stack, sizeof(ppoll_stack_backup));
+    memcpy(previous_stack, target_pages, sizeof(target_pages));
+    frame.rsp += 8;
+    assert(kernel_signal_rt_sigreturn(&target, &frame) == 0);
+    assert(target.blocked_signals == (1ULL << 3) && (int64_t)frame.rax == -LINUX_EINTR &&
+           fpu_restore_calls == 1);
+    fpu_restore_calls = 0;
+    memcpy(previous_stack, ppoll_stack_backup, sizeof(ppoll_stack_backup));
     const uint64_t epoll_calls[] = {__NR_epoll_wait, __NR_epoll_pwait, __NR_epoll_pwait2};
     for (unsigned i = 0; i < sizeof(epoll_calls) / sizeof(epoll_calls[0]); ++i) {
         target.blocked_signals = 0;

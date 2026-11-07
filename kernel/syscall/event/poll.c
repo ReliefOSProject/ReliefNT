@@ -673,37 +673,66 @@ select_out:
 #endif
 }
 
+/**
+ * @brief Poll with a temporary signal mask owned across scheduler retries.
+ * @param fds_ptr User pollfd array, nullable when count is zero.
+ * @param count Number of pollfd entries, checked against the caller's limit.
+ * @param timeout_ptr Optional user timespec; null selects an indefinite wait.
+ * @param signal_mask_ptr Optional user pointer to the native 64-bit signal set.
+ * @param signal_mask_size Signal-set size; a nonnull mask requires eight bytes.
+ * @return Ready count, zero on timeout, negative errno or an internal retry token.
+ * @note The syscall execution transaction serializes mask installation with
+ * polling. Matching retries retain the temporary mask; final returns and scope
+ * cancellation restore it, while signal delivery saves the old mask for sigreturn.
+ * Mask and timeout operands are copied before installation and retained by the swap scope.
+ */
 int64_t syscall_ppoll(uint64_t fds_ptr, uint64_t count, uint64_t timeout_ptr,
                              uint64_t signal_mask_ptr, uint64_t signal_mask_size)
 {
+    struct task *task = sched_current_task();
+    uint64_t requested_mask = 0;
     int64_t timeout_ms = -1;
+    int64_t result = -RELIEFOS_EINVAL;
+    if (!task) return result;
     if (signal_mask_ptr) {
-        if (signal_mask_size != sizeof(uint64_t)) return -RELIEFOS_EINVAL;
+        if (signal_mask_size != sizeof(requested_mask)) goto ppoll_out;
 #ifdef CONFIG_SWAP
-        int rc = swap_prepare_user_range(sched_current_task(), signal_mask_ptr, sizeof(uint64_t), false);
-        if (rc == SWAP_STORAGE_CONTENDED) return KERNEL_SYSCALL_SWAP_CONTENDED;
-        if (rc < 0) return -RELIEFOS_EFAULT;
+        struct task_user_text operand;
+        result = task_lookup_user_bytes(task, signal_mask_ptr, sizeof(requested_mask), &operand);
+        if (result) goto ppoll_out;
+        __builtin_memcpy(&requested_mask, operand.text, sizeof(requested_mask));
+        kernel_free(operand.allocation);
+#else
+        if (!task->sigsuspend_active) {
+            if (!user_range_ok(signal_mask_ptr, sizeof(requested_mask))) {
+                result = -RELIEFOS_EFAULT;
+                goto ppoll_out;
+            }
+            __builtin_memcpy(&requested_mask, (const void *)(uintptr_t)signal_mask_ptr,
+                             sizeof(requested_mask));
+        }
 #endif
-        if (!user_range_ok(signal_mask_ptr, sizeof(uint64_t))) return -RELIEFOS_EFAULT;
-        return -RELIEFOS_EOPNOTSUPP;
-    }
-    if (signal_mask_size != 0 && signal_mask_size != sizeof(uint64_t)) {
-        return -RELIEFOS_EINVAL;
+    } else if (signal_mask_size != 0 && signal_mask_size != sizeof(requested_mask)) {
+        goto ppoll_out;
     }
     if (timeout_ptr) {
         struct linux_timespec timeout;
 #ifdef CONFIG_SWAP
         struct task_user_text operand;
-        int rc = task_lookup_user_bytes(sched_current_task(), timeout_ptr, sizeof(timeout), &operand);
-        if (rc) return rc;
+        result = task_lookup_user_bytes(task, timeout_ptr, sizeof(timeout), &operand);
+        if (result) goto ppoll_out;
         __builtin_memcpy(&timeout, operand.text, sizeof(timeout));
         kernel_free(operand.allocation);
 #else
-        if (!user_range_ok(timeout_ptr, sizeof(timeout))) return -RELIEFOS_EFAULT;
+        if (!user_range_ok(timeout_ptr, sizeof(timeout))) {
+            result = -RELIEFOS_EFAULT;
+            goto ppoll_out;
+        }
         timeout = *(const struct linux_timespec *)(uintptr_t)timeout_ptr;
 #endif
         if (timeout.tv_sec < 0 || timeout.tv_nsec < 0 || timeout.tv_nsec >= 1000000000) {
-            return -RELIEFOS_EINVAL;
+            result = -RELIEFOS_EINVAL;
+            goto ppoll_out;
         }
         if (timeout.tv_sec > 2147482) {
             timeout_ms = 2147483647;
@@ -712,5 +741,22 @@ int64_t syscall_ppoll(uint64_t fds_ptr, uint64_t count, uint64_t timeout_ptr,
             if (timeout_ms > 2147483647) timeout_ms = 2147483647;
         }
     }
-    return syscall_poll(fds_ptr, count, timeout_ms);
+    if (signal_mask_ptr && !task->sigsuspend_active) {
+        task->sigsuspend_saved_mask = task->blocked_signals;
+        task->sigsuspend_active = 1;
+        task->blocked_signals = requested_mask & ~((1ULL << 8) | (1ULL << 18));
+    }
+    result = syscall_poll(fds_ptr, count, timeout_ms);
+ppoll_out:
+    if (result != -RELIEFOS_EAGAIN &&
+        result != KERNEL_SYSCALL_BLOCKED &&
+#ifdef CONFIG_SWAP
+        !(result == KERNEL_SYSCALL_SWAP_CONTENDED && task->lookup_scope.armed &&
+          task->lookup_scope.number == LINUX_SYS_PPOLL) &&
+#endif
+        task->sigsuspend_active) {
+        task->blocked_signals = task->sigsuspend_saved_mask;
+        task->sigsuspend_active = 0;
+    }
+    return result;
 }

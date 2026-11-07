@@ -55,12 +55,13 @@ static bool lookup_path_call(uint64_t number)
     case __NR_mknod: case __NR_mknodat: case __NR_mount: case __NR_umount2:
     case __NR_statfs: case __NR_fstatfs: case __NR_execve: case __NR_execveat:
     case __NR_bind: case __NR_connect: case __NR_sendto: case __NR_sendmsg: case __NR_sendmmsg:
+    case __NR_ppoll:
 #ifdef CONFIG_SWAP
     case __NR_recvfrom: case __NR_recvmsg: case __NR_recvmmsg: case __NR_mincore:
     case __NR_prlimit64: case __NR_rt_sigprocmask: case __NR_timerfd_settime:
     case __NR_memfd_create: case __NR_swapon: case __NR_swapoff: case __NR_clone3:
     case __NR_process_vm_readv: case __NR_process_vm_writev:
-    case __NR_poll: case __NR_ppoll: case __NR_select: case __NR_pselect6:
+    case __NR_poll: case __NR_select: case __NR_pselect6:
     case __NR_getdents: case __NR_getdents64:
     case __NR_msgsnd: case __NR_msgrcv: case __NR_msgctl:
     case __NR_semop: case __NR_semtimedop: case __NR_semctl:
@@ -102,21 +103,21 @@ static void lookup_path_release(struct task_lookup_path *path)
  * An empty scope performs no work. Detaches the entire list first so nested
  * cleanup cannot release it twice. Removes a parked wait and drains owned
  * storage commands before any path/provider can retire, including direct
- * call-replacement cancellation without an admitted OFD. Backend puts may
- * perform I/O; no scheduler, graph or module-table spinlock spans this call.
+ * call-replacement cancellation without an admitted OFD. Restores temporary
+ * ppoll/pselect signal masks before retiring their operand snapshots and clears
+ * a canceled ppoll deadline. Backend puts may perform I/O; no scheduler, graph
+ * or module-table spinlock spans this call.
  */
 void task_lookup_scope_cancel(struct task *task)
 {
     if(!task || !task->lookup_scope.armed)return;
     struct task_lookup_scope old=task->lookup_scope;
     task->lookup_scope=(struct task_lookup_scope){0};
-#ifdef CONFIG_SWAP
-    /* A canceled pselect owns its temporary mask until completion or signal. */
-    if(old.number==__NR_pselect6 && task->sigsuspend_active) {
+    if((old.number==__NR_pselect6 || old.number==__NR_ppoll) && task->sigsuspend_active) {
         task->blocked_signals=task->sigsuspend_saved_mask;
         task->sigsuspend_active=0;
     }
-#endif
+    if(old.number==__NR_ppoll)task->poll_deadline_ticks=0;
 #ifdef CONFIG_SWAP
     if(memory_wait_cancel &&
        (old.number==__NR_mincore ||

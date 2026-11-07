@@ -191,6 +191,41 @@ static int test_nofile_bound_and_signed_overflow(void)
     return 0;
 }
 
+static int test_ppoll_signal_mask(void)
+{
+    uint64_t original_mask = 1ULL << 9;
+    uint64_t signal_mask = 0;
+    struct linux_timespec timeout = {0};
+    struct pollfd descriptor = {.fd = 5, .events = POLLIN};
+    current.blocked_signals = original_mask;
+    set_readable_file(5);
+    assert(syscall_ppoll((uintptr_t)&descriptor, 1, (uintptr_t)&timeout,
+                         (uintptr_t)&signal_mask, sizeof(signal_mask)) == 1);
+    assert(descriptor.revents == POLLIN && !current.sigsuspend_active &&
+           current.blocked_signals == original_mask);
+    signal_mask = UINT64_MAX;
+    descriptor.fd = -1;
+    timeout.tv_sec = 1;
+    assert(syscall_ppoll((uintptr_t)&descriptor, 1, (uintptr_t)&timeout,
+                         (uintptr_t)&signal_mask, sizeof(signal_mask)) == KERNEL_SYSCALL_BLOCKED);
+    uint64_t temporary_mask = UINT64_MAX & ~((1ULL << 8) | (1ULL << 18));
+    assert(current.sigsuspend_active && current.blocked_signals == temporary_mask &&
+           current.sigsuspend_saved_mask == original_mask);
+    signal_mask = 0;
+    assert(syscall_ppoll((uintptr_t)&descriptor, 1, (uintptr_t)&timeout,
+                         (uintptr_t)&signal_mask, sizeof(signal_mask)) == KERNEL_SYSCALL_BLOCKED);
+    assert(current.blocked_signals == temporary_mask &&
+           current.sigsuspend_saved_mask == original_mask);
+    current.poll_deadline_ticks = time_ticks();
+    assert(syscall_ppoll((uintptr_t)&descriptor, 1, (uintptr_t)&timeout,
+                         (uintptr_t)&signal_mask, sizeof(signal_mask)) == 0);
+    assert(!current.sigsuspend_active && current.blocked_signals == original_mask);
+    assert(syscall_ppoll(0, 1, 0, (uintptr_t)&signal_mask,
+                         sizeof(signal_mask)) == -RELIEFOS_EFAULT);
+    assert(!current.sigsuspend_active && current.blocked_signals == original_mask);
+    return 0;
+}
+
 int main(void)
 {
     memset(&current, 0, sizeof(current));
@@ -202,6 +237,7 @@ int main(void)
     if (test_error_preserves_masks()) return 1;
     if (test_allocation_failure_preserves_masks()) return 1;
     if (test_nofile_bound_and_signed_overflow()) return 1;
+    if (test_ppoll_signal_mask()) return 1;
     puts("PASS raw select: fd 1100, RLIMIT bound, error and allocation mask preservation");
     return 0;
 }
