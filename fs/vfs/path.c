@@ -190,7 +190,7 @@ static int vfs_path_format_walk(const struct vfs_path *root,const struct vfs_pat
     if(!buffer || !capacity)return -EINVAL;buffer[0]=0;
     struct vfs_path cursor=*path;size_t at=capacity-1;buffer[at]=0;
     while(!vfs_path_equal(root,&cursor)) {
-        if(cursor.dentry->disconnected && !diagnostic){buffer[0]=0;return -ENOENT;}
+        if(cursor.dentry->disconnected && !diagnostic && cursor.dentry!=cursor.mount->root){buffer[0]=0;return -ENOENT;}
         if(cursor.dentry==cursor.mount->root) {
             if(!cursor.mount->point.mount){buffer[0]=0;return -ENOENT;}
             cursor=cursor.mount->point;continue;
@@ -244,8 +244,10 @@ int vfs_path_backend_name(const struct vfs_path *path,char *buffer,size_t capaci
 {
     if(!buffer || !capacity)return -EINVAL;buffer[0]=0;
     if(!vfs_path_valid(path))return -EINVAL;
-    struct vfs_path root={path->mount,path->mount->root};
-    return vfs_path_format_walk(&root,path,buffer,capacity,false);
+    struct vfs_path native=*path;
+    while(native.mount->bind_source.mount)native.mount=native.mount->bind_source.mount;
+    struct vfs_path root={native.mount,native.mount->root};
+    return vfs_path_format_walk(&root,&native,buffer,capacity,false);
 }
 
 int vfs_path_getcwd(const struct vfs_namespace *ns,const struct vfs_path *root,

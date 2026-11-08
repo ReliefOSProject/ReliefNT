@@ -2345,6 +2345,16 @@ static void runtime_mount_syscalls(struct vfs_namespace *ns,const struct vfs_pat
     assert(vfs_path_mount_flags(&mounted)&MS_RDONLY);
     assert(vfs_path_mount_flags(&mounted)&MS_RELATIME);vfs_path_put(&mounted);
     strcpy(user.source,"/syscall-source");strcpy(user.target,"/syscall-destination");
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,source,target,UINT64_MAX,MS_BIND|MS_REC,UINT64_MAX)==-EOPNOTSUPP);
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,source,target,UINT64_MAX,MS_BIND|MS_SILENT,UINT64_MAX));
+    assert(!vfs_path_lookup(ns,root,root,user.target,0,&mounted));
+    assert(vfs_path_context(&mounted)==volume);
+    assert((vfs_path_mount_flags(&mounted)&(MS_RDONLY|MS_NOSUID|MS_NODEV))==(MS_RDONLY|MS_NOSUID|MS_NODEV));
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,target,0,0,0,0)==-EBUSY);
+    vfs_path_put(&mounted);
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,source,0,0,0,0)==-EBUSY);
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,target,0,0,0,0));
+    assert(volume->ready);
     assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,source,target,0,MS_MOVE|MS_SILENT,0));
     assert(!vfs_path_lookup(ns,root,root,user.target,0,&mounted));
     assert(vfs_path_context(&mounted)==volume && (vfs_path_mount_flags(&mounted)&MS_RDONLY));vfs_path_put(&mounted);

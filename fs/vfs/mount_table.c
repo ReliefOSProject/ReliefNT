@@ -75,7 +75,14 @@ static int mount_line(const struct vfs_namespace *ns,const struct vfs_path *root
     struct vfs_path mounted_root={(struct vfs_mount *)mount,mount->root};
     rc=vfs_path_format(ns,root,&mounted_root,point,VFS_PATH_MAX);
     if(rc==-ENOENT)return 0;
-    backing[0]='/';backing[1]=0;
+    if(rc)return rc;
+    rc=vfs_path_backend_name(&mounted_root,backing,VFS_PATH_MAX);
+    if(rc==-ENOENT && mount->bind_source.mount) {
+        struct vfs_path native=mounted_root;
+        while(native.mount->bind_source.mount)native.mount=native.mount->bind_source.mount;
+        struct vfs_path native_root={native.mount,native.mount->root};
+        rc=vfs_path_format_link(ns,&native_root,&native,backing,VFS_PATH_MAX);
+    }
     if(rc)return rc;
     struct vfs_path path={(struct vfs_mount *)mount,mount->root};
     uint64_t flags=vfs_path_mount_flags(&path);

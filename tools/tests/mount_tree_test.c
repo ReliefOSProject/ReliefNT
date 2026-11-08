@@ -421,8 +421,56 @@ static void mount_table_objects(void)
     puts("PASS proc mount views follow actual moves, subtree parent IDs, escaping, chroot, chunked reads and detach");
 }
 
+/** @brief Prove bind views retain actual subdirectory objects and source lifetime. */
+static void bound_directory_objects(void)
+{
+    struct vfs_namespace ns={0};struct vfs_mount *base=mount_new(&a,NULL);
+    assert(!vfs_namespace_init(&ns,base));vfs_mount_put(base);
+    struct vfs_path root={0};assert(!vfs_namespace_root(&ns,&root));
+    struct vfs_path source=find(&ns,&root,&root,"/mnt",2);
+    struct vfs_path target=find(&ns,&root,&root,"/other",3);
+    size_t saved=allocations;
+    for(unsigned nth=1;nth<=2;++nth) {
+        fail_after=nth;allocation_attempts=0;
+        assert(vfs_mount_bind(&ns,&source,&target)==-ENOMEM);
+        fail_after=0;assert(allocations==saved);
+    }
+    assert(!vfs_mount_bind(&ns,&source,&target));
+    struct vfs_path bound=find(&ns,&root,&root,"/other",2);
+    struct vfs_path leaf=find(&ns,&root,&root,"/other/old",4);
+    struct vfs_path original=find(&ns,&root,&root,"/mnt/old",4);
+    assert(leaf.dentry==original.dentry && leaf.mount!=original.mount);
+    formatted(&ns,&root,&leaf,"/other/old");backend_formatted(&leaf,"/mnt/old");
+    struct vfs_path parent=find(&ns,&root,&bound,"..",1);
+    assert(vfs_path_equal(&root,&parent));vfs_path_put(&parent);
+    parent=find(&ns,&bound,&bound,"../old",4);vfs_path_put(&parent);
+    char table[1024];uint32_t count=0;
+    assert(!vfs_read_mount_table(&ns,&root,true,0,table,sizeof(table)-1,&count));table[count]=0;
+    assert(strstr(table," /mnt /other "));
+    struct vfs_rename *change=NULL;
+    assert(!vfs_rename_prepare(&ns,&source,&root,"renamed",&change));
+    a_entries[1].name="renamed";vfs_rename_commit(change);
+    backend_formatted(&leaf,"/renamed/old");formatted(&ns,&root,&leaf,"/other/old");
+    assert(!vfs_mount_bind(&ns,&bound,&source));
+    struct vfs_path chained=find(&ns,&root,&root,"/renamed",2);
+    backend_formatted(&chained,"/renamed");
+    assert(vfs_mount_unmount(&ns,&bound)==-EBUSY);
+    assert(vfs_mount_move(&ns,&bound,&chained)==-ELOOP);
+    assert(!vfs_mount_unmount(&ns,&chained));vfs_path_put(&chained);
+    vfs_path_put(&leaf);vfs_path_put(&original);
+    vfs_path_unlinked(&source);
+    assert(!vfs_read_mount_table(&ns,&root,true,0,table,sizeof(table)-1,&count));table[count]=0;
+    assert(strstr(table,"/renamed\\040(deleted) /other "));
+    assert(!vfs_mount_unmount(&ns,&bound));vfs_path_put(&bound);
+    vfs_path_put(&source);vfs_path_put(&target);vfs_path_put(&root);
+    assert(!vfs_namespace_destroy(&ns));a_entries[1].name="mnt";
+    no_pins(&a);assert(!allocations);
+    puts("PASS bind directories: shared inode/rename, backend names, mountinfo, chained views, busy unmount, cycle and allocation rollback");
+}
+
 int main(void)
 {
+    bound_directory_objects();
     mount_table_objects();
     magic_link_objects();
     renamed_paths();

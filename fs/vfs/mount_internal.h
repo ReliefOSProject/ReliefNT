@@ -25,7 +25,7 @@ struct vfs_mount {
     struct vfs_namespace *ns;
     struct vfs_mount *next,*notify_next;
     struct vfs_mount **notify_link;
-    struct vfs_path point;
+    struct vfs_path point,bind_source;
     struct vfs_dentry *root;
     const struct vfs_backend_ops *ops;
     void *context;

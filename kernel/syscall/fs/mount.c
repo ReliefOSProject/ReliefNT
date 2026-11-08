@@ -22,6 +22,23 @@ static int mount_move(struct vfs_namespace *ns,struct task *task,uint64_t source
     vfs_path_put(&from.path);vfs_path_put(&to.path);return rc;
 }
 
+/** @brief Resolve and retain both endpoints of a nonrecursive directory bind.
+ * @param ns Authorized caller's execution-owned namespace.
+ * @param task Caller with retry-stable user lookup operands.
+ * @param source Required user source path. @param target Required user target.
+ * @return Zero or negative lookup/type/busy/allocation errno. Local paths
+ * always retire; successful attachment retains the actual source objects.
+ */
+static int mount_bind(struct vfs_namespace *ns,struct task *task,uint64_t source,uint64_t target)
+{
+    struct vfs_lookup_result from={0},to={0};
+    int rc=resolve_user_object_at_flags(ns,task,LINUX_AT_FDCWD,source,false,false,VFS_LOOKUP_FOLLOW,&from);
+    if(!rc)storage_release_task_io(task->pid);
+    if(!rc)rc=resolve_user_object_at_flags(ns,task,LINUX_AT_FDCWD,target,false,false,VFS_LOOKUP_FOLLOW,&to);
+    if(!rc)rc=vfs_mount_bind(ns,&from.path,&to.path);
+    vfs_path_put(&from.path);vfs_path_put(&to.path);return rc;
+}
+
 /** @brief Sync and detach the selected topmost mount with real busy checking.
  * @param ns Borrowed execution-owned namespace.
  * @param task Authorized caller retaining any retry scope.
@@ -147,6 +164,7 @@ int64_t syscall_mount_control(struct vfs_namespace *ns,struct task *task,uint64_
     a3&=~MS_SILENT;
     if(a3&MS_REMOUNT)return a4 ? -RELIEFOS_EOPNOTSUPP : mount_remount(ns,task,a1,a3&~MS_REMOUNT);
     if(a3&MS_MOVE)return a3!=MS_MOVE ? -RELIEFOS_EOPNOTSUPP : mount_move(ns,task,a0,a1);
+    if(a3&MS_BIND)return a3!=MS_BIND ? -RELIEFOS_EOPNOTSUPP : mount_bind(ns,task,a0,a1);
     const uint64_t supported=MS_RDONLY|MS_NOSUID|MS_NODEV|MS_NOEXEC|MS_SYNCHRONOUS|MS_DIRSYNC|
         MS_NOATIME|MS_NODIRATIME|MS_RELATIME|MS_STRICTATIME|MS_LAZYTIME;
     if(a3&~supported)return -RELIEFOS_EOPNOTSUPP;

@@ -123,6 +123,9 @@ void vfs_notify_mount_retired(struct vfs_mount *mount)
  */
 void vfs_notify_dentry_created(struct vfs_mount *mount,struct vfs_dentry *dentry)
 {
+    /* Shared dentries belong to the backend's canonical mount, which every
+     * bind view pins. A short-lived alias must not own weak inode records. */
+    while(mount->bind_source.mount)mount=mount->bind_source.mount;
     dentry->notify_mount=mount;dentry->notify_next=notify_dentries;dentry->notify_link=&notify_dentries;
     if(notify_dentries)notify_dentries->notify_link=&dentry->notify_next;
     notify_dentries=dentry;

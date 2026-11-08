@@ -32,6 +32,13 @@ bool vfs_reclaim_pending(void) {return retired_count!=0;}
  */
 static bool vfs_finish_retirement(struct vfs_mount *mount)
 {
+    if(mount->bind_source.mount) {
+        struct vfs_path backing=mount->bind_source;
+        if(vfs_notify_mount_retired)vfs_notify_mount_retired(mount);
+        struct module *owner=mount->owner;
+        kernel_free(mount->source);kernel_free(mount);
+        vfs_path_put(&backing);module_put(owner);return true;
+    }
     if(mount->ops->finish && mount->ops->finish(mount->context))return false;
     if(vfs_notify_mount_retired)vfs_notify_mount_retired(mount);
     struct module *owner=mount->owner;
@@ -105,7 +112,7 @@ void vfs_mount_put(struct vfs_mount *mount)
 {
     if(!mount || --mount->references)return;
     vfs_lookup_cache_purge(mount);
-    vfs_dentry_put(mount,mount->root);
+    if(!mount->bind_source.mount)vfs_dentry_put(mount,mount->root);
     mount->root=NULL;
     if(!vfs_finish_retirement(mount))vfs_queue_retirement(mount);
 }
@@ -226,6 +233,34 @@ int vfs_mount_attach(struct vfs_namespace *ns,struct vfs_mount *mount,const stru
     mount->next=ns->mounts;ns->mounts=mount;return 0;
 }
 
+/** @brief Publish an independent directory view sharing the retained source graph.
+ * @param ns Borrowed execution-owned namespace.
+ * @param source Borrowed directory path retained before publication.
+ * @param target Borrowed destination directory path in the same namespace.
+ * @return Zero or negative errno; every allocation/admission/attach failure
+ * releases only newly acquired references. No provider context is duplicated,
+ * and no graph lock spans allocation or backend callbacks.
+ */
+int vfs_mount_bind(struct vfs_namespace *ns,const struct vfs_path *source,const struct vfs_path *target)
+{
+    if(!ns || !vfs_path_valid(source) || !vfs_path_valid(target))return -EINVAL;
+    if(source->mount->ns!=ns || target->mount->ns!=ns)return -EXDEV;
+    if(source->dentry->node.type!=RELIEFOS_FS_TYPE_DIR || target->dentry->node.type!=RELIEFOS_FS_TYPE_DIR)return -ENOTDIR;
+    if(source->dentry->disconnected)return -ENOENT;
+    struct vfs_mount *original=source->mount;
+    if(!try_module_get(original->owner))return -ENODEV;
+    struct vfs_mount *mount=kernel_malloc(sizeof(*mount));
+    if(!mount){module_put(original->owner);return -ENOMEM;}
+    *mount=(struct vfs_mount){.ops=original->ops,.context=original->context,
+        .owner=original->owner,.references=1,.root=source->dentry,.policy=original->policy};
+    vfs_path_get(source,&mount->bind_source);
+    if(vfs_notify_mount_created)vfs_notify_mount_created(mount);
+    int rc=vfs_mount_describe(mount,original->source ? original->source : "none",
+        original->filesystem ? original->filesystem : "none",original->device);
+    if(!rc)rc=vfs_mount_attach(ns,mount,target);
+    vfs_mount_put(mount);return rc;
+}
+
 int vfs_mount_move(struct vfs_namespace *ns,const struct vfs_path *source,const struct vfs_path *target)
 {
     if(!ns || !vfs_path_valid(source) || !vfs_path_valid(target))return -EINVAL;
@@ -235,7 +270,8 @@ int vfs_mount_move(struct vfs_namespace *ns,const struct vfs_path *source,const 
     if(mount==ns->root || !mount->point.mount)return -EBUSY;
     if(target->dentry->node.type!=RELIEFOS_FS_TYPE_DIR)return -ENOTDIR;
     for(struct vfs_mount *ancestor=target->mount;ancestor;ancestor=ancestor->point.mount)
-        if(ancestor==mount)return -ELOOP;
+        for(struct vfs_mount *backing=ancestor;backing;backing=backing->bind_source.mount)
+            if(backing==mount)return -ELOOP;
     if(vfs_covering(ns,target))return -EBUSY;
     struct vfs_path replacement={0};vfs_path_get(target,&replacement);
     struct vfs_path old=mount->point;mount->point=replacement;vfs_path_put(&old);return 0;
@@ -257,7 +293,7 @@ int vfs_mount_unmount(struct vfs_namespace *ns,const struct vfs_path *path)
     if(mount->ns!=ns)return -EXDEV;
     if(path->dentry!=mount->root)return -EINVAL;
     if(mount==ns->root || !mount->point.mount || mount->references!=2)return -EBUSY;
-    if(mount->ops->can_unmount) {
+    if(!mount->bind_source.mount && mount->ops->can_unmount) {
         int rc=mount->ops->can_unmount(mount->context,mount->root->backend_pin);if(rc)return rc;
     }
     vfs_mount_detach(ns,mount);return 0;
@@ -270,9 +306,9 @@ int vfs_namespace_destroy(struct vfs_namespace *ns)
     for(struct vfs_mount *mount=ns->mounts;mount;mount=mount->next) {
         uint64_t expected=1;
         for(struct vfs_mount *child=ns->mounts;child;child=child->next)
-            if(child->point.mount==mount)++expected;
+            {if(child->point.mount==mount)++expected;if(child->bind_source.mount==mount)++expected;}
         if(mount->references!=expected)return -EBUSY;
-        if(mount->ops->can_unmount) {
+        if(!mount->bind_source.mount && mount->ops->can_unmount) {
             int rc=mount->ops->can_unmount(mount->context,mount->root->backend_pin);if(rc)return rc;
         }
     }
@@ -280,7 +316,7 @@ int vfs_namespace_destroy(struct vfs_namespace *ns)
         struct vfs_mount *leaf=ns->mounts;
         for(;;) {
             struct vfs_mount *child=ns->mounts;
-            while(child && child->point.mount!=leaf)child=child->next;
+            while(child && child->point.mount!=leaf && child->bind_source.mount!=leaf)child=child->next;
             if(!child)break;leaf=child;
         }
         vfs_mount_detach(ns,leaf);

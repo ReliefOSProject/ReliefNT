@@ -276,6 +276,27 @@ int main(void)
     struct vfs_path point={0};mode.mode=0755;
     assert(!vfs_path_create_node(&root,"mnt",LINUX_S_IFDIR,&mode,NULL,&point));
     take(dirs,dwd,IN_CREATE|IN_ISDIR,"mnt");
+    /* A dentry first discovered through a bind must retain a canonical weak
+     * notification owner after that view retires and another path survives. */
+    struct vfs_path bind_source={0},bind_root={0},bound_file={0},original_file={0};
+    assert(!vfs_path_create_node(&root,"bind-source",LINUX_S_IFDIR,&mode,NULL,&bind_source));
+    take(dirs,dwd,IN_CREATE|IN_ISDIR,"bind-source");
+    struct fsnotify_instance *bind_watch=new_watch(&bind_source,IN_ALL_EVENTS,&fwd);
+    assert(!vfs_mount_bind(&ns,&bind_source,&point));
+    vfs_path_get(&point,&bind_root);vfs_follow_mounts(&ns,&bind_root);
+    mode.mode=0644;
+    assert(!vfs_path_create_node(&bind_root,"retained",LINUX_S_IFREG,&mode,NULL,&bound_file));
+    take(bind_watch,fwd,IN_CREATE,"retained");
+    assert(!vfs_path_lookup_child(&bind_source,"retained",&original_file));
+    vfs_path_put(&bound_file);
+    assert(!vfs_mount_unmount(&ns,&bind_root));vfs_path_put(&bind_root);empty(bind_watch);
+    assert(!vfs_path_write(&original_file,0,"x",1,&written));
+    take(bind_watch,fwd,IN_MODIFY,"retained");
+    assert(!vfs_path_remove(&ns,&original_file,false));
+    take(bind_watch,fwd,IN_DELETE,"retained");vfs_path_put(&original_file);
+    fsnotify_put(bind_watch);
+    assert(!vfs_path_remove(&ns,&bind_source,true));
+    take(dirs,dwd,IN_DELETE|IN_ISDIR,"bind-source");vfs_path_put(&bind_source);
     struct tmpfs_super *childfs=NULL;struct vfs_mount *child=new_mount(&childfs);
     assert(!vfs_mount_attach(&ns,child,&point));
     struct vfs_path child_value={child,child->root},child_root={0};

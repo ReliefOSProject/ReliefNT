@@ -491,6 +491,16 @@ int vfs_namespace_root(const struct vfs_namespace *ns,struct vfs_path *out);
  */
 int vfs_mount_attach(struct vfs_namespace *ns,struct vfs_mount *mount,
                       const struct vfs_path *target);
+/** @brief Bind one directory inode into a separate nonrecursive attachment.
+ * @param ns Execution-owned namespace containing both retained paths.
+ * @param source Directory whose actual dentry/backend remain pinned.
+ * @param target Destination directory, required in the same namespace.
+ * @return Zero or negative errno without a partial attachment. Inherits
+ * source mount policy; shares inode identities and backend lifetime without
+ * duplicating provider destruction. Child mounts are not copied.
+ */
+int vfs_mount_bind(struct vfs_namespace *ns,const struct vfs_path *source,
+                    const struct vfs_path *target);
 /** @brief Atomically move an attached subtree, preserving held paths and IDs.
  * @param ns Namespace under execution ownership.
  * @param source Held root of an attached mount, never the namespace base root.
