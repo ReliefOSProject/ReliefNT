@@ -120,6 +120,7 @@ static int64_t process_resource_limit(uint64_t number, uint64_t a0, uint64_t a1,
      * The process limit still has normal query, update and inheritance rules. */
     else if (resource == LINUX_RLIMIT_CORE) stored = &limits->core;
     else if (resource == LINUX_RLIMIT_MEMLOCK) stored = &limits->memlock;
+    else if (resource == LINUX_RLIMIT_FSIZE) stored = &limits->fsize;
     else return -LINUX_ENOSYS;
     if (setting && next.rlim_max > stored->rlim_max &&
         !(caller->cap_effective & (1ULL << CAP_SYS_RESOURCE))) return -LINUX_EPERM;

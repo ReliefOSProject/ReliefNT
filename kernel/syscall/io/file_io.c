@@ -15,6 +15,8 @@
 #include <reliefnt/usercopy.h>
 #include <reliefos/fs_abi.h>
 #include <linux/errno.h>
+#include <reliefnt/file_limits.h>
+#include "vector_internal.h"
 
 extern void page_cache_note_write(uint64_t) __attribute__((weak));
 
@@ -240,6 +242,11 @@ int64_t syscall_regular_io(struct task *task, struct task_file *file, uint64_t b
         }
         if (position > INT64_MAX || count > (uint64_t)INT64_MAX - position)
             return -LINUX_EINVAL;
+        if (!block && writing && !(file->node.flags & (STORAGE_NODE_FLAG_PROC | STORAGE_NODE_FLAG_SYSFS))) {
+            int ret = task_file_limit_write(task, position, &count,
+                                             !task->vector_io || !task->vector_io->completed);
+            if (ret) return ret;
+        }
         if (resumable) {
             task->regular_io.buffer = buffer;
             task->regular_io.count = count;

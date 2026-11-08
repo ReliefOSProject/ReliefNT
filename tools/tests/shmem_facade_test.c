@@ -7,8 +7,19 @@
 #undef main
 #undef mm_alloc_page
 #undef mm_free_page
+static struct task *limit_task;
+static struct task *shmem_limit_current(void) { return limit_task; }
+#define sched_current_task shmem_limit_current
 #include "../../kernel/ipc/shm.c"
+#undef sched_current_task
 #include <linux/errno.h>
+static unsigned file_size_signals;
+/** @brief Observe the shmem caller's file-size signal without exiting.
+ * @param task Expected limit actor. @param signal_number Required SIGXFSZ.
+ * @return Zero after counting the signal.
+ */
+int kernel_signal_queue_task(struct task *task,int signal_number)
+{assert(task==limit_task && signal_number==LINUX_SIGXFSZ);++file_size_signals;return 0;}
 
 static struct { uint64_t address; unsigned refs; } shmem_frames[8];
 int file_can_write(const struct task_file *file)
@@ -82,6 +93,23 @@ static void shmem_readonly_reopen(void)
     assert(storage_inode_stat(&old,&(struct linux_stat_abi){0})==-RELIEFOS_ENOENT);
     puts("PASS real shmem readonly reopen: independent offset, writer leases, retained anonymous target and shared seals");
 }
+/** @brief Enforce a real memfd short write and the sandbox's zero limit. */
+static void shmem_file_size_limit(void)
+{
+    static struct task actor;
+    actor.limits.fsize=(struct linux_rlimit64){4,4};limit_task=&actor;
+    struct task_file writer={.used=1,.flags=RELIEFOS_O_RDWR};
+    assert(!task_shm_attach(&writer,LINUX_MFD_ALLOW_SEALING));
+    assert(task_shm_write(&writer,"abcdef",6)==4 && writer.offset==4 && writer.node.size==4);
+    assert(!file_size_signals);
+    assert(task_shm_write(&writer,"x",1)==-EFBIG && file_size_signals==1);
+    assert(!task_shm_write(&writer,"",0) && file_size_signals==1);
+    actor.limits.fsize.rlim_cur=0;writer.offset=0;
+    assert(task_shm_write(&writer,"x",1)==-EFBIG && writer.offset==0 && file_size_signals==2);
+    shmem_file_close(&writer);limit_task=NULL;
+    puts("PASS memfd FSIZE: short write, unchanged size/offset on EFBIG, SIGXFSZ and zero length");
+}
+
 static void shmem_path_failures(void)
 {
     unsigned failures=0,successes=0;
@@ -168,7 +196,7 @@ int main(void)
     assert(storage_task_io_owner == 2 && g_active_volume == original_volume);
     storage_release_task_io(2);
     storage_set_io_async_context(false);
-    shmem_path_failures();shmem_readonly_reopen();
+    shmem_path_failures();shmem_readonly_reopen();shmem_file_size_limit();
     tmpfs_destroy(g_shmem_volume.tmpfs);
     g_shmem_volume = (struct storage_volume){0};
     puts("PASS shmem VFS facade: independent superblock, sparse 32 GiB file, coherent pages and inode pins");

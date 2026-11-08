@@ -8,6 +8,7 @@
 #include <linux/fcntl.h>
 #include <linux/mman.h>
 #include <linux/errno.h>
+#include <reliefnt/file_limits.h>
 
 struct task_shm {
     uint32_t refs;
@@ -393,6 +394,10 @@ static int task_shm_write_check(struct task_file *file,uint32_t length)
     struct task_shm *segment = task_shm_for_file(file);
     if (!segment || !file_can_write(file)) return -RELIEFOS_EBADF;
     if (!length) return 0;
+    uint64_t allowed=length;
+    int limited=task_file_limit_write(sched_current_task(),file->offset,&allowed,true);
+    if(limited)return limited;
+    length=(uint32_t)allowed;
     if (segment->seals & (LINUX_F_SEAL_WRITE | LINUX_F_SEAL_FUTURE_WRITE)) return -RELIEFOS_EPERM;
     if (file->offset > INT64_MAX || length > (uint64_t)INT64_MAX - file->offset) return -RELIEFOS_EFBIG;
     if (file->offset + length > segment->node.size && (segment->seals & LINUX_F_SEAL_GROW))
@@ -420,6 +425,10 @@ int task_shm_write(struct task_file *file, const void *buffer, uint32_t length)
     struct task_shm *segment=task_shm_for_file(file);
     if(!segment || !file_can_write(file))return -RELIEFOS_EBADF;
     if(length && !buffer)return -RELIEFOS_EFAULT;
+    uint64_t allowed=length;
+    int limited=task_file_limit_write(sched_current_task(),file->offset,&allowed,true);
+    if(limited)return limited;
+    length=(uint32_t)allowed;
     int check=task_shm_write_check(file,length);if(check)return check;
     if(!length)return 0;
     uint32_t written = 0;

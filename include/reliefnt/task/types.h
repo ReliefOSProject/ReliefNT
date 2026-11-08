@@ -445,6 +445,7 @@ struct task_rlimit_state {
     struct linux_rlimit64 nproc;
     struct linux_rlimit64 core;
     struct linux_rlimit64 memlock;
+    struct linux_rlimit64 fsize;
 };
 
 struct sysv_sem_array;

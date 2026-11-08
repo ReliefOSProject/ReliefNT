@@ -12,6 +12,13 @@
 #include <linux/mount.h>
 
 static unsigned char disk[1048576], data[1048576];
+static unsigned file_size_signals;
+/** @brief Record a fixture SIGXFSZ instead of terminating the caller.
+ * @param task Borrowed caller. @param signal_number Expected file-size signal.
+ * @return Zero after recording delivery.
+ */
+int kernel_signal_queue_task(struct task *task,int signal_number)
+{assert(task && signal_number==LINUX_SIGXFSZ);++file_size_signals;return 0;}
 static unsigned char *fixture_user, *fixture_alias;
 static unsigned fixture_refs;
 static bool fixture_device,fixture_readonly;
@@ -188,6 +195,7 @@ int main(void)
     assert(!vfs_path_anonymous(mount,&file.node,&file.path_ref));vfs_mount_put(mount);
     strcpy(file.path,"/a/diagnostic/name/that/was/replaced");expected_cursor=&file.read_cursor;
     assert(task && other);
+    task->limits.fsize=other->limits.fsize=(struct linux_rlimit64){LINUX_RLIM_INFINITY,LINUX_RLIM_INFINITY};
     task->pid = 10;
     other->pid = 11;
     task->syscall_file = other->syscall_file = &file;
@@ -323,6 +331,23 @@ int main(void)
     assert(fixture_refs == 1 && fixture_drained); fixture_expect_drain = false;
     task->regular_io.active = false; file.io_owner = 0; close(shared);
     munmap(fixture_user, 4096); munmap(fixture_alias, 4096); task->kind = TASK_KIND_KERNEL;
+    /* Exercise the actual provider path, including a partial write and a
+     * blocked append. A zero-length request must not signal or write. */
+    file.flags=RELIEFOS_O_RDWR;file.offset=4;error_offset=UINT64_MAX;
+    task->syscall_file_number=LINUX_SYS_WRITE;task->limits.fsize.rlim_cur=8;
+    unsigned before_writes=provider_writes;
+    assert(syscall_regular_io(task,&file,(uintptr_t)data,10,0,true,false)==4);
+    assert(file.offset==8 && !file_size_signals && provider_writes>before_writes);
+    before_writes=provider_writes;
+    assert(syscall_regular_io(task,&file,(uintptr_t)data,1,0,true,false)==-LINUX_EFBIG);
+    assert(file.offset==8 && file_size_signals==1 && provider_writes==before_writes);
+    assert(!syscall_regular_io(task,&file,(uintptr_t)data,0,0,true,false) && file_size_signals==1);
+    file.flags|=RELIEFOS_O_APPEND;disk_size=10;
+    assert(syscall_regular_io(task,&file,(uintptr_t)data,1,0,true,false)==-LINUX_EFBIG);
+    assert(file_size_signals==2 && provider_writes==before_writes);
+    file.flags=RELIEFOS_O_RDWR;task->vector_io=&vector_state;vector_state.completed=4;
+    assert(syscall_regular_io(task,&file,(uintptr_t)data,1,8,true,true)==-LINUX_EFBIG && file_size_signals==2);
+    task->vector_io=NULL;
     vfs_path_put(&file.path_ref);assert(!provider_pins);
     free(task);
     free(other);

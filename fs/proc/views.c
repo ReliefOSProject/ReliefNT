@@ -278,7 +278,7 @@ static void status(struct task *t, struct text_stream *s)
     text_string(s, "\n");
     proc_task_identity_fields(t, s);
 }
-/** @brief Emit the seven resource limits actually enforced/stored by the kernel.
+/** @brief Emit the resource limits actually enforced/stored by the kernel.
  * @param t Live target. @param s Required stream; query never changes limits.
  */
 static void limits(struct task *t, struct text_stream *s)
@@ -286,12 +286,12 @@ static void limits(struct task *t, struct text_stream *s)
     struct task_rlimit_state *l = sched_task_limits(t);
     const char *names[] = {"Max open files",   "Max address space", "Max pending signals",
                            "Max stack size",   "Max processes",     "Max core file size",
-                           "Max locked memory"};
-    const char *units[] = {"files", "bytes", "signals", "bytes", "processes", "bytes", "bytes"};
+                           "Max locked memory", "Max file size"};
+    const char *units[] = {"files", "bytes", "signals", "bytes", "processes", "bytes", "bytes", "bytes"};
     struct linux_rlimit64 *values[] = {&l->nofile, &l->as,   &l->sigpending, &l->stack,
-                                       &l->nproc,  &l->core, &l->memlock};
+                                       &l->nproc,  &l->core, &l->memlock, &l->fsize};
     text_string(s, "Limit                     Soft Limit           Hard Limit           Units\n");
-    for (unsigned i = 0; i < 7; ++i) {
+    for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
         text_string(s, names[i]);
         for (size_t p = __builtin_strlen(names[i]); p < 26; ++p)
             text_string(s, " ");

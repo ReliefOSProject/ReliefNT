@@ -6,6 +6,7 @@
 #define LINUX_SIGRTMIN 32
 #define LINUX_SIGBUS 7
 #define LINUX_SIGSEGV 11
+#define LINUX_SIGXFSZ 25
 #define LINUX_SI_USER 0
 #define LINUX_SI_KERNEL 128
 #define LINUX_SI_QUEUE (-1)

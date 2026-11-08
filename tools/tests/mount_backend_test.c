@@ -13,6 +13,13 @@
 #define main storage_mkdir_reference_main
 #include "storage_mkdir_mount_test.c"
 #undef main
+static unsigned file_size_signals;
+/** @brief Observe FSIZE delivery while keeping the VFS fixture alive.
+ * @param task Calling actor. @param signal_number Expected SIGXFSZ.
+ * @return Zero after counting the signal.
+ */
+int kernel_signal_queue_task(struct task *task,int signal_number)
+{assert(task && signal_number==25);++file_size_signals;return 0;}
 #include "../../fs/vfs/storage_backend.h"
 #include <reliefnt/mount.h>
 #include <reliefnt/exec_file.h>
@@ -898,6 +905,7 @@ static void held_task_paths(struct vfs_namespace *ns,const struct vfs_path *root
     puts("PASS directory syscalls: actual overmount/cwd/root, stale dirfd names, search/capability gates, Linux raw getcwd size and user writes");
     static struct task actor;
     actor=(struct task){.pid=902,.cap_effective=UINT64_MAX};
+    actor.limits.fsize=(struct linux_rlimit64){LINUX_RLIM_INFINITY,LINUX_RLIM_INFINITY};
     vfs_path_get(root,&actor.fs_paths.root);vfs_path_get(old_dir,&actor.fs_paths.cwd);
     actor.files[0]=(struct task_file){.used=1,.node=*vfs_path_node(old_dir)};
     strcpy(actor.files[0].path,"/deliberately/stale");
@@ -923,6 +931,16 @@ static void held_task_paths(struct vfs_namespace *ns,const struct vfs_path *root
     assert(!vfs_path_stat(old_file,&resized) && resized.st_size==7);
     assert(!syscall_fallocate_object(&actor,4,0,7,17));
     assert(!vfs_path_stat(old_file,&resized) && resized.st_size==24);
+    actor.limits.fsize.rlim_cur=24;
+    assert(syscall_truncate_object(ns,&actor,LINUX_SYS_FTRUNCATE,4,25)==-EFBIG && file_size_signals==1);
+    assert(syscall_fallocate_object(&actor,4,0,24,1)==-EFBIG && file_size_signals==2);
+    assert(!syscall_fallocate_object(&actor,4,1,32,8) && file_size_signals==2);
+    assert(!vfs_path_stat(old_file,&resized) && resized.st_size==24);
+    actor.limits.fsize.rlim_cur=0;
+    assert(!syscall_truncate_object(ns,&actor,LINUX_SYS_FTRUNCATE,4,0));
+    assert(syscall_truncate_object(ns,&actor,LINUX_SYS_FTRUNCATE,4,1)==-EFBIG && file_size_signals==3);
+    actor.limits.fsize.rlim_cur=LINUX_RLIM_INFINITY;
+    assert(!syscall_truncate_object(ns,&actor,LINUX_SYS_FTRUNCATE,4,24));
     assert(!syscall_sync_object(ns,&actor,LINUX_SYS_FSYNC,4));
     assert(!syscall_sync_object(ns,&actor,LINUX_SYS_FDATASYNC,4));
     assert(!syscall_sync_object(ns,&actor,LINUX_SYS_SYNCFS,4));

@@ -1,19 +1,22 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "../internal.h"
+#include <reliefnt/file_limits.h>
 
 /** @brief Resize an authorized inode while excluding executable writers.
+ * @param task Execution-owned caller whose file-size limit applies.
  * @param path Borrowed held inode retaining its provider through I/O.
  * @param length Validated nonnegative logical size.
  * @return Zero or negative errno. Acquires a temporary inode/write lease
  * before truncation and releases it on every outcome, including retry.
  * No text lookup or graph/module spinlock spans the provider callback.
  */
-static int truncate_inode_path(const struct vfs_path *path,uint64_t length)
+static int truncate_inode_path(struct task *task,const struct vfs_path *path,uint64_t length)
 {
     const struct storage_node *node=vfs_path_node(path);
     if(!node)return -RELIEFOS_EINVAL;
     if(node->type==RELIEFOS_FS_TYPE_DIR)return -RELIEFOS_EISDIR;
     if(node->type!=RELIEFOS_FS_TYPE_FILE)return -RELIEFOS_EINVAL;
+    int limited=task_file_limit_size(task,length);if(limited)return limited;
     struct storage_inode_ref *inode=NULL;
     int rc=storage_inode_get(node,&inode);if(rc)return rc;
     if(!inode)return -RELIEFOS_EOPNOTSUPP;
@@ -52,7 +55,7 @@ int64_t syscall_truncate_object(struct vfs_namespace *ns,struct task *task,uint6
         rc=resolve_user_object_at_flags(ns,task,LINUX_AT_FDCWD,operand,false,false,VFS_LOOKUP_FOLLOW,&found);
         if(!rc)rc=fs_permissions_check_path(task,&found.path,FS_ACCESS_WRITE,false);
     } else return -RELIEFOS_ENOSYS;
-    if(!rc)rc=truncate_inode_path(&found.path,length);
+    if(!rc)rc=truncate_inode_path(task,&found.path,length);
     if(!rc && file) {
         file->node=*vfs_path_node(&found.path);file->read_cursor.valid=0;
     }
@@ -82,6 +85,18 @@ int64_t syscall_fallocate_object(struct task *task,int32_t fd,uint32_t mode,uint
     if(file->node.type==RELIEFOS_FS_TYPE_DIR)return -RELIEFOS_EISDIR;
     if(file->node.type==RELIEFOS_FS_TYPE_FIFO || (file->flags&TASK_FILE_FLAG_PIPE))return -LINUX_ESPIPE;
     if(file->node.type!=RELIEFOS_FS_TYPE_FILE || !vfs_path_node(&file->path_ref))return -RELIEFOS_ENODEV;
+    if(!(mode&(1u|2u|8u))) {
+        struct linux_stat_abi status;
+        int checked=vfs_path_stat(&file->path_ref,&status);if(checked)return checked;
+        if(status.st_size<0)return -RELIEFOS_EIO;
+        uint64_t size=(uint64_t)status.st_size;
+        uint64_t end=offset+length;
+        if(mode&32u) {
+            if(length>(uint64_t)INT64_MAX-size)return -RELIEFOS_EFBIG;
+            end=size+length;
+        }
+        if(end>size) {checked=task_file_limit_size(task,end);if(checked)return checked;}
+    }
     struct storage_inode_ref *inode=NULL;
     int rc=storage_inode_get(vfs_path_node(&file->path_ref),&inode);if(rc)return rc;
     if(!inode)return -RELIEFOS_EOPNOTSUPP;

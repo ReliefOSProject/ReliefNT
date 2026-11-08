@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "../internal.h"
 #include <reliefnt/swap.h>
+#include <reliefnt/file_limits.h>
 
 /* One original invocation owns both OFDs and any bytes read before a queue
  * wait. Filesystem callbacks are synchronous for this kernel staging buffer;
@@ -174,6 +175,11 @@ static int transfer_prepare(struct task *task)
     if(state->range && state->count && vfs_path_same_inode(&state->input->path_ref,&state->output->path_ref) &&
        state->output_position<state->input_position+state->count &&
        state->input_position<state->output_position+state->count)return -EINVAL;
+    if(state->output->node.type==RELIEFOS_FS_TYPE_FILE &&
+       !(state->output->node.flags&(STORAGE_NODE_FLAG_PROC|STORAGE_NODE_FLAG_SYSFS))) {
+        rc=task_file_limit_write(task,state->output_position,&state->count,true);
+        if(rc)return rc;
+    }
     state->prepared=true;return 0;
 }
 

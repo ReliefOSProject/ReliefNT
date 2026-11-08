@@ -86,8 +86,8 @@ flush 的独立统计行/扩展字段。同步统计不分配内存；异步记�
      - 逐区域或汇总的 RSS/PSS、共享/私有 clean/dirty、Referenced、Anonymous、
        Locked；swap 和未支持的匿名大页统计为零。
    * - ``limits``
-     - 内核支持的七项资源限制：文件数、地址空间、待处理信号、栈、进程数、
-       core 大小和锁定内存；不虚构其他 rlimit。
+     - 内核支持的八项资源限制：文件数、地址空间、待处理信号、栈、进程数、
+       core 大小、锁定内存和普通文件大小；不虚构其他 rlimit。
    * - ``auxv``
      - exec 构造的二进制 ``uint64_t type, value`` 数组，包括 ``AT_NULL``；
        不是文本，也不重新读取可能被用户修改的栈。

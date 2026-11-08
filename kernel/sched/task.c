@@ -123,6 +123,7 @@ static void task_init_limits(struct task *task)
         .nproc = {threads / 2, threads / 2},
         /* INIT_RLIMITS includes CORE even when CONFIG_COREDUMP is disabled. */
         .core = {0, LINUX_RLIM_INFINITY},
+        .fsize = {LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY},
         /* Linux v6.14 resource.h MLOCK_LIMIT / INIT_RLIMITS. */
         .memlock = {8ULL * 1024ULL * 1024ULL, 8ULL * 1024ULL * 1024ULL},
         .as = {LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY},

@@ -1,9 +1,17 @@
 #include <assert.h>
 #include <stdio.h>
 #include "../../kernel/syscall/process/process.c"
+#include <reliefnt/file_limits.h>
 
 static struct task caller, target;
 static uint64_t readonly;
+static unsigned file_signals;
+/** @brief Count the file-size signal without modifying fixture task state.
+ * @param task Expected caller. @param signal_number Required SIGXFSZ.
+ * @return Zero after recording the delivery.
+ */
+int kernel_signal_queue_task(struct task *task, int signal_number)
+{ assert(task == &caller && signal_number == 25); ++file_signals; return 0; }
 struct task *sched_current_task(void) { return &caller; }
 struct task *sched_find(uint32_t pid) { return pid == 7 ? &target : NULL; }
 bool user_range_ok(uint64_t address, uint64_t length)
@@ -144,5 +152,26 @@ int main(void)
     value = (struct linux_rlimit64){0, 65536};
     assert(process_resource_limit(LINUX_SYS_SETRLIMIT, LINUX_RLIMIT_MEMLOCK,
         (uintptr_t)&value, 0, 0) == 0 && !target.shared_limits->memlock.rlim_cur);
-    puts("PASS native rlimit helpers: shared state, hard limits, widths, ID checks, alias, stack/memlock and output-fault commit");
+    caller.cap_effective=1ULL<<CAP_SYS_RESOURCE;
+    caller.limits.fsize=(struct linux_rlimit64){LINUX_RLIM_INFINITY,LINUX_RLIM_INFINITY};
+    value=(struct linux_rlimit64){8,16};
+    assert(!process_resource_limit(LINUX_SYS_PRLIMIT64,7,LINUX_RLIMIT_FSIZE,
+                                  (uintptr_t)&value,(uintptr_t)&old));
+    assert(old.rlim_cur==LINUX_RLIM_INFINITY && caller.limits.fsize.rlim_cur==8);
+    uint64_t count=10;
+    assert(!task_file_limit_write(&caller,5,&count,true) && count==3 && !file_signals);
+    count=1;
+    assert(task_file_limit_write(&caller,8,&count,true)==-LINUX_EFBIG && file_signals==1);
+    assert(task_file_limit_write(&caller,8,&count,false)==-LINUX_EFBIG && file_signals==1);
+    count=0;
+    assert(!task_file_limit_write(&caller,100,&count,true) && file_signals==1);
+    assert(!task_file_limit_size(&caller,8));
+    assert(task_file_limit_size(&caller,9)==-LINUX_EFBIG && file_signals==2);
+    value=(struct linux_rlimit64){0,0};
+    assert(!process_resource_limit(LINUX_SYS_SETRLIMIT,LINUX_RLIMIT_FSIZE,(uintptr_t)&value,0,0));
+    assert(!process_resource_limit(LINUX_SYS_GETRLIMIT,LINUX_RLIMIT_FSIZE,(uintptr_t)&old,0,0));
+    assert(!old.rlim_cur && !old.rlim_max);
+    caller.cap_effective=0;value=(struct linux_rlimit64){1,1};
+    assert(process_resource_limit(LINUX_SYS_SETRLIMIT,LINUX_RLIMIT_FSIZE,(uintptr_t)&value,0,0)==-LINUX_EPERM);
+    puts("PASS native rlimits, including shared FSIZE state, short writes, SIGXFSZ and OpenSSH's zero limit");
 }

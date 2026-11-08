@@ -5395,6 +5395,7 @@
         "tools/tests/task8_host_stubs/writable_alias_model.c",
         "tools/tests/task8_host_stubs/device_page_unreached.c",
         "fs/vfs/mount_tree.c",
+        "fs/vfs/lookup_cache.c",
         "fs/vfs/file.c",
         "fs/vfs/open.c",
         "fs/vfs/attributes.c",
