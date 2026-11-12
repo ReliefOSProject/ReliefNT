@@ -27,7 +27,6 @@
 #include <reliefnt/lock_profile.h>
 #include <reliefnt/smp.h>
 #include <reliefnt/userland.h>
-#include <reliefnt/kernel_debug.h>
 #include <reliefnt/vdso.h>
 #include <reliefnt/svga.h>
 #include <reliefos/layout.h>
@@ -1172,7 +1171,6 @@ static int userland_commit_prepared(struct task *task, struct task *prepared)
     syscall_close_cloexec_files(task);
     arch_fpu_task_init(task->fpu_state);
     arch_fpu_restore(task->fpu_state);
-    kernel_debug_finish_initramfs_boot(task);
     console_debug("[reliefnt] exec pid=%u path=%s pty=%u committed cr3=0x%llx\n",
                    task->pid, prepared->path, task->pty_id,
                    (unsigned long long)(*sched_task_as(task)).cr3);

@@ -53,7 +53,7 @@ Kconfig 选择内置或编译为可加载 ELF 模块，默认保持内置。模�
 
 * 路径：``lib/``、``firmware/``; 职责：内核内部基础工具、panic/bugcheck、文本与固件支持。
 
-* 路径：``vdso/``、``debug/``; 职责：独立 vDSO ELF 及嵌入对象；独立 kerneldebug 载荷。
+* 路径：``vdso/``; 职责：独立 vDSO ELF 及嵌入对象。
 
 私有接口与共享状态
 ==================
@@ -85,11 +85,10 @@ Kconfig 选择内置或编译为可加载 ELF 模块，默认保持内置。模�
 导入的 Linux 6.12 Kbuild/Kconfig 引擎保持原样。
 
 vDSO 使用其专用 PIC/链接参数，只有 ``vdso_blob.o`` 进入内核归档；
-``debug/kerneldebug.o`` 单独生成 ``kerneldebug.sys``，不进入内核归档。
 宿主工具使用 ``tools/host/Kbuild``；运行时宿主 fixture 由
 ``tools/tests/Kbuild`` 一次构建，避免并行目标重复写共享对象。
 
-产物路径保持为 ``O/generated/system/{kernel.sys,kernel.debug,kerneldebug.sys}``。
+产物路径保持为 ``O/generated/system/{kernel.sys,kernel.debug}``。
 父仓继续通过原有 ``make kernel``、``make image-vmdk`` 等目标集成。
 
 .. code-block:: sh
@@ -107,7 +106,7 @@ vDSO 使用其专用 PIC/链接参数，只有 ``vdso_blob.o`` 进入内核归�
 移除；历史报告中的旧文件行号属于相应历史版本，应结合该映射查阅。
 
 ``make test-module-layout`` 检查各级本地 Kbuild、重复/遗漏对象、生产实现包含、
-特殊 debug/vDSO 源文件覆盖和上游引擎哈希。它也属于默认 ``make test``。
+特殊 vDSO 源文件覆盖和上游引擎哈希。它也属于默认 ``make test``。
 父仓 ``tools/test_build_incremental.py`` 从实际目录 Kbuild 读取预期归档顺序，
 用隔离源码及输出验证源码/头/参数/工具身份和缺失产物的重建。
 

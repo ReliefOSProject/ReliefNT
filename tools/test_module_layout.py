@@ -7,7 +7,7 @@ import re
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
-PRODUCTION = ('arch', 'block', 'drivers', 'firmware', 'fs', 'kernel', 'lib', 'mm', 'net', 'sound', 'debug', 'vdso')
+PRODUCTION = ('arch', 'block', 'drivers', 'firmware', 'fs', 'kernel', 'lib', 'mm', 'net', 'sound', 'vdso')
 
 
 def main():
@@ -116,7 +116,6 @@ def main():
                         generated_sources.add(linker.relative_to(ROOT).as_posix())
 
     visit(Path('.'))
-    visit(Path('debug'))
     if len(objects) != len(set(objects)):
         errors.append('duplicate production object')
     built_sources = set(generated_sources)

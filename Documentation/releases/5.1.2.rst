@@ -51,7 +51,7 @@ Linux 系统调用、调度与性能
 ==================
 
 1. 本次为 **源码 Release**，不提供预编译内核。使用标签源码、锁定依赖和实际配置重新构建，保持 ``kernel.sys``、调试符号、导出 UAPI 与配套用户态一致。
-2. 使用新的 ``O`` 目录和 Kconfig 配置验证迁移，内部路径参照 `模块说明 <https://github.com/ReliefOSProject/ReliefNT/blob/v5.1.2/docs/KERNEL_MODULES.md>`_。产物仍位于 ``O/generated/system/{kernel.sys,kernel.debug,kerneldebug.sys}``，父仓通过安装清单消费。
+2. 使用新的 ``O`` 目录和 Kconfig 配置验证迁移，内部路径参照 `模块说明 <https://github.com/ReliefOSProject/ReliefNT/blob/v5.1.2/docs/KERNEL_MODULES.md>`_。产物仍由父仓通过安装清单消费。
 3. BIOS 入口需要支持相应 CPU 特性的机器与正确的 Multiboot2 引导器；本仓不负责生成 ReliefOS ISO 或安装引导器。显式 PARTUUID 必须唯一且对应目标 GPT root，旧内核回滚不能假定支持新菜单。
 4. 更新 SDK 和使用块 ioctl 的程序，核对设备 DAC 与 capability 策略。FAT 改动没有改变磁盘格式，仍需在更新或操作分区前备份数据。
 5. 已有分项 QEMU 启动、安装配套和系统调用验证不等于本标签的整版迁移认证。**VMware 验证未完成**，物理硬件未验证；编译压力下桌面交互、长期运行和全部恢复场景仍未完成验收。

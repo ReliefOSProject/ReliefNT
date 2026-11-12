@@ -68,7 +68,7 @@ DRM、vmwgfx 与图形资源
 开发者提示
 ==========
 
-- 生产入口为本仓根 GNU Make，产物为 ``kernel.sys``、``kernel.debug``、``kerneldebug.sys``；内核与驱动编译由本仓负责，不消费父仓私有实现。
+- 生产入口为本仓根 GNU Make，内核与驱动编译由本仓负责，不消费父仓私有实现。
 - 基础版本为 ``5.1.1``，数字字段为 ``5/1/1``；``EXTRAVERSION`` 与 ``LOCALVERSION`` 继续独立追加，完整版本保留现有字符集和长度检查。
 - UAPI 通过 ``headers_install`` 白名单导出。新 DRM 头用于目标用户态编译；内核私有指针、资源实现和页表结构不作为公共线协议传递。
 - 图形兼容范围受 SVGA-II、VGPU9 和实际能力检查限制。不承诺 atomic modesetting、硬件 vblank、硬件光标、跨设备 DMA-BUF、所有 Mesa 功能或物理宿主 GPU 利用率测量。

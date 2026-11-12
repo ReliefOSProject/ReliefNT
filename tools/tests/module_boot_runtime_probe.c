@@ -128,8 +128,6 @@ int main(void)
     puts("PASS MODULE_DRM_DISABLED no module or DRM nodes, permanent framebuffer remains usable");
 #endif
     require(!statfs("/boot",&fs) && fs.f_type==0x4d44,"root fstab ESP is mounted through vfat module");
-    errno=0;require(lstat("/boot/reliefos/state/kerneldebug.next",&status)==-1 && errno==ENOENT,
-        "deferred boot checkpoint consumed actual one-shot ESP control");
     file=open("/ko-production-init-write",O_WRONLY|O_CREAT|O_EXCL,0600);
     require(file>=0 && write(file,"standard",8)==8 && !fsync(file) && !close(file) &&
         !unlink("/ko-production-init-write"),"ordinary real-root file writes work after production init");

@@ -29,12 +29,12 @@ WIRE_HEADERS = [
     "uapi/reliefos/rootfs.h", "uapi/reliefos/syscall_abi.h",
     "reliefos/audio.h", "reliefos/auth.h", "reliefos/device.h",
     "reliefos/driver.h", "reliefos/elf_abi.h", "reliefos/gpu.h", "reliefos/inputm.h",
-    "reliefos/kernel_debug.h", "reliefos/net.h", "reliefos/pty.h", "reliefos/signal.h",
+    "reliefos/net.h", "reliefos/pty.h", "reliefos/signal.h",
     "reliefos/startup.h", "reliefos/system.h",
     # split targets, once they exist
     "uapi/reliefos/audio_abi.h", "uapi/reliefos/auth_abi.h", "uapi/reliefos/device_abi.h",
     "uapi/reliefos/driver_abi.h", "uapi/reliefos/gpu_abi.h", "uapi/reliefos/inputm_abi.h",
-    "uapi/reliefos/kernel_debug_abi.h", "uapi/reliefos/net_abi.h",
+    "uapi/reliefos/net_abi.h",
     "uapi/reliefos/startup_abi.h", "uapi/reliefos/system_abi.h",
     "uapi/reliefos/pty_abi.h", "uapi/reliefos/signal_abi.h",
 ]
@@ -46,8 +46,6 @@ CONSTANTS = [
     "RELIEFOS_DRIVER_CONTROL_IOCTL",
     "RELIEFOS_VT_GETGENERATION", "RELIEFOS_EVIOCSVT",
     "RELIEFOS_NET_CONTROL_IOCTL",
-    "RELIEFOS_KERNEL_DEBUG_CONTROL_GET_STATE", "RELIEFOS_KERNEL_DEBUG_CONTROL_SET_ENABLED",
-    "RELIEFOS_KERNEL_DEBUG_CONTROL_ARM_NEXT_BOOT", "RELIEFOS_KERNEL_DEBUG_CONTROL_CLEAR",
     "RELIEFOS_IOCTL_GPU_INFO", "RELIEFOS_IOCTL_GPU_CREATE", "RELIEFOS_IOCTL_GPU_DESTROY",
     "RELIEFOS_IOCTL_GPU_RENDER", "RELIEFOS_IOCTL_GPU_DIAGNOSTICS",
     "RELIEFOS_AUTH_ROLE_NONE", "RELIEFOS_AUTH_ROLE_USER", "RELIEFOS_AUTH_ROLE_ADMIN",

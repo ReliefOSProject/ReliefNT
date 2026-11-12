@@ -55,9 +55,7 @@ int storage_readdir_node(const struct storage_node *node, uint64_t *cursor,
 
 
 
-int storage_write_boot_esp_file(const char *path, const void *buf, uint32_t len);
 
-int storage_unlink_boot_esp_file(const char *path);
 
 
 

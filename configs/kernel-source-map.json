@@ -26,9 +26,6 @@
     "kernel/reliefnt/kernel.c": [
       "kernel/init/kernel.c"
     ],
-    "kernel/reliefnt/kernel_debug.c": [
-      "kernel/init/kernel_debug.c"
-    ],
     "kernel/reliefnt/lock.c": [
       "kernel/sync/lock.c"
     ],
@@ -284,9 +281,6 @@
     "kernel/reliefnt/include/reliefnt/kernel.h": [
       "include/reliefnt/kernel.h"
     ],
-    "kernel/reliefnt/include/reliefnt/kernel_debug.h": [
-      "include/reliefnt/kernel_debug.h"
-    ],
     "kernel/reliefnt/include/reliefnt/loadavg.h": [
       "include/reliefnt/loadavg.h"
     ],
@@ -313,9 +307,6 @@
     ],
     "kernel/reliefnt/include/reliefnt/object.h": [
       "include/reliefnt/object.h"
-    ],
-    "kernel/reliefnt/include/reliefnt/ostui.h": [
-      "include/reliefnt/ostui.h"
     ],
     "kernel/reliefnt/include/reliefnt/page_cache.h": [
       "include/reliefnt/page_cache.h"

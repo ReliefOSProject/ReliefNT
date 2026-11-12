@@ -11,7 +11,6 @@ compatibility	include/reliefos/elf_abi.h	published ELF note and runtime SONAME v
 compatibility	include/reliefos/layout.h	frozen task 6 guest layout values
 compatibility	include/uapi/reliefos/rootfs.h	frozen task 6 rootfs paths
 compatibility	kernel/init/kernel.c	识别旧 installer-root GRUB module tag
-compatibility	kernel/init/kernel_debug.c	旧 kerneldebug ELF note section 与函数名/hash 双接受
 compatibility	kernel/syscall/device/input_ioctl.c	冻结设备 ioctl 对外 identity：PS/2 名称与 leonos-fb
 compatibility	kernel/syscall/device/legacy_ioctl.c	冻结设备 ioctl 对外 identity：PS/2 名称与 leonos-fb
 compatibility	tools/tests/fixtures/legacy-abi-layout.json	旧 UAPI sizeof/offsetof/常量布局 golden，值级对比基线不得随意改写

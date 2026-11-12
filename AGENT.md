@@ -5,7 +5,7 @@
 
 ## 构建与验证
 
-- 根 Makefile 是生产入口；产物为 `kernel.sys`、`kernel.debug` 和 `kerneldebug.sys`。
+- 根 Makefile 是生产入口；产物为 `kernel.sys` 和 `kernel.debug`。
   本仓不包含 ReliefOS 用户态、系统镜像或 APK 打包。
 - C/汇编、宿主工具、依赖追踪和配置由 `scripts/kbuild-source.json` 中校验过的
   Linux 6.12 Kbuild/Kconfig 文件提供；适配只放在 `Kbuild`、`scripts/Makefile.reliefnt`

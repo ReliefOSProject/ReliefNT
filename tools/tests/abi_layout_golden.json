@@ -19,10 +19,6 @@
   "RELIEFOS_IOCTL_GPU_DIAGNOSTICS": 1279741957,
   "RELIEFOS_IOCTL_GPU_INFO": 1279741953,
   "RELIEFOS_IOCTL_GPU_RENDER": 1279741955,
-  "RELIEFOS_KERNEL_DEBUG_CONTROL_ARM_NEXT_BOOT": 3,
-  "RELIEFOS_KERNEL_DEBUG_CONTROL_CLEAR": 4,
-  "RELIEFOS_KERNEL_DEBUG_CONTROL_GET_STATE": 1,
-  "RELIEFOS_KERNEL_DEBUG_CONTROL_SET_ENABLED": 2,
   "RELIEFOS_NET_CONTROL_IOCTL": 3268955248,
   "RELIEFOS_PERF_MAX_CPUS": 64,
   "RELIEFOS_PTY_NCCS": 19,
@@ -1354,28 +1350,6 @@
     ]
    ],
    "size": 840
-  },
-  "reliefos_kernel_debug_control": {
-   "align": 4,
-   "members": [
-    [
-     0,
-     "uint32_t version"
-    ],
-    [
-     4,
-     "uint32_t command"
-    ],
-    [
-     8,
-     "uint32_t flags"
-    ],
-    [
-     12,
-     "uint32_t result_flags"
-    ]
-   ],
-   "size": 16
   },
   "reliefos_machine_identity": {
    "align": 4,

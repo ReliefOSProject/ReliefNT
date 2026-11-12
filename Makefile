@@ -120,7 +120,7 @@ endif
 .SUFFIXES:
 .DELETE_ON_ERROR:
 
-.PHONY: help all kernel kerneldebug boot vdso tools fetch fetch-check \
+.PHONY: help all kernel boot vdso tools fetch fetch-check \
 	defconfig olddefconfig menuconfig config-sync build-info headers_install \
 	install test test-tools test-abi test-header-export test-vdso test-kconfig htmldocs \
 	kbuild-fixdep kconfig-tools clean distclean FORCE
@@ -129,9 +129,8 @@ help:
 	@printf '%s\n' \
 	  'ReliefNT standalone kernel build (Linux 6.12 Kbuild)' \
 	  '' \
-	  '  all               kernel.sys, kernel.debug, kerneldebug.sys' \
+	  '  all               kernel.sys, kernel.debug' \
 	  '  kernel            kernel.sys and kernel.debug' \
-	  '  kerneldebug       kerneldebug.sys' \
 	  '  modules           build configured native .ko modules (also the default with M=)' \
 	  '  modules_prepare   prepare original modpost/genksyms and native headers' \
 	  '  modules_install   stage modules under INSTALL_MOD_PATH/lib/modules/<release>' \
@@ -246,7 +245,7 @@ module-tools: config-sync kbuild-fixdep $(RELIEFNT_HOST_CC_ID) $(RELIEFNT_TARGET
 	+$(Q)$(call RELIEFNT_KBUILD,obj=scripts/genksyms KBUILD_HOSTCFLAGS='$(RELIEFNT_HOST_CFLAGS) -std=gnu11 $(RELIEFNT_HOST_CPPFLAGS)')
 	+$(Q)$(call RELIEFNT_KBUILD,obj=scripts/mod KBUILD_HOSTCFLAGS='$(RELIEFNT_HOST_CFLAGS) -std=gnu11 $(RELIEFNT_HOST_CPPFLAGS)')
 
-modules_prepare: module-tools prepare-assets prepare-debug prepare-module-abi \
+modules_prepare: module-tools prepare-assets prepare-module-abi \
 	$(RELIEFNT_TARGET_AR_ID) $(RELIEFNT_TARGET_LD_ID) $(RELIEFNT_TARGET_OBJCOPY_ID)
 	+$(Q)$(call RELIEFNT_KBUILD,obj=arch/x86_64/module arch/x86_64/module/module.lds)
 	+$(Q)$(call RELIEFNT_KBUILD,obj=. ./scripts/module.lds)
@@ -255,7 +254,7 @@ kernel: modules_prepare vdso
 	+$(Q)$(call RELIEFNT_KBUILD,obj=. ./built-in.a ./modules.order ./vmlinux.a)
 	+$(Q)$(call RELIEFNT_KBUILD,obj=. RELIEFNT_KBUILD_FILE=scripts/Makefile.vmlinux_o)
 	+$(Q)$(call RELIEFNT_KBUILD,obj=. RELIEFNT_KBUILD_FILE=scripts/Makefile.modpost)
-	+$(Q)$(call RELIEFNT_KBUILD,obj=. ./.vmlinux.export.o ./generated/system/kernel.sys ./generated/system/kernel.debug ./generated/system/kerneldebug.sys ./System.map)
+	+$(Q)$(call RELIEFNT_KBUILD,obj=. ./.vmlinux.export.o ./generated/system/kernel.sys ./generated/system/kernel.debug ./System.map)
 	+$(Q)$(call RELIEFNT_KBUILD,obj=. RELIEFNT_KBUILD_FILE=scripts/Makefile.modfinal)
 	$(Q)sh $(RELIEFNT_SRC)/scripts/modules-clean-stale.sh '$(O)' '$(O)/modules.order'
 	$(Q)sh $(RELIEFNT_SRC)/scripts/modules-manifest.sh '$(O)'
@@ -287,10 +286,6 @@ modules_sdk: kernel
 	    sh '$(RELIEFNT_SRC)/scripts/modules-sdk.sh' '$(RELIEFNT_SRC)' '$(O)' '$(INSTALL_MOD_PATH)'
 
 all: kernel
-
-kerneldebug: config-sync prepare-debug kbuild-fixdep \
-	$(RELIEFNT_TARGET_CC_ID) $(RELIEFNT_TARGET_OBJCOPY_ID)
-	+$(Q)$(call RELIEFNT_KBUILD,obj=. ./generated/system/kerneldebug.sys)
 
 boot: kernel
 
@@ -403,8 +398,7 @@ install: all headers_install modules_install tools
 	dest='$(DESTDIR)'; \
 	mkdir -p "$$dest"; \
 	cp $(O)/generated/system/kernel.sys \
-	   $(O)/generated/system/kernel.debug \
-	   $(O)/generated/system/kerneldebug.sys "$$dest"/; \
+	   $(O)/generated/system/kernel.debug "$$dest"/; \
 	{ \
 	  printf 'format_version: 1\n'; \
 	  printf 'arch: %s\n' '$(ARCH)'; \
@@ -419,7 +413,7 @@ install: all headers_install modules_install tools
 	  printf 'config_sha256: %s\n' "$$(sha256sum '$(O)/.config' | cut -d' ' -f1)"; \
 	  printf 'uapi_sha256: %s\n' "$$(sha256sum '$(O)/kernel-export/manifest.txt' | cut -d' ' -f1)"; \
 	  printf 'artifacts:\n'; \
-	  (cd "$$dest" && sha256sum kernel.sys kernel.debug kerneldebug.sys | sed 's/^/  /'); \
+	  (cd "$$dest" && sha256sum kernel.sys kernel.debug | sed 's/^/  /'); \
 	} > "$$dest/manifest.txt.tmp"; \
 	mv -f "$$dest/manifest.txt.tmp" "$$dest/manifest.txt"
 	$(Q)'$(O)/tools/host/manifest/reliefnt-install-bundle' '$(DESTDIR)' \
@@ -437,7 +431,7 @@ distclean:
 		sh $(RELIEFNT_SRC)/scripts/clean.sh; \
 	else printf 'distclean: no owned output at %s\n' '$(O)'; fi
 
-.PHONY: prepare-assets prepare-debug test-module-layout
+.PHONY: prepare-assets test-module-layout
 prepare-assets: tools
 	+$(Q)$(call RELIEFNT_KBUILD,obj=. ./include/generated/build_info.h ./include/generated/cjk_font.h)
 
@@ -448,9 +442,6 @@ prepare-module-abi: config-sync kbuild-fixdep $(RELIEFNT_TARGET_CC_ID) \
 
 kernelrelease: prepare-module-abi
 	$(Q)cat $(O)/include/config/kernel.release
-
-prepare-debug: config-sync kbuild-fixdep $(RELIEFNT_TARGET_CC_ID)
-	+$(Q)$(call RELIEFNT_KBUILD,obj=debug)
 
 test-module-layout:
 	$(Q)$(RELIEFNT_TEST_PYTHON) $(RELIEFNT_SRC)/tools/test_module_layout.py
