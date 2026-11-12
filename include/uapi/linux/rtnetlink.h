@@ -13,6 +13,7 @@ struct rtmsg { uint8_t rtm_family, rtm_dst_len, rtm_src_len, rtm_tos;
 #define RTM_NEWLINK 16
 #define RTM_DELLINK 17
 #define RTM_GETLINK 18
+#define RTM_SETLINK 19
 #define RTM_NEWADDR 20
 #define RTM_DELADDR 21
 #define RTM_GETADDR 22

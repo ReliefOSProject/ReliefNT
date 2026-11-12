@@ -9,6 +9,7 @@
 #include <reliefnt/console.h>
 #include <reliefnt/driver_manager.h>
 #include <reliefnt/e1000.h>
+#include <reliefnt/net_device.h>
 #include <reliefnt/framebuffer.h>
 #include <reliefnt/input.h>
 #include <reliefnt/mm.h>
@@ -99,12 +100,21 @@ int driver_register_mouse(const struct reliefos_driver_mouse_ops *ops);
 int driver_register_serial(const struct reliefos_driver_serial_ops *ops);
 
 /**
- * @brief Bind the loading driver's Ethernet ops without replacing another owner.
+ * @brief Adapt the loading driver's legacy singleton Ethernet callbacks.
  * @param ops Validated callbacks retained by the current loading driver slot.
- * @return Zero, -EINVAL for invalid registration, or -EBUSY when eth0 already
- * belongs to another provider. Task init; IRQ-safe service lock, no callback.
+ * @return Zero, -EINVAL, allocation/index error, or -EBUSY when another legacy
+ * provider exists. Task init; no callback under the service lock.
  */
 int driver_register_e1000(const struct reliefos_driver_e1000_ops *ops);
+
+/** @brief Publish completed NIC registrations and notify the network stack.
+ * @param owner Loaded driver slot. Caller owns network execution.
+ */
+void driver_netdev_publish_owner(uint32_t owner);
+/** @brief Remove an owner's drained NICs and notify the network stack.
+ * @param owner Closed and drained driver slot. Caller owns network execution.
+ */
+void driver_netdev_remove_owner(uint32_t owner);
 
 /**
  * @brief Bind the loading driver's v1 backend with a non-reused generation.

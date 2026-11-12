@@ -25,10 +25,10 @@ tristate，``make defconfig`` 默认选择 ``y``。选择 ``m`` 生成
      - RTL8125A ``0x60900000``、B ``0x64100000``、D-1 ``0x68800000``、
        D-2 ``0x68900000``。
 
-未知 MAC 家族返回 ``-ENODEV``。现有网络服务仅提供一个外部 Ethernet
-接口，先注册的网卡拥有 ``eth0``，后来的 owner 收到 ``-EBUSY``。
-驱动复用内部历史名称 ``register_e1000`` 的服务，网络用户程序继续使用
-现有 Linux socket、ioctl、netlink 和 proc 接口。
+未知 MAC 家族返回 ``-ENODEV``。驱动枚举全部匹配的 PCI 功能，为每张网卡
+分配独立 DMA 环和上下文，通过私有 ``driver_register_netdev`` 注册
+``eth0``、``eth1`` 等接口。网络用户程序使用 Linux socket、ioctl、netlink
+和 proc 接口。接口生命周期和多网卡选路见 :doc:`network-devices`。
 
 .. code-block:: sh
 

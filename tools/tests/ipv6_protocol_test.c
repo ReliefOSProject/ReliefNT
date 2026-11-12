@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /** @file Packet-level IPv6 fixture: only NIC, clock, heap and transport are mocked. */
 #include <reliefnt/net_ipv6.h>
+#include <reliefnt/net_device.h>
+#include <reliefnt/net_interface.h>
 #include <reliefnt/random.h>
 #include "../../net/internal.h"
 #include <linux/errno.h>
@@ -9,15 +11,25 @@
 #include <stdlib.h>
 #include <string.h>
 
-bool net_interface_up = true;
+static bool fixture_interface_up = true;
+bool *net_interface_legacy_up(void) { return &fixture_interface_up; }
 static uint64_t now_ms;
 static uint32_t random_word;
 static bool random_unavailable;
 static bool nic_ready = true;
+static bool first_nic = true;
 static uint8_t nic_mac[6] = {0x52,0x54,0x00,0x12,0x34,0x56};
+static bool second_nic;
+static uint32_t second_index=3;
+static uint32_t extra_nics;
+static unsigned failed_allocations;
+static uint8_t second_mac[6] = {0x52,0x54,0x00,0x12,0x34,0x57};
 static uint8_t sent[128][1536];
 static uint32_t sent_len[128];
+static uint32_t sent_ifindex[128];
 static unsigned sent_count, udp_count, raw_count;
+static uint32_t last_udp_ifindex, last_error_ifindex;
+static unsigned socket_error_count;
 static uint8_t queued_frame[1536];
 static uint32_t queued_length;
 const uint8_t net_broadcast_mac[6]={255,255,255,255,255,255};
@@ -38,8 +50,30 @@ const uint8_t *e1000_mac(void) { return nic_mac; }
  * @return Zero when captured. */
 int e1000_send(const void *frame, uint32_t len)
 { assert(sent_count < 128 && len <= 1536); memcpy(sent[sent_count],frame,len); sent_len[sent_count++]=len; return 0; }
+uint32_t netdev_next(uint32_t after)
+{
+    uint32_t next=0;
+    if(after<2 && first_nic)next=2;
+    if(second_nic && after<second_index && (!next || second_index<next))next=second_index;
+    uint32_t extra=after<100?100:after+1;
+    if(extra_nics && extra>=100 && extra-100<extra_nics && (!next || extra<next))next=extra;
+    return next;
+}
+int netdev_is_ready(uint32_t index)
+{ return index==2?(first_nic && nic_ready):((index==second_index && second_nic) || (index>=100 && index-100<extra_nics)); }
+const uint8_t *netdev_mac(uint32_t index) { return index==second_index?second_mac:nic_mac; }
+int netdev_send(uint32_t index,const void *frame,uint32_t len)
+{ assert(index==2 || (index==second_index && second_nic));assert(sent_count<128);
+  sent_ifindex[sent_count]=index;return e1000_send(frame,len); }
+bool net_interface_exists(uint32_t index)
+{ return index==1 || (index==2 && first_nic) || (index==second_index && second_nic) || (index>=100 && index-100<extra_nics); }
+bool net_interface_is_up(uint32_t index) { return index==1 || (net_interface_exists(index) && net_interface_up); }
+bool net_interface_is_ready(uint32_t index) { return index==1 || (net_interface_is_up(index) && netdev_is_ready(index)); }
+bool net_device_registration_pending(void) { return false; }
+void net_device_retry_registration(void) { }
 /** @brief Allocate kernel fixture memory. @param size Requested bytes. @return Owned memory. */
-void *kernel_malloc(size_t size) { return calloc(1,size); }
+void *kernel_malloc(size_t size)
+{ if(failed_allocations){--failed_allocations;return NULL;}return calloc(1,size); }
 /** @brief Free fixture memory. @param memory Owned allocation or NULL. */
 void kernel_free(void *memory) { free(memory); }
 /** @brief Announce a state change to the fixture. */
@@ -49,8 +83,8 @@ void netlink_ipv6_changed(void) { }
  * @param ifindex Interface. @param hops Hop limit. @return True for a listening port. */
 bool net_udp6_input(const struct in6_addr *s,const struct in6_addr *d,uint16_t sp,
                     uint16_t dp,const void *data,uint32_t len,uint32_t ifindex,uint8_t hops)
-{ (void)s;(void)d;(void)sp;(void)ifindex;(void)hops; if(dp!=9000)return false;
-  assert(len<=sizeof(received));memcpy(received,data,len);received_len=len;++udp_count;return true; }
+{ (void)s;(void)d;(void)sp;(void)hops; if(dp!=9000)return false;
+  assert(len<=sizeof(received));memcpy(received,data,len);received_len=len;last_udp_ifindex=ifindex;++udp_count;return true; }
 /** @brief Ignore checked TCP. @param s Source. @param d Destination. @param p Bytes.
  * @param n Length. @param i Interface. */
 void net_tcp6_input(const struct in6_addr *s,const struct in6_addr *d,const void *p,uint32_t n,uint32_t i)
@@ -63,6 +97,8 @@ void net_raw6_input(const struct in6_addr *s,const struct in6_addr *d,uint8_t p,
 /** @brief Ignore socket errors. @param p Quote. @param n Length. @param e Error. @param m MTU. */
 void net_ipv6_socket_error(const uint8_t *p,uint32_t n,int e,uint32_t m)
 { (void)p;(void)n;(void)e;(void)m; }
+void net_ipv6_socket_error_on(uint32_t i,const uint8_t *p,uint32_t n,int e,uint32_t m)
+{ last_error_ifindex=i;++socket_error_count;net_ipv6_socket_error(p,n,e,m); }
 /** @brief Copy bytes. @param d Destination. @param s Source. @param n Length. */
 void net_memcpy(void *d,const void *s,uint32_t n) { memcpy(d,s,n); }
 /** @brief Clear bytes. @param d Destination. @param n Length. */
@@ -91,16 +127,25 @@ uint64_t time_ticks(void) { return now_ms/10; }
 int e1000_poll(void *frame,uint32_t capacity,uint32_t *len)
 { if(!queued_length){*len=0;return 0;}assert(queued_length<=capacity);memcpy(frame,queued_frame,queued_length);
   *len=queued_length;queued_length=0;return 1; }
+int netdev_poll(uint32_t index,void *frame,uint32_t capacity,uint32_t *len)
+{ if(index==2)return e1000_poll(frame,capacity,len);*len=0;return 0; }
 /** @brief Ignore packet socket mirroring. @param frame Bytes. @param length Byte length. */
 void net_packet_input(const void *frame,uint32_t length) { (void)frame;(void)length; }
+void net_packet_input_on(uint32_t index,const void *frame,uint32_t length)
+{ (void)index;net_packet_input(frame,length); }
 /** @brief Ignore ARP for this fixture. @param frame Bytes. @param length Length. @param wait Waiter. */
 void net_handle_arp(const uint8_t *frame,uint32_t length,struct net_arp_wait *wait)
 { (void)frame;(void)length;(void)wait; }
+void net_handle_arp_on(uint32_t index,const uint8_t *frame,uint32_t length,struct net_arp_wait *wait)
+{ (void)index;net_handle_arp(frame,length,wait); }
 /** @brief Ignore IPv4 for this fixture. @param frame Bytes. @param length Length.
  * @param ping Waiter. @param udp_wait Waiter. @param tcp Waiter. */
 void net_handle_ipv4(const uint8_t *frame,uint32_t length,struct net_ping_wait *ping,
                      struct net_udp_wait *udp_wait,struct net_tcp_wait *tcp)
 { (void)frame;(void)length;(void)ping;(void)udp_wait;(void)tcp; }
+void net_handle_ipv4_on(uint32_t index,const uint8_t *frame,uint32_t length,struct net_ping_wait *ping,
+                        struct net_udp_wait *udp_wait,struct net_tcp_wait *tcp)
+{ (void)index;net_handle_ipv4(frame,length,ping,udp_wait,tcp); }
 /** @brief No IPv4 TCP work is active. @return False. */
 bool net_tcp_maintenance_pending(void) { return false; }
 /** @brief Ignore empty IPv4 TCP maintenance. */
@@ -147,6 +192,262 @@ static uint32_t neighbor_state(const struct in6_addr *target)
 { struct net_ipv6_neighbor neighbors[16];uint32_t n=net_ipv6_neighbors(neighbors,16);
   for(uint32_t i=0;i<n && i<16;i++)if(!memcmp(&neighbors[i].address,target,16))return neighbors[i].state;
   return 0; }
+
+/** @brief Count probes for a particular neighbor on a particular link. */
+static unsigned probes_since(unsigned first,uint32_t ifindex,const struct in6_addr *target)
+{
+    unsigned count=0;
+    for(unsigned i=first;i<sent_count;i++)
+        if(sent_ifindex[i]==ifindex && sent_len[i]>=78 && sent[i][20]==58 && sent[i][54]==135 &&
+           !memcmp(sent[i]+62,target->s6_addr,16))++count;
+    return count;
+}
+
+/** @brief Find an MLD report for a group and interface. */
+static bool saw_mld(uint32_t ifindex,const struct in6_addr *group,uint8_t type)
+{
+    for(unsigned i=0;i<sent_count;i++){
+        if(sent_ifindex[i]!=ifindex || sent_len[i]<86 || sent[i][20]!=0 || sent[i][54]!=58 || sent[i][62]!=type)continue;
+        unsigned group_offset=type==143?74:70;
+        if(sent_len[i]>=group_offset+16 && !memcmp(sent[i]+group_offset,group->s6_addr,16))return true;
+    }
+    return false;
+}
+
+/** @brief Exercise the real IPv6 core with duplicate scoped addresses on two NICs. */
+static void test_multiple_interfaces(void)
+{
+    const uint8_t text[]="hello";
+    const uint8_t mac2[6]={0x02,0,0,0,0,2},mac3[6]={0x02,0,0,0,0,3};
+    struct in6_addr shared={.s6_addr={0xfe,0x80,0,0,0,0,0,0,0,0,0,0,0,0,0x12,0x34}};
+    struct in6_addr peer={.s6_addr={0xfe,0x80,0,0,0,0,0,0,0,0,0,0,0,0,0,0x42}};
+    struct in6_addr peer2=peer;peer2.s6_addr[15]=0x43;
+    struct in6_addr all={.s6_addr={0xff,2,0,0,0,0,0,0,0,0,0,0,0,0,0,1}};
+    uint8_t frame[1536],message[64],na[32]={136,0,0,0,0x60},fragment[32];
+    struct net_ipv6_path path2,path3;
+    second_nic=true;first_nic=true;nic_ready=true;random_word=0;
+    net_ipv6_init();sent_count=0;net_ipv6_poll();
+    uint8_t early_ra[16]={134};net_put_u16(early_ra+2,net_ipv6_checksum(&peer,&all,58,early_ra,sizeof(early_ra)));
+    uint32_t len=packet(frame,&peer,&all,58,255,early_ra,sizeof(early_ra));net_ipv6_input_on(2,frame,len);
+    now_ms+=1000;net_ipv6_poll();
+
+    /* DAD and MLD frames must use each NIC's own source MAC. */
+    bool saw2=false,saw3=false,rs2=false,rs3=false;
+    for(unsigned i=0;i<sent_count;i++){
+        if(sent_ifindex[i]==2){assert(!memcmp(sent[i]+6,nic_mac,6));saw2=true;}
+        if(sent_ifindex[i]==3){assert(!memcmp(sent[i]+6,second_mac,6));saw3=true;}
+        if(sent_len[i]>=55 && sent[i][20]==58 && sent[i][54]==133){
+            if(sent_ifindex[i]==2)rs2=true;
+            if(sent_ifindex[i]==3)rs3=true;
+        }
+    }
+    assert(saw2 && saw3 && !rs2 && rs3);
+    struct net_ipv6_address initial[16];uint32_t initial_count=net_ipv6_addresses(initial,16);
+    struct in6_addr auto3={0};bool found_auto3=false;
+    for(uint32_t i=0;i<initial_count && i<16;i++)if(initial[i].ifindex==3 && initial[i].address.s6_addr[0]==0xfe){
+        auto3=initial[i].address;found_auto3=true;
+    }
+    assert(found_auto3);
+    assert(net_ipv6_route(&peer,0,&auto3,&path3)==0 && path3.ifindex==3);
+    assert(net_ipv6_route(&all,0,&auto3,&path3)==0 && path3.ifindex==3);
+    struct in6_addr interface_group={.s6_addr={0xff,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0x77}};
+    assert(net_ipv6_multicast_change(&interface_group,3,1)==0);
+    assert(net_ipv6_route(&interface_group,3,&auto3,&path3)==0);
+    udp(message,&auto3,&interface_group,9000,text,5);
+    sent_count=0;unsigned interface_delivered=udp_count;
+    assert(net_ipv6_output(&path3,17,message,13,1,0,false,true)==13);
+    net_ipv6_poll();assert(udp_count==interface_delivered+1 && last_udp_ifindex==3);
+    assert(sent_count==0); /* interface-local multicast never goes on the wire */
+    udp(message,&peer,&interface_group,9000,text,5);
+    len=packet(frame,&peer,&interface_group,17,1,message,13);net_ipv6_input_on(3,frame,len);
+    assert(udp_count==interface_delivered+1);
+    struct net_ipv6_address local={0};local.address=shared;local.prefix_length=64;
+    local.flags=NET_IPV6_ADDR_NODAD;local.preferred_until=local.valid_until=UINT64_MAX;
+    local.ifindex=2;assert(net_ipv6_address_update(&local,false)==0);
+    local.ifindex=3;assert(net_ipv6_address_update(&local,false)==0);
+    assert(net_ipv6_route(&shared,2,NULL,&path2)==0 && path2.ifindex==2);
+    assert(net_ipv6_route(&shared,3,NULL,&path3)==0 && path3.ifindex==3);
+    assert(net_ipv6_route(&peer,2,&shared,&path2)==0);
+    assert(net_ipv6_route(&peer,3,&shared,&path3)==0);
+
+    /* A neighbor advertisement must flush only the matching link's queue. */
+    udp(message,&shared,&peer,9000,text,5);sent_count=0;
+    assert(net_ipv6_output(&path2,17,message,13,64,0,false,false)==13);
+    assert(net_ipv6_output(&path3,17,message,13,64,0,false,false)==13);
+    assert(probes_since(0,2,&peer)==1 && probes_since(0,3,&peer)==1);
+    memcpy(na+8,peer.s6_addr,16);na[24]=2;na[25]=1;memcpy(na+26,mac3,6);
+    net_put_u16(na+2,net_ipv6_checksum(&peer,&shared,58,na,sizeof(na)));
+    len=packet(frame,&peer,&shared,58,255,na,sizeof(na));
+    unsigned before=sent_count;net_ipv6_input_on(3,frame,len);
+    assert(sent_count==before+1 && sent_ifindex[before]==3);
+    assert(!memcmp(sent[before],mac3,6) && !memcmp(sent[before]+6,second_mac,6));
+    struct net_ipv6_neighbor neighbors[16];uint32_t count=net_ipv6_neighbors(neighbors,16);
+    bool pending2=false,resolved3=false;
+    for(uint32_t i=0;i<count && i<16;i++)if(!memcmp(&neighbors[i].address,&peer,16)){
+        if(neighbors[i].ifindex==2 && neighbors[i].state==1)pending2=true;
+        if(neighbors[i].ifindex==3 && neighbors[i].state==2)resolved3=true;
+    }
+    assert(pending2 && resolved3);
+    memcpy(na+26,mac2,6);na[2]=na[3]=0;
+    net_put_u16(na+2,net_ipv6_checksum(&peer,&shared,58,na,sizeof(na)));
+    len=packet(frame,&peer,&shared,58,255,na,sizeof(na));before=sent_count;
+    net_ipv6_input_on(2,frame,len);
+    assert(sent_count==before+1 && sent_ifindex[before]==2 && !memcmp(sent[before],mac2,6));
+
+    /* Fragment IDs remain unique for identical endpoints sent over both NICs. */
+    uint8_t large[2000]={0};sent_count=0;
+    assert(net_ipv6_output(&path2,17,large,sizeof(large),64,0,false,false)==(int)sizeof(large));
+    assert(net_ipv6_output(&path3,17,large,sizeof(large),64,0,false,false)==(int)sizeof(large));
+    assert(sent_count==4 && sent_ifindex[0]==2 && sent_ifindex[2]==3);
+    assert(net_get_u32(sent[0]+58)!=net_get_u32(sent[2]+58));
+
+    /* Same source, destination and fragment ID must form two separate datagrams. */
+    udp(message,&peer,&shared,9000,text,5);memset(fragment,0,sizeof(fragment));
+    fragment[0]=17;net_put_u16(fragment+2,1);net_put_u32(fragment+4,0x12345678);
+    memcpy(fragment+8,message,8);len=packet(frame,&peer,&shared,44,64,fragment,16);
+    unsigned delivered=udp_count;net_ipv6_input_on(2,frame,len);
+    net_put_u16(fragment+2,8);memcpy(fragment+8,message+8,5);
+    len=packet(frame,&peer,&shared,44,64,fragment,13);net_ipv6_input_on(3,frame,len);
+    assert(udp_count==delivered);
+    net_put_u16(fragment+2,1);memcpy(fragment+8,message,8);
+    len=packet(frame,&peer,&shared,44,64,fragment,16);net_ipv6_input_on(3,frame,len);
+    assert(udp_count==delivered+1 && last_udp_ifindex==3);
+    net_put_u16(fragment+2,8);memcpy(fragment+8,message+8,5);
+    len=packet(frame,&peer,&shared,44,64,fragment,13);net_ipv6_input_on(2,frame,len);
+    assert(udp_count==delivered+2 && last_udp_ifindex==2);
+
+    /* RA MTU and retransmission values, and later PMTU, are link-local state. */
+    uint8_t ra[24]={134,0,0,0};ra[16]=5;ra[17]=1;
+    net_put_u32(ra+12,2500);net_put_u32(ra+20,1500);
+    net_put_u16(ra+2,net_ipv6_checksum(&peer,&all,58,ra,sizeof(ra)));
+    len=packet(frame,&peer,&all,58,255,ra,sizeof(ra));net_ipv6_input_on(2,frame,len);
+    net_put_u32(ra+12,1000);net_put_u32(ra+20,1400);ra[2]=ra[3]=0;
+    net_put_u16(ra+2,net_ipv6_checksum(&peer,&all,58,ra,sizeof(ra)));
+    len=packet(frame,&peer,&all,58,255,ra,sizeof(ra));net_ipv6_input_on(3,frame,len);
+    assert(net_ipv6_route(&peer2,2,&shared,&path2)==0 && path2.mtu==1500);
+    assert(net_ipv6_route(&peer2,3,&shared,&path3)==0 && path3.mtu==1400);
+    uint8_t ptb[48]={2};net_put_u32(ptb+4,1280);ptb[8]=0x60;
+    memcpy(ptb+16,shared.s6_addr,16);memcpy(ptb+32,peer2.s6_addr,16);
+    net_put_u16(ptb+2,net_ipv6_checksum(&peer,&shared,58,ptb,sizeof(ptb)));
+    len=packet(frame,&peer,&shared,58,64,ptb,sizeof(ptb));net_ipv6_input_on(3,frame,len);
+    assert(net_ipv6_route(&peer2,2,&shared,&path2)==0 && path2.mtu==1500);
+    assert(net_ipv6_route(&peer2,3,&shared,&path3)==0 && path3.mtu==1280);
+
+    /* SLAAC constructs the address and installs its prefix route on the ingress NIC. */
+    uint8_t prefix_ra[48]={134};prefix_ra[16]=3;prefix_ra[17]=4;prefix_ra[18]=64;prefix_ra[19]=0xc0;
+    net_put_u32(prefix_ra+20,1200);net_put_u32(prefix_ra+24,600);
+    prefix_ra[32]=0x20;prefix_ra[33]=1;prefix_ra[34]=0x0d;prefix_ra[35]=0xb8;prefix_ra[37]=3;
+    net_put_u16(prefix_ra+2,net_ipv6_checksum(&peer,&all,58,prefix_ra,sizeof(prefix_ra)));
+    len=packet(frame,&peer,&all,58,255,prefix_ra,sizeof(prefix_ra));net_ipv6_input_on(3,frame,len);
+    struct net_ipv6_address addresses[16];count=net_ipv6_addresses(addresses,16);
+    bool found_slaac=false;
+    for(uint32_t i=0;i<count && i<16;i++)if(!memcmp(addresses[i].address.s6_addr,prefix_ra+32,8)){
+        assert(addresses[i].ifindex==3 && addresses[i].address.s6_addr[8]==(uint8_t)(second_mac[0]^2));
+        assert(addresses[i].address.s6_addr[15]==second_mac[5]);found_slaac=true;
+    }
+    assert(found_slaac);
+    struct net_ipv6_route routes[24];count=net_ipv6_routes(routes,24);bool found_route=false;
+    for(uint32_t i=0;i<count && i<24;i++)if(routes[i].prefix_length==64 && routes[i].ifindex==3 &&
+        !memcmp(routes[i].destination.s6_addr,prefix_ra+32,8))found_route=true;
+    assert(found_route);
+
+    /* MLDv1 compatibility learned on one NIC does not change the other NIC's reports. */
+    uint8_t query[32]={58,0,5,2,0,0,1,0,130};
+    net_put_u16(query+10,net_ipv6_checksum(&peer,&all,58,query+8,24));
+    len=packet(frame,&peer,&all,0,1,query,sizeof(query));net_ipv6_input_on(2,frame,len);
+    struct in6_addr group={.s6_addr={0xff,2,0,0,0,0,0,0,0,0,0,0,0,0,0x77,0x77}};
+    assert(net_ipv6_multicast_change(&group,2,1)==0);
+    assert(net_ipv6_multicast_change(&group,3,1)==0);
+    sent_count=0;net_ipv6_poll();
+    assert(saw_mld(2,&group,131) && saw_mld(3,&group,143));
+
+    /* Failure for the same next hop on one link must not fail the other queue. */
+    struct in6_addr failing_peer=peer;failing_peer.s6_addr[15]=0x44;
+    assert(net_ipv6_route(&failing_peer,2,&shared,&path2)==0);
+    assert(net_ipv6_route(&failing_peer,3,&shared,&path3)==0);
+    udp(message,&shared,&failing_peer,9000,text,5);sent_count=0;
+    assert(net_ipv6_output(&path2,17,message,13,64,0,false,false)==13);
+    assert(net_ipv6_output(&path3,17,message,13,64,0,false,false)==13);
+    unsigned errors=socket_error_count;
+    for(unsigned i=0;i<3;i++){now_ms+=1000;net_ipv6_poll();}
+    assert(socket_error_count==errors+1 && last_error_ifindex==3);
+    memcpy(na+8,failing_peer.s6_addr,16);memcpy(na+26,mac2,6);na[2]=na[3]=0;
+    net_put_u16(na+2,net_ipv6_checksum(&failing_peer,&shared,58,na,sizeof(na)));
+    len=packet(frame,&failing_peer,&shared,58,255,na,sizeof(na));before=sent_count;
+    net_ipv6_input_on(2,frame,len);
+    assert(sent_count==before+1 && sent_ifindex[before]==2);
+
+    assert(net_ipv6_route(&peer2,2,&shared,&path2)==0);
+    assert(net_ipv6_route(&peer2,3,&shared,&path3)==0);
+    udp(message,&shared,&peer2,9000,text,5);sent_count=0;
+    assert(net_ipv6_output(&path2,17,message,13,64,0,false,false)==13);
+    assert(net_ipv6_output(&path3,17,message,13,64,0,false,false)==13);
+    before=sent_count;now_ms+=1000;net_ipv6_poll();
+    assert(probes_since(before,2,&peer2)==0 && probes_since(before,3,&peer2)==1);
+
+    /* Unplugging one device fails only its queue and retains the other link and reassembly. */
+    udp(message,&peer,&shared,9000,text,5);memset(fragment,0,sizeof(fragment));
+    fragment[0]=17;net_put_u16(fragment+2,1);net_put_u32(fragment+4,0x87654321);
+    memcpy(fragment+8,message,8);len=packet(frame,&peer,&shared,44,64,fragment,16);
+    net_ipv6_input_on(2,frame,len);net_ipv6_input_on(3,frame,len);delivered=udp_count;
+    errors=socket_error_count;first_nic=false;net_ipv6_detached_on(2);
+    assert(socket_error_count==errors+1 && last_error_ifindex==2);
+    assert(net_ipv6_route(&peer2,3,&shared,&path3)==0 && path3.mtu==1280);
+    net_put_u16(fragment+2,8);memcpy(fragment+8,message+8,5);
+    len=packet(frame,&peer,&shared,44,64,fragment,13);net_ipv6_input_on(3,frame,len);
+    assert(udp_count==delivered+1 && last_udp_ifindex==3);
+    memcpy(na+8,peer2.s6_addr,16);memcpy(na+26,mac3,6);na[2]=na[3]=0;
+    net_put_u16(na+2,net_ipv6_checksum(&peer2,&shared,58,na,sizeof(na)));
+    len=packet(frame,&peer2,&shared,58,255,na,sizeof(na));before=sent_count;
+    net_ipv6_input(frame,len); /* legacy wrapper now selects the first surviving NIC */
+    assert(sent_count==before+1 && sent_ifindex[before]==3);
+
+    /* Stable NIC indices are not array offsets and need not be dense. */
+    second_nic=false;net_ipv6_detached_on(3);second_index=1000;second_nic=true;
+    net_ipv6_link_changed_on(second_index,true);sent_count=0;net_ipv6_poll();now_ms+=1000;net_ipv6_poll();
+    assert(net_ipv6_route(&peer,second_index,NULL,&path3)==0 && path3.ifindex==second_index);
+    udp(message,&path3.source,&peer,9000,text,5);before=sent_count;
+    assert(net_ipv6_output(&path3,17,message,13,64,0,false,false)==13);
+    assert(sent_count==before+1 && sent_ifindex[before]==second_index);
+    second_nic=false;net_ipv6_detached_on(second_index);
+}
+
+/** @brief Link state must not impose a second, independent NIC count limit. */
+static void test_many_interfaces(void)
+{
+    first_nic=false;second_nic=false;extra_nics=17;net_ipv6_init();
+    struct net_ipv6_address addresses[16];uint32_t count=net_ipv6_addresses(addresses,16);
+    bool removed=false;
+    for(uint32_t i=0;i<count && i<16;i++)if(addresses[i].ifindex==100){
+        assert(net_ipv6_address_update(&addresses[i],true)==0);removed=true;break;
+    }
+    assert(removed);
+    struct net_ipv6_address address={0};address.address.s6_addr[0]=0xfe;
+    address.address.s6_addr[1]=0x80;address.address.s6_addr[15]=1;
+    address.ifindex=116;address.prefix_length=64;address.flags=NET_IPV6_ADDR_NODAD;
+    address.preferred_until=address.valid_until=UINT64_MAX;
+    assert(net_ipv6_address_update(&address,false)==0);
+    struct in6_addr peer=address.address;peer.s6_addr[15]=2;
+    struct net_ipv6_path path;
+    assert(net_ipv6_route(&peer,116,&address.address,&path)==0 && path.ifindex==116);
+    for(uint32_t i=100;i<117;i++)net_ipv6_detached_on(i);
+    extra_nics=0;
+}
+
+/** @brief Allocation failures are reported and the maintenance pump retries registration. */
+static void test_link_allocation_retry(void)
+{
+    net_ipv6_init();second_index=1000;second_nic=true;failed_allocations=1;
+    assert(net_ipv6_link_changed_on(second_index,true)==-LINUX_ENOMEM);
+    struct net_ipv6_address addresses[16];uint32_t count=net_ipv6_addresses(addresses,16);
+    for(uint32_t i=0;i<count && i<16;i++)assert(addresses[i].ifindex!=second_index);
+    assert(net_ipv6_maintenance_pending());
+    sent_count=0;net_ipv6_poll();now_ms+=1000;net_ipv6_poll();
+    struct in6_addr peer={.s6_addr={0xfe,0x80,0,0,0,0,0,0,0,0,0,0,0,0,0,0x42}};
+    struct net_ipv6_path path;
+    assert(net_ipv6_route(&peer,second_index,NULL,&path)==0 && path.ifindex==second_index);
+    second_nic=false;net_ipv6_detached_on(second_index);
+}
 #endif
 
 /** @brief Exercise real host packet/state processing with deterministic NIC and time.
@@ -371,6 +672,10 @@ int main(void)
     net_ipv6_detached();random_unavailable=true;now_ms+=5000;net_ipv6_link_changed(true);sent_count=0;start=now_ms;
     while(last_icmp(135)<0 && now_ms-start<=1000){net_ipv6_poll();now_ms+=10;}
     assert(last_icmp(135)>=0 && now_ms-start<=1010);random_unavailable=false;
+    /* Address configuration must accept a second real Ethernet interface. */
+    test_multiple_interfaces();
+    test_many_interfaces();
+    test_link_allocation_retry();
     puts("PASS IPv6 protocol: loopback, DAD/NDP, checksums, fragments, RA/SLAAC, MLD and timer pump");
 #endif
     return 0;

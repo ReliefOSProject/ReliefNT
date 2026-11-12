@@ -40,6 +40,7 @@ static uint32_t sent_lengths[128];
 static uint32_t sent_length;
 static uint32_t sent_count;
 static int send_error;
+static bool arp_reply_pending;
 static int allocation_failure;
 static int buffers;
 static bool advance_poll_clock;
@@ -68,10 +69,31 @@ int e1000_send(const void *data, uint32_t length)
     __builtin_memcpy(sent_frames[index], data, length);
     sent_lengths[index] = length;
     ++sent_count;
+    if (!send_error && length >= 42 && net_get_u16(sent_frame + 12) == ETH_TYPE_ARP &&
+        net_get_u16(sent_frame + 20) == ARP_OPER_REQUEST) arp_reply_pending = true;
     return send_error;
 }
 int e1000_poll(void *frame, uint32_t capacity, uint32_t *length)
-{ (void)frame; (void)capacity; ++network_poll_count; *length = 0; if (advance_poll_clock) ++now_ms; return 0; }
+{
+    ++network_poll_count;
+    *length = 0;
+    if (advance_poll_clock) ++now_ms;
+    if (!arp_reply_pending) return 0;
+    assert(capacity >= 42);
+    arp_reply_pending = false;
+    uint8_t *reply = frame;
+    const uint8_t peer[6] = {2,9,8,7,6,5};
+    net_memcpy(reply, sent_frame, 42);
+    net_memcpy(reply, e1000_mac(), 6);
+    net_memcpy(reply + 6, peer, 6);
+    net_put_u16(reply + 20, ARP_OPER_REPLY);
+    net_memcpy(reply + 22, peer, 6);
+    net_put_u32(reply + 28, net_get_u32(sent_frame + 38));
+    net_memcpy(reply + 32, e1000_mac(), 6);
+    net_put_u32(reply + 38, net_get_u32(sent_frame + 28));
+    *length = 42;
+    return 1;
+}
 void net_udp_input(uint32_t source, uint32_t destination, uint16_t source_port,
                    uint16_t destination_port, const void *data, uint32_t length, int ifindex)
 { (void)ifindex; (void)source; (void)destination; (void)source_port; (void)destination_port; (void)data; (void)length; }
@@ -153,7 +175,7 @@ static void test_proc_network(struct net_socket *socket)
     assert(strstr(text, "eth0\t0000250a\t00000000\t0001") && strstr(text, "00ffffff"));
     assert(strstr(text, "eth0\t00000000\t0200250a\t0003"));
     const uint8_t mac[] = {2, 3, 4, 5, 6, 7};
-    net_arp_cache_store(0x0a250002, mac);
+    net_arp_store_on(2, 0x0a250002, mac);
     memset(text, 0, sizeof(text));
     stream = (struct text_stream){.buffer = text, .capacity = sizeof(text) - 1};
     assert(!net_proc_emit(&stream, "arp") && strstr(text, "10.37.0.2"));
@@ -264,6 +286,9 @@ static void test_nonblocking_tcp_send_without_ack(void)
     socket->state = RELIEFOS_NET_TCP_ESTABLISHED;
     socket->local_ip = 0x0a25000f;
     socket->remote_ip = 0x0a250002;
+    socket->ifindex = 2;
+    socket->next_hop = socket->remote_ip;
+    net_memcpy(socket->dst_mac, e1000_mac(), 6);
     socket->local_port = 51001;
     socket->remote_port = 8000;
     socket->local_seq = 9000;
@@ -360,6 +385,9 @@ static void test_tcp_peer_window_and_persist(void)
     socket->state = RELIEFOS_NET_TCP_ESTABLISHED;
     socket->local_ip = 0x0a25000f;
     socket->remote_ip = 0x0a250002;
+    socket->ifindex = 2;
+    socket->next_hop = socket->remote_ip;
+    net_memcpy(socket->dst_mac, e1000_mac(), 6);
     socket->local_port = 51002;
     socket->remote_port = 8001;
     socket->local_seq = socket->acked_seq = 12000;
@@ -391,6 +419,9 @@ static void test_tcp_peer_window_and_persist(void)
     socket->state = RELIEFOS_NET_TCP_ESTABLISHED;
     socket->local_ip = 0x0a25000f;
     socket->remote_ip = 0x0a250002;
+    socket->ifindex = 2;
+    socket->next_hop = socket->remote_ip;
+    net_memcpy(socket->dst_mac, e1000_mac(), 6);
     socket->local_port = 51003;
     socket->remote_port = 8002;
     socket->local_seq = socket->acked_seq = 33000;
@@ -455,6 +486,9 @@ static void test_tcp_timeouts_and_read_errors(void)
     socket->state = RELIEFOS_NET_TCP_ESTABLISHED;
     socket->local_ip = 0x0a25000f;
     socket->remote_ip = 0x0a250002;
+    socket->ifindex = 2;
+    socket->next_hop = socket->remote_ip;
+    net_memcpy(socket->dst_mac, e1000_mac(), 6);
     socket->local_port = 51004;
     socket->remote_port = 8003;
     socket->local_seq = socket->acked_seq = 55000;
@@ -531,6 +565,9 @@ static void test_negative_socket_timeout_seconds_clamp_to_immediate(void)
     inet->state = RELIEFOS_NET_TCP_ESTABLISHED;
     inet->local_ip = 0x0a25000f;
     inet->remote_ip = 0x0a250002;
+    inet->ifindex = 2;
+    inet->next_hop = inet->remote_ip;
+    net_memcpy(inet->dst_mac, e1000_mac(), 6);
     inet->local_port = 51015;
     inet->remote_port = 8014;
     inet->local_seq = inet->acked_seq = 94000;
@@ -639,6 +676,9 @@ static void test_tcp_release_then_owner_exit_drains_queued_bytes(void)
     socket->state = RELIEFOS_NET_TCP_ESTABLISHED;
     socket->local_ip = 0x0a25000f;
     socket->remote_ip = 0x0a250002;
+    socket->ifindex = 2;
+    socket->next_hop = socket->remote_ip;
+    net_memcpy(socket->dst_mac, e1000_mac(), 6);
     socket->local_port = 51010;
     socket->remote_port = 8009;
     socket->local_seq = socket->acked_seq = initial_seq;
@@ -719,6 +759,9 @@ static void test_tcp_fin_retransmit_ack_and_half_close(void)
     socket->state = RELIEFOS_NET_TCP_ESTABLISHED;
     socket->local_ip = 0x0a25000f;
     socket->remote_ip = 0x0a250002;
+    socket->ifindex = 2;
+    socket->next_hop = socket->remote_ip;
+    net_memcpy(socket->dst_mac, e1000_mac(), 6);
     socket->local_port = 51011;
     socket->remote_port = 8010;
     socket->local_seq = socket->acked_seq = 91000;
@@ -814,6 +857,9 @@ static void test_tcp_peer_half_close_allows_reply(void)
     socket->state = RELIEFOS_NET_TCP_ESTABLISHED;
     socket->local_ip = 0x0a25000f;
     socket->remote_ip = 0x0a250002;
+    socket->ifindex = 2;
+    socket->next_hop = socket->remote_ip;
+    net_memcpy(socket->dst_mac, e1000_mac(), 6);
     socket->local_port = 51014;
     socket->remote_port = 8013;
     socket->local_seq = socket->acked_seq = 93000;
@@ -888,6 +934,9 @@ static void test_tcp_unacknowledged_fin_is_not_reclaimed(void)
     socket->state = RELIEFOS_NET_TCP_ESTABLISHED;
     socket->local_ip = 0x0a25000f;
     socket->remote_ip = 0x0a250002;
+    socket->ifindex = 2;
+    socket->next_hop = socket->remote_ip;
+    net_memcpy(socket->dst_mac, e1000_mac(), 6);
     socket->local_port = 51012;
     socket->remote_port = 8011;
     socket->local_seq = socket->acked_seq = 92000;
@@ -923,6 +972,9 @@ static void test_tcp_out_of_window_segment_cannot_ack_data(void)
     socket->state = RELIEFOS_NET_TCP_ESTABLISHED;
     socket->local_ip = 0x0a25000f;
     socket->remote_ip = 0x0a250002;
+    socket->ifindex = 2;
+    socket->next_hop = socket->remote_ip;
+    net_memcpy(socket->dst_mac, e1000_mac(), 6);
     socket->local_port = 51013;
     socket->remote_port = 8012;
     socket->local_seq = 30008;
@@ -948,8 +1000,89 @@ static void test_tcp_out_of_window_segment_cannot_ack_data(void)
     net_socket_clear(socket);
 }
 
+static void test_tcp_route_gateway_change(void)
+{
+    struct reliefos_net_config saved = net_config;
+    const uint8_t first_mac[6] = {2,1,2,3,4,5};
+    const uint8_t second_mac[6] = {2,6,7,8,9,10};
+    net_config.gateway_ip = 0x0a250002;
+    net_arp_store_on(2, 0x0a250002, first_mac);
+    net_arp_store_on(2, 0x0a250003, second_mac);
+    struct net_socket *socket = net_socket_alloc(7, 1000);
+    assert(socket);
+    socket->local_ip = net_config.local_ip;
+    socket->remote_ip = 0x08080808;
+    socket->local_port = 55050;
+    socket->remote_port = 80;
+    socket->ifindex = 2;
+    memcpy(socket->dst_mac, first_mac, 6);
+    assert(net_send_tcp_socket(socket, 1, 1, TCP_FLAG_ACK, NULL, 0) >= 0);
+    assert(!memcmp(sent_frame, first_mac, 6));
+    net_config.gateway_ip = 0x0a250003;
+    assert(net_send_tcp_socket(socket, 1, 1, TCP_FLAG_ACK, NULL, 0) >= 0);
+    assert(!memcmp(sent_frame, second_mac, 6));
+    net_socket_clear(socket);
+    net_config = saved;
+}
+
+static void test_tcp_bound_device_local_delivery(void)
+{
+    struct net_socket *listener = net_socket_alloc(7, 1000);
+    struct net_socket *client = net_socket_alloc(7, 1000);
+    assert(listener && client);
+    uint32_t index = 2;
+    assert(!net_socket_bound_device(listener->handle, true, &index));
+    assert(!tcp_bind_port(listener, net_config.local_ip, 55051));
+    assert(!net_socket_listen_fd(listener->handle, 2));
+    assert(net_socket_connect_fd(client->handle, net_config.local_ip, 55051, true) == -LINUX_EINPROGRESS);
+    for (unsigned pass = 0; pass < 8 && net_tcp_loop_pending(); ++pass)
+        net_tcp_loop_service();
+    assert(client->state == RELIEFOS_NET_TCP_ESTABLISHED);
+    int child_handle = net_socket_accept_peek(listener->handle);
+    assert(child_handle > 0);
+    struct net_socket *child = net_socket_find(child_handle, 0, 1);
+    assert(child && child->bound_ifindex == 2 && child->ifindex == 2);
+    net_socket_clear(child);
+    net_socket_clear(client);
+    net_socket_clear(listener);
+}
+
+static void test_tcp_matching_and_scope_isolation(void)
+{
+    struct net_socket *first = net_socket_alloc(7, 1000);
+    struct net_socket *second = net_socket_alloc(7, 1000);
+    assert(first && second);
+    first->state = second->state = RELIEFOS_NET_TCP_ESTABLISHED;
+    first->local_ip = second->local_ip = 0x0a25000f;
+    first->remote_ip = second->remote_ip = 0x0a250002;
+    first->local_port = second->local_port = 55052;
+    first->remote_port = second->remote_port = 80;
+    first->bound_ifindex = 2;
+    second->bound_ifindex = 3;
+    assert(net_socket_match(2,0x0a250002,0x0a25000f,80,55052) == first);
+    assert(net_socket_match(3,0x0a250002,0x0a25000f,80,55052) == second);
+    first->resolving_neighbor = true;
+    unsigned before = sent_count;
+    assert(net_send_tcp_socket(first,1,1,TCP_FLAG_ACK,NULL,0) == -LINUX_EAGAIN);
+    net_socket_service(first);
+    assert(sent_count == before);
+    net_socket_clear(second);
+    net_socket_clear(first);
+    first = net_socket_alloc(7,1000);
+    assert(first && !net_socket_set_ipv6(first->handle,true));
+    uint32_t index=2;
+    assert(!net_socket_bound_device(first->handle,true,&index));
+    struct sockaddr_in6 peer={.sin6_family=AF_INET6,.sin6_port=__builtin_bswap16(80),
+        .sin6_scope_id=1,.sin6_addr={.s6_addr={0xfe,0x80,0,0,0,0,0,0,0,0,0,0,0,0,0,2}}};
+    assert(net_socket_connect6_fd(first->handle,&peer,true) == -LINUX_EINVAL);
+    net_socket_clear(first);
+}
+
 int main(void)
 {
+    static struct net_interface test_interface = {.index=2, .up=true,
+        .config={.local_ip=0x0a25000f,.subnet_mask=0xffffff00,.gateway_ip=0x0a250002}};
+    interfaces = &test_interface;
     struct net_socket *s = net_socket_alloc(7, 1000);
     bool interface_was_up = net_interface_up;
     assert(s);
@@ -965,6 +1098,9 @@ int main(void)
     assert(net_socket_find(handle, 0, 1) == s);
     s->state = RELIEFOS_NET_TCP_ESTABLISHED;
     s->local_ip = 0x0a25000f; s->remote_ip = 0x0a250002;
+    s->ifindex = 2;
+    s->next_hop = s->remote_ip;
+    net_memcpy(s->dst_mac, e1000_mac(), 6);
     s->local_port = 51000; s->remote_port = 8000;
     s->remote_seq = 500; s->local_seq = s->acked_seq = 100;
     s->rx_len = NET_SOCKET_RX_CAP - 2;
@@ -1013,6 +1149,10 @@ int main(void)
     assert(s && buffers == 3);
     net_socket_clear(s);
     assert(buffers == 0);
+    net_config = (struct reliefos_net_config){.local_ip=0x0a25000f,.subnet_mask=0xffffff00,.gateway_ip=0x0a250002};
+    test_tcp_route_gateway_change();
+    test_tcp_bound_device_local_delivery();
+    test_tcp_matching_and_scope_isolation();
     test_nonblocking_tcp_send_without_ack();
     test_tcp_peer_window_and_persist();
     test_tcp_timeouts_and_read_errors();
@@ -1033,3 +1173,22 @@ int main(void)
 int syscall_unix_path(struct vfs_namespace *ns,struct task *task,const char *name,
                           bool create,struct vfs_path *out)
 { (void)ns;(void)task;(void)name;(void)create;(void)out;abort(); }
+
+uint32_t netdev_next(uint32_t after) { return after < 2 ? 2 : 0; }
+int netdev_is_ready(uint32_t index) { return index == 2; }
+const uint8_t *netdev_mac(uint32_t index) { (void)index; return e1000_mac(); }
+void netdev_get_info(uint32_t index, struct e1000_info *out)
+{ if (index == 2) e1000_get_info(out); else *out = (struct e1000_info){0}; }
+int netdev_send(uint32_t index, const void *data, uint32_t length)
+{ (void)index; return e1000_send(data, length); }
+int netdev_poll(uint32_t index, void *frame, uint32_t capacity, uint32_t *length)
+{ (void)index; return e1000_poll(frame, capacity, length); }
+void netdev_counters(uint32_t index, struct net_proc_counters *out)
+{ (void)index; *out = (struct net_proc_counters){0}; }
+void net_ipv6_input_on(uint32_t index, const uint8_t *frame, uint32_t length)
+{ (void)index; net_ipv6_input(frame,length); }
+void net_packet_input_on(uint32_t index, const void *frame, uint32_t length)
+{ (void)index; net_packet_input(frame,length); }
+int net_ipv6_link_changed_on(uint32_t index, bool up) { (void)index; (void)up; return 0; }
+void net_ipv6_detached_on(uint32_t index) { (void)index; }
+void netlink_ipv6_changed(void) {}

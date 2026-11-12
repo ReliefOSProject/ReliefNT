@@ -1,6 +1,6 @@
 #include "../internal.h"
 
-struct tcp_loop_frame { uint32_t length; uint8_t bytes[NET_FRAME_MAX]; };
+struct tcp_loop_frame { uint32_t length, ifindex; uint8_t bytes[NET_FRAME_MAX]; };
 static struct tcp_loop_frame tcp_loop_frames[32];
 static uint32_t tcp_loop_head, tcp_loop_count;
 
@@ -16,7 +16,9 @@ void net_tcp_loop_service(void)
         struct tcp_loop_frame frame = tcp_loop_frames[tcp_loop_head];
         tcp_loop_head = (tcp_loop_head + 1u) % 32u; --tcp_loop_count;
         const uint8_t *ip = frame.bytes + 14;
-        net_handle_tcp(ip, frame.length - 14u, 20u, net_get_u32(ip + 12), NULL, NULL);
+        if (net_interface_exists(frame.ifindex) && net_interface_is_up(frame.ifindex))
+            net_handle_tcp_on(frame.ifindex, ip, frame.length - 14u, 20u,
+                              net_get_u32(ip + 12), NULL, NULL);
     }
 }
 
@@ -77,7 +79,7 @@ uint32_t net_socket_select_window(const struct net_socket *socket)
  * @note The receiver window is read from the matching stable socket under the
  * network execution transaction, then published only after successful transmit.
  */
-int net_send_tcp_to_mac(const uint8_t *dst_mac, uint32_t src_ip,
+static int net_send_tcp_to_mac_on(uint32_t ifindex, const uint8_t *dst_mac, uint32_t src_ip,
                                uint32_t dst_ip, uint16_t src_port,
                                uint16_t dst_port, uint32_t seq,
                                uint32_t ack, uint8_t flags,
@@ -97,7 +99,7 @@ int net_send_tcp_to_mac(const uint8_t *dst_mac, uint32_t src_ip,
     tcp_len = (uint16_t)(tcp_header_len + payload_len);
     total_len = (uint16_t)(20u + tcp_len);
     net_memzero(frame, 34u + tcp_header_len + payload_len);
-    net_write_eth(frame, dst_mac, ETH_TYPE_IPV4);
+    net_write_eth_on(ifindex, frame, dst_mac, ETH_TYPE_IPV4);
     ip[0] = 0x45;
     ip[1] = 0;
     net_put_u16(ip + 2, total_len);
@@ -119,7 +121,7 @@ int net_send_tcp_to_mac(const uint8_t *dst_mac, uint32_t src_ip,
     struct net_socket *receiver = 0;
     for (struct net_socket *s = net_sockets; s; s = s->registry_next) {
         if (s->used && s->local_port == src_port && s->remote_port == dst_port &&
-            s->remote_ip == dst_ip) {
+            s->remote_ip == dst_ip && s->local_ip == src_ip) {
             receiver = s;
             window = net_socket_select_window(s);
             break;
@@ -138,13 +140,14 @@ int net_send_tcp_to_mac(const uint8_t *dst_mac, uint32_t src_ip,
     }
     net_put_u16(tcp + 16, net_tcp_checksum(src_ip, dst_ip, tcp, tcp_len));
     int result;
-    if ((dst_ip >> 24) == 127 || (dst_ip && dst_ip == net_config.local_ip)) {
+    if ((dst_ip >> 24) == 127 || (dst_ip && net_interface_for_ipv4(dst_ip))) {
         if (tcp_loop_count == 32) return -LINUX_ENOBUFS;
         struct tcp_loop_frame *queued = &tcp_loop_frames[(tcp_loop_head + tcp_loop_count) % 32u];
         queued->length = 14u + total_len;
+        queued->ifindex = ifindex;
         net_memcpy(queued->bytes, frame, queued->length);
         ++tcp_loop_count; result = (int)queued->length;
-    } else result = net_interface_up ? e1000_send(frame, 14u + total_len) : -LINUX_ENETDOWN;
+    } else result = net_interface_is_ready(ifindex) ? netdev_send(ifindex, frame, 14u + total_len) : -LINUX_ENETDOWN;
     if (result >= 0 && receiver && (flags & TCP_FLAG_ACK)) {
         receiver->rx_window_ack = ack;
         receiver->rx_window = window;
@@ -174,13 +177,35 @@ uint32_t net_socket_mss(const struct net_socket *socket)
 int net_send_tcp_socket(struct net_socket *socket, uint32_t seq, uint32_t ack,
                         uint8_t flags, const uint8_t *payload, uint32_t length)
 {
-    if (!socket->ipv6 || socket->mapped)
-        return net_send_tcp_to_mac(socket->dst_mac, socket->local_ip, socket->remote_ip,
-            socket->local_port, socket->remote_port, seq, ack, flags, payload, length);
+    if (socket->resolving_neighbor) return -LINUX_EAGAIN;
+    if (!socket->ipv6 || socket->mapped) {
+        bool local = net_interface_for_ipv4(socket->remote_ip) != 0;
+        if (!local) {
+            struct net_ipv4_path path;
+            int result = net_ipv4_route_lookup(socket->remote_ip, socket->local_ip,
+                                               socket->bound_ifindex, &path);
+            if (result < 0) return result;
+            if (socket->ifindex != path.ifindex || socket->next_hop != path.next_hop ||
+                net_mac_is_zero(socket->dst_mac)) {
+                socket->resolving_neighbor = true;
+                result = net_resolve_mac_on(path.ifindex, path.next_hop, 1000, socket->dst_mac);
+                socket->resolving_neighbor = false;
+                if (result < 0) return result;
+            }
+            socket->ifindex = path.ifindex;
+            socket->next_hop = path.next_hop;
+        }
+        return net_send_tcp_to_mac_on(local ? net_interface_for_ipv4(socket->remote_ip) : socket->ifindex, socket->dst_mac,
+            socket->local_ip, socket->remote_ip, socket->local_port, socket->remote_port,
+            seq, ack, flags, payload, length);
+    }
+    if (socket->remote_scope6 && socket->bound_ifindex && socket->remote_scope6 != socket->bound_ifindex)
+        return -LINUX_EINVAL;
     struct net_ipv6_path path;
-    int ret = net_ipv6_route(&socket->remote6, socket->remote_scope6, &socket->local6, &path);
+    int ret = net_ipv6_route(&socket->remote6, socket->remote_scope6 ? socket->remote_scope6 : socket->bound_ifindex, &socket->local6, &path);
     if (ret < 0) return ret;
     socket->mtu6 = path.mtu;
+    socket->ifindex = path.ifindex;
     uint32_t header = (flags & TCP_FLAG_SYN) ? 24u : 20u;
     if (length > net_socket_mss(socket) || (length && !payload)) return -LINUX_EMSGSIZE;
     uint8_t tcp[NET_TCP_MSS + 24];
@@ -204,4 +229,20 @@ int net_send_tcp_socket(struct net_socket *socket, uint32_t seq, uint32_t ack,
         socket->rx_window_ack = ack; socket->rx_window = window; socket->rx_window_valid = true;
     }
     return ret;
+}
+
+/** @brief Send a legacy TCP segment with normal route selection.
+ * @param mac Peer MAC. @param source Local IP. @param destination Peer IP.
+ * @param source_port Local port. @param destination_port Peer port.
+ * @param seq Sequence. @param ack Acknowledgment. @param flags Control bits.
+ * @param data Payload. @param length Bytes. @return Driver result or negative errno. */
+int net_send_tcp_to_mac(const uint8_t *mac, uint32_t source, uint32_t destination,
+    uint16_t source_port, uint16_t destination_port, uint32_t seq, uint32_t ack,
+    uint8_t flags, const uint8_t *data, uint32_t length)
+{
+    struct net_ipv4_path path;
+    int result = net_ipv4_route_lookup(destination, source, 0, &path);
+    if (result < 0) return result;
+    return net_send_tcp_to_mac_on(path.ifindex, mac, source, destination, source_port,
+                                   destination_port, seq, ack, flags, data, length);
 }

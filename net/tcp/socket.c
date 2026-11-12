@@ -397,6 +397,7 @@ static int tcp_bind_port(struct net_socket *socket, uint32_t ip, uint16_t port)
         for (struct net_socket *other = net_sockets; other; other = other->registry_next) {
             if (other == socket || !other->used || !other->bound || other->listener || other->local_port != candidate) continue;
             if (socket->reuse && other->reuse && other->state != NET_TCP_LISTEN) continue;
+            if (socket->bound_ifindex && other->bound_ifindex && socket->bound_ifindex != other->bound_ifindex) continue;
             if (tcp_uses_ipv4(socket) && tcp_uses_ipv4(other) && (!ip || !other->local_ip || ip == other->local_ip)) conflict = true;
             if (socket->ipv6 && other->ipv6 && !tcp6_mapped(&socket->local6) && !tcp6_mapped(&other->local6) &&
                 (tcp6_any(&socket->local6) || tcp6_any(&other->local6) ||
@@ -533,7 +534,7 @@ static void net_socket_service(struct net_socket *socket)
     uint32_t flight_limit;
     uint32_t unsent;
     uint32_t send_window;
-    if (!socket || !socket->used) return;
+    if (!socket || !socket->used || socket->resolving_neighbor) return;
     now = time_uptime_ms();
     if (socket->state == RELIEFOS_NET_TCP_SYN_SENT || socket->state == NET_TCP_SYN_RECEIVED) {
         if (socket->syn_deadline && now >= socket->syn_deadline) {
@@ -753,10 +754,18 @@ static uint32_t net_socket_connect_ip(struct net_socket *socket,
     if (!socket || !remote_ip || !remote_port) {
         return RELIEFOS_NET_STATUS_BAD_ARGUMENT;
     }
-    if ((remote_ip >> 24) == 127 || (remote_ip && remote_ip == net_config.local_ip)) net_memzero(dst_mac, sizeof(dst_mac));
+    struct net_ipv4_path path;
+    ret = net_ipv4_route_lookup(remote_ip, socket->local_ip, socket->bound_ifindex, &path);
+    if (ret < 0) {
+        socket->error = -ret;
+        return RELIEFOS_NET_STATUS_NO_ADDRESS;
+    }
+    socket->ifindex = path.ifindex;
+    socket->next_hop = path.next_hop;
+    if (net_interface_for_ipv4(remote_ip)) net_memzero(dst_mac, sizeof(dst_mac));
     else {
-        arp_ip = net_route_arp_ip(remote_ip);
-        ret = net_resolve_mac(arp_ip, timeout_ms, dst_mac);
+        arp_ip = path.next_hop;
+        ret = net_resolve_mac_on(path.ifindex, arp_ip, timeout_ms, dst_mac);
         if (ret < 0) return ret == -1 ? RELIEFOS_NET_STATUS_TX_FAILED : RELIEFOS_NET_STATUS_ARP_TIMEOUT;
     }
 
@@ -770,7 +779,7 @@ static uint32_t net_socket_connect_ip(struct net_socket *socket,
     socket->fin_pending = false;
     socket->fin_sent = false;
     socket->fin_acked = false;
-    if (!socket->local_ip) socket->local_ip = (remote_ip >> 24) == 127 ? 0x7f000001 : net_config.local_ip;
+    if (!socket->local_ip) socket->local_ip = path.source;
     socket->remote_ip = remote_ip;
     socket->remote_port = remote_port;
     socket->local_seq = 0x4c4e0000u ^ (net_sequence++ << 8) ^
@@ -1306,10 +1315,10 @@ int net_socket_connect_fd(int32_t handle, uint32_t ip, uint16_t port, bool nonbl
     if (!s) return -LINUX_EBADF;
     if (s->state == RELIEFOS_NET_TCP_SYN_SENT) return -LINUX_EALREADY;
     if (s->state != RELIEFOS_NET_TCP_CLOSED) return -LINUX_EISCONN;
-    bool local = (ip >> 24) == 127 || (ip && ip == net_config.local_ip);
-    if (!local && !e1000_is_ready()) return -LINUX_ENETDOWN;
     if (!ip || !port) return -LINUX_EINVAL;
-    if (!local && net_ensure_ipv4_config(3000, 0) != RELIEFOS_NET_STATUS_OK) return -LINUX_ENETUNREACH;
+    struct net_ipv4_path path;
+    int route = net_ipv4_route_lookup(ip, s->local_ip, s->bound_ifindex, &path);
+    if (route < 0) return route;
     s->error = 0;
     uint32_t status = net_socket_connect_ip(s, ip, port, 10000, nonblock);
     if (s->state == RELIEFOS_NET_TCP_SYN_SENT) return -LINUX_EINPROGRESS;
@@ -1346,14 +1355,16 @@ int net_socket_bind6_fd(int32_t handle, const struct sockaddr_in6 *address)
     struct net_socket *s = net_socket_find(handle, 0, 1);
     if (!s) return -LINUX_EBADF;
     if (!address || s->bound || s->state != RELIEFOS_NET_TCP_CLOSED) return -LINUX_EINVAL;
-    if (address->sin6_scope_id > 2) return -LINUX_ENODEV;
+    if (address->sin6_scope_id && !net_interface_exists(address->sin6_scope_id)) return -LINUX_ENODEV;
+    if (address->sin6_scope_id && s->bound_ifindex && address->sin6_scope_id != s->bound_ifindex)
+        return -LINUX_EINVAL;
     bool mapped = tcp6_mapped(&address->sin6_addr);
     if (mapped && s->ipv6 && s->v6only) return -LINUX_EINVAL;
     uint32_t ip = mapped ? tcp6_unmap(&address->sin6_addr) : 0;
     if (mapped) {
         struct reliefos_net_config config;
         net_get_config(&config);
-        if (ip && (ip >> 24) != 127 && ip != config.local_ip) return -LINUX_EADDRNOTAVAIL;
+        if (ip && !net_interface_for_ipv4(ip)) return -LINUX_EADDRNOTAVAIL;
     } else if (!tcp6_any(&address->sin6_addr)) {
         if (!s->ipv6) return -LINUX_EAFNOSUPPORT;
         if (address->sin6_addr.s6_addr[0] == 0xfe && (address->sin6_addr.s6_addr[1] & 0xc0) == 0x80 && !address->sin6_scope_id)
@@ -1395,12 +1406,14 @@ int net_socket_connect6_fd(int32_t handle, const struct sockaddr_in6 *address, b
         s->mapped = true; s->remote6 = address->sin6_addr;
         return net_socket_connect_fd(handle, tcp6_unmap(&address->sin6_addr), port, nonblock);
     }
+    if (address->sin6_scope_id && s->bound_ifindex && address->sin6_scope_id != s->bound_ifindex)
+        return -LINUX_EINVAL;
     if (tcp6_mapped(&s->local6)) return -LINUX_ENETUNREACH;
     struct net_ipv6_path path;
-    int ret = net_ipv6_route(&address->sin6_addr, address->sin6_scope_id, &s->local6, &path);
+    int ret = net_ipv6_route(&address->sin6_addr, address->sin6_scope_id ? address->sin6_scope_id : s->bound_ifindex, &s->local6, &path);
     if (ret < 0) return ret;
     if (!s->bound) { ret = tcp_bind_port(s, 0, 0); if (ret < 0) return ret; }
-    s->local6 = path.source; s->remote6 = address->sin6_addr; s->remote_scope6 = address->sin6_scope_id;
+    s->ifindex = path.ifindex; s->local6 = path.source; s->remote6 = address->sin6_addr; s->remote_scope6 = address->sin6_scope_id;
     s->mtu6 = path.mtu; s->remote_port = port; s->error = 0; s->mapped = false;
     s->state = RELIEFOS_NET_TCP_SYN_SENT; s->status = RELIEFOS_NET_STATUS_TCP_TIMEOUT;
     s->local_seq = 0x4c4e0000u ^ (net_sequence++ << 8) ^ (uint32_t)time_uptime_ms();
@@ -1493,11 +1506,12 @@ int net_socket_reuse(int32_t handle, bool set, int *value)
  * @param source Original local address. @param destination Original peer address.
  * @param source_port Local port. @param destination_port Peer port.
  * @param error Positive errno. @param mtu Reported path MTU or zero. */
-void net_tcp6_error(const struct in6_addr *source,const struct in6_addr *destination,
+void net_tcp6_error_on(uint32_t ifindex, const struct in6_addr *source,const struct in6_addr *destination,
                     uint16_t source_port,uint16_t destination_port,int error,uint32_t mtu)
 {
     for (struct net_socket *s = net_sockets; s; s = s->registry_next) {
         if (!s->used || !s->ipv6 || s->mapped || s->local_port != source_port || s->remote_port != destination_port ||
+            (ifindex && s->ifindex && s->ifindex != ifindex) ||
             __builtin_memcmp(&s->local6, source, sizeof(*source)) ||
             __builtin_memcmp(&s->remote6, destination, sizeof(*destination))) continue;
         if (mtu) { if (mtu < 1280) mtu = 1280; if (!s->mtu6 || mtu < s->mtu6) s->mtu6 = mtu; }
@@ -1578,6 +1592,7 @@ struct net_socket *net_tcp_passive6(struct net_socket *listener,const struct in6
     if (net_ipv6_route(source, scope, destination, &path) < 0) return NULL;
     struct net_socket *s = net_socket_alloc(listener->owner_pid, listener->owner_uid);
     if (!s) return NULL;
+    s->ifindex = ifindex; s->bound_ifindex = listener->bound_ifindex;
     s->ipv6 = true; s->v6only = listener->v6only; s->bound = true; s->listener = listener;
     s->local6 = *destination; s->remote6 = *source; s->remote_scope6 = scope; s->mtu6 = path.mtu;
     s->local_port = listener->local_port; s->remote_port = source_port; s->peer_mss = mss;
@@ -1598,15 +1613,17 @@ struct net_socket *net_tcp_passive6(struct net_socket *listener,const struct in6
  * @param destination Local IPv4 host order. @param source_port Peer port.
  * @param source_mac Borrowed next-hop MAC, null for loopback. @param seq Peer sequence.
  * @param window Peer window. @param mss Advertised MSS. @return Child or null on failure. */
-struct net_socket *net_tcp_passive4(struct net_socket *listener,uint32_t source,uint32_t destination,
+struct net_socket *net_tcp_passive4_on(uint32_t ifindex, struct net_socket *listener,uint32_t source,uint32_t destination,
                                     uint16_t source_port,const uint8_t *source_mac,
                                     uint32_t seq,uint16_t window,uint16_t mss)
 {
     if (!listener || listener->state != NET_TCP_LISTEN || tcp_pending(listener, false) >= listener->backlog) return NULL;
-    if (!source_mac && (source >> 24) != 127 && source != net_config.local_ip) return NULL;
+    if (!source_mac && !net_interface_for_ipv4(source)) return NULL;
     struct net_socket *s = net_socket_alloc(listener->owner_pid, listener->owner_uid);
     if (!s) return NULL;
+    s->ifindex = ifindex; s->bound_ifindex = listener->bound_ifindex;
     s->ipv6 = listener->ipv6; s->mapped = listener->ipv6; s->v6only = listener->v6only;
+    s->next_hop = source;
     s->bound = true; s->listener = listener; s->local_ip = destination; s->remote_ip = source;
     s->local6 = tcp6_map(destination); s->remote6 = tcp6_map(source);
     s->local_port = listener->local_port; s->remote_port = source_port; s->peer_mss = mss;
@@ -1815,5 +1832,40 @@ int net_socket_set_timeout_ticks(int32_t handle, bool send, uint64_t ticks)
     if (!socket) return -LINUX_EBADF;
     if (send) socket->send_timeout = ticks;
     else socket->receive_timeout = ticks;
+    return 0;
+}
+
+/** @brief Preserve the legacy passive-open entry point using the destination link.
+ * @param listener Parent. @param source Peer. @param destination Local address.
+ * @param source_port Peer port. @param source_mac Next-hop MAC. @param seq Sequence.
+ * @param window Window. @param mss MSS. @return Child or NULL. */
+struct net_socket *net_tcp_passive4(struct net_socket *listener, uint32_t source,
+    uint32_t destination, uint16_t source_port, const uint8_t *source_mac,
+    uint32_t seq, uint16_t window, uint16_t mss)
+{
+    uint32_t index = source_mac ? net_interface_for_ipv4(destination) : 1;
+    return net_tcp_passive4_on(index, listener, source, destination, source_port,
+                               source_mac, seq, window, mss);
+}
+/** @brief Forward an old ICMPv6 error call without an interface filter.
+ * @param source Local. @param destination Peer. @param source_port Local port.
+ * @param destination_port Peer port. @param error Errno. @param mtu Path MTU. */
+void net_tcp6_error(const struct in6_addr *source, const struct in6_addr *destination,
+    uint16_t source_port, uint16_t destination_port, int error, uint32_t mtu)
+{
+    net_tcp6_error_on(0, source, destination, source_port, destination_port, error, mtu);
+}
+/** @brief Read or change a stream endpoint's bound output device.
+ * @param handle Socket handle. @param set Select update. @param index Input/output index.
+ * @return Zero or negative errno. Caller authorizes and validates user memory. */
+int net_socket_bound_device(int32_t handle, bool set, uint32_t *index)
+{
+    struct net_socket *socket = net_socket_find(handle, 0, 1);
+    if (!socket) return -LINUX_EBADF;
+    if (!index) return -LINUX_EINVAL;
+    if (set) {
+        if (*index && !net_interface_exists(*index)) return -LINUX_ENODEV;
+        socket->bound_ifindex = *index;
+    } else *index = socket->bound_ifindex;
     return 0;
 }

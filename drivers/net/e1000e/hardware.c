@@ -16,16 +16,13 @@ static int wait_bits(struct e1k_device *d, unsigned reg, uint32_t mask,
     }
 }
 
-/** @brief Discover, map and reset an explicitly supported PCIe controller.
- * @param d Zeroed state with validated services; caller retains partial state.
+/** @brief Map and reset one already selected supported PCIe controller.
+ * @param d Selected PCI identity with validated services; retains partial state.
  * @return Zero, -ENODEV, -EINVAL, -ENOMEM or -ETIMEDOUT; no DMA buffers are allocated.
  */
 int e1k_hardware_start(struct e1k_device *d)
 {
-    static const uint16_t devices[]={0x10d3,0x150c};
-    for (unsigned i=0;i<sizeof(devices)/sizeof(devices[0]);++i)
-        if (!d->api->pci_find(0x8086,devices[i],&d->pci)) { d->present=true; break; }
-    if (!d->present) return -19;
+    d->present=true;
     const struct reliefos_driver_pci_device *p=&d->pci;
     d->original_command=d->api->pci_read16(p->bus,p->slot,p->function,4);
     d->command_saved=true;

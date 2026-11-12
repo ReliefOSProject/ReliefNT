@@ -30,6 +30,7 @@ _Static_assert(RTL_RX_COUNT * sizeof(struct rtl_descriptor) == 4096, "RX ring pa
 _Static_assert(RTL_TX_COUNT * sizeof(struct rtl_descriptor) == 4096, "TX ring page");
 
 struct rtl_device {
+    struct rtl_device *next;
     const struct reliefos_driver_kernel_api *api;
     struct reliefos_driver_pci_device pci;
     volatile uint8_t *registers;
@@ -121,8 +122,8 @@ int rtl8125_start(struct rtl_device *d);
  */
 int rtl8125_stop(struct rtl_device *d);
 
-/** @brief Probe a supported PCI identity, enter D0, claim a BAR and identify the MAC.
- * @param d Zeroed state with validated services; retained for mandatory rollback.
+/** @brief Probe a selected PCI identity, enter D0, claim a BAR and identify the MAC.
+ * @param d Selected PCI identity with validated services; retained for rollback.
  * @return Zero or negative Linux errno. Leaves bus mastering disabled.
  */
 int rtl_hardware_probe(struct rtl_device *d);

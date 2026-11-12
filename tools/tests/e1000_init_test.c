@@ -2,8 +2,12 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <sys/mman.h>
 #include "../../drivers/net/e1000/e1000_main.c"
+#define g_e1000 (*devices)
+void *kernel_malloc(size_t size) { return calloc(1, size); }
+void kernel_free(void *p) { free(p); }
 
 static unsigned allocations, allocation_limit = 1024;
 static uint64_t next_physical = 0x100000ULL;
@@ -13,10 +17,16 @@ static uint64_t fixture_bar = TEST_E1000_BAR_PHYS;
 static struct { uint64_t phys; uint32_t pages; void *host; } allocation_map[1024];
 static int registration_error;
 static int stuck_reset, teardown_error;
+static int multi_mode, stuck_second;
+static const struct reliefnt_netdev_ops *networks[2];
+static void *contexts[2];
+static unsigned network_count;
 static int fail_mmio_map;
 static unsigned mmio_map_calls, mmio_maps, mmio_unmaps;
 static uint16_t command_bits;
 static uint8_t *registers;
+static uint16_t command_bits_second;
+static uint8_t *registers_second;
 static uint64_t allocate(uint32_t count)
 {
     if (allocations == allocation_limit) return 0;
@@ -62,50 +72,70 @@ static int find(uint16_t vendor, uint16_t device, struct reliefos_driver_pci_dev
     *out = (struct reliefos_driver_pci_device){.vendor_id = vendor, .device_id = device, .class_code = 2};
     return 0;
 }
+static int enumerate(uint32_t index, struct reliefos_driver_pci_device *out)
+{
+    if (index > (unsigned)multi_mode) return -19;
+    int rc=find(0x8086, 0x100f, out);
+    if (!rc) out->slot=(uint8_t)index;
+    return rc;
+}
 /** @brief Return the configured low or 64-bit fixture BAR configuration word.
  * @param b Bus. @param s Slot. @param f Function. @param offset Config byte offset.
  * @return Selected BAR register value, or zero for other offsets.
  */
 static uint32_t read32(uint8_t b, uint8_t s, uint8_t f, uint8_t offset)
 {
-    (void)b; (void)s; (void)f;
-    if (offset == 0x10) return (uint32_t)fixture_bar | (fixture_bar > UINT32_MAX ? 4u : 0);
-    return offset == 0x14 ? (uint32_t)(fixture_bar >> 32) : 0;
+    (void)b; (void)f;
+    uint64_t device_bar=fixture_bar+(s ? 0x100000u : 0);
+    if (offset == 0x10) return (uint32_t)device_bar | (device_bar > UINT32_MAX ? 4u : 0);
+    return offset == 0x14 ? (uint32_t)(device_bar >> 32) : 0;
 }
 static uint16_t read16(uint8_t b, uint8_t s, uint8_t f, uint8_t offset)
-{ (void)b; (void)s; (void)f; (void)offset; return command_bits; }
+{ (void)b; (void)f; (void)offset; return s ? command_bits_second : command_bits; }
 static void write16(uint8_t b, uint8_t s, uint8_t f, uint8_t offset, uint16_t value)
-{ (void)b; (void)s; (void)f; (void)offset; command_bits = value; }
+{ (void)b; (void)f; (void)offset; if (s) command_bits_second=value; else command_bits=value; }
 /** @brief Lease the configured fixture BAR through the driver API.
  * @param phys Exact BAR physical address. @param bytes Register aperture bytes.
  * @return Borrowed emulated register alias or NULL on injected failure.
  */
 static void *map_mmio(uint64_t phys, uint64_t bytes)
 {
-    assert(phys == fixture_bar);
+    assert(phys == fixture_bar || (multi_mode && phys == fixture_bar+0x100000u));
     assert(bytes == TEST_E1000_REGISTER_BYTES);
-    assert(!(command_bits & (PCI_COMMAND_IO | PCI_COMMAND_MEMORY |
+    uint16_t command=phys==fixture_bar ? command_bits : command_bits_second;
+    assert(!(command & (PCI_COMMAND_IO | PCI_COMMAND_MEMORY |
                              PCI_COMMAND_BUS_MASTER)));
     ++mmio_map_calls;
     if (fail_mmio_map) return NULL;
     ++mmio_maps;
-    return registers;
+    return phys==fixture_bar ? registers : registers_second;
 }
 static void unmap_mmio(void *pointer, uint64_t bytes)
 {
-    assert(pointer == registers && bytes == TEST_E1000_REGISTER_BYTES);
-    assert(!(command_bits & PCI_COMMAND_BUS_MASTER));
+    assert((pointer == registers || pointer == registers_second) && bytes == TEST_E1000_REGISTER_BYTES);
+    uint16_t command=pointer==registers ? command_bits : command_bits_second;
+    assert(!(command & PCI_COMMAND_BUS_MASTER));
     assert(mmio_maps > mmio_unmaps);
     ++mmio_unmaps;
 }
 static void pause_ms(uint64_t ms)
-{ (void)ms; if(!stuck_reset) *(uint32_t *)(registers + E1000_REG_CTRL) &= ~(1u << 26); }
+{
+    (void)ms;
+    if(!stuck_reset) *(uint32_t *)(registers + E1000_REG_CTRL) &= ~(1u << 26);
+    if(registers_second && !stuck_reset && !stuck_second)
+        *(uint32_t *)(registers_second + E1000_REG_CTRL) &= ~(1u << 26);
+}
 static void report_teardown(int error) { teardown_error=error; }
 static void log_text(const char *text) { (void)text; }
 static void log_record(enum console_log_level level, const char *format, ...)
 { (void)level; (void)format; }
-static int register_ops(const struct reliefos_driver_e1000_ops *ops)
-{ assert(ops->is_ready()); return registration_error; }
+int driver_register_netdev(const struct reliefnt_netdev_ops *ops, void *context, uint32_t *id)
+{
+    assert(ops->is_ready(context));
+    if (registration_error) return registration_error;
+    if (multi_mode) { assert(network_count<2); networks[network_count]=ops; contexts[network_count++]=context; }
+    *id=2; return 0;
+}
 
 /** @brief Exercise complete e1000 lifecycle, high BAR and high DMA descriptors.
  * @return Zero after all fixture assertions succeed.
@@ -123,8 +153,8 @@ int main(void)
         .alloc_pages = allocate, .free_pages = release, .console_write = log_text,
         .console_log = log_record, .phys_to_virt = physical_alias,
         .map_mmio = map_mmio, .unmap_mmio = unmap_mmio,
-        .pci_find = find, .pci_read16 = read16, .pci_write16 = write16,
-        .pci_read32 = read32, .sleep_ms = pause_ms, .register_e1000 = register_ops,
+        .pci_find = find, .pci_enumerate = enumerate, .pci_read16 = read16, .pci_write16 = write16,
+        .pci_read32 = read32, .sleep_ms = pause_ms,
         .report_teardown_failure = report_teardown,
     };
     struct reliefos_driver_kernel_api old_api = api;
@@ -160,7 +190,7 @@ int main(void)
     allocation_limit = 1024;
     registration_error = -16;
     assert(e1000_driver_init(&api) == -16);
-    assert(allocations == 0 && !g_e1000.active && mmio_maps == mmio_unmaps);
+    assert(allocations == 0 && !devices && mmio_maps == mmio_unmaps);
     registration_error = 0;
     assert(e1000_driver_init(&api) == 0);
     assert(g_e1000.mmio_base == (uintptr_t)registers);
@@ -173,15 +203,15 @@ int main(void)
     assert(!memcmp(g_e1000.mac, "\x00\x0c\x29\x06\x29\x97", 6));
     *(uint32_t *)(registers + E1000_REG_STATUS) = 0;
     struct module_e1000_info info;
-    e1000_get_info(&info);
-    assert(info.present && !info.active && !e1000_is_ready());
+    e1000_device_get_info(devices, &info);
+    assert(info.present && !info.active && !e1000_device_is_ready(devices));
     *(uint32_t *)(registers + E1000_REG_STATUS) = 1u << 1;
-    assert(e1000_is_ready());
+    assert(e1000_device_is_ready(devices));
     unsigned char frame[2048];
     uint32_t length;
     g_e1000.rx[0].length = 65535;
     g_e1000.rx[0].status = E1000_RX_STATUS_DD | E1000_RX_STATUS_EOP;
-    assert(e1000_poll(frame, sizeof(frame), &length) == -90 && length == 0);
+    assert(e1000_device_poll(devices, frame, sizeof(frame), &length) == -90 && length == 0);
     /* A full TCP window arrives before the next poll, including ring wrap. */
     for (unsigned burst = 0; burst < 5; ++burst) {
         unsigned queued = 0;
@@ -195,10 +225,10 @@ int main(void)
         }
         assert(queued == 64);
         for (unsigned packet = 0; packet < queued; ++packet) {
-            assert(e1000_poll(frame, sizeof(frame), &length) == 1 && length == 1460);
+            assert(e1000_device_poll(devices, frame, sizeof(frame), &length) == 1 && length == 1460);
             for (unsigned byte = 0; byte < length; ++byte) assert(frame[byte] == packet);
         }
-        assert(e1000_poll(frame, sizeof(frame), &length) == 0 && length == 0);
+        assert(e1000_device_poll(devices, frame, sizeof(frame), &length) == 0 && length == 0);
     }
     stuck_reset=1;
     e1000_driver_fini();
@@ -207,7 +237,7 @@ int main(void)
     stuck_reset=0; teardown_error=0;
     e1000_driver_fini();
     assert(!teardown_error);
-    assert(!allocations && !g_e1000.active && mmio_maps == mmio_unmaps);
+    assert(!allocations && !devices && mmio_maps == mmio_unmaps);
     assert(command_bits == (PCI_COMMAND_IO | PCI_COMMAND_MEMORY | PCI_COMMAND_BUS_MASTER));
     fixture_bar = 0xc000000000ULL;
     next_physical = 5ULL << 30;
@@ -216,6 +246,27 @@ int main(void)
     assert(g_e1000.rx_phys > UINT32_MAX && g_e1000.rx[0].addr > UINT32_MAX);
     e1000_driver_fini();
     assert(!allocations && mmio_maps == mmio_unmaps);
+    /* Two identical PCI IDs have separate BARs, rings and RX callbacks. */
+    registers_second=mmap(NULL, 0x20000, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(registers_second != MAP_FAILED);
+    *(uint32_t *)(registers_second+E1000_REG_STATUS)=1u<<1;
+    *(uint32_t *)(registers_second+E1000_REG_RAL)=0x12345602;
+    *(uint32_t *)(registers_second+E1000_REG_RAH)=E1000_RAH_AV|0x9876;
+    command_bits_second=7; multi_mode=1;
+    assert(!e1000_driver_init(&api) && network_count==2 && contexts[0]!=contexts[1]);
+    struct e1000_state *first=contexts[0], *second=contexts[1];
+    assert(first->pci.slot==0 && second->pci.slot==1 && first->rx_phys!=second->rx_phys);
+    first->rx_buf[0][0]=0xa1; first->rx[0].length=1; first->rx[0].status=3;
+    second->rx_buf[0][0]=0xb2; second->rx[0].length=1; second->rx[0].status=3;
+    assert(networks[1]->poll(contexts[1],frame,sizeof(frame),&length)==1 && frame[0]==0xb2);
+    assert(networks[0]->poll(contexts[0],frame,sizeof(frame),&length)==1 && frame[0]==0xa1);
+    stuck_second=1; e1000_driver_fini();
+    assert(teardown_error==-110 && devices==second && !second->next && allocations);
+    assert(!(command_bits_second&PCI_COMMAND_BUS_MASTER));
+    stuck_second=0; teardown_error=0; e1000_driver_fini();
+    assert(!devices && !allocations && mmio_maps==mmio_unmaps);
+    assert(munmap(registers_second,0x20000)==0);
     assert(munmap(registers, 0x20000) == 0);
     puts("PASS e1000 initialization, VMware MAC, link setup, RX bounds and failure cleanup");
 }

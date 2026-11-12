@@ -4,6 +4,8 @@
 #include <reliefnt/net_ipv6.h>
 #include <reliefnt/proc_stats.h>
 #include <reliefnt/net.h>
+#include <reliefnt/net_device.h>
+#include <reliefnt/net_interface.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/syscall.h>
@@ -124,7 +126,7 @@ static int bind_port(struct udp_socket *s, uint32_t ip, uint16_t port)
     if (s->bound) return -LINUX_EINVAL;
     struct reliefos_net_config config;
     net_get_config(&config);
-    if (ip && (ip >> 24) != 127 && ip != config.local_ip) return -LINUX_EADDRNOTAVAIL;
+    if (ip && !net_interface_for_ipv4(ip)) return -LINUX_EADDRNOTAVAIL;
     struct task *task = sched_current_task();
     if (port && port < 1024 && !(task->cap_effective & (1ULL << CAP_NET_BIND_SERVICE)))
         return -LINUX_EACCES;
@@ -135,7 +137,8 @@ static int bind_port(struct udp_socket *s, uint32_t ip, uint16_t port)
         for (struct udp_socket *other = sockets; other;
              other = other->registry_next) {
             if (other == s || !other->bound || other->port != candidate ||
-                (s->reuse && other->reuse)) continue;
+                (s->reuse && other->reuse) ||
+                (s->ifindex && other->ifindex && s->ifindex != other->ifindex)) continue;
             if (udp_ipv4_overlap(s, ip, other)) conflict = true;
             if (s->ipv6 && other->ipv6 && !udp6_mapped(&s->local6) &&
                 !udp6_mapped(&other->local6) &&
@@ -292,7 +295,9 @@ static int udp6_bind(struct udp_socket *s, const struct sockaddr_in6 *address)
     if (s->bound) return -LINUX_EINVAL;
     const struct in6_addr *ip = &address->sin6_addr;
     if (udp6_mapped(ip) && s->v6only) return -LINUX_EINVAL;
-    if (address->sin6_scope_id > 2) return -LINUX_ENODEV;
+    if (address->sin6_scope_id && !net_interface_exists(address->sin6_scope_id)) return -LINUX_ENODEV;
+    if (address->sin6_scope_id && s->ifindex && address->sin6_scope_id != (uint32_t)s->ifindex)
+        return -LINUX_EINVAL;
     if (ip->s6_addr[0] == 0xfe && (ip->s6_addr[1] & 0xc0) == 0x80 && !address->sin6_scope_id)
         return -LINUX_EINVAL;
     if (!udp6_any(ip) && !udp6_mapped(ip) && ip->s6_addr[0] != 0xff) {
@@ -333,17 +338,20 @@ static int udp6_send(struct udp_socket *s, const void *data, uint32_t length,
         if (!s->bound) { int ret = bind_port(s, 0, 0); if (ret) return ret; }
         struct reliefos_net_config config;
         net_get_config(&config);
-        if ((ip >> 24) == 127 || (ip && ip == config.local_ip)) {
-            if (s->ifindex && s->ifindex != 1) return -LINUX_ENETUNREACH;
+        if ((ip >> 24) == 127 || (ip && net_interface_for_ipv4(ip))) {
+            uint32_t local_index = net_interface_for_ipv4(ip);
+            if (s->ifindex && (uint32_t)s->ifindex != local_index) return -LINUX_ENETUNREACH;
             loopback_bytes += length + 28; ++loopback_packets;
-            net_udp_input(s->local ? s->local : ip, ip, s->port, port, data, length, 1);
+            net_udp_input(s->local ? s->local : ip, ip, s->port, port, data, length, (int)local_index);
             return (int)length;
         }
         if (s->ifindex == 1) return -LINUX_ENETUNREACH;
-        int ret = net_ipv4_send_udp(s->local, ip, s->port, port, data, length);
+        int ret = net_ipv4_send_udp_on((uint32_t)s->ifindex, s->local, ip, s->port, port, data, length);
         return ret < 0 ? ret : (int)length;
     }
     if (udp6_mapped(&s->local6)) return -LINUX_ENETUNREACH;
+    if (to.sin6_scope_id && s->ifindex && to.sin6_scope_id != (uint32_t)s->ifindex)
+        return -LINUX_EINVAL;
     uint32_t scope = to.sin6_scope_id ? to.sin6_scope_id : (uint32_t)s->ifindex;
     if (!scope && to.sin6_addr.s6_addr[0] == 0xff) scope = s->multicast_if;
     struct net_ipv6_path path;
@@ -394,15 +402,16 @@ int task_udp_send(struct task_file *file, const void *data, uint32_t length,
     if (!s->bound) { int ret = bind_port(s, 0, 0); if (ret < 0) return ret; }
     struct reliefos_net_config config;
     net_get_config(&config);
-    if ((ip >> 24) == 127 || (ip && ip == config.local_ip)) {
-        if (s->ifindex && s->ifindex != 1) return -LINUX_ENETUNREACH;
+    if ((ip >> 24) == 127 || (ip && net_interface_for_ipv4(ip))) {
+        uint32_t local_index = net_interface_for_ipv4(ip);
+        if (s->ifindex && (uint32_t)s->ifindex != local_index) return -LINUX_ENETUNREACH;
         loopback_bytes += length + 28;
         ++loopback_packets;
-        net_udp_input(s->local ? s->local : ip, ip, s->port, port, data, length, 1);
+        net_udp_input(s->local ? s->local : ip, ip, s->port, port, data, length, (int)local_index);
         return (int)length;
     }
     if (s->ifindex == 1) return -LINUX_ENETUNREACH;
-    int ret = net_ipv4_send_udp(s->local, ip, s->port, port, data, length);
+    int ret = net_ipv4_send_udp_on((uint32_t)s->ifindex, s->local, ip, s->port, port, data, length);
     return ret < 0 ? ret : (int)length;
 }
 
@@ -576,7 +585,7 @@ static int udp6_option(struct udp_socket *s, bool set, uint32_t option,
         __builtin_memcpy(&group, (void *)(uintptr_t)pointer, sizeof(group));
         if (group.ipv6mr_multiaddr.s6_addr[0] != 0xff || group.ipv6mr_ifindex < 0) return -LINUX_EINVAL;
         uint32_t ifindex = group.ipv6mr_ifindex ? (uint32_t)group.ipv6mr_ifindex : s->multicast_if;
-        if (!ifindex) ifindex = s->ifindex ? (uint32_t)s->ifindex : 2;
+        if (!ifindex) ifindex = s->ifindex ? (uint32_t)s->ifindex : netdev_next(0);
         unsigned slot = UDP6_GROUP_LIMIT, empty = UDP6_GROUP_LIMIT;
         for (unsigned i = 0; i < UDP6_GROUP_LIMIT; ++i) {
             if (!s->groups[i].used && empty == UDP6_GROUP_LIMIT) empty = i;
@@ -603,7 +612,7 @@ static int udp6_option(struct udp_socket *s, bool set, uint32_t option,
         case IPV6_V6ONLY: if (s->bound) return -LINUX_EINVAL; s->v6only = value != 0; break;
         case IPV6_UNICAST_HOPS: if (value < -1 || value > 255) return -LINUX_EINVAL; s->unicast_hops = value; break;
         case IPV6_MULTICAST_HOPS: if (value < -1 || value > 255) return -LINUX_EINVAL; s->multicast_hops = value; break;
-        case IPV6_MULTICAST_IF: if (value < 0 || value > 2) return -LINUX_ENODEV; s->multicast_if = (uint32_t)value; break;
+        case IPV6_MULTICAST_IF: if (value < 0 || (value && !net_interface_exists((uint32_t)value))) return -LINUX_ENODEV; s->multicast_if = (uint32_t)value; break;
         case IPV6_MULTICAST_LOOP: if (value != 0 && value != 1) return -LINUX_EINVAL; s->multicast_loop = value != 0; break;
         case IPV6_RECVPKTINFO: s->recv_pktinfo = value != 0; break;
         case IPV6_RECVHOPLIMIT: s->recv_hoplimit = value != 0; break;
@@ -631,7 +640,7 @@ static int udp6_option(struct udp_socket *s, bool set, uint32_t option,
     case IPV6_MTU: {
         struct net_ipv6_path path;
         if (!s->connected || udp6_mapped(&s->remote6)) return -LINUX_ENOTCONN;
-        int ret = net_ipv6_route(&s->remote6, s->remote_scope6, &s->local6, &path);
+        int ret = net_ipv6_route(&s->remote6, s->remote_scope6 ? s->remote_scope6 : (uint32_t)s->ifindex, &s->local6, &path);
         if (ret < 0) return ret;
         value = (int)path.mtu;
         break;
@@ -712,6 +721,8 @@ int64_t syscall_udp(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
             if (number == __NR_bind) return udp6_bind(s, &address);
             if (udp6_mapped(&address.sin6_addr) && s->v6only) return -LINUX_ENETUNREACH;
             if (!s->bound && (ret = bind_port(s, 0, 0)) < 0) return ret;
+            if (address.sin6_scope_id && s->ifindex && address.sin6_scope_id != (uint32_t)s->ifindex)
+                return -LINUX_EINVAL;
             s->remote6 = address.sin6_addr; s->remote_scope6 = address.sin6_scope_id;
             s->remote = udp6_mapped(&address.sin6_addr) ? udp6_unmap(&address.sin6_addr) : 0;
             s->remote_port = swap16(address.sin6_port); s->connected = true;
@@ -740,7 +751,7 @@ int64_t syscall_udp(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
                     address.sin6_addr = udp6_map(s->remote >> 24 == 127 ? 0x7f000001 : config.local_ip);
                 } else {
                     struct net_ipv6_path path;
-                    if (!net_ipv6_route(&s->remote6, s->remote_scope6, &s->local6, &path)) address.sin6_addr = path.source;
+                    if (!net_ipv6_route(&s->remote6, s->remote_scope6 ? s->remote_scope6 : (uint32_t)s->ifindex, &s->local6, &path)) address.sin6_addr = path.source;
                 }
             }
             return udp6_export(a1, a2, &address);
@@ -748,7 +759,13 @@ int64_t syscall_udp(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
         struct reliefos_net_config config;
         net_get_config(&config);
         uint32_t local = s->local;
-        if (!local && s->connected) local = s->remote >> 24 == 127 ? 0x7f000001 : config.local_ip;
+        if (!local && s->connected) {
+            if (net_interface_for_ipv4(s->remote)) local = s->remote;
+            else {
+                struct net_ipv4_path path;
+                if (!net_ipv4_route_lookup(s->remote, 0, (uint32_t)s->ifindex, &path)) local = path.source;
+            }
+        }
         return export_address(a1, a2, number == __NR_getsockname ? local : s->remote,
                                number == __NR_getsockname ? s->port : s->remote_port);
     }
@@ -764,27 +781,10 @@ int64_t syscall_udp(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
         }
         if ((int32_t)length < 0) return -LINUX_EINVAL;
         if (a2 == SO_BINDTODEVICE) {
-            if (set) {
-                struct task *task = sched_current_task();
-                if (!(task->cap_effective & (1ULL << CAP_NET_RAW))) return -LINUX_EPERM;
-                char name[16] = {0};
-                uint32_t size = length < sizeof(name) - 1 ? length : sizeof(name) - 1;
-                int prep=socket_user_prepare(task,a3,size,false);if(prep)return prep;
-                if (size && !user_range_ok(a3, size)) return -LINUX_EFAULT;
-                if (size) __builtin_memcpy(name, (void *)(uintptr_t)a3, size);
-                int index = !name[0] ? 0 : !__builtin_strcmp(name, "eth0") ? 2 : !__builtin_strcmp(name, "lo") ? 1 : -1;
-                if (index < 0) return -LINUX_ENODEV;
-                s->ifindex = index;
-                return 0;
-            }
-            const char *name = s->ifindex == 2 ? "eth0" : s->ifindex == 1 ? "lo" : "";
-            uint32_t size = s->ifindex == 2 ? 5 : s->ifindex == 1 ? 3 : 0;
-            if (size && length < 16) return -LINUX_EINVAL;
-            int prep=socket_user_prepare(task,a3,size,true);if(prep)return prep;
-            if (size && !user_range_writable(a3, size)) return -LINUX_EFAULT;
-            if (size) __builtin_memcpy((void *)(uintptr_t)a3, name, size);
-            *(uint32_t *)(uintptr_t)a4 = size;
-            return 0;
+            uint32_t index = (uint32_t)s->ifindex;
+            int result = net_interface_device_option(set, a3, a4, &index);
+            if (!result && set) s->ifindex = (int)index;
+            return result;
         }
         int value = 0;
         if (a2 == SO_RCVTIMEO || a2 == SO_RCVTIMEO_NEW) {
@@ -849,12 +849,15 @@ int64_t syscall_udp(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
  * @param source Original local address. @param destination Original peer address.
  * @param source_port Original local port. @param destination_port Original peer port.
  * @param error Positive errno. @param mtu Reported path MTU or zero. */
-void net_udp6_error(const struct in6_addr *source,const struct in6_addr *destination,
+void net_udp6_error_on(uint32_t ifindex, const struct in6_addr *source,const struct in6_addr *destination,
                     uint16_t source_port,uint16_t destination_port,int error,uint32_t mtu)
 {
     (void)mtu;
     for (struct udp_socket *s = sockets; s; s = s->registry_next) {
         if (!s->ipv6 || !s->bound || s->port != source_port ||
+            (ifindex && ((s->ifindex && (uint32_t)s->ifindex != ifindex) ||
+                         (s->scope6 && s->scope6 != ifindex) ||
+                         (s->remote_scope6 && s->remote_scope6 != ifindex))) ||
             (!udp6_any(&s->local6) && __builtin_memcmp(&s->local6, source, sizeof(*source))) ||
             (s->connected && (s->remote_port != destination_port ||
                               __builtin_memcmp(&s->remote6, destination, sizeof(*destination))))) continue;
@@ -929,4 +932,25 @@ void net_loopback_proc_emit(struct text_stream *s)
     text_string(s, " ");
     text_unsigned(s, loopback_packets);
     text_string(s, " 0 0 0 0 0 0\n");
+}
+
+/** @brief Deliver a compatibility ICMPv6 quote without an explicit ingress filter.
+ * @param source Quoted local address. @param destination Quoted peer.
+ * @param source_port Local port. @param destination_port Peer port.
+ * @param error Positive errno. @param mtu Reported MTU. */
+void net_udp6_error(const struct in6_addr *source, const struct in6_addr *destination,
+                    uint16_t source_port, uint16_t destination_port, int error, uint32_t mtu)
+{
+    net_udp6_error_on(0, source, destination, source_port, destination_port, error, mtu);
+}
+
+/** @brief Wake only UDP endpoints explicitly tied to a removed interface.
+ * @param ifindex Removed non-reused interface index. */
+void net_udp_device_detached(uint32_t ifindex)
+{
+    for (struct udp_socket *s = sockets; s; s = s->registry_next) {
+        if ((uint32_t)s->ifindex == ifindex || s->scope6 == ifindex || s->remote_scope6 == ifindex)
+            s->error = LINUX_ENETDOWN;
+    }
+    kernel_poll_readiness_notify();
 }

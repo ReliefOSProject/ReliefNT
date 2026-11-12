@@ -13,7 +13,7 @@
  * @param payload_len Value supplied by the caller.
  * @return The value or status produced by the operation.
  */
-int net_send_udp_to_mac(const uint8_t *dst_mac, uint32_t src_ip,
+int net_send_udp_to_mac_on(uint32_t ifindex, const uint8_t *dst_mac, uint32_t src_ip,
                                uint32_t dst_ip, uint16_t src_port,
                                uint16_t dst_port, const uint8_t *payload,
                                uint32_t payload_len)
@@ -29,7 +29,7 @@ int net_send_udp_to_mac(const uint8_t *dst_mac, uint32_t src_ip,
     udp_len = (uint16_t)(8u + payload_len);
     total_len = (uint16_t)(20u + udp_len);
     net_memzero(frame, 42u + payload_len);
-    net_write_eth(frame, dst_mac, ETH_TYPE_IPV4);
+    net_write_eth_on(ifindex, frame, dst_mac, ETH_TYPE_IPV4);
     ip[0] = 0x45;
     ip[1] = 0;
     net_put_u16(ip + 2, total_len);
@@ -45,7 +45,7 @@ int net_send_udp_to_mac(const uint8_t *dst_mac, uint32_t src_ip,
     net_put_u16(udp + 4, udp_len);
     net_put_u16(udp + 6, 0);
     net_memcpy(udp + 8, payload, payload_len);
-    return net_interface_up ? e1000_send(frame, 42u + payload_len) : -LINUX_ENETDOWN;
+    return net_interface_is_ready(ifindex) ? netdev_send(ifindex, frame, 42u + payload_len) : -LINUX_ENETDOWN;
 }
 
 /**
@@ -56,7 +56,7 @@ int net_send_udp_to_mac(const uint8_t *dst_mac, uint32_t src_ip,
  * @param src_ip Value supplied by the caller.
  * @param udp_wait Value supplied by the caller.
  */
-void net_handle_udp(const uint8_t *ip, uint32_t total_len,
+void net_handle_udp_on(uint32_t ifindex, const uint8_t *ip, uint32_t total_len,
                            uint32_t ihl, uint32_t src_ip,
                            struct net_udp_wait *udp_wait)
 {
@@ -80,8 +80,8 @@ void net_handle_udp(const uint8_t *ip, uint32_t total_len,
         sum += IPV4_PROTO_UDP + udp_len;
         if (net_checksum_finish(net_checksum_partial(sum, udp, udp_len))) return;
     }
-    net_udp_input(src_ip, net_get_u32(ip + 16), src_port, dst_port, udp + 8, udp_len - 8, 2);
-    if (!udp_wait || udp_wait->done) return;
+    net_udp_input(src_ip, net_get_u32(ip + 16), src_port, dst_port, udp + 8, udp_len - 8, (int)ifindex);
+    if (!udp_wait || udp_wait->done || (udp_wait->ifindex && udp_wait->ifindex != ifindex)) return;
     if (udp_wait->src_port && src_port != udp_wait->src_port) {
         return;
     }
@@ -100,15 +100,58 @@ void net_handle_udp(const uint8_t *ip, uint32_t total_len,
     udp_wait->done = 1;
 }
 
+/** @brief Receive UDP on the primary compatibility interface.
+ * @param ip Packet. @param total_len IP size. @param ihl Header bytes.
+ * @param src_ip Host-order source. @param wait Optional waiter. */
+void net_handle_udp(const uint8_t *ip, uint32_t total_len, uint32_t ihl,
+                     uint32_t src_ip, struct net_udp_wait *wait)
+{
+    net_handle_udp_on(netdev_next(0), ip, total_len, ihl, src_ip, wait);
+}
+
+/** @brief Send an IPv4 datagram with an explicit bound interface or route selection.
+ * @param ifindex Bound device or zero. @param source Optional source address.
+ * @param destination Peer address. @param source_port Local port. @param destination_port Peer port.
+ * @param data Borrowed payload. @param length Bytes. @return Zero or negative errno. */
+int net_ipv4_send_udp_on(uint32_t ifindex, uint32_t source, uint32_t destination,
+                          uint16_t source_port, uint16_t destination_port,
+                          const void *data, uint32_t length)
+{
+    if (length > 1472 || (length && !data)) return -LINUX_EMSGSIZE;
+    struct net_ipv4_path path;
+    int result = net_ipv4_route_lookup(destination, source, ifindex, &path);
+    if (result < 0) return result;
+    uint8_t mac[6];
+    struct net_interface *interface = net_interface_get(path.ifindex);
+    if (destination == UINT32_MAX || (interface && destination == interface->broadcast))
+        net_memcpy(mac, net_broadcast_mac, 6);
+    else if (net_resolve_mac_on(path.ifindex, path.next_hop, 1000, mac) < 0)
+        return -LINUX_EHOSTUNREACH;
+    result = net_send_udp_to_mac_on(path.ifindex, mac, path.source, destination,
+                                    source_port, destination_port, data, length);
+    return result < 0 ? result : 0;
+}
+
+/** @brief Send UDP with automatic output device selection.
+ * @param source Optional source. @param destination Peer. @param source_port Local port.
+ * @param destination_port Peer port. @param data Payload. @param length Bytes.
+ * @return Zero or negative errno. */
 int net_ipv4_send_udp(uint32_t source, uint32_t destination, uint16_t source_port,
                        uint16_t destination_port, const void *data, uint32_t length)
 {
-    if (!e1000_is_ready()) return -LINUX_ENETDOWN;
-    if (net_ensure_ipv4_config(3000, 0) != RELIEFOS_NET_STATUS_OK) return -LINUX_ENETUNREACH;
-    uint8_t mac[6];
-    if (destination == 0xffffffffu) net_memcpy(mac, net_broadcast_mac, 6);
-    else if (net_resolve_mac(net_route_arp_ip(destination), 1000, mac) < 0) return -LINUX_EHOSTUNREACH;
-    if (!source) source = net_config.local_ip;
-    return net_send_udp_to_mac(mac, source, destination, source_port, destination_port,
-                               data, length) < 0 ? -LINUX_EIO : 0;
+    return net_ipv4_send_udp_on(0, source, destination, source_port, destination_port, data, length);
+}
+
+/** @brief Build a legacy UDP frame using destination-based route selection.
+ * @param mac Destination MAC. @param source IPv4 source. @param destination Peer.
+ * @param source_port Local port. @param destination_port Peer port.
+ * @param data Payload. @param length Bytes. @return Driver result or negative errno. */
+int net_send_udp_to_mac(const uint8_t *mac, uint32_t source, uint32_t destination,
+    uint16_t source_port, uint16_t destination_port, const uint8_t *data, uint32_t length)
+{
+    struct net_ipv4_path path;
+    int result = net_ipv4_route_lookup(destination, source, 0, &path);
+    if (result < 0) return result;
+    return net_send_udp_to_mac_on(path.ifindex, mac, source, destination,
+                                  source_port, destination_port, data, length);
 }

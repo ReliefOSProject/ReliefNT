@@ -78,4 +78,13 @@ void task_packet_release(struct task_file *file);
  * @return Length, zero when empty, or negative errno.
  */
 int task_packet_available(struct task_file *file);
+/** @brief Deliver one Ethernet frame while retaining its original ingress link.
+ * @param ifindex Stable ingress interface. @param frame Borrowed frame.
+ * @param length Complete Ethernet frame length. */
+void net_packet_input_on(uint32_t ifindex, const void *frame, uint32_t length);
+
+
+/** @brief Wake raw sockets bound to a disappearing device. @param ifindex Device. */
+void net_packet_device_detached(uint32_t ifindex);
+
 #endif

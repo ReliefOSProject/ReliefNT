@@ -1,4 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-obj-y := config.o
+obj-y := config.o state.o routes.o ioctl.o socket.o
 
 include $(srctree)/scripts/Makefile.module

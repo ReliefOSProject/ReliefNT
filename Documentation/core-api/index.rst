@@ -16,6 +16,7 @@
    path-cache
    resource-limits
    drivers
+   network-devices
    e1000e
    realtek
    usb

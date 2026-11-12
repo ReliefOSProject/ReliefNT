@@ -9,6 +9,8 @@
 #include <reliefnt/e1000.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/net.h>
+#include <reliefnt/net_device.h>
+#include <reliefnt/net_interface.h>
 #include <reliefnt/net_packet.h>
 #include <reliefnt/net_udp.h>
 #include <reliefnt/net_ipv6.h>
@@ -84,12 +86,14 @@
 #define NET_NTP_UNIX_EPOCH_OFFSET 2208988800ULL
 
 struct net_arp_wait {
+    uint32_t ifindex;
     uint32_t ip;
     uint8_t mac[6];
     uint32_t done;
 };
 
 struct net_ping_wait {
+    uint32_t ifindex;
     uint32_t target_ip;
     uint16_t ident;
     uint16_t sequence;
@@ -97,6 +101,7 @@ struct net_ping_wait {
 };
 
 struct net_udp_wait {
+    uint32_t ifindex;
     uint32_t src_ip;
     uint16_t src_port;
     uint16_t dst_port;
@@ -107,6 +112,7 @@ struct net_udp_wait {
 };
 
 struct net_tcp_wait {
+    uint32_t ifindex;
     uint32_t src_ip;
     uint16_t src_port;
     uint16_t dst_port;
@@ -133,6 +139,7 @@ struct net_dhcp_offer {
 };
 
 struct net_arp_cache_entry {
+    uint32_t ifindex;
     uint32_t ip;
     uint8_t mac[6];
 };
@@ -159,6 +166,10 @@ struct net_socket {
     uint32_t status;
     uint32_t local_ip;
     uint32_t remote_ip;
+    uint32_t ifindex;
+    uint32_t bound_ifindex;
+    uint32_t next_hop;
+    bool resolving_neighbor;
     struct in6_addr local6, remote6;
     uint32_t scope6, remote_scope6, mtu6;
     uint16_t peer_mss;
@@ -438,8 +449,8 @@ struct net_socket {
 extern const uint8_t net_broadcast_mac[6];
 extern uint32_t net_sequence;
 extern uint16_t net_ipv4_id;
-extern struct reliefos_net_config net_config;
-extern bool net_interface_up;
+#define net_config (*net_interface_legacy_config())
+#define net_interface_up (*net_interface_legacy_up())
 extern struct net_socket *net_sockets;
 
 /**
@@ -1095,5 +1106,64 @@ int net_interface_ioctl(uint32_t request, uint64_t address);
 
 /** @brief Report the real administrative and hardware state of eth0. */
 bool net_interface_ready(void);
+
+
+/** @brief Clear only one interface's ARP entries; zero clears every entry.
+ * @param ifindex Stable interface index or zero. No driver callback or wait. */
+void net_arp_cache_clear_on(uint32_t ifindex);
+/** @brief Resolve an IPv4 neighbor on one specific Ethernet link.
+ * @param ifindex Egress link. @param ip Next-hop IPv4, host order.
+ * @param timeout_ms Bounded wait. @param out_mac Six writable bytes.
+ * @return Zero or negative errno/legacy timeout status. */
+int net_resolve_mac_on(uint32_t ifindex, uint32_t ip, uint32_t timeout_ms, uint8_t out_mac[6]);
+/** @brief Construct the link header with the selected device's source MAC.
+ * @param ifindex Egress link. @param frame Fourteen writable bytes.
+ * @param dst_mac Six destination bytes. @param type Host-order EtherType. */
+void net_write_eth_on(uint32_t ifindex, uint8_t *frame, const uint8_t *dst_mac, uint16_t type);
+/** @brief Match the frame destination against a specific link and multicast policy.
+ * @param ifindex Ingress link. @param frame Fourteen readable bytes.
+ * @return Nonzero for an accepted link-layer destination. */
+int net_frame_for_us_on(uint32_t ifindex, const uint8_t *frame);
+/** @brief Validate and process ARP while preserving ingress link identity.
+ * @param ifindex Ingress link. @param frame Borrowed Ethernet frame.
+ * @param len Frame bytes. @param wait Optional matching synchronous waiter. */
+void net_handle_arp_on(uint32_t ifindex, const uint8_t *frame, uint32_t len, struct net_arp_wait *wait);
+/** @brief Validate and dispatch IPv4 using the receiving interface.
+ * @param ifindex Ingress link. @param frame Borrowed Ethernet frame. @param len Bytes.
+ * @param ping Optional ICMP waiter. @param udp Optional UDP waiter. @param tcp Optional TCP waiter. */
+void net_handle_ipv4_on(uint32_t ifindex, const uint8_t *frame, uint32_t len,
+                         struct net_ping_wait *ping, struct net_udp_wait *udp, struct net_tcp_wait *tcp);
+/** @brief Deliver checked IPv4 UDP with the original ingress interface.
+ * @param ifindex Ingress link. @param ip Packet. @param total_len IP bytes.
+ * @param ihl Header bytes. @param src_ip Host-order source. @param wait Optional waiter. */
+void net_handle_udp_on(uint32_t ifindex, const uint8_t *ip, uint32_t total_len,
+                        uint32_t ihl, uint32_t src_ip, struct net_udp_wait *wait);
+
+
+/** @brief Process TCP with a stable ingress device identity.
+ * @param ifindex Ingress. @param ip IP packet. @param total_len Bytes. @param ihl Header size.
+ * @param src_ip Peer address. @param source_mac Peer MAC or NULL for loopback.
+ * @param wait Optional synchronous waiter. */
+void net_handle_tcp_on(uint32_t ifindex, const uint8_t *ip, uint32_t total_len,
+                        uint32_t ihl, uint32_t src_ip, const uint8_t *source_mac, struct net_tcp_wait *wait);
+/** @brief Create an incoming IPv4 child associated with its ingress link.
+ * @param ifindex Ingress. @param listener Parent. @param source Peer. @param destination Local.
+ * @param source_port Peer port. @param source_mac Peer MAC. @param seq Sequence.
+ * @param window Peer window. @param mss MSS. @return Child or NULL. */
+struct net_socket *net_tcp_passive4_on(uint32_t ifindex, struct net_socket *listener,
+    uint32_t source, uint32_t destination, uint16_t source_port, const uint8_t *source_mac,
+    uint32_t seq, uint16_t window, uint16_t mss);
+/** @brief Build and send a UDP frame on an explicit link.
+ * @param ifindex Egress. @param mac Peer MAC. @param source Local. @param destination Peer.
+ * @param source_port Local port. @param destination_port Peer port. @param payload Bytes.
+ * @param length Payload length. @return Driver result or negative errno. */
+int net_send_udp_to_mac_on(uint32_t ifindex, const uint8_t *mac, uint32_t source,
+    uint32_t destination, uint16_t source_port, uint16_t destination_port,
+    const uint8_t *payload, uint32_t length);
+
+/** @brief Query whether device-state allocation retries remain pending. @return Retry hint. */
+bool net_device_registration_pending(void);
+/** @brief Retry one failed interface registration under execution ownership. */
+void net_device_retry_registration(void);
 
 #endif

@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "../../net/socket/udp.c"
+#include "../../net/interface/socket.c"
 
 static struct task current;
 static struct task_file files[80];
@@ -51,17 +52,67 @@ int net_ipv4_send_udp(uint32_t source, uint32_t destination, uint16_t source_por
                        uint16_t destination_port, const void *data, uint32_t length)
 { (void)source; (void)destination; (void)source_port; (void)destination_port; (void)data; (void)length; return -LINUX_ENETDOWN; }
 
+uint32_t net_interface_for_ipv4(uint32_t ip)
+{ return (ip >> 24) == 127 ? 1 : ip == 0x0a00020f ? 2 : ip == 0x0a00030f ? 3 : 0; }
+bool net_interface_exists(uint32_t index) { return index >= 1 && index <= 3; }
+uint32_t net_interface_index(const char *name)
+{ return !strcmp(name,"lo") ? 1 : !strcmp(name,"eth0") ? 2 : !strcmp(name,"eth1") ? 3 : 0; }
+bool net_interface_name(uint32_t index, char out[16])
+{ if (!net_interface_exists(index)) return false; strcpy(out, index == 1 ? "lo" : index == 2 ? "eth0" : "eth1"); return true; }
+uint32_t netdev_next(uint32_t after) { return after < 2 ? 2 : after == 2 ? 3 : 0; }
+int net_ipv4_route_lookup(uint32_t destination, uint32_t source, uint32_t scope, struct net_ipv4_path *path)
+{ uint32_t index=scope ? scope : 2; *path=(struct net_ipv4_path){.ifindex=index,
+    .source=source ? source : index==3 ? 0x0a00030f : 0x0a00020f,.destination=destination,.next_hop=destination}; return 0; }
+int net_ipv4_send_udp_on(uint32_t index, uint32_t source, uint32_t destination,
+                          uint16_t source_port, uint16_t destination_port,
+                          const void *data, uint32_t length)
+{ (void)index; return net_ipv4_send_udp(source,destination,source_port,destination_port,data,length); }
+
 static long call(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e)
 { return syscall_udp(nr, a, b, c, d, e, 0); }
 static int open_socket(void)
 { return (int)call(__NR_socket, AF_INET, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, 0, 0); }
 
+static void test_udp_device_local_delivery(void)
+{
+    int sender = open_socket(), receiver = open_socket();
+    assert(sender >= 0 && receiver >= 0);
+    const char device[] = "eth1";
+    assert(!call(__NR_setsockopt, receiver, SOL_SOCKET, SO_BINDTODEVICE, (uintptr_t)device, sizeof(device)));
+    struct sockaddr_in local = {.sin_family=AF_INET,.sin_port=swap16(55009),
+        .sin_addr.s_addr=swap32(0x0a00030f)};
+    assert(!call(__NR_bind, receiver, (uintptr_t)&local, sizeof(local), 0, 0));
+    assert(task_udp_send(&files[sender], "local", 5, 0, (uintptr_t)&local, sizeof(local)) == 5);
+    char result[8];
+    assert(task_udp_recv(&files[receiver], result, sizeof(result), 0, 0, 0) == 5);
+    assert(!memcmp(result,"local",5));
+    assert(!call(__NR_setsockopt, sender, SOL_SOCKET, SO_BINDTODEVICE, (uintptr_t)device, sizeof(device)));
+    assert(task_udp_send(&files[sender], "bound", 5, 0, (uintptr_t)&local, sizeof(local)) == 5);
+    assert(task_udp_recv(&files[receiver], result, sizeof(result), 0, 0, 0) == 5);
+    assert(!memcmp(result,"bound",5));
+    task_udp_release(&files[sender]); files[sender].used=0;
+    task_udp_release(&files[receiver]); files[receiver].used=0;
+    loopback_bytes = loopback_packets = 0;
+}
+
 int main(void)
 {
     current.cap_effective = 1ULL << CAP_NET_BIND_SERVICE;
     current.euid = 1234;
+    test_udp_device_local_delivery();
     int a = open_socket(), b = open_socket();
     assert(a >= 0 && b >= 0 && a != b);
+    const char secondary[] = "eth1";
+    assert(call(__NR_setsockopt, a, SOL_SOCKET, SO_BINDTODEVICE,
+                (uintptr_t)secondary, sizeof(secondary)) == 0);
+    char selected[16] = {0};
+    uint32_t selected_size = sizeof(selected);
+    assert(call(__NR_getsockopt, a, SOL_SOCKET, SO_BINDTODEVICE,
+                (uintptr_t)selected, (uintptr_t)&selected_size) == 0);
+    assert(selected_size == sizeof(secondary) && !strcmp(selected, secondary));
+    assert(call(__NR_setsockopt, a, SOL_SOCKET, SO_BINDTODEVICE, (uintptr_t)"", 1) == -LINUX_EPERM);
+    current.cap_effective |= 1ULL << CAP_NET_RAW;
+    assert(call(__NR_setsockopt, a, SOL_SOCKET, SO_BINDTODEVICE, (uintptr_t)"", 1) == 0);
     assert(files[a].fd_flags == 1 && (files[a].flags & RELIEFOS_O_NONBLOCK));
     struct sockaddr_in dest = {.sin_family = AF_INET, .sin_port = swap16(55000),
                                .sin_addr = {.s_addr = swap32(0x7f000001)}};

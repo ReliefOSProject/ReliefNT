@@ -5,6 +5,8 @@
 #include <reliefnt/net_udp.h>
 #include <reliefnt/proc_stats.h>
 #include <reliefnt/e1000.h>
+#include <reliefnt/net_device.h>
+#include <reliefnt/net_interface.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/syscall.h>
@@ -81,7 +83,7 @@ static struct packet_socket *packet_of(const struct task_file *file)
  * @param input Ethernet frame under the execution lock.
  * @param length Complete frame length.
  */
-void net_packet_input(const void *input, uint32_t length)
+void net_packet_input_on(uint32_t ifindex, const void *input, uint32_t length)
 {
     if (length < 14 || length > 1514) return;
     const uint8_t *frame = input;
@@ -95,7 +97,7 @@ void net_packet_input(const void *input, uint32_t length)
         uint32_t source = 0, destination = 0;
         if (s->domain == AF_PACKET) {
             if (!s->protocol || (s->protocol != (int)__builtin_bswap16(3) && s->protocol != protocol)) continue;
-            if (s->ifindex && s->ifindex != 2) continue;
+            if (s->ifindex && (uint32_t)s->ifindex != ifindex) continue;
         } else {
             if (s->domain != AF_INET) continue;
             if (protocol != __builtin_bswap16(0x0800) || length < 34 || frame[14] >> 4 != 4 ||
@@ -111,7 +113,7 @@ void net_packet_input(const void *input, uint32_t length)
         struct packet_message *m = kernel_malloc(sizeof(*m) + size);
         if (!m) continue;
         *m = (struct packet_message){.length = size,
-            .link = {.sll_family = AF_PACKET, .sll_protocol = protocol, .sll_ifindex = 2,
+            .link = {.sll_family = AF_PACKET, .sll_protocol = protocol, .sll_ifindex = (int)ifindex,
                 .sll_hatype = 1, .sll_halen = 6,
                 .sll_pkttype = frame[0] == 255 ? PACKET_BROADCAST : frame[0] & 1 ? PACKET_MULTICAST : PACKET_HOST},
             .ip = {.sin_family = AF_INET, .sin_addr.s_addr = source}};
@@ -188,6 +190,8 @@ static int packet6_send(struct packet_socket *s, const void *data, uint32_t leng
     if (address) { int ret = packet6_import(address, address_length, &to); if (ret) return ret; }
     else if (!s->connected6) return -LINUX_EDESTADDRREQ;
     if (length > 65535) return -LINUX_EMSGSIZE;
+    if (to.sin6_scope_id && s->ifindex && to.sin6_scope_id != (uint32_t)s->ifindex)
+        return -LINUX_EINVAL;
     uint32_t scope = to.sin6_scope_id ? to.sin6_scope_id : (uint32_t)s->ifindex;
     if (!scope && to.sin6_addr.s6_addr[0] == 0xff) scope = s->multicast_if;
     struct net_ipv6_path path;
@@ -231,7 +235,6 @@ int task_packet_send(struct task_file *file, const void *data, uint32_t length,
     if (s->error) { int error=s->error; s->error=0; return -error; }
     if (flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL)) return -LINUX_EOPNOTSUPP;
     if (s->domain == AF_INET6) return packet6_send(s, data, length, address, address_length);
-    if (!net_interface_ready()) return -LINUX_ENETDOWN;
     if (s->domain == AF_INET) {
         uint32_t destination = s->remote_ip;
         if (address) {
@@ -246,7 +249,7 @@ int task_packet_send(struct task_file *file, const void *data, uint32_t length,
         }
         if (!destination) return -LINUX_EDESTADDRREQ;
         if (destination == UINT32_MAX && !s->broadcast) return -LINUX_EACCES;
-        return net_ipv4_send_raw(__builtin_bswap32(destination), __builtin_bswap32(s->local_ip),
+        return net_ipv4_send_raw_on((uint32_t)s->ifindex, __builtin_bswap32(destination), __builtin_bswap32(s->local_ip),
             (uint8_t)s->protocol, s->hdrincl, data, length);
     }
     struct sockaddr_ll to = {.sll_family = AF_PACKET, .sll_protocol = (uint16_t)s->protocol, .sll_ifindex = s->ifindex};
@@ -258,14 +261,16 @@ int task_packet_send(struct task_file *file, const void *data, uint32_t length,
         __builtin_memcpy(&to, (void *)(uintptr_t)address, sizeof(to));
         if (to.sll_family != AF_PACKET) return -LINUX_EINVAL;
     }
-    if (to.sll_ifindex != 2) return -LINUX_ENXIO;
+    if (to.sll_ifindex <= 0 || !net_interface_exists((uint32_t)to.sll_ifindex)) return -LINUX_ENXIO;
+    if (to.sll_ifindex == 1) return -LINUX_EOPNOTSUPP;
+    if (!net_interface_is_ready((uint32_t)to.sll_ifindex)) return -LINUX_ENETDOWN;
     uint8_t frame[1514];
     uint32_t total = length;
     if (s->type == SOCK_DGRAM) {
         if (length > 1500) return -LINUX_EMSGSIZE;
         if (to.sll_halen < 6 || to.sll_halen > 8) return -LINUX_EINVAL;
         __builtin_memcpy(frame, to.sll_addr, 6);
-        __builtin_memcpy(frame + 6, e1000_mac(), 6);
+        __builtin_memcpy(frame + 6, netdev_mac((uint32_t)to.sll_ifindex), 6);
         __builtin_memcpy(frame + 12, &to.sll_protocol, 2);
         __builtin_memcpy(frame + 14, data, length);
         total += 14;
@@ -274,7 +279,7 @@ int task_packet_send(struct task_file *file, const void *data, uint32_t length,
         if (length > sizeof(frame)) return -LINUX_EMSGSIZE;
         __builtin_memcpy(frame, data, length);
     }
-    int ret = e1000_send(frame, total);
+    int ret = netdev_send((uint32_t)to.sll_ifindex, frame, total);
     return ret < 0 ? ret : (int)length;
 }
 
@@ -442,7 +447,7 @@ static int packet6_option(struct packet_socket *s, bool set, uint32_t level, uin
         __builtin_memcpy(&group, (void *)(uintptr_t)pointer, sizeof(group));
         if (group.ipv6mr_multiaddr.s6_addr[0] != 0xff || group.ipv6mr_ifindex < 0) return -LINUX_EINVAL;
         uint32_t ifindex = group.ipv6mr_ifindex ? (uint32_t)group.ipv6mr_ifindex : s->multicast_if;
-        if (!ifindex) ifindex = s->ifindex ? (uint32_t)s->ifindex : 2;
+        if (!ifindex) ifindex = s->ifindex ? (uint32_t)s->ifindex : netdev_next(0);
         unsigned slot = 16, empty = 16;
         for (unsigned i = 0; i < 16; ++i) {
             if (!s->groups[i].used && empty == 16) empty = i;
@@ -471,7 +476,7 @@ static int packet6_option(struct packet_socket *s, bool set, uint32_t level, uin
             s->checksum_offset = value < 0 ? -1 : value; break;
         case IPV6_UNICAST_HOPS: if (value < -1 || value > 255) return -LINUX_EINVAL; s->unicast_hops = value; break;
         case IPV6_MULTICAST_HOPS: if (value < -1 || value > 255) return -LINUX_EINVAL; s->multicast_hops = value; break;
-        case IPV6_MULTICAST_IF: if (value < 0 || value > 2) return -LINUX_ENODEV; s->multicast_if = (uint32_t)value; break;
+        case IPV6_MULTICAST_IF: if (value < 0 || (value && !net_interface_exists((uint32_t)value))) return -LINUX_ENODEV; s->multicast_if = (uint32_t)value; break;
         case IPV6_MULTICAST_LOOP: if (value != 0 && value != 1) return -LINUX_EINVAL; s->multicast_loop = value != 0; break;
         case IPV6_RECVPKTINFO: s->recv_pktinfo = value != 0; break;
         case IPV6_RECVHOPLIMIT: s->recv_hoplimit = value != 0; break;
@@ -498,7 +503,7 @@ static int packet6_option(struct packet_socket *s, bool set, uint32_t level, uin
     case IPV6_MTU: {
         if (!s->connected6) return -LINUX_ENOTCONN;
         struct net_ipv6_path path;
-        int ret = net_ipv6_route(&s->remote6, s->remote_scope6, &s->local6, &path);
+        int ret = net_ipv6_route(&s->remote6, s->remote_scope6 ? s->remote_scope6 : (uint32_t)s->ifindex, &s->local6, &path);
         if (ret < 0) return ret;
         value = (int)path.mtu; break;
     }
@@ -576,6 +581,14 @@ int64_t syscall_packet(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
 #endif
     struct packet_socket *s = packet_of(file);
     if (!s) return -LINUX_EBADF;
+    if ((number == __NR_setsockopt || number == __NR_getsockopt) &&
+        a1 == SOL_SOCKET && a2 == SO_BINDTODEVICE) {
+        uint32_t index = (uint32_t)s->ifindex;
+        bool set = number == __NR_setsockopt;
+        int result = net_interface_device_option(set, a3, a4, &index);
+        if (!result && set) s->ifindex = (int)index;
+        return result;
+    }
     if (number == __NR_bind || number == __NR_connect) {
         if (s->domain == AF_PACKET) {
             if (number == __NR_connect) return -LINUX_EOPNOTSUPP;
@@ -585,15 +598,20 @@ int64_t syscall_packet(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
             struct sockaddr_ll address;
             __builtin_memcpy(&address, (void *)(uintptr_t)a1, sizeof(address));
             if (address.sll_family != AF_PACKET) return -LINUX_EINVAL;
-            if (address.sll_ifindex && address.sll_ifindex != 2) return -LINUX_ENODEV;
+            if (address.sll_ifindex < 0 || (address.sll_ifindex &&
+                !net_interface_exists((uint32_t)address.sll_ifindex))) return -LINUX_ENODEV;
             s->ifindex = address.sll_ifindex;
             s->protocol = address.sll_protocol;
         } else if (s->domain == AF_INET6) {
             struct sockaddr_in6 address;
             int ret = packet6_import(a1, (uint32_t)a2, &address);
             if (ret < 0) return ret;
-            if (address.sin6_scope_id > 2) return -LINUX_ENODEV;
+            if (address.sin6_scope_id && !net_interface_exists(address.sin6_scope_id)) return -LINUX_ENODEV;
+            if (address.sin6_scope_id && s->ifindex && address.sin6_scope_id != (uint32_t)s->ifindex)
+                return -LINUX_EINVAL;
             if (number == __NR_connect) {
+                if (address.sin6_scope_id && s->ifindex && address.sin6_scope_id != (uint32_t)s->ifindex)
+                    return -LINUX_EINVAL;
                 s->remote6 = address.sin6_addr; s->remote_scope6 = address.sin6_scope_id; s->connected6 = true;
             } else {
                 if (s->type == SOCK_DGRAM && address.sin6_port) {
@@ -622,9 +640,7 @@ int64_t syscall_packet(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
             if (address.sin_family != AF_INET) return -LINUX_EAFNOSUPPORT;
             if (number == __NR_connect) s->remote_ip = address.sin_addr.s_addr;
             else {
-                struct reliefos_net_config config;
-                net_get_config(&config);
-                if (address.sin_addr.s_addr && address.sin_addr.s_addr != __builtin_bswap32(config.local_ip))
+                if (address.sin_addr.s_addr && !net_interface_for_ipv4(__builtin_bswap32(address.sin_addr.s_addr)))
                     return -LINUX_EADDRNOTAVAIL;
                 s->local_ip = address.sin_addr.s_addr;
             }
@@ -641,7 +657,7 @@ int64_t syscall_packet(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
         if (number == __NR_getsockname && s->type == SOCK_DGRAM) address.sin6_port = __builtin_bswap16(s->ping_id);
         if (number == __NR_getsockname && s->connected6 && packet6_any(&address.sin6_addr)) {
             struct net_ipv6_path path;
-            if (!net_ipv6_route(&s->remote6, s->remote_scope6, &s->local6, &path)) address.sin6_addr = path.source;
+            if (!net_ipv6_route(&s->remote6, s->remote_scope6 ? s->remote_scope6 : (uint32_t)s->ifindex, &s->local6, &path)) address.sin6_addr = path.source;
         }
         if (length > sizeof(address)) length = sizeof(address);
         ret = socket_user_prepare(task, a1, length, true); if (ret) return ret;
@@ -734,7 +750,7 @@ int64_t syscall_packet(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
 /** @brief Report ICMPv6 errors to the socket owning the quoted protocol tuple.
  * @param packet Quoted original IPv6 packet. @param length Quote size.
  * @param error Positive Linux errno. @param mtu Reported path MTU or zero. */
-void net_ipv6_socket_error(const uint8_t *packet, uint32_t length, int error, uint32_t mtu)
+void net_ipv6_socket_error_on(uint32_t ifindex, const uint8_t *packet, uint32_t length, int error, uint32_t mtu)
 {
     if (!packet || length < 40 || packet[0] >> 4 != 6) return;
     struct in6_addr source, destination;
@@ -743,12 +759,15 @@ void net_ipv6_socket_error(const uint8_t *packet, uint32_t length, int error, ui
     if ((protocol == 6 || protocol == 17) && length >= 48) {
         uint16_t source_port = ((uint16_t)packet[40] << 8) | packet[41];
         uint16_t destination_port = ((uint16_t)packet[42] << 8) | packet[43];
-        if (protocol == 6) net_tcp6_error(&source, &destination, source_port, destination_port, error, mtu);
-        else net_udp6_error(&source, &destination, source_port, destination_port, error, mtu);
+        if (protocol == 6) net_tcp6_error_on(ifindex, &source, &destination, source_port, destination_port, error, mtu);
+        else net_udp6_error_on(ifindex, &source, &destination, source_port, destination_port, error, mtu);
     }
     for (unsigned i = 0; i < PACKET_LIMIT; ++i) {
         struct packet_socket *s = sockets[i];
         if (!s || s->domain != AF_INET6 || s->protocol != protocol ||
+            (ifindex && ((s->ifindex && (uint32_t)s->ifindex != ifindex) ||
+                         (s->scope6 && s->scope6 != ifindex) ||
+                         (s->remote_scope6 && s->remote_scope6 != ifindex))) ||
             (!packet6_any(&s->local6) && __builtin_memcmp(&s->local6, &source, sizeof(source))) ||
             (s->connected6 && __builtin_memcmp(&s->remote6, &destination, sizeof(destination)))) continue;
         s->error = error;
@@ -783,4 +802,29 @@ void net_ipv6_transport_proc_emit(struct text_stream *stream, const char *leaf)
     if (!__builtin_strcmp(leaf,"tcp6")) net_tcp6_proc_emit(stream);
     else if (!__builtin_strcmp(leaf,"udp6")) net_udp6_proc_emit(stream);
     else if (!__builtin_strcmp(leaf,"raw6")) net_raw6_proc_emit(stream);
+}
+
+/** @brief Deliver a frame for the primary compatibility interface.
+ * @param input Borrowed Ethernet frame. @param length Complete frame length. */
+void net_packet_input(const void *input, uint32_t length)
+{
+    net_packet_input_on(netdev_next(0), input, length);
+}
+
+/** @brief Forward a compatibility ICMPv6 error without a link filter.
+ * @param packet Quote. @param length Bytes. @param error Errno. @param mtu MTU. */
+void net_ipv6_socket_error(const uint8_t *packet, uint32_t length, int error, uint32_t mtu)
+{
+    net_ipv6_socket_error_on(0, packet, length, error, mtu);
+}
+/** @brief Wake raw endpoints explicitly bound to a removed NIC.
+ * @param ifindex Removed interface index. */
+void net_packet_device_detached(uint32_t ifindex)
+{
+    for (unsigned i = 0; i < PACKET_LIMIT; ++i) {
+        struct packet_socket *socket = sockets[i];
+        if (socket && ((uint32_t)socket->ifindex == ifindex || socket->scope6 == ifindex ||
+                       socket->remote_scope6 == ifindex)) socket->error = LINUX_ENETDOWN;
+    }
+    kernel_poll_readiness_notify();
 }

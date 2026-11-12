@@ -61,6 +61,7 @@ _Static_assert(E1K_RX_COUNT*sizeof(struct e1k_rx_descriptor)==4096, "RX ring pag
 _Static_assert(E1K_TX_COUNT*sizeof(struct e1k_tx_descriptor)<=4096, "TX ring page");
 
 struct e1k_device {
+    struct e1k_device *next;
     const struct reliefos_driver_kernel_api *api;
     struct reliefos_driver_pci_device pci;
     volatile uint8_t *registers;
@@ -92,8 +93,8 @@ static inline void e1k_write(struct e1k_device *d, unsigned offset, uint32_t val
 static inline void e1k_flush(struct e1k_device *d)
 { (void)e1k_read(d,E1K_STATUS); }
 
-/** @brief Discover, map and reset an explicitly supported PCIe controller.
- * @param d Zeroed state with validated kernel services, retained for rollback.
+/** @brief Map and reset one already selected supported PCIe controller.
+ * @param d Selected PCI identity and validated services, retained for rollback.
  * @return Zero, or negative Linux errno; all acquired resources remain owned by d.
  */
 int e1k_hardware_start(struct e1k_device *d);

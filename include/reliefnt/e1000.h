@@ -1,6 +1,6 @@
 /*
- * ReliefOS e1000 driver interface: declares Intel e1000 network operations.
- * Connects the PCI-backed NIC driver to the kernel networking layer.
+ * Compatibility wrappers for the first published Ethernet controller.
+ * New networking code should address a specific NIC through net_device.h.
  */
 #ifndef RELIEFNT_E1000_H
 #define RELIEFNT_E1000_H
@@ -20,24 +20,34 @@ struct e1000_info {
 };
 
 /**
- * @brief Probe and initialize the Intel e1000 NIC, if one is present.
+ * @brief Retained startup hook; drivers initialize their own controllers.
  */
 void e1000_init(void);
 /**
- * @brief Return non-zero when the e1000 driver is present and usable.
+ * @brief Return the first published NIC's current carrier status.
+ * @return Nonzero when carrier is available; zero otherwise.
  */
 int e1000_is_ready(void);
+/** @brief Borrow the first published NIC's core-owned station address.
+ * @return Six bytes or the zero address. Caller holds network execution ownership.
+ */
 const uint8_t *e1000_mac(void);
 /**
- * @brief Transmit len bytes of frame over the NIC; returns 0, or -ENODEV when absent.
+ * @brief Transmit through the first published NIC.
+ * @param frame Borrowed frame bytes. @param len Number of bytes.
+ * @return Zero or a negative Linux errno, including -ENODEV when absent.
  */
 int e1000_send(const void *frame, uint32_t len);
 /**
- * @brief Receive one packet into frame (up to capacity bytes), writing its size to out_len.
+ * @brief Receive a packet from the first published NIC.
+ * @param frame Writable buffer. @param capacity Buffer bytes.
+ * @param out_len Optional frame length output.
+ * @return One frame, zero if empty, or a negative Linux errno.
  */
 int e1000_poll(void *frame, uint32_t capacity, uint32_t *out_len);
 /**
- * @brief Fill info with the NIC's presence, PCI location, and MAC address.
+ * @brief Copy the first published NIC's identity, or zeros when absent.
+ * @param info Nullable caller-owned identity output.
  */
 void e1000_get_info(struct e1000_info *info);
 

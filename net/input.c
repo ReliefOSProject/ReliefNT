@@ -15,7 +15,7 @@ static bool net_tcp_maintenance_tick_valid;
  * @param udp_wait Value supplied by the caller.
  * @param tcp_wait Value supplied by the caller.
  */
-static void net_process_frame(const uint8_t *frame, uint32_t len,
+static void net_process_frame(uint32_t ifindex, const uint8_t *frame, uint32_t len,
                               struct net_arp_wait *arp_wait,
                               struct net_ping_wait *ping_wait,
                               struct net_udp_wait *udp_wait,
@@ -31,23 +31,23 @@ static void net_process_frame(const uint8_t *frame, uint32_t len,
  * @param udp_wait Value supplied by the caller.
  * @param tcp_wait Value supplied by the caller.
  */
-static void net_process_frame(const uint8_t *frame, uint32_t len,
+static void net_process_frame(uint32_t ifindex, const uint8_t *frame, uint32_t len,
                               struct net_arp_wait *arp_wait,
                               struct net_ping_wait *ping_wait,
                               struct net_udp_wait *udp_wait,
                               struct net_tcp_wait *tcp_wait)
 {
     uint16_t type;
-    if (len < 14 || !net_frame_for_us(frame)) {
+    if (len < 14 || !net_frame_for_us_on(ifindex, frame)) {
         return;
     }
     type = net_get_u16(frame + 12);
     if (type == ETH_TYPE_ARP) {
-        net_handle_arp(frame, len, arp_wait);
+        net_handle_arp_on(ifindex, frame, len, arp_wait);
     } else if (type == ETH_TYPE_IPV4) {
-        net_handle_ipv4(frame, len, ping_wait, udp_wait, tcp_wait);
+        net_handle_ipv4_on(ifindex, frame, len, ping_wait, udp_wait, tcp_wait);
     } else if (type == 0x86dd) {
-        net_ipv6_input(frame, len);
+        net_ipv6_input_on(ifindex, frame, len);
     }
 }
 
@@ -65,12 +65,19 @@ void net_poll_once(struct net_arp_wait *arp_wait,
                           struct net_udp_wait *udp_wait,
                           struct net_tcp_wait *tcp_wait)
 {
+    net_device_retry_registration();
     uint8_t frame[NET_FRAME_MAX];
     uint32_t len = 0;
-    int ret = e1000_poll(frame, sizeof(frame), &len);
-    if (ret > 0 && len && net_interface_up) {
-        net_packet_input(frame, len);
-        net_process_frame(frame, len, arp_wait, ping_wait, udp_wait, tcp_wait);
+    static uint32_t previous;
+    uint32_t ifindex = netdev_next(previous);
+    if (!ifindex) ifindex = netdev_next(0);
+    previous = ifindex;
+    if (ifindex && net_interface_is_up(ifindex)) {
+        int ret = netdev_poll(ifindex, frame, sizeof(frame), &len);
+        if (ret > 0 && len) {
+            net_packet_input_on(ifindex, frame, len);
+            net_process_frame(ifindex, frame, len, arp_wait, ping_wait, udp_wait, tcp_wait);
+        }
     }
     net_tcp_service_sockets();
     net_ipv6_poll();
@@ -89,7 +96,7 @@ void net_poll_packets(void)
  */
 bool net_tcp_maintenance_due(void)
 {
-    return ((net_tcp_maintenance_pending() && net_interface_up) ||
+    return (net_device_registration_pending() || net_tcp_maintenance_pending() ||
             net_ipv6_maintenance_pending()) &&
         (!net_tcp_maintenance_tick_valid ||
          time_ticks() != net_tcp_maintenance_last_tick);
@@ -108,7 +115,7 @@ void net_tcp_maintenance(void)
     net_tcp_maintenance_last_tick = time_ticks();
 
     for (uint32_t i = 0; i < NET_TCP_MAINTENANCE_POLL_BUDGET &&
-         (net_tcp_maintenance_pending() || net_ipv6_maintenance_pending()); ++i) {
+         (net_device_registration_pending() || net_tcp_maintenance_pending() || net_ipv6_maintenance_pending()); ++i) {
         net_poll_once(0, 0, 0, 0);
     }
 }

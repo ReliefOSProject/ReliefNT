@@ -3,6 +3,7 @@
 #include <reliefnt/proc_stats.h>
 #include "unix_path.h"
 #include <reliefnt/net.h>
+#include <reliefnt/net_interface.h>
 #include <reliefnt/net_udp.h>
 #include <reliefnt/net_packet.h>
 #include <reliefnt/netlink.h>
@@ -1239,6 +1240,14 @@ void task_inet_release(struct task_file *file)
 static int inet_socket_option(bool setting, int level, int option,
                               uint64_t address, uint64_t length, int32_t handle)
 {
+    if (level == SOL_SOCKET && option == SO_BINDTODEVICE) {
+        uint32_t index = 0;
+        int result = net_socket_bound_device(handle, false, &index);
+        if (result < 0) return result;
+        result = net_interface_device_option(setting, address, length, &index);
+        if (result < 0) return result;
+        return setting ? net_socket_bound_device(handle, true, &index) : 0;
+    }
     if (level == SOL_IPV6 || (level == SOL_SOCKET && option == SO_REUSEADDR)) {
         int value = 0; uint32_t size = (uint32_t)length;
         if (setting) {
