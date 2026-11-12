@@ -97,22 +97,14 @@ static int map_registers(struct rtl_device *d)
     return rc;
 }
 
-/** @brief Discover a supported Realtek function and retain its MMIO/PCI state.
- * @param d Zeroed device containing validated kernel services.
+/** @brief Probe a selected Realtek function and retain its MMIO/PCI state.
+ * @param d Selected PCI identity with validated kernel services.
  * @return Zero with identified hardware and valid station address, or negative errno.
  * Bus mastering remains disabled until rings have been fully allocated.
  */
 int rtl_hardware_probe(struct rtl_device *d)
 {
-    static const uint16_t ids[] = {0x8168, 0x8125};
-    for (unsigned i = 0; i < sizeof(ids) / sizeof(ids[0]); ++i) {
-        if (!d->api->pci_find(0x10ec, ids[i], &d->pci)) {
-            d->present = true;
-            break;
-        }
-    }
-    if (!d->present)
-        return -19;
+    d->present = true;
     const struct reliefos_driver_pci_device *p = &d->pci;
     if (p->class_code != 2 || p->subclass != 0)
         return -19;

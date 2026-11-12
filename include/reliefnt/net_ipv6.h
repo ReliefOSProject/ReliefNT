@@ -5,7 +5,7 @@
 #include <reliefnt/types.h>
 struct text_stream;
 #define NET_IPV6_IF_LOOPBACK 1u
-#define NET_IPV6_IF_ETHERNET 2u
+#define NET_IPV6_IF_ETHERNET 2u /* Legacy default when no NIC is registered. */
 #define NET_IPV6_ADDR_TENTATIVE 0x40u
 #define NET_IPV6_ADDR_DADFAILED 0x08u
 #define NET_IPV6_ADDR_DEPRECATED 0x20u
@@ -36,19 +36,31 @@ struct net_ipv6_path {
 };
 /** @brief Initialize loopback and Ethernet IPv6 host state without blocking. */
 void net_ipv6_init(void);
-/** @brief Retire NIC-specific IPv6 state and queued packets after detach. */
+/** @brief Retire state of the first live NIC, or the legacy default when none exists. */
 void net_ipv6_detached(void);
-/** @brief Apply administrative Ethernet state; never touch driver IRQ ownership.
+/** @brief Retire state owned by the specified NIC, including after registry removal.
+ * @param ifindex Stable interface index. */
+void net_ipv6_detached_on(uint32_t ifindex);
+/** @brief Apply Ethernet state to the first live NIC or the legacy default.
  * @param up New administrative state. */
 void net_ipv6_link_changed(bool up);
+/** @brief Apply administrative state to one NIC under network execution ownership.
+ * @param ifindex Stable interface index. @param up New administrative state.
+ * @return Zero, -ENOMEM when link state cannot be allocated, or -ENODEV for an invalid interface.
+ * Before initialization, state is applied later by the initialization scan. */
+int net_ipv6_link_changed_on(uint32_t ifindex,bool up);
 /** @brief Advance bounded DAD, router/neighbor discovery and queued loopback work. */
 void net_ipv6_poll(void);
 /** @brief Indicate receive/timer work requiring the task-context network pump.
  * @return True when bounded maintenance should remain enabled. */
 bool net_ipv6_maintenance_pending(void);
-/** @brief Validate and dispatch an IPv6 Ethernet frame.
+/** @brief Validate a frame on the first live NIC or the legacy default.
  * @param frame Borrowed complete Ethernet frame. @param length Available bytes. */
 void net_ipv6_input(const uint8_t *frame,uint32_t length);
+/** @brief Validate and dispatch a frame received on the specified NIC.
+ * @param ifindex Stable receiving interface index. @param frame Borrowed Ethernet frame.
+ * @param length Available bytes. */
+void net_ipv6_input_on(uint32_t ifindex,const uint8_t *frame,uint32_t length);
 /** @brief Select a route and usable source without borrowing mutable state.
  * @param destination Required destination. @param scope Explicit interface or zero.
  * @param bound Optional local source, zero-address means automatic. @param out_path Output.
@@ -121,6 +133,10 @@ void net_raw6_input(const struct in6_addr *source,const struct in6_addr *destina
  * @param packet Quoted original IPv6 packet. @param length Available quote bytes.
  * @param error Positive Linux errno. @param mtu Reported MTU or zero. */
 void net_ipv6_socket_error(const uint8_t *packet,uint32_t length,int error,uint32_t mtu);
+/** @brief Deliver an asynchronous error for a specific receiving or transmitting interface.
+ * @param ifindex Interface index, zero to skip interface filtering. @param packet Quoted packet.
+ * @param length Available quote bytes. @param error Positive Linux errno. @param mtu MTU or zero. */
+void net_ipv6_socket_error_on(uint32_t ifindex,const uint8_t *packet,uint32_t length,int error,uint32_t mtu);
 /** @brief Render tcp6/udp6/raw6 socket state without driving I/O.
  * @param stream Slice output. @param leaf Requested standard proc basename. */
 void net_ipv6_transport_proc_emit(struct text_stream *stream,const char *leaf);

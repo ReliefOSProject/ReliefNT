@@ -51,7 +51,6 @@ static uint32_t net_effective_dns_ip(uint32_t dhcp_dns_ip);
 
 static void net_expire_lease(void);
 
-static uint32_t net_interface_broadcast;
 static uint32_t net_dns_mode = RELIEFOS_NET_DNS_MODE_DHCP;
 static uint32_t net_dns_custom_ip;
 static uint32_t net_dhcp_dns_ip;
@@ -235,7 +234,10 @@ void net_update_config_flags(void)
  */
 void net_set_static_fallback(void)
 {
-    net_arp_cache_clear();
+    uint32_t index = net_interface_next(NET_IF_LOOPBACK);
+    struct net_interface *iface = net_interface_get(index);
+    net_arp_cache_clear_on(index);
+    if (iface) { iface->broadcast = 0; iface->default_metric = 0; }
     net_dhcp_dns_ip = 0;
     net_dhcp_acquired_ms = 0;
     net_config = (struct reliefos_net_config){
@@ -264,9 +266,15 @@ static void net_expire_lease(void)
  */
 void net_apply_dhcp_offer(const struct net_dhcp_offer *offer)
 {
-    net_arp_cache_clear();
+    uint32_t index = net_interface_next(NET_IF_LOOPBACK);
+    struct net_interface *iface = net_interface_get(index);
+    net_arp_cache_clear_on(index);
     net_config.local_ip = offer->yiaddr;
     net_config.subnet_mask = offer->subnet_mask ? offer->subnet_mask : RELIEFOS_NET_DEFAULT_SUBNET_MASK;
+    if (iface) {
+        iface->broadcast = net_config.local_ip | ~net_config.subnet_mask;
+        iface->default_metric = 0;
+    }
     net_config.gateway_ip = offer->router_ip;
     net_dhcp_dns_ip = offer->dns_ip;
     net_config.dns_ip = net_effective_dns_ip(net_dhcp_dns_ip);
@@ -440,178 +448,6 @@ void net_device_info(uint32_t *flags, uint64_t *mac_value, uint32_t *local_ip)
         *local_ip = net_config.local_ip;
     }
 }
-
-/** @brief Apply/query network interfaces through the Linux native ioctl ABI.
- * Loopback name/index and the real Ethernet interface/default route are exposed.
- * Unsupported routing/features return an error rather than retaining inert state.
- */
-int net_interface_ioctl(uint32_t request, uint64_t address)
-{
-    bool change = request == SIOCSIFFLAGS || request == SIOCSIFADDR ||
-        request == SIOCSIFNETMASK || request == SIOCSIFBRDADDR ||
-        request == SIOCSIFMTU || request == SIOCADDRT || request == SIOCDELRT;
-    struct task *task = sched_current_task();
-    if (change && (!task || !(task->cap_effective & (1ULL << CAP_NET_ADMIN))))
-        return -LINUX_EPERM;
-    if (request == SIOCADDRT || request == SIOCDELRT) {
-        struct rtentry route;
-        int rc=socket_user_import(task,address,&route,sizeof(route));if(rc)return rc;
-        if (route.rt_dst.sa_family != AF_INET) return -LINUX_EAFNOSUPPORT;
-        uint32_t route_mask = net_get_u32((uint8_t *)&route.rt_genmask + 4);
-        if (route.rt_genmask.sa_family != AF_INET && (route.rt_genmask.sa_family || route_mask))
-            return -LINUX_EAFNOSUPPORT;
-        if (route.rt_dev) {
-            char name[IFNAMSIZ] = {0};
-            for (unsigned i = 0; i < sizeof(name); ++i) {
-                if(route.rt_dev>UINT64_MAX-i)return -LINUX_EFAULT;
-                rc=socket_user_import(task,route.rt_dev+i,&name[i],1);if(rc)return rc;
-                if (!name[i]) break;
-            }
-            if (__builtin_memcmp(name, "eth0", 5)) return -LINUX_ENODEV;
-        }
-        if (!net_interface_present()) return -LINUX_ENODEV;
-        uint32_t dst = net_get_u32((uint8_t *)&route.rt_dst + 4);
-        uint32_t mask = net_get_u32((uint8_t *)&route.rt_genmask + 4);
-        uint32_t gateway = route.rt_gateway.sa_family == AF_INET ?
-            net_get_u32((uint8_t *)&route.rt_gateway + 4) : 0;
-        if (dst || mask || (route.rt_flags & ~3u) || route.rt_metric > 1)
-            return -LINUX_EOPNOTSUPP;
-        if (request == SIOCDELRT) {
-            if (!net_config.gateway_ip || (gateway && gateway != net_config.gateway_ip))
-                return -LINUX_ESRCH;
-            net_config.gateway_ip = 0;
-        } else {
-            if ((route.rt_flags & 2) && !gateway) return -LINUX_EINVAL;
-            if (!(route.rt_flags & 2)) return -LINUX_EOPNOTSUPP;
-            if (!net_interface_up || !net_config.local_ip ||
-                (gateway & net_config.subnet_mask) != (net_config.local_ip & net_config.subnet_mask))
-                return -LINUX_ENETUNREACH;
-            if (net_config.gateway_ip) return -LINUX_EEXIST;
-            net_config.gateway_ip = gateway;
-        }
-        net_arp_cache_clear();
-        return 0;
-    }
-    if (request == SIOCGIFCONF) {
-        struct ifconf conf;
-        int rc=socket_user_import(task,address,&conf,sizeof(conf));if(rc)return rc;
-        rc=socket_user_prepare(task,address,sizeof(conf),true);if(rc)return rc;
-        if(!user_range_writable(address,sizeof(conf)))return -LINUX_EFAULT;
-        if (conf.ifc_len < 0) return -LINUX_EINVAL;
-        int available = net_interface_present() && net_config.local_ip ? sizeof(struct ifreq) : 0;
-        if (!conf.ifc_buf) conf.ifc_len = available;
-        else {
-            conf.ifc_len = conf.ifc_len >= available ? available : 0;
-            if (conf.ifc_len) {
-                rc=socket_user_prepare(task,conf.ifc_buf,sizeof(struct ifreq),true);if(rc)return rc;
-                if (!user_range_writable(conf.ifc_buf, sizeof(struct ifreq))) return -LINUX_EFAULT;
-                struct ifreq result = { .ifr_name = "eth0", .data.addr.sa_family = AF_INET };
-                net_put_u32((uint8_t *)&result.data.addr + 4, net_config.local_ip);
-                net_memcpy((void *)(uintptr_t)conf.ifc_buf, &result, sizeof(result));
-            }
-        }
-        net_memcpy((void *)(uintptr_t)address, &conf, sizeof(conf));
-        return 0;
-    }
-    switch (request) {
-    case SIOCGIFNAME: case SIOCGIFINDEX: case SIOCGIFHWADDR: case SIOCGIFFLAGS:
-    case SIOCSIFFLAGS: case SIOCGIFADDR: case SIOCSIFADDR: case SIOCGIFNETMASK:
-    case SIOCSIFNETMASK: case SIOCGIFBRDADDR: case SIOCSIFBRDADDR: case SIOCGIFMTU:
-    case SIOCSIFMTU: break;
-    default: return -LINUX_ENOTTY;
-    }
-    struct ifreq req;
-    int rc=socket_user_import(task,address,&req,sizeof(req));if(rc)return rc;
-    if(!change) {
-        rc=socket_user_prepare(task,address,sizeof(req),true);if(rc)return rc;
-        if(!user_range_writable(address,sizeof(req)))return -LINUX_EFAULT;
-    }
-    if (request == SIOCGIFNAME) {
-        const char *name;
-        uint32_t size;
-        if (req.data.value == 1) { name = "lo"; size = 3; }
-        else if (req.data.value == 2 && net_interface_present()) { name = "eth0"; size = 5; }
-        else return -LINUX_ENODEV;
-        net_memzero(req.ifr_name, sizeof(req.ifr_name));
-        net_memcpy(req.ifr_name, name, size);
-        net_memcpy((void *)(uintptr_t)address, &req, sizeof(req));
-        return 0;
-    }
-    req.ifr_name[IFNAMSIZ - 1] = 0;
-    if (request == SIOCGIFINDEX && !__builtin_memcmp(req.ifr_name, "lo", 3)) {
-        req.data.value = 1;
-        net_memcpy((void *)(uintptr_t)address, &req, sizeof(req));
-        return 0;
-    }
-    if (!net_interface_present() || __builtin_memcmp(req.ifr_name, "eth0", 5)) return -LINUX_ENODEV;
-    switch (request) {
-        case SIOCGIFINDEX: req.data.value = 2; break;
-        case SIOCGIFHWADDR:
-            net_memzero(&req.data, sizeof(req.data));
-            req.data.addr.sa_family = 1; /* ARPHRD_ETHER */
-            net_memcpy(req.data.addr.sa_data, e1000_mac(), 6); break;
-        case SIOCGIFFLAGS:
-            req.data.flags = IFF_BROADCAST | IFF_MULTICAST |
-                (net_interface_up ? IFF_UP : 0) |
-                (net_interface_ready() ? IFF_RUNNING : 0); break;
-        case SIOCSIFFLAGS:
-            if (req.data.flags & ~(IFF_UP | IFF_RUNNING | IFF_BROADCAST | IFF_MULTICAST))
-                return -LINUX_EOPNOTSUPP;
-            if (net_interface_up != !!(req.data.flags & IFF_UP)) {
-                net_interface_up = !!(req.data.flags & IFF_UP);
-                net_ipv6_link_changed(net_interface_up);
-                netlink_ipv6_changed();
-            }
-            break;
-        case SIOCGIFMTU: req.data.value = 1500; break;
-        case SIOCSIFMTU:
-            if (req.data.value != 1500) return -LINUX_EOPNOTSUPP;
-            break;
-        default: {
-            uint32_t *value = (request == SIOCGIFADDR || request == SIOCSIFADDR) ? &net_config.local_ip :
-                (request == SIOCGIFNETMASK || request == SIOCSIFNETMASK) ? &net_config.subnet_mask : &net_interface_broadcast;
-            if (change) {
-                if (req.data.addr.sa_family != AF_INET) return -LINUX_EAFNOSUPPORT;
-                uint32_t ip = net_get_u32((uint8_t *)&req.data.addr + 4);
-                if (request == SIOCSIFNETMASK && ((~ip) & ((~ip) + 1))) return -LINUX_EINVAL;
-                if (request == SIOCSIFADDR && ip >= 0xe0000000u) return -LINUX_EINVAL;
-                *value = ip;
-                if (request == SIOCSIFADDR || request == SIOCSIFNETMASK)
-                    net_interface_broadcast = net_config.local_ip | ~net_config.subnet_mask;
-                if (!net_config.local_ip) net_config.gateway_ip = 0;
-                net_config.source = net_config.local_ip ? RELIEFOS_NET_CONFIG_SOURCE_STATIC : RELIEFOS_NET_CONFIG_SOURCE_NONE;
-                net_config.lease_seconds = net_config.dhcp_server_ip = 0;
-                net_arp_cache_clear();
-            } else {
-                if (!net_config.local_ip) return -LINUX_EADDRNOTAVAIL;
-                net_memzero(&req.data, sizeof(req.data));
-                req.data.addr.sa_family = AF_INET;
-                net_put_u32((uint8_t *)&req.data.addr + 4, *value);
-            }
-        } break;
-    }
-    if (!change) net_memcpy((void *)(uintptr_t)address, &req, sizeof(req));
-    return 0;
-}
-
-/** @brief Report the real administrative and hardware state of eth0. */
-bool net_interface_ready(void) { return net_interface_up && e1000_is_ready(); }
-
-/** @brief Report a registered Ethernet device independently of carrier state.
- * @return True while a retained provider publishes a present PCI device;
- * false before registration or after detach. Caller owns network execution.
- */
-bool net_interface_present(void)
-{
-    struct e1000_info info;
-    e1000_get_info(&info);
-    return info.present!=0;
-}
-
-/** @brief Report the administrative IFF_UP setting independently of carrier.
- * @return Current eth0 administrative flag; caller owns network execution.
- */
-bool net_interface_admin_up(void) { return net_interface_up; }
 
 /** @brief Apply Linux IPv6 address and route ioctls for an IPv6 socket.
  * @param request Supported address or route mutation command.

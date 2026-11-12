@@ -37,6 +37,10 @@ int sound_service_unregister_owner(uint32_t id,uint32_t force) { (void)id; (void
 void driver_resources_release(uint32_t id,bool irq_only)
 { (void)id; if(irq_only){assert(!execution_depth);++irq_releases;} else {assert(execution_depth);++data_releases;} }
 void net_driver_detached(void) { ++detaches; }
+void net_device_attached(uint32_t ifindex) { assert(ifindex >= 2); }
+void net_device_detached(uint32_t ifindex) { assert(ifindex >= 2); ++detaches; }
+void *kernel_malloc(size_t size) { return calloc(1, size); }
+void kernel_free(void *p) { free(p); }
 int module_add_resource(struct module *code,int (*stop)(void *),void (*free_fn)(void *),void *context)
 {
     assert(code==&owner && stop && free_fn && !resource.stop);

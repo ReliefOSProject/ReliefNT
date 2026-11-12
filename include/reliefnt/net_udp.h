@@ -50,4 +50,15 @@ void net_udp6_error(const struct in6_addr *source,const struct in6_addr *destina
 void net_udp6_proc_emit(struct text_stream *stream);
 void net_udp_input(uint32_t source, uint32_t destination, uint16_t source_port,
                     uint16_t destination_port, const void *data, uint32_t length, int ifindex);
+
+/** @brief Deliver a checked ICMPv6 error only to UDP state on the matching link.
+ * @param ifindex Link or zero. @param source Local. @param destination Peer.
+ * @param source_port Local port. @param destination_port Peer port.
+ * @param error Positive errno. @param mtu Reported MTU. */
+void net_udp6_error_on(uint32_t ifindex, const struct in6_addr *source,
+                       const struct in6_addr *destination, uint16_t source_port,
+                       uint16_t destination_port, int error, uint32_t mtu);
+/** @brief Wake UDP sockets bound to a disappearing device. @param ifindex Device. */
+void net_udp_device_detached(uint32_t ifindex);
+
 #endif

@@ -6,10 +6,10 @@
 #include "../../net/internal.h"
 
 struct net_socket *net_sockets;
-struct reliefos_net_config net_config;
+static struct reliefos_net_config fixture_config;
+static bool fixture_interface_up;
 uint32_t net_sequence;
 uint16_t net_ipv4_id;
-bool net_interface_up;
 static struct task current;
 static uint64_t now = 1000;
 static const struct in6_addr loop6 = {.s6_addr = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1}};
@@ -30,15 +30,34 @@ uint32_t kernel_wait_queue_wake_all(struct kernel_wait_queue *q) { (void)q; retu
 void kernel_poll_readiness_notify(void) {}
 void console_log(enum console_log_level level, const char *format, ...) { (void)level; (void)format; }
 int net_get_config(struct reliefos_net_config *out) { *out = net_config; return 0; }
+struct reliefos_net_config *net_interface_legacy_config(void) { return &fixture_config; }
+bool *net_interface_legacy_up(void) { return &fixture_interface_up; }
+bool net_interface_exists(uint32_t index) { return index==1; }
+bool net_interface_is_ready(uint32_t index) { return index==1; }
+uint32_t net_interface_for_ipv4(uint32_t ip) { return (ip>>24)==127?1:0; }
+uint32_t netdev_next(uint32_t after) { (void)after;return 0; }
+int netdev_send(uint32_t index,const void *data,uint32_t length)
+{ (void)index;(void)data;(void)length;return -LINUX_ENETDOWN; }
+int net_ipv4_route_lookup(uint32_t destination,uint32_t source,uint32_t scope,struct net_ipv4_path *out)
+{
+    if((destination>>24)!=127 || (scope && scope!=1))return -LINUX_ENETUNREACH;
+    *out=(struct net_ipv4_path){.source=source?source:0x7f000001u,.destination=destination,
+                                .next_hop=destination,.ifindex=1};
+    return 0;
+}
 int e1000_is_ready(void) { return 0; }
 int e1000_send(const void *data, uint32_t length) { (void)data; (void)length; return -LINUX_ENETDOWN; }
 int net_resolve_mac(uint32_t ip, uint32_t timeout, uint8_t *out) { (void)ip; (void)timeout; (void)out; return -1; }
+int net_resolve_mac_on(uint32_t index,uint32_t ip,uint32_t timeout,uint8_t *out)
+{ (void)index;return net_resolve_mac(ip,timeout,out); }
 uint32_t net_route_arp_ip(uint32_t ip) { return ip; }
 uint32_t net_ensure_ipv4_config(uint32_t timeout, int dns) { (void)timeout; (void)dns; return RELIEFOS_NET_STATUS_OK; }
 void net_poll_once(struct net_arp_wait *a, struct net_ping_wait *p, struct net_udp_wait *u, struct net_tcp_wait *t)
 { (void)a; (void)p; (void)u; (void)t; }
 void net_write_eth(uint8_t *frame, const uint8_t *mac, uint16_t type)
 { (void)frame; (void)mac; (void)type; }
+void net_write_eth_on(uint32_t index,uint8_t *frame,const uint8_t *mac,uint16_t type)
+{ (void)index;net_write_eth(frame,mac,type); }
 uint32_t net_ipv6_addresses(struct net_ipv6_address *out,uint32_t cap)
 { if (cap) out[0] = (struct net_ipv6_address){.address=loop6,.ifindex=1}; return 1; }
 int net_ipv6_route(const struct in6_addr *destination,uint32_t scope,
@@ -142,3 +161,5 @@ int main(void)
     while (net_sockets) { struct net_socket *s=net_sockets; net_sockets=s->registry_next; free(s->rx); free(s->tx); free(s); }
     puts("PASS IPv6 and IPv4-mapped TCP deferred loopback handshake, accept, payload and FIN");
 }
+
+bool net_interface_is_up(uint32_t index) { return net_interface_is_ready(index); }

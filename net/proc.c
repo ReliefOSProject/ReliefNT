@@ -33,8 +33,8 @@ static int proc_ipv6_addresses(struct text_stream *s)
     if (net_ipv6_addresses(entries,count)>count) { kernel_free(entries); return -LINUX_EAGAIN; }
     for (uint32_t i=0;i<count;++i) {
         struct net_ipv6_address *a=&entries[i];
-        const char *name=a->ifindex==1 ? "lo" : a->ifindex==2 ? "eth0" : NULL;
-        if (!name) continue;
+        char name[NET_IF_NAME_LEN];
+        if (!net_interface_name(a->ifindex,name)) continue;
         proc_ipv6(s,&a->address); text_string(s," "); text_hex(s,a->ifindex,2);
         text_string(s," "); text_hex(s,a->prefix_length,2);
         text_string(s," "); text_hex(s,proc_ipv6_scope(a->scope),2);
@@ -57,8 +57,8 @@ static int proc_ipv6_routes(struct text_stream *s)
     static const struct in6_addr zero;
     for (uint32_t i=0;i<count;++i) {
         struct net_ipv6_route *r=&entries[i];
-        const char *name=r->ifindex==1 ? "lo" : r->ifindex==2 ? "eth0" : NULL;
-        if (!name) continue;
+        char name[NET_IF_NAME_LEN];
+        if (!net_interface_name(r->ifindex,name)) continue;
         proc_ipv6(s,&r->destination); text_string(s," "); text_hex(s,r->prefix_length,2);
         text_string(s," "); proc_ipv6(s,&zero); text_string(s," 00 ");
         proc_ipv6(s,&r->gateway); text_string(s," "); text_hex(s,r->metric,8);
@@ -91,17 +91,18 @@ int net_proc_emit(struct text_stream *s, const char *leaf)
         return 0;
     }
     if (!__builtin_strcmp(leaf, "dev")) {
-        struct net_proc_counters c;
-        net_device_counters(&c);
         text_string(s, "Inter-|   Receive                                                |  "
                        "Transmit\n face |bytes    packets errs drop fifo frame compressed "
                        "multicast|bytes    packets errs drop fifo colls carrier compressed\n");
         /* Loopback datagrams are accounted by their owner rather than the NIC. */
         net_loopback_proc_emit(s);
-        struct e1000_info info;
-        e1000_get_info(&info);
-        if (info.present) {
-            text_string(s, "  eth0:");
+        for (uint32_t index=net_interface_next(NET_IF_LOOPBACK);index;
+             index=net_interface_next(index)) {
+            struct net_proc_counters c;
+            char name[NET_IF_NAME_LEN];
+            if (!net_interface_name(index,name)) continue;
+            netdev_counters(index,&c);
+            text_string(s, "  "); text_string(s,name); text_string(s, ":");
             uint64_t fields[] = {c.rx_bytes, c.rx_packets, c.rx_errors, c.rx_drops, 0, 0, 0, 0,
                                  c.tx_bytes, c.tx_packets, c.tx_errors, 0,          0, 0, 0, 0};
             for (unsigned i = 0; i < 16; ++i) {
@@ -113,21 +114,22 @@ int net_proc_emit(struct text_stream *s, const char *leaf)
     } else if (!__builtin_strcmp(leaf, "route")) {
         text_string(s, "Iface\tDestination\tGateway "
                        "\tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n");
-        /* No IPv4 forwarding/routing table exists beyond loopback, connected
-         * subnet and the configured default gateway. Emit only those routes. */
-        text_string(s, "lo\t0000007f\t00000000\t0001\t0\t0\t0\t000000ff\t0\t0\t0\n");
-        if (net_interface_up && net_config.local_ip) {
-            text_string(s, "eth0\t");
-            proc_ip(s, net_config.local_ip & net_config.subnet_mask);
-            text_string(s, "\t00000000\t0001\t0\t0\t0\t");
-            proc_ip(s, net_config.subnet_mask);
-            text_string(s, "\t0\t0\t0\n");
-            if (net_config.gateway_ip) {
-                text_string(s, "eth0\t00000000\t");
-                proc_ip(s, net_config.gateway_ip);
-                text_string(s, "\t0003\t0\t0\t0\t00000000\t0\t0\t0\n");
-            }
+        uint32_t count=net_ipv4_routes(NULL,0);
+        if (count > UINT32_MAX / sizeof(struct net_ipv4_route)) return -LINUX_ENOMEM;
+        struct net_ipv4_route *routes=count ? kernel_malloc((size_t)count*sizeof(*routes)) : NULL;
+        if (count && !routes) return -LINUX_ENOMEM;
+        if (net_ipv4_routes(routes,count)>count) { kernel_free(routes); return -LINUX_EAGAIN; }
+        for (uint32_t i=0;i<count;++i) {
+            char name[NET_IF_NAME_LEN];
+            if (!net_interface_name(routes[i].ifindex,name)) continue;
+            text_string(s,name); text_string(s,"\t"); proc_ip(s,routes[i].destination);
+            text_string(s,"\t"); proc_ip(s,routes[i].gateway);
+            text_string(s,"\t"); text_hex(s,routes[i].flags,4);
+            text_string(s,"\t0\t0\t"); text_unsigned(s,routes[i].metric);
+            text_string(s,"\t"); proc_ip(s,routes[i].mask);
+            text_string(s,"\t0\t0\t0\n");
         }
+        kernel_free(routes);
     } else if (!__builtin_strcmp(leaf, "arp"))
         net_arp_proc_emit(s);
     else if (!__builtin_strcmp(leaf, "udp"))

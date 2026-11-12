@@ -4,6 +4,7 @@
  * Controlled substitutes model only the boundaries asserted by this fixture.
  */
 #include <stdlib.h>
+#define NET_INTERFACE_TEST_EXTERNAL_ALLOC
 #define main inherited_interface_main
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wreturn-type"
@@ -37,6 +38,7 @@ static int scoped(unsigned request,uint64_t address)
 }
 int main(void)
 {
+    assert(net_interface_register(2) == 0);
     current=(struct task){.kind=TASK_KIND_USER,.pid=45,.syscall_file=&net_file,
                           .syscall_fd=3,.syscall_file_number=LINUX_SYS_IOCTL,
                           .cap_effective=1ULL<<CAP_NET_ADMIN};
@@ -57,7 +59,7 @@ int main(void)
     net_config.local_ip=0x0a00020f;blocked=(uintptr_t)&output;block_output=true;
     assert(scoped(SIOCGIFCONF,(uintptr_t)&conf)==KERNEL_SYSCALL_SWAP_CONTENDED);
     conf.ifc_buf=0;blocked=0;
-    assert(!scoped(SIOCGIFCONF,(uintptr_t)&conf) && !strcmp(output.ifr_name,"eth0"));
+    assert(!scoped(SIOCGIFCONF,(uintptr_t)&conf) && !strcmp(output.ifr_name,"lo"));
     task_lookup_scope_cancel(&current);
     char route_name[]="eth0";
     struct rtentry route={.rt_dst.sa_family=AF_INET,.rt_gateway.sa_family=AF_INET,

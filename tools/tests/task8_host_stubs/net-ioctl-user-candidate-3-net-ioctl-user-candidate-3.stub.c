@@ -22,6 +22,22 @@ __attribute__((noreturn)) void kernel_wait_queue_remove(void) { __builtin_trap()
 __attribute__((noreturn)) void kernel_wait_queue_wake_all(void) { __builtin_trap(); }
 /** @brief Trap if the fixture reaches unmodeled net_packet_input. */
 __attribute__((noreturn)) void net_packet_input(void) { __builtin_trap(); }
+/** @brief Trap if the ioctl-only fixture attempts hardware transmission. */
+__attribute__((noreturn)) void netdev_send(void) { __builtin_trap(); }
+/** @brief Trap if the ioctl-only fixture attempts hardware receive polling. */
+__attribute__((noreturn)) void netdev_poll(void) { __builtin_trap(); }
+/** @brief Trap if the ioctl-only fixture delivers a received packet frame. */
+__attribute__((noreturn)) void net_packet_input_on(void) { __builtin_trap(); }
+/** @brief Trap if the ioctl-only fixture delivers an IPv6 frame. */
+__attribute__((noreturn)) void net_ipv6_input_on(void) { __builtin_trap(); }
+/** @brief Trap if the ioctl-only fixture runs IPv6 discovery maintenance. */
+__attribute__((noreturn)) void net_ipv6_poll(void) { __builtin_trap(); }
+/** @brief Trap if the ioctl-only fixture selects an IPv6 transport route. */
+__attribute__((noreturn)) void net_ipv6_route(void) { __builtin_trap(); }
+/** @brief Trap if the ioctl-only fixture computes an IPv6 transport checksum. */
+__attribute__((noreturn)) void net_ipv6_checksum(void) { __builtin_trap(); }
+/** @brief Trap if the ioctl-only fixture transmits an IPv6 packet. */
+__attribute__((noreturn)) void net_ipv6_output(void) { __builtin_trap(); }
 /** @brief Trap if the fixture reaches unmodeled net_udp_input. */
 __attribute__((noreturn)) void net_udp_input(void) { __builtin_trap(); }
 /** @brief Trap if the fixture reaches unmodeled sched_sleep_current_until. */
@@ -34,6 +50,8 @@ __attribute__((noreturn)) void storage_inode_get(void) { __builtin_trap(); }
 __attribute__((noreturn)) void task_packet_available(void) { __builtin_trap(); }
 /** @brief Trap if the fixture reaches unmodeled task_udp_available. */
 __attribute__((noreturn)) void task_udp_available(void) { __builtin_trap(); }
+/** @brief Trap if the ioctl-only fixture queries netlink receive bytes. */
+__attribute__((noreturn)) void task_netlink_available(void) { __builtin_trap(); }
 /** @brief Trap if the fixture reaches unmodeled time_set_wall_clock. */
 __attribute__((noreturn)) void time_set_wall_clock(void) { __builtin_trap(); }
 /** @brief Trap if the fixture reaches unmodeled time_ticks. */

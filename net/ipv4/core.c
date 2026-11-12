@@ -15,7 +15,7 @@ static uint16_t net_packet_ip_id;
  */
 static int net_ip_for_us(uint32_t dst_ip)
 {
-    return dst_ip == net_config.local_ip ||
+    return net_interface_for_ipv4(dst_ip) != 0 ||
            dst_ip == 0xffffffffu ||
            dst_ip == 0;
 }
@@ -28,7 +28,7 @@ static int net_ip_for_us(uint32_t dst_ip)
  * @param udp_wait Optional legacy UDP waiter.
  * @param tcp_wait Optional legacy TCP waiter.
  */
-void net_handle_ipv4(const uint8_t *frame, uint32_t len,
+void net_handle_ipv4_on(uint32_t ifindex, const uint8_t *frame, uint32_t len,
                             struct net_ping_wait *ping_wait,
                             struct net_udp_wait *udp_wait,
                             struct net_tcp_wait *tcp_wait)
@@ -64,11 +64,11 @@ void net_handle_ipv4(const uint8_t *frame, uint32_t len,
     }
     src_ip = net_get_u32(ip + 12);
     if (ip[9] == IPV4_PROTO_UDP) {
-        net_handle_udp(ip, total_len, ihl, src_ip, udp_wait);
+        net_handle_udp_on(ifindex, ip, total_len, ihl, src_ip, udp_wait);
         return;
     }
     if (ip[9] == IPV4_PROTO_TCP) {
-        net_handle_tcp(ip, total_len, ihl, src_ip, frame + 6, tcp_wait);
+        net_handle_tcp_on(ifindex, ip, total_len, ihl, src_ip, frame + 6, tcp_wait);
         return;
     }
     if (ip[9] != IPV4_PROTO_ICMP || total_len < ihl + 8u) {
@@ -80,6 +80,7 @@ void net_handle_ipv4(const uint8_t *frame, uint32_t len,
         return;
     }
     if (icmp[0] == ICMP_ECHO_REPLY && ping_wait &&
+        (!ping_wait->ifindex || ping_wait->ifindex == ifindex) &&
         src_ip == ping_wait->target_ip &&
         net_get_u16(icmp + 4) == ping_wait->ident &&
         net_get_u16(icmp + 6) == ping_wait->sequence) {
@@ -97,7 +98,7 @@ void net_handle_ipv4(const uint8_t *frame, uint32_t len,
  * @param length Payload bytes.
  * @return Bytes accepted or negative errno; no fragmentation is implemented.
  */
-int net_ipv4_send_raw(uint32_t destination, uint32_t source, uint8_t protocol,
+int net_ipv4_send_raw_on(uint32_t ifindex, uint32_t destination, uint32_t source, uint8_t protocol,
                       bool header_included, const void *data, uint32_t length)
 {
     uint32_t header = header_included ? 0 : 20;
@@ -105,7 +106,11 @@ int net_ipv4_send_raw(uint32_t destination, uint32_t source, uint8_t protocol,
     if (header_included && (length < 20 || ((const uint8_t *)data)[0] >> 4 != 4)) return -LINUX_EINVAL;
     uint8_t frame[1514] = {0};
     uint8_t *ip = frame + 14;
-    if (!source) source = net_config.local_ip;
+    struct net_ipv4_path path;
+    int route = net_ipv4_route_lookup(destination, source, ifindex, &path);
+    if (route < 0) return route;
+    ifindex = path.ifindex;
+    source = path.source;
     if (header_included) {
         net_memcpy(ip, data, length);
         uint32_t ihl = (ip[0] & 15) * 4;
@@ -124,9 +129,27 @@ int net_ipv4_send_raw(uint32_t destination, uint32_t source, uint8_t protocol,
         net_memcpy(ip + 20, data, length);
     }
     if (destination == UINT32_MAX) net_memcpy(frame, net_broadcast_mac, 6);
-    else if (net_resolve_mac(net_route_arp_ip(destination), 1000, frame) < 0) return -LINUX_EHOSTUNREACH;
-    net_memcpy(frame + 6, e1000_mac(), 6);
+    else if (net_resolve_mac_on(ifindex, path.next_hop, 1000, frame) < 0) return -LINUX_EHOSTUNREACH;
+    net_memcpy(frame + 6, netdev_mac(ifindex), 6);
     net_put_u16(frame + 12, 0x0800);
-    int ret = net_interface_up ? e1000_send(frame, length + header + 14) : -LINUX_ENETDOWN;
+    int ret = net_interface_is_ready(ifindex) ? netdev_send(ifindex, frame, length + header + 14) : -LINUX_ENETDOWN;
     return ret < 0 ? ret : (int)length;
+}
+
+/** @brief Receive IPv4 on the primary compatibility device.
+ * @param frame Ethernet packet. @param length Byte count. @param ping Optional waiter.
+ * @param udp Optional waiter. @param tcp Optional waiter. */
+void net_handle_ipv4(const uint8_t *frame, uint32_t length, struct net_ping_wait *ping,
+                      struct net_udp_wait *udp, struct net_tcp_wait *tcp)
+{
+    net_handle_ipv4_on(netdev_next(0), frame, length, ping, udp, tcp);
+}
+/** @brief Send raw IPv4 using normal destination-based routing.
+ * @param destination Peer. @param source Optional source. @param protocol Protocol.
+ * @param header_included Header present. @param data Payload. @param length Bytes.
+ * @return Accepted bytes or negative errno. */
+int net_ipv4_send_raw(uint32_t destination, uint32_t source, uint8_t protocol,
+                       bool header_included, const void *data, uint32_t length)
+{
+    return net_ipv4_send_raw_on(0, destination, source, protocol, header_included, data, length);
 }

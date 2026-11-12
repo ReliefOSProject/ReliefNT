@@ -2,6 +2,8 @@
 /** @file IPv6 host, neighbor discovery, bounded reassembly and MLD. */
 #include "../internal.h"
 #include <reliefnt/net_ipv6.h>
+#include <reliefnt/net_device.h>
+#include <reliefnt/net_interface.h>
 #include <reliefnt/random.h>
 #include <linux/ipv6_route.h>
 
@@ -63,7 +65,7 @@ struct ipv6_pending {
 struct ipv6_reassembly {
     struct in6_addr source, destination;
     uint8_t *data, *bitmap, *prefix;
-    uint32_t identification, covered, total, highwater, prefix_len, prev_next;
+    uint32_t identification, ifindex, covered, total, highwater, prefix_len, prev_next;
     uint64_t deadline;
     uint8_t next;
     bool used, poisoned, have_first, have_last;
@@ -82,44 +84,68 @@ static struct ipv6_group_slot ipv6_groups[IPV6_GROUP_MAX];
 static struct ipv6_pending ipv6_pending[IPV6_PENDING_MAX];
 static struct ipv6_reassembly ipv6_reassembly[IPV6_REASM_MAX];
 static struct ipv6_pmtu ipv6_pmtu[IPV6_PMTU_MAX];
-static bool ipv6_initialized, ipv6_link_up;
-static uint32_t ipv6_link_mtu = IPV6_LINK_MTU, ipv6_frag_id, ipv6_rng_state;
-static uint32_t ipv6_base_reachable_ms = 30000, ipv6_retrans_ms = 1000;
-static uint64_t ipv6_reachable_ms = 30000, ipv6_reachable_refresh;
-static uint64_t ipv6_rs_at, ipv6_error_at, ipv6_mld_v1_until;
-static uint8_t ipv6_rs_sent, ipv6_error_count;
+/* Indexes are stable identifiers, not dense array positions. */
+struct ipv6_link {
+    struct ipv6_link *next;
+    uint32_t ifindex, mtu, rng_state, base_reachable_ms, retrans_ms;
+    uint64_t reachable_ms, reachable_refresh, rs_at, mld_v1_until;
+    uint8_t rs_sent;
+    bool up;
+};
+static struct ipv6_link *ipv6_links;
+static bool ipv6_initialized;
+/* Fragment IDs must not collide when the same endpoints use different NICs. */
+static uint32_t ipv6_frag_id;
+static uint64_t ipv6_error_at;
+static uint8_t ipv6_error_count;
 static const struct in6_addr ipv6_zero = {0};
 static const struct in6_addr ipv6_loop = {.s6_addr={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1}};
 static const struct in6_addr ipv6_all_nodes = {.s6_addr={0xff,2,0,0,0,0,0,0,0,0,0,0,0,0,0,1}};
 static const struct in6_addr ipv6_all_routers = {.s6_addr={0xff,2,0,0,0,0,0,0,0,0,0,0,0,0,0,2}};
 static const struct in6_addr ipv6_mld_routers = {.s6_addr={0xff,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0x16}};
 
-/** @brief Obtain a discovery jitter word without requiring a hardware generator.
- * @return Hardware random value when available, otherwise a non-cryptographic interface sequence. */
-static uint32_t ipv6_jitter_word(void)
+/** @brief Look up link state by stable interface index, optionally allocating it. */
+static struct ipv6_link *ipv6_link(uint32_t ifindex,bool create)
+{
+    for(struct ipv6_link *link=ipv6_links;link;link=link->next)
+        if(link->ifindex==ifindex)return link;
+    if(!create)return 0;
+    struct ipv6_link *link=kernel_malloc(sizeof(*link));if(!link)return 0;
+    net_memzero(link,sizeof(*link));link->ifindex=ifindex;
+    link->mtu=IPV6_LINK_MTU;link->base_reachable_ms=30000;link->retrans_ms=1000;
+    link->next=ipv6_links;ipv6_links=link;
+    return link;
+}
+/** @brief Select the historical default NIC, including in legacy white-box fixtures. */
+static uint32_t ipv6_default_interface(void)
+{
+    uint32_t ifindex=netdev_next(0);
+    return ifindex?ifindex:NET_IPV6_IF_ETHERNET;
+}
+/** @brief Obtain per-interface discovery jitter without requiring hardware RNG. */
+static uint32_t ipv6_jitter_word(struct ipv6_link *link)
 {
     uint32_t value;
     if(kernel_random_fill(&value,sizeof(value))==0)return value;
-    if(!ipv6_rng_state){const uint8_t *mac=e1000_mac();uint64_t now=time_uptime_ms();
-        ipv6_rng_state=(uint32_t)now^(uint32_t)(now>>32)^0x9e3779b9u;
-        for(uint32_t i=0;i<6;i++)ipv6_rng_state=(ipv6_rng_state^mac[i])*16777619u;
-        if(!ipv6_rng_state)ipv6_rng_state=0x6d2b79f5u;}
-    value=ipv6_rng_state;value^=value<<13;value^=value>>17;value^=value<<5;
-    ipv6_rng_state=value;return value;
+    if(!link->rng_state){const uint8_t *mac=netdev_mac(link->ifindex);uint64_t now=time_uptime_ms();
+        link->rng_state=(uint32_t)now^(uint32_t)(now>>32)^0x9e3779b9u^link->ifindex;
+        if(mac)for(uint32_t i=0;i<6;i++)link->rng_state=(link->rng_state^mac[i])*16777619u;
+        if(!link->rng_state)link->rng_state=0x6d2b79f5u;}
+    value=link->rng_state;value^=value<<13;value^=value>>17;value^=value<<5;
+    link->rng_state=value;return value;
 }
-/** @brief Choose a bounded, uniformly scaled discovery delay.
- * @param maximum Largest accepted delay, at most UINT32_MAX. @return Milliseconds in the inclusive range. */
-static uint32_t ipv6_jitter(uint32_t maximum)
-{ return (uint32_t)(((uint64_t)ipv6_jitter_word()*((uint64_t)maximum+1u))>>32); }
-/** @brief Recompute randomized neighbor reachability using the current advertised base time. */
-static void ipv6_refresh_reachable(void)
+/** @brief Choose a bounded, uniformly scaled discovery delay on one link. */
+static uint32_t ipv6_jitter(struct ipv6_link *link,uint32_t maximum)
+{ return (uint32_t)(((uint64_t)ipv6_jitter_word(link)*((uint64_t)maximum+1u))>>32); }
+/** @brief Recompute one link's randomized neighbor reachability time. */
+static void ipv6_refresh_reachable(struct ipv6_link *link)
 {
-    ipv6_reachable_ms=(uint64_t)ipv6_base_reachable_ms/2u+ipv6_jitter(ipv6_base_reachable_ms);
-    ipv6_reachable_refresh=time_uptime_ms()+7200000u;
+    link->reachable_ms=(uint64_t)link->base_reachable_ms/2u+ipv6_jitter(link,link->base_reachable_ms);
+    link->reachable_refresh=time_uptime_ms()+7200000u;
 }
-/** @brief Restore interface discovery timing defaults and choose a fresh reachable interval. */
-static void ipv6_reset_timing(void)
-{ ipv6_base_reachable_ms=30000;ipv6_retrans_ms=1000;ipv6_refresh_reachable(); }
+/** @brief Restore one interface's discovery timing defaults. */
+static void ipv6_reset_timing(struct ipv6_link *link)
+{ link->base_reachable_ms=30000;link->retrans_ms=1000;ipv6_refresh_reachable(link); }
 /** @brief Compare IPv6 addresses. @param a First. @param b Second. @return True if identical. */
 static bool ipv6_equal(const struct in6_addr *a,const struct in6_addr *b)
 { return net_memeq(a->s6_addr,b->s6_addr,16)!=0; }
@@ -244,7 +270,7 @@ uint32_t net_ipv6_neighbors(struct net_ipv6_neighbor *out,uint32_t capacity)
  * @param ifindex Interface. @param delta One to join or minus one to leave. @return Zero or errno. */
 int net_ipv6_multicast_change(const struct in6_addr *address,uint32_t ifindex,int delta)
 {
-    if(!address || !ipv6_multicast(address) || (ifindex!=1 && ifindex!=2) || (delta!=1 && delta!=-1))return -LINUX_EINVAL;
+    if(!address || !ipv6_multicast(address) || !net_interface_exists(ifindex) || (delta!=1 && delta!=-1))return -LINUX_EINVAL;
     struct ipv6_group_slot *g=ipv6_find_group(address,ifindex);
     if(delta<0){if(!g)return -LINUX_EADDRNOTAVAIL;if(--g->refs==0){
         /* Keep the group briefly to send an MLD state-change record. */
@@ -259,7 +285,7 @@ int net_ipv6_multicast_change(const struct in6_addr *address,uint32_t ifindex,in
  * @param remove Remove rather than add. @return Zero or negative errno. */
 int net_ipv6_route_update(const struct net_ipv6_route *route,bool remove)
 {
-    if(!route || route->prefix_length>128 || (route->ifindex!=1 && route->ifindex!=2) ||
+    if(!route || route->prefix_length>128 || !net_interface_exists(route->ifindex) ||
        ipv6_multicast(&route->gateway))return -LINUX_EINVAL;
     struct net_ipv6_route normalized=*route;ipv6_mask(&normalized.destination,normalized.prefix_length);
     struct ipv6_route_slot *free_slot=0;
@@ -277,12 +303,12 @@ int net_ipv6_route_update(const struct net_ipv6_route *route,bool remove)
 /** @brief Recompute an automatic connected route from manually assigned addresses.
  * @param address An address in the prefix. @param bits Prefix width.
  * @return Zero or negative capacity errno. */
-static int ipv6_connected_route(const struct in6_addr *address,uint32_t bits)
+static int ipv6_connected_route(const struct in6_addr *address,uint32_t bits,uint32_t ifindex)
 {
     struct in6_addr prefix=*address;ipv6_mask(&prefix,bits);uint64_t deadline=0,now=time_uptime_ms();
     for(uint32_t i=0;i<IPV6_ADDR_MAX;i++){
         struct ipv6_address_slot *a=&ipv6_addrs[i];
-        if(a->used && !a->autonomous && a->value.ifindex==2 && a->value.prefix_length==bits &&
+        if(a->used && !a->autonomous && a->value.ifindex==ifindex && a->value.prefix_length==bits &&
            ipv6_prefix_equal(&a->value.address,&prefix,bits) && !ipv6_expired(a->value.valid_until,now) &&
            a->value.valid_until>deadline)deadline=a->value.valid_until;
     }
@@ -290,12 +316,12 @@ static int ipv6_connected_route(const struct in6_addr *address,uint32_t bits)
     for(uint32_t i=0;i<IPV6_ROUTE_MAX;i++){
         struct ipv6_route_slot *r=&ipv6_routes[i];
         if(!r->used){if(!empty)empty=r;continue;}
-        if(r->value.ifindex==2 && r->value.prefix_length==bits && ipv6_unspecified(&r->value.gateway) &&
+        if(r->value.ifindex==ifindex && r->value.prefix_length==bits && ipv6_unspecified(&r->value.gateway) &&
            ipv6_equal(&r->value.destination,&prefix)){slot=r;break;}
     }
     if(slot && !slot->automatic)return 0;
     if(!slot){if(!deadline)return 0;if(!empty)return -LINUX_ENOBUFS;slot=empty;net_memzero(slot,sizeof(*slot));
-        slot->used=true;slot->automatic=true;slot->value.destination=prefix;slot->value.ifindex=2;
+        slot->used=true;slot->automatic=true;slot->value.destination=prefix;slot->value.ifindex=ifindex;
         slot->value.prefix_length=bits;slot->value.metric=256;
         slot->value.flags=RTF_UP | (bits==128?RTF_HOST:0);}
     slot->address_until=deadline;
@@ -309,40 +335,42 @@ static int ipv6_connected_route(const struct in6_addr *address,uint32_t bits)
  * @param autonomous True for router-derived addresses. @return Zero or negative errno. */
 static int ipv6_address_set(const struct net_ipv6_address *address,bool remove,bool autonomous)
 {
-    if(!address || address->prefix_length>128 || (address->ifindex!=1 && address->ifindex!=2) ||
+    if(!address || address->prefix_length>128 || !net_interface_exists(address->ifindex) ||
        ipv6_multicast(&address->address) || ipv6_unspecified(&address->address) ||
        address->preferred_until>address->valid_until)return -LINUX_EINVAL;
     struct ipv6_address_slot *slot=ipv6_find_address(&address->address,address->ifindex);
     if(remove){if(!slot)return -LINUX_EADDRNOTAVAIL;
         if(slot->value.ifindex==1 && ipv6_equal(&slot->value.address,&ipv6_loop))return -LINUX_EPERM;
         struct in6_addr group;ipv6_solicited(&group,&slot->value.address);
-        if(slot->value.ifindex==2)(void)net_ipv6_multicast_change(&group,slot->value.ifindex,-1);
-        bool connected=slot->value.ifindex==2 && !slot->autonomous;
+        if(slot->value.ifindex!=1)(void)net_ipv6_multicast_change(&group,slot->value.ifindex,-1);
+        bool connected=slot->value.ifindex!=1 && !slot->autonomous;
         struct net_ipv6_address old=slot->value;slot->used=false;
-        if(connected)(void)ipv6_connected_route(&old.address,old.prefix_length);
+        if(connected)(void)ipv6_connected_route(&old.address,old.prefix_length,old.ifindex);
         netlink_ipv6_changed();return 0;}
     if(slot){struct net_ipv6_address old=slot->value;bool old_auto=slot->autonomous;
         uint32_t state=slot->value.flags & (NET_IPV6_ADDR_TENTATIVE|NET_IPV6_ADDR_DADFAILED);
         slot->value=*address;slot->value.flags|=state;slot->value.scope=ipv6_scope(&address->address);
         slot->autonomous=autonomous;
-        if(old.ifindex==2 && !old_auto)(void)ipv6_connected_route(&old.address,old.prefix_length);
-        if(address->ifindex==2 && !autonomous){int rc=ipv6_connected_route(&address->address,address->prefix_length);
+        if(old.ifindex!=1 && !old_auto)(void)ipv6_connected_route(&old.address,old.prefix_length,old.ifindex);
+        if(address->ifindex!=1 && !autonomous){int rc=ipv6_connected_route(&address->address,address->prefix_length,address->ifindex);
             if(rc<0){slot->value=old;slot->autonomous=old_auto;
-                if(old.ifindex==2 && !old_auto)(void)ipv6_connected_route(&old.address,old.prefix_length);
+                if(old.ifindex!=1 && !old_auto)(void)ipv6_connected_route(&old.address,old.prefix_length,old.ifindex);
                 return rc;}}
         netlink_ipv6_changed();return 0;}
     for(uint32_t i=0;i<IPV6_ADDR_MAX;i++)if(!ipv6_addrs[i].used){slot=&ipv6_addrs[i];break;}
     if(!slot)return -LINUX_ENOBUFS;
     struct in6_addr group;ipv6_solicited(&group,&address->address);
-    if(address->ifindex==2){int ret=net_ipv6_multicast_change(&group,address->ifindex,1);if(ret<0)return ret;}
+    if(address->ifindex!=1){int ret=net_ipv6_multicast_change(&group,address->ifindex,1);if(ret<0)return ret;}
     slot->used=true;slot->value=*address;slot->value.scope=ipv6_scope(&address->address);
     slot->autonomous=autonomous;slot->dad_sent=false;slot->dad_wait_mld=false;slot->dad_at=time_uptime_ms();
-    if(address->ifindex==2 && !(address->flags&NET_IPV6_ADDR_NODAD)){
-        slot->value.flags|=NET_IPV6_ADDR_TENTATIVE;slot->dad_at+=ipv6_jitter(1000);
+    if(address->ifindex!=1 && !(address->flags&NET_IPV6_ADDR_NODAD)){
+        slot->value.flags|=NET_IPV6_ADDR_TENTATIVE;struct ipv6_link *link=ipv6_link(address->ifindex,true);
+        if(!link){slot->used=false;(void)net_ipv6_multicast_change(&group,address->ifindex,-1);return -LINUX_ENOMEM;}
+        slot->dad_at+=ipv6_jitter(link,1000);
         struct ipv6_group_slot *g=ipv6_find_group(&group,address->ifindex);
         if(g && g->refs==1 && g->reports==2){g->report_at=slot->dad_at;slot->dad_wait_mld=true;}
     }
-    if(address->ifindex==2 && !autonomous){int ret=ipv6_connected_route(&address->address,address->prefix_length);
+    if(address->ifindex!=1 && !autonomous){int ret=ipv6_connected_route(&address->address,address->prefix_length,address->ifindex);
         if(ret<0){slot->used=false;(void)net_ipv6_multicast_change(&group,address->ifindex,-1);return ret;}}
     netlink_ipv6_changed();return 0;
 }
@@ -358,34 +386,47 @@ int net_ipv6_address_update(const struct net_ipv6_address *address,bool remove)
 int net_ipv6_route(const struct in6_addr *destination,uint32_t scope,
                    const struct in6_addr *bound,struct net_ipv6_path *out_path)
 {
-    if(!destination || !out_path || ipv6_unspecified(destination) || (scope && scope!=1 && scope!=2))return -LINUX_EINVAL;
+    if(!destination || !out_path || ipv6_unspecified(destination) || (scope && !net_interface_exists(scope)))return -LINUX_EINVAL;
     uint64_t now=time_uptime_ms();uint32_t ifindex=0,mtu=IPV6_LINK_MTU;
     struct in6_addr next=*destination;
-    struct ipv6_address_slot *local=ipv6_find_address(destination,0);
+    struct ipv6_address_slot *local=ipv6_find_address(destination,scope);
     if(ipv6_equal(destination,&ipv6_loop)){ifindex=1;mtu=65575;}
     else if(local && !(local->value.flags&(NET_IPV6_ADDR_TENTATIVE|NET_IPV6_ADDR_DADFAILED))){
         ifindex=local->value.ifindex;mtu=65575;
     } else if(ipv6_multicast(destination)){
         uint8_t ms=destination->s6_addr[1]&15;
         if(ms==0)return -LINUX_EINVAL;
-        ifindex=scope?scope:(ms==1?1:2);mtu=ifindex==1?65575:ipv6_link_mtu;
-        if(ms==1 && ifindex!=1)return -LINUX_ENETUNREACH;
+        ifindex=scope?scope:(ms==1?1:ipv6_default_interface());
+        if(!scope && bound && !ipv6_unspecified(bound)){
+            struct ipv6_address_slot *binding=ipv6_find_address(bound,0);
+            if(binding)ifindex=binding->value.ifindex;
+        }
     } else {
-        struct ipv6_route_slot *best=0;
+        struct ipv6_route_slot *best=0;bool matched_route=false;
         for(uint32_t i=0;i<IPV6_ROUTE_MAX;i++){
             struct ipv6_route_slot *r=&ipv6_routes[i];
             if(!r->used || ipv6_expired(r->value.valid_until,now) ||
                (scope && r->value.ifindex!=scope) || !ipv6_prefix_equal(destination,&r->value.destination,r->value.prefix_length))continue;
+            matched_route=true;
+            if(bound && !ipv6_unspecified(bound)){
+                struct ipv6_address_slot *binding=ipv6_find_address(bound,r->value.ifindex);
+                if(!binding || binding->value.flags&(NET_IPV6_ADDR_TENTATIVE|NET_IPV6_ADDR_DADFAILED) ||
+                   ipv6_expired(binding->value.valid_until,now))continue;
+            }
             if(!best || r->value.prefix_length>best->value.prefix_length ||
                (r->value.prefix_length==best->value.prefix_length && r->value.metric<best->value.metric))best=r;
         }
-        if(!best)return -LINUX_ENETUNREACH;
-        ifindex=best->value.ifindex;mtu=ifindex==1?65575:ipv6_link_mtu;
+        if(!best)return matched_route?-LINUX_EADDRNOTAVAIL:-LINUX_ENETUNREACH;
+        ifindex=best->value.ifindex;
         if(!ipv6_unspecified(&best->value.gateway))next=best->value.gateway;
     }
     if(scope && scope!=ifindex)return -LINUX_ENETUNREACH;
-    if(ifindex==2 && (!ipv6_link_up || !e1000_is_ready()))return -LINUX_ENETDOWN;
-    if(ifindex==2 && ipv6_equal(destination,&ipv6_loop))return -LINUX_ENETUNREACH;
+    if(ifindex!=1){
+        struct ipv6_link *link=ipv6_link(ifindex,false);
+        if(!link || !link->up || !net_interface_is_ready(ifindex))return -LINUX_ENETDOWN;
+        if(mtu!=65575)mtu=link->mtu;
+        if(ipv6_equal(destination,&ipv6_loop))return -LINUX_ENETUNREACH;
+    }
     struct ipv6_address_slot *source=0;uint32_t best_score=0;
     for(uint32_t i=0;i<IPV6_ADDR_MAX;i++){
         struct ipv6_address_slot *a=&ipv6_addrs[i];
@@ -394,9 +435,9 @@ int net_ipv6_route(const struct in6_addr *destination,uint32_t scope,
         if(bound && !ipv6_unspecified(bound) && !ipv6_equal(bound,&a->value.address))continue;
         bool link_destination=ipv6_linklocal(destination) ||
             (ipv6_multicast(destination) && (destination->s6_addr[1]&15)<=2);
-        if(ifindex==2 && !link_destination && ipv6_linklocal(&a->value.address))continue;
+        if(ifindex!=1 && !link_destination && ipv6_linklocal(&a->value.address))continue;
         uint32_t score=ipv6_match_bits(destination,&a->value.address)+1;
-        if(ifindex==2 && link_destination && ipv6_linklocal(&a->value.address))score+=512;
+        if(ifindex!=1 && link_destination && ipv6_linklocal(&a->value.address))score+=512;
         if(!(a->value.flags&NET_IPV6_ADDR_DEPRECATED) && !ipv6_expired(a->value.preferred_until,now))score+=256;
         if(ipv6_equal(destination,&a->value.address))score+=512;
         if(!source || score>best_score){source=a;best_score=score;}
@@ -412,35 +453,36 @@ int net_ipv6_route(const struct in6_addr *destination,uint32_t scope,
  * @param source IPv6 source. @param destination IPv6 destination. @param next Next header.
  * @param hops Hop limit. @param flowinfo Network-order flow bits. @param payload Bytes.
  * @param length Payload length no greater than Ethernet MTU minus IPv6 header. @return Driver status. */
-static int ipv6_send_frame(const uint8_t mac[6],const struct in6_addr *source,
+static int ipv6_send_frame(uint32_t ifindex,const uint8_t mac[6],const struct in6_addr *source,
                            const struct in6_addr *destination,uint8_t next,uint8_t hops,
                            uint32_t flowinfo,const uint8_t *payload,uint32_t length)
 {
-    if(!ipv6_link_up || !e1000_is_ready())return -LINUX_ENETDOWN;
+    struct ipv6_link *link=ipv6_link(ifindex,false);
+    if(!link || !link->up || !net_interface_is_ready(ifindex))return -LINUX_ENETDOWN;
     if(length>IPV6_LINK_MTU-40)return -LINUX_EMSGSIZE;
     uint8_t frame[14+IPV6_LINK_MTU];uint8_t *ip=frame+14;const uint8_t *flow=(const uint8_t *)&flowinfo;
-    net_write_eth(frame,mac,IPV6_ETHERTYPE);ip[0]=(uint8_t)(0x60|(flow[0]&15));
+    net_memcpy(frame,mac,6);net_memcpy(frame+6,netdev_mac(ifindex),6);net_put_u16(frame+12,IPV6_ETHERTYPE);ip[0]=(uint8_t)(0x60|(flow[0]&15));
     ip[1]=flow[1];ip[2]=flow[2];ip[3]=flow[3];net_put_u16(ip+4,(uint16_t)length);
     ip[6]=next;ip[7]=hops;net_memcpy(ip+8,source->s6_addr,16);net_memcpy(ip+24,destination->s6_addr,16);
     if(length)net_memcpy(ip+40,payload,length);
-    return e1000_send(frame,14+40+length);
+    return netdev_send(ifindex,frame,14+40+length);
 }
 /** @brief Derive an Ethernet destination from an IPv6 multicast group. @param mac Six-byte output.
  * @param address Multicast destination. */
 static void ipv6_multicast_mac(uint8_t mac[6],const struct in6_addr *address)
 { mac[0]=0x33;mac[1]=0x33;net_memcpy(mac+2,address->s6_addr+12,4); }
 /** @brief Find one neighbor. @param address Neighbor address. @return Entry or NULL. */
-static struct ipv6_neighbor_slot *ipv6_find_neighbor(const struct in6_addr *address)
+static struct ipv6_neighbor_slot *ipv6_find_neighbor(uint32_t ifindex,const struct in6_addr *address)
 {
-    for(uint32_t i=0;i<IPV6_NEIGH_MAX;i++)if(ipv6_neighbors[i].used &&
+    for(uint32_t i=0;i<IPV6_NEIGH_MAX;i++)if(ipv6_neighbors[i].used && ipv6_neighbors[i].value.ifindex==ifindex &&
         ipv6_equal(&ipv6_neighbors[i].value.address,address))return &ipv6_neighbors[i];
     return 0;
 }
 /** @brief Create a bounded neighbor entry. @param address Neighbor address.
  * @return Entry or NULL when every slot is active. */
-static struct ipv6_neighbor_slot *ipv6_create_neighbor(const struct in6_addr *address)
+static struct ipv6_neighbor_slot *ipv6_create_neighbor(uint32_t ifindex,const struct in6_addr *address)
 {
-    struct ipv6_neighbor_slot *slot=ipv6_find_neighbor(address);
+    struct ipv6_neighbor_slot *slot=ipv6_find_neighbor(ifindex,address);
     if(slot && slot->value.state!=IPV6_NUD_FAILED)return slot;
     if(slot){net_memzero(slot->value.mac,6);slot->value.state=IPV6_NUD_INCOMPLETE;
         slot->deadline=time_uptime_ms();slot->probes=0;netlink_ipv6_changed();return slot;}
@@ -448,28 +490,28 @@ static struct ipv6_neighbor_slot *ipv6_create_neighbor(const struct in6_addr *ad
         ipv6_neighbors[i].value.state==IPV6_NUD_FAILED){slot=&ipv6_neighbors[i];break;}
     if(!slot)return 0;
     net_memzero(slot,sizeof(*slot));slot->used=true;slot->value.address=*address;
-    slot->value.ifindex=2;slot->value.state=IPV6_NUD_INCOMPLETE;slot->deadline=time_uptime_ms();
+    slot->value.ifindex=ifindex;slot->value.state=IPV6_NUD_INCOMPLETE;slot->deadline=time_uptime_ms();
     netlink_ipv6_changed();return slot;
 }
 /** @brief Send a Neighbor Solicitation for DAD or address resolution. @param target Target.
  * @param source Usable source or unspecified for DAD. @param unicast Optional neighbor MAC.
  * @return Driver status. */
-static int ipv6_send_ns(const struct in6_addr *target,const struct in6_addr *source,const uint8_t *unicast)
+static int ipv6_send_ns(uint32_t ifindex,const struct in6_addr *target,const struct in6_addr *source,const uint8_t *unicast)
 {
     struct in6_addr dest;uint8_t mac[6],ns[32]={0};uint32_t len=24;
     if(unicast){dest=*target;net_memcpy(mac,unicast,6);}else{ipv6_solicited(&dest,target);ipv6_multicast_mac(mac,&dest);}
     ns[0]=135;net_memcpy(ns+8,target->s6_addr,16);
-    if(!ipv6_unspecified(source)){ns[24]=1;ns[25]=1;net_memcpy(ns+26,e1000_mac(),6);len=32;}
+    if(!ipv6_unspecified(source)){ns[24]=1;ns[25]=1;net_memcpy(ns+26,netdev_mac(ifindex),6);len=32;}
     net_put_u16(ns+2,net_ipv6_checksum(source,&dest,58,ns,len));
-    return ipv6_send_frame(mac,source,&dest,58,255,0,ns,len);
+    return ipv6_send_frame(ifindex,mac,source,&dest,58,255,0,ns,len);
 }
 /** @brief Send a Router Solicitation after link-local DAD. @param source Link-local source.
  * @return Driver status. */
-static int ipv6_send_rs(const struct in6_addr *source)
+static int ipv6_send_rs(uint32_t ifindex,const struct in6_addr *source)
 {
     uint8_t mac[6],rs[16]={133,0,0,0,0,0,0,0,1,1};ipv6_multicast_mac(mac,&ipv6_all_routers);
-    net_memcpy(rs+10,e1000_mac(),6);net_put_u16(rs+2,net_ipv6_checksum(source,&ipv6_all_routers,58,rs,16));
-    return ipv6_send_frame(mac,source,&ipv6_all_routers,58,255,0,rs,16);
+    net_memcpy(rs+10,netdev_mac(ifindex),6);net_put_u16(rs+2,net_ipv6_checksum(source,&ipv6_all_routers,58,rs,16));
+    return ipv6_send_frame(ifindex,mac,source,&ipv6_all_routers,58,255,0,rs,16);
 }
 /** @brief Transmit one datagram, fragmenting at the source when necessary. @param path Route snapshot.
  * @param protocol Upper next-header. @param data Borrowed bytes. @param length Length.
@@ -478,17 +520,19 @@ static int ipv6_send_rs(const struct in6_addr *source)
 static int ipv6_transmit(const struct net_ipv6_path *path,uint8_t protocol,const uint8_t *data,
                          uint32_t length,int hops,uint32_t flowinfo,bool dont_fragment,const uint8_t mac[6])
 {
-    uint32_t mtu=path->mtu;if(mtu>ipv6_link_mtu)mtu=ipv6_link_mtu;
+    struct ipv6_link *link=ipv6_link(path->ifindex,false);
+    if(!link || !link->up)return -LINUX_ENETDOWN;
+    uint32_t mtu=path->mtu;if(mtu>link->mtu)mtu=link->mtu;
     if(mtu<IPV6_MIN_MTU)mtu=IPV6_MIN_MTU;
     uint8_t hop=(uint8_t)(hops<0?64:hops);
-    if(length+40<=mtu){int rc=ipv6_send_frame(mac,&path->source,&path->destination,protocol,hop,flowinfo,data,length);
+    if(length+40<=mtu){int rc=ipv6_send_frame(path->ifindex,mac,&path->source,&path->destination,protocol,hop,flowinfo,data,length);
         return rc<0?rc:(int)length;}
     if(dont_fragment)return -LINUX_EMSGSIZE;
     uint32_t chunk=(mtu-48)&~7u,ident=++ipv6_frag_id,offset=0;uint8_t fragment[IPV6_LINK_MTU-40];
     while(offset<length){uint32_t n=length-offset;if(n>chunk)n=chunk;
         fragment[0]=protocol;fragment[1]=0;net_put_u16(fragment+2,(uint16_t)(offset|(offset+n<length?1u:0u)));
         net_put_u32(fragment+4,ident);net_memcpy(fragment+8,data+offset,n);
-        int rc=ipv6_send_frame(mac,&path->source,&path->destination,44,hop,flowinfo,fragment,n+8);
+        int rc=ipv6_send_frame(path->ifindex,mac,&path->source,&path->destination,44,hop,flowinfo,fragment,n+8);
         if(rc<0)return rc;
         offset+=n;}
     return (int)length;
@@ -519,14 +563,21 @@ int net_ipv6_output(const struct net_ipv6_path *path,uint8_t protocol,const void
 {
     if(length>65535)return -LINUX_EMSGSIZE;
     if(!path || (!data && length) || hops < -1 || hops>255 ||
-       (path->ifindex!=1 && path->ifindex!=2))return -LINUX_EINVAL;
-    if(path->ifindex==2 && (!ipv6_link_up || !e1000_is_ready()))return -LINUX_ENETDOWN;
+       !net_interface_exists(path->ifindex))return -LINUX_EINVAL;
+    struct ipv6_link *link=path->ifindex==1?0:ipv6_link(path->ifindex,false);
+    if(path->ifindex!=1 && (!link || !link->up || !net_interface_is_ready(path->ifindex)))return -LINUX_ENETDOWN;
     if(dont_fragment && length+40>path->mtu)return -LINUX_EMSGSIZE;
     struct ipv6_address_slot *dst=ipv6_find_address(&path->destination,path->ifindex);
     if(path->ifindex==1 || (dst && !(dst->value.flags&(NET_IPV6_ADDR_TENTATIVE|NET_IPV6_ADDR_DADFAILED))))
         return ipv6_queue(path,protocol,data,length,hops,flowinfo,dont_fragment,true);
     if(ipv6_multicast(&path->destination)){
         struct ipv6_group_slot *group=ipv6_find_group(&path->destination,path->ifindex);
+        /* Interface-local multicast is delivered only inside this host. */
+        if((path->destination.s6_addr[1]&15)==1){
+            if(multicast_loop && group && group->refs)
+                return ipv6_queue(path,protocol,data,length,hops,flowinfo,dont_fragment,true);
+            return (int)length;
+        }
         struct ipv6_pending *queued=0;
         if(multicast_loop && (ipv6_equal(&path->destination,&ipv6_all_nodes) || (group && group->refs))){
             for(uint32_t i=0;i<IPV6_PENDING_MAX;i++)if(!ipv6_pending[i].used){queued=&ipv6_pending[i];break;}
@@ -538,15 +589,15 @@ int net_ipv6_output(const struct net_ipv6_path *path,uint8_t protocol,const void
         if(rc<0 && queued){kernel_free(queued->data);queued->used=false;}
         return rc;
     }
-    struct ipv6_neighbor_slot *neighbor=ipv6_create_neighbor(&path->next_hop);
+    struct ipv6_neighbor_slot *neighbor=ipv6_create_neighbor(path->ifindex,&path->next_hop);
     if(!neighbor)return -LINUX_ENOBUFS;
     if(neighbor->value.state!=IPV6_NUD_INCOMPLETE && neighbor->value.state!=IPV6_NUD_FAILED){
         if(neighbor->value.state==IPV6_NUD_STALE){neighbor->value.state=IPV6_NUD_DELAY;neighbor->deadline=time_uptime_ms()+5000;}
         return ipv6_transmit(path,protocol,data,length,hops,flowinfo,dont_fragment,neighbor->value.mac);
     }
     int rc=ipv6_queue(path,protocol,data,length,hops,flowinfo,dont_fragment,false);
-    if(rc>=0 && neighbor->probes==0){(void)ipv6_send_ns(&path->next_hop,&path->source,0);
-        neighbor->probes=1;neighbor->deadline=time_uptime_ms()+ipv6_retrans_ms;}
+    if(rc>=0 && neighbor->probes==0){(void)ipv6_send_ns(path->ifindex,&path->next_hop,&path->source,0);
+        neighbor->probes=1;neighbor->deadline=time_uptime_ms()+link->retrans_ms;}
     return rc;
 }
 
@@ -557,14 +608,14 @@ static void ipv6_pending_error(const struct ipv6_pending *pending,int error)
     uint8_t quote[128]={0};uint32_t n=pending->length;if(n>sizeof(quote)-40)n=sizeof(quote)-40;
     quote[0]=0x60;net_put_u16(quote+4,(uint16_t)pending->length);quote[6]=pending->protocol;
     net_memcpy(quote+8,pending->path.source.s6_addr,16);net_memcpy(quote+24,pending->path.destination.s6_addr,16);
-    net_memcpy(quote+40,pending->data,n);net_ipv6_socket_error(quote,n+40,error,0);
+    net_memcpy(quote+40,pending->data,n);net_ipv6_socket_error_on(pending->path.ifindex,quote,n+40,error,0);
 }
 /** @brief Release queued packets for a newly resolved neighbor. @param neighbor Resolved entry. */
 static void ipv6_flush_neighbor(struct ipv6_neighbor_slot *neighbor)
 {
     for(uint32_t i=0;i<IPV6_PENDING_MAX;i++){
         struct ipv6_pending *p=&ipv6_pending[i];if(!p->used || p->loopback ||
-            !ipv6_equal(&p->path.next_hop,&neighbor->value.address))continue;
+            p->path.ifindex!=neighbor->value.ifindex || !ipv6_equal(&p->path.next_hop,&neighbor->value.address))continue;
         int rc=ipv6_transmit(&p->path,p->protocol,p->data,p->length,p->hops,p->flowinfo,p->dont_fragment,neighbor->value.mac);
         if(rc<0)ipv6_pending_error(p,-rc);
         kernel_free(p->data);p->used=false;
@@ -572,14 +623,15 @@ static void ipv6_flush_neighbor(struct ipv6_neighbor_slot *neighbor)
 }
 /** @brief Update neighbor state from a validated link-layer option. @param address Neighbor address.
  * @param mac Link address. @param solicited Valid solicited advertisement. @param override Replace changed address. */
-static void ipv6_learn_neighbor(const struct in6_addr *address,const uint8_t mac[6],bool solicited,bool override)
+static void ipv6_learn_neighbor(uint32_t ifindex,const struct in6_addr *address,const uint8_t mac[6],bool solicited,bool override)
 {
     if(ipv6_unspecified(address) || ipv6_multicast(address) || (mac[0]&1))return;
-    struct ipv6_neighbor_slot *n=ipv6_create_neighbor(address);if(!n)return;
+    struct ipv6_neighbor_slot *n=ipv6_create_neighbor(ifindex,address);if(!n)return;
     bool changed=n->value.state!=IPV6_NUD_INCOMPLETE && !net_memeq(n->value.mac,mac,6);
     if(changed && !override){if(n->value.state==IPV6_NUD_REACHABLE)n->value.state=IPV6_NUD_STALE;return;}
     net_memcpy(n->value.mac,mac,6);n->value.state=solicited?IPV6_NUD_REACHABLE:IPV6_NUD_STALE;
-    n->deadline=time_uptime_ms()+ipv6_reachable_ms;n->probes=0;netlink_ipv6_changed();ipv6_flush_neighbor(n);
+    struct ipv6_link *link=ipv6_link(ifindex,false);if(!link)return;
+    n->deadline=time_uptime_ms()+link->reachable_ms;n->probes=0;netlink_ipv6_changed();ipv6_flush_neighbor(n);
 }
 /** @brief Find and validate an ND link-layer option. @param options Option bytes. @param length Byte length.
  * @param kind Wanted option type. @param mac Output pointer into input or NULL. @return False for malformed options. */
@@ -594,13 +646,13 @@ static bool ipv6_nd_options(const uint8_t *options,uint32_t length,uint8_t kind,
 }
 /** @brief Respond to a valid solicitation for one of our addresses. @param target Local address.
  * @param destination Recipient address. @param mac Ethernet recipient. @param solicited Solicited response. */
-static void ipv6_send_na(const struct in6_addr *target,const struct in6_addr *destination,
+static void ipv6_send_na(uint32_t ifindex,const struct in6_addr *target,const struct in6_addr *destination,
                          const uint8_t mac[6],bool solicited)
 {
     uint8_t na[32]={136,0,0,0,0,0,0,0};na[4]=(uint8_t)(0x20|(solicited?0x40:0));
-    net_memcpy(na+8,target->s6_addr,16);na[24]=2;na[25]=1;net_memcpy(na+26,e1000_mac(),6);
+    net_memcpy(na+8,target->s6_addr,16);na[24]=2;na[25]=1;net_memcpy(na+26,netdev_mac(ifindex),6);
     net_put_u16(na+2,net_ipv6_checksum(target,destination,58,na,32));
-    (void)ipv6_send_frame(mac,target,destination,58,255,0,na,32);
+    (void)ipv6_send_frame(ifindex,mac,target,destination,58,255,0,na,32);
 }
 /** @brief Mark an address as a failed duplicate. @param slot Tentative local address. */
 static void ipv6_dad_failed(struct ipv6_address_slot *slot)
@@ -611,20 +663,20 @@ static void ipv6_dad_failed(struct ipv6_address_slot *slot)
 /** @brief Install or refresh an automatically learned prefix route. @param prefix Prefix address.
  * @param bits Prefix width. @param gateway Gateway or unspecified. @param deadline Lifetime.
  * @param metric Selection metric. @param addrconf True for an RA-derived route. */
-static void ipv6_auto_route(const struct in6_addr *prefix,uint32_t bits,const struct in6_addr *gateway,
+static void ipv6_auto_route(uint32_t ifindex,const struct in6_addr *prefix,uint32_t bits,const struct in6_addr *gateway,
                             uint64_t deadline,uint32_t metric,bool addrconf)
 {
     struct in6_addr network=*prefix;ipv6_mask(&network,bits);uint64_t now=time_uptime_ms();
     struct ipv6_route_slot *slot=0,*empty=0;
     for(uint32_t i=0;i<IPV6_ROUTE_MAX;i++){
         struct ipv6_route_slot *r=&ipv6_routes[i];if(!r->used){if(!empty)empty=r;continue;}
-        if(r->value.ifindex==2 && r->value.prefix_length==bits && ipv6_equal(&r->value.destination,&network) &&
+        if(r->value.ifindex==ifindex && r->value.prefix_length==bits && ipv6_equal(&r->value.destination,&network) &&
            ipv6_equal(&r->value.gateway,gateway)){slot=r;break;}
     }
     if(slot && !slot->automatic)return;
     if(!slot){if(ipv6_expired(deadline,now) || !empty)return;slot=empty;net_memzero(slot,sizeof(*slot));
         slot->used=true;slot->automatic=true;slot->value.destination=network;slot->value.gateway=*gateway;
-        slot->value.prefix_length=bits;slot->value.ifindex=2;slot->value.metric=metric;
+        slot->value.prefix_length=bits;slot->value.ifindex=ifindex;slot->value.metric=metric;
         slot->value.flags=RTF_UP | (bits==128?RTF_HOST:0) | (!ipv6_unspecified(gateway)?RTF_GATEWAY:0);}
     if(addrconf)slot->value.flags|=RTF_ADDRCONF;
     slot->ra_until=ipv6_expired(deadline,now)?0:deadline;
@@ -636,12 +688,12 @@ static void ipv6_auto_route(const struct in6_addr *prefix,uint32_t bits,const st
 /** @brief Apply a validated autonomous /64 prefix with RFC 4862 lifetime protection.
  * @param prefix Prefix information option. @param valid Valid lifetime seconds.
  * @param preferred Preferred lifetime seconds. */
-static void ipv6_slaac(const uint8_t *prefix,uint32_t valid,uint32_t preferred)
+static void ipv6_slaac(uint32_t ifindex,const uint8_t *prefix,uint32_t valid,uint32_t preferred)
 {
     struct in6_addr address;net_memcpy(address.s6_addr,prefix,8);
-    const uint8_t *mac=e1000_mac();address.s6_addr[8]=mac[0]^2;address.s6_addr[9]=mac[1];address.s6_addr[10]=mac[2];
+    const uint8_t *mac=netdev_mac(ifindex);address.s6_addr[8]=mac[0]^2;address.s6_addr[9]=mac[1];address.s6_addr[10]=mac[2];
     address.s6_addr[11]=0xff;address.s6_addr[12]=0xfe;address.s6_addr[13]=mac[3];address.s6_addr[14]=mac[4];address.s6_addr[15]=mac[5];
-    struct ipv6_address_slot *slot=ipv6_find_address(&address,2);uint64_t now=time_uptime_ms();
+    struct ipv6_address_slot *slot=ipv6_find_address(&address,ifindex);uint64_t now=time_uptime_ms();
     uint64_t valid_until=ipv6_deadline(valid),preferred_until=ipv6_deadline(preferred);
     if(slot){if(!slot->autonomous)return;
         uint64_t remaining=slot->value.valid_until==IPV6_FOREVER?IPV6_FOREVER:
@@ -657,44 +709,45 @@ static void ipv6_slaac(const uint8_t *prefix,uint32_t valid,uint32_t preferred)
         netlink_ipv6_changed();return;
     }
     if(!valid)return;
-    struct net_ipv6_address entry={0};entry.address=address;entry.ifindex=2;entry.prefix_length=64;
+    struct net_ipv6_address entry={0};entry.address=address;entry.ifindex=ifindex;entry.prefix_length=64;
     entry.preferred_until=preferred_until;entry.valid_until=valid_until;
     if(preferred==0)entry.flags|=NET_IPV6_ADDR_DEPRECATED;
     (void)ipv6_address_set(&entry,false,true);
 }
 /** @brief Process a validated router advertisement and its bounded options.
  * @param source Link-local router. @param icmp Message. @param length Bytes. */
-static void ipv6_router_advertisement(const struct in6_addr *source,const uint8_t *icmp,uint32_t length)
+static void ipv6_router_advertisement(uint32_t ifindex,const struct in6_addr *source,const uint8_t *icmp,uint32_t length)
 {
-    if(!ipv6_linklocal(source) || length<16 || icmp[1])return;
+    struct ipv6_link *link=ipv6_link(ifindex,false);
+    if(!link || !ipv6_linklocal(source) || length<16 || icmp[1])return;
     /* Validate the entire option sequence before applying any changes. */
     for(uint32_t off=16;off<length;){if(length-off<2 || !icmp[off+1])return;
         uint32_t n=(uint32_t)icmp[off+1]*8u;if(n>length-off)return;off+=n;}
     uint32_t reachable=net_get_u32(icmp+8),retrans=net_get_u32(icmp+12);
-    if(reachable && reachable!=ipv6_base_reachable_ms){ipv6_base_reachable_ms=reachable;ipv6_refresh_reachable();}
-    if(retrans)ipv6_retrans_ms=retrans;
-    ipv6_rs_sent=3;
-    uint16_t life=net_get_u16(icmp+6);ipv6_auto_route(&ipv6_zero,0,source,ipv6_deadline(life),1024,true);
+    if(reachable && reachable!=link->base_reachable_ms){link->base_reachable_ms=reachable;ipv6_refresh_reachable(link);}
+    if(retrans)link->retrans_ms=retrans;
+    link->rs_sent=3;
+    uint16_t life=net_get_u16(icmp+6);ipv6_auto_route(ifindex,&ipv6_zero,0,source,ipv6_deadline(life),1024,true);
     for(uint32_t off=16;off<length;){uint8_t kind=icmp[off];uint32_t n=(uint32_t)icmp[off+1]*8u;
         const uint8_t *p=icmp+off;
-        if(kind==1 && n==8)ipv6_learn_neighbor(source,p+2,false,true);
-        else if(kind==5 && n==8){uint32_t mtu=net_get_u32(p+4);if(mtu>=IPV6_MIN_MTU && mtu<=IPV6_LINK_MTU)ipv6_link_mtu=mtu;}
+        if(kind==1 && n==8)ipv6_learn_neighbor(ifindex,source,p+2,false,true);
+        else if(kind==5 && n==8){uint32_t mtu=net_get_u32(p+4);if(mtu>=IPV6_MIN_MTU && mtu<=IPV6_LINK_MTU)link->mtu=mtu;}
         else if(kind==3 && n==32){uint8_t bits=p[2],flags=p[3];uint32_t valid=net_get_u32(p+4),preferred=net_get_u32(p+8);
             struct in6_addr prefix;net_memcpy(prefix.s6_addr,p+16,16);
             if(bits<=128 && !ipv6_linklocal(&prefix) && !ipv6_multicast(&prefix)){
-                if(flags&0x80)ipv6_auto_route(&prefix,bits,&ipv6_zero,ipv6_deadline(valid),256,true);
-                if((flags&0x40) && bits==64 && preferred<=valid)ipv6_slaac(prefix.s6_addr,valid,preferred);
+                if(flags&0x80)ipv6_auto_route(ifindex,&prefix,bits,&ipv6_zero,ipv6_deadline(valid),256,true);
+                if((flags&0x40) && bits==64 && preferred<=valid)ipv6_slaac(ifindex,prefix.s6_addr,valid,preferred);
             }}
         off+=n;
     }
 }
 /** @brief Remember a validated path MTU update from an ICMPv6 quote. @param quote IPv6 header.
  * @param length Quote length. @param mtu Reported MTU. */
-static void ipv6_update_pmtu(const uint8_t *quote,uint32_t length,uint32_t mtu)
+static void ipv6_update_pmtu(uint32_t ifindex,const uint8_t *quote,uint32_t length,uint32_t mtu)
 {
     if(length<40 || quote[0]>>4!=6)return;
     struct in6_addr src,dst;net_memcpy(src.s6_addr,quote+8,16);net_memcpy(dst.s6_addr,quote+24,16);
-    struct ipv6_address_slot *a=ipv6_find_address(&src,0);if(!a || ipv6_multicast(&dst))return;
+    struct ipv6_address_slot *a=ipv6_find_address(&src,ifindex);if(!a || ipv6_multicast(&dst))return;
     if(mtu<IPV6_MIN_MTU)mtu=IPV6_MIN_MTU;
     if(mtu>IPV6_LINK_MTU)return;
     struct ipv6_pmtu *slot=0;
@@ -722,7 +775,7 @@ static bool ipv6_error_suppressed(const uint8_t *ip,uint32_t length)
 /** @brief Generate a rate-limited ICMPv6 error for a locally received packet.
  * @param ip Original IPv6 packet. @param length Available bytes. @param type Error type.
  * @param code Error code. @param word Type-specific field. @param allow_multicast Permit RFC option exception. */
-static void ipv6_error(const uint8_t *ip,uint32_t length,uint8_t type,uint8_t code,uint32_t word,bool allow_multicast)
+static void ipv6_error(const uint8_t *ip,uint32_t length,uint8_t type,uint8_t code,uint32_t word,bool allow_multicast,uint32_t ifindex)
 {
     if(length<40)return;
     struct in6_addr src,dst;net_memcpy(src.s6_addr,ip+8,16);net_memcpy(dst.s6_addr,ip+24,16);
@@ -730,7 +783,7 @@ static void ipv6_error(const uint8_t *ip,uint32_t length,uint8_t type,uint8_t co
     if(ipv6_error_suppressed(ip,length))return;
     uint64_t now=time_uptime_ms();if(now-ipv6_error_at>=1000){ipv6_error_at=now;ipv6_error_count=0;}
     if(ipv6_error_count>=10)return;
-    struct net_ipv6_path path;if(net_ipv6_route(&src,ipv6_linklocal(&src)?2:0,
+    struct net_ipv6_path path;if(net_ipv6_route(&src,ipv6_linklocal(&src)?ifindex:0,
         ipv6_multicast(&dst)?0:&dst,&path)<0)return;
     uint8_t error[1240]={0};uint32_t n=length;if(n>1232)n=1232;
     error[0]=type;error[1]=code;net_put_u32(error+4,word);net_memcpy(error+8,ip,n);
@@ -757,29 +810,29 @@ static void ipv6_icmp(const uint8_t *ip,uint32_t ip_length,const uint8_t *icmp,u
         int error=icmp[0]==1?(icmp[1]==4?LINUX_ECONNREFUSED:LINUX_EHOSTUNREACH):
             (icmp[0]==2?LINUX_EMSGSIZE:(icmp[0]==3?LINUX_ETIMEDOUT:LINUX_EPROTO));
         uint32_t mtu=icmp[0]==2?net_get_u32(icmp+4):0;
-        if(icmp[0]==2)ipv6_update_pmtu(icmp+8,length-8,mtu);
-        net_ipv6_socket_error(icmp+8,length-8,error,mtu);return;
+        if(icmp[0]==2)ipv6_update_pmtu(ifindex,icmp+8,length-8,mtu);
+        net_ipv6_socket_error_on(ifindex,icmp+8,length-8,error,mtu);return;
     }
-    if(ifindex!=2 || fragmented || ip[7]!=255 || icmp[1]!=0 || !ethernet_mac)return;
-    if(icmp[0]==134){ipv6_router_advertisement(&src,icmp,length);return;}
+    if(ifindex==1 || fragmented || ip[7]!=255 || icmp[1]!=0 || !ethernet_mac)return;
+    if(icmp[0]==134){ipv6_router_advertisement(ifindex,&src,icmp,length);return;}
     if((icmp[0]==135 || icmp[0]==136) && length>=24){
         struct in6_addr target;net_memcpy(target.s6_addr,icmp+8,16);if(ipv6_multicast(&target))return;
         const uint8_t *mac=0;if(!ipv6_nd_options(icmp+24,length-24,icmp[0]==135?1:2,&mac))return;
         if(icmp[0]==135){
             if(ipv6_unspecified(&src)){struct in6_addr group;ipv6_solicited(&group,&target);
                 if(mac || !ipv6_equal(&dst,&group))return;}
-            else if(mac)ipv6_learn_neighbor(&src,mac,false,true);
+            else if(mac)ipv6_learn_neighbor(ifindex,&src,mac,false,true);
             struct ipv6_address_slot *slot=ipv6_find_address(&target,ifindex);if(!slot)return;
-            if(slot->value.flags&NET_IPV6_ADDR_TENTATIVE){if(!net_memeq(ethernet_mac,e1000_mac(),6))ipv6_dad_failed(slot);return;}
+            if(slot->value.flags&NET_IPV6_ADDR_TENTATIVE){if(!net_memeq(ethernet_mac,netdev_mac(ifindex),6))ipv6_dad_failed(slot);return;}
             if(slot->value.flags&NET_IPV6_ADDR_DADFAILED)return;
             if(ipv6_unspecified(&src)){uint8_t allmac[6];ipv6_multicast_mac(allmac,&ipv6_all_nodes);
-                ipv6_send_na(&target,&ipv6_all_nodes,allmac,false);}
-            else ipv6_send_na(&target,&src,ethernet_mac,true);
+                ipv6_send_na(ifindex,&target,&ipv6_all_nodes,allmac,false);}
+            else ipv6_send_na(ifindex,&target,&src,ethernet_mac,true);
         }else{
             if(ipv6_unspecified(&src) || (ipv6_multicast(&dst) && (icmp[4]&0x40)))return;
             struct ipv6_address_slot *slot=ipv6_find_address(&target,ifindex);
-            if(slot && slot->value.flags&NET_IPV6_ADDR_TENTATIVE){if(!net_memeq(ethernet_mac,e1000_mac(),6))ipv6_dad_failed(slot);return;}
-            if(mac && ipv6_find_neighbor(&target))ipv6_learn_neighbor(&target,mac,(icmp[4]&0x40)!=0,(icmp[4]&0x20)!=0);
+            if(slot && slot->value.flags&NET_IPV6_ADDR_TENTATIVE){if(!net_memeq(ethernet_mac,netdev_mac(ifindex),6))ipv6_dad_failed(slot);return;}
+            if(mac && ipv6_find_neighbor(ifindex,&target))ipv6_learn_neighbor(ifindex,&target,mac,(icmp[4]&0x40)!=0,(icmp[4]&0x20)!=0);
         }
     }
     (void)ip_length;
@@ -821,7 +874,7 @@ static void ipv6_reassembly_expire(struct ipv6_reassembly *r)
                 quote[n++]=r->data[i];
             }
         }
-        ipv6_error(quote,n,3,1,0,false);
+        ipv6_error(quote,n,3,1,0,false,r->ifindex);
     }
     ipv6_reassembly_clear(r);
 }
@@ -844,19 +897,19 @@ static void ipv6_fragment(const uint8_t *ip,uint32_t ip_length,uint32_t off,uint
     uint32_t offset=field&0xfff8u,n=ip_length-off-8u,ident=net_get_u32(fragment+4);
     bool more=(field&1)!=0;if((more && (!n || (n&7u))) || offset+n>65535u || off-40u+offset+n>65535u)return;
     if(offset==0 && !ipv6_first_complete(fragment[0],fragment+8,n)){
-        ipv6_error(ip,ip_length,4,3,0,false);return;}
+        ipv6_error(ip,ip_length,4,3,0,false,ifindex);return;}
     struct in6_addr src,dst;net_memcpy(src.s6_addr,ip+8,16);net_memcpy(dst.s6_addr,ip+24,16);
     struct ipv6_reassembly *r=0,*free_slot=0;
     for(uint32_t i=0;i<IPV6_REASM_MAX;i++){
         struct ipv6_reassembly *e=&ipv6_reassembly[i];
         if(e->used && ipv6_expired(e->deadline,time_uptime_ms()))ipv6_reassembly_expire(e);
-        if(e->used && e->identification==ident && ipv6_equal(&e->source,&src) && ipv6_equal(&e->destination,&dst)){
+        if(e->used && e->ifindex==ifindex && e->identification==ident && ipv6_equal(&e->source,&src) && ipv6_equal(&e->destination,&dst)){
             r=e;break;}if(!e->used && !free_slot)free_slot=e;
     }
     if(!r){if(!free_slot)return;r=free_slot;r->data=kernel_malloc(65535);r->bitmap=kernel_malloc(8192);
         if(!r->data || !r->bitmap){ipv6_reassembly_clear(r);return;}
         net_memzero(r->bitmap,8192);r->used=true;r->source=src;r->destination=dst;
-        r->identification=ident;r->next=fragment[0];r->deadline=time_uptime_ms()+IPV6_REASM_TIMEOUT;
+        r->ifindex=ifindex;r->identification=ident;r->next=fragment[0];r->deadline=time_uptime_ms()+IPV6_REASM_TIMEOUT;
     }
     if(r->poisoned)return;
     if(r->next!=fragment[0] || (r->have_last && offset+n>r->total) ||
@@ -881,15 +934,15 @@ static void ipv6_fragment(const uint8_t *ip,uint32_t ip_length,uint32_t off,uint
  * @param ip Packet. @param total Packet bytes. @param off Extension offset.
  * @param length Extension length. @param router_alert Set when the MLD router alert is present.
  * @return True when processing may continue. */
-static bool ipv6_options(const uint8_t *ip,uint32_t total,uint32_t off,uint32_t length,bool *router_alert)
+static bool ipv6_options(const uint8_t *ip,uint32_t total,uint32_t off,uint32_t length,bool *router_alert,uint32_t ifindex)
 {
     uint32_t pos=off+2,end=off+length;
     while(pos<end){uint8_t type=ip[pos];if(type==0){++pos;continue;}
-        if(end-pos<2 || (uint32_t)ip[pos+1]+2u>end-pos){ipv6_error(ip,total,4,0,pos,false);return false;}
+        if(end-pos<2 || (uint32_t)ip[pos+1]+2u>end-pos){ipv6_error(ip,total,4,0,pos,false,ifindex);return false;}
         uint32_t n=(uint32_t)ip[pos+1]+2u;
         if(type==5 && n==4 && ip[pos+2]==0 && ip[pos+3]==0)*router_alert=true;
         else if(type!=1){uint8_t action=type>>6;if(action){
-            if(action==2 || action==3){ipv6_error(ip,total,4,2,pos,action==2);}
+            if(action==2 || action==3){ipv6_error(ip,total,4,2,pos,action==2,ifindex);}
             return false;}}
         pos+=n;
     }
@@ -904,19 +957,20 @@ static uint32_t ipv6_mld_response_ms(uint16_t code,bool v2)
 }
 /** @brief Schedule listener reports in response to a valid MLD query. @param ip IPv6 packet.
  * @param icmp Query. @param length Bytes. @param router_alert Hop-by-hop router alert was present. */
-static void ipv6_mld_query(const uint8_t *ip,const uint8_t *icmp,uint32_t length,bool router_alert)
+static void ipv6_mld_query(uint32_t ifindex,const uint8_t *ip,const uint8_t *icmp,uint32_t length,bool router_alert)
 {
     if(ip[7]!=1 || !router_alert || length<24 || icmp[1])return;
     struct in6_addr source,group;net_memcpy(source.s6_addr,ip+8,16);net_memcpy(group.s6_addr,icmp+8,16);
     if(!ipv6_unspecified(&source) && !ipv6_linklocal(&source))return;
     if(!ipv6_unspecified(&group) && !ipv6_multicast(&group))return;
     bool v2=length!=24;
-    if(!v2)ipv6_mld_v1_until=time_uptime_ms()+260000;
+    struct ipv6_link *link=ipv6_link(ifindex,false);if(!link)return;
+    if(!v2)link->mld_v1_until=time_uptime_ms()+260000;
     else if(length<28 || (uint32_t)net_get_u16(icmp+26)*16u>length-28)return;
     uint32_t maximum=ipv6_mld_response_ms(net_get_u16(icmp+4),v2);
     for(uint32_t i=0;i<IPV6_GROUP_MAX;i++)if(ipv6_groups[i].used && ipv6_groups[i].refs &&
-        ipv6_groups[i].ifindex==2 && (ipv6_unspecified(&group) || ipv6_equal(&group,&ipv6_groups[i].address))){
-        uint64_t deadline=time_uptime_ms()+ipv6_jitter(maximum);
+        ipv6_groups[i].ifindex==ifindex && (ipv6_unspecified(&group) || ipv6_equal(&group,&ipv6_groups[i].address))){
+        uint64_t deadline=time_uptime_ms()+ipv6_jitter(link,maximum);
         if(!ipv6_groups[i].query_pending || deadline<ipv6_groups[i].query_at)ipv6_groups[i].query_at=deadline;
         ipv6_groups[i].query_pending=true;}
 }
@@ -928,8 +982,9 @@ static void ipv6_receive_ip(const uint8_t *ip,uint32_t length,uint32_t ifindex,c
     if(length<40 || ip[0]>>4!=6)return;
     uint32_t total=40u+net_get_u16(ip+4);if(total>length)return;
     struct in6_addr src,dst;net_memcpy(src.s6_addr,ip+8,16);net_memcpy(dst.s6_addr,ip+24,16);
-    if(ipv6_multicast(&src) || (ifindex==2 && (ipv6_equal(&src,&ipv6_loop) || ipv6_equal(&dst,&ipv6_loop))) ||
-       (ifindex==2 && ipv6_multicast(&dst) && (dst.s6_addr[1]&15)<2) || !ipv6_destination_local(&dst,ifindex))return;
+    if(ipv6_multicast(&src) || (ifindex!=1 && (ipv6_equal(&src,&ipv6_loop) || ipv6_equal(&dst,&ipv6_loop))) ||
+       (ifindex!=1 && mac && ipv6_multicast(&dst) && (dst.s6_addr[1]&15)<2) ||
+       !ipv6_destination_local(&dst,ifindex))return;
     uint32_t off=40,previous=6,count=0;uint8_t next=ip[6];bool fragmented=reassembled,router_alert=false;
     while(next==0 || next==43 || next==44 || next==60){
         if(++count>IPV6_HEADER_COUNT || off>IPV6_HEADER_LIMIT || total-off<8)return;
@@ -939,10 +994,10 @@ static void ipv6_receive_ip(const uint8_t *ip,uint32_t length,uint32_t ifindex,c
             if((field&0xfff9u)!=0){ipv6_fragment(ip,total,off,previous,ifindex);return;}
             next=ip[off];previous=off;off+=8;continue;
         }
-        if(next==0 && off!=40){ipv6_error(ip,total,4,1,previous,false);return;}
+        if(next==0 && off!=40){ipv6_error(ip,total,4,1,previous,false,ifindex);return;}
         uint32_t n=((uint32_t)ip[off+1]+1u)*8u;if(n>total-off || off+n>IPV6_HEADER_LIMIT)return;
-        if(next==43 && ip[off+3]){ipv6_error(ip,total,4,0,off+2,false);return;}
-        if((next==0 || next==60) && !ipv6_options(ip,total,off,n,&router_alert))return;
+        if(next==43 && ip[off+3]){ipv6_error(ip,total,4,0,off+2,false,ifindex);return;}
+        if((next==0 || next==60) && !ipv6_options(ip,total,off,n,&router_alert,ifindex))return;
         next=ip[off];previous=off;off+=n;
     }
     uint32_t payload=total-off;const uint8_t *data=ip+off;
@@ -953,7 +1008,7 @@ static void ipv6_receive_ip(const uint8_t *ip,uint32_t length,uint32_t ifindex,c
            net_ipv6_checksum(&src,&dst,17,data,payload))return;
         net_raw6_input(&src,&dst,next,data,payload,ifindex,ip[7]);
         if(!net_udp6_input(&src,&dst,net_get_u16(data),net_get_u16(data+2),data+8,payload-8,ifindex,ip[7]))
-            ipv6_error(ip,total,1,4,0,false);
+            ipv6_error(ip,total,1,4,0,false,ifindex);
     }else if(next==6){
         if(payload<20 || (data[12]>>4)<5 || (uint32_t)(data[12]>>4)*4u>payload ||
            net_ipv6_checksum(&src,&dst,6,data,payload))return;
@@ -963,104 +1018,124 @@ static void ipv6_receive_ip(const uint8_t *ip,uint32_t length,uint32_t ifindex,c
         /* RFC 6980: fragmented Neighbor Discovery must not reach raw consumers either. */
         if(fragmented && data[0]>=133 && data[0]<=137)return;
         net_raw6_input(&src,&dst,next,data,payload,ifindex,ip[7]);
-        if(data[0]==130 && ifindex==2 && !fragmented)ipv6_mld_query(ip,data,payload,router_alert);
+        if(data[0]==130 && ifindex!=1 && !fragmented)ipv6_mld_query(ifindex,ip,data,payload,router_alert);
         ipv6_icmp(ip,total,data,payload,ifindex,mac,fragmented);
     }else{
-        net_raw6_input(&src,&dst,next,data,payload,ifindex,ip[7]);ipv6_error(ip,total,4,1,previous,false);
+        net_raw6_input(&src,&dst,next,data,payload,ifindex,ip[7]);ipv6_error(ip,total,4,1,previous,false,ifindex);
     }
 }
-/** @brief Process one complete IPv6 Ethernet frame. @param frame Borrowed frame.
- * @param length Ethernet bytes including header. */
-void net_ipv6_input(const uint8_t *frame,uint32_t length)
+/** @brief Process one complete IPv6 Ethernet frame on its receiving interface. */
+void net_ipv6_input_on(uint32_t ifindex,const uint8_t *frame,uint32_t length)
 {
-    if(!frame || length<54 || net_get_u16(frame+12)!=IPV6_ETHERTYPE || !ipv6_link_up)return;
-    ipv6_receive_ip(frame+14,length-14,2,frame+6,false);
+    struct ipv6_link *link=ipv6_link(ifindex,false);
+    if(!frame || length<54 || net_get_u16(frame+12)!=IPV6_ETHERTYPE ||
+       !link || !link->up || !net_interface_is_ready(ifindex))return;
+    ipv6_receive_ip(frame+14,length-14,ifindex,frame+6,false);
 }
+void net_ipv6_input(const uint8_t *frame,uint32_t length)
+{ net_ipv6_input_on(ipv6_default_interface(),frame,length); }
 
-/** @brief Return a usable Ethernet link-local source. @return Borrowed address or NULL. */
-static const struct in6_addr *ipv6_link_source(void)
+/** @brief Return a usable link-local source on one Ethernet interface. */
+static const struct in6_addr *ipv6_link_source(uint32_t ifindex)
 {
-    for(uint32_t i=0;i<IPV6_ADDR_MAX;i++)if(ipv6_addrs[i].used && ipv6_addrs[i].value.ifindex==2 &&
+    for(uint32_t i=0;i<IPV6_ADDR_MAX;i++)if(ipv6_addrs[i].used && ipv6_addrs[i].value.ifindex==ifindex &&
        ipv6_linklocal(&ipv6_addrs[i].value.address) &&
        !(ipv6_addrs[i].value.flags&(NET_IPV6_ADDR_TENTATIVE|NET_IPV6_ADDR_DADFAILED)))return &ipv6_addrs[i].value.address;
     return 0;
 }
-/** @brief Send one MLDv1/v2 group-state report with the mandatory Router Alert.
- * @param group Membership entry. @param query True for a query response. @return True when sent or unnecessary. */
+/** @brief Send one MLDv1/v2 group-state report with the mandatory Router Alert. */
 static bool ipv6_send_mld(struct ipv6_group_slot *group,bool query)
 {
-    if(group->ifindex!=2 || ipv6_equal(&group->address,&ipv6_all_nodes))return true;
-    const struct in6_addr *source=ipv6_link_source();if(!source)source=&ipv6_zero;
-    bool v1=time_uptime_ms()<ipv6_mld_v1_until;
+    if(group->ifindex==1 || (group->address.s6_addr[1]&15)<=1 ||
+       ipv6_equal(&group->address,&ipv6_all_nodes))return true;
+    struct ipv6_link *link=ipv6_link(group->ifindex,false);
+    if(!link || !link->up)return false;
+    const struct in6_addr *source=ipv6_link_source(group->ifindex);if(!source)source=&ipv6_zero;
+    bool v1=time_uptime_ms()<link->mld_v1_until;
     struct in6_addr dest=v1?(group->refs?group->address:ipv6_all_routers):ipv6_mld_routers;
     uint8_t payload[36]={58,0,5,2,0,0,1,0};uint8_t *icmp=payload+8;uint32_t n;
     if(v1){n=24;icmp[0]=(uint8_t)(group->refs?131:132);net_memcpy(icmp+8,group->address.s6_addr,16);}
     else{n=28;icmp[0]=143;net_put_u16(icmp+6,1);icmp[8]=(uint8_t)(group->refs?(query?2:4):3);
         net_memcpy(icmp+12,group->address.s6_addr,16);}
     net_put_u16(icmp+2,net_ipv6_checksum(source,&dest,58,icmp,n));uint8_t mac[6];ipv6_multicast_mac(mac,&dest);
-    return ipv6_send_frame(mac,source,&dest,0,1,0,payload,n+8)>=0;
+    return ipv6_send_frame(group->ifindex,mac,source,&dest,0,1,0,payload,n+8)>=0;
 }
-/** @brief Tear down owned reassembly and queued payload state for one link. */
-static void ipv6_clear_link_state(void)
+/** @brief Tear down only the state owned by one link. */
+static void ipv6_clear_link_state(uint32_t ifindex)
 {
-    for(uint32_t i=0;i<IPV6_PENDING_MAX;i++)if(ipv6_pending[i].used && ipv6_pending[i].path.ifindex==2){
+    for(uint32_t i=0;i<IPV6_PENDING_MAX;i++)if(ipv6_pending[i].used && ipv6_pending[i].path.ifindex==ifindex){
         ipv6_pending_error(&ipv6_pending[i],LINUX_ENETDOWN);kernel_free(ipv6_pending[i].data);ipv6_pending[i].used=false;}
-    for(uint32_t i=0;i<IPV6_REASM_MAX;i++)if(ipv6_reassembly[i].used)ipv6_reassembly_clear(&ipv6_reassembly[i]);
-    for(uint32_t i=0;i<IPV6_ADDR_MAX;i++)if(ipv6_addrs[i].used && ipv6_addrs[i].value.ifindex==2)ipv6_addrs[i].used=false;
-    for(uint32_t i=0;i<IPV6_ROUTE_MAX;i++)if(ipv6_routes[i].used && ipv6_routes[i].value.ifindex==2)ipv6_routes[i].used=false;
-    for(uint32_t i=0;i<IPV6_GROUP_MAX;i++)if(ipv6_groups[i].used && ipv6_groups[i].ifindex==2)ipv6_groups[i].used=false;
-    net_memzero(ipv6_neighbors,sizeof(ipv6_neighbors));net_memzero(ipv6_pmtu,sizeof(ipv6_pmtu));
-    ipv6_link_mtu=IPV6_LINK_MTU;ipv6_rs_sent=0;ipv6_mld_v1_until=0;
-    ipv6_base_reachable_ms=30000;ipv6_retrans_ms=1000;netlink_ipv6_changed();
+    for(uint32_t i=0;i<IPV6_REASM_MAX;i++)if(ipv6_reassembly[i].used && ipv6_reassembly[i].ifindex==ifindex)
+        ipv6_reassembly_clear(&ipv6_reassembly[i]);
+    for(uint32_t i=0;i<IPV6_ADDR_MAX;i++)if(ipv6_addrs[i].used && ipv6_addrs[i].value.ifindex==ifindex)ipv6_addrs[i].used=false;
+    for(uint32_t i=0;i<IPV6_ROUTE_MAX;i++)if(ipv6_routes[i].used && ipv6_routes[i].value.ifindex==ifindex)ipv6_routes[i].used=false;
+    for(uint32_t i=0;i<IPV6_GROUP_MAX;i++)if(ipv6_groups[i].used && ipv6_groups[i].ifindex==ifindex)ipv6_groups[i].used=false;
+    for(uint32_t i=0;i<IPV6_NEIGH_MAX;i++)if(ipv6_neighbors[i].used && ipv6_neighbors[i].value.ifindex==ifindex)ipv6_neighbors[i].used=false;
+    for(uint32_t i=0;i<IPV6_PMTU_MAX;i++)if(ipv6_pmtu[i].used && ipv6_pmtu[i].ifindex==ifindex)ipv6_pmtu[i].used=false;
+    netlink_ipv6_changed();
 }
-/** @brief Change administrative Ethernet state and rebuild link-local discovery when enabled.
- * @param up Administrative state; no NIC IRQ ownership is changed. */
-void net_ipv6_link_changed(bool up)
+/** @brief Apply administrative/carrier state and rebuild the link-local address. */
+int net_ipv6_link_changed_on(uint32_t ifindex,bool up)
 {
-    if(!ipv6_initialized)return;
-    bool enabled=up && e1000_is_ready();
-    if(enabled==ipv6_link_up)return;
-    ipv6_link_up=enabled;if(!enabled){ipv6_clear_link_state();return;}
-    ipv6_reset_timing();
-    const uint8_t *mac=e1000_mac();struct net_ipv6_address a={0};a.address.s6_addr[0]=0xfe;a.address.s6_addr[1]=0x80;
+    if(!ipv6_initialized)return 0;
+    if(ifindex==1 || !net_interface_exists(ifindex))return -LINUX_ENODEV;
+    bool enabled=up && netdev_is_ready(ifindex);
+    struct ipv6_link *link=ipv6_link(ifindex,enabled);
+    if(!link)return enabled?-LINUX_ENOMEM:0;
+    if(enabled==link->up)return 0;
+    link->up=enabled;
+    if(!enabled){ipv6_clear_link_state(ifindex);return 0;}
+    link->mtu=IPV6_LINK_MTU;link->rng_state=0;link->mld_v1_until=0;
+    ipv6_reset_timing(link);
+    const uint8_t *mac=netdev_mac(ifindex);struct net_ipv6_address a={0};a.address.s6_addr[0]=0xfe;a.address.s6_addr[1]=0x80;
     a.address.s6_addr[8]=mac[0]^2;a.address.s6_addr[9]=mac[1];a.address.s6_addr[10]=mac[2];
     a.address.s6_addr[11]=0xff;a.address.s6_addr[12]=0xfe;a.address.s6_addr[13]=mac[3];
-    a.address.s6_addr[14]=mac[4];a.address.s6_addr[15]=mac[5];a.ifindex=2;a.prefix_length=64;
+    a.address.s6_addr[14]=mac[4];a.address.s6_addr[15]=mac[5];a.ifindex=ifindex;a.prefix_length=64;
     a.flags=NET_IPV6_ADDR_PERMANENT;a.preferred_until=a.valid_until=IPV6_FOREVER;
     (void)net_ipv6_address_update(&a,false);
-    struct in6_addr prefix={.s6_addr={0xfe,0x80}};ipv6_auto_route(&prefix,64,&ipv6_zero,IPV6_FOREVER,256,false);
-    ipv6_rs_at=IPV6_FOREVER;ipv6_rs_sent=0;
+    struct in6_addr prefix={.s6_addr={0xfe,0x80}};
+    ipv6_auto_route(ifindex,&prefix,64,&ipv6_zero,IPV6_FOREVER,256,false);
+    link->rs_at=IPV6_FOREVER;link->rs_sent=0;
+    return 0;
 }
-/** @brief Retire NIC-specific addresses, routes, neighbors, fragments and queued packets. */
-void net_ipv6_detached(void)
+void net_ipv6_link_changed(bool up)
+{ (void)net_ipv6_link_changed_on(ipv6_default_interface(),up); }
+/** @brief Retire all state for the detached interface, even after registry removal. */
+void net_ipv6_detached_on(uint32_t ifindex)
 {
-    if(ipv6_link_up){ipv6_link_up=false;ipv6_clear_link_state();}
+    if(!ipv6_initialized || ifindex==1)return;
+    ipv6_clear_link_state(ifindex);
+    struct ipv6_link **link=&ipv6_links;
+    while(*link && (*link)->ifindex!=ifindex)link=&(*link)->next;
+    if(*link){struct ipv6_link *removed=*link;*link=removed->next;kernel_free(removed);}
 }
-/** @brief Initialize loopback and Ethernet host state without waiting for discovery. */
+void net_ipv6_detached(void)
+{ net_ipv6_detached_on(ipv6_default_interface()); }
+/** @brief Initialize loopback and every currently published Ethernet interface. */
 void net_ipv6_init(void)
 {
     if(ipv6_initialized){
         for(uint32_t i=0;i<IPV6_PENDING_MAX;i++)if(ipv6_pending[i].used)kernel_free(ipv6_pending[i].data);
         for(uint32_t i=0;i<IPV6_REASM_MAX;i++)if(ipv6_reassembly[i].used)ipv6_reassembly_clear(&ipv6_reassembly[i]);
     }
+    while(ipv6_links){struct ipv6_link *old=ipv6_links;ipv6_links=old->next;kernel_free(old);}
     net_memzero(ipv6_addrs,sizeof(ipv6_addrs));net_memzero(ipv6_routes,sizeof(ipv6_routes));
     net_memzero(ipv6_neighbors,sizeof(ipv6_neighbors));net_memzero(ipv6_groups,sizeof(ipv6_groups));
     net_memzero(ipv6_pending,sizeof(ipv6_pending));net_memzero(ipv6_reassembly,sizeof(ipv6_reassembly));
-    net_memzero(ipv6_pmtu,sizeof(ipv6_pmtu));ipv6_link_up=false;ipv6_initialized=true;
-    ipv6_link_mtu=IPV6_LINK_MTU;ipv6_frag_id=0;ipv6_rng_state=0;ipv6_error_at=0;ipv6_error_count=0;
-    ipv6_mld_v1_until=0;ipv6_base_reachable_ms=30000;ipv6_retrans_ms=1000;
+    net_memzero(ipv6_pmtu,sizeof(ipv6_pmtu));
+    ipv6_initialized=true;ipv6_frag_id=0;ipv6_error_at=0;ipv6_error_count=0;
     struct net_ipv6_address loop={0};loop.address=ipv6_loop;loop.ifindex=1;loop.prefix_length=128;
     loop.flags=NET_IPV6_ADDR_PERMANENT|NET_IPV6_ADDR_NODAD;loop.preferred_until=loop.valid_until=IPV6_FOREVER;
     (void)net_ipv6_address_update(&loop,false);
     struct net_ipv6_route route={0};route.destination=ipv6_loop;route.ifindex=1;route.prefix_length=128;
     route.valid_until=IPV6_FOREVER;route.flags=RTF_UP|RTF_HOST;(void)net_ipv6_route_update(&route,false);
-    net_ipv6_link_changed(net_interface_up);
+    for(uint32_t i=netdev_next(0);i;i=netdev_next(i))(void)net_ipv6_link_changed_on(i,net_interface_is_up(i));
 }
-/** @brief Check if task-context receive or timer service should continue.
- * @return True while an Ethernet interface or deferred loopback packet is active. */
+/** @brief Check if task-context receive or timer service should continue. */
 bool net_ipv6_maintenance_pending(void)
 {
-    if(ipv6_initialized && net_interface_up && e1000_is_ready())return true;
+    if(ipv6_initialized)for(uint32_t i=netdev_next(0);i;i=netdev_next(i))
+        if(net_interface_is_ready(i))return true;
     for(uint32_t i=0;i<IPV6_PENDING_MAX;i++)if(ipv6_pending[i].used && ipv6_pending[i].loopback)return true;
     return false;
 }
@@ -1078,20 +1153,25 @@ static void ipv6_loop_deliver(struct ipv6_pending *p)
 void net_ipv6_poll(void)
 {
     if(!ipv6_initialized)return;
-    if(!ipv6_link_up && net_interface_up && e1000_is_ready())net_ipv6_link_changed(true);
+    for(uint32_t i=netdev_next(0);i;i=netdev_next(i)){
+        struct ipv6_link *link=ipv6_link(i,false);
+        bool up=net_interface_is_ready(i);
+        if((link && link->up)!=up)(void)net_ipv6_link_changed_on(i,up);
+    }
     uint64_t now=time_uptime_ms();
     for(uint32_t i=0;i<IPV6_PENDING_MAX;i++)if(ipv6_pending[i].used && ipv6_pending[i].loopback){
         struct ipv6_pending p=ipv6_pending[i];ipv6_pending[i].used=false;ipv6_loop_deliver(&p);kernel_free(p.data);}
-    if(ipv6_link_up){
-        if(now>=ipv6_reachable_refresh)ipv6_refresh_reachable();
-        /* Report a new solicited-node membership before sending its DAD probe. */
-        for(uint32_t i=0;i<IPV6_GROUP_MAX;i++){
-            struct ipv6_group_slot *g=&ipv6_groups[i];if(!g->used)continue;
-            if(g->query_pending && now>=g->query_at && ipv6_send_mld(g,true))g->query_pending=false;
-            if(g->reports && now>=g->report_at && ipv6_send_mld(g,false)){
-                --g->reports;g->report_at=now+ipv6_jitter(1000);
-                if(!g->reports && !g->refs)g->used=false;
-            }
+    for(struct ipv6_link *link=ipv6_links;link;link=link->next)
+        if(link->up && now>=link->reachable_refresh)ipv6_refresh_reachable(link);
+    /* Report a new solicited-node membership before sending its DAD probe. */
+    for(uint32_t i=0;i<IPV6_GROUP_MAX;i++){
+        struct ipv6_group_slot *g=&ipv6_groups[i];if(!g->used)continue;
+        struct ipv6_link *link=ipv6_link(g->ifindex,false);
+        if(g->ifindex!=1 && (!link || !link->up))continue;
+        if(g->query_pending && now>=g->query_at && ipv6_send_mld(g,true))g->query_pending=false;
+        if(g->reports && now>=g->report_at && ipv6_send_mld(g,false)){
+            --g->reports;g->report_at=now+(link?ipv6_jitter(link,1000):0);
+            if(!g->reports && !g->refs)g->used=false;
         }
     }
     for(uint32_t i=0;i<IPV6_ADDR_MAX;i++){
@@ -1100,12 +1180,14 @@ void net_ipv6_poll(void)
             (void)net_ipv6_address_update(&old,true);continue;}
         if(!(a->value.flags&NET_IPV6_ADDR_DEPRECATED) && ipv6_expired(a->value.preferred_until,now)){
             a->value.flags|=NET_IPV6_ADDR_DEPRECATED;netlink_ipv6_changed();}
-        if(ipv6_link_up && (a->value.flags&NET_IPV6_ADDR_TENTATIVE) && now>=a->dad_at){
+        struct ipv6_link *link=ipv6_link(a->value.ifindex,false);
+        if(link && link->up && (a->value.flags&NET_IPV6_ADDR_TENTATIVE) && now>=a->dad_at){
             if(!a->dad_sent && a->dad_wait_mld){struct in6_addr group;ipv6_solicited(&group,&a->value.address);
                 struct ipv6_group_slot *g=ipv6_find_group(&group,a->value.ifindex);
                 if(g && g->reports==2)continue;
                 a->dad_wait_mld=false;}
-            if(!a->dad_sent){if(ipv6_send_ns(&a->value.address,&ipv6_zero,0)>=0){a->dad_sent=true;a->dad_at=now+ipv6_retrans_ms;}}
+            if(!a->dad_sent){if(ipv6_send_ns(a->value.ifindex,&a->value.address,&ipv6_zero,0)>=0){
+                a->dad_sent=true;a->dad_at=now+link->retrans_ms;}}
             else{a->value.flags&=~NET_IPV6_ADDR_TENTATIVE;netlink_ipv6_changed();}
         }
     }
@@ -1113,22 +1195,27 @@ void net_ipv6_poll(void)
         ipv6_routes[i].used=false;netlink_ipv6_changed();}
     for(uint32_t i=0;i<IPV6_REASM_MAX;i++)if(ipv6_reassembly[i].used && ipv6_expired(ipv6_reassembly[i].deadline,now))
         ipv6_reassembly_expire(&ipv6_reassembly[i]);
-    if(!ipv6_link_up)return;
-    const struct in6_addr *link_source=ipv6_link_source();
-    if(link_source && !ipv6_rs_sent && ipv6_rs_at==IPV6_FOREVER)ipv6_rs_at=now+ipv6_jitter(1000);
-    if(link_source && ipv6_rs_sent<3 && now>=ipv6_rs_at){
-        if(ipv6_send_rs(link_source)>=0){++ipv6_rs_sent;ipv6_rs_at=now+4000;}}
+    for(struct ipv6_link *link=ipv6_links;link;link=link->next){
+        if(!link->up)continue;
+        const struct in6_addr *source=ipv6_link_source(link->ifindex);
+        if(source && !link->rs_sent && link->rs_at==IPV6_FOREVER)link->rs_at=now+ipv6_jitter(link,1000);
+        if(source && link->rs_sent<3 && now>=link->rs_at && ipv6_send_rs(link->ifindex,source)>=0){
+            ++link->rs_sent;link->rs_at=now+4000;}
+    }
     for(uint32_t i=0;i<IPV6_NEIGH_MAX;i++){
         struct ipv6_neighbor_slot *n=&ipv6_neighbors[i];if(!n->used || now<n->deadline)continue;
+        struct ipv6_link *link=ipv6_link(n->value.ifindex,false);if(!link || !link->up)continue;
+        const struct in6_addr *source=ipv6_link_source(n->value.ifindex);
         if(n->value.state==IPV6_NUD_REACHABLE){n->value.state=IPV6_NUD_STALE;netlink_ipv6_changed();}
         else if(n->value.state==IPV6_NUD_DELAY){n->value.state=IPV6_NUD_PROBE;n->probes=0;n->deadline=now;}
         if(n->value.state==IPV6_NUD_INCOMPLETE || n->value.state==IPV6_NUD_PROBE){
             if(n->probes>=3){n->value.state=IPV6_NUD_FAILED;netlink_ipv6_changed();
                 for(uint32_t j=0;j<IPV6_PENDING_MAX;j++)if(ipv6_pending[j].used && !ipv6_pending[j].loopback &&
+                    ipv6_pending[j].path.ifindex==n->value.ifindex &&
                     ipv6_equal(&ipv6_pending[j].path.next_hop,&n->value.address)){
                     ipv6_pending_error(&ipv6_pending[j],LINUX_EHOSTUNREACH);kernel_free(ipv6_pending[j].data);ipv6_pending[j].used=false;}
-            }else if(link_source){(void)ipv6_send_ns(&n->value.address,link_source,
-                n->value.state==IPV6_NUD_PROBE?n->value.mac:0);++n->probes;n->deadline=now+ipv6_retrans_ms;}
+            }else if(source){(void)ipv6_send_ns(n->value.ifindex,&n->value.address,source,
+                n->value.state==IPV6_NUD_PROBE?n->value.mac:0);++n->probes;n->deadline=now+link->retrans_ms;}
         }
     }
 }

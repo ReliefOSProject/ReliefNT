@@ -5,6 +5,9 @@
 #include <string.h>
 #if __has_include("../../net/socket/netlink.c")
 #include "../../net/socket/netlink.c"
+#include "../../net/interface/state.c"
+#include "../../net/interface/routes.c"
+#include "../../net/interface/ioctl.c"
 #include "../../net/interface/config.c"
 #include "../../net/proc.c"
 
@@ -14,8 +17,6 @@ static unsigned allocations, updates, link_changes;
 static bool additional_address;
 static bool nic_ready=true;
 static bool nic_present=true;
-struct reliefos_net_config net_config = {.local_ip=0x0a00020f,.subnet_mask=0xffffff00};
-bool net_interface_up=true;
 struct net_socket *net_sockets;
 struct task *sched_current_task(void) { return &current; }
 void *kernel_malloc(size_t bytes) { ++allocations; return calloc(1, bytes); }
@@ -39,12 +40,21 @@ struct task_file *task_file_for_fd(struct task *task, int fd)
 int e1000_is_ready(void) { return nic_ready; }
 const uint8_t *e1000_mac(void) { static const uint8_t mac[6] = {2,3,4,5,6,7}; return mac; }
 void e1000_get_info(struct e1000_info *info) { *info = (struct e1000_info){.present=nic_present,.active=nic_ready,.mac={2,3,4,5,6,7}}; }
+uint32_t netdev_next(uint32_t after) { return nic_present && after<2 ? 2 : 0; }
+int netdev_is_ready(uint32_t index) { return index==2 && nic_present && nic_ready; }
+const uint8_t *netdev_mac(uint32_t index) { (void)index; return e1000_mac(); }
+void netdev_get_info(uint32_t index,struct e1000_info *info)
+{ if (index==2) e1000_get_info(info); else memset(info,0,sizeof(*info)); }
+void netdev_counters(uint32_t index,struct net_proc_counters *out)
+{ (void)index; memset(out,0,sizeof(*out)); }
 void net_memcpy(void *dst,const void *src,uint32_t size) { memcpy(dst,src,size); }
 void net_memzero(void *dst,uint32_t size) { memset(dst,0,size); }
 uint32_t net_get_u32(const uint8_t *p) { return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]; }
 void net_put_u32(uint8_t *p,uint32_t value) { p[0]=value>>24;p[1]=value>>16;p[2]=value>>8;p[3]=value; }
 void net_arp_cache_clear(void) {}
+void net_arp_cache_clear_on(uint32_t index) { (void)index; }
 void net_ipv6_link_changed(bool up) { (void)up; ++link_changes; }
+int net_ipv6_link_changed_on(uint32_t index,bool up) { (void)index; (void)up; ++link_changes; return 0; }
 void net_device_counters(struct net_proc_counters *out) { memset(out,0,sizeof(*out)); }
 void net_loopback_proc_emit(struct text_stream *stream) { (void)stream; }
 void net_arp_proc_emit(struct text_stream *stream) { (void)stream; }
@@ -163,6 +173,8 @@ static void check_dump_boundaries(int fd)
 
 int main(void)
 {
+    assert(!net_interface_register(2));
+    net_config.local_ip=0x0a00020f; net_config.subnet_mask=0xffffff00;
     int fd = (int)call(__NR_socket,AF_NETLINK,SOCK_RAW|SOCK_NONBLOCK,NETLINK_ROUTE,0,0);
     assert(fd >= 0 && files[fd].socket_ino);
     check_route_completion(fd);
@@ -292,6 +304,7 @@ int main(void)
     memset(&ifr,0,sizeof(ifr)); ifr.data.value=1;
     assert(net_interface_ioctl(SIOCGIFNAME,(uintptr_t)&ifr)==0 && !strcmp(ifr.ifr_name,"lo"));
     nic_ready=nic_present=false;
+    net_interface_remove(2);
     strcpy(ifr.ifr_name,"lo");
     assert(net_interface_ioctl(SIOCGIFINDEX,(uintptr_t)&ifr)==0 && ifr.data.value==1);
     memset(&ifr,0,sizeof(ifr)); ifr.data.value=1;
@@ -299,6 +312,7 @@ int main(void)
     strcpy(ifr.ifr_name,"eth0");
     assert(net_interface_ioctl(SIOCGIFINDEX,(uintptr_t)&ifr)==-LINUX_ENODEV);
     nic_ready=nic_present=true;
+    assert(!net_interface_register(2));
     memset(&ifr,0,sizeof(ifr)); ifr.data.value=2;
     assert(net_interface_ioctl(SIOCGIFNAME,(uintptr_t)&ifr)==0 && !strcmp(ifr.ifr_name,"eth0"));
     strcpy(ifr.ifr_name,"eth0");
@@ -313,6 +327,7 @@ int main(void)
     memset(text,0,sizeof(text)); stream=(struct text_stream){.buffer=text,.capacity=sizeof(text)-1};
     assert(net_proc_emit(&stream,"tcp6")==0 && !strcmp(text,"tcp6\n"));
     task_netlink_release(&files[fd]);
+    net_interface_remove(2);
     assert(!allocations);
     puts("PASS route-netlink dumps/updates, musl requests, multicast/overflow, IPv6 ioctl and proc");
     return 0;

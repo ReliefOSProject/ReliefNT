@@ -21,6 +21,8 @@ __attribute__((noreturn)) void panic(const char *message) { fprintf(stderr,"pani
 int sound_service_unregister_owner(uint32_t owner,uint32_t force) { (void)owner;(void)force;return 0; }
 void driver_resources_release(uint32_t owner,bool irq_only) { (void)owner;(void)irq_only; }
 void net_driver_detached(void) { }
+void net_device_attached(uint32_t ifindex) { (void)ifindex; }
+void net_device_detached(uint32_t ifindex) { (void)ifindex; }
 static int ready(void) { return 1; }
 static int configure_audio(const struct reliefos_audio_format *format) { (void)format;return 0; }
 static long write_audio(const void *bytes,uint32_t length,uint32_t *status) { (void)bytes;*status=0;return length; }

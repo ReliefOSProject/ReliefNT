@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../../drivers/net/r8169/internal.h"
+#include <reliefnt/net_device.h>
 
 extern const struct reliefos_driver_module r8169_driver_module;
 
@@ -13,6 +14,10 @@ static uint8_t registers[0x10000];
 static uint16_t mac_ocp[32768], phy_ocp[32768], ephy[128], phy[32];
 static uint32_t csi[1024];
 static uint16_t device_id, pci_command, original_command;
+static int multi_mode;
+static const struct reliefnt_netdev_ops *networks[2];
+static void *contexts[2];
+static unsigned network_count;
 static uint16_t pmcsr;
 static bool power_capability;
 static unsigned live, maps, unmaps, allocation_attempts, allocation_failure;
@@ -20,7 +25,10 @@ static unsigned kicks, resets, mdio_accesses;
 static int reset_stuck, indirect_stuck, mapping_failure, registration_error, teardown_error;
 static uint64_t next_physical = 0x140000000ULL;
 static const uint64_t bar = 0xc000000000ULL;
-static const struct reliefos_driver_e1000_ops *network;
+static const struct reliefnt_netdev_ops *network;
+static void *network_context;
+void *kernel_malloc(size_t size) { return calloc(1, size); }
+void kernel_free(void *p) { free(p); }
 static struct allocation { uint64_t physical; unsigned pages; void *bytes; } memory[8];
 
 static uint32_t raw32(unsigned offset)
@@ -72,6 +80,8 @@ uint32_t rtl_read32(const struct rtl_device *d, unsigned offset)
 {
     assert((d->registers == registers || d->io_base == 0xe000) &&
            !(offset & 3) && offset + 4 <= d->mmio_bytes);
+    if (offset == 0x40 && multi_mode && d->pci.slot==4 && !d->chip_name)
+        return 0x54100800u; /* This second BDF has its own initial XID. */
     if (offset == 0x40)
         return raw32(offset) | 0x800; /* No outstanding TX DMA in the boundary model. */
     return raw32(offset);
@@ -225,9 +235,17 @@ static int find(uint16_t vendor, uint16_t id, struct reliefos_driver_pci_device 
     return 0;
 }
 
+static int enumerate(uint32_t index, struct reliefos_driver_pci_device *out)
+{
+    if (index > (unsigned)multi_mode) return -19;
+    int rc=find(0x10ec, device_id, out);
+    if (!rc) out->slot=(uint8_t)(3+index);
+    return rc;
+}
+
 static uint16_t pci_read16(uint8_t b, uint8_t s, uint8_t f, uint8_t offset)
 {
-    assert(b == 2 && s == 3 && f == 0);
+    assert(b == 2 && (s == 3 || (multi_mode && s == 4)) && f == 0);
     if (power_capability) {
         if (offset == 6)
             return 0x10;
@@ -241,7 +259,7 @@ static uint16_t pci_read16(uint8_t b, uint8_t s, uint8_t f, uint8_t offset)
 
 static void pci_write16(uint8_t b, uint8_t s, uint8_t f, uint8_t offset, uint16_t value)
 {
-    assert(b == 2 && s == 3 && f == 0);
+    assert(b == 2 && (s == 3 || (multi_mode && s == 4)) && f == 0);
     if (power_capability && offset == 0x44) {
         pmcsr = (value & ~0x8000u) | (pmcsr & ~value & 0x8000u);
         return;
@@ -252,7 +270,7 @@ static void pci_write16(uint8_t b, uint8_t s, uint8_t f, uint8_t offset, uint16_
 
 static uint32_t pci_read32(uint8_t b, uint8_t s, uint8_t f, uint8_t offset)
 {
-    assert(b == 2 && s == 3 && f == 0);
+    assert(b == 2 && (s == 3 || (multi_mode && s == 4)) && f == 0);
     if (power_capability && offset == 0x34)
         return 0x40;
     if (offset == 0x10)
@@ -276,7 +294,8 @@ static void *map(uint64_t physical, uint64_t bytes)
 static void unmap(void *pointer, uint64_t bytes)
 {
     assert(pointer == registers && bytes <= sizeof(registers));
-    assert(!(pci_command & 4) && !live && maps == unmaps + 1);
+    assert(!(pci_command & 4));
+    assert(multi_mode || (!live && maps == unmaps + 1));
     ++unmaps;
 }
 
@@ -309,12 +328,13 @@ static void io_outl(uint16_t port, uint32_t value)
     store32(port - 0xe000, value);
 }
 
-static int register_network(const struct reliefos_driver_e1000_ops *ops)
+int driver_register_netdev(const struct reliefnt_netdev_ops *ops, void *context, uint32_t *id)
 {
     if (registration_error)
         return registration_error;
-    assert(!network);
-    network = ops;
+    assert(multi_mode || !network);
+    network = ops; network_context = context; *id = 2;
+    if (multi_mode) { assert(network_count<2); networks[network_count]=ops; contexts[network_count++]=context; }
     return 0;
 }
 
@@ -334,16 +354,17 @@ static void failed_stop(int error)
 
 static const struct reliefos_driver_kernel_api api = {
     .abi_version = RELIEFOS_DRIVER_ABI_VERSION, .struct_size = sizeof(api),
-    .pci_find = find, .pci_read16 = pci_read16, .pci_write16 = pci_write16,
+    .pci_find = find, .pci_enumerate = enumerate, .pci_read16 = pci_read16, .pci_write16 = pci_write16,
     .pci_read32 = pci_read32, .map_mmio = map, .unmap_mmio = unmap,
     .alloc_dma = allocate, .free_dma = release, .phys_to_virt = alias,
     .sleep_ms = sleep_ms, .console_log = log_message,
-    .register_e1000 = register_network, .report_teardown_failure = failed_stop,
+    .report_teardown_failure = failed_stop,
 };
 
 static void fixture(uint16_t id, uint32_t xid)
 {
     assert(!live && maps == unmaps);
+    multi_mode=0; network_count=0;
     memset(registers, 0, sizeof(registers));
     memset(mac_ocp, 0, sizeof(mac_ocp));
     memset(phy_ocp, 0, sizeof(phy_ocp));
@@ -458,9 +479,9 @@ static void lifecycle(uint16_t id, uint32_t xid)
     if (rc)
         fprintf(stderr, "init id=%04x xid=%08x failed %d\n", id, xid, rc);
     assert(rc == 0 && network && live == 4 && mdio_accesses);
-    assert(network->is_ready());
-    struct reliefos_driver_e1000_info info;
-    network->get_info(&info);
+    assert(network->is_ready(network_context));
+    struct e1000_info info;
+    network->get_info(network_context, &info);
     assert(info.present && info.active && info.vendor_id == 0x10ec && info.device_id == id);
     assert(!memcmp(info.mac, "\x02\x11\x22\x33\x44\x55", 6));
     assert(raw32(0x20) && raw32(0x24) && raw32(0xe4) && raw32(0xe8));
@@ -472,9 +493,9 @@ static void lifecycle(uint16_t id, uint32_t xid)
         assert(phy_ocp[0xa408 / 2] == 0x0de1 && phy_ocp[0xa412 / 2] == 0x0300);
     }
     registers[0x6c] = 0;
-    assert(!network->is_ready());
+    assert(!network->is_ready(network_context));
     registers[0x6c] = 2;
-    assert(network->is_ready());
+    assert(network->is_ready(network_context));
     reset_stuck = 1;
     network = NULL;
     r8169_driver_module.fini();
@@ -540,6 +561,23 @@ int main(void)
     assert(r8169_driver_module.init(&port_api) == 0 && network && maps == unmaps && live == 4);
     assert((pci_command & 7) == 5);
     assert(pmcsr == 0x8000);
+    finish();
+    /* Same-ID PCI functions still dispatch through separate ring contexts. */
+    fixture(0x8168, 0x54100000); multi_mode=1;
+    int multi_rc=r8169_driver_module.init(&api);
+    if (multi_rc || network_count!=2 || live!=8)
+        fprintf(stderr,"multi init rc=%d registrations=%u live=%u xid=%08x\n",multi_rc,network_count,live,raw32(0x40));
+    assert(!multi_rc && network_count==2 && live==8);
+    struct rtl_device *first=contexts[0], *second=contexts[1];
+    assert(first!=second && first->pci.slot==3 && second->pci.slot==4);
+    assert(first->rx_physical!=second->rx_physical);
+    first->rx_data[0]=0xa1; first->rx[0].command=RTL_DESC_FIRST|RTL_DESC_LAST|64;
+    second->rx_data[0]=0xb2; second->rx[0].command=RTL_DESC_FIRST|RTL_DESC_LAST|64;
+    uint8_t multi_output[128]; uint32_t multi_length;
+    assert(networks[1]->poll(contexts[1],multi_output,sizeof(multi_output),&multi_length)==1 &&
+           multi_length==60 && multi_output[0]==0xb2);
+    assert(networks[0]->poll(contexts[0],multi_output,sizeof(multi_output),&multi_length)==1 &&
+           multi_length==60 && multi_output[0]==0xa1);
     finish();
     puts("r8169: DMA ring wrap, framing, high addresses, failure rollback and lifecycle passed");
     return 0;

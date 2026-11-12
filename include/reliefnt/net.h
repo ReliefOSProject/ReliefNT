@@ -280,7 +280,7 @@ int net_socket_address(int32_t handle, uint32_t owner_pid,
  */
 void net_close_owner_sockets(uint32_t owner_pid);
 /**
- * @brief Drop network state after the NIC driver is removed so callers stop using stale sockets.
+ * @brief Retire the primary compatibility interface's network state.
  */
 void net_driver_detached(void);
 /**
@@ -291,7 +291,7 @@ void net_device_info(uint32_t *flags, uint64_t *mac_value, uint32_t *local_ip);
 /** @brief Execute a native Linux interface/route ioctl with checked user memory. */
 int net_interface_ioctl(uint32_t request, uint64_t address);
 
-/** @brief Report whether eth0 is administratively up and ready. */
+/** @brief Report whether the primary compatibility NIC is administratively up and ready. */
 bool net_interface_ready(void);
 
 /** @brief Report a registered Ethernet device independently of carrier state.
@@ -301,8 +301,36 @@ bool net_interface_ready(void);
 bool net_interface_present(void);
 
 /** @brief Report the administrative IFF_UP setting independently of carrier.
- * @return Current eth0 administrative flag; caller owns network execution.
+ * @return Current primary-interface administrative flag; caller owns network execution.
  */
 bool net_interface_admin_up(void);
+
+/** @brief Transmit raw IPv4 with an optional bound output device.
+ * @param ifindex Bound device or zero for route selection. @param destination Peer IPv4.
+ * @param source Bound source or zero. @param protocol IP protocol.
+ * @param header_included Payload contains an IPv4 header. @param data Borrowed bytes.
+ * @param length Byte count. @return Bytes accepted or negative Linux errno. */
+int net_ipv4_send_raw_on(uint32_t ifindex, uint32_t destination, uint32_t source,
+                          uint8_t protocol, bool header_included, const void *data, uint32_t length);
+/** @brief Transmit a UDP message through the selected interface and route.
+ * @param ifindex Bound output device or zero. @param source Optional bound source.
+ * @param destination Peer IPv4. @param source_port Local port. @param destination_port Peer port.
+ * @param data Borrowed payload. @param length Byte count. @return Zero or negative errno. */
+int net_ipv4_send_udp_on(uint32_t ifindex, uint32_t source, uint32_t destination,
+                          uint16_t source_port, uint16_t destination_port, const void *data, uint32_t length);
+
+
+/** @brief Deliver a checked ICMPv6 error only to TCP state on the matching link.
+ * @param ifindex Link or zero. @param source Local. @param destination Peer.
+ * @param source_port Local port. @param destination_port Peer port.
+ * @param error Positive errno. @param mtu Reported MTU. */
+void net_tcp6_error_on(uint32_t ifindex, const struct in6_addr *source,
+                       const struct in6_addr *destination, uint16_t source_port,
+                       uint16_t destination_port, int error, uint32_t mtu);
+
+/** @brief Read or update a TCP socket's SO_BINDTODEVICE interface.
+ * @param handle Internal socket. @param set Update when true. @param index Input/output.
+ * @return Zero or negative errno; caller validates privileges and user memory. */
+int net_socket_bound_device(int32_t handle, bool set, uint32_t *index);
 
 #endif

@@ -215,3 +215,6 @@ vmwgfx_ppn_bo tools/test_vmwgfx_ppn_bo.py
 physical_metadata tools/test_physical_metadata.py
 heap_slab tools/test_heap_slab.py
 vfs_lookup_cache tools/test_vfs_lookup_cache.py
+net_device tools/test_net_device.py
+net_multi_interface tools/test_net_multi_interface.py
+net_multinic_data tools/test_net_multinic_data.py

@@ -42,7 +42,8 @@ static int driver_run_fini(struct driver_slot *slot,
                             const struct reliefos_driver_module *module);
 
 /**
- * @brief Detach any device ops owned by slot_id and reset their state (notifying net on e1000).
+ * @brief Detach callbacks and all network devices belonging to one driver slot.
+ * @param slot_id Closed and drained driver slot. Caller owns network execution.
  */
 static void driver_clear_services(uint32_t slot_id);
 
@@ -180,11 +181,11 @@ static int driver_run_fini(struct driver_slot *slot,
 }
 
 /**
- * @brief Detach any device ops owned by slot_id and reset their state (notifying net on e1000).
+ * @brief Detach callbacks and all network devices belonging to one driver slot.
+ * @param slot_id Closed and drained driver slot. Caller owns network execution.
  */
 static void driver_clear_services(uint32_t slot_id)
 {
-    bool detach_network = false;
     driver_manager_service_disable(slot_id);
     uint64_t flags;
     kernel_spin_lock_irqsave(&manager_service_lock, &flags);
@@ -198,7 +199,6 @@ static void driver_clear_services(uint32_t slot_id)
         serial_owner = 0;
     }
     if (e1000_ops && e1000_owner == slot_id) {
-        detach_network = true;
         e1000_ops = 0;
         e1000_owner = 0;
     }
@@ -207,7 +207,7 @@ static void driver_clear_services(uint32_t slot_id)
         audio_owner = 0;
     }
     kernel_spin_unlock_irqrestore(&manager_service_lock, flags);
-    if (detach_network) net_driver_detached();
+    driver_netdev_remove_owner(slot_id);
 }
 
 /**
@@ -307,6 +307,7 @@ static int driver_load_registered(struct driver_slot *slot,
     slot->info.state = RELIEFOS_DRIVER_STATE_LOADED;
     slot->info.error[0] = 0;
     driver_manager_service_enable(slot->info.id);
+    driver_netdev_publish_owner(slot->info.id);
     console_info("[driver] loaded %s abi=%u\n", module->name,
                    slot->info.abi_version);
     return 0;

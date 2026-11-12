@@ -3,7 +3,8 @@
 #include <reliefnt/netlink.h>
 #include <reliefnt/net_ipv6.h>
 #include <reliefnt/net.h>
-#include <reliefnt/e1000.h>
+#include <reliefnt/net_device.h>
+#include <reliefnt/net_interface.h>
 #include <reliefnt/futex.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/sched.h>
@@ -42,8 +43,15 @@ static uint64_t netlink_ino;
 static struct net_ipv6_address *nl_previous_addresses;
 static struct net_ipv6_route *nl_previous_routes;
 static uint32_t nl_previous_address_count, nl_previous_route_count;
-static struct e1000_info nl_previous_link;
-static bool nl_previous_link_up, nl_snapshot_ready;
+struct nl_link_state {
+    uint32_t index;
+    char name[NET_IF_NAME_LEN];
+    uint8_t mac[6];
+    bool up, active;
+};
+static struct nl_link_state *nl_previous_links;
+static uint32_t nl_previous_link_count;
+static bool nl_snapshot_ready;
 #define NL_SUPPORTED_GROUPS (RTMGRP_LINK|RTMGRP_IPV6_IFADDR|RTMGRP_IPV6_ROUTE)
 
 /** @brief Resolve the route socket attached to an open description.
@@ -177,27 +185,28 @@ static uint8_t nl_prefix4(uint32_t mask)
 
 /** @brief Emit one interface from a copied link state.
  * @param b Builder. @param seq Sequence. @param index Interface index.
- * @param multi Multipart flag. @param type Native event. @param info Ethernet snapshot.
- * @param up Administrative IFF_UP flag, independent of carrier. @return Zero or ENOBUFS. */
-static int nl_link_snapshot(struct nl_builder *b, uint32_t seq, int index, bool multi,
-                            uint16_t type, const struct e1000_info *info, bool up)
+ * @param multi Multipart flag. @param type Native event. @param link Copied link.
+ * @return Zero or ENOBUFS. */
+static int nl_link_snapshot(struct nl_builder *b, uint32_t seq, bool multi,
+                            uint16_t type, const struct nl_link_state *link)
 {
+    uint32_t index = link->index;
     uint32_t start = b->used;
     struct ifinfomsg *m = nl_begin(b, type, multi ? NLM_F_MULTI : 0, seq, sizeof(*m));
     if (!m) return -LINUX_ENOBUFS;
     m->ifi_index = index;
     m->ifi_type = index == 1 ? 772 : 1; /* ARPHRD_LOOPBACK / ARPHRD_ETHER */
     m->ifi_flags = index == 1 ? IFF_UP | IFF_LOOPBACK | IFF_RUNNING | 0x10000u :
-        IFF_BROADCAST | IFF_MULTICAST | (up ? IFF_UP : 0) |
-        (up && info->active ? IFF_RUNNING : 0) |
-        (info->active ? 0x10000u : 0);
+        IFF_BROADCAST | IFF_MULTICAST | (link->up ? IFF_UP : 0) |
+        (link->up && link->active ? IFF_RUNNING : 0) |
+        (link->active ? 0x10000u : 0);
+    if (index == NET_IF_LOOPBACK && !link->up) m->ifi_flags = IFF_LOOPBACK;
     m->ifi_change = UINT32_MAX;
     uint32_t mtu = index == 1 ? 65536 : 1500;
     uint8_t zero[6] = {0}, broadcast[6] = {255,255,255,255,255,255};
-    const char *name = index == 1 ? "lo" : "eth0";
-    if (nl_attr(b,start,IFLA_IFNAME,name,index == 1 ? 3 : 5) ||
+    if (nl_attr(b,start,IFLA_IFNAME,link->name,__builtin_strlen(link->name)+1) ||
         nl_attr(b,start,IFLA_MTU,&mtu,sizeof(mtu)) ||
-        nl_attr(b,start,IFLA_ADDRESS,index == 1 ? zero : info->mac,6) ||
+        nl_attr(b,start,IFLA_ADDRESS,index == 1 ? zero : link->mac,6) ||
         nl_attr(b,start,IFLA_BROADCAST,index == 1 ? zero : broadcast,6)) return -LINUX_ENOBUFS;
     return 0;
 }
@@ -207,9 +216,15 @@ static int nl_link_snapshot(struct nl_builder *b, uint32_t seq, int index, bool 
  * @param multi Multipart flag. @return Zero or errno. */
 static int nl_link(struct nl_builder *b, uint32_t seq, int index, bool multi)
 {
-    struct e1000_info info={0};
-    if (index==2) { e1000_get_info(&info); if (!info.present) return -LINUX_ENODEV; }
-    return nl_link_snapshot(b,seq,index,multi,RTM_NEWLINK,&info,net_interface_admin_up());
+    struct nl_link_state link = {.index=(uint32_t)index};
+    if (!net_interface_name(link.index,link.name)) return -LINUX_ENODEV;
+    link.up = net_interface_is_up(link.index);
+    if (link.index != NET_IF_LOOPBACK) {
+        struct e1000_info info = {0}; netdev_get_info(link.index,&info);
+        link.active = info.active != 0;
+        __builtin_memcpy(link.mac,info.mac,sizeof(link.mac));
+    }
+    return nl_link_snapshot(b,seq,multi,RTM_NEWLINK,&link);
 }
 
 /** @brief Emit one IPv4 address using its actual configured mask.
@@ -223,10 +238,11 @@ static int nl_address4(struct nl_builder *b, uint32_t seq, uint32_t index,
     if (!m) return -LINUX_ENOBUFS;
     *m = (struct ifaddrmsg){.ifa_family=AF_INET,.ifa_prefixlen=prefix,.ifa_flags=IFA_F_PERMANENT,
         .ifa_scope=index==1 ? RT_SCOPE_HOST : RT_SCOPE_UNIVERSE,.ifa_index=index};
-    const char *name = index == 1 ? "lo" : "eth0";
+    char name[NET_IF_NAME_LEN];
+    if (!net_interface_name(index,name)) return -LINUX_ENODEV;
     if (nl_attr(b,start,IFA_ADDRESS,&ip,4) || nl_attr(b,start,IFA_LOCAL,&ip,4) ||
-        nl_attr(b,start,IFA_LABEL,name,index==1 ? 3 : 5) ||
-        (index==2 && nl_attr(b,start,IFA_BROADCAST,&br,4))) return -LINUX_ENOBUFS;
+        nl_attr(b,start,IFA_LABEL,name,__builtin_strlen(name)+1) ||
+        (index!=NET_IF_LOOPBACK && nl_attr(b,start,IFA_BROADCAST,&br,4))) return -LINUX_ENOBUFS;
     return 0;
 }
 
@@ -275,7 +291,7 @@ static int nl_route6(struct nl_builder *b, uint32_t seq, const struct net_ipv6_r
  * @param prefix Prefix length. @param gateway Host-order gateway. @param index Interface.
  * @return Zero or ENOBUFS. */
 static int nl_route4(struct nl_builder *b, uint32_t seq, uint32_t destination,
-                     uint8_t prefix, uint32_t gateway, uint32_t index)
+                     uint8_t prefix, uint32_t gateway, uint32_t index, uint32_t metric)
 {
     uint32_t start=b->used, dst=__builtin_bswap32(destination), gw=__builtin_bswap32(gateway);
     struct rtmsg *m=nl_begin(b,RTM_NEWROUTE,NLM_F_MULTI,seq,sizeof(*m));
@@ -284,7 +300,8 @@ static int nl_route4(struct nl_builder *b, uint32_t seq, uint32_t destination,
         .rtm_protocol=RTPROT_KERNEL,.rtm_scope=gateway ? RT_SCOPE_UNIVERSE : RT_SCOPE_LINK,
         .rtm_type=RTN_UNICAST};
     if ((prefix && nl_attr(b,start,RTA_DST,&dst,4)) || nl_attr(b,start,RTA_OIF,&index,4) ||
-        (gateway && nl_attr(b,start,RTA_GATEWAY,&gw,4))) return -LINUX_ENOBUFS;
+        (gateway && nl_attr(b,start,RTA_GATEWAY,&gw,4)) ||
+        nl_attr(b,start,RTA_PRIORITY,&metric,4)) return -LINUX_ENOBUFS;
     return 0;
 }
 
@@ -316,12 +333,37 @@ static int nl_routes(struct net_ipv6_route **out, uint32_t *count)
     return 0;
 }
 
+/** @brief Copy every live link for dumps and subsequent change detection. */
+static int nl_links(struct nl_link_state **out, uint32_t *count)
+{
+    *out = NULL; *count = 0;
+    for (uint32_t index=net_interface_next(0);index;index=net_interface_next(index)) ++*count;
+    if (!*count) return 0;
+    if (*count > NL_MESSAGE_MAX / sizeof(**out)) return -LINUX_ENOBUFS;
+    struct nl_link_state *links=kernel_malloc((size_t)*count*sizeof(*links));
+    if (!links) return -LINUX_ENOMEM;
+    uint32_t used=0;
+    for (uint32_t index=net_interface_next(0);index;index=net_interface_next(index)) {
+        if (used==*count) { kernel_free(links); return -LINUX_EAGAIN; }
+        struct nl_link_state *link=&links[used++];
+        __builtin_memset(link,0,sizeof(*link)); link->index=index;
+        if (!net_interface_name(index,link->name)) { kernel_free(links); return -LINUX_EAGAIN; }
+        link->up=net_interface_is_up(index);
+        if (index!=NET_IF_LOOPBACK) {
+            struct e1000_info info={0}; netdev_get_info(index,&info);
+            link->active=info.active!=0; __builtin_memcpy(link->mac,info.mac,sizeof(link->mac));
+        }
+    }
+    *out=links; *count=used; return 0;
+}
+
 /** @brief Drop the owned change-detection baseline after the last subscriber leaves. */
 static void nl_forget_snapshot(void)
 {
-    kernel_free(nl_previous_addresses); kernel_free(nl_previous_routes);
+    kernel_free(nl_previous_addresses); kernel_free(nl_previous_routes); kernel_free(nl_previous_links);
     nl_previous_addresses=NULL; nl_previous_routes=NULL;
-    nl_previous_address_count=nl_previous_route_count=0; nl_snapshot_ready=false;
+    nl_previous_links=NULL;
+    nl_previous_address_count=nl_previous_route_count=nl_previous_link_count=0; nl_snapshot_ready=false;
 }
 
 /** @brief Capture a baseline before admitting the first subscription.
@@ -330,12 +372,14 @@ static int nl_initial_snapshot(void)
 {
     if (nl_snapshot_ready) return 0;
     struct net_ipv6_address *addresses; struct net_ipv6_route *routes;
-    uint32_t acount, rcount;
+    struct nl_link_state *links;
+    uint32_t acount, rcount, lcount;
     int rc=nl_addresses(&addresses,&acount); if (rc) return rc;
     rc=nl_routes(&routes,&rcount); if (rc) { kernel_free(addresses); return rc; }
+    rc=nl_links(&links,&lcount); if (rc) { kernel_free(addresses); kernel_free(routes); return rc; }
     nl_previous_addresses=addresses; nl_previous_address_count=acount;
     nl_previous_routes=routes; nl_previous_route_count=rcount;
-    e1000_get_info(&nl_previous_link); nl_previous_link_up=net_interface_admin_up();
+    nl_previous_links=links; nl_previous_link_count=lcount;
     nl_snapshot_ready=true; return 0;
 }
 
@@ -395,6 +439,7 @@ static bool nl_equal_route(const struct net_ipv6_route *a,const struct net_ipv6_
  * route or Ethernet snapshot according to group. @param up Link readiness for link events. */
 static void nl_publish(uint32_t group,uint16_t type,const void *value,bool up)
 {
+    (void)up;
     bool interested=false;
     for (struct netlink_socket *s=netlink_sockets;s;s=s->next) if (s->groups & group) { interested=true; break; }
     if (!interested) return;
@@ -403,7 +448,7 @@ static void nl_publish(uint32_t group,uint16_t type,const void *value,bool up)
     struct nl_builder b={.message=message};
     int rc=group==RTMGRP_IPV6_IFADDR ? nl_address6(&b,0,value,type,false) :
            group==RTMGRP_IPV6_ROUTE ? nl_route6(&b,0,value,type,false) :
-           nl_link_snapshot(&b,0,2,false,type,value,up);
+           nl_link_snapshot(&b,0,false,type,value);
     if (rc) { kernel_free(message); nl_overrun(group); return; }
     for (struct netlink_socket *s=netlink_sockets;s;s=s->next) {
         if (!(s->groups & group)) continue;
@@ -425,11 +470,14 @@ void netlink_ipv6_changed(void)
 {
     if (!nl_snapshot_ready) return;
     struct net_ipv6_address *addresses; struct net_ipv6_route *routes;
-    uint32_t acount, rcount;
+    struct nl_link_state *links;
+    uint32_t acount, rcount, lcount;
     int rc=nl_addresses(&addresses,&acount);
     if (rc) { nl_overrun(NL_SUPPORTED_GROUPS); return; }
     rc=nl_routes(&routes,&rcount);
     if (rc) { kernel_free(addresses); nl_overrun(NL_SUPPORTED_GROUPS); return; }
+    rc=nl_links(&links,&lcount);
+    if (rc) { kernel_free(addresses); kernel_free(routes); nl_overrun(NL_SUPPORTED_GROUPS); return; }
     for (uint32_t i=0;i<nl_previous_address_count;++i) {
         bool found=false;
         for (uint32_t j=0;j<acount;++j) if (nl_same_address(&nl_previous_addresses[i],&addresses[j])) { found=true; break; }
@@ -452,16 +500,24 @@ void netlink_ipv6_changed(void)
             if (nl_equal_route(&routes[i],&nl_previous_routes[j])) { same=true; break; }
         if (!same) nl_publish(RTMGRP_IPV6_ROUTE,RTM_NEWROUTE,&routes[i],false);
     }
-    struct e1000_info link={0}; e1000_get_info(&link); bool up=net_interface_admin_up();
-    if (link.present!=nl_previous_link.present || link.active!=nl_previous_link.active ||
-        up!=nl_previous_link_up || __builtin_memcmp(link.mac,nl_previous_link.mac,6)) {
-        if (link.present) nl_publish(RTMGRP_LINK,RTM_NEWLINK,&link,up);
-        else if (nl_previous_link.present) nl_publish(RTMGRP_LINK,RTM_DELLINK,&nl_previous_link,nl_previous_link_up);
+    for (uint32_t i=0;i<nl_previous_link_count;++i) {
+        bool found=false;
+        for (uint32_t j=0;j<lcount;++j) if (nl_previous_links[i].index==links[j].index) { found=true; break; }
+        if (!found) nl_publish(RTMGRP_LINK,RTM_DELLINK,&nl_previous_links[i],false);
     }
-    kernel_free(nl_previous_addresses); kernel_free(nl_previous_routes);
+    for (uint32_t i=0;i<lcount;++i) {
+        const struct nl_link_state *old=NULL;
+        for (uint32_t j=0;j<nl_previous_link_count;++j)
+            if (nl_previous_links[j].index==links[i].index) { old=&nl_previous_links[j]; break; }
+        if (!old || old->up!=links[i].up || old->active!=links[i].active ||
+            __builtin_memcmp(old->mac,links[i].mac,sizeof(old->mac)) ||
+            __builtin_strcmp(old->name,links[i].name))
+            nl_publish(RTMGRP_LINK,RTM_NEWLINK,&links[i],false);
+    }
+    kernel_free(nl_previous_addresses); kernel_free(nl_previous_routes); kernel_free(nl_previous_links);
     nl_previous_addresses=addresses; nl_previous_address_count=acount;
     nl_previous_routes=routes; nl_previous_route_count=rcount;
-    nl_previous_link=link; nl_previous_link_up=up;
+    nl_previous_links=links; nl_previous_link_count=lcount;
 }
 
 /** @brief Render a link, address or route dump from current network state.
@@ -477,11 +533,12 @@ static int nl_dump(struct nl_builder *b, const struct nlmsghdr *h)
         if (req.ifi_family != AF_UNSPEC && req.ifi_family != AF_PACKET &&
             req.ifi_family != AF_INET && req.ifi_family != AF_INET6) return -LINUX_EAFNOSUPPORT;
         if (!multi) {
-            if (req.ifi_index != 1 && req.ifi_index != 2) return -LINUX_ENODEV;
+            if (req.ifi_index <= 0 || !net_interface_exists((uint32_t)req.ifi_index)) return -LINUX_ENODEV;
             return nl_link(b,h->nlmsg_seq,req.ifi_index,false);
         }
-        int rc=nl_link(b,h->nlmsg_seq,1,true); if (rc) return rc;
-        if (net_interface_present()) { rc=nl_link(b,h->nlmsg_seq,2,true); if (rc) return rc; }
+        for (uint32_t index=net_interface_next(0);index;index=net_interface_next(index)) {
+            int rc=nl_link(b,h->nlmsg_seq,(int)index,true); if (rc) return rc;
+        }
         return nl_done(b,h->nlmsg_seq);
     }
     if (!multi) return -LINUX_EOPNOTSUPP;
@@ -493,12 +550,15 @@ static int nl_dump(struct nl_builder *b, const struct nlmsghdr *h)
             return -LINUX_EAFNOSUPPORT;
         int rc=0;
         if (req.ifa_family != AF_INET6) {
-            if ((!req.ifa_index || req.ifa_index==1) &&
-                (rc=nl_address4(b,h->nlmsg_seq,1,0x7f000001u,8,0))) return rc;
-            struct reliefos_net_config config; net_get_config(&config);
-            if ((!req.ifa_index || req.ifa_index==2) && net_interface_present() && config.local_ip &&
-                (rc=nl_address4(b,h->nlmsg_seq,2,config.local_ip,nl_prefix4(config.subnet_mask),
-                                config.local_ip | ~config.subnet_mask))) return rc;
+            for (uint32_t index=net_interface_next(0);index;index=net_interface_next(index)) {
+                struct reliefos_net_config config;
+                if ((req.ifa_index && req.ifa_index!=index) ||
+                    net_interface_get_config(index,&config) || !config.local_ip) continue;
+                struct net_interface *iface=net_interface_get(index);
+                uint32_t broadcast=iface ? iface->broadcast : 0;
+                rc=nl_address4(b,h->nlmsg_seq,index,config.local_ip,nl_prefix4(config.subnet_mask),broadcast);
+                if (rc) return rc;
+            }
         }
         if (req.ifa_family != AF_INET) {
             struct net_ipv6_address *entries; uint32_t count;
@@ -517,13 +577,15 @@ static int nl_dump(struct nl_builder *b, const struct nlmsghdr *h)
         return -LINUX_EAFNOSUPPORT;
     int rc=0;
     if (req.rtm_family != AF_INET6) {
-        rc=nl_route4(b,h->nlmsg_seq,0x7f000000u,8,0,1); if (rc) return rc;
-        struct reliefos_net_config config; net_get_config(&config);
-        if (net_interface_ready() && config.local_ip) {
-            rc=nl_route4(b,h->nlmsg_seq,config.local_ip & config.subnet_mask,
-                         nl_prefix4(config.subnet_mask),0,2); if (rc) return rc;
-            if (config.gateway_ip) { rc=nl_route4(b,h->nlmsg_seq,0,0,config.gateway_ip,2); if (rc) return rc; }
-        }
+        uint32_t count=net_ipv4_routes(NULL,0);
+        if (count > NL_MESSAGE_MAX / sizeof(struct net_ipv4_route)) return -LINUX_ENOBUFS;
+        struct net_ipv4_route *entries=count ? kernel_malloc((size_t)count*sizeof(*entries)) : NULL;
+        if (count && !entries) return -LINUX_ENOMEM;
+        if (net_ipv4_routes(entries,count)>count) { kernel_free(entries); return -LINUX_EAGAIN; }
+        for (uint32_t i=0;i<count && !rc;++i)
+            rc=nl_route4(b,h->nlmsg_seq,entries[i].destination,nl_prefix4(entries[i].mask),
+                         entries[i].gateway,entries[i].ifindex,entries[i].metric);
+        kernel_free(entries); if (rc) return rc;
     }
     if (req.rtm_family != AF_INET) {
         struct net_ipv6_route *entries; uint32_t count;
@@ -564,12 +626,112 @@ static int nl_copy_attr(const struct rtattr *a, void *out, uint32_t size)
     __builtin_memcpy(out,a+1,size); return 0;
 }
 
+/** @brief Change administrative state on one existing interface. */
+static int nl_change_link(const struct nlmsghdr *h)
+{
+    if (h->nlmsg_len < sizeof(*h)+sizeof(struct ifinfomsg)) return -LINUX_EINVAL;
+    struct ifinfomsg req;
+    __builtin_memcpy(&req,h+1,sizeof(req));
+    if (req.ifi_family!=AF_UNSPEC && req.ifi_family!=AF_PACKET &&
+        req.ifi_family!=AF_INET && req.ifi_family!=AF_INET6) return -LINUX_EAFNOSUPPORT;
+    if (req.ifi_index<0) return -LINUX_EINVAL;
+    if (req.ifi_change & ~IFF_UP) return -LINUX_EOPNOTSUPP;
+    const struct rtattr *attrs[17]={0};
+    int rc=nl_parse_attrs((const uint8_t *)(h+1)+sizeof(req),
+                          h->nlmsg_len-sizeof(*h)-sizeof(req),attrs,17);
+    if (rc) return rc;
+    for (unsigned i=0;i<17;++i)
+        if (attrs[i] && i!=IFLA_IFNAME && i!=IFLA_MTU) return -LINUX_EOPNOTSUPP;
+    uint32_t index=(uint32_t)req.ifi_index;
+    if (attrs[IFLA_IFNAME]) {
+        uint32_t n=attrs[IFLA_IFNAME]->rta_len-sizeof(struct rtattr);
+        const char *input=(const char *)(attrs[IFLA_IFNAME]+1);
+        if (!n || n>NET_IF_NAME_LEN) return -LINUX_EINVAL;
+        bool terminated=false;
+        for (uint32_t i=0;i<n;++i) if (!input[i]) { terminated=true; break; }
+        if (!terminated) return -LINUX_EINVAL;
+        char name[NET_IF_NAME_LEN]={0};
+        __builtin_memcpy(name,input,n);
+        uint32_t named=net_interface_index(name);
+        if (!index) index=named;
+        else if (named!=index) return -LINUX_EOPNOTSUPP;
+    }
+    if (!index) return attrs[IFLA_IFNAME] ? -LINUX_ENODEV : -LINUX_EINVAL;
+    if (!net_interface_exists(index)) return -LINUX_ENODEV;
+    if (attrs[IFLA_MTU]) {
+        uint32_t mtu;
+        rc=nl_copy_attr(attrs[IFLA_MTU],&mtu,sizeof(mtu)); if (rc) return rc;
+        if (mtu!=(index==NET_IF_LOOPBACK ? 65536u : 1500u)) return -LINUX_EOPNOTSUPP;
+    }
+    if (req.ifi_change & IFF_UP) {
+        bool up=(req.ifi_flags & IFF_UP)!=0;
+        if (net_interface_is_up(index)!=up) {
+            rc=net_interface_set_up(index,up); if (rc) return rc;
+            if (index!=NET_IF_LOOPBACK) net_ipv6_link_changed_on(index,up);
+            netlink_ipv6_changed();
+        }
+    }
+    return 0;
+}
+
+/** @brief Apply a primary IPv4 address request to its exact NIC. */
+static int nl_change_address4(const struct nlmsghdr *h, const struct ifaddrmsg *req, bool remove)
+{
+    if (!req->ifa_index || req->ifa_prefixlen>32) return -LINUX_EINVAL;
+    struct net_interface *iface=net_interface_get(req->ifa_index);
+    if (!iface) return req->ifa_index==NET_IF_LOOPBACK ? -LINUX_EOPNOTSUPP : -LINUX_ENODEV;
+    const struct rtattr *a[9]={0};
+    int rc=nl_parse_attrs((const uint8_t *)(h+1)+sizeof(*req),
+                          h->nlmsg_len-sizeof(*h)-sizeof(*req),a,9);
+    if (rc) return rc;
+    for (unsigned i=0;i<9;++i)
+        if (a[i] && i!=IFA_LOCAL && i!=IFA_ADDRESS && i!=IFA_FLAGS &&
+            i!=IFA_BROADCAST && i!=IFA_LABEL && i!=IFA_CACHEINFO) return -LINUX_EOPNOTSUPP;
+    if (!a[IFA_LOCAL] && !a[IFA_ADDRESS]) return -LINUX_EINVAL;
+    uint32_t ip=0, peer=0, broadcast=0, flags=req->ifa_flags;
+    rc=nl_copy_attr(a[IFA_LOCAL] ? a[IFA_LOCAL] : a[IFA_ADDRESS],&ip,4); if (rc) return rc;
+    if (a[IFA_LOCAL] && a[IFA_ADDRESS]) {
+        rc=nl_copy_attr(a[IFA_ADDRESS],&peer,4); if (rc) return rc;
+        if (peer!=ip) return -LINUX_EOPNOTSUPP;
+    }
+    if (a[IFA_FLAGS]) { rc=nl_copy_attr(a[IFA_FLAGS],&flags,4); if (rc) return rc; }
+    if (flags & ~IFA_F_PERMANENT) return -LINUX_EOPNOTSUPP;
+    if (a[IFA_LABEL]) {
+        char name[NET_IF_NAME_LEN];
+        if (!net_interface_name(req->ifa_index,name)) return -LINUX_ENODEV;
+        uint32_t n=a[IFA_LABEL]->rta_len-sizeof(struct rtattr);
+        if (n!=__builtin_strlen(name)+1 || __builtin_memcmp(a[IFA_LABEL]+1,name,n))
+            return -LINUX_EOPNOTSUPP;
+    }
+    if (a[IFA_CACHEINFO]) {
+        struct ifa_cacheinfo cache;
+        rc=nl_copy_attr(a[IFA_CACHEINFO],&cache,sizeof(cache)); if (rc) return rc;
+        if (cache.ifa_prefered!=UINT32_MAX || cache.ifa_valid!=UINT32_MAX) return -LINUX_EOPNOTSUPP;
+    }
+    ip=__builtin_bswap32(ip);
+    if (!ip || ip>=0xe0000000u) return -LINUX_EINVAL;
+    uint32_t mask=req->ifa_prefixlen ? UINT32_MAX << (32u-req->ifa_prefixlen) : 0;
+    if (a[IFA_BROADCAST]) { rc=nl_copy_attr(a[IFA_BROADCAST],&broadcast,4); if (rc) return rc;
+        broadcast=__builtin_bswap32(broadcast); }
+    else broadcast=ip | ~mask;
+    bool found=iface->config.local_ip==ip && iface->config.subnet_mask==mask;
+    if (remove) {
+        if (!found) return -LINUX_EADDRNOTAVAIL;
+        return net_interface_configure_ipv4(req->ifa_index,0,0,0);
+    }
+    if (iface->config.local_ip && !(h->nlmsg_flags & NLM_F_REPLACE)) return -LINUX_EEXIST;
+    if (!iface->config.local_ip && (h->nlmsg_flags & NLM_F_REPLACE) &&
+        !(h->nlmsg_flags & NLM_F_CREATE)) return -LINUX_EADDRNOTAVAIL;
+    return net_interface_configure_ipv4(req->ifa_index,ip,mask,broadcast);
+}
+
 /** @brief Apply an authorized IPv6 address request using copied snapshots.
  * @param h Checked request. @param remove True for delete. @return Zero or errno. */
 static int nl_change_address(const struct nlmsghdr *h, bool remove)
 {
     if (h->nlmsg_len < sizeof(*h)+sizeof(struct ifaddrmsg)) return -LINUX_EINVAL;
     struct ifaddrmsg req; __builtin_memcpy(&req,h+1,sizeof(req));
+    if (req.ifa_family == AF_INET) return nl_change_address4(h,&req,remove);
     if (req.ifa_family != AF_INET6) return -LINUX_EAFNOSUPPORT;
     if (!req.ifa_index || req.ifa_prefixlen > 128) return -LINUX_EINVAL;
     const struct rtattr *a[9]={0};
@@ -591,8 +753,9 @@ static int nl_change_address(const struct nlmsghdr *h, bool remove)
     if (a[IFA_LABEL]) {
         const char *label=(const char *)(a[IFA_LABEL]+1);
         uint32_t n=a[IFA_LABEL]->rta_len-sizeof(struct rtattr);
-        const char *expected=entry.ifindex==1 ? "lo" : entry.ifindex==2 ? "eth0" : "";
-        uint32_t expected_n=entry.ifindex==1 ? 3 : entry.ifindex==2 ? 5 : 1;
+        char expected[NET_IF_NAME_LEN];
+        if (!net_interface_name(entry.ifindex,expected)) return -LINUX_ENODEV;
+        uint32_t expected_n=__builtin_strlen(expected)+1;
         if (n!=expected_n || __builtin_memcmp(label,expected,n)) return -LINUX_EOPNOTSUPP;
     }
     if (a[IFA_CACHEINFO]) {
@@ -617,12 +780,68 @@ static int nl_change_address(const struct nlmsghdr *h, bool remove)
     return net_ipv6_address_update(&entry,remove);
 }
 
+/** @brief Apply an IPv4 route request to the shared route table. */
+static int nl_change_route4(const struct nlmsghdr *h, const struct rtmsg *req, bool remove)
+{
+    if (req->rtm_dst_len>32 || req->rtm_src_len || req->rtm_tos || req->rtm_flags ||
+        (req->rtm_table && req->rtm_table!=RT_TABLE_MAIN) ||
+        (req->rtm_type && req->rtm_type!=RTN_UNICAST)) return -LINUX_EOPNOTSUPP;
+    const struct rtattr *a[16]={0};
+    int rc=nl_parse_attrs((const uint8_t *)(h+1)+sizeof(*req),
+                          h->nlmsg_len-sizeof(*h)-sizeof(*req),a,16);
+    if (rc) return rc;
+    for (unsigned i=0;i<16;++i)
+        if (a[i] && i!=RTA_DST && i!=RTA_GATEWAY && i!=RTA_OIF &&
+            i!=RTA_PRIORITY && i!=RTA_TABLE) return -LINUX_EOPNOTSUPP;
+    if (req->rtm_dst_len && !a[RTA_DST]) return -LINUX_EINVAL;
+    struct net_ipv4_route route={.mask=req->rtm_dst_len ? UINT32_MAX << (32u-req->rtm_dst_len) : 0,
+                                  .flags=RTF_UP};
+    if ((rc=nl_copy_attr(a[RTA_DST],&route.destination,4)) ||
+        (rc=nl_copy_attr(a[RTA_GATEWAY],&route.gateway,4)) ||
+        (rc=nl_copy_attr(a[RTA_OIF],&route.ifindex,4)) ||
+        (rc=nl_copy_attr(a[RTA_PRIORITY],&route.metric,4))) return rc;
+    route.destination=__builtin_bswap32(route.destination) & route.mask;
+    route.gateway=__builtin_bswap32(route.gateway);
+    if (a[RTA_TABLE]) { uint32_t table; rc=nl_copy_attr(a[RTA_TABLE],&table,4); if (rc) return rc;
+        if (table!=RT_TABLE_MAIN) return -LINUX_EOPNOTSUPP; }
+    if (a[RTA_GATEWAY]) { if (!route.gateway) return -LINUX_EINVAL; route.flags|=RTF_GATEWAY; }
+    if (route.mask==UINT32_MAX) route.flags|=RTF_HOST;
+    if (!route.ifindex) {
+        struct net_ipv4_path path;
+        rc=net_ipv4_route_lookup(route.gateway ? route.gateway : route.destination,0,0,&path);
+        if (rc) return rc;
+        route.ifindex=path.ifindex;
+    }
+    if (remove && !route.mask && !route.gateway) {
+        struct net_interface *iface=net_interface_get(route.ifindex);
+        if (!iface || !iface->config.gateway_ip) return -LINUX_ESRCH;
+        route.gateway=iface->config.gateway_ip; route.flags|=RTF_GATEWAY;
+    }
+    bool replace=(h->nlmsg_flags & NLM_F_REPLACE)!=0;
+    if (!remove && replace && !(h->nlmsg_flags & NLM_F_CREATE)) {
+        uint32_t count=net_ipv4_routes(NULL,0);
+        if (count>NL_MESSAGE_MAX/sizeof(struct net_ipv4_route)) return -LINUX_ENOBUFS;
+        struct net_ipv4_route *entries=count ? kernel_malloc((size_t)count*sizeof(*entries)) : NULL;
+        if (count && !entries) return -LINUX_ENOMEM;
+        if (net_ipv4_routes(entries,count)>count) { kernel_free(entries); return -LINUX_EAGAIN; }
+        bool found=false;
+        for (uint32_t i=0;i<count;++i)
+            if (entries[i].destination==route.destination && entries[i].mask==route.mask &&
+                entries[i].ifindex==route.ifindex && entries[i].gateway==route.gateway) { found=true; break; }
+        kernel_free(entries); if (!found) return -LINUX_ESRCH;
+    }
+    rc=net_ipv4_route_update(&route,remove,replace);
+    if (!rc) netlink_ipv6_changed();
+    return rc;
+}
+
 /** @brief Apply an authorized IPv6 route request with checked native attributes.
  * @param h Checked request. @param remove True for delete. @return Zero or errno. */
 static int nl_change_route(const struct nlmsghdr *h, bool remove)
 {
     if (h->nlmsg_len < sizeof(*h)+sizeof(struct rtmsg)) return -LINUX_EINVAL;
     struct rtmsg req; __builtin_memcpy(&req,h+1,sizeof(req));
+    if (req.rtm_family == AF_INET) return nl_change_route4(h,&req,remove);
     if (req.rtm_family != AF_INET6) return -LINUX_EAFNOSUPPORT;
     if (req.rtm_dst_len > 128 || req.rtm_src_len || req.rtm_tos || req.rtm_flags ||
         (req.rtm_table && req.rtm_table!=RT_TABLE_MAIN) ||
@@ -671,11 +890,14 @@ static int nl_request(struct nl_builder *b, const struct nlmsghdr *h)
     if (!(h->nlmsg_flags & NLM_F_REQUEST)) rc=-LINUX_EINVAL;
     else if (h->nlmsg_type==RTM_GETLINK || h->nlmsg_type==RTM_GETADDR || h->nlmsg_type==RTM_GETROUTE)
         rc=nl_dump(b,h);
-    else if (h->nlmsg_type==RTM_NEWADDR || h->nlmsg_type==RTM_DELADDR ||
+    else if (h->nlmsg_type==RTM_NEWLINK || h->nlmsg_type==RTM_SETLINK ||
+             h->nlmsg_type==RTM_NEWADDR || h->nlmsg_type==RTM_DELADDR ||
              h->nlmsg_type==RTM_NEWROUTE || h->nlmsg_type==RTM_DELROUTE) {
         struct task *task=sched_current_task();
         if (!task || !(task->cap_effective & (1ULL<<CAP_NET_ADMIN))) rc=-LINUX_EPERM;
         else if (h->nlmsg_flags & (NLM_F_ECHO|NLM_F_APPEND)) rc=-LINUX_EOPNOTSUPP;
+        else if (h->nlmsg_type==RTM_NEWLINK || h->nlmsg_type==RTM_SETLINK)
+            rc=nl_change_link(h);
         else if (h->nlmsg_type==RTM_NEWADDR || h->nlmsg_type==RTM_DELADDR)
             rc=nl_change_address(h,h->nlmsg_type==RTM_DELADDR);
         else rc=nl_change_route(h,h->nlmsg_type==RTM_DELROUTE);

@@ -32,11 +32,10 @@ I217、I218、I219、82571/82572/82573 以及其他未列出的设备不在本�
 Kbuild/modpost 生成 ``drivers/net/e1000e/e1000e.ko``；``n`` 不编译该驱动。
 模块携带精确 PCI 别名，ReliefOS 按实际硬件通过普通 modprobe 加载。
 
-网络继续使用现有 ``eth0`` 和 Linux socket、ioctl、netlink、proc 网络接口。
-内核当前只有一个外部 Ethernet 提供者；后来的不同 owner 注册返回
-``-EBUSY``，不替换先前的网卡或回调。内部历史名称 ``register_e1000`` 和
-``e1000_*`` 服务函数也承载 e1000e，不代表绑定硬件仍是 8254x；本次没有改变
-这些服务结构的布局、Linux UAPI 或 BusyBox。
+每个受支持的 PCI 功能拥有独立的上下文、DMA 环和 ``ethN`` 网络接口。
+Intel e1000、e1000e 与 Realtek 网卡可以同时注册。用户程序使用 Linux
+socket、ioctl、netlink 和 proc 接口，接口状态和选路由 :doc:`network-devices`
+描述的设备层管理。旧 ``e1000_*`` 内部入口查询首个已发布接口。
 
 接口存在性不依赖网线或 PHY 协商：无载波时仍能查询名称、index、MAC、MTU
 和已配置地址，也能设置 ``IFF_UP``。ioctl 与 rtnetlink 分别报告管理状态和

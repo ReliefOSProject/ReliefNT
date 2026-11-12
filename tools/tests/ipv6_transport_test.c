@@ -78,6 +78,9 @@ int main(void)
     assert(call(__NR_bind, receiver, (uintptr_t)&local, sizeof(local), 0, 0) == 0);
     assert(call(__NR_connect, fd, (uintptr_t)&local, sizeof(local), 0, 0) == 0);
     assert(task_udp_send(&files[fd], "hello6", 6, 0, 0, 0) == 6);
+    struct udp_socket conflict = {.ipv6=true,.ifindex=2,.connected=true,
+        .remote6=loop6,.remote_scope6=1,.remote_port=55001};
+    assert(udp6_send(&conflict, "scope", 5, 0, 0) == -LINUX_EINVAL);
     char payload[16] = {0};
     struct sockaddr_in6 source = {0};
     uint32_t source_length = sizeof(source);
@@ -178,3 +181,11 @@ int main(void)
     loopback_bytes = loopback_packets = 0;
     return ipv4_udp_regression_main();
 }
+
+bool net_interface_is_ready(uint32_t index) { return index >= 1 && index <= 3; }
+const uint8_t *netdev_mac(uint32_t index) { (void)index; return e1000_mac(); }
+int netdev_send(uint32_t index, const void *frame, uint32_t length)
+{ (void)index; return e1000_send(frame, length); }
+int net_ipv4_send_raw_on(uint32_t index, uint32_t destination, uint32_t source,
+    uint8_t protocol, bool hdrincl, const void *data, uint32_t length)
+{ (void)index; return net_ipv4_send_raw(destination,source,protocol,hdrincl,data,length); }
