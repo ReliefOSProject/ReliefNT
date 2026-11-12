@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+config R8169
+	tristate "Realtek RTL8111/8168 and RTL8125 PCIe Ethernet"
+	default y
+	help
+	  Native driver for supported Realtek RTL8111/8168 Gigabit and RTL8125
+	  2.5 Gigabit PCIe Ethernet MAC revisions. Supports coherent DMA and
+	  standard copper autonegotiation, with software protocol checksums.
+	  Select M to build r8169.ko. The default configuration builds it in.

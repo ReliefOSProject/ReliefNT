@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-$(CONFIG_R8169) += r8169.o
+r8169-y := main.o hardware.o io.o rings.o rtl8168.o rtl8125.o firmware_8125.o module.o
+
+include $(srctree)/scripts/Makefile.module
