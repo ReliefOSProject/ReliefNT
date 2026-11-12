@@ -34,7 +34,7 @@ SOURCE_DATE_EPOCH 使用独立 Make 参数。
 产物与版本
 ==========
 
-产物在 O/generated/system：kernel.sys、kernel.debug、kerneldebug.sys。
+产物在 O/generated/system：kernel.sys、kernel.debug。
 vDSO 有独立 PIC/链接参数，仅嵌入对象进入内核。headers_install 按白名单导出，
 install 发布带摘要的清单，不消费父仓私有实现。
 

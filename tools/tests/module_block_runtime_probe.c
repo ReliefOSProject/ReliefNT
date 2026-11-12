@@ -227,12 +227,10 @@ static void boot_runtime_probe(void)
  const char expected[]="ReliefNT owned boot runtime QA\n";char bytes[sizeof(expected)]={0};
  require(read(owned,bytes,sizeof(bytes))==sizeof(expected)-1 &&
   !memcmp(bytes,expected,sizeof(expected)-1) && !close(owned),"boot cleanup preserves external marker through stale symlink");
- errno=0;require(lstat("/boot/reliefos/state/kerneldebug.next",&status)<0 && errno==ENOENT,
-  "boot consumes the owned one-shot ESP control before PID1");
  const char *removed[]={"/run/ko-stale","/run/ko-stale-link"};
  for(unsigned i=0;i<sizeof(removed)/sizeof(removed[0]);++i){errno=0;
   require(lstat(removed[i],&status)<0 && errno==ENOENT,"boot removes actual stale tree and literal symlink");}
- puts("MODULE_RUNTIME_BOOT_OBJECTS actual root/run/shm, corrected modes, stale tree/literal symlink cleanup and consumed ESP marker");
+ puts("MODULE_RUNTIME_BOOT_OBJECTS actual root/run/shm, corrected modes, stale tree/literal symlink cleanup");
 }
 /** @brief Exercise the inherited implicit TTY metadata without pathname replay.
  * @return None; halts PID1 on incorrect type, ownership, mode or restoration.

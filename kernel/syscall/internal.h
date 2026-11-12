@@ -36,7 +36,6 @@
 #include <reliefnt/usercopy.h>
 #include <reliefnt/userland.h>
 #include <reliefnt/elf.h>
-#include <reliefnt/kernel_debug.h>
 #include <reliefnt/wait.h>
 #include <reliefos/layout.h>
 

@@ -447,32 +447,6 @@ int storage_readdir_node(const struct storage_node *node, uint64_t *cursor,
                          struct reliefos_dir_entry *entry);
 /** @brief Return a GPT UUID in a 37-byte buffer under the storage lock, or negative errno. */
 int storage_disk_partition_uuid(uint32_t disk_id, uint32_t partition_index, char uuid[37]);
-/** @brief Write a control file on the boot volume's actual visible attachment.
- * @param path Trusted absolute /boot/ descendant, required.
- * @param buf Kernel bytes, NULL only at length0. @param len Complete byte count.
- * @return Zero or negative errno. Standard state directories are ensured0755;
- * new files0644, existing metadata preserved. Rejects absent/overmounted ESP
- * and paths escaping its attachment. Caller authorizes under execution
- * ownership; storage synchronous, all path/writer/code pins balanced without
- * graph/module callback locks. Failure after truncation may leave a prefix.
- */
-int storage_write_boot_esp_file(const char *path,const void *buf,uint32_t len);
-/** @brief Unlink a literal control entry on the actual boot ESP attachment.
- * @param path Trusted absolute /boot/ descendant, required.
- * @return Zero including absent member, or negative errno. Refuses an absent
- * or overmounted ESP; final symlinks are victims, never deletion targets.
- * Caller authorizes under execution ownership; synchronous I/O, balanced pins,
- * preserved mutation latch and no graph/module locks across callbacks.
- */
-int storage_unlink_boot_esp_file(const char *path);
-/** @brief Adopt PID1's mounted boot ESP after an initramfs root transition.
- * @return Zero or lookup/type/ENODEV/EBUSY errno. Boot policy calls once under
- * execution ownership after mounting the root's fstab. Records only an exact
- * registered device identity; no path/code reference survives. Later control
- * operations revalidate the visible native attachment against that identity.
- * No graph/module lock spans I/O, and failed adoption leaves the binding intact.
- */
-int storage_bind_boot_esp(void);
 /**
  * @brief Copy discovered installer disk identities without inventing mount state.
  * @param disks Writable array of capacity entries; NULL permitted at capacity zero.

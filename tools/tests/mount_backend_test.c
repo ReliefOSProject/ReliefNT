@@ -1373,41 +1373,6 @@ int sysfs_create_vfs_mount(struct vfs_mount **out)
     if(initial_sysfs_error){*out=NULL;return -EIO;}
     return storage_create_vfs_mount(&g_volumes[5],NULL,out);
 }
-static void kernel_boot_control(struct vfs_namespace *ns,const struct vfs_path *root)
-{
-    int rc=vfs_kernel_mkdir(ns,"/boot",0755);assert(!rc || rc==-EEXIST);
-    struct vfs_path point={0},boot={0},state={0},link={0};struct vfs_mount *mount=NULL;
-    assert(!vfs_path_lookup(ns,root,root,"/boot",0,&point));
-    assert(vfs_path_context(&point)==&g_volumes[STORAGE_VOLUME_BOOT]);
-    assert(!vfs_mount_unmount(ns,&point));vfs_path_put(&point);
-    assert(!vfs_path_lookup(ns,root,root,"/boot",0,&point));
-    assert(!storage_create_vfs_mount(&g_volumes[STORAGE_VOLUME_BOOT],NULL,&mount));
-    assert(!vfs_mount_attach(ns,mount,&point));vfs_mount_put(mount);vfs_path_put(&point);
-    assert(!vfs_path_lookup(ns,root,root,"/boot",0,&boot));
-    const char *control="/boot/reliefos/state/kerneldebug.next";
-    assert(!storage_write_boot_esp_file(control,"owned",5));
-    const void *data=NULL;size_t length=0;
-    assert(!vfs_kernel_read_file(ns,control,&data,&length) && length==5 && !memcmp(data,"owned",5));vfs_kernel_file_free(data,length);
-    assert(!vfs_kernel_write_file(ns,"/outside-control","outside",7));
-    assert(storage_write_boot_esp_file("/boot/../outside-control","denied",6)==-EXDEV);
-    assert(!vfs_path_lookup(ns,root,root,"/boot/reliefos/state",0,&state));
-    struct reliefos_permissions mode={0777,0,0};
-    assert(!vfs_path_create_node(&state,"outside-link",LINUX_S_IFLNK,&mode,"/outside-control",&link));vfs_path_put(&link);
-    assert(storage_write_boot_esp_file("/boot/reliefos/state/outside-link","denied",6)==-EXDEV);
-    assert(!storage_unlink_boot_esp_file("/boot/reliefos/state/outside-link"));
-    assert(!vfs_kernel_read_file(ns,"/outside-control",&data,&length) && length==7 && !memcmp(data,"outside",7));vfs_kernel_file_free(data,length);
-    assert(!storage_new_tmpfs_mount("cover-boot",0,NULL,0,0,&mount));
-    assert(!vfs_mount_attach(ns,mount,&boot));vfs_mount_put(mount);
-    assert(storage_write_boot_esp_file(control,"denied",6)==-ENODEV);
-    assert(storage_unlink_boot_esp_file(control)==-ENODEV);
-    struct vfs_path cover={0};assert(!vfs_path_lookup(ns,root,root,"/boot",0,&cover));
-    assert(!vfs_mount_unmount(ns,&cover));vfs_path_put(&cover);
-    assert(!storage_unlink_boot_esp_file(control) && !storage_unlink_boot_esp_file(control));
-    vfs_path_put(&state);assert(!vfs_mount_unmount(ns,&boot));vfs_path_put(&boot);
-    assert(storage_write_boot_esp_file(control,"denied",6)==-ENODEV);
-    assert(!vfs_kernel_unlink(ns,"/outside-control"));
-    puts("PASS kernel boot controls: actual ESP attachment, no text labels, escape rejection, literal unlink and overmount rejection");
-}
 /** @brief Verify default and explicit access policy on actual boot attachments.
  * @return None. Uses the production bootstrap/tmpfs graph, restores raw volume
  * flags and wall clock, and retires every new namespace and volatile shm.
@@ -1502,14 +1467,16 @@ static void production_initial_namespace(struct tmpfs_super *rootfs)
             struct vfs_namespace *ns=vfs_system_namespace();assert(ns);
             struct vfs_path root={0},node={0};assert(!vfs_namespace_root(ns,&root));
             assert(!vfs_path_lookup(ns,&root,&root,"/boot",0,&node));
-            assert(vfs_path_context(&node)==&g_volumes[STORAGE_VOLUME_BOOT]);vfs_path_put(&node);
+            assert(vfs_path_context(&node)==&g_volumes[STORAGE_VOLUME_BOOT]);
+            /* Retire the bootstrap attachment before testing this volume's
+             * ordinary data-partition alias and mount-move diagnostics. */
+            assert(!vfs_mount_unmount(ns,&node));vfs_path_put(&node);
             /* A normal alias is attached through the actual VFS API, never a
              * filename field inside its shared filesystem instance. */
             struct vfs_path alias_point={0};struct vfs_mount *alias_mount=NULL;
             assert(!vfs_path_lookup(ns,&root,&root,"/mnt",0,&alias_point));
             assert(!storage_create_vfs_mount(&g_volumes[2],NULL,&alias_mount));
             assert(!vfs_mount_attach(ns,alias_mount,&alias_point));vfs_mount_put(alias_mount);vfs_path_put(&alias_point);
-            kernel_boot_control(ns,&root);
             assert(!vfs_path_lookup(ns,&root,&root,"/dev/null",0,&node));
             assert(vfs_path_node(&node)->first_cluster==STORAGE_DEV_KIND_NULL);vfs_path_put(&node);
             assert(!vfs_path_lookup(ns,&root,&root,"/proc",0,&node));assert(vfs_path_node(&node)->volume_id==4);vfs_path_put(&node);

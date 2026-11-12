@@ -441,7 +441,7 @@ int main(int argc, char **argv)
         (root_status.st_ino == filesystem_root.st_ino && root_status.st_dev == filesystem_root.st_dev)) goto out;
     snprintf(install.prefix, sizeof(install.prefix), "lib/modules/%s/", argv[2]);
     if (ownership(&install)) goto out;
-    static const char *const kernels[] = {"kernel.sys", "kernel.debug", "kerneldebug.sys"};
+    static const char *const kernels[] = {"kernel.sys", "kernel.debug"};
     for (size_t i = 0; i < sizeof(kernels) / sizeof(kernels[0]); ++i) if (add_product(&install, kernels[i], NULL)) goto out;
     static const char *const required[] = {"config", "module.abi", "Module.symvers", "System.map", "modules.order", "modules.builtin", "modules.builtin.modinfo"};
     for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); ++i) {

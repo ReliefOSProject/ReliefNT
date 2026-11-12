@@ -39,7 +39,7 @@ class InstallBundle(unittest.TestCase):
             ownership.write_text("".join(hashlib.sha256(p.read_bytes()).hexdigest() + "  " +
                                           str(p.relative_to(modules)) + "\n"
                                           for p in sorted(modules.rglob("*")) if p.is_file()))
-            for name in ("kernel.sys", "kernel.debug", "kerneldebug.sys"):
+            for name in ("kernel.sys", "kernel.debug"):
                 (dest / name).write_bytes(name.encode())
 
             def run():

@@ -8,8 +8,7 @@ always-y += \
     include/generated/cjk_font.h \
     generated/system/kernel.unstripped \
     generated/system/kernel.sys \
-    generated/system/kernel.debug \
-    generated/system/kerneldebug.sys
+    generated/system/kernel.debug
 
 targets += \
     include/generated/build_info.h \
@@ -17,8 +16,7 @@ targets += \
     include/generated/cjk_font.h \
     generated/system/kernel.unstripped \
     generated/system/kernel.sys \
-    generated/system/kernel.debug \
-    generated/system/kerneldebug.sys
+    generated/system/kernel.debug
 
 
 quiet_cmd_reliefnt_build_info = GEN     $@
@@ -84,25 +82,13 @@ $(obj)/generated/system/kernel.sys: \
     $(objtree)/.reliefnt-target-objcopy.id FORCE
 	$(call if_changed,reliefnt_kernel_strip)
 
-quiet_cmd_reliefnt_kernel_debug = OBJCOPY $@
-cmd_reliefnt_kernel_debug = $(RELIEFNT_TARGET_OBJCOPY) --only-keep-debug $< $@.tmp && mv -f $@.tmp $@
+quiet_cmd_reliefnt_kernel_symbols = OBJCOPY $@
+cmd_reliefnt_kernel_symbols = $(RELIEFNT_TARGET_OBJCOPY) --only-keep-debug $< $@.tmp && mv -f $@.tmp $@
 
 $(obj)/generated/system/kernel.debug: \
     $(obj)/generated/system/kernel.unstripped \
     $(objtree)/.reliefnt-target-objcopy.id FORCE
-	$(call if_changed,reliefnt_kernel_debug)
-
-quiet_cmd_reliefnt_kerneldebug = OBJCOPY $@
-cmd_reliefnt_kerneldebug = $(RELIEFNT_TARGET_OBJCOPY) \
-    --remove-section .llvm_addrsig --remove-section .comment \
-    --remove-section .note.GNU-stack \
-    --rename-section .note.reliefos.kerneldebug=.note.reliefos.kerneldebug,alloc,load,readonly,data,contents \
-    $< $@.tmp && mv -f $@.tmp $@
-
-$(obj)/generated/system/kerneldebug.sys: \
-    $(objtree)/debug/kerneldebug.o \
-    $(objtree)/.reliefnt-target-objcopy.id FORCE
-	$(call if_changed,reliefnt_kerneldebug)
+	$(call if_changed,reliefnt_kernel_symbols)
 
 # Exact UAPI whitelist. Each copied header and the manifest are independent
 # Kbuild targets, so a removed output is repaired even when all sources are old.

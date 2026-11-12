@@ -12,7 +12,6 @@
 #include <reliefnt/framebuffer.h>
 #include <reliefnt/input.h>
 #include <reliefnt/inventory.h>
-#include <reliefnt/kernel_debug.h>
 #include <reliefnt/kernel.h>
 #include <reliefnt/lock.h>
 #include <reliefnt/mm.h>
@@ -455,11 +454,6 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
     driver_manager_load_builtin();
     console_info("[boot] input providers initialized; initializing IPv4 networking\n");
     net_init();
-    if (kernel_debug_boot_requested()) {
-        console_info("[reliefnt] entering kernel debug tool before userland\n");
-        (void)kernel_debug_run_module();
-        console_info("[reliefnt] kernel debug tool finished; continuing normal startup\n");
-    }
     if (boot_log_pause) {
         console_info("[svga3d] init=%d available=%u fifo-ready=%u\n",
                        svga_ret, (unsigned)boot_svga_info.available,

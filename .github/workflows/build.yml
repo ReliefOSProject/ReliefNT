@@ -1,6 +1,6 @@
 # Build verification for the standalone ReliefNT kernel tree: every push and
-# pull request must prove `make all` produces all three kernel products
-# (kernel.sys, kernel.debug, kerneldebug.sys).
+# pull request must prove `make all` produces both kernel products
+# (kernel.sys and kernel.debug).
 # Source audit, standalone host regressions and build; no guest runtime claim.
 
 name: Build ReliefNT
