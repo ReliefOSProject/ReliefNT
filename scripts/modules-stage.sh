@@ -20,6 +20,13 @@ if [ -z "$extmod" ]; then
     cp "$out/System.map" "$work/lib/modules/$release/System.map"
     cp "$out/.config" "$work/lib/modules/$release/config"
     cp "$out/include/config/module.abi" "$work/lib/modules/$release/module.abi"
+    # Keep binary attribution within the versioned, checksummed kernel payload.
+    mkdir -p "$work/lib/modules/$release/LICENSES/realtek"
+    cp "$src/LICENSE" "$src/NOTICE" "$work/lib/modules/$release/LICENSES/"
+    cp "$src/LICENSES/realtek/OpenBSD-ISC.txt" \
+       "$src/LICENSES/realtek/OpenBSD-BSD-4-Clause.txt" \
+       "$src/LICENSES/realtek/Realtek-firmware.txt" \
+       "$work/lib/modules/$release/LICENSES/realtek/"
     # Original modinst omits this file when MODULES=n. The all-builtin bundle
     # still needs an explicit empty module set; no imported rule is changed.
     if [ ! -f "$work/lib/modules/$release/modules.order" ]; then

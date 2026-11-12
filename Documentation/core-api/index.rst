@@ -17,5 +17,6 @@
    resource-limits
    drivers
    e1000e
+   realtek
    usb
    svga

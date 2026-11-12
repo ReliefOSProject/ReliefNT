@@ -1,0 +1,15 @@
+Copyright (c) 2026 Realtek Semiconductor Corporation
+
+Permission is hereby granted for the distribution of this firmware
+data in hexadecimal or equivalent format, provided this copyright
+notice is accompanying it.
+
+Copyright (c) 2011-2013, Realtek Semiconductor Corporation
+
+Permission is hereby granted for the distribution of this firmware
+data in hexadecimal or equivalent format, provided this copyright
+notice is accompanying it.
+
+Embedded, unchanged register-pair data for RTL8125 A/B/D-1/D-2.
+Source: OpenBSD src sys/dev/microcode/rge/rgemcode.h
+Revision: 7779d12194498048b288afda664dd6271a2ec016

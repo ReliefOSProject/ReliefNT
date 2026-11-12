@@ -32,6 +32,10 @@ drivers/ 按 console、tty、video、storage、net、input、usb、sound 等设�
      - ``e1000e``
      - Intel 82574L/82574IT、82583V PCIe 千兆网卡；共用单 eth0 服务，
        不替换已有网络 owner。设备范围和验证边界见 :doc:`e1000e`。
+   * - ``R8169``
+     - ``r8169``
+     - Realtek RTL8111/8168 千兆与 RTL8125 2.5GbE PCIe 网卡；共用单 eth0
+       服务。芯片版本、固件来源和验证范围见 :doc:`realtek`。
    * - ``MOUSE_PS2`` / ``USB_UHCI_HCD``
      - ``mouse`` / ``uhci``
      - PS/2、VMware 鼠标与 UHCI HID；键盘基础输入和分发入口内置。
