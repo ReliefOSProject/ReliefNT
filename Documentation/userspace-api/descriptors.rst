@@ -2,6 +2,25 @@
 描述符、块设备与时间戳
 ======================
 
+可移动块设备身份
+================
+
+``/sys/class/block/<disk>/removable``、``ro`` 和 ``diskseq`` 提供 Linux 风格
+的可移动标志、只读状态及全局递增介质注册序号，``uevent`` 同时包含 ``DISKSEQ``。
+``BLKGETDISKSEQ`` 返回打开描述符持有的整盘序号，分区描述符返回其所属整盘序号。
+拔出后旧描述符保留原序号。重新注册分配更大的序号。``BLKROGET`` 与
+``BLKSSZGET`` 分别返回真实注册的只读标志和逻辑扇区大小。
+
+FAT32/exFAT 的显式挂载支持 Linux ``uid``、``gid``、``umask``、``fmask`` 和
+``dmask`` 选项。UID/GID 使用十进制，掩码使用八进制。完整解析成功后才提交。
+显式选项决定该文件系统实例的合成所有权和模式，ext 文件系统继续使用介质上的
+POSIX 元数据。共享实例已有挂载时，不同选项返回 ``EBUSY``。无显式选项的
+现有调用继续使用原有元数据策略。
+
+接口语义参考 Linux 的
+`块设备 ioctl <https://github.com/torvalds/linux/blob/master/block/ioctl.c>`_、
+`diskseq 属性 <https://www.kernel.org/doc/html/v5.16/admin-guide/abi-testing.html>`_。
+
 授权与身份
 ==========
 

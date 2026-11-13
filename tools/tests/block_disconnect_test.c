@@ -58,7 +58,10 @@ int main(void)
     assert(!register_block_device(&registration));
     assert(!block_device_get(registration.info.device,&held));
     assert(block_device_lookup_generation(&held));
+    uint64_t sequence = block_device_sequence(&held);
+    assert(sequence);
     assert(!disconnect_block_device(&registration));
+    assert(block_device_sequence(&held) == sequence);
     assert(!block_device_lookup_generation(&held));
     assert(block_device_get(registration.info.device,&other)==-ENODEV);
     assert(block_device_read(&held,0,1,bytes)==-ENODEV);
@@ -69,6 +72,11 @@ int main(void)
     assert(unregister_block_device(&registration)==-EBUSY);
     block_device_put(&held);assert(!unregister_block_device(&registration));
     assert(!allocations);
+    assert(!register_block_device(&registration));
+    assert(!block_device_get(registration.info.device, &other));
+    assert(block_device_sequence(&other) > sequence);
+    block_device_put(&other);
+    assert(!unregister_block_device(&registration));
     struct module owner={0};registration.owner=&owner;during_registration=&registration;
     assert(register_block_device(&registration)==-ENODEV);
     assert(block_device_get(registration.info.device,&other)==-ENODEV);
