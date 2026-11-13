@@ -239,6 +239,14 @@ static int sys_blocks(sys_visit visit, void *ctx)
         char diskpath[RELIEFOS_FS_PATH_LEN];
         char diskname[RELIEFOS_FS_PATH_LEN];
         if (sys_block_name(diskname, disks[i].id, -1) < 0) return -2;
+        struct block_device_ref reference = {0};
+        struct block_device_info info;
+        ret = storage_disk_block_get(disks[i].id, &reference);
+        if (ret) return ret;
+        ret = block_device_info(&reference, &info);
+        uint64_t sequence = block_device_sequence(&reference);
+        block_device_put(&reference);
+        if (ret) return ret;
         int pci=sys_block_pci_parent(disks[i].id);
         if (pci>=0) {
             char prefix[RELIEFOS_FS_PATH_LEN];
@@ -278,6 +286,7 @@ static int sys_blocks(sys_visit visit, void *ctx)
             text_string(&s, "\nMINOR="); text_unsigned(&s, minor);
             text_string(&s, "\nDEVNAME="); text_string(&s, devname);
             text_string(&s, "\nDEVTYPE="); text_string(&s, part < 0 ? "disk" : "partition");
+            text_string(&s, "\nDISKSEQ="); text_unsigned(&s, sequence);
             if (part >= 0) { text_string(&s, "\nPARTN="); text_unsigned(&s, part + 1); }
             event[s.written] = 0;
             const char *suffix[] = {"", "/holders", "/slaves", "/dev", "/size", "/uevent",
@@ -307,6 +316,14 @@ static int sys_blocks(sys_visit visit, void *ctx)
             sys_path(path, "/sys/class/block/", -1, devname);
             if ((ret=sys_emit(visit,ctx,path,A_LINK,0,target))) return ret;
             if (part < 0) {
+                const char *attributes[] = {"/removable", "/ro", "/diskseq"};
+                const uint64_t values[] = {!!(info.flags & BLOCK_DEVICE_REMOVABLE),
+                                          !!(info.flags & BLOCK_DEVICE_READ_ONLY), sequence};
+                for (uint32_t attribute = 0; attribute < 3; ++attribute) {
+                    sys_path(path, base, -1, attributes[attribute]);
+                    struct sys_node node = {.path=path, .attr=A_BLOCK_NUMBER, .value=values[attribute]};
+                    if ((ret = visit(&node, ctx))) return ret;
+                }
                 sys_path(target, "../", -1, base + 5);
                 sys_path(path, "/sys/block/", -1, devname);
                 if ((ret=sys_emit(visit,ctx,path,A_LINK,0,target))) return ret;

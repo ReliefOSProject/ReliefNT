@@ -3,6 +3,7 @@
 #include <reliefnt/devfs.h>
 #include <reliefnt/procfs.h>
 #include <reliefnt/inventory.h>
+#include <reliefnt/fat_options.h>
 
 /** @brief Resolve both exact endpoints of a mount move and commit the graph.
  * @param ns Borrowed execution-owned namespace.
@@ -104,7 +105,13 @@ static int mount_backend(struct vfs_namespace *ns,struct task *task,const char *
                              const char *type,const char *options,uint64_t flags,struct vfs_mount **out)
 {
     if(!__builtin_strcmp(type,"tmpfs"))return storage_new_tmpfs_mount(source,flags,options,task->fsuid,task->fsgid,out);
-    if(options[0])return -RELIEFOS_EOPNOTSUPP;
+    if (options[0]) {
+        if (__builtin_strcmp(type,"vfat") && __builtin_strcmp(type,"exfat"))
+            return -RELIEFOS_EOPNOTSUPP;
+        struct fat_mount_options parsed;
+        int result = fat_options_parse(options, &parsed);
+        if (result) return result;
+    }
     int rc;
     if(!__builtin_strcmp(type,"proc"))rc=proc_create_vfs_mount(out);
     else if(!__builtin_strcmp(type,"sysfs"))rc=sysfs_create_vfs_mount(out);
@@ -126,6 +133,8 @@ static int mount_backend(struct vfs_namespace *ns,struct task *task,const char *
                 int32_t partition=STORAGE_BLOCK_PARTITION(node->volume_id);
                 rc=storage_new_block_mount(STORAGE_BLOCK_DISK_ID(node->volume_id),
                     (uint32_t)partition,type[0] ? type : NULL,flags,out);
+                if (!rc) rc = storage_mount_fat_options(*out, options);
+                if (rc && *out) { vfs_mount_put(*out); *out = NULL; }
             }
         }
         vfs_path_put(&found.path);return rc;

@@ -94,12 +94,20 @@ int storage_block_get_tree(const char *name,const struct fs_mount_request *reque
 {
     if(!out)return -EINVAL;*out=NULL;
     if(!name || !request || !request->source_node)return -EINVAL;
-    if(request->options && request->options[0])return -EOPNOTSUPP;
+    if (request->options && request->options[0]) {
+        if (__builtin_strcmp(name,"vfat") && __builtin_strcmp(name,"exfat")) return -EOPNOTSUPP;
+        struct fat_mount_options parsed;
+        int rc=fat_options_parse(request->options,&parsed);
+        if (rc) return rc;
+    }
     const struct storage_node *node=request->source_node;
     if(!(node->flags&STORAGE_NODE_FLAG_DEV_BLOCK))return -ENOTBLK;
     int32_t partition=STORAGE_BLOCK_PARTITION(node->volume_id);
-    return storage_new_block_mount(STORAGE_BLOCK_DISK_ID(node->volume_id),(uint32_t)partition,
+    int rc=storage_new_block_mount(STORAGE_BLOCK_DISK_ID(node->volume_id),(uint32_t)partition,
         name,request->flags,out);
+    if (!rc) rc=storage_mount_fat_options(*out,request->options);
+    if (rc && *out) { vfs_mount_put(*out); *out=NULL; }
+    return rc;
 }
 EXPORT_SYMBOL(storage_mount_filesystem);
 EXPORT_SYMBOL(storage_destroy_filesystem);

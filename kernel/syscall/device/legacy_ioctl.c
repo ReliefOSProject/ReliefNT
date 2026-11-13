@@ -367,6 +367,14 @@ int64_t syscall_legacy_ioctl(uint64_t number, uint64_t a0, uint64_t a1, uint64_t
         uint64_t sector_count;
 #endif
         if (task_block_device(file, &disk_id, &partition_index)) {
+            if (a1 == BLKGETDISKSEQ) {
+                IOCTL_PREPARE(a2, sizeof(uint64_t), true, -RELIEFOS_EFAULT);
+                if (!a2 || !user_range_writable(a2, sizeof(uint64_t))) return -RELIEFOS_EFAULT;
+                uint64_t sequence = block_device_sequence(&file->block_ref);
+                if (!sequence) return -RELIEFOS_ENODEV;
+                *(uint64_t *)(uintptr_t)a2 = sequence;
+                return 0;
+            }
             if (a1 == BLKGETSIZE64 || a1 == BLKGETSIZE) {
 #ifdef CONFIG_SWAP
                 return block_ioctl_size(task,disk_id,partition_index,a1,a2);
@@ -388,13 +396,19 @@ int64_t syscall_legacy_ioctl(uint64_t number, uint64_t a0, uint64_t a1, uint64_t
             if (a1 == BLKSSZGET) {
                 IOCTL_PREPARE(a2, sizeof(int), true, -RELIEFOS_EFAULT);
                 if (!a2 || !user_range_writable(a2, sizeof(int))) return -RELIEFOS_EFAULT;
-                *(int *)(uintptr_t)a2 = 512;
+                struct block_device_info info;
+                int result = block_device_info(&file->block_ref, &info);
+                if (result) return result;
+                *(int *)(uintptr_t)a2 = info.block_size;
                 return 0;
             }
             if (a1 == BLKROGET) {
                 IOCTL_PREPARE(a2, sizeof(int), true, -RELIEFOS_EFAULT);
                 if (!a2 || !user_range_writable(a2, sizeof(int))) return -RELIEFOS_EFAULT;
-                *(int *)(uintptr_t)a2 = 0;
+                struct block_device_info info;
+                int result = block_device_info(&file->block_ref, &info);
+                if (result) return result;
+                *(int *)(uintptr_t)a2 = !!(info.flags & BLOCK_DEVICE_READ_ONLY);
                 return 0;
             }
             if (a1 == BLKRRPART) {

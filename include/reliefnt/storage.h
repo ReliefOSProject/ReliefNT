@@ -124,6 +124,13 @@ int storage_new_tmpfs_mount(const char *source,uint64_t flags,const char *option
  */
 int storage_new_block_mount(uint32_t disk,uint32_t partition,const char *filesystem,
                                uint64_t flags,struct vfs_mount **out);
+/** @brief Apply explicit Linux FAT ownership/mask options to a detached mount.
+ * @param mount Owned native mount under construction, required.
+ * @param options Optional uid/gid/umask/fmask/dmask option string.
+ * @return Zero or malformed/type/busy errno. Existing shared instances reject
+ * conflicting options. Execution ownership required, no callbacks or I/O.
+ */
+int storage_mount_fat_options(struct vfs_mount *mount,const char *options);
 /** @brief Acquire an actual inode lease and its resident cluster timestamps.
  * @param node Required native identity; a cluster generation must remain current.
  * @param out Required owned reference output, cleared before validation.

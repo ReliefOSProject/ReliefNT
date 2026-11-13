@@ -79,6 +79,17 @@ int storage_backend_permissions(void *context,const struct vfs_path *path,
         *value=(struct reliefos_permissions){0555,0,0};return 0;
     }
     if(!(node->flags&(STORAGE_NODE_FLAG_FAT32|STORAGE_NODE_FLAG_EXFAT)))return -EOPNOTSUPP;
+    if (volume->fat_options.enabled) {
+        const struct fat_mount_options *options = &volume->fat_options;
+        struct reliefos_permissions effective = {
+            0777u & ~(node->type == RELIEFOS_FS_TYPE_DIR ? options->dmask : options->fmask),
+            options->uid, options->gid
+        };
+        if (write && (value->uid != effective.uid || value->gid != effective.gid ||
+                       (value->mode & 07777u) != effective.mode)) return -EPERM;
+        *value = effective;
+        return 0;
+    }
     struct storage_inode_ref *pin=path->dentry->backend_pin;if(!pin)return -ESTALE;
     if(!write && pin->permissions_valid){*value=pin->permissions;return 0;}
     if(pin->unlinked) {

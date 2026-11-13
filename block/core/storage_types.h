@@ -10,6 +10,7 @@
 #include <reliefnt/tmpfs.h>
 #include <reliefnt/fs_type.h>
 #include <reliefnt/blkdev.h>
+#include <reliefnt/fat_options.h>
 
 #include "../../fs/ext_common/storage_ext4_types.h"
 
@@ -88,6 +89,7 @@ struct storage_volume {
     struct tmpfs_super *tmpfs;
     char tmpfs_source[RELIEFOS_FS_PATH_LEN];
     uint64_t mount_flags;
+    struct fat_mount_options fat_options;
     uint64_t vfs_mounts;
     bool vfs_managed; /* Last graph attachment owns backend/cache teardown. */
     uint8_t volume_id;

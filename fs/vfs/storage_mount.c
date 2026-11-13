@@ -3,6 +3,31 @@
 #include "../../block/core/storage_internal.h"
 #include <linux/errno.h>
 #include <reliefnt/fs_type.h>
+#include "mount_internal.h"
+
+/** @brief Commit explicit ownership/masks before exposing a FAT attachment.
+ * @param mount Owned detached native mount, retaining its backend context.
+ * @param options Borrowed Linux filesystem option string, nullable.
+ * @return Zero or -EINVAL/-EBUSY. Empty input preserves existing policy.
+ * Shared instances accept only identical options. Serialized execution,
+ * no graph lock, provider callback, allocation or persistent metadata change.
+ */
+int storage_mount_fat_options(struct vfs_mount *mount,const char *options)
+{
+    if (!mount) return -EINVAL;
+    if (!options || !options[0]) return 0;
+    struct fat_mount_options parsed;
+    int rc = fat_options_parse(options, &parsed);
+    if (rc) return rc;
+    struct storage_volume *volume = mount->context;
+    if (!volume || (volume->filesystem != STORAGE_FILESYSTEM_FAT32 &&
+                    volume->filesystem != STORAGE_FILESYSTEM_EXFAT)) return -EINVAL;
+    const struct fat_mount_options *old = &volume->fat_options;
+    if (volume->vfs_mounts > 1 && (!old->enabled || old->uid != parsed.uid ||
+        old->gid != parsed.gid || old->fmask != parsed.fmask || old->dmask != parsed.dmask)) return -EBUSY;
+    volume->fat_options = parsed;
+    return 0;
+}
 
 /** @brief Destroy an unowned initialized instance after native inode retirement.
  * @param volume Exclusive context without mount memberships; nullable.

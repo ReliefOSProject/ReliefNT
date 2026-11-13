@@ -268,6 +268,17 @@ int block_device_info(const struct block_device_ref *reference,struct block_devi
     *out=reference->device->registration->info;return 0;
 }
 
+/** @brief Return the registration identity retained by an open device token.
+ * @param reference Borrowed token whose caller retains the device lifetime.
+ * @return Nonzero immutable registration serial, or zero for an empty token.
+ * Disconnection preserves this identity. No callbacks, locks or allocation.
+ */
+uint64_t block_device_sequence(const struct block_device_ref *reference)
+{
+    return reference && reference->device ? reference->device->serial : 0;
+}
+EXPORT_SYMBOL(block_device_sequence);
+
 uint64_t block_device_lookup_generation(const struct block_device_ref *reference)
 {
     if(!reference || !reference->device)return 0;

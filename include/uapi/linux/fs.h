@@ -11,5 +11,6 @@
 #define BLKGETSIZE    _IO(0x12, 96)
 #define BLKSSZGET     _IO(0x12, 104)
 #define BLKGETSIZE64  _IOR(0x12, 114, __u64)
+#define BLKGETDISKSEQ _IOR(0x12, 128, __u64)
 
 #endif

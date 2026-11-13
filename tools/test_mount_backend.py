@@ -6,6 +6,15 @@ import tempfile
 import unittest
 ROOT = Path(__file__).resolve().parents[1]
 class MountBackend(unittest.TestCase):
+    def test_fat_ownership_options(self):
+        with tempfile.TemporaryDirectory(prefix="reliefnt-fat-options-") as directory:
+            binary = Path(directory) / "fat-options"
+            subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
+                "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-Iinclude", "-Iinclude/uapi",
+                "tools/tests/fat_options_test.c", "fs/vfs/fat_options.c", "-o", str(binary)],
+                cwd=ROOT, check=True)
+            subprocess.run([str(binary)], check=True, timeout=10)
+
     def test_real_tmpfs_without_text_routing(self):
         with tempfile.TemporaryDirectory(prefix="reliefnt-mount-backend-") as directory:
             binary = Path(directory) / "mount-backend"
@@ -14,7 +23,7 @@ class MountBackend(unittest.TestCase):
                 "-Wl,--gc-sections", "-Wl,--wrap=storage_ext4_read_inode", "-Wl,--wrap=storage_read_device", "-Wl,--wrap=storage_inode_stat", "-Wl,--wrap=storage_backend_commit_rename_metadata", "-Wl,--wrap=storage_cluster_write", "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
                 "-Iinclude", "-Iinclude/uapi", "tools/tests/mount_backend_test.c", "kernel/dma/buffer.c", "drivers/storage/ahci/dma.c", "block/partition/mbr.c",
                 "fs/vfs/filesystems.c", "fs/vfs/filesystem_instance.c", "fs/ext_common/journal.c", "fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c", "fs/vfs/mount_table.c", "fs/vfs/path.c", "fs/vfs/dentry.c", "fs/vfs/file.c", "fs/vfs/open.c", "fs/vfs/kernel_file.c", "fs/vfs/kernel_path.c", "fs/vfs/exec_file.c", "fs/vfs/attributes.c", "fs/vfs/initial.c", "fs/vfs/storage_initial.c", "fs/vfs/storage_attributes.c", "fs/vfs/storage_access.c", "fs/vfs/storage_backend.c", "fs/vfs/mutation.c", "fs/vfs/storage_mutation.c", "fs/vfs/storage_create.c", "fs/vfs/storage_security.c", "fs/vfs/write_access.c",
-                "fs/vfs/storage_mount.c", "fs/tmpfs/core.c", "mm/physical/proc.c", "fs/security/access.c", "lib/text_utf16.c", "fs/devfs/mount.c", "fs/devfs/device.c", "fs/devfs/identity.c", "fs/vfs/pseudo.c", "kernel/exec/runtime.c", "kernel/exec/pending.c", "kernel/syscall/process/exec.c", "kernel/syscall/system/user_string.c",
+                "fs/vfs/storage_mount.c", "fs/vfs/fat_options.c", "fs/tmpfs/core.c", "mm/physical/proc.c", "fs/security/access.c", "lib/text_utf16.c", "fs/devfs/mount.c", "fs/devfs/device.c", "fs/devfs/identity.c", "fs/vfs/pseudo.c", "kernel/exec/runtime.c", "kernel/exec/pending.c", "kernel/syscall/process/exec.c", "kernel/syscall/system/user_string.c",
                 "kernel/syscall/ipc/unix_path.c", "kernel/syscall/ipc/unix_name.c", "kernel/syscall/fs/create.c", "kernel/syscall/fs/mount.c", "kernel/syscall/fs/mutation.c", "kernel/syscall/fs/directory.c", "kernel/syscall/fs/size.c", "kernel/syscall/fs/sync.c", "kernel/syscall/fs/path.c", "kernel/syscall/fs/lookup_state.c", "kernel/syscall/fd/descriptor.c", "kernel/device/character.c", "kernel/syscall/io/vector.c", "kernel/syscall/fd/pty_descriptor.c", "kernel/sched/tables.c", "kernel/device/mapping.c", "kernel/sched/fs.c", "kernel/sync/wait.c", "-o", str(binary)
             ], cwd=ROOT, check=True)
             subprocess.run([str(binary)], check=True, timeout=20)

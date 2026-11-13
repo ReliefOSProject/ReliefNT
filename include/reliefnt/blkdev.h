@@ -137,6 +137,13 @@ void block_device_put(struct block_device_ref *reference);
  * @return Zero or -EINVAL; no allocation, callback or I/O.
  */
 int block_device_info(const struct block_device_ref *reference,struct block_device_info *out);
+/** @brief Read the immutable disk sequence through an owned device reference.
+ * @param reference Borrowed nonempty token, held throughout the call.
+ * @return Nonzero globally increasing registration sequence, or zero for an
+ * invalid token. Disconnected references retain their original sequence.
+ * No lock, allocation, I/O, provider callback or ownership transfer.
+ */
+uint64_t block_device_sequence(const struct block_device_ref *reference);
 /** @brief Query an owned device's write/admission epoch under registry exclusion.
  * @param reference Borrowed live token. @return Zero when invalid/revoked,
  * otherwise a nonzero epoch advanced before every admitted write attempt.

@@ -117,9 +117,12 @@ int main(void)
     assert(!block_device_get(0x801,&ref) && runtime->users==1);
     assert(block_device_get(0x801,&ref)==-EBUSY && runtime->users==1);
     assert(!block_device_info(&ref,&info) && info.blocks==8 && info.block_size==512);
+    assert(block_device_sequence(&ref) && !block_device_sequence(NULL));
     assert(unregister_block_device(&registration)==-EBUSY);
     assert(module_unload("test_block",0)==-EWOULDBLOCK);
     assert(!block_device_next(&cursor,&second) && cursor && runtime->users==2);
+    assert(block_device_sequence(&ref) == cursor);
+    assert(block_device_sequence(&ref) == block_device_sequence(&second));
     block_device_put(&second);assert(block_device_next(&cursor,&second)==-ENOENT);
     assert(block_device_read(&ref,8,1,bytes)==-EINVAL);
     assert(block_device_read(&ref,7,2,bytes)==-EINVAL);
