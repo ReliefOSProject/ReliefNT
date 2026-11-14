@@ -897,9 +897,16 @@ int proc_lookup(const char *path, struct storage_node *out)
             return 0;
         }
         if ((kind == 2 || kind == 3) && proc_fd_number(file) >= 0) {
-            char target[RELIEFOS_FS_PATH_LEN];
-            int ret = proc_readlink(path, target, sizeof(target));
-            if (ret < 0) return ret;
+            struct task *task = kind == 3 ? sched_current_task() : sched_find(pid);
+            if (!task) return -RELIEFOS_ENOENT;
+            if (!proc_stat_mm_visible(sched_current_task(), task)) return -RELIEFOS_EACCES;
+            int fd = proc_fd_number(file);
+            const struct task_pty_fd *pty = task_pty_fd_for_fd(task, fd);
+            /* Descriptor presence is independent of its printable link target.
+             * Anonymous pipe/event descriptors must remain visible to getdents
+             * so fork/exec clients can close all inherited descriptors. */
+            if (!task_file_for_fd(task, fd) && !(pty && pty->pty_id && pty->endpoint))
+                return -RELIEFOS_ENOENT;
             if (out) *out = (struct storage_node){.type = RELIEFOS_FS_TYPE_SYMLINK,
                 .flags = STORAGE_NODE_FLAG_PROC};
             return 0;
