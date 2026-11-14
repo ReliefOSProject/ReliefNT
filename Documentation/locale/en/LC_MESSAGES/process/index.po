@@ -1,0 +1,20 @@
+# ReliefNT documentation translation.
+# Copyright (C) 2021-2026, ReliefOS contributors
+# This file is distributed under the same license as the ReliefNT package.
+msgid ""
+msgstr ""
+"Project-Id-Version: ReliefNT 5.3.2\n"
+"PO-Revision-Date: 2026-11-14 00:00+0000\n"
+"Last-Translator: ReliefOS contributors\n"
+"Language-Team: English\n"
+"Language: en\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "内核开发流程"
+msgstr "Kernel Development Process"
+
+msgid "源码、文档、测试及发布规则。"
+msgstr "Rules for source, documentation, testing, and releases."

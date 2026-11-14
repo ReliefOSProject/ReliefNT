@@ -1,0 +1,43 @@
+# ReliefNT documentation translation.
+# Copyright (C) 2021-2026, ReliefOS contributors
+# This file is distributed under the same license as the ReliefNT package.
+msgid ""
+msgstr ""
+"Project-Id-Version: ReliefNT 5.3.2\n"
+"PO-Revision-Date: 2026-11-14 00:00+0000\n"
+"Last-Translator: ReliefOS contributors\n"
+"Language-Team: English\n"
+"Language: en\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "Framebuffer 启动徽标"
+msgstr "Framebuffer Boot Logo"
+
+msgid "显示与移除"
+msgstr "Display and Removal"
+
+msgid ""
+"索引颜色图像直接嵌入内核只读数据，无需文件系统或用户态加载。 按发现的逻辑 CPU 数量绘制图标，适当留距，屏幕不足时换行或缩放，同时保留 文本行。该数量不是 CPU "
+"插槽数。用户态启动前移除徽标，恢复完整控制台。 绘制遵守 framebuffer pitch、原生颜色与边界；不能因图像更换覆盖屏外内存。"
+msgstr ""
+"The indexed-color image is embedded directly in the kernel's read-only data and needs no "
+"filesystem or userspace loading. Icons are drawn for the number of detected logical CPUs, with "
+"suitable spacing and wrapping or scaling when screen space is insufficient, while leaving room for"
+" text lines. This count is not the number of CPU sockets. The logos are removed before userspace "
+"starts, restoring the full console. Drawing respects framebuffer pitch, native colors, and bounds;"
+" replacing the image must not cause writes beyond screen memory."
+
+msgid "验证"
+msgstr "Validation"
+
+msgid ""
+"make test-boot-logo 使用实际绘制器检查 RAM surface；QEMU 的数量、留距、 持续显示和自动隐藏要由真实启动画面检查。VMware 验证未完成，不能从 QEMU "
+"设备模拟推导真实 VMware 或物理硬件显示成功。"
+msgstr ""
+"make test-boot-logo checks a RAM surface using the actual renderer. Counts, spacing, persistent "
+"display, and automatic hiding in QEMU must be checked against actual boot screens. VMware "
+"validation is incomplete; QEMU device emulation does not establish successful display on real "
+"VMware or physical hardware."

@@ -1,0 +1,49 @@
+# ReliefNT documentation translation.
+# Copyright (C) 2021-2026, ReliefOS contributors
+# This file is distributed under the same license as the ReliefNT package.
+msgid ""
+msgstr ""
+"Project-Id-Version: ReliefNT 5.3.2\n"
+"PO-Revision-Date: 2026-11-14 00:00+0000\n"
+"Last-Translator: ReliefOS contributors\n"
+"Language-Team: English\n"
+"Language: en\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "内核开发约定"
+msgstr "Kernel Development Conventions"
+
+msgid "模块与注释"
+msgstr "Modules and Comments"
+
+msgid ""
+"先阅读 AGENT.md、相关模块与构建图。每个生产文件独立编译，由本地 Kbuild 登记，不包含 .c/.inc 实现代替拆分，不恢复全局源列表。 "
+"模块内共享状态只定义一次，跨文件可见不意味着对用户公开；锁、IRQ 状态、 所有权和生命周期必须在接口中表达。"
+msgstr ""
+"Read AGENT.md, the relevant modules, and the build graph first. Each production file is compiled "
+"independently and registered in its local Kbuild. Do not include .c/.inc implementations in place "
+"of splitting files or restore global source lists. Define shared module state only once. Cross-"
+"file visibility does not mean public userspace exposure; interfaces must express locks, IRQ state,"
+" ownership, and lifecycle."
+
+msgid "保留现有 Doxygen 函数注释约定，说明职责、参数、可空性、所有权、容量与 返回错误；不要为文档重组批量改写算法或函数签名。"
+msgstr ""
+"Retain existing Doxygen function-comment conventions, documenting responsibilities, parameters, "
+"nullability, ownership, capacity, and returned errors. Do not broadly rewrite algorithms or "
+"function signatures to reorganize documentation."
+
+msgid "范围与提交"
+msgstr "Scope and Commits"
+
+msgid ""
+"不修改导入的 Linux Kbuild/Kconfig 引擎来规避测试。源迁移映射位于 configs/kernel-source-map.json，仅供审计，不参与生产编译。 新 UAPI "
+"需要导出白名单和用户态联动；普通重构保持磁盘格式和行为。 只有用户明确授权才提交/推送，先推本仓，再由父仓更新 gitlink。"
+msgstr ""
+"Do not modify imported Linux Kbuild/Kconfig engines to evade tests. configs/kernel-source-map.json"
+" is a source migration map for auditing only, not production compilation. New UAPI requires export"
+" allowlisting and userspace coordination; ordinary refactoring preserves disk formats and "
+"behavior. Commit/push only with explicit user authorization: push this repository first, then "
+"update the gitlink in the parent repository."

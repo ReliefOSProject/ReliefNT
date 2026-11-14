@@ -1,0 +1,101 @@
+# ReliefNT documentation translation.
+# Copyright (C) 2021-2026, ReliefOS contributors
+# This file is distributed under the same license as the ReliefNT package.
+msgid ""
+msgstr ""
+"Project-Id-Version: ReliefNT 5.3.2\n"
+"PO-Revision-Date: 2026-11-14 00:00+0000\n"
+"Last-Translator: ReliefOS contributors\n"
+"Language-Team: English\n"
+"Language: en\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "e1000e 实现与验证计划"
+msgstr "e1000e Implementation and Validation Plan"
+
+msgid "目标与边界"
+msgstr "Goals and Boundaries"
+
+msgid ""
+"为 Intel 82574L/82574IT（8086:10d3）和 82583V（8086:150c）提供独立的 原生 PCIe 以太网驱动。沿用现有单 eth0 网络服务、Linux "
+"socket/ioctl ABI 及原生模块 owner 管理，不修改 BusyBox 或公开 ABI。其他 e1000e 家族设备 不在本次设备表中。默认内置，允许配置为 e1000e.ko。"
+msgstr ""
+"Provide a standalone native PCIe Ethernet driver for Intel 82574L/82574IT (8086:10d3) and 82583V "
+"(8086:150c). Retain the existing single-eth0 network service, Linux socket/ioctl ABI, and native "
+"module owner management, without changing BusyBox or public ABI. Other e1000e-family devices are "
+"outside this device table. Built in by default, with e1000e.ko configurable."
+
+msgid ""
+"实现采用本项目 Apache-2.0 源码，依据 Intel 寄存器手册；不复制 Linux GPL 驱动。保留现有 E1000。芯片识别、复位与链路管理、DMA 收发环和模块注册分别 归属 "
+"drivers/net/e1000e/ 中的文件，并由该目录 Kbuild 列出。"
+msgstr ""
+"Use this project's Apache-2.0 source, based on Intel register manuals; do not copy Linux GPL "
+"drivers. Retain the existing E1000. Chip identification, reset/link management, DMA "
+"transmit/receive rings, and module registration belong in separate files under "
+"drivers/net/e1000e/, listed by that directory's Kbuild."
+
+msgid "执行清单"
+msgstr "Execution Checklist"
+
+msgid "[x] 核对实际工作树、旧 E1000、PCI MMIO/DMA 和网络 owner 生命周期。"
+msgstr "[x] Check the actual worktree, legacy E1000, PCI MMIO/DMA, and network owner lifecycle."
+
+msgid "[x] 先建立驱动行为测试，确认驱动缺失时失败。"
+msgstr "[x] Establish driver behavior tests first and confirm failure when the driver is absent."
+
+msgid "[x] 实现精确 PCI 设备表、64 位 BAR、复位、MAC/NVM 和 PHY 自动协商。"
+msgstr ""
+"[x] Implement an exact PCI device table, 64-bit BARs, reset, MAC/NVM, and PHY autonegotiation."
+
+msgid "[x] 实现有界异步 TX、完整 RX 校验、并发环访问和安全停止/回滚。"
+msgstr ""
+"[x] Implement bounded asynchronous TX, full RX validation, concurrent ring access, and safe "
+"shutdown/rollback."
+
+msgid "[x] 接入 E1000E tristate、模块别名、默认内置和独立模块构建。"
+msgstr ""
+"[x] Integrate the E1000E tristate, module aliases, default built-in configuration, and separate "
+"module build."
+
+msgid "[x] 防止第二个网络提供者覆盖已有 eth0，验证原提供者仍然可用。"
+msgstr ""
+"[x] Prevent a second network provider from overwriting existing eth0 and verify the original "
+"provider remains usable."
+
+msgid "[x] 运行定向宿主测试、内置和模块构建、相关 Kconfig/归属检查。"
+msgstr ""
+"[x] Run targeted host tests, built-in and module builds, and related Kconfig/ownership checks."
+
+msgid "[x] 在私有 QEMU 镜像验证 DHCP、IPv4/IPv6、TCP 数据校验和模块重载。"
+msgstr ""
+"[x] Validate DHCP, IPv4/IPv6, TCP data integrity, and module reloading with a private QEMU image."
+
+msgid "[x] 更新驱动文档，分别记录 QEMU、VMware、实体硬件的验证边界。"
+msgstr ""
+"[x] Update driver documentation, recording QEMU, VMware, and physical hardware validation "
+"boundaries separately."
+
+msgid "验证约束"
+msgstr "Validation Constraints"
+
+msgid ""
+"测试驱动初始化、DMA 地址而非 CPU 地址、描述符回收与环回绕、错误 RX、 无网线启动、分配/映射失败、复位超时和卸载后的资源回收。宿主硬件模型只替代 PCI/MMIO/DMA "
+"外部设备，执行真实驱动入口与回调；不为生产驱动增加测试接口。"
+msgstr ""
+"Test driver initialization, DMA rather than CPU addresses, descriptor reclamation and ring "
+"wraparound, erroneous RX, boot without a cable, allocation/mapping failures, reset timeout, and "
+"resource reclamation after unloading. The host hardware model substitutes only external "
+"PCI/MMIO/DMA devices and executes real driver entries and callbacks; add no test interfaces to "
+"production drivers."
+
+msgid ""
+"内核行为探针和宿主测试放在 ReliefNT；完整镜像与 QEMU 编排放在 ReliefOS。 仅修改新建的 out/e1000e/ 留证与镜像副本，保留原镜像。TMPDIR 使用父仓 "
+"out/tmp。实体硬件与 VMware 未运行时必须明确标记未验证。"
+msgstr ""
+"Kernel behavior probes and host tests belong in ReliefNT; full images and QEMU orchestration "
+"belong in ReliefOS. Modify only newly created evidence and image copies under out/e1000e/, "
+"retaining original images. Use the parent repository's out/tmp for TMPDIR. Physical hardware and "
+"VMware must be explicitly marked unvalidated if not run."

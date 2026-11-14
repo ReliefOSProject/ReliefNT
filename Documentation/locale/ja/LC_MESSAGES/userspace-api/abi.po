@@ -1,0 +1,58 @@
+# ReliefNT documentation translation.
+# Copyright (C) 2021-2026, ReliefOS contributors
+# This file is distributed under the same license as the ReliefNT package.
+msgid ""
+msgstr ""
+"Project-Id-Version: ReliefNT 5.3.2\n"
+"PO-Revision-Date: 2026-11-14 00:00+0000\n"
+"Last-Translator: ReliefOS contributors\n"
+"Language-Team: Japanese\n"
+"Language: ja\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+msgid "系统调用与 UAPI"
+msgstr "システムコールと UAPI"
+
+msgid "约定"
+msgstr "規約"
+
+msgid ""
+"x86_64 使用 Linux syscall 编号与寄存器约定，未知接口返回 ENOSYS。 公开线协议位于 include/uapi，headers_install 由 "
+"configs/header-export.list 控制；私有 task、页表和驱动状态不导出为用户 ABI。固定宽度、长度、版本、 边界和负 errno 都是接口契约的一部分。"
+msgstr ""
+"x86_64 は Linux の syscall 番号とレジスター規約を使い、未知のインターフェースは ENOSYS を返します。公開の受け渡し形式は include/uapi "
+"にあり、headers_install は configs/header-export.list で制御します。非公開の task、ページテーブル、ドライバー状態はユーザー ABI "
+"として公開しません。固定幅、長さ、バージョン、境界、負の errno はすべてインターフェース契約の一部です。"
+
+msgid "vDSO 的 ELF 符号版本、辅助向量、vvar 邻接映射及时间读取均有专用测试。 不支持的时钟或条件继续走真实 syscall，不返回猜测值。"
+msgstr ""
+"vDSO の ELF シンボルバージョン、補助ベクトル、vvar の隣接マッピング、時刻読み取りには専用テストがあります。非対応のクロックや条件では実際の syscall "
+"に進み、推測値は返しません。"
+
+msgid "兼容"
+msgstr "互換性"
+
+msgid ""
+"公开头保留实际支持的兼容名称，旧用户库不能伪装成新 SONAME。 只实现的接口才可视为可用；头文件存在不能代替完整运行认证。 接口修改同步内核、导出头、用户态包装、消费者和必要验证，不以更新 "
+"golden 替代布局或语义审查。"
+msgstr ""
+"公開ヘッダーは実際に対応する互換名を保持し、古いユーザーライブラリーを新しい SONAME "
+"に見せかけてはなりません。利用可能とみなせるのは実装済みのインターフェースだけで、ヘッダーの存在は完全な実行時認証の代わりにはなりません。インターフェース変更はカーネル、公開ヘッダー、ユーザー空間ラッパー、利用側、必要な検証に同期して反映し、golden"
+" データの更新でレイアウトや意味の審査を代替しません。"
+
+msgid "目录 bind mount"
+msgstr "ディレクトリーの bind mount"
+
+msgid ""
+"``mount(source, target, NULL, MS_BIND, NULL)`` 支持非递归目录绑定。 新挂载保留源目录的实际 inode、父链和文件系统生命周期，继承源挂载的 "
+"只读、nosuid、nodev 等策略。``/proc/self/mountinfo`` 的 root 字段报告源目录 在文件系统内的路径；命名空间路径、``..`` 和 chroot "
+"边界按新挂载计算。 源文件系统在绑定仍存在时不能卸载，解绑不销毁源文件系统。 递归绑定、文件绑定和 bind remount 尚不支持，返回明确错误。"
+msgstr ""
+"``mount(source, target, NULL, MS_BIND, NULL)`` は非再帰のディレクトリーバインドに対応します。新しいマウントは元ディレクトリーの実際の "
+"inode、親チェーン、ファイルシステムのライフサイクルを保持し、元マウントの読み取り専用、nosuid、nodev などの方針を継承します。``/proc/self/mountinfo`` の "
+"root フィールドは元ディレクトリーのファイルシステム内のパスを報告し、名前空間のパス、``..``、chroot "
+"境界は新マウントを基準に計算します。バインドが残る間は元ファイルシステムをアンマウントできず、バインド解除で元ファイルシステムを破棄することもありません。再帰バインド、ファイルバインド、bind "
+"remount は未対応で、明示的なエラーを返します。"

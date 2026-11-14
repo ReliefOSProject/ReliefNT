@@ -1,0 +1,107 @@
+# ReliefNT documentation translation.
+# Copyright (C) 2021-2026, ReliefOS contributors
+# This file is distributed under the same license as the ReliefNT package.
+msgid ""
+msgstr ""
+"Project-Id-Version: ReliefNT 5.3.2\n"
+"PO-Revision-Date: 2026-11-14 00:00+0000\n"
+"Last-Translator: ReliefOS contributors\n"
+"Language-Team: Japanese\n"
+"Language: ja\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+msgid "ReliefNT 5.3.2"
+msgstr "ReliefNT 5.3.2"
+
+msgid "更新内容"
+msgstr "更新された内容"
+
+msgid "新增原生 PCIe ``e1000e`` 网卡驱动，支持 Intel 82574L/82574IT 与 82583V，并由现有网络服务统一管理设备。"
+msgstr ""
+"Intel 82574L/82574IT と 82583V に対応するネイティブ PCIe ``e1000e`` "
+"ネットワークドライバーを追加し、既存のネットワークサービスでデバイスを統一管理します。"
+
+msgid "新增可调度内核线程与工作队列，支持并行、合并及延迟工作；改进常驻管道 I/O 并行度和 FIFO 打开路由。"
+msgstr "スケジュール可能なカーネルスレッドとワークキューを追加し、並列、統合、遅延作業に対応しました。常駐パイプ I/O の並列性と FIFO open の経路選択を改善しました。"
+
+msgid "按 CPU 缓存物理地址位宽，减少重复读取和同步；写保护缺页在并发 COW 处理已完成时重新检查并继续，而不是误报故障。"
+msgstr "CPU ごとに物理アドレス幅をキャッシュし、反復読み取りと同期を減らします。書き込み保護フォールトは並行 COW 処理が完了していれば再確認して続行し、誤った障害報告を避けます。"
+
+msgid "修复 netlink multipart dump 的完成报文边界，并使 ``ppoll`` 支持调用期间的临时 signal mask。"
+msgstr "netlink multipart dump の完了メッセージ境界を修正し、``ppoll`` に呼び出し中の一時 signal mask 対応を追加しました。"
+
+msgid "实现 ``RLIMIT_FSIZE`` 对文件写入的限制，并扩展 mount/bind 实例支持，为多个系统实例隔离挂载关系。"
+msgstr ""
+"ファイル書き込みへの ``RLIMIT_FSIZE`` 制限を実装し、mount/bind インスタンス対応を拡張して、複数のシステムインスタンス間でマウント関係を隔離できるようにしました。"
+
+msgid "移除已退役产品激活身份辅助接口，并修正 GNU Unifont 构建下载来源。"
+msgstr "廃止済みの製品アクティベーション識別補助インターフェースを削除し、ビルド時の GNU Unifont ダウンロード元を修正しました。"
+
+msgid "破坏性更新"
+msgstr "破壊的変更"
+
+msgid ""
+"**是，涉及内核内部 ABI、模块配套和一项已退役的私有接口。** 内核、initramfs、树外模块、符号版本及 ABI 清单必须使用同一版本；旧 ``.ko`` 和 prepared SDK "
+"不能与本版混用。移除的产品激活身份 helper 不再提供，依赖它的程序须改用标准系统信息接口。没有改变既有 syscall 编号或磁盘文件系统格式。"
+msgstr ""
+"**あり。カーネル内部 ABI、対応モジュール、廃止済みの非公開インターフェース 1 件が対象です。** カーネル、initramfs、ツリー外モジュール、シンボルバージョン、ABI "
+"マニフェストは同じ版を使う必要があり、旧 ``.ko`` や prepared SDK を本版と混在させることはできません。削除した製品アクティベーション識別 helper "
+"は提供せず、依存プログラムは標準システム情報インターフェースに変更する必要があります。既存 syscall 番号やディスクのファイルシステム形式は変えません。"
+
+msgid "更新与迁移注意事项"
+msgstr "更新・移行時の注意"
+
+msgid ""
+"本次为**源码 Release**，只提供标签和 GitHub 自动源码归档，不附预编译内核、模块、SDK 或镜像。使用 v5.3.2 对应配置执行 "
+"``olddefconfig``，并重新构建完整内核与 initramfs；树外模块须使用本版 ``Module.symvers`` 和 prepared SDK。"
+msgstr ""
+"今回は **ソース Release** としてタグと GitHub 自動ソースアーカイブだけを提供し、プリコンパイル済みカーネル、モジュール、SDK、イメージは添付しません。v5.3.2 "
+"に対応する設定で ``olddefconfig`` を実行し、完全なカーネルと initramfs を再ビルドしてください。ツリー外モジュールには本版の ``Module.symvers`` と "
+"prepared SDK が必要です。"
+
+msgid ""
+"``e1000e`` 的设备表仅覆盖 Intel 82574L/82574IT 与 82583V。验证范围包括 QEMU 对 82574L 的模拟和 82583V host "
+"model；不应据此推断其他同属 e1000e 家族的设备或实体网卡已验证。"
+msgstr ""
+"``e1000e`` のデバイス表は Intel 82574L/82574IT と 82583V だけを対象とします。検証範囲は QEMU の 82574L エミュレーションと 82583V "
+"host model であり、他の e1000e 系デバイスや物理ネットワークカードが検証済みとは推定できません。"
+
+msgid ""
+"新增 mount/bind 实例能力扩展挂载关系的隔离语义；更新时应使用匹配的用户态、内核和启动配置。``RLIMIT_FSIZE`` 对超出限制的写入返回文件大小错误，应用应检查短写及 "
+"``EFBIG``。"
+msgstr ""
+"新しい mount/bind インスタンス機能はマウント関係の隔離の意味を拡張するため、更新時は対応するユーザー空間、カーネル、起動設定を使ってください。``RLIMIT_FSIZE`` "
+"は制限超過の書き込みにファイルサイズエラーを返すため、アプリケーションは短い書き込みと ``EFBIG`` を確認する必要があります。"
+
+msgid ""
+"本版验证包含版本生成、字符串与数字宏、工具和 ownership 检查，以及 14 个 host smoke suites。该检查不等于完整系统启动、QEMU "
+"全量回归或运行时驱动验收；VMware、实体硬件和长期稳定性尚未完成验收。"
+msgstr ""
+"本版の検証にはバージョン生成、文字列と数値マクロ、ツール、ownership 検査、14 個の host smoke suites を含みます。これはシステム全体の起動、QEMU "
+"完全回帰、実行時ドライバー受け入れ検証ではありません。VMware、物理ハードウェア、長期安定性の受け入れ検証は未完了です。"
+
+msgid "开发者提示"
+msgstr "開発者向け情報"
+
+msgid ""
+"``configs/build-version`` 为 **5.3.2**，生成的版本数字字段为 **5/3/2**；EXTRAVERSION、LOCALVERSION 和模块 ABI "
+"后缀仍分别处理，并遵守完整 release 长度限制。"
+msgstr ""
+"``configs/build-version`` は **5.3.2**、生成する数値バージョンフィールドは **5/3/2** "
+"です。EXTRAVERSION、LOCALVERSION、モジュール ABI 接尾辞は引き続き個別に扱い、完全な release の長さ制限に従います。"
+
+msgid "内核实现、UAPI、模块接口、探针和手册归属本仓；ReliefOS 桌面、打包、RPR 与镜像流程归主仓。保留既有 ABI golden，不以重生成基线掩盖差异。"
+msgstr ""
+"カーネル実装、UAPI、モジュールインターフェース、プローブ、手引きは本リポジトリーに属し、ReliefOS デスクトップ、パッケージング、RPR、イメージ処理はメインに属します。既存 ABI "
+"golden を保持し、基準の再生成で差異を隠してはなりません。"
+
+msgid ""
+"本次范围为 ReliefNT v5.3.1 提交 **d4e365ba2672c25cf33f8c3a7e3bcecfe62ee9c2** 之后至 v5.3.2 "
+"标签指向的版本提交；仅汇总本仓最终生效内容，排除 ReliefOS 应用、打包及纯合并。下一版以该版本提交为起点。"
+msgstr ""
+"今回の範囲は ReliefNT v5.3.1 コミット **d4e365ba2672c25cf33f8c3a7e3bcecfe62ee9c2** の後から v5.3.2 "
+"タグが指すバージョンコミットまでです。本リポジトリーの最終的に有効な内容だけをまとめ、ReliefOS "
+"アプリケーション、パッケージング、純粋なマージは除外します。次版はそのバージョンコミットを起点とします。"
