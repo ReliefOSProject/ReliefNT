@@ -1,4 +1,5 @@
 #include "vga_terminal.h"
+#include "dec_graphics.h"
 #include <reliefos/psf_font.h>
 
 /** @brief Resolve an individual Unicode mapping from the immutable PSF1 table. */
@@ -87,24 +88,12 @@ void vga_terminal_index(struct vga_page *p, bool reverse, bool carriage)
     p->pending_wrap = false;
 }
 
-/** @brief Map the VT100 special-graphics subset to Unicode font mappings. */
-static uint32_t vga_dec_graphic(uint32_t cp)
-{
-    static const uint16_t table[] = {
-        0x25c6,0x2592,0x2409,0x240c,0x240d,0x240a,0x00b0,0x00b1,
-        0x2424,0x240b,0x2518,0x2510,0x250c,0x2514,0x253c,0x23ba,
-        0x23bb,0x2500,0x23bc,0x23bd,0x251c,0x2524,0x2534,0x252c,
-        0x2502,0x2264,0x2265,0x03c0,0x2260,0x00a3,0x00b7,
-    };
-    return cp >= 0x60 && cp <= 0x7e ? table[cp - 0x60] : cp;
-}
-
 /** @brief Place a printable scalar with delayed right-margin wrap and insertion. */
 void vga_terminal_scalar(struct vga_terminal *t, uint32_t cp)
 {
     struct vga_page *p = &t->page[t->alternate];
     if (p->pending_wrap && p->cursor.wrap) vga_terminal_index(p, false, true);
-    if (p->cursor.charset[p->cursor.g1]) cp = vga_dec_graphic(cp);
+    if (p->cursor.charset[p->cursor.g1]) cp = console_dec_graphic(cp);
     unsigned at = p->cursor.y * VGA_TEXT_COLS + p->cursor.x;
     if (p->insert && p->cursor.x + 1 < VGA_TEXT_COLS)
         __builtin_memmove(p->cells + at + 1, p->cells + at,
