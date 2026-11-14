@@ -122,7 +122,7 @@ endif
 
 .PHONY: help all kernel boot vdso tools fetch fetch-check \
 	defconfig olddefconfig menuconfig config-sync build-info headers_install \
-	install test test-tools test-abi test-header-export test-vdso test-kconfig htmldocs \
+	install test test-tools test-abi test-header-export test-vdso test-kconfig htmldocs gettext gettext-check \
 	kbuild-fixdep kconfig-tools clean distclean FORCE
 
 help:
@@ -149,6 +149,7 @@ help:
 	  '  test-ownership    reject OS/parent dependencies in kernel tests' \
 	  '  test-kconfig      standalone native configuration ownership checks' \
 	  '  htmldocs          strict Sphinx HTML manual in O/Documentation/html' \
+	  '  gettext / gettext-check  extract templates / check complete translations' \
 	  '  clean / distclean (download cache is preserved)' \
 	  '' \
 	  '  variables: O= ARCH=x86_64 PROFILE=release|debug TOOLCHAIN= V=1' \
@@ -157,9 +158,18 @@ help:
 
 SPHINXBUILD ?= sphinx-build
 SPHINXOPTS ?=
-htmldocs: $(RELIEFNT_O_MARKER)
-	$(Q)SPHINXBUILD='$(SPHINXBUILD)' SPHINXOPTS='$(SPHINXOPTS)' \
+DOCS_PYTHON ?=
+RELIEFNT_DOCS_I18N_INPUTS := $(RELIEFNT_SRC)/scripts/docs-python.sh \
+	$(RELIEFNT_SRC)/scripts/update-doc-translations.py \
+	$(RELIEFNT_SRC)/Documentation/locale/identical.json
+htmldocs: $(RELIEFNT_O_MARKER) $(RELIEFNT_SRC)/scripts/build-docs.sh $(RELIEFNT_DOCS_I18N_INPUTS)
+	$(Q)SPHINXBUILD='$(SPHINXBUILD)' SPHINXOPTS='$(SPHINXOPTS)' DOCS_PYTHON='$(DOCS_PYTHON)' \
 	    sh $(RELIEFNT_SRC)/scripts/build-docs.sh $(RELIEFNT_SRC)/Documentation $(O)/Documentation/html
+
+gettext gettext-check: $(RELIEFNT_O_MARKER) $(RELIEFNT_DOCS_I18N_INPUTS)
+	$(Q)SPHINXBUILD='$(SPHINXBUILD)' SPHINXOPTS='$(SPHINXOPTS)' DOCS_PYTHON='$(DOCS_PYTHON)' \
+	    sh $(RELIEFNT_SRC)/scripts/docs-python.sh $(RELIEFNT_SRC)/scripts/update-doc-translations.py \
+	    --output $(O)/Documentation/gettext $(if $(filter gettext-check,$@),--check)
 
 $(RELIEFNT_O_MARKER): | $(O)
 	$(Q)printf 'reliefos-build-out version=1 root=%s\n' '$(RELIEFNT_SRC)' > $@.tmp

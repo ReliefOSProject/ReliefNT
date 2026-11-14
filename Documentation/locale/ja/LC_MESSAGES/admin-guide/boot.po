@@ -1,0 +1,50 @@
+# ReliefNT documentation translation.
+# Copyright (C) 2021-2026, ReliefOS contributors
+# This file is distributed under the same license as the ReliefNT package.
+msgid ""
+msgstr ""
+"Project-Id-Version: ReliefNT 5.3.2\n"
+"PO-Revision-Date: 2026-11-14 00:00+0000\n"
+"Last-Translator: ReliefOS contributors\n"
+"Language-Team: Japanese\n"
+"Language: ja\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+msgid "启动契约"
+msgstr "起動契約"
+
+msgid "固件与交接"
+msgstr "ファームウェアと引き渡し"
+
+msgid ""
+"同一 kernel.sys 包含 Multiboot2 BIOS 32 位入口与 EFI64 入口。 BIOS 入口检查 CPU 能力、建立页表与栈后进入共享 64 位内核。 "
+"解析交接数据时检查边界、对齐、长度和溢出；EFI 信息指针保留完整宽度。 固件、GRUB 与模块载荷需满足该协议，本仓不生成 ISO 或安装引导器。"
+msgstr ""
+"同じ kernel.sys に Multiboot2 BIOS の 32 ビットエントリーと EFI64 エントリーを含みます。BIOS エントリーは CPU "
+"機能を確認し、ページテーブルとスタックを構築してから共通の 64 ビットカーネルに入ります。引き渡しデータの解析では境界、アラインメント、長さ、オーバーフローを検査し、EFI "
+"情報のポインターは全ビット幅を保持します。ファームウェア、GRUB、モジュールのペイロードはこのプロトコルを満たす必要があります。このリポジトリーでは ISO "
+"の生成やブートローダーのインストールは行いません。"
+
+msgid "根分区"
+msgstr "ルートパーティション"
+
+msgid ""
+"设备发现后解析显式 ``root=PARTUUID=...``，匹配唯一 GPT 分区身份。 畸形、缺失或重复请求拒绝自动回退；连接顺序不能替代指定身份。 "
+"旧自动发现行为与显式选择是不同路线。内核映像和引导模块的内存范围 在物理内存管理初始化前保留，不能当作可重用空闲页。"
+msgstr ""
+"デバイス検出後、明示された ``root=PARTUUID=...`` を解析し、一意の GPT "
+"パーティション識別情報と照合します。不正、欠落、重複した要求では自動フォールバックを拒否し、接続順序で指定された識別情報を代用することはできません。従来の自動検出と明示的な選択は別の経路です。カーネルイメージと起動モジュールが占めるメモリー範囲は、物理メモリー管理の初期化前に予約し、再利用可能な空きページとして扱ってはなりません。"
+
+msgid "日志"
+msgstr "ログ"
+
+msgid ""
+"启动日志可镜像到 COM1。``logcolor=0`` 关闭内核颜色，``bootlog-pause=1`` 在启动检查点等待输入；普通启动继续进入用户态。文字控制台采用现有 "
+"framebuffer 字形、pitch 和原生 RGB 转换，不假设紧密排列的 32 位像素。"
+msgstr ""
+"起動ログは COM1 にも出力できます。``logcolor=0`` はカーネルの色表示を無効にし、``bootlog-pause=1`` "
+"は起動チェックポイントで入力を待ちます。通常の起動はそのままユーザー空間へ進みます。テキストコンソールは既存の framebuffer 字形、pitch、ネイティブ RGB 変換を使い、32 "
+"ビットピクセルが隙間なく並ぶことは前提としません。"
