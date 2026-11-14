@@ -571,6 +571,14 @@ int main(void)
     assert(proc_readdir("/proc/42", &offset, &entry) == 1 && !strcmp(entry.name, "oom_score_adj") && entry.type == RELIEFOS_FS_TYPE_FILE);
     assert(proc_readdir("/proc/42", &offset, &entry) == 0);
     offset = 0;
+    /* Anonymous descriptors must survive proc inode lookup during getdents.
+     * GLib enumerates this directory to close inherited spawn pipe ends. */
+    current.files[0] = (struct task_file){.used = 1, .flags = TASK_FILE_FLAG_PIPE, .aux = 77};
+    assert(!proc_lookup("/proc/42/fd/3", &node) && node.type == RELIEFOS_FS_TYPE_SYMLINK);
+    assert(proc_readdir("/proc/42/fd", &offset, &entry) == 1 && !strcmp(entry.name, "0"));
+    assert(proc_readdir("/proc/42/fd", &offset, &entry) == 1 && !strcmp(entry.name, "3"));
+    current.files[0] = (struct task_file){0};
+    offset = 0;
     assert(proc_readdir("/proc/42/fd", &offset, &entry) == 1 && !strcmp(entry.name, "0"));
     assert(proc_readdir("/proc/42/fd", &offset, &entry) == 0);
     current.pty_fds[1] = (struct task_pty_fd){.used = 1, .fd = 2048,
