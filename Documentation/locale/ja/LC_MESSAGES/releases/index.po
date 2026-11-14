@@ -1,0 +1,31 @@
+# ReliefNT documentation translation.
+# Copyright (C) 2021-2026, ReliefOS contributors
+# This file is distributed under the same license as the ReliefNT package.
+msgid ""
+msgstr ""
+"Project-Id-Version: ReliefNT 5.3.2\n"
+"PO-Revision-Date: 2026-11-14 00:00+0000\n"
+"Last-Translator: ReliefOS contributors\n"
+"Language-Team: Japanese\n"
+"Language: ja\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+msgid "版本与发布记录"
+msgstr "バージョンとリリース履歴"
+
+msgid ""
+"当前版本来自 ``configs/build-version``。本目录归档 ReliefNT 自身的发布说明； 原始正文、标签和源码保存在 `GitHub Releases "
+"<https://github.com/ReliefOSProject/ReliefNT/releases>`_。"
+msgstr ""
+"現在のバージョンは ``configs/build-version`` に由来します。本ディレクトリーは ReliefNT 自体のリリースノートを保存し、元の本文、タグ、ソースは `GitHub "
+"Releases <https://github.com/ReliefOSProject/ReliefNT/releases>`_ にあります。"
+
+msgid ""
+"历史说明保留发布时的功能范围、迁移要求、验证结果与已知限制，不代表当前 版本状态。旧文档链接固定到对应发布标签，历史命令和路径不作为现行使用指南。 新版本按 "
+":doc:`../process/releasing` 归档。"
+msgstr ""
+"過去の説明はリリース時点の機能範囲、移行要件、検証結果、既知の制限を保持し、現在の状態を表しません。旧文書へのリンクは対応するリリースタグに固定し、過去のコマンドやパスを現行の使用手順とはしません。新しいバージョンは"
+" :doc:`../process/releasing` に従って保存します。"

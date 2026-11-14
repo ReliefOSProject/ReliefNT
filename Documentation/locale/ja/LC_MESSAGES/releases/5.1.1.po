@@ -1,0 +1,321 @@
+# ReliefNT documentation translation.
+# Copyright (C) 2021-2026, ReliefOS contributors
+# This file is distributed under the same license as the ReliefNT package.
+msgid ""
+msgstr ""
+"Project-Id-Version: ReliefNT 5.3.2\n"
+"PO-Revision-Date: 2026-11-14 00:00+0000\n"
+"Last-Translator: ReliefOS contributors\n"
+"Language-Team: Japanese\n"
+"Language: ja\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+msgid "ReliefNT 5.1.1"
+msgstr "ReliefNT 5.1.1"
+
+msgid "发布日期"
+msgstr "リリース日時"
+
+msgid "2026-10-20 12:54:47 UTC"
+msgstr "2026-10-20 12:54:47 UTC"
+
+msgid "发布标签"
+msgstr "リリースタグ"
+
+msgid "``v5.1.1``"
+msgstr "``v5.1.1``"
+
+msgid "版本提交"
+msgstr "バージョンコミット"
+
+msgid ""
+"`d561d4c8b296153723677c6b63497eb8867d024d "
+"<https://github.com/ReliefOSProject/ReliefNT/commit/d561d4c8b296153723677c6b63497eb8867d024d>`__"
+msgstr ""
+"`d561d4c8b296153723677c6b63497eb8867d024d "
+"<https://github.com/ReliefOSProject/ReliefNT/commit/d561d4c8b296153723677c6b63497eb8867d024d>`__"
+
+msgid "原始说明"
+msgstr "元のリリースノート"
+
+msgid "`GitHub Release <https://github.com/ReliefOSProject/ReliefNT/releases/tag/v5.1.1>`__"
+msgstr "`GitHub Release <https://github.com/ReliefOSProject/ReliefNT/releases/tag/v5.1.1>`__"
+
+msgid "本页归档发布时的完整说明，仅转换文档格式并将旧相对链接固定到对应标签。 文中的路径、功能范围、验证结果与已知限制均指该历史版本，不代表当前版本状态或重新验收。"
+msgstr ""
+"本ページはリリース時の完全な説明を保存し、文書形式の変換と旧相対リンクの対応タグへの固定だけを行っています。本文のパス、機能範囲、検証結果、既知の制限は当時の版を指し、現在の状態や再度の受け入れ検証を表しません。"
+
+msgid "发布范围"
+msgstr "リリース範囲"
+
+msgid ""
+"上一版本基线：``5.1.0`` 的版本提交 `09930b87355b8abbb75e39b693a6a7765ece2397 "
+"<https://github.com/ReliefOSProject/ReliefNT/commit/09930b87355b8abbb75e39b693a6a7765ece2397>`__。"
+msgstr ""
+"前版の基準：``5.1.0`` のバージョンコミット `09930b87355b8abbb75e39b693a6a7765ece2397 "
+"<https://github.com/ReliefOSProject/ReliefNT/commit/09930b87355b8abbb75e39b693a6a7765ece2397>`__。"
+
+msgid ""
+"本次版本：``5.1.1``，终点为 `v5.1.1 <https://github.com/ReliefOSProject/ReliefNT/tree/v5.1.1>`__ "
+"指向的本次版本提交；完整提交身份以该标签为准。"
+msgstr ""
+"今回のバージョンは ``5.1.1`` で、終点は `v5.1.1 <https://github.com/ReliefOSProject/ReliefNT/tree/v5.1.1>`__ "
+"が指す今回のバージョンコミットです。完全なコミット識別情報はタグを基準とします。"
+
+msgid ""
+"更新区间为 ``(上一版本提交, 本次版本提交]``，起点不含、终点包含。仅总结 ReliefNT 内核、驱动、UAPI 和本仓开发输入的有效变化；合并去重，不包括 ReliefOS "
+"应用、桌面配置、安装器或镜像打包。"
+msgstr ""
+"更新区間は ``(上一版本提交, 本次版本提交]`` で、起点を含まず終点を含みます。ReliefNT "
+"カーネル、ドライバー、UAPI、本リポジトリーの開発入力の有効な変更だけを統合・重複除去してまとめ、ReliefOS "
+"のアプリケーション、デスクトップ設定、インストーラー、イメージ作成は含みません。"
+
+msgid "本次是正式源码 Release，提供标签、中文说明及 GitHub 自动源码归档，不附内核二进制或系统镜像。"
+msgstr "今回は正式なソース Release として、タグ、中国語の説明、GitHub 自動ソースアーカイブを提供し、カーネルバイナリーやシステムイメージは添付しません。"
+
+msgid "更新内容"
+msgstr "更新された内容"
+
+msgid "DRM、vmwgfx 与图形资源"
+msgstr "DRM、vmwgfx、グラフィックスリソース"
+
+msgid ""
+"为 VMware SVGA-II 增加 Linux 兼容 DRM 设备层：按设备和能力公开 "
+"``/dev/dri/card0``、``/dev/dri/renderD128``，实现文件/主设备认证、受拥有者约束的缓冲区与表面、传统 KMS、framebuffer 及 fence "
+"等接口，并补充 PCI/DRM sysfs 信息。"
+msgstr ""
+"VMware SVGA-II 向けに Linux 互換 DRM デバイス層を追加し、デバイスと機能に応じて ``/dev/dri/card0``、``/dev/dri/renderD128`` "
+"を公開します。ファイル／master 認証、所有者で制約したバッファーとサーフェス、従来型 KMS、framebuffer、fence などを実装し、PCI/DRM sysfs 情報を補いました。"
+
+msgid ""
+"增加适配上游 Mesa 的有界 VGPU9 vmwgfx 路线：能力协商、资源与上下文、验证后的 execbuf 命令提交、着色器、查询和同步；支持同一设备内的 PRIME "
+"表面引用交换。该接口不承诺跨设备 DMA-BUF 导入、挂接或通用 Linux DRM 全量兼容。"
+msgstr ""
+"上流 Mesa に対応する範囲限定の VGPU9 vmwgfx 経路として、機能交渉、リソースとコンテキスト、検証済み execbuf "
+"コマンド送信、シェーダー、問い合わせ、同期を追加しました。同一デバイス内の PRIME サーフェス参照交換に対応します。デバイス間 DMA-BUF インポート、アタッチ、汎用 Linux DRM "
+"の完全互換は保証しません。"
+
+msgid ""
+"加强 GMR、guest-backed 对象/MOB "
+"和提交中资源的生命周期管理；关闭句柄、异常退出或解除映射时按使用状态延迟回收。无可运行任务时，在独立调度服务栈上推进有界资源退休，避免在活动陷阱返回栈上执行终结器。"
+msgstr ""
+"GMR、guest-backed オブジェクト／MOB、送信中リソースのライフサイクル管理を強化し、ハンドルの "
+"close、異常終了、アンマップ時は利用状態に応じて回収を遅延します。実行可能タスクがない場合は独立したスケジューラーサービススタックで有限のリソース終了処理を進め、アクティブなトラップ復帰スタック上でのファイナライザー実行を避けます。"
+
+msgid ""
+"改进 fbdev 模式验证、framebuffer 与 DRM 映射衔接；补充 ``FB_ACTIVATE_*`` 常量，以及 "
+"``asm/ioctl.h``、``drm.h``、``drm_mode.h``、``vmwgfx_drm.h`` 的公开导出。设备节点默认权限为 ``0660``、组 GID 44。"
+msgstr ""
+"fbdev モード検査と framebuffer／DRM マッピングの連携を改善しました。``FB_ACTIVATE_*`` 定数と "
+"``asm/ioctl.h``、``drm.h``、``drm_mode.h``、``vmwgfx_drm.h`` の公開を追加しました。デバイスノードのデフォルト権限は "
+"``0660``、グループは GID 44 です。"
+
+msgid "同步、缓存与调度"
+msgstr "同期、キャッシュ、スケジューリング"
+
+msgid ""
+"将非 lazy vmwgfx fence 重试合并为有界、可中断的轮询批次，保持 fence 身份、超时 "
+"cookie、截止时间和信号/重启语义；减少批次元数据分配，避免将大量小重试转换为不必要的调度开销。"
+msgstr ""
+"非 lazy の vmwgfx fence 再試行を有限で中断可能なポーリングバッチに統合し、fence 識別情報、タイムアウト "
+"cookie、期限、シグナル／再開の意味を維持しました。バッチメタデータの割り当てを減らし、多数の小さな再試行による不要なスケジューリング負荷を避けます。"
+
+msgid ""
+"对经过验证的 VMware BAR/FIFO 路径准备并核对 write-back 映射，补充 PCI 资源/页缓存属性处理；保留必要的 flush 通知、查询同步和资源引用，合并待提交的 KMS"
+" damage 区域。"
+msgstr ""
+"検証済みの VMware BAR/FIFO 経路に write-back マッピングを準備・照合し、PCI リソース／ページキャッシュ属性処理を補いました。必要な flush "
+"通知、問い合わせ同期、リソース参照を維持し、送信待ち KMS damage 領域を統合します。"
+
+msgid "成功安装捕获信号的用户栈帧后唤醒可中断任务，避免被信号打断的无超时 futex 等待使 Xorg 长期停驻。DRM 同步阶段结合可中断性处理信号，避免在仍被设备使用时提前释放对象。"
+msgstr ""
+"捕捉シグナルのユーザースタックフレームを正常に設置した後、中断可能タスクを起こし、シグナル中断された無期限 futex 待機で Xorg が長時間停止することを防ぎます。DRM "
+"同期段階は中断可能性を考慮してシグナルを扱い、デバイス使用中のオブジェクトの早期解放を避けます。"
+
+msgid "描述符、映射与异常隔离"
+msgstr "記述子、マッピング、例外の隔離"
+
+msgid "补充 DRM 所需的描述符、close-on-exec、文件共享、内存映射与保护/解除映射语义，维护 fork 及 VMA 变化期间的对象引用、边界和写权限。"
+msgstr ""
+"DRM に必要な記述子、close-on-exec、ファイル共有、メモリーマッピング、保護／アンマップの意味を補い、fork と VMA 変更時のオブジェクト参照、境界、書き込み権限を維持します。"
+
+msgid "增加按目标任务页表进行受检查的用户内存复制，避免依赖当前 CR3 读取其他任务地址；非法范围或缺页失败返回明确错误。"
+msgstr ""
+"対象タスクのページテーブルで検査付きユーザーメモリーコピーを行い、現在の CR3 に依存して他タスクのアドレスを読まないようにしました。不正な範囲やページフォールト失敗は明示的なエラーを返します。"
+
+msgid ""
+"用户态一般保护异常（#GP）转为强制 ``SIGSEGV`` 并走正常用户调度路径，使用完整陷阱帧；内核态 #GP 继续保留致命异常策略，不把过期 CR2 当作用户 #GP 的故障地址。"
+msgstr ""
+"ユーザー空間の一般保護例外（#GP）は強制 ``SIGSEGV`` に変換し、完全なトラップフレームで通常のユーザースケジューリング経路を通します。カーネルの #GP "
+"は致命的例外方針を維持し、古い CR2 をユーザー #GP の障害アドレスとは扱いません。"
+
+msgid "文本 VT 历史恢复先在同布局 RAM 表面完成重放，再提交到可见 framebuffer，降低恢复过程中逐次重绘的显示开销。"
+msgstr "テキスト VT 履歴の復元は同じ配置の RAM surface に先に再生してから可視 framebuffer に反映し、復元中の逐次再描画負荷を減らします。"
+
+msgid "破坏性更新"
+msgstr "破壊的変更"
+
+msgid "**否（相对于 5.1.0 已发布源码中的既有公开 UAPI）。** 本区间没有删除既有公开头或缩减已有线协议结构；主要新增 DRM/vmwgfx 接口与内部正确性、性能修复。"
+msgstr ""
+"**なし（公開済み 5.1.0 ソースの既存公開 UAPI に対して）。** 本区間では既存公開ヘッダーの削除や受け渡し構造の縮小はなく、主に DRM/vmwgfx "
+"インターフェースの追加と内部の正確性・性能修正です。"
+
+msgid "新 DRM 节点有明确权限和能力条件，应用不能假定 render 节点总存在、任意 DRM ioctl 都受支持或任意 GPU 都可用。"
+msgstr ""
+"新 DRM ノードには明確な権限・機能条件があります。アプリケーションは render ノードが常に存在すること、任意の DRM ioctl への対応、任意の GPU "
+"の利用を前提にしてはなりません。"
+
+msgid "同设备 PRIME 不等于通用跨设备共享；不支持的请求应处理明确错误并选择适合的软件路线。"
+msgstr "同一デバイスの PRIME は汎用的なデバイス間共有ではありません。非対応要求の明示的なエラーを処理し、適切なソフトウェア経路を選んでください。"
+
+msgid ""
+"这不是全量 ABI 认证：现有 ``reliefos_driver_kernel_api`` 的 golden 仍与实际结构不一致，见下文。该问题在 5.1.0 已记录，本次没有通过修改 "
+"golden 掩盖它。"
+msgstr ""
+"完全な ABI 認証ではありません。既存の ``reliefos_driver_kernel_api`` の golden は依然として実構造と不一致で、後述します。この問題は 5.1.0 "
+"でも記録しており、golden の変更で隠していません。"
+
+msgid "更新与迁移注意事项"
+msgstr "更新・移行時の注意"
+
+msgid "获取本标签源码并重新构建内核，保持实际启动的 ``kernel.sys``、导出的 UAPI 和配套用户态版本一致；本源码 Release 不提供可直接替换的预编译文件。"
+msgstr ""
+"このタグのソースを取得してカーネルを再ビルドし、実際に起動する ``kernel.sys``、公開 UAPI、対応ユーザー空間のバージョンを一致させてください。このソース Release "
+"は置き換え可能なプリコンパイル済みファイルを提供しません。"
+
+msgid "需要 VMware 3D 路线时核对虚拟显卡与宿主能力；缺少相应能力时应保留二维 framebuffer 或软件渲染回退，不强行公开不可用的 render 节点。"
+msgstr ""
+"VMware 3D 経路が必要な場合は仮想グラフィックスとホストの機能を確認してください。機能不足なら 2D framebuffer またはソフトウェア描画のフォールバックを残し、使えない "
+"render ノードを無理に公開しないでください。"
+
+msgid "使用 ``/dev/dri/`` 的账户需得到 GID 44 的组授权。现有账户库、自定义设备策略和不同 GID 映射应人工合并；账户创建与桌面配置由 ReliefOS 主仓负责。"
+msgstr ""
+"``/dev/dri/`` を使うアカウントには GID 44 のグループ権限が必要です。既存アカウントデータベース、独自デバイス方針、異なる GID "
+"対応は手動で統合してください。アカウント作成とデスクトップ設定は ReliefOS メインリポジトリーが担当します。"
+
+msgid "更新导出白名单和 SDK 后重新编译图形用户态；按已实现的有界接口使用缓冲区、表面、fence 和同设备 PRIME，保留错误、超时和中断处理。"
+msgstr ""
+"公開許可リストと SDK を更新してグラフィックスユーザー空間を再コンパイルしてください。実装された範囲内でバッファー、サーフェス、fence、同一デバイス PRIME "
+"を使い、エラー、タイムアウト、中断処理を保持してください。"
+
+msgid "现有安装原地替换内核、全部应用组合及真实硬件迁移未完成整版验证。先在独立副本检查启动、VT 往返、设备权限、资源回收和软件回退。"
+msgstr ""
+"既存環境でのカーネル置き換え、全アプリケーションの組み合わせ、物理ハードウェア移行の版全体検証は未完了です。まず独立したコピーで起動、VT "
+"往復、デバイス権限、リソース回収、ソフトウェアフォールバックを確認してください。"
+
+msgid "开发者提示"
+msgstr "開発者向け情報"
+
+msgid "生产入口为本仓根 GNU Make，内核与驱动编译由本仓负责，不消费父仓私有实现。"
+msgstr "製品用入口は本リポジトリールートの GNU Make です。カーネルとドライバーのコンパイルは本リポジトリーが担当し、親の非公開実装は使用しません。"
+
+msgid "基础版本为 ``5.1.1``，数字字段为 ``5/1/1``；``EXTRAVERSION`` 与 ``LOCALVERSION`` 继续独立追加，完整版本保留现有字符集和长度检查。"
+msgstr ""
+"基本バージョンは ``5.1.1``、数値フィールドは ``5/1/1`` です。``EXTRAVERSION`` と ``LOCALVERSION`` "
+"は引き続き個別に追加し、完全なバージョンの既存文字集合・長さ検査を保ちます。"
+
+msgid "UAPI 通过 ``headers_install`` 白名单导出。新 DRM 头用于目标用户态编译；内核私有指针、资源实现和页表结构不作为公共线协议传递。"
+msgstr ""
+"UAPI は ``headers_install`` の許可リストで公開します。新 DRM "
+"ヘッダーはターゲットユーザー空間のコンパイル用であり、カーネル非公開ポインター、リソース実装、ページテーブル構造を公開受け渡し形式にしません。"
+
+msgid ""
+"图形兼容范围受 SVGA-II、VGPU9 和实际能力检查限制。不承诺 atomic modesetting、硬件 vblank、硬件光标、跨设备 DMA-BUF、所有 Mesa 功能或物理宿主 "
+"GPU 利用率测量。"
+msgstr ""
+"グラフィックス互換範囲は SVGA-II、VGPU9、実際の機能検査に制約されます。atomic modesetting、ハードウェア vblank／カーソル、デバイス間 DMA-BUF、Mesa"
+" の全機能、物理ホスト GPU 利用率の測定は保証しません。"
+
+msgid "本区间实现对应的 DRM/SVGA、调度与信号宿主夹具及平台验收记录保存在配套 ReliefOS 主仓；这些测试的新增属于主仓，不能算成本仓新增了同一批工具。"
+msgstr ""
+"本区間の DRM/SVGA、スケジューリング／シグナルのホストフィクスチャとプラットフォーム受け入れ記録は、対応する ReliefOS "
+"メインリポジトリーにあります。これらのテスト追加はメイン側のもので、同じツールを本リポジトリーで新規追加したと数えてはなりません。"
+
+msgid ""
+"后续版本遵循 `发布规范 "
+"<https://github.com/ReliefOSProject/ReliefNT/blob/v5.1.1/docs/RELEASE_PROCESS.md>`__，从本次版本提交之后计算更新范围，两仓独立编写说明。"
+msgstr ""
+"後続版は `リリース規則 <https://github.com/ReliefOSProject/ReliefNT/blob/v5.1.1/docs/RELEASE_PROCESS.md>`__ "
+"に従い、今回のバージョンコミットの後から更新範囲を計算し、両リポジトリーの説明を独立して作成します。"
+
+msgid "验证与已知限制"
+msgstr "検証と既知の制限"
+
+msgid "**源码检查：** 审阅本仓 5.1.0 版本提交后的有效差异，对合并历史去重；核对版本输入、README 当前示例和发布范围。未修改 ABI golden。"
+msgstr ""
+"**ソース検査：** 5.1.0 バージョンコミット後の有効な差分を調べてマージ履歴を重複除去し、バージョン入力、README の現行例、公開範囲を確認しました。ABI golden "
+"は変更していません。"
+
+msgid ""
+"**本次编译与宿主工具通过：** 从父仓根执行 ``TMPDIR=\"$PWD/out/tmp\" make -C kernel/reliefnt O=\"$PWD/out/xorg-"
+"vmware-debug/reliefnt\" PROFILE=debug -j4 kernel test-tools test-header-export``。普通及 ASan/UBSan "
+"共享工具检查通过；头文件导出覆盖 85 个头，包含白名单精确性、独立 C/C++ 编译、私有头隔离及移除后无残留。"
+msgstr ""
+"**今回のコンパイルとホストツールは合格：** 親ルートで ``TMPDIR=\"$PWD/out/tmp\" make -C kernel/reliefnt O=\"$PWD/out/xorg-"
+"vmware-debug/reliefnt\" PROFILE=debug -j4 kernel test-tools test-header-export`` を実行しました。通常および "
+"ASan/UBSan の共有ツール検査は合格し、ヘッダー公開は 85 ヘッダーについて、許可リストの正確性、独立 C/C++ コンパイル、非公開ヘッダー隔離、削除後の残存なしを検査しました。"
+
+msgid ""
+"**父仓构建适配通过：** ReliefOS 的 ``build-info kernel test-tools`` 成功，主仓与内核版本字符串为 ``5.1.1``，内核数字字段为 "
+"``5/1/1``；父仓版本、后缀、无操作生成、适配和 procfs 定向检查通过。"
+msgstr ""
+"**親ビルド適応は合格：** ReliefOS の ``build-info kernel test-tools`` が成功し、メインとカーネルの文字列は "
+"``5.1.1``、カーネル数値フィールドは ``5/1/1`` でした。親のバージョン、接尾辞、無操作生成、適応、procfs 対象別検査は合格しました。"
+
+msgid ""
+"**ABI 门禁未通过：** 本次 ``test-abi`` 再次报告 ``reliefos_driver_kernel_api`` golden 大小 168、实际大小 296，以及 "
+"PCI/DMA/IRQ/音频/日志回调的偏移差异。完整测试门禁因此不能记为通过，需维护者另行审阅 ABI 决策。"
+msgstr ""
+"**ABI ゲートは不合格：** ``test-abi`` は再び ``reliefos_driver_kernel_api`` の golden サイズ 168、実サイズ 296 "
+"と、PCI/DMA/IRQ／音声／ログコールバックのオフセット差を報告しました。完全なテストゲートを合格とは記録できず、ABI の判断は保守担当者による別途審査が必要です。"
+
+msgid "**打包：** 本仓不生成 ReliefOS 系统镜像；本次不发布内核二进制，未将旧内核文件重标为 5.1.1。"
+msgstr ""
+"**パッケージング：** 本リポジトリーは ReliefOS システムイメージを生成しません。今回カーネルバイナリーは公開せず、旧カーネルファイルを 5.1.1 と付け替えてもいません。"
+
+msgid "**QEMU：** 区间内配套主仓记录了有限的设备/桌面及软件回退测试；本次没有对最终 5.1.1 标签进行完整启动、图形和异常恢复验收。宿主夹具和编译不替代目标虚拟机运行证明。"
+msgstr ""
+"**QEMU：** 区間内に対応メインリポジトリーで限定的なデバイス／デスクトップとソフトウェアフォールバックのテストを記録しました。最終 5.1.1 "
+"タグの完全な起動、グラフィックス、例外復旧の受け入れ検証は実施していません。ホストフィクスチャとコンパイルは対象 VM の実行証拠を代替しません。"
+
+msgid ""
+"**VMware：VMware 验证未完成。** 配套主仓的 SVGA3D 文档记录了冻结源码下的原生 VMware GPU/PRIME/KMS、桌面、软件回退及局部性能测量；这些不等同于最终 "
+"5.1.1 整版验收，也不表示所有负载都比软件渲染快。"
+msgstr ""
+"**VMware：検証は未完了です。** 対応メインリポジトリーの SVGA3D 文書は、固定ソースでのネイティブ VMware "
+"GPU/PRIME/KMS、デスクトップ、ソフトウェアフォールバック、部分性能測定を記録しています。これらは最終 5.1.1 "
+"全体の受け入れ検証ではなく、全負荷でソフトウェア描画より速いことも意味しません。"
+
+msgid "**真实硬件：** 本版未验证。不声称完成 Linux/POSIX 认证或任意物理 GPU 验证。"
+msgstr "**物理ハードウェア：** 本版では未検証です。Linux/POSIX 認証の完了や任意の物理 GPU の検証は表明しません。"
+
+msgid "获取与追溯"
+msgstr "ソースの取得と追跡"
+
+msgid ""
+"获取 `v5.1.1 源码 <https://github.com/ReliefOSProject/ReliefNT/tree/v5.1.1>`__ 及 GitHub 自动生成的 Source "
+"code ZIP/TAR.GZ；下载缓存和预编译产物不包含在本次发布中。"
+msgstr ""
+"`v5.1.1 ソース <https://github.com/ReliefOSProject/ReliefNT/tree/v5.1.1>`__ と GitHub 自動生成の Source "
+"code ZIP/TAR.GZ を取得してください。ダウンロードキャッシュやプリコンパイル済み成果物は含みません。"
+
+msgid ""
+"`完整提交与差异 "
+"<https://github.com/ReliefOSProject/ReliefNT/compare/09930b87355b8abbb75e39b693a6a7765ece2397...v5.1.1>`__。compare"
+" 展示完整历史，本说明不将纯合并或版本条目列作功能。"
+msgstr ""
+"`全コミットと差分 "
+"<https://github.com/ReliefOSProject/ReliefNT/compare/09930b87355b8abbb75e39b693a6a7765ece2397...v5.1.1>`__。compare"
+" は全履歴を示し、本説明では純粋なマージやバージョン項目を機能として扱いません。"
+
+msgid ""
+"配套主仓的桌面/账户集成、测试夹具和限定场景证据见 `ReliefOS 5.1.1 "
+"<https://github.com/ReliefOSProject/ReliefOS/releases/tag/v5.1.1>`__ 与该标签下的 `SVGA3D 文档 "
+"<https://github.com/ReliefOSProject/ReliefOS/blob/v5.1.1/docs/SVGA3D.md>`__。"
+msgstr ""
+"対応メインリポジトリーのデスクトップ／アカウント統合、テストフィクスチャ、限定シナリオの証拠は `ReliefOS 5.1.1 "
+"<https://github.com/ReliefOSProject/ReliefOS/releases/tag/v5.1.1>`__ と、そのタグの `SVGA3D 文書 "
+"<https://github.com/ReliefOSProject/ReliefOS/blob/v5.1.1/docs/SVGA3D.md>`__ を参照してください。"

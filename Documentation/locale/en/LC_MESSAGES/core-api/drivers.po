@@ -1,0 +1,281 @@
+# ReliefNT core API documentation translations.
+# Copyright (C) 2021-2026, ReliefOS contributors
+# This file is distributed under the same license as the ReliefNT package.
+msgid ""
+msgstr ""
+"Project-Id-Version: ReliefNT 5.3.2\n"
+"PO-Revision-Date: 2026-11-14 00:00+0800\n"
+"Last-Translator: ReliefOS contributors\n"
+"Language-Team: English\n"
+"Language: en\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "驱动与存储部件"
+msgstr "Drivers and storage components"
+
+msgid "职责"
+msgstr "Responsibilities"
+
+msgid ""
+"drivers/ 按 console、tty、video、storage、net、input、usb、sound 等设备族 组织；sound/core "
+"实现 PCM、mixer 及 ALSA/OSS 路线。block/ 负责块 I/O、GPT/MBR 与 设备身份，fs/ "
+"各文件系统负责自己的元数据、缓存和同步。 默认生产配置全部内置；下表中的部件可选择 ``m``，使用相同的原生注册、 探测和撤销入口。模块针对匹配的 "
+"ReliefNT 构建，不兼容 Linux 原版二进制 模块。构建、安装和树外模块 SDK 见 :doc:`../kbuild/modules`。"
+msgstr ""
+"The drivers/ tree is organized into device families such as console, tty, "
+"video, storage, net, input, usb, and sound; sound/core implements PCM, "
+"mixer, and the ALSA/OSS paths. block/ handles block I/O, GPT/MBR, and device"
+" identity, while each filesystem in fs/ manages its own metadata, caches, "
+"and synchronization. The default production configuration builds everything "
+"in; the components in the table below can be set to ``m`` and use the same "
+"native registration, probing, and teardown entry points. Modules target a "
+"matching ReliefNT build and are not compatible with upstream Linux binary "
+"modules. See :doc:`../kbuild/modules` for building, installation, and the "
+"out-of-tree module SDK."
+
+msgid "模块边界"
+msgstr "Module boundaries"
+
+msgid "可模块化生产部件"
+msgstr "Modular production components"
+
+msgid "Kconfig"
+msgstr "Kconfig"
+
+msgid "模块"
+msgstr "Module"
+
+msgid "归属与约束"
+msgstr "Ownership and constraints"
+
+msgid "``SATA_AHCI`` / ``PATA_IDE`` / ``BLK_DEV_NVME``"
+msgstr "``SATA_AHCI`` / ``PATA_IDE`` / ``BLK_DEV_NVME``"
+
+msgid "``ahci`` / ``ide`` / ``nvme``"
+msgstr "``ahci`` / ``ide`` / ``nvme``"
+
+msgid "原生控制器、IRQ 和 DMA；根设备引用阻止卸载。"
+msgstr ""
+"Native controllers, IRQs, and DMA; references to the root device prevent "
+"unloading."
+
+msgid "``E1000``"
+msgstr "``E1000``"
+
+msgid "``e1000``"
+msgstr "``e1000``"
+
+msgid "PRO/1000 设备；网络协议栈和回调入口保留内置。"
+msgstr ""
+"PRO/1000 devices; the network protocol stack and callback entry points "
+"remain built in."
+
+msgid "``E1000E``"
+msgstr "``E1000E``"
+
+msgid "``e1000e``"
+msgstr "``e1000e``"
+
+msgid ""
+"Intel 82574L/82574IT、82583V PCIe 千兆网卡；每个 PCI 功能独立注册 网络接口。设备范围和验证边界见 "
+":doc:`e1000e`。"
+msgstr ""
+"Intel 82574L/82574IT and 82583V PCIe Gigabit Ethernet adapters; each PCI "
+"function registers its own network interface. See :doc:`e1000e` for device "
+"coverage and validation boundaries."
+
+msgid "``R8169``"
+msgstr "``R8169``"
+
+msgid "``r8169``"
+msgstr "``r8169``"
+
+msgid ""
+"Realtek RTL8111/8168 千兆与 RTL8125 2.5GbE PCIe 网卡；每个 PCI 功能 "
+"独立注册网络接口。芯片版本、固件来源和验证范围见 :doc:`realtek`。"
+msgstr ""
+"Realtek RTL8111/8168 Gigabit and RTL8125 2.5GbE PCIe adapters; each PCI "
+"function registers its own network interface. See :doc:`realtek` for chip "
+"revisions, firmware sources, and validation coverage."
+
+msgid "``MOUSE_PS2`` / ``USB_UHCI_HCD``"
+msgstr "``MOUSE_PS2`` / ``USB_UHCI_HCD``"
+
+msgid "``mouse`` / ``uhci``"
+msgstr "``mouse`` / ``uhci``"
+
+msgid "PS/2、VMware 鼠标与 UHCI HID；键盘基础输入和分发入口内置。"
+msgstr ""
+"PS/2 and VMware mice, and UHCI HID; basic keyboard input and dispatch entry "
+"points are built in."
+
+msgid "``USB_EHCI_HCD``"
+msgstr "``USB_EHCI_HCD``"
+
+msgid "``ehci``"
+msgstr "``ehci``"
+
+msgid ""
+"USB 2.0 高速主机、BOT/SCSI 存储与 boot HID；挂载或打开的块设备固定模块。 低速/全速根端口设备使用 UHCI "
+"companion，详见 :doc:`usb`。"
+msgstr ""
+"USB 2.0 high-speed hosts, BOT/SCSI storage, and boot HID; mounted or open "
+"block devices pin the module. Low-speed/full-speed root-port devices use a "
+"UHCI companion; see :doc:`usb`."
+
+msgid "``SERIAL_8250``"
+msgstr "``SERIAL_8250``"
+
+msgid "``serial``"
+msgstr "``serial``"
+
+msgid "COM1 终端提供者；早期诊断与 panic 输出不依赖模块。"
+msgstr ""
+"COM1 terminal provider; early diagnostics and panic output do not depend on "
+"the module."
+
+msgid "``SND``"
+msgstr "``SND``"
+
+msgid "``snd``"
+msgstr "``snd``"
+
+msgid "ALSA/OSS、PCM 与 mixer；通用字符设备入口内置。"
+msgstr ""
+"ALSA/OSS, PCM, and mixer; generic character-device entry points are built "
+"in."
+
+msgid "``SND_HDA_INTEL`` / ``SND_INTEL8X0`` / ``SND_ENS1371``"
+msgstr "``SND_HDA_INTEL`` / ``SND_INTEL8X0`` / ``SND_ENS1371``"
+
+msgid "``hda`` / ``ac97`` / ``es1371``"
+msgstr "``hda`` / ``ac97`` / ``es1371``"
+
+msgid "依赖 sound core，Kconfig 限制驱动的链接等级不高于 core。"
+msgstr ""
+"Depend on the sound core; Kconfig prevents a driver's linkage level from "
+"exceeding that of the core."
+
+msgid "``DRM``"
+msgstr "``DRM``"
+
+msgid "``drm``"
+msgstr "``drm``"
+
+msgid "DRM/vmwgfx 服务、资源与映射；启动 framebuffer 和文本控制台内置。"
+msgstr ""
+"DRM/vmwgfx services, resources, and mappings; the boot framebuffer and text "
+"console are built in."
+
+msgid "``FAT_FS`` / ``EXFAT_FS`` / ``ISO9660_FS``"
+msgstr "``FAT_FS`` / ``EXFAT_FS`` / ``ISO9660_FS``"
+
+msgid "``vfat`` / ``exfat`` / ``isofs``"
+msgstr "``vfat`` / ``exfat`` / ``isofs``"
+
+msgid "对应文件系统；ISO9660 只读，格式化仅在对应实现支持时提供。"
+msgstr ""
+"The respective filesystems; ISO9660 is read-only, and formatting is "
+"available only where the corresponding implementation supports it."
+
+msgid "``EXT2_FS`` / ``EXT4_FS``"
+msgstr "``EXT2_FS`` / ``EXT4_FS``"
+
+msgid "``ext2`` / ``ext4``，共同依赖 ``ext_common``"
+msgstr "``ext2`` / ``ext4``, both depending on ``ext_common``"
+
+msgid "各自注册文件系统类型，共用实际 ext 引擎。隐藏公共选项取所需最高链接等级。"
+msgstr ""
+"Each registers its own filesystem type and shares the actual ext engine. The"
+" hidden common option takes the highest linkage level required."
+
+msgid ""
+"所有表中生产选项在 defconfig 中为 ``y``。``MODULE_TESTS`` 的 provider、 "
+"consumer、参数和故障模块只供显式测试，不作为生产设备或默认加载策略。 ``allmodconfig`` "
+"会同时打开测试选项；生成了测试模块不表示它们应自动加载。"
+msgstr ""
+"All production options in the table are ``y`` in defconfig. The provider, "
+"consumer, parameter, and fault modules under ``MODULE_TESTS`` are for "
+"explicit testing only, not production devices or a default loading policy. "
+"``allmodconfig`` also enables the test options; generating test modules does"
+" not mean they should be loaded automatically."
+
+msgid ""
+"调度、物理内存、页表、模块加载器、VFS/挂载树、通用设备注册与设备映射、 IRQ、DMA 分配及网络协议栈保持内置。初始 newc "
+"根、内存块设备、tmpfs、proc、 sysfs 和 devfs 为启动与模块管理提供基础，也保持内置。这些核心没有独立的 "
+"可卸载生命周期，不提供无法安全使用的 ``m`` 选项。"
+msgstr ""
+"Scheduling, physical memory, page tables, the module loader, VFS/mount "
+"trees, generic device registration and device mappings, IRQs, DMA "
+"allocation, and the network protocol stack remain built in. The initial newc"
+" root, memory block devices, tmpfs, proc, sysfs, and devfs provide the "
+"foundation for boot and module management and also remain built in. These "
+"core components have no independent unloadable lifecycle and do not offer an"
+" ``m`` option that cannot be used safely."
+
+msgid ""
+"``net/services/`` 的 DHCP、DNS、NTP 和旧同步 HTTP 客户端辅助代码仍属于 内置网络栈。这里没有独立的 HTTP "
+"服务注册入口；HTTP 文件还提供普通 TCP 连接使用的地址解析帮助函数，不能把整个文件改成 ``m`` 后留下内置调用者。 "
+"因此它不属于上述生产模块集合，也不显示尚不能安全装卸的配置选项。"
+msgstr ""
+"DHCP, DNS, NTP, and the legacy synchronous HTTP client helpers in "
+"``net/services/`` remain part of the built-in network stack. There is no "
+"separate HTTP service registration entry point here; the HTTP file also "
+"provides address-resolution helpers used by ordinary TCP connections, so the"
+" entire file cannot be changed to ``m`` while leaving built-in callers. It "
+"is therefore outside the production module set above, and no configuration "
+"option is exposed until safe loading and unloading are possible."
+
+msgid "生命周期与引用"
+msgstr "Lifecycle and references"
+
+msgid ""
+"设备注册记录包含实现 owner，外部引用与正在执行的回调分别固定原始模块。 注册动作本身不建立永久自引用，未发现硬件时允许模块注册成功但不绑定设备。 "
+"是否激活硬件应查看驱动和设备状态，不能只看 ``/proc/modules`` 的 LIVE。"
+msgstr ""
+"Device registration records include the implementation owner; external "
+"references and executing callbacks each pin the original module. "
+"Registration itself does not establish a permanent self-reference, and a "
+"module may register successfully without binding a device when no hardware "
+"is found. Check driver and device state to determine whether hardware is "
+"active; a LIVE state in ``/proc/modules`` alone is insufficient."
+
+msgid ""
+"卸载先拒绝新的使用者，再停止 IRQ/DMA、排空回调并释放资源，最后释放代码。 硬件未确认停止时保留代码和 "
+"backing，报告失败并允许诊断或重试。打开文件、 挂载、用户映射、fork 后的映射、异步音频工作与 GPU fence 都必须保留对应 "
+"实现；不通过强制卸载绕过这些引用，也不将模块静态区直接当作连续 DMA 内存。"
+msgstr ""
+"Unloading first rejects new users, then stops IRQs/DMA, drains callbacks, "
+"and releases resources before finally releasing the code. If the hardware "
+"has not been confirmed stopped, code and backing storage are retained, "
+"failure is reported, and diagnosis or retry remains possible. Open files, "
+"mounts, user mappings, mappings inherited through fork, asynchronous audio "
+"work, and GPU fences must all retain the corresponding implementation; "
+"forced unloading does not bypass these references, and a module's static "
+"storage must not be used directly as contiguous DMA memory."
+
+msgid "磁盘与显示"
+msgstr "Disks and display"
+
+msgid ""
+"原始块写入遵守打开时 DAC、描述符模式与权限；重读分区表要求 CAP_SYS_ADMIN。 FAT 目录按需有界分配，长文件名按 UTF-16 "
+"wire 数据处理，不能使用未对齐主机读取。 默认 root 的 PARTUUID 选择与磁盘编号分开。"
+msgstr ""
+"Raw block writes honor the DAC checks at open time, descriptor mode, and "
+"permissions; rereading a partition table requires CAP_SYS_ADMIN. FAT "
+"directories use bounded allocation on demand, and long filenames are handled"
+" as UTF-16 wire data without unaligned host reads. The default root PARTUUID"
+" selection is independent of disk numbering."
+
+msgid ""
+"framebuffer 提供基本显示；DRM/vmwgfx 实现有界 SVGA-II/VGPU9 能力、资源、 命令验证与 fence，不承诺通用跨设备"
+" DMA-BUF、atomic modesetting 或硬件 vblank。 未得到设备能力时不能伪造 render 节点或成功状态。"
+msgstr ""
+"The framebuffer provides basic display; DRM/vmwgfx implements bounded SVGA-"
+"II/VGPU9 capabilities, resources, command validation, and fences, without "
+"promising general cross-device DMA-BUF, atomic modesetting, or hardware "
+"vblank. Render nodes or successful status must not be fabricated when device"
+" capabilities are unavailable."
