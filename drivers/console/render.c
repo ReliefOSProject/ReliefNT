@@ -1,4 +1,5 @@
 #include "internal.h"
+#include "dec_graphics.h"
 
 /**
  * @brief Fill a rectangle on the current text-rendering surface.
@@ -177,6 +178,8 @@ void fb_console_show_tty_cursor(void)
     uint32_t row_bytes;
 
     if (!fb_console_tty_cursor_active || fb_console_tty_cursor_visible ||
+        (console_active_vt && console_active_vt <= CONSOLE_VT_COUNT &&
+         vt_text[console_active_vt - 1].cursor_hidden) ||
         !fb->available || !fb->pixels || !fb_cols || !fb_rows ||
         fb_col >= fb_cols || fb_row >= fb_rows || !fb->bytes_per_pixel ||
         fb->bytes_per_pixel > 4u) {
@@ -303,11 +306,9 @@ static void fb_console_scalar(uint32_t ch)
         return;
     }
     if (ch == '\b') {
+        /* Readline uses BS to move across existing text. */
         if (fb_col) {
             --fb_col;
-            fb_console_rect(fb_x + fb_col * RELIEFOS_FONT_W,
-                            fb_y + fb_row * RELIEFOS_FONT_H,
-                            RELIEFOS_FONT_W, RELIEFOS_FONT_H, fb_console_bg_color);
         }
         return;
     }
@@ -323,6 +324,11 @@ static void fb_console_scalar(uint32_t ch)
     }
     if (ch == 0x7fu) {
         return;
+    }
+    uint32_t number = fb_console_render_vt ? fb_console_render_vt : console_active_vt;
+    if (number && number <= CONSOLE_VT_COUNT) {
+        const struct console_vt_text *state = &vt_text[number - 1];
+        if (state->charset[state->charset_bank]) ch = console_dec_graphic(ch);
     }
     uint32_t cells = framebuffer_codepoint_width(ch);
     if (fb_console_panic_overlay && cells > fb_cols) {

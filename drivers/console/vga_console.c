@@ -101,10 +101,17 @@ void vga_console_panic_write(const char *s, size_t len, uint8_t color)
     vga_text_hw_present(p->cells,p->cursor.x,p->cursor.y,false,0,false);
 }
 
-/** @brief Encode common full-screen-tool keys; return zero for ordinary typing. */
+/** @brief Encode xterm navigation and function keys for either console backend.
+ * @param vt One-based VT, 1..6. @param key Normalized Set-1 keycode.
+ * @param mod xterm modifier value, 1..8. @param out Writable buffer of 8 bytes.
+ * @return Encoded byte count, or zero for an invalid/ordinary key.
+ */
 unsigned vga_console_key(uint32_t vt, uint8_t key, unsigned mod, char *out)
 {
     if (vt<1 || vt>6 || !out || mod<1 || mod>8) return 0;
+    if (key == 15 && mod == 2) {
+        out[0] = 27; out[1] = '['; out[2] = 'Z'; return 3;
+    }
     char final=key==72?'A':key==80?'B':key==77?'C':key==75?'D':key==71?'H':key==79?'F':0;
     unsigned code=key==82?2:key==83?3:key==73?5:key==81?6:0;
     if (key>=59 && key<=62) final=(char)('P'+key-59);
@@ -116,7 +123,9 @@ unsigned vga_console_key(uint32_t vt, uint8_t key, unsigned mod, char *out)
     if (!final && !code) return 0;
     unsigned used=0;out[used++]=27;
     if (final && mod==1) {
-        out[used++]=(vga_screens[vt-1].application_cursor || (key>=59 && key<=62))?'O':'[';
+        bool application = console_vga_text_mode ? vga_screens[vt-1].application_cursor
+                                                 : vt_text[vt-1].application_cursor;
+        out[used++]=(application || (key>=59 && key<=62))?'O':'[';
         out[used++]=final;
         return used;
     }

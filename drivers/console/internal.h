@@ -22,9 +22,42 @@
 #define CONSOLE_VT_COUNT 6u
 #define CONSOLE_VT_TEXT_CAP 65536u
 
+/* Pixel checkpoints retain the complete streaming parser across VT changes. */
+struct fb_console_state {
+    struct reliefos_utf8_stream utf8;
+    uint32_t x;
+    uint32_t y;
+    uint32_t cols;
+    uint32_t rows;
+    uint32_t col;
+    uint32_t row;
+    uint32_t saved_col;
+    uint32_t saved_row;
+    uint32_t foreground;
+    uint32_t background;
+    bool bold;
+    bool underline;
+    bool reverse;
+    uint32_t underline_color;
+    bool underline_color_set;
+    uint32_t scroll_top;
+    uint32_t scroll_bottom;
+    uint8_t ansi_state;
+    uint32_t param_count;
+    uint32_t param_value;
+    bool param_active;
+    bool private_mode;
+    bool dec_private;
+    uint8_t charset_target;
+    uint32_t params[FB_ANSI_MAX_PARAMS];
+    bool param_colon[FB_ANSI_MAX_PARAMS];
+};
+
 struct console_vt_text {
     char bytes[CONSOLE_VT_TEXT_CAP];
     size_t length;
+    bool application_cursor, cursor_hidden;
+    uint8_t charset[2], charset_bank;
 };
 
 
@@ -157,6 +190,7 @@ extern struct console_vt_text vt_text[CONSOLE_VT_COUNT];
 extern uint32_t console_active_vt;
 extern bool console_vt_graphical;
 extern const struct framebuffer *fb_console_render_target;
+extern uint32_t fb_console_render_vt;
 extern char log_buffer[CONSOLE_LOG_CAP];
 extern size_t log_len;
 extern size_t log_start;
@@ -244,6 +278,19 @@ void fb_console_putc(char ch);
 void fb_console_clear_row_range(uint32_t row, uint32_t first, uint32_t last);
 
 void fb_console_ansi_feed(char ch);
+
+/**
+ * @brief Save the serialized renderer and partial ANSI/UTF-8 parser.
+ * @param state Required writable checkpoint storage owned by the caller.
+ */
+void fb_console_state_save(struct fb_console_state *state);
+
+/**
+ * @brief Restore a renderer checkpoint for its retained pixel surface.
+ * @param state Required checkpoint saved for the matching surface layout.
+ */
+void fb_console_state_restore(const struct fb_console_state *state);
+
 
 /** @brief Reset text state and clear the full active rendering surface. */
 void fb_console_initialize_fullscreen(void);

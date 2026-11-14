@@ -23,6 +23,93 @@ static bool console_restore_graphic_frame(uint32_t number);
 static uint8_t *console_graphic_saved;
 static size_t console_graphic_saved_bytes;
 static uint32_t console_graphic_saved_vt;
+
+struct console_vt_surface {
+    struct framebuffer frame;
+    struct fb_console_state state;
+    bool initialized;
+};
+
+static struct console_vt_surface console_vt_surfaces[CONSOLE_VT_COUNT];
+uint32_t fb_console_render_vt;
+
+/**
+ * @brief Retain a lazily allocated text surface matching the current display.
+ * @param number Valid one-based virtual terminal number.
+ * @return Its surface, or NULL when allocation or display format is unavailable.
+ */
+static struct console_vt_surface *fb_console_vt_surface(uint32_t number)
+{
+    struct console_vt_surface *surface = &console_vt_surfaces[number - 1u];
+    const struct framebuffer *active = framebuffer_get();
+    if (!active->available || !active->pixels) return NULL;
+    if (surface->frame.pixels && surface->frame.width == active->width &&
+        surface->frame.height == active->height && surface->frame.pitch == active->pitch &&
+        surface->frame.bpp == active->bpp &&
+        surface->frame.red_field_position == active->red_field_position &&
+        surface->frame.red_mask_size == active->red_mask_size &&
+        surface->frame.green_field_position == active->green_field_position &&
+        surface->frame.green_mask_size == active->green_mask_size &&
+        surface->frame.blue_field_position == active->blue_field_position &&
+        surface->frame.blue_mask_size == active->blue_mask_size)
+        return surface;
+    if (surface->frame.pixels) kernel_free(surface->frame.pixels);
+    *surface = (struct console_vt_surface){0};
+    uint8_t *pixels;
+    if (!fb_console_allocate_replay_target(&surface->frame, &pixels)) return NULL;
+    return surface;
+}
+
+/**
+ * @brief Save the visible text pixels and parser before another VT takes over.
+ * The caller has removed the software cursor and serializes console access.
+ */
+static void fb_console_save_active_text(void)
+{
+    if (!console_active_vt || console_vt_graphical || !fb_console_enabled) return;
+    struct console_vt_surface *surface = fb_console_vt_surface(console_active_vt);
+    if (!surface) return;
+    const struct framebuffer *active = framebuffer_get();
+    __builtin_memcpy(surface->frame.pixels, active->pixels,
+        (size_t)active->pitch * active->height);
+    fb_console_state_save(&surface->state);
+    surface->initialized = true;
+}
+
+/**
+ * @brief Apply background output to its own retained pixels and streaming parser.
+ * @param number Valid one-based destination VT number, currently off screen.
+ * @param bytes Output bytes already accepted by the terminal.
+ * @param length Number of bytes. Caller serializes console access.
+ */
+static void fb_console_write_background(uint32_t number, const char *bytes, size_t length)
+{
+    struct console_vt_surface *surface = fb_console_vt_surface(number);
+    if (!surface) return;
+    struct fb_console_state previous;
+    fb_console_state_save(&previous);
+    const struct framebuffer *previous_target = fb_console_render_target;
+    uint32_t previous_vt = fb_console_render_vt;
+    bool previous_enabled = fb_console_enabled;
+    fb_console_render_target = &surface->frame;
+    fb_console_render_vt = number;
+    fb_console_enabled = true;
+    if (surface->initialized) fb_console_state_restore(&surface->state);
+    else {
+        console_utf8 = (struct reliefos_utf8_stream){0};
+        fb_console_initialize_fullscreen();
+        struct console_vt_text *history = &vt_text[number - 1u];
+        for (size_t i = 0; i < history->length; ++i) fb_console_ansi_feed(history->bytes[i]);
+    }
+    for (size_t i = 0; i < length; ++i) fb_console_ansi_feed(bytes[i]);
+    fb_console_state_save(&surface->state);
+    surface->initialized = true;
+    fb_console_render_target = previous_target;
+    fb_console_render_vt = previous_vt;
+    fb_console_enabled = previous_enabled;
+    fb_console_state_restore(&previous);
+}
+
 /**
  * @brief Allocate a same-layout RAM surface for one fullscreen text replay.
  * @param target Receives a copy of the active framebuffer descriptor.
@@ -119,6 +206,7 @@ void console_vt_write(uint32_t number, const char *s, size_t len)
     if (console_vga_text_mode) { vga_console_write(number,s,len); return; }
     if (number == console_active_vt && !console_vt_graphical)
         fb_console_hide_tty_cursor();
+    else fb_console_write_background(number, s, len);
     struct console_vt_text *screen = &vt_text[number - 1u];
     for (size_t i = 0; i < len; ++i) {
         if (screen->length == CONSOLE_VT_TEXT_CAP) {
@@ -168,6 +256,7 @@ void console_vt_activate(uint32_t number, bool graphical)
     }
     if (console_vt_graphical && !graphical) console_save_graphic_frame();
     fb_console_hide_tty_cursor();
+    if (!preserve_text) fb_console_save_active_text();
     console_active_vt = number;
     console_vt_graphical = graphical;
     console_service_logs_only = true;
@@ -186,32 +275,32 @@ void console_vt_activate(uint32_t number, bool graphical)
         console_present();
         return;
     }
-    struct framebuffer replay_target;
-    uint8_t *replay_pixels = NULL;
-    bool replay_staged = fb_console_allocate_replay_target(&replay_target,
-                                                            &replay_pixels);
-    if (replay_staged) {
-        fb_console_render_target = &replay_target;
+    struct console_vt_surface *surface = fb_console_vt_surface(number);
+    if (surface) fb_console_render_target = &surface->frame;
+    if (surface && surface->initialized) fb_console_state_restore(&surface->state);
+    else {
+        console_utf8 = (struct reliefos_utf8_stream){0};
+        fb_console_initialize_fullscreen();
+        struct console_vt_text *screen = &vt_text[number - 1u];
+        for (size_t i = 0; i < screen->length; ++i) fb_console_ansi_feed(screen->bytes[i]);
     }
-    fb_console_initialize_fullscreen();
-    struct console_vt_text *screen = &vt_text[number - 1u];
-    for (size_t i = 0; i < screen->length; ++i) fb_console_ansi_feed(screen->bytes[i]);
-    console_present();
-    if (replay_staged) {
+    if (surface) {
+        fb_console_state_save(&surface->state);
+        surface->initialized = true;
         const struct framebuffer *active = framebuffer_get();
         size_t visible_row_bytes =
             (size_t)active->width * active->bytes_per_pixel;
         for (uint32_t row = 0; row < active->height; ++row) {
             uint8_t *destination = (uint8_t *)active->pixels +
                                    (uint64_t)row * active->pitch;
-            const uint8_t *source = replay_pixels +
-                                    (uint64_t)row * replay_target.pitch;
+            const uint8_t *source = (const uint8_t *)surface->frame.pixels +
+                                    (uint64_t)row * surface->frame.pitch;
             __builtin_memcpy(destination, source, visible_row_bytes);
         }
         fb_console_render_target = NULL;
-        framebuffer_present();
-        kernel_free(replay_pixels);
     }
+    console_present();
+    framebuffer_present();
 }
 
 /** @brief Leave a failed VGA transition uncommitted by the VT ownership layer. */

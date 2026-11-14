@@ -71,8 +71,13 @@ static void scenario(uint8_t bytes,bool graphical)
         framebuffer_drm_scanout_owned=true;
     }
     unsigned old_alloc=allocations,old_locks=locking;
+    fb_console_render_vt=3;
+    vt_text[console_active_vt-1].charset[0]=1;
+    vt_text[console_active_vt-1].charset_bank=0;
     panic_phase=true;
     struct console_panic_context context=console_panic_begin();
+    CHECK(fb_console_render_vt==0);
+    CHECK(vt_text[context.vt-1].charset[0]==0);
     CHECK(context.vt==(graphical?1u:2u));
     CHECK(context.graphical==graphical);
     CHECK(console_active_vt==(graphical?1u:2u));

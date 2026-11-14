@@ -11,6 +11,7 @@ void kernel_free(void *ptr) { free(ptr); }
 static uint32_t pixels[80 * 48];
 static uint32_t full_clear_count;
 static uint32_t text_present_count;
+static uint32_t last_codepoint;
 static char serial_output[16384];
 static size_t serial_length;
 static const struct framebuffer display = {
@@ -44,10 +45,10 @@ void framebuffer_present_region(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 { (void)x; (void)y; (void)w; (void)h; ++text_present_count; }
 uint32_t framebuffer_codepoint_width(uint32_t c) { (void)c; return 1; }
 void framebuffer_codepoint(uint32_t x, uint32_t y, uint32_t c, uint32_t fg, uint32_t bg)
-{ (void)c; (void)bg; framebuffer_rect(x, y, 8, 16, fg); }
+{ last_codepoint = c; framebuffer_rect(x, y, 8, 16, c == ' ' ? bg : fg); }
 void framebuffer_codepoint_to(const struct framebuffer *target, uint32_t x, uint32_t y,
                               uint32_t c, uint32_t fg, uint32_t bg)
-{ (void)c; (void)bg; framebuffer_rect_to(target, x, y, 8, 16, fg); }
+{ last_codepoint = c; framebuffer_rect_to(target, x, y, 8, 16, c == ' ' ? bg : fg); }
 void serial_write(const char *text)
 {
     size_t length = strlen(text);
@@ -62,6 +63,45 @@ void kernel_irq_restore(uint64_t flags) { (void)flags; }
 uint32_t smp_current_cpu(void) { return 0; }
 uint32_t smp_cpu_count(void) { return 1; }
 void smp_membarrier_poll(void) {}
+
+/** @brief Keep text intact during BS motion and erase only explicitly overwritten cells. */
+static void test_backspace_preserves_text(void)
+{
+    static const char text[] = "\033[?25l\033[0m\033[2J\033[HABCDE";
+    uint32_t saved[80 * 48];
+    console_vt_write(2, text, sizeof(text) - 1);
+    memcpy(saved, pixels, sizeof(saved));
+    console_vt_write(2, "\b\b", 2);
+    assert(fb_col == 3 && fb_row == 0);
+    assert(memcmp(saved, pixels, sizeof(saved)) == 0);
+    console_vt_write(2, "\r\b", 2);
+    assert(fb_col == 0 && fb_row == 0);
+    assert(memcmp(saved, pixels, sizeof(saved)) == 0);
+
+    /* Canonical erase explicitly writes a space over E, then moves back. */
+    static const char erase[] = "\033[6G\b \b";
+    console_vt_write(2, erase, sizeof(erase) - 1);
+    assert(fb_col == 4 && fb_row == 0);
+    for (unsigned y = 0; y < 16; ++y)
+        for (unsigned x = 32; x < 40; ++x) saved[y * 80 + x] = 0;
+    assert(memcmp(saved, pixels, sizeof(saved)) == 0);
+
+    console_vt_write(2, text, sizeof(text) - 1);
+    memcpy(saved, pixels, sizeof(saved));
+    console_vt_write(2, "\033[?25h", sizeof("\033[?25h") - 1);
+    console_vt_write(2, "\b", 1);
+    assert(fb_col == 4 && fb_console_tty_cursor_visible);
+    fb_console_hide_tty_cursor();
+    assert(memcmp(saved, pixels, sizeof(saved)) == 0);
+
+    console_vt_activate(3, false);
+    console_vt_write(2, "\b", 1);
+    console_vt_activate(2, false);
+    assert(fb_col == 3);
+    fb_console_hide_tty_cursor();
+    assert(memcmp(saved, pixels, sizeof(saved)) == 0);
+    puts("BS cursor motion preserves foreground/background text, first-column bounds and explicit erase");
+}
 
 int main(void)
 {
@@ -139,6 +179,53 @@ int main(void)
     assert(strstr(vt_text[0].bytes, openrc_output) != NULL);
     assert(strstr(vt_text[0].bytes, service_output) != NULL);
     assert(strstr(vt_text[0].bytes, graphical_output) != NULL);
-    puts("VT boot continuity, terminal/diagnostic separation, serial mirror, graphics isolation and text cursor passed");
+    char key[8];
+    console_vt_activate(2, false);
+    console_vt_write(2, "\033[?1h", sizeof("\033[?1h") - 1);
+    assert(vga_console_key(2, 72, 1, key) == 3 && !memcmp(key, "\033OA", 3));
+    assert(vga_console_key(1, 72, 1, key) == 3 && !memcmp(key, "\033[A", 3));
+    assert(vga_console_key(2, 61, 1, key) == 3 && !memcmp(key, "\033OR", 3));
+    assert(vga_console_key(2, 15, 2, key) == 3 && !memcmp(key, "\033[Z", 3));
+    console_vt_write(2, "\033[?1l", sizeof("\033[?1l") - 1);
+    assert(vga_console_key(2, 72, 1, key) == 3 && !memcmp(key, "\033[A", 3));
+    console_vt_write(2, "\033(0q", sizeof("\033(0q") - 1);
+    assert(last_codepoint == 0x2500);
+    console_vt_write(2, "\033(Bq", sizeof("\033(Bq") - 1);
+    assert(last_codepoint == 'q');
+    console_vt_write(2, "\033)0\016x", sizeof("\033)0\016x") - 1);
+    assert(last_codepoint == 0x2502);
+    console_vt_write(2, "\017x", sizeof("\017x") - 1);
+    assert(last_codepoint == 'x');
+    console_vt_write(2, "\033[?25l", sizeof("\033[?25l") - 1);
+    assert(!fb_console_tty_cursor_visible);
+    console_vt_write(2, "\033[?25h", sizeof("\033[?25h") - 1);
+    assert(fb_console_tty_cursor_visible);
+    test_backspace_preserves_text();
+    static const char full_screen[] = "\033[?25l\033[44m\033[2J\033[H";
+    console_vt_write(2, full_screen, sizeof(full_screen) - 1);
+    for (unsigned i = 0; i < CONSOLE_VT_TEXT_CAP / 4u + 100u; ++i)
+        console_vt_write(2, "\033[Hq", 4);
+    memcpy(before, pixels, sizeof(pixels));
+    uint32_t foreground = fb_console_fg_color;
+    uint32_t background = fb_console_bg_color;
+    console_vt_activate(3, false);
+    console_vt_activate(2, false);
+    assert(memcmp(before, pixels, sizeof(pixels)) == 0);
+    assert(fb_console_fg_color == foreground && fb_console_bg_color == background);
+    console_vt_activate(3, false);
+    console_vt_write(2, "\033[42", 4);
+    console_vt_write(3, "\033[41m", 5);
+    console_vt_write(2, "m\033[2J\033[H", 8);
+    for (unsigned i = 0; i < CONSOLE_VT_TEXT_CAP / 4u + 100u; ++i)
+        console_vt_write(2, "\033[Hq", 4);
+    console_vt_activate(2, false);
+    assert(pixels[79 + 47 * 80] == 0x006fc77au);
+    assert(fb_console_bg_color == 0x006fc77au);
+    console_vt_write(2, "\xe4", 1);
+    console_vt_activate(3, false);
+    console_vt_write(3, "x", 1);
+    console_vt_write(2, "\xb8\xad", 2);
+    assert(last_codepoint == 0x4e2d);
+    puts("VT continuity, isolation, framebuffer ncurses keys, DEC graphics and cursor modes passed");
     return 0;
 }
