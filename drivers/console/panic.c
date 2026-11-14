@@ -65,6 +65,11 @@ struct console_panic_context console_panic_begin(void)
         fb_rows != active->height / RELIEFOS_FONT_H ||
         fb_col > fb_cols || fb_row >= fb_rows;
     fb_console_render_target = NULL;
+    fb_console_render_vt = 0;
+    if (context.vt >= 1u && context.vt <= CONSOLE_VT_COUNT) {
+        struct console_vt_text *state = &vt_text[context.vt - 1u];
+        state->charset[0] = state->charset[1] = state->charset_bank = 0;
+    }
     if (usable && !context.graphical) fb_console_hide_tty_cursor();
     console_boot_logo_active = false;
     console_vt_graphical = false;

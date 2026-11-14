@@ -22,6 +22,79 @@ static const uint32_t fb_ansi_colors[16] = {
 };
 static uint32_t fb_ansi_params[FB_ANSI_MAX_PARAMS];
 static bool fb_ansi_param_colon[FB_ANSI_MAX_PARAMS];
+static bool fb_ansi_dec_private;
+static uint8_t fb_ansi_charset_target;
+
+/**
+ * @brief Save the serialized renderer and partial ANSI/UTF-8 parser.
+ * @param state Required writable checkpoint storage owned by the caller.
+ */
+void fb_console_state_save(struct fb_console_state *state)
+{
+    state->utf8 = console_utf8;
+    state->x = fb_x;
+    state->y = fb_y;
+    state->cols = fb_cols;
+    state->rows = fb_rows;
+    state->col = fb_col;
+    state->row = fb_row;
+    state->saved_col = fb_saved_col;
+    state->saved_row = fb_saved_row;
+    state->foreground = fb_console_fg_color;
+    state->background = fb_console_bg_color;
+    state->bold = fb_console_bold;
+    state->underline = fb_console_underline;
+    state->reverse = fb_console_reverse;
+    state->underline_color = fb_console_underline_color;
+    state->underline_color_set = fb_console_underline_color_set;
+    state->scroll_top = fb_scroll_top;
+    state->scroll_bottom = fb_scroll_bottom;
+    state->ansi_state = fb_ansi_state;
+    state->param_count = fb_ansi_param_count;
+    state->param_value = fb_ansi_param_value;
+    state->param_active = fb_ansi_param_active;
+    state->private_mode = fb_ansi_private;
+    state->dec_private = fb_ansi_dec_private;
+    state->charset_target = fb_ansi_charset_target;
+    __builtin_memcpy(state->params, fb_ansi_params, sizeof(state->params));
+    __builtin_memcpy(state->param_colon, fb_ansi_param_colon, sizeof(state->param_colon));
+}
+
+/**
+ * @brief Restore a renderer checkpoint for its retained pixel surface.
+ * @param state Required checkpoint saved for the matching surface layout.
+ */
+void fb_console_state_restore(const struct fb_console_state *state)
+{
+    console_utf8 = state->utf8;
+    fb_x = state->x;
+    fb_y = state->y;
+    fb_cols = state->cols;
+    fb_rows = state->rows;
+    fb_col = state->col;
+    fb_row = state->row;
+    fb_saved_col = state->saved_col;
+    fb_saved_row = state->saved_row;
+    fb_console_fg_color = state->foreground;
+    fb_console_bg_color = state->background;
+    fb_console_bold = state->bold;
+    fb_console_underline = state->underline;
+    fb_console_reverse = state->reverse;
+    fb_console_underline_color = state->underline_color;
+    fb_console_underline_color_set = state->underline_color_set;
+    fb_scroll_top = state->scroll_top;
+    fb_scroll_bottom = state->scroll_bottom;
+    fb_ansi_state = state->ansi_state;
+    fb_ansi_param_count = state->param_count;
+    fb_ansi_param_value = state->param_value;
+    fb_ansi_param_active = state->param_active;
+    fb_ansi_private = state->private_mode;
+    fb_ansi_dec_private = state->dec_private;
+    fb_ansi_charset_target = state->charset_target;
+    __builtin_memcpy(fb_ansi_params, state->params, sizeof(state->params));
+    __builtin_memcpy(fb_ansi_param_colon, state->param_colon, sizeof(state->param_colon));
+}
+
 static uint32_t fb_ansi_param(uint32_t index, uint32_t fallback)
 {
     if (index >= fb_ansi_param_count) {
@@ -117,6 +190,18 @@ static bool fb_console_apply_extended_color(uint32_t index,
 static void fb_console_execute_csi(char final)
 {
     uint32_t n = fb_ansi_param_count;
+    uint32_t number = fb_console_render_vt ? fb_console_render_vt : console_active_vt;
+    if (fb_ansi_private) {
+        if (fb_ansi_dec_private && (final == 'h' || final == 'l') &&
+            number && number <= CONSOLE_VT_COUNT) {
+            struct console_vt_text *state = &vt_text[number - 1];
+            for (uint32_t i = 0; i < n; ++i) {
+                if (fb_ansi_params[i] == 1) state->application_cursor = final == 'h';
+                if (fb_ansi_params[i] == 25) state->cursor_hidden = final == 'l';
+            }
+        }
+        return;
+    }
     uint32_t p0 = fb_ansi_param(0, (final == 'J' || final == 'K') ? 0u : 1u);
     uint32_t p1 = fb_ansi_param(1, 1);
     uint32_t movement = p0 ? p0 : 1u;
@@ -276,11 +361,17 @@ static void fb_console_execute_csi(char final)
 void fb_console_ansi_feed(char ch)
 {
     unsigned char byte = (unsigned char)ch;
+    uint32_t number = fb_console_render_vt ? fb_console_render_vt : console_active_vt;
     if (!fb_console_enabled) {
         return;
     }
     if (fb_ansi_state == FB_ANSI_NORMAL) {
-        if (byte == 0x07u || byte == 0x7fu || byte == 0x00u || byte == 0x0eu || byte == 0x0fu) {
+        if (byte == 0x0eu || byte == 0x0fu) {
+            if (number && number <= CONSOLE_VT_COUNT)
+                vt_text[number - 1].charset_bank = byte == 0x0e;
+            return;
+        }
+        if (byte == 0x07u || byte == 0x7fu || byte == 0x00u) {
             return;
         }
         if (byte == 0x1bU) {
@@ -296,6 +387,7 @@ void fb_console_ansi_feed(char ch)
             fb_ansi_param_count = 0;
             fb_ansi_param_value = 0;
             fb_ansi_param_active = false;
+            fb_ansi_dec_private = false;
             return;
         }
         if (ch == '7') {
@@ -305,6 +397,11 @@ void fb_console_ansi_feed(char ch)
             return;
         }
         if (ch == 'c') {
+            if (number && number <= CONSOLE_VT_COUNT) {
+                struct console_vt_text *state = &vt_text[number - 1];
+                state->application_cursor = state->cursor_hidden = false;
+                state->charset[0] = state->charset[1] = state->charset_bank = 0;
+            }
             fb_col = 0;
             fb_row = 0;
             fb_scroll_top = 0;
@@ -331,6 +428,7 @@ void fb_console_ansi_feed(char ch)
             return;
         }
         if (ch == '(' || ch == ')') {
+            fb_ansi_charset_target = ch == ')';
             fb_ansi_state = FB_ANSI_CHARSET;
             return;
         }
@@ -354,6 +452,8 @@ void fb_console_ansi_feed(char ch)
         return;
     }
     if (fb_ansi_state == FB_ANSI_CHARSET) {
+        if (number && number <= CONSOLE_VT_COUNT)
+            vt_text[number - 1].charset[fb_ansi_charset_target] = ch == '0';
         fb_console_reset_ansi();
         return;
     }
@@ -372,6 +472,7 @@ void fb_console_ansi_feed(char ch)
     if ((ch == '?' || ch == '>') && !fb_ansi_param_count &&
         !fb_ansi_param_active) {
         fb_ansi_private = true;
+        fb_ansi_dec_private = ch == '?';
         return;
     }
     if (byte >= '0' && byte <= '9') {
@@ -398,9 +499,7 @@ void fb_console_ansi_feed(char ch)
                 fb_ansi_param_active ? fb_ansi_param_value : 0u;
             fb_ansi_param_colon[fb_ansi_param_count - 1u] = false;
         }
-        if (!fb_ansi_private) {
-            fb_console_execute_csi(ch);
-        }
+        fb_console_execute_csi(ch);
         fb_console_reset_ansi();
         return;
     }

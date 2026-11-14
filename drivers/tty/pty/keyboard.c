@@ -231,8 +231,8 @@ void pty_console_key_event(uint8_t keycode, uint8_t pressed)
         return;
     }
     if (!pressed) return;
-    length=console_vga_text_mode ? vga_console_key(pty_id,keycode,
-        1u+(console_shift_down?1u:0u)+(console_alt_down?2u:0u)+(console_ctrl_down?4u:0u),bytes) : 0;
+    length=vga_console_key(pty_id,keycode,
+        1u+(console_shift_down?1u:0u)+(console_alt_down?2u:0u)+(console_ctrl_down?4u:0u),bytes);
     if (!length && !console_key_to_bytes(keycode,bytes,&length)) return;
     /* Feed through the same canonical/ISIG handling used by PTY hosts. */
     (void)pty_write_input(session->owner_pid, pty_id, bytes, length);
