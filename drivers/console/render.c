@@ -306,11 +306,9 @@ static void fb_console_scalar(uint32_t ch)
         return;
     }
     if (ch == '\b') {
+        /* Readline uses BS to move across existing text. */
         if (fb_col) {
             --fb_col;
-            fb_console_rect(fb_x + fb_col * RELIEFOS_FONT_W,
-                            fb_y + fb_row * RELIEFOS_FONT_H,
-                            RELIEFOS_FONT_W, RELIEFOS_FONT_H, fb_console_bg_color);
         }
         return;
     }
