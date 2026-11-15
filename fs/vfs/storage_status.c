@@ -65,6 +65,8 @@ const char *storage_root_filesystem_name(void)
         return "exfat";
     case STORAGE_FILESYSTEM_EXT2:
         return "ext2";
+    case STORAGE_FILESYSTEM_EXT3:
+        return "ext3";
     case STORAGE_FILESYSTEM_EXT4:
         return "ext4";
     case STORAGE_FILESYSTEM_FAT32:

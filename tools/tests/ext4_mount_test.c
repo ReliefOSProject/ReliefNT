@@ -636,12 +636,12 @@ int main(int argc, char **argv)
         case_ro(image, STORAGE_EXT4_READ_ONLY_UNKNOWN_RO_COMPAT, STORAGE_FILESYSTEM_EXT4,
                 "UNKNOWN_RO_COMPAT on a classic ext2 shape");
     else if (!strcmp(test_case, "journal-recover"))
-        case_ro(image, STORAGE_EXT4_READ_ONLY_NONE, STORAGE_FILESYSTEM_EXT4,
+        case_ro(image, STORAGE_EXT4_READ_ONLY_NONE, STORAGE_FILESYSTEM_EXT3,
                 "empty journal recovered");
     else if (!strcmp(test_case, "journal-clean"))
-        case_ro(image, STORAGE_EXT4_READ_ONLY_NONE, STORAGE_FILESYSTEM_EXT4, "clean journal");
+        case_ro(image, STORAGE_EXT4_READ_ONLY_NONE, STORAGE_FILESYSTEM_EXT3, "clean journal");
     else if (!strcmp(test_case, "journal-corrupt"))
-        case_ro(image, STORAGE_EXT4_READ_ONLY_JOURNAL_CORRUPT, STORAGE_FILESYSTEM_EXT4, "corrupt journal");
+        case_ro(image, STORAGE_EXT4_READ_ONLY_JOURNAL_CORRUPT, STORAGE_FILESYSTEM_EXT3, "corrupt journal");
     else if (!strcmp(test_case, "bare-recover"))
         case_ro(image, STORAGE_EXT4_READ_ONLY_JOURNAL_NEEDS_RECOVERY, STORAGE_FILESYSTEM_EXT4,
                 "bare RECOVER without HAS_JOURNAL");

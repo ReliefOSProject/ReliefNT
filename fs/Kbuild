@@ -3,6 +3,7 @@
 obj-y := initramfs/ devfs/ proc/ security/ sysfs/ tmpfs/ vfs/ notify/
 obj-$(CONFIG_EXT_FS_COMMON) += ext_common/
 obj-$(CONFIG_EXT2_FS) += ext2/
+obj-$(CONFIG_EXT3_FS) += ext3/
 obj-$(CONFIG_EXT4_FS) += ext4/
 obj-$(CONFIG_FAT_FS) += fat/
 obj-$(CONFIG_EXFAT_FS) += exfat/

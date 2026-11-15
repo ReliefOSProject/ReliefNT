@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-$(CONFIG_EXT3_FS) := ext3.o
+ext3-y := type.o
+include $(srctree)/scripts/Makefile.module

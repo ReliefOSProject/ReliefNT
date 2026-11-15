@@ -229,7 +229,8 @@ static bool ext_native_super_group(uint32_t group, bool sparse)
 static int ext_native_statfs(struct storage_volume *volume,struct linux_statfs_abi *value)
 {
     int ret=0;
-    if(volume->filesystem==STORAGE_FILESYSTEM_EXT4)return storage_ext4_ops.statfs(volume,value);
+    if(volume->filesystem==STORAGE_FILESYSTEM_EXT4 || volume->filesystem==STORAGE_FILESYSTEM_EXT3)
+        return storage_ext4_ops.statfs(volume,value);
     struct ext2_superblock super;
     ret = storage_read_sectors(volume->ext2_start_lba + 2, 2, storage_scratch);
     if (ret < 0) return ret;

@@ -146,6 +146,10 @@ static int storage_filesystem_from_name(const char *filesystem, uint32_t *out_fi
         *out_filesystem = RELIEFOS_DISK_FILESYSTEM_EXT2;
         return 0;
     }
+    if (storage_text_eq_ci(filesystem, "ext3")) {
+        *out_filesystem = RELIEFOS_DISK_FILESYSTEM_EXT3;
+        return 0;
+    }
     if (storage_text_eq_ci(filesystem, "ext4")) {
         *out_filesystem = RELIEFOS_DISK_FILESYSTEM_EXT4;
         return 0;
@@ -179,6 +183,7 @@ static int storage_existing_block_partition(uint32_t disk,uint32_t partition,uin
         uint32_t actual=volume->filesystem==STORAGE_FILESYSTEM_FAT32 ? RELIEFOS_DISK_FILESYSTEM_FAT32 :
             volume->filesystem==STORAGE_FILESYSTEM_EXFAT ? RELIEFOS_DISK_FILESYSTEM_EXFAT :
             volume->filesystem==STORAGE_FILESYSTEM_EXT2 ? RELIEFOS_DISK_FILESYSTEM_EXT2 :
+            volume->filesystem==STORAGE_FILESYSTEM_EXT3 ? RELIEFOS_DISK_FILESYSTEM_EXT3 :
             volume->filesystem==STORAGE_FILESYSTEM_EXT4 ? RELIEFOS_DISK_FILESYSTEM_EXT4 : RELIEFOS_DISK_FILESYSTEM_UNKNOWN;
         if(!actual)return -EOPNOTSUPP;
         if(requested && requested!=actual)return -EINVAL;
@@ -302,13 +307,15 @@ static int storage_open_block_partition_owned(uint32_t disk_id, uint32_t partiti
     g_active_volume = volume;
     ret = storage_mount_filesystem(volume,filesystem == RELIEFOS_DISK_FILESYSTEM_FAT32 ? "vfat" :
           filesystem == RELIEFOS_DISK_FILESYSTEM_EXFAT ? "exfat" :
-          filesystem == RELIEFOS_DISK_FILESYSTEM_EXT2 ? "ext2" : "ext4");
+          filesystem == RELIEFOS_DISK_FILESYSTEM_EXT2 ? "ext2" :
+          filesystem == RELIEFOS_DISK_FILESYSTEM_EXT3 ? "ext3" : "ext4");
     if (ret == 0 &&
         ((filesystem == RELIEFOS_DISK_FILESYSTEM_FAT32 &&
           volume->filesystem != STORAGE_FILESYSTEM_FAT32) ||
          (filesystem == RELIEFOS_DISK_FILESYSTEM_EXFAT &&
           volume->filesystem != STORAGE_FILESYSTEM_EXFAT) ||
          ((filesystem == RELIEFOS_DISK_FILESYSTEM_EXT2 ||
+           filesystem == RELIEFOS_DISK_FILESYSTEM_EXT3 ||
            filesystem == RELIEFOS_DISK_FILESYSTEM_EXT4) &&
           !storage_filesystem_is_ext(volume)))) {
         ret = -5;
@@ -320,7 +327,8 @@ static int storage_open_block_partition_owned(uint32_t disk_id, uint32_t partiti
                        disk_id, partition_index,
                        filesystem == RELIEFOS_DISK_FILESYSTEM_FAT32 ? "fat32" :
                        (filesystem == RELIEFOS_DISK_FILESYSTEM_EXFAT ? "exfat" :
-                        (filesystem == RELIEFOS_DISK_FILESYSTEM_EXT4 ? "ext4" : "ext2")));
+                        (filesystem == RELIEFOS_DISK_FILESYSTEM_EXT4 ? "ext4" :
+                         filesystem == RELIEFOS_DISK_FILESYSTEM_EXT3 ? "ext3" : "ext2")));
         if (out_volume_id) {
             *out_volume_id = volume_id;
         }

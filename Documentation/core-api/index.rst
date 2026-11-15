@@ -19,5 +19,7 @@
    network-devices
    e1000e
    realtek
+   vmxnet3
+   ext3
    usb
    svga
