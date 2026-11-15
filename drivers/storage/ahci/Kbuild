@@ -1,4 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
 obj-$(CONFIG_SATA_AHCI) += ahci.o
-ahci-y := storage_ahci.o dma.o probe.o
+ahci-y := storage_ahci.o dma.o interrupt.o probe.o
 include $(srctree)/scripts/Makefile.module

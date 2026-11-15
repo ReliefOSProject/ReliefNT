@@ -5,6 +5,7 @@
 #include <reliefnt/module.h>
 #include <reliefnt/usb.h>
 #include <reliefnt/fsnotify_vfs.h>
+#include <reliefnt/storage_wait.h>
 #include <linux/inotify.h>
 
 /** @brief Distinguish a nonblocking stream result from an internal I/O wait.
@@ -343,6 +344,7 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
         (int32_t)(number==LINUX_SYS_MMAP ? frame->r8 : frame->rdi),
         number==LINUX_SYS_MMAP ? frame->r10 : frame->rdx);
     task_lookup_scope_begin(calling_task,frame);
+    uint64_t storage_generation=storage_wait_begin();
     storage_set_io_async_context(true);
     if (pin_error) {
         result = pin_error;
@@ -528,15 +530,14 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
         /* sigreturn and successful exec already supplied the user context. */
     } else if (result == KERNEL_SYSCALL_BLOCKED ||
                (result == -RELIEFOS_EAGAIN && !eagain_from_nonblocking)) {
-        /* int $0x80 has advanced RIP by two bytes.  Park this task for one
-         * timer tick and re-execute the exact same instruction when its AHCI
-         * DMA request can be polled again.  User programs keep normal
-         * blocking read/open/stat semantics and never observe EAGAIN. */
+        /* Retry the original instruction after a completion notification or
+         * bounded fallback. Registration happens only after driver locks
+         * unwind; the generation closes IRQ-before-sleep on another CPU. */
         frame->rax = number;
         frame->rip -= 2u;
         if (calling_task) calling_task->restart_syscall = number + 1;
         if (result != KERNEL_SYSCALL_BLOCKED)
-            sched_sleep_current_until(time_ticks() + 1u);
+            storage_wait_sleep(storage_generation);
         kernel_execution_unlock_irqrestore(lock_flags);
         return NULL;
     }

@@ -11,6 +11,8 @@
 #define AHCI_PORT_TFD_BSY 0x80u
 #define AHCI_PORT_TFD_DRQ 0x08u
 #define AHCI_PORT_IS_TFES 0x40000000u
+#define AHCI_PORT_ERROR_MASK ((0x1fu<<26) | (1u<<24))
+#define AHCI_IRQ_MASK (0x3fu | AHCI_PORT_ERROR_MASK)
 #define AHCI_PORT_SIG_ATA 0x00000101u
 #define AHCI_PORT_SIG_ATAPI 0xeb140101u
 #define AHCI_PORT_DET_PRESENT 0x3u
@@ -21,16 +23,16 @@
 
 #define AHCI_CMDH_PRDTL 1u
 #define AHCI_MAX_SECTORS 64u
-/* AHCI completion is polled synchronously. Keep enough headroom for a busy
+/* Non-replayable writes and boot/reclaim I/O poll synchronously. Retain a bound
  * virtual disk: a too-short limit abandons a live command and turns the next
  * application image read into a spurious -EIO. Filesystem syscalls already
  * bound each transfer, which is the responsiveness control for this path. */
 #define AHCI_WAIT_SPINS 40000000u
 /* Most virtual AHCI reads complete just after the command is submitted.  In
- * asynchronous syscall context, poll briefly before yielding a whole PIT
- * tick: this keeps application image and UI-resource loading fast without
+ * asynchronous syscall context, poll briefly before IRQ-driven waiting (one
+ * tick when no IRQ is available): this keeps image/resource loading fast without
  * restoring the old unbounded Ring-0 busy wait on a slow disk. */
-#define AHCI_ASYNC_FAST_POLL_SPINS 8192u
+#define AHCI_ASYNC_FAST_POLL_SPINS 128u
 /* A pending asynchronous command may be polled by transparently resumed
  * syscalls for at most five seconds. A failed virtual controller must not
  * leave a task blocked forever. */

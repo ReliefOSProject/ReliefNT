@@ -37,9 +37,11 @@ int driver_request_pci_msix_irq(const struct reliefos_driver_pci_device *dev,
 void pci_irq_dispatch(uint32_t vector);
 /** @brief Disable MSI/MSI-X, drain ISR pins and retire the vector until reboot.
  * @param handle Owned generation token; stale/duplicate frees are harmless.
- * @return None. Task context only, no execution lock and never from handler.
- * Caller first masks the device source and keeps callback memory alive until
- * return. DMA quiescence must be established before freeing DMA resources.
+ * @return None. Task context only, never from handler or with a lock needed by
+ * it. Execution ownership is allowed only if the handler never acquires it.
+ * Caller first closes command/source admission and retains callback memory
+ * through return. PCI messages are disabled before draining callback pins;
+ * DMA quiescence must be established before freeing DMA resources.
  * Pending messages can still arrive; the vector never names a new owner.
  */
 void pci_free_irq(uint32_t handle);

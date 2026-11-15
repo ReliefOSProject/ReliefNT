@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "../../kernel/sync/wait.c"
+#include "../../block/core/storage_wait.c"
 
 #define CONCURRENT_TASKS 24u
 #define REMOVE_WAKE_ROUNDS 64u
@@ -27,6 +28,8 @@ static bool race_sleep_entered;
 static atomic_bool race_wait_for_notify;
 static bool race_block_before_wait;
 static atomic_uint sleep_call_count;
+static uint64_t last_sleep_tick;
+uint64_t time_ticks(void) { return 10; }
 static struct kernel_wait_queue *unlock_wake_queue;
 
 void kernel_spin_init(struct kernel_spinlock *lock)
@@ -81,7 +84,7 @@ void sched_block_current(void)
 
 void sched_sleep_current_until(uint64_t wake_tick)
 {
-    (void)wake_tick;
+    last_sleep_tick=wake_tick;
     atomic_fetch_add_explicit(&sleep_call_count, 1u, memory_order_relaxed);
 
     if (!atomic_load_explicit(&race_wait_for_notify, memory_order_acquire)) {
@@ -501,6 +504,21 @@ static int test_exit_unlink_races_wake(void)
 
 int main(void)
 {
+    struct task storage_task;task_init(&storage_task,777,TASK_RUNNING);
+    current_task=&storage_task;
+    uint64_t observed=storage_wait_begin();
+    storage_completion_notify();storage_wait_sleep(observed);
+    if(storage_task.state!=TASK_RUNNING || storage_task.waiting_queue)return EXIT_FAILURE;
+    observed=storage_wait_begin();storage_wait_hint(510);storage_wait_sleep(observed);
+    if(storage_task.state!=TASK_BLOCKED || last_sleep_tick!=510)return EXIT_FAILURE;
+    storage_completion_notify();
+    if(storage_task.state!=TASK_READY || storage_task.waiting_queue)return EXIT_FAILURE;
+    storage_task.state=TASK_RUNNING;observed=storage_wait_begin();storage_wait_sleep(observed);
+    if(storage_task.state!=TASK_BLOCKED || last_sleep_tick!=11)return EXIT_FAILURE;
+    storage_task.state=TASK_RUNNING;(void)storage_wait_begin();
+    if(storage_task.waiting_queue)return EXIT_FAILURE;
+    current_task=NULL;
+    puts("PASS storage completion-before-sleep, IRQ wake, provider timeout, polling fallback and retry unlink");
     if (test_poll_stale_generation_does_not_sleep()) return EXIT_FAILURE;
     if (test_queue_wake_at_registration_unlock()) return EXIT_FAILURE;
     if (test_poll_notify_race(POLL_NOTIFY_BEFORE_BLOCKED)) return EXIT_FAILURE;

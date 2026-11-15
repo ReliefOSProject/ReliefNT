@@ -12,13 +12,6 @@ struct ahci_disk {
     struct ahci_hba_port *port;
     struct block_device_registration registration;
 };
-struct ahci_controller {
-    struct ahci_hba_mem *abar;
-    size_t bytes;
-    struct ahci_disk *disks;
-    uint32_t implemented;
-    uint8_t bus,slot,function;
-};
 
 /** @brief Enter one ATA/ATAPI read using a pinned registration and owned DMA.
  * @param context Stable driver-owned disk. @param first First logical block.
@@ -64,6 +57,7 @@ static const struct block_device_operations ahci_operations={.read=ahci_disk_rea
 static int ahci_controller_stop(void *context)
 {
     struct ahci_controller *controller=context;int rc=0;
+    ahci_interrupt_stop(controller);
     for(unsigned p=0;p<32;++p)if(controller->implemented&(1u<<p))
         if(ahci_stop_port(&controller->abar->ports[p]))rc=-EIO;
     if(!rc) {
@@ -108,6 +102,7 @@ static int ahci_probe_disk(struct ahci_controller *controller,unsigned port)
     bool optical=p->sig==AHCI_PORT_SIG_ATAPI;
     int rc=ahci_setup_port(p,controller->abar->cap&(1u<<31) ? UINT64_MAX : UINT32_MAX);
     if(rc)return rc;
+    controller->ports[port]=ahci_dma_find(p);
     struct block_device_info info={.block_size=optical ? 2048u : 512u,.max_blocks=optical ? 32u : AHCI_MAX_SECTORS,
         .transport=STORAGE_TRANSPORT_AHCI,.bus=controller->bus,.slot=controller->slot,
         .function=controller->function,.port=port};
@@ -184,6 +179,9 @@ static int ahci_probe_controller(const struct pci_device *device)
         int result=ahci_probe_disk(controller,p);
         if(result)console_warn("[ahci] unavailable pci=%u:%u.%u port=%u status=%d\n",device->bus,device->slot,device->function,p,result);
     }
+    ahci_interrupt_start(controller);
+    console_info("[ahci] controller pci=%u:%u.%u irq=%s\n",controller->bus,
+        controller->slot,controller->function,controller->irq_handle ? "msi" : "poll");
     return 0;
 }
 

@@ -45,6 +45,20 @@ void console_log(enum console_log_level level, const char *format, ...)
 }
 
 #include "../../drivers/storage/ahci/storage_ahci.c"
+#include <reliefnt/pci_irq.h>
+
+void kernel_spin_lock_irqsave(struct kernel_spinlock *lock,uint64_t *flags)
+{ *flags=0;assert(!lock->state);lock->state=1; }
+void kernel_spin_unlock_irqrestore(struct kernel_spinlock *lock,uint64_t flags)
+{ (void)flags;assert(lock->state);lock->state=0; }
+static unsigned notifications;
+void storage_completion_notify(void) { ++notifications; }
+void storage_wait_hint(uint64_t deadline) { assert(deadline>time_ticks()); }
+static void (*irq_handler)(void *);
+static void *irq_context;
+int pci_request_irq(const struct reliefos_driver_pci_device *dev,void (*handler)(void *),void *arg,uint32_t *out)
+{ (void)dev;irq_handler=handler;irq_context=arg;*out=1;return 0; }
+void pci_free_irq(uint32_t handle) { assert(handle==1); }
 
 /* Model hardware completing an already-issued slot after synchronous polling
  * begins. These are fake MMIO registers, not a hardware or guest test. */
@@ -114,6 +128,19 @@ int main(void)
     assert(!ahci_prepare_command(dma,AHCI_PACKET_CAPACITY,0,1,current));
     assert(table->acmd[0]==0x25 && !table->acmd[8] && table->prdt[0].dbc==7);
     assert(!dma_buffer_end(&dma->data,NULL,true));
+    /* Once a write was issued it must finish synchronously even if the caller
+     * accidentally retained read-replay admission. No write may be replayed. */
+    {
+        assert(!ahci_prepare_command(dma,AHCI_WRITE,100,1,current));
+        ahci_pending_command=(struct ahci_pending_command){.active=1,.port=&port,.dma=dma,
+            .write=1,.owner_pid=7,.operation=AHCI_WRITE,.sector_count=1};
+        port.ci=1;port.is=0;storage_io_async_context=true;
+        struct fixture_completion write_completion={.port=&port};pthread_t write_hardware;
+        assert(!pthread_create(&write_hardware,NULL,fixture_complete_later,&write_completion));
+        assert(!ahci_pending_poll(NULL));
+        assert(!pthread_join(write_hardware,NULL));
+        assert(!dma->data.busy && !ahci_pending_command.active);
+    }
     /* Deferred cleanup may execute as the real idle PID. Forced synchronous
      * completion still owns its DMA and must not be cancelled as PID 7. */
     fixture_pid=0;storage_io_async_context=false;
@@ -146,6 +173,25 @@ int main(void)
     assert(freed == before && ahci_dma_find(&port) == dma && dma->data.busy);
     port.cmd = 0; /* External hardware STOP finally acknowledged. */
     assert(!ahci_release_ports() && !ahci_dma_find(&port));
+    /* Fake RAM needs an explicit hardware-side W1C effect. The assertion is
+     * about preserved evidence after the real ISR acknowledges PxIS, not about
+     * treating RAM's write of ones as an emulation of the device register. */
+    struct ahci_hba_mem hba={0};
+    struct ahci_controller controller={.abar=&hba,.implemented=1};
+    assert(!ahci_setup_port(&hba.ports[0],UINT32_MAX));
+    controller.ports[0]=ahci_dma_find(&hba.ports[0]);
+    ahci_interrupt_start(&controller);
+    assert(controller.irq_handle && hba.ports[0].ie==AHCI_IRQ_MASK);
+    hba.is=1;hba.ports[0].is=AHCI_PORT_IS_TFES;
+    irq_handler(irq_context);
+    hba.is=0;hba.ports[0].is=0; /* Model the hardware W1C result. */
+    assert(notifications==1 && (ahci_interrupt_status(&hba.ports[0])&AHCI_PORT_IS_TFES));
+    ahci_interrupt_begin(controller.ports[0]);hba.ports[0].is=0;
+    assert(!ahci_interrupt_status(&hba.ports[0]));
+    irq_handler(irq_context);assert(notifications==1);
+    ahci_interrupt_stop(&controller);
+    assert(!controller.irq_handle && !hba.ports[0].ie && !(hba.ghc&2));
+    assert(!ahci_release_ports());
     assert(!heap_objects && allocated == freed);
     puts("AHCI completion: retry/cancel, real owned DMA/IDENTIFY/ATAPI, failed STOP retention PASS");
 }

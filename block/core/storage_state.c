@@ -25,18 +25,17 @@ uint64_t storage_metadata_generation(void)
     return storage_metadata_epoch;
 }
 
+/** @brief Set replay admission for the current execution-owned storage transaction.
+ * @param enabled Permit read continuation before mutation; never drops the owner.
+ * Execution writer serializes flags/cache/volume selection on every CPU. Native
+ * transports retain their DMA independently of any syscall stack or CPU.
+ */
 void storage_set_io_async_context(bool enabled)
 {
-    /* The asynchronous path stores a single pending command, scratch DMA
-     * buffer and owner PID globally.  It is safe only while there is one
-     * possible caller.  On SMP every operation is completed synchronously
-     * inside its storage transaction; a page fault must never inherit or
-     * overwrite another CPU's resumable command state. */
-    if (smp_cpu_count() > 1u) {
-        storage_io_async_context = false;
-        storage_io_write_started = true;
-        return;
-    }
+    /* This enables serialized continuations, not simultaneous filesystem
+     * transactions: storage_acquire_task_io retains a PID across the unwind.
+     * A competing disk caller must acquire that owner before selecting state.
+     * IRQs touch only transport completion state and the permanent wait queue. */
     storage_io_async_context = enabled;
     storage_io_write_started = false;
 }
@@ -88,21 +87,14 @@ void storage_release_task_io(uint32_t pid)
 }
 
 /**
- * @brief Test whether the current single-CPU read transaction may be retried after yielding.
- * @return True only for an asynchronous context before any write and with at most one CPU.
+ * @brief Test whether the execution-owned read transaction can unwind and retry.
+ * @return True only in asynchronous context before the first irreversible write.
  * @par Context
  * Caller holds storage execution ownership; shared volume/cache state must remain selected and live throughout the call.
  */
 bool storage_async_can_yield(void)
 {
-    /* AHCI command descriptors, DMA staging buffers, filesystem caches and
-     * the pending-command record are still single-instance state.  Allowing
-     * a command to survive a syscall yield lets another CPU reuse that state
-     * before the original instruction is retried.  Keep the fast retry mode
-     * for the single-CPU legacy path, but use a fully synchronous transaction
-     * once SMP is active. */
-    return storage_io_async_context && !storage_io_write_started &&
-           smp_cpu_count() <= 1u;
+    return storage_io_async_context && !storage_io_write_started;
 }
 
 /**

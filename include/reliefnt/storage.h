@@ -366,19 +366,22 @@ struct boot_info;
  */
 void storage_init(void);
 /**
- * @brief Toggle asynchronous I/O for the calling context on or off.
+ * @brief Set read replay admission under the global execution writer.
+ * @param enabled Allow a disk-owner continuation before any irreversible write.
+ * SMP callers remain serialized by the same execution/owner protocol.
  */
 void storage_set_io_async_context(bool enabled);
 /* Read under the kernel execution lock; changes on writes and mount/cache resets. */
 uint64_t storage_metadata_generation(void);
 /**
- * @brief Abandon any in-flight I/O owned by pid without completing it.
+ * @brief Release generic disk transaction ownership after provider drain/completion.
+ * @param pid Owner identity, zero ignored; execution writer required.
  */
 void storage_release_task_io(uint32_t pid);
 /**
  * @brief Drain/discard an exiting task's I/O without dereferencing saved memory.
  * @param pid Exiting task identity, zero ignored; reaper context only under the
- * single-CPU async ownership protocol. On timeout live DMA backing remains owned
+ * serialized async ownership protocol. On timeout live DMA backing remains owned
  * and quarantined by the controller, independently of the task's address space.
  */
 void storage_drain_task_io(uint32_t pid);

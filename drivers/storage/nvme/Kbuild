@@ -1,4 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
 obj-$(CONFIG_BLK_DEV_NVME) += nvme.o
-nvme-y := storage_nvme.o module.o
+nvme-y := storage_nvme.o queue.o module.o
 include $(srctree)/scripts/Makefile.module

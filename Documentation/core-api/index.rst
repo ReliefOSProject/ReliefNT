@@ -16,6 +16,7 @@
    path-cache
    resource-limits
    drivers
+   storage-completion
    network-devices
    e1000e
    realtek

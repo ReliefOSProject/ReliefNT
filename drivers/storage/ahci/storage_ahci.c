@@ -5,6 +5,7 @@
 #include <reliefnt/sched.h>
 #include <reliefnt/syscall.h>
 #include <reliefnt/time.h>
+#include <reliefnt/storage_wait.h>
 
 /* The transport lock serializes one command across ports. Pending records keep
  * caller pointers only as identity; DMA always targets independently owned pages. */
@@ -48,7 +49,7 @@ static int ahci_async_fast_poll_idle(struct ahci_hba_port *port)
 static int ahci_async_fast_poll_command(struct ahci_hba_port *port)
 {
     for (uint32_t i = 0; i < AHCI_ASYNC_FAST_POLL_SPINS; ++i) {
-        if (port->is & AHCI_PORT_IS_TFES) return -5;
+        if (ahci_interrupt_status(port) & AHCI_PORT_ERROR_MASK) return -5;
         if (!(port->ci & 1u)) return 0;
         ahci_cpu_relax();
     }
@@ -108,7 +109,7 @@ static void ahci_log_pending_failure(const char *reason, struct ahci_hba_port *p
                   ahci_pending_command.write ? "write" : "read",
                   ahci_pending_command.owner_pid,
                   (unsigned long long)ahci_pending_command.lba,
-                  ahci_pending_command.sector_count, port->ci, port->is,
+                  ahci_pending_command.sector_count, port->ci, ahci_interrupt_status(port),
                   port->tfd, port->serr);
 }
 
@@ -123,19 +124,22 @@ static int ahci_pending_poll(void *destination)
     struct ahci_hba_port *port = ahci_pending_command.port;
     struct ahci_port_dma *dma = ahci_pending_command.dma;
     if (!ahci_pending_command.active || !port) return -22;
-    if (port->is & AHCI_PORT_IS_TFES) goto failed;
+    if (ahci_interrupt_status(port) & AHCI_PORT_ERROR_MASK) goto failed;
     if (port->ci & 1u) {
-        if (storage_async_can_yield()) {
+        if (!ahci_pending_command.write && storage_async_can_yield()) {
             int result = ahci_async_fast_poll_command(port);
             if (result != -RELIEFOS_EAGAIN) goto complete;
-            if (time_ticks() - ahci_pending_command.start_tick < AHCI_ASYNC_TIMEOUT_TICKS)
+            if (time_ticks() - ahci_pending_command.start_tick < AHCI_ASYNC_TIMEOUT_TICKS) {
+                if(dma && dma->irq_enabled)
+                    storage_wait_hint(ahci_pending_command.start_tick+AHCI_ASYNC_TIMEOUT_TICKS);
                 return -RELIEFOS_EAGAIN;
+            }
             ahci_log_pending_failure("timeout", port);
             ahci_pending_clear();
             return -5;
         }
         for (uint32_t i = 0; i < AHCI_WAIT_SPINS; ++i) {
-            if (port->is & AHCI_PORT_IS_TFES) goto failed;
+            if (ahci_interrupt_status(port) & AHCI_PORT_ERROR_MASK) goto failed;
             if (!(port->ci & 1u)) goto complete;
             ahci_cpu_relax();
         }
@@ -144,7 +148,7 @@ static int ahci_pending_poll(void *destination)
         return -5;
     }
 complete:
-    if (port->is & AHCI_PORT_IS_TFES) goto failed;
+    if (ahci_interrupt_status(port) & AHCI_PORT_ERROR_MASK) goto failed;
     ahci_memory_barrier();
     if (dma && dma->data.busy) {
         int result = dma_buffer_end(&dma->data, destination, true);
@@ -153,7 +157,8 @@ complete:
     ahci_pending_clear();
     return 0;
 failed:
-    ahci_log_pending_failure("task-file error", port);
+    ahci_log_pending_failure(ahci_interrupt_status(port)&AHCI_PORT_IS_TFES ?
+                             "task-file error" : "port error", port);
     if (dma && dma->data.busy && !(port->ci & 1u))
         (void)dma_buffer_end(&dma->data, NULL, true);
     ahci_pending_clear();
@@ -180,7 +185,7 @@ static int ahci_pending_matches(struct ahci_hba_port *port, uint64_t lba,
 
 /** @brief Drain or quarantine an exiting task's DMA without touching task memory.
  * @param pid Exiting task identity, zero is ignored. Reaper context only; current
- * transport exclusion is supplied by the single-CPU async ownership protocol.
+ * transport exclusion is supplied by the execution-owned async protocol.
  * DMA pages belong to the driver even on timeout, so task pages can be reclaimed.
  */
 void ahci_cancel_task(uint32_t pid)
@@ -205,6 +210,7 @@ void ahci_cancel_task(uint32_t pid)
 int ahci_stop_port(struct ahci_hba_port *port)
 {
     if (!port) return -22;
+    port->ie=0;
     port->cmd &= ~AHCI_PORT_CMD_ST;
     /* Stop command processing and observe CR=0 before stopping FIS reception. */
     for (uint32_t i = 0; i < AHCI_WAIT_SPINS; ++i) {
@@ -244,8 +250,8 @@ int ahci_setup_port(struct ahci_hba_port *port, uint64_t mask)
     base += AHCI_DMA_FIS_OFFSET;
     port->fb = (uint32_t)base;
     port->fbu = (uint32_t)(base >> 32);
-    port->ie = 0; /* Polling driver: no unowned interrupt handler. */
-    port->is = 0xffffffffu;
+    ahci_interrupt_begin(dma);
+    port->ie = dma->irq_enabled ? AHCI_IRQ_MASK : 0;
     port->serr = 0xffffffffu;
     ahci_memory_barrier();
     port->cmd |= AHCI_PORT_CMD_FRE;
@@ -386,7 +392,7 @@ static int ahci_transfer_once(struct ahci_hba_port *port, enum ahci_operation op
         .buffer = buffer, .start_tick = time_ticks(), .owner_pid = sched_current_pid(),
         .operation = operation, .write = operation == AHCI_WRITE || operation == AHCI_FLUSH,
         .active = 1};
-    port->is = 0xffffffffu;
+    ahci_interrupt_begin(dma);
     ahci_memory_barrier();
     port->ci = 1u;
     return ahci_pending_poll(operation == AHCI_WRITE || operation == AHCI_FLUSH ? NULL : buffer);

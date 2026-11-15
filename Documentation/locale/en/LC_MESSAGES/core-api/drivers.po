@@ -57,10 +57,14 @@ msgstr "``SATA_AHCI`` / ``PATA_IDE`` / ``BLK_DEV_NVME``"
 msgid "``ahci`` / ``ide`` / ``nvme``"
 msgstr "``ahci`` / ``ide`` / ``nvme``"
 
-msgid "原生控制器、IRQ 和 DMA；根设备引用阻止卸载。"
+msgid ""
+"原生控制器、IRQ 和 DMA；根设备引用阻止卸载。 NVMe/AHCI 的中断、读取接续及验证边界见 :doc:`storage-"
+"completion`。"
 msgstr ""
-"Native controllers, IRQs, and DMA; references to the root device prevent "
-"unloading."
+"Native controllers, IRQs and DMA; root-device references prevent unload. "
+"See :doc:`storage-completion` for NVMe/AHCI interrupts, read "
+"continuations and verification boundaries."
+
 
 msgid "``E1000``"
 msgstr "``E1000``"

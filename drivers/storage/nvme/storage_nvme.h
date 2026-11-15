@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <reliefnt/lock.h>
 #include "../ata.h"
+#include "hardware.h"
 
 struct nvme_command;
 struct nvme_completion;
@@ -55,13 +56,48 @@ struct nvme_controller {
     uint32_t io_buffer_pages;
     char model[41];
     struct kernel_spinlock lock;
+    /* IRQ never takes lock or any filesystem/transport execution lock. */
+    struct kernel_spinlock completion_lock;
+    uint32_t irq_handle;
+    uint8_t irq_mode;
+    bool queues_live,completion_active,completion_done,queue_fault;
+    uint16_t completion_cid;
+    int completion_result;
+    struct {
+        bool active;
+        uint32_t nsid,sectors,pid;
+        uint64_t lba,deadline;
+        const void *identity; /* Compared only; never dereferenced after EAGAIN. */
+    } pending_read;
 };
+
+/** @brief Publish one serialized I/O command with its own completion identity.
+ * @param controller Ready controller; task holds controller lock.
+ * @param command Borrowed prepared command copied before return.
+ * @return Zero or -EINVAL/-EBUSY/-EIO; DMA stays controller-owned until consumed.
+ */
+int nvme_queue_issue(struct nvme_controller *controller,struct nvme_command *command);
+/** @brief Consume a serialized I/O result using the same CQ path as its IRQ.
+ * @param controller Ready task-locked controller retaining queue/DMA memory.
+ * @return Zero, -EAGAIN while outstanding, or -EIO/-EINVAL. Never sleeps.
+ */
+int nvme_queue_poll(struct nvme_controller *controller);
+/** @brief Allocate one MSI-X, then MSI vector while the controller is stopped.
+ * @param controller Mapped exclusively owned controller; no live queue required.
+ * Missing capability/vector leaves polling operational; init task only.
+ */
+void nvme_interrupt_prepare(struct nvme_controller *controller);
+/** @brief Disable messages and drain callbacks before freeing controller memory.
+ * @param controller Stable driver context with no new callback admission.
+ * Task context; never hold completion_lock across this synchronization.
+ */
+void nvme_interrupt_stop(struct nvme_controller *controller);
 
 /** @brief Transfer a bounded namespace extent using owned full-width PRPs.
  * @param controller Stable initialized controller. @param nsid Namespace ID.
  * @param lba First 512-byte sector. @param sector_count Nonzero sectors within
  * NVME_MAX_SECTORS. @param buffer Current readable/writable extent.
- * @param write Nonzero for write. @return Zero or native errno. Caller pins
+ * @param write Nonzero for write. @return Zero, retryable -EAGAIN, or native errno. Caller pins
  * code/context and transport exclusion; controller owns queue lock and DMA,
  * failed STOP retains backing and code rather than using retired CPU memory.
  */

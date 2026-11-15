@@ -2,6 +2,7 @@
 #include <reliefnt/pci.h>
 #include <reliefnt/apic.h>
 #include <reliefnt/lock.h>
+#include <reliefnt/export.h>
 #define IRQ_COUNT 16U
 struct pci_irq_entry {
     struct reliefos_driver_pci_device dev;
@@ -240,9 +241,11 @@ void pci_irq_dispatch(uint32_t vector)
 }
 /** @brief Disable MSI/MSI-X, drain ISR pins, unmap the table and retire the vector.
  * @param handle Owned generation token; stale/duplicate frees are harmless.
- * @return None. Task context only, no execution lock and never from handler.
- * Caller first masks the device source and keeps callback memory alive until
- * return. DMA quiescence must be established before freeing DMA resources.
+ * @return None. Task context only, never from handler or with a lock needed by
+ * it. An execution writer is allowed only for handlers that never acquire it.
+ * Caller first closes command/source admission and retains callback memory
+ * through return. PCI messages are disabled before callback pins drain;
+ * DMA quiescence must be established before freeing DMA resources.
  * A message pending before disable may reach dispatch after this returns;
  * its vector must remain a tombstone rather than identify a new callback.
  */
@@ -278,3 +281,6 @@ void pci_free_irq(uint32_t handle)
     e->msix_mapping=NULL; e->msix_table=NULL; e->msix_bytes=0;
     kernel_spin_unlock_irqrestore(&pci_irq_lock, flags);
 }
+EXPORT_SYMBOL(pci_request_irq);
+EXPORT_SYMBOL(pci_request_msix_irq);
+EXPORT_SYMBOL(pci_free_irq);

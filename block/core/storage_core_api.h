@@ -46,8 +46,8 @@ int storage_mount_whole_filesystem(struct storage_volume *volume,uint32_t disk,c
 void storage_boot_reset(void);
 
 /**
- * @brief Test whether the current single-CPU read transaction may be retried after yielding.
- * @return True only for an asynchronous context before any write and with at most one CPU.
+ * @brief Test whether the execution-owned read transaction can unwind and retry.
+ * @return True only in asynchronous context before the first irreversible write.
  * @par Context
  * Caller holds storage execution ownership; shared volume/cache state must remain selected and live throughout the call.
  */

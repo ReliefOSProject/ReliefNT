@@ -54,8 +54,13 @@ msgstr "``SATA_AHCI`` / ``PATA_IDE`` / ``BLK_DEV_NVME``"
 msgid "``ahci`` / ``ide`` / ``nvme``"
 msgstr "``ahci`` / ``ide`` / ``nvme``"
 
-msgid "原生控制器、IRQ 和 DMA；根设备引用阻止卸载。"
-msgstr "ネイティブのコントローラー、IRQ、DMA。ルートデバイスへの参照がアンロードを防ぎます。"
+msgid ""
+"原生控制器、IRQ 和 DMA；根设备引用阻止卸载。 NVMe/AHCI 的中断、读取接续及验证边界见 :doc:`storage-"
+"completion`。"
+msgstr ""
+"ネイティブコントローラー、IRQ、DMA。ルートデバイスへの参照がアンロードを防ぎます。NVMe/AHCI の割り込み、読み取り継続、検証範囲は "
+":doc:`storage-completion` を参照してください。"
+
 
 msgid "``E1000``"
 msgstr "``E1000``"

@@ -1,14 +1,13 @@
 #include <reliefnt/console.h>
 /*
- * Synchronous NVMe 1.x PCI transport.
+ * Serialized NVMe 1.x PCI transport with interrupt-driven read continuations.
  *
  * The storage facade submits one request at a time, so this driver deliberately
  * uses one admin queue and one I/O queue per controller.  The queue protocol is
  * still the real NVMe protocol: queue entries are phase checked, data is
  * described with PRPs, and a controller reset rebuilds the queues after a
- * fatal status or timeout.  Keeping this boundary synchronous lets the
- * filesystem keep its existing retry/locking rules without hiding DMA work in
- * an unrelated worker thread.
+ * fatal status or timeout. Reads may unwind and retry through the storage
+ * owner; writes, flushes and boot/reclaim contexts remain synchronous.
  */
 
 #include "storage_nvme.h"
@@ -18,6 +17,9 @@
 #include <reliefnt/mm.h>
 #include <reliefnt/pci.h>
 #include <reliefnt/paging.h>
+#include <reliefnt/sched.h>
+#include <reliefnt/time.h>
+#include <reliefnt/storage_wait.h>
 
 #define NVME_MAX_CONTROLLERS 8u
 #define NVME_MMIO_BYTES 0x4000u
@@ -51,30 +53,6 @@
 #define NVME_IDENTIFY_NAMESPACE 0u
 #define NVME_IDENTIFY_CONTROLLER 1u
 #define NVME_IDENTIFY_ACTIVE_NAMESPACE_LIST 2u
-
-struct __attribute__((packed)) nvme_command {
-    uint32_t cdw0;
-    uint32_t nsid;
-    uint64_t reserved0;
-    uint64_t metadata;
-    uint64_t prp1;
-    uint64_t prp2;
-    uint32_t cdw10;
-    uint32_t cdw11;
-    uint32_t cdw12;
-    uint32_t cdw13;
-    uint32_t cdw14;
-    uint32_t cdw15;
-};
-
-struct __attribute__((packed)) nvme_completion {
-    uint32_t result;
-    uint32_t reserved0;
-    uint16_t sq_head;
-    uint16_t sq_id;
-    uint16_t command_id;
-    uint16_t status;
-};
 
 
 
@@ -142,11 +120,15 @@ static int nvme_wait_ready(const struct nvme_controller *controller, uint8_t wan
     return -5;
 }
 
+/** @brief Reset queue RAM and software identities only after proven controller STOP.
+ * @param controller Task-owned stopped controller; IRQ CQ access is excluded.
+ */
 static void nvme_reset_queue_state(struct nvme_controller *controller)
 {
     if (!controller) {
         return;
     }
+    uint64_t flags;kernel_spin_lock_irqsave(&controller->completion_lock,&flags);
     if (controller->admin_sq) {
         storage_memzero(controller->admin_sq,
                         (size_t)controller->queue_depth * sizeof(*controller->admin_sq));
@@ -170,6 +152,10 @@ static void nvme_reset_queue_state(struct nvme_controller *controller)
     controller->cq_phase_admin = 1;
     controller->cq_phase_io = 1;
     controller->next_command_id = 0;
+    controller->completion_active=false;controller->completion_done=false;
+    controller->queue_fault=false;controller->pending_read.active=false;
+    controller->queues_live=true;
+    kernel_spin_unlock_irqrestore(&controller->completion_lock,flags);
 }
 
 /** @brief Disable hardware and await RDY=0 even when CC.EN is already clear.
@@ -180,6 +166,9 @@ static void nvme_reset_queue_state(struct nvme_controller *controller)
 static int nvme_disable_controller(struct nvme_controller *controller)
 {
     if (!controller || !controller->mmio) return -22;
+    uint64_t flags;kernel_spin_lock_irqsave(&controller->completion_lock,&flags);
+    controller->queues_live=false;
+    kernel_spin_unlock_irqrestore(&controller->completion_lock,flags);
     uint32_t cc = nvme_read32(controller, NVME_REG_CC);
     controller->ready = 0;
     if (nvme_read32(controller, NVME_REG_CSTS) & NVME_CSTS_RDY)
@@ -286,6 +275,11 @@ static int nvme_release_controller_memory(struct nvme_controller *controller)
     return 0;
 }
 
+/** @brief Complete an admin or non-replayable I/O command by bounded polling.
+ * @param controller Task-locked controller. @param admin Select admin queue.
+ * @param command Prepared command copied to owned queue RAM.
+ * @return Zero or native errno. I/O uses the same completion state as the ISR.
+ */
 static int nvme_submit_locked(struct nvme_controller *controller, uint8_t admin,
                               struct nvme_command *command)
 {
@@ -301,21 +295,22 @@ static int nvme_submit_locked(struct nvme_controller *controller, uint8_t admin,
     if (!controller || !controller->ready || !command || !controller->queue_depth) {
         return -22;
     }
-    if (admin) {
-        sq = controller->admin_sq;
-        cq = controller->admin_cq;
-        sq_tail = &controller->admin_sq_tail;
-        cq_head = &controller->admin_cq_head;
-        cq_phase = &controller->cq_phase_admin;
-        queue_id = 0;
-    } else {
-        sq = controller->io_sq;
-        cq = controller->io_cq;
-        sq_tail = &controller->io_sq_tail;
-        cq_head = &controller->io_cq_head;
-        cq_phase = &controller->cq_phase_io;
-        queue_id = 1;
+    if(!admin) {
+        int rc=nvme_queue_issue(controller,command);
+        if(rc)return rc;
+        for(uint32_t i=0;i<NVME_WAIT_SPINS;++i) {
+            rc=nvme_queue_poll(controller);
+            if(rc!=-11)return rc;
+            nvme_cpu_relax();
+        }
+        return -5;
     }
+    sq = controller->admin_sq;
+    cq = controller->admin_cq;
+    sq_tail = &controller->admin_sq_tail;
+    cq_head = &controller->admin_cq_head;
+    cq_phase = &controller->cq_phase_admin;
+    queue_id = 0;
     if (!sq || !cq) {
         return -22;
     }
@@ -410,6 +405,10 @@ static void nvme_copy_model(char out[41], const uint8_t *model)
     out[end] = 0;
 }
 
+/** @brief Create one physical I/O CQ/SQ, enabling IV zero only with an owned IRQ.
+ * @param controller Ready admin queue under task/controller exclusion.
+ * @return Zero or bounded admin command error; no DMA backing is released here.
+ */
 static int nvme_create_io_queues_locked(struct nvme_controller *controller)
 {
     struct nvme_command command;
@@ -424,7 +423,8 @@ static int nvme_create_io_queues_locked(struct nvme_controller *controller)
     command.cdw0 = NVME_ADMIN_CREATE_IO_CQ;
     command.prp1 = controller->io_cq_phys;
     command.cdw10 = 1u | queue_size;
-    command.cdw11 = 1u; /* physically contiguous queue, interrupt disabled */
+    /* PC=1, IEN only with an owned vector, IV=0 for MSI/MSI-X entry zero. */
+    command.cdw11 = 1u | (controller->irq_handle ? 2u : 0u);
     ret = nvme_submit_locked(controller, 1, &command);
     if (ret < 0) {
         return ret;
@@ -484,6 +484,7 @@ static int nvme_program_controller(struct nvme_controller *controller)
         return ret;
     }
     controller->ready = 1;
+    if(controller->irq_mode==2)nvme_write32(controller,0x10u,1u); /* INTMC, MSI only. */
     return nvme_create_io_queues(controller);
 }
 
@@ -516,6 +517,7 @@ static int nvme_reinitialize_controller(struct nvme_controller *controller)
         ret = nvme_wait_ready(controller, 1);
         if (ret == 0) {
             controller->ready = 1;
+            if(controller->irq_mode==2)nvme_write32(controller,0x10u,1u);
             ret = nvme_create_io_queues_locked(controller);
         }
     }
@@ -602,6 +604,7 @@ static int nvme_initialize_controller(struct nvme_controller *controller)
     ret = nvme_allocate_page(&controller->prp_list_phys,
                              (uint8_t **)(void *)&controller->prp_list);
     if (ret < 0) goto fail;
+    nvme_interrupt_prepare(controller);
 
     ret = nvme_program_controller(controller);
     if (ret < 0) goto fail;
@@ -613,12 +616,14 @@ static int nvme_initialize_controller(struct nvme_controller *controller)
     if (!controller->model[0]) {
         storage_copy_text(controller->model, sizeof(controller->model), "NVMe Controller");
     }
-    console_info("[reliefnt] NVMe controller ready pci=%u:%u.%u model=\"%s\" namespaces=%u qdepth=%u\n",
+    console_info("[reliefnt] NVMe controller ready pci=%u:%u.%u model=\"%s\" namespaces=%u qdepth=%u irq=%s\n",
                    controller->bus, controller->slot, controller->function,
-                   controller->model, controller->namespace_count, controller->queue_depth);
+                   controller->model, controller->namespace_count, controller->queue_depth,
+                   controller->irq_mode==1 ? "msix" : controller->irq_mode==2 ? "msi" : "poll");
     return 0;
 
 fail:
+    nvme_interrupt_stop(controller);
     controller->ready = 0;
     if (!nvme_disable_controller(controller)) {
         (void)nvme_release_controller_memory(controller);
@@ -663,6 +668,43 @@ static int nvme_prepare_prp(struct nvme_controller *controller,
     return 0;
 }
 
+/** @brief Finish a retained read into current memory, or discard on cancellation.
+ * @param c Task-locked controller. @param destination Current valid output, NULL to discard.
+ * @param asynchronous Allow an execution-owned read to unwind while hardware runs.
+ * @return Zero, -EAGAIN retaining request/DMA, or -EIO requiring STOP/recovery.
+ */
+static int nvme_pending_finish(struct nvme_controller *c,void *destination,bool asynchronous)
+{
+    uint32_t limit=asynchronous ? 128u : NVME_WAIT_SPINS;
+    for(uint32_t i=0;i<limit;++i) {
+        int rc=nvme_queue_poll(c);
+        if(rc!=-11) {
+            if(!rc && destination) {
+                nvme_memory_barrier();
+                storage_memcpy(destination,c->io_buffer,(size_t)c->pending_read.sectors*SECTOR_SIZE);
+            }
+            c->pending_read.active=false;
+            return rc;
+        }
+        nvme_cpu_relax();
+    }
+    if(asynchronous && time_ticks()<c->pending_read.deadline) {
+        if(c->irq_handle)storage_wait_hint(c->pending_read.deadline);
+        return -11;
+    }
+    console_error("[nvme] read timeout pci=%u:%u.%u nsid=%u lba=%llu pid=%u\n",
+        c->bus,c->slot,c->function,c->pending_read.nsid,
+        (unsigned long long)c->pending_read.lba,c->pending_read.pid);
+    return -5;
+}
+
+/** @brief Submit or resume one DMA-owned namespace transfer under controller lock.
+ * @param controller Ready controller. @param nsid Namespace identity.
+ * @param lba First sector. @param sector_count Bounded sector count.
+ * @param buffer Current valid CPU buffer; saved pointer is identity only.
+ * @param write Nonzero stages and completes a synchronous write.
+ * @return Zero, -EAGAIN for replayable read, or native errno.
+ */
 static int nvme_readwrite_once(struct nvme_controller *controller, uint32_t nsid,
                                uint64_t lba, uint32_t sector_count, void *buffer,
                                uint8_t write)
@@ -679,6 +721,14 @@ static int nvme_readwrite_once(struct nvme_controller *controller, uint32_t nsid
         lba + sector_count < lba) {
         return -22;
     }
+    bool asynchronous=!write && storage_async_can_yield();
+    if(controller->pending_read.active) {
+        bool matches=!write && controller->pending_read.pid==sched_current_pid() &&
+            controller->pending_read.nsid==nsid && controller->pending_read.lba==lba &&
+            controller->pending_read.sectors==sector_count && controller->pending_read.identity==buffer;
+        ret=nvme_pending_finish(controller,matches ? buffer : NULL,asynchronous);
+        if(matches || ret)return ret;
+    }
     if (write) {
         storage_memcpy(controller->io_buffer, buffer, (size_t)bytes);
         nvme_memory_barrier();
@@ -693,14 +743,23 @@ static int nvme_readwrite_once(struct nvme_controller *controller, uint32_t nsid
     if (ret < 0) {
         return ret;
     }
-    ret = nvme_submit_locked(controller, 0, &command);
-    if (ret == 0 && !write) {
-        nvme_memory_barrier();
-        storage_memcpy(buffer, controller->io_buffer, (size_t)bytes);
-    }
-    return ret;
+    if(write)return nvme_submit_locked(controller,0,&command);
+    ret=nvme_queue_issue(controller,&command);
+    if(ret)return ret;
+    controller->pending_read.active=true;controller->pending_read.nsid=nsid;
+    controller->pending_read.lba=lba;controller->pending_read.sectors=sector_count;
+    controller->pending_read.pid=sched_current_pid();controller->pending_read.identity=buffer;
+    controller->pending_read.deadline=time_ticks()+5u*RELIEFNT_TICK_HZ;
+    return nvme_pending_finish(controller,buffer,asynchronous);
 }
 
+/** @brief Serialize a namespace transfer and recover non-retryable command errors.
+ * @param controller Stable pinned controller. @param nsid Nonzero namespace.
+ * @param lba First sector. @param sector_count Bounded nonzero sector count.
+ * @param buffer Current valid read/write bytes. @param write Nonzero for writes.
+ * @return Zero, -EAGAIN retaining an owned read, or native errno. Transport and
+ * execution ownership are supplied by caller; failed STOP retains all DMA.
+ */
 int nvme_readwrite(struct nvme_controller *controller, uint32_t nsid,
                           uint64_t lba, uint32_t sector_count, void *buffer,
                           uint8_t write)
@@ -708,7 +767,7 @@ int nvme_readwrite(struct nvme_controller *controller, uint32_t nsid,
     int ret;
     kernel_spin_lock(&controller->lock);
     ret = nvme_readwrite_once(controller, nsid, lba, sector_count, buffer, write);
-    if (ret < 0 && controller->ready) {
+    if (ret < 0 && ret != -11 && controller->ready) {
         /* A timed out command has no safe completion ownership. Rebuild both
          * queues, then retry once with a fresh command id and phase state. */
         if (nvme_reinitialize_controller(controller) == 0) {
@@ -719,6 +778,11 @@ int nvme_readwrite(struct nvme_controller *controller, uint32_t nsid,
     return ret;
 }
 
+/** @brief Drain prior reads then synchronously flush one namespace's write cache.
+ * @param controller Stable pinned controller. @param nsid Nonzero namespace.
+ * @return Zero or native errno after bounded recovery. Caller holds transport
+ * and execution ownership; no registry lock or retired caller pointer is used.
+ */
 int nvme_flush_cache(struct nvme_controller *controller, uint32_t nsid)
 {
     int ret;
@@ -727,7 +791,8 @@ int nvme_flush_cache(struct nvme_controller *controller, uint32_t nsid)
     command.cdw0 = NVME_IO_FLUSH;
     command.nsid = nsid;
     kernel_spin_lock(&controller->lock);
-    ret = nvme_submit_locked(controller, 0, &command);
+    ret=controller->pending_read.active ? nvme_pending_finish(controller,NULL,false) : 0;
+    if(!ret)ret = nvme_submit_locked(controller, 0, &command);
     if (ret < 0 && controller->ready && nvme_reinitialize_controller(controller) == 0) {
         ret = nvme_submit_locked(controller, 0, &command);
     }
@@ -808,8 +873,20 @@ static int nvme_block_flush(void *context)
 {
     struct nvme_namespace *ns=context;return nvme_flush_cache(ns->controller,ns->nsid);
 }
+/** @brief Drain/discard this task's retained read without touching its old buffer.
+ * @param context Stable namespace. @param pid Exiting owner identity.
+ * Caller holds transport exclusion; failed drain resets or retains live DMA.
+ */
+static void nvme_block_cancel(void *context,uint32_t pid)
+{
+    struct nvme_controller *c=((struct nvme_namespace *)context)->controller;
+    kernel_spin_lock(&c->lock);
+    if(c->pending_read.active && c->pending_read.pid==pid && nvme_pending_finish(c,NULL,false))
+        (void)nvme_reinitialize_controller(c);
+    kernel_spin_unlock(&c->lock);
+}
 static const struct block_device_operations nvme_operations={
-    .read=nvme_block_read,.write=nvme_block_write,.flush=nvme_block_flush};
+    .read=nvme_block_read,.write=nvme_block_write,.flush=nvme_block_flush,.cancel=nvme_block_cancel};
 
 /** @brief Release one namespace only after its registration and controller drain.
  * @param context Owned heap namespace, consumed once by owner final release.
@@ -855,6 +932,7 @@ static int nvme_controller_stop(void *context)
 {
     struct nvme_controller *controller=context;
     if(!controller->mmio)return 0;
+    nvme_interrupt_stop(controller);
     int rc=nvme_disable_controller(controller);
     if(!rc) {
         uint16_t command=pci_config_read16(controller->bus,controller->slot,controller->function,4);
@@ -932,6 +1010,7 @@ static int nvme_probe_controller(uint8_t bus,uint8_t slot,uint8_t function)
     ret=module_add_resource(THIS_MODULE,nvme_controller_stop,nvme_controller_release,controller);
     if(ret){pci_unmap_mmio((void *)controller->mmio,NVME_MMIO_BYTES);storage_memzero(controller,sizeof(*controller));return ret;}
     kernel_spin_init(&controller->lock);
+    kernel_spin_init(&controller->completion_lock);
     ret = nvme_initialize_controller(controller);
     if (ret < 0) {
         console_error("[reliefnt] NVMe controller init failed pci=%u:%u.%u ret=%d\n",

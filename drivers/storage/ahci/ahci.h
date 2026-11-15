@@ -2,9 +2,10 @@
 #ifndef RELIEFNT_AHCI_PRIVATE_H
 #define RELIEFNT_AHCI_PRIVATE_H
 #include <reliefnt/dma.h>
+#include <reliefnt/lock.h>
 #include "hardware.h"
 
-/** @brief Flush a polling AHCI port through its owned nondata command slot.
+/** @brief Flush an AHCI port synchronously through its owned nondata command slot.
  * @param port Stable mapped port, transport lock held.
  * @return Zero, -ENODEV, -EAGAIN for resumable wait, or native I/O errno.
  */
@@ -68,7 +69,40 @@ struct ahci_port_dma {
     struct dma_buffer descriptors, data;
     uint64_t mask;
     bool quarantined;
+    struct kernel_spinlock irq_lock;
+    uint32_t irq_status;
+    bool irq_enabled;
 };
+
+struct ahci_disk;
+struct ahci_controller {
+    struct ahci_hba_mem *abar;
+    size_t bytes;
+    struct ahci_disk *disks;
+    uint32_t implemented,irq_handle;
+    uint8_t bus,slot,function;
+    struct ahci_port_dma *ports[32]; /* Immutable while IRQ is admitted. */
+};
+
+/** @brief Read live plus IRQ-latched status without losing a W1C task-file error.
+ * @param port Stable mapped port under transport exclusion.
+ * @return Combined status bits; no allocation, DMA copy, recovery or sleeping.
+ */
+uint32_t ahci_interrupt_status(struct ahci_hba_port *port);
+/** @brief Clear the previous command's error latch and W1C status before issue.
+ * @param dma Idle stable port DMA; task holds transport exclusion.
+ * Serializes with ISR status acknowledgement, retaining no caller memory.
+ */
+void ahci_interrupt_begin(struct ahci_port_dma *dma);
+/** @brief Bind one MSI for all active ports, otherwise preserve polling.
+ * @param controller Probed controller with immutable port backing, init task.
+ */
+void ahci_interrupt_start(struct ahci_controller *controller);
+/** @brief Mask source registers and drain the owned MSI callback.
+ * @param controller Stable controller, task context before port/BAR release.
+ * ISR never needs execution ownership; do not hold a port irq_lock here.
+ */
+void ahci_interrupt_stop(struct ahci_controller *controller);
 
 /** @brief Find a borrowed per-port object under transport exclusion.
  * @param port Stable mapped hardware port, required.
