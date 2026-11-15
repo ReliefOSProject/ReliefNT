@@ -383,12 +383,13 @@ int64_t syscall_clone_prepared(const struct trap_frame *frame,uint64_t flags,
  * @return One if resolved; zero if not. May perform synchronous backing I/O.
  */
 int syscall_handle_user_page_fault(uint64_t fault_addr, uint64_t error);
-/** @brief Resolve a current task fault, retaining admitted allocation failure.
+/** @brief Resolve a current task fault, retaining allocation/backing retry errors.
  * @param fault_addr Faulting address. @param error x86 page-fault flags.
  * @param user_fault True only for a real ring-3 hardware fault.
  * @return One if resolved, zero for ineligible, -ENOMEM for a valid page
- * whose backing or page tables could not be allocated. The caller must drop
- * fault/loader locks before deciding whether pressure reclaim is admissible.
+ * whose backing or page tables could not be allocated, or -EAGAIN for temporary
+ * file-backing contention. The caller must drop fault/loader locks before
+ * reclaiming or waiting for storage; no newly allocated frame is retained.
  */
 int syscall_handle_user_page_fault_detailed(uint64_t fault_addr, uint64_t error, bool user_fault);
 /** @brief Resolve an unshared task's private demand-zero VMA fault.

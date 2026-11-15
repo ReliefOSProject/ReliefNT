@@ -37,6 +37,14 @@ BLKROGET 使用 Linux 历史 _IO(0x12,94) 编码，旧错误 _IOR 编码不作�
 不能与 O_SYNC/O_TMPFILE 位重叠；同步操作要实际完成刷新并传播失败。
 独占块打开应正确检查真实挂载冲突，不把匿名 RAM/光盘挂载误认为其他设备占用。
 
+管道可读字节数
+==============
+
+匿名管道和命名 FIFO 的读端、写端均支持 ``ioctl(fd, FIONREAD, int *)``，
+返回当前缓冲区内的未读字节数，不消费数据、不等待新的输入。空管道返回零；
+写端关闭后，读端仍报告尚未读完的数据。查询与并行管道传输使用同一数据锁。
+输出指针必须可写；无效或只读地址返回 ``EFAULT``，不改变缓冲区。
+
 evdev 与 epoll
 ==============
 
@@ -74,6 +82,12 @@ TCP 的 ``recvfrom/recvmsg`` 支持 ``MSG_PEEK``：重复预读保留相同的�
 ``MSG_OOB`` 与 ``MSG_TRUNC``，明确返回 ``EOPNOTSUPP``；不能静默消耗数据
 或把短读冒充所请求的完整语义。UDP、packet 和 UNIX 的标志支持由各协议处理。
 标志定义参见 `POSIX socket 头文件 <https://pubs.opengroup.org/onlinepubs/9799919799.2024edition/basedefs/sys_socket.h.html>`_。
+
+TCP 的 ``setsockopt/getsockopt(SOL_TCP, TCP_NODELAY)`` 接受原生整数标志，
+默认关闭并由监听套接字传给新连接。关闭时，尚有未确认数据的小段等待确认或
+完整 MSS 后发送；启用时立即尝试发送已排队的小段，仍遵守对端窗口、拥塞窗口
+和重传约束。写方向关闭会排空尾部数据再发 FIN。未实现的 TCP 选项继续返回
+``ENOPROTOOPT``，不以静默成功代替协议行为。
 
 ``/proc`` 数字进程目录的枚举 cookie 按 PID 递增，独立于调度器内部数组下标。
 一个进程退出并触发数组压缩，不应导致仍存活的较大 PID 从同一次枚举中丢失。

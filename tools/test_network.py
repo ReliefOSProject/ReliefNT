@@ -14,3 +14,7 @@ with tempfile.TemporaryDirectory(prefix="reliefos-inet-") as work:
                         f"tools/tests/{name}_test.c", "fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c", "fs/vfs/file.c", "fs/vfs/open.c", "fs/vfs/initial.c", "kernel/syscall/ipc/unix_name.c", "kernel/syscall/fs/lookup_state.c",
                         "-o", str(binary)], cwd=ROOT, check=True)
         subprocess.run([str(binary)], check=True, timeout=20)
+    binary = Path(work) / "tcp_nodelay_probe"
+    subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                    "tools/tests/tcp_nodelay_probe.c", "-o", str(binary)], cwd=ROOT, check=True)
+    subprocess.run([str(binary)], check=True, timeout=20)

@@ -7,6 +7,12 @@
 #pragma clang diagnostic pop
 #undef main
 #include "../../mm/swap/internal.h"
+#ifndef SWAP_PAGING_FIXTURE_ENTRY
+/** @brief Supply ample free RAM for this standalone paging fixture.
+ * @return Fixed KiB; allocation failure is controlled by the fixture allocator.
+ */
+uint64_t mm_free_memory_kib(void) { return 4096; }
+#endif
 static uint8_t swap_media[4][4096];
 static int swap_media_error;
 static bool swap_media_partial_error;

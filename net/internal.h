@@ -174,6 +174,7 @@ struct net_socket {
     uint32_t scope6, remote_scope6, mtu6;
     uint16_t peer_mss;
     bool ipv6, mapped, v6only, bound, reuse, dont_fragment;
+    bool nodelay;
     int unicast_hops, mtu_discover;
     uint32_t backlog;
     struct net_socket *listener;

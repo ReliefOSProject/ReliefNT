@@ -251,6 +251,22 @@ static uint32_t pipe_buffered(const struct task_pipe *pipe)
     return (pipe->head + pipe->capacity + 1u - pipe->tail) % (pipe->capacity + 1u);
 }
 
+/** @brief Snapshot unread pipe bytes without consuming data or waiting.
+ * @param file Borrowed read or write endpoint, pinned by execution ownership.
+ * @return Buffered byte count or -EBADF for a stale/nonpipe description.
+ * The data lock excludes parallel resident transfers; no usercopy occurs here.
+ */
+int task_pipe_available(const struct task_file *file)
+{
+    struct task_pipe *pipe = task_pipe_for_file(file);
+    if (!pipe) return -RELIEFOS_EBADF;
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&pipe->data_lock, &flags);
+    uint32_t count = pipe_buffered(pipe);
+    kernel_spin_unlock_irqrestore(&pipe->data_lock, flags);
+    return (int)count;
+}
+
 /** @brief Copy buffered bytes while serializing this pipe's ring only.
  * @param pipe Live data-locked pipe. @param buffer Prepared writable memory.
  * @param length Available destination bytes. @return Bytes consumed.

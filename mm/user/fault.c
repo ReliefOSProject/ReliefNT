@@ -146,7 +146,8 @@ static int task_map_anonymous_page(struct task *task, struct task_vma *vma,
  * @param phys Physical cache frame to fill.
  * @param opaque File, offset, and segment-limit context.
  * @return Zero on success, -EINVAL for an invalid context, -ENOMEM for a
- * missing direct map or provider allocation failure, or -EIO for other
+ * missing direct map or provider allocation failure, -EAGAIN for temporary
+ * backing contention, or -EIO for other
  * provider errors and short reads. The cache owns the frame.
  */
 static int load_file_cache_page(uint64_t phys, void *opaque)
@@ -173,7 +174,7 @@ static int load_file_cache_page(uint64_t phys, void *opaque)
     void *page = mm_phys_to_virt(phys);
     if (!page) return -RELIEFOS_ENOMEM;
     int ret = file_vma_read(context->vma, offset, page, want, &got);
-    if (ret < 0) return ret == -RELIEFOS_ENOMEM ? ret : -RELIEFOS_EIO;
+    if (ret < 0) return ret == -RELIEFOS_ENOMEM || ret == -RELIEFOS_EAGAIN ? ret : -RELIEFOS_EIO;
     if (got != want) return -RELIEFOS_EIO;
     context->did_read = true;
     return 0;
@@ -225,7 +226,7 @@ static int task_map_file_vma_page_observed(struct task *task, const struct task_
             cached = 0;
             phys = mm_alloc_page();
         } else if (result < 0) {
-            return result == -RELIEFOS_ENOMEM ? result : -RELIEFOS_EIO;
+            return result == -RELIEFOS_ENOMEM || result == -RELIEFOS_EAGAIN ? result : -RELIEFOS_EIO;
         }
     } else {
         phys = mm_alloc_page();
@@ -631,9 +632,10 @@ enum syscall_private_fault_result syscall_handle_private_page_fault(
  * @param task User task pinned by execution ownership, nullable.
  * @param fault_addr Faulting user byte address. @param error x86 fault flags.
  * @param defer_oom_diagnostic True when the caller reports a terminal fault
- * after pressure retries; other backing failures remain immediately logged.
+ * after allocation/storage retries; other backing failures remain immediately logged.
  * @param record_major True only for an admitted user hardware fault.
- * @return One on resolution, -ENOMEM on a valid allocation failure, or zero
+ * @return One on resolution, -ENOMEM on a valid allocation failure, -EAGAIN
+ * when file backing is temporarily unavailable, or zero
  * for an invalid/denied/provider failure. The loader lock is released before
  * return. The caller holds execution ownership and owns any resulting page
  * mapping; hardware-fault callers also hold the fault lock.
@@ -771,7 +773,7 @@ static int task_page_fault_detailed(struct task *task, uint64_t fault_addr, uint
                 (vma->flags & TASK_VMA_FLAG_MMAP) &&
                 (ret == -RELIEFOS_EINVAL || ret == -RELIEFOS_ENOSPC))
                 task->page_fault_signal = LINUX_SIGBUS;
-            if (!defer_oom_diagnostic || ret != -RELIEFOS_ENOMEM)
+            if (!defer_oom_diagnostic || (ret != -RELIEFOS_ENOMEM && ret != -RELIEFOS_EAGAIN))
                 console_error("[reliefnt] lazy file map failed pid=%u page=0x%llx "
                            "fault=0x%llx error=0x%llx vma=0x%llx-0x%llx "
                            "flags=0x%x file_off=0x%llx file_limit=0x%llx ret=%d\n",
@@ -783,7 +785,7 @@ static int task_page_fault_detailed(struct task *task, uint64_t fault_addr, uint
                            (unsigned long long)vma->file_offset,
                            (unsigned long long)vma->file_limit, ret);
         }
-        return ret == 0 ? 1 : ret == -RELIEFOS_ENOMEM ? -RELIEFOS_ENOMEM : 0;
+        return ret == 0 ? 1 : ret == -RELIEFOS_ENOMEM || ret == -RELIEFOS_EAGAIN ? ret : 0;
     }
 }
 
@@ -800,10 +802,11 @@ int syscall_handle_user_page_fault(uint64_t fault_addr, uint64_t error)
     return syscall_handle_task_page_fault(sched_current_task(), fault_addr, error);
 }
 
-/** @brief Resolve a current task fault while retaining allocation failure.
+/** @brief Resolve a current task fault while retaining retryable backing errors.
  * @param fault_addr Faulting user byte address. @param error x86 fault flags.
  * @param user_fault True for a real ring-3 hardware fault.
- * @return One if resolved, -ENOMEM on admitted allocation failure, or zero;
+ * @return One if resolved, -ENOMEM on admitted allocation failure, -EAGAIN
+ * for temporary file-backing contention, or zero;
  * caller holds execution ownership. Hardware-fault callers also hold the
  * fault lock; held locks are retained on return.
  */

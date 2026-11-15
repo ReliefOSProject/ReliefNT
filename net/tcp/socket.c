@@ -610,6 +610,10 @@ static void net_socket_service(struct net_socket *socket)
         uint32_t mss = net_socket_mss(socket);
         length = unsent > mss ? mss : unsent;
         if (length > room) length = room;
+        /* Nagle holds a short tail while data is unacknowledged. A full
+         * segment, NODELAY, or a pending write-side close may flush it. */
+        if (!socket->nodelay && socket->tx_sent && length < mss &&
+            !socket->fin_pending) return;
         sequence = socket->local_seq;
         net_socket_tx_copy(socket, segment, socket->tx_sent, length);
         socket->tx_persist_deadline = 0;
@@ -1577,6 +1581,27 @@ int net_socket_ipv6_option(int32_t handle, bool set, uint32_t option, int *value
     }
 }
 
+/** @brief Read or update TCP_NODELAY and service a newly unblocked short tail.
+ * @param handle Execution-owned stable TCP handle.
+ * @param set True to set the flag, false to query it.
+ * @param value Required kernel integer input/output; nonzero enables NODELAY.
+ * @return Zero or -EBADF for an invalid handle/value. May transmit one queued
+ * segment without waiting; peer window, congestion and retransmit rules apply.
+ */
+int net_socket_nodelay(int32_t handle, bool set, int *value)
+{
+    struct net_socket *socket = net_socket_find(handle, 0, 1);
+    if (!socket || !value) return -LINUX_EBADF;
+    if (set) {
+        socket->nodelay = *value != 0;
+        if (socket->nodelay) {
+            net_socket_work_schedule(socket);
+            net_socket_service(socket);
+        }
+    } else *value = socket->nodelay;
+    return 0;
+}
+
 /** @brief Create a queued native IPv6 child and send its SYN/ACK.
  * @param listener Listening socket. @param source Peer address. @param destination Local address.
  * @param source_port Peer port. @param ifindex Interface. @param seq Peer sequence.
@@ -1594,6 +1619,7 @@ struct net_socket *net_tcp_passive6(struct net_socket *listener,const struct in6
     if (!s) return NULL;
     s->ifindex = ifindex; s->bound_ifindex = listener->bound_ifindex;
     s->ipv6 = true; s->v6only = listener->v6only; s->bound = true; s->listener = listener;
+    s->nodelay = listener->nodelay;
     s->local6 = *destination; s->remote6 = *source; s->remote_scope6 = scope; s->mtu6 = path.mtu;
     s->local_port = listener->local_port; s->remote_port = source_port; s->peer_mss = mss;
     s->remote_seq = seq + 1; s->peer_window = window; s->peer_window_seq = seq; s->peer_window_valid = true;
@@ -1623,6 +1649,7 @@ struct net_socket *net_tcp_passive4_on(uint32_t ifindex, struct net_socket *list
     if (!s) return NULL;
     s->ifindex = ifindex; s->bound_ifindex = listener->bound_ifindex;
     s->ipv6 = listener->ipv6; s->mapped = listener->ipv6; s->v6only = listener->v6only;
+    s->nodelay = listener->nodelay;
     s->next_hop = source;
     s->bound = true; s->listener = listener; s->local_ip = destination; s->remote_ip = source;
     s->local6 = tcp6_map(destination); s->remote6 = tcp6_map(source);

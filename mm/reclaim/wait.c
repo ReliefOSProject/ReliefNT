@@ -114,7 +114,7 @@ int memory_fault_oom(struct task *task, uint64_t address)
     return memory_fault_wait_defer(task, address, memory_reclaim_stall_cause());
 }
 
-/** @brief Defer an unsubmitted slot read behind an existing storage owner.
+/** @brief Defer an unsubmitted file/slot read behind an existing storage owner.
  * @param task Current live user task under the outer writer.
  * @param address Faulting byte address for stall accounting.
  * @return -EAGAIN after timed blocking, or terminal negative errno; never

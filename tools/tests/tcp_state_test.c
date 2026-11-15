@@ -382,6 +382,9 @@ static void test_tcp_peer_window_and_persist(void)
     uint8_t payload[5000];
     unsigned before;
     assert(socket);
+    /* Isolate peer-window limits from the separately tested Nagle delay. */
+    int nodelay = 1;
+    assert(!net_socket_nodelay(socket->handle, true, &nodelay));
     socket->state = RELIEFOS_NET_TCP_ESTABLISHED;
     socket->local_ip = 0x0a25000f;
     socket->remote_ip = 0x0a250002;
@@ -416,6 +419,7 @@ static void test_tcp_peer_window_and_persist(void)
     net_socket_clear(socket);
     socket = net_socket_alloc(8, 1000);
     assert(socket);
+    assert(!net_socket_nodelay(socket->handle, true, &nodelay));
     socket->state = RELIEFOS_NET_TCP_ESTABLISHED;
     socket->local_ip = 0x0a25000f;
     socket->remote_ip = 0x0a250002;
@@ -470,6 +474,78 @@ static void test_tcp_peer_window_and_persist(void)
         4096, TCP_FLAG_ACK, NULL, 0);
     assert(socket->tx_sent == 0 && socket->tx_len == 0);
     net_socket_clear(socket);
+}
+
+/** @brief Check TCP_NODELAY changes actual short-segment transmission.
+ * ACK, full-MSS, close and peer-window boundaries remain protocol decisions.
+ */
+static void test_tcp_nodelay(void)
+{
+    struct net_socket *socket = net_socket_alloc(36, 1000);
+    assert(socket);
+    socket->state = RELIEFOS_NET_TCP_ESTABLISHED;
+    socket->local_ip = 0x0a25000f; socket->remote_ip = 0x0a250002;
+    socket->ifindex = 2; socket->next_hop = socket->remote_ip;
+    net_memcpy(socket->dst_mac, e1000_mac(), 6);
+    socket->local_port = 51016; socket->remote_port = 8015;
+    socket->local_seq = socket->acked_seq = 125000;
+    socket->remote_seq = 126000;
+    socket->peer_window_valid = true; socket->peer_window = 65535;
+    int value = -1; socklen_t size = sizeof(value);
+    assert(!inet_socket_option(false, SOL_TCP, TCP_NODELAY,
+        (uintptr_t)&value, (uintptr_t)&size, socket->handle));
+    assert(value == 0 && size == sizeof(value));
+    uint8_t payload[NET_TCP_MSS]; memset(payload, 0x57, sizeof(payload));
+    struct reliefos_net_socket_io request = {
+        .socket=socket->handle, .buffer=payload, .length=1};
+    unsigned before = sent_count;
+    assert(!net_socket_send(&request, 0) && request.transferred == 1);
+    assert(sent_count == before + 1 && socket->tx_sent == 1);
+    assert(!net_socket_send(&request, 0) && request.transferred == 1);
+    assert(sent_count == before + 1 && socket->tx_sent == 1 && socket->tx_len == 2);
+    value = -7;
+    assert(!inet_socket_option(true, SOL_TCP, TCP_NODELAY,
+        (uintptr_t)&value, sizeof(value), socket->handle));
+    assert(sent_count == before + 2 && socket->tx_sent == 2);
+    assert(net_get_u32(sent_frame + 38) == 125001 && sent_frame[54] == payload[0]);
+    value = 0;
+    assert(!net_socket_nodelay(socket->handle, false, &value) && value == 1);
+    value = 0;
+    assert(!net_socket_nodelay(socket->handle, true, &value));
+    assert(!net_socket_send(&request, 0) && request.transferred == 1);
+    assert(sent_count == before + 2 && socket->tx_sent == 2 && socket->tx_len == 3);
+    net_socket_handle_tcp(socket, socket->remote_seq, socket->local_seq,
+        65535, TCP_FLAG_ACK, NULL, 0);
+    net_poll_packets();
+    assert(sent_count == before + 3 && socket->tx_sent == 1 && socket->tx_len == 1);
+    request.length = sizeof(payload);
+    assert(!net_socket_send(&request, 0) && request.transferred == sizeof(payload));
+    assert(sent_count == before + 4 && socket->tx_sent == sizeof(payload) + 1);
+    socket->peer_window = 0;
+    request.length = 1;
+    assert(!net_socket_send(&request, 0) && request.transferred == 1);
+    value = 1;
+    assert(!net_socket_nodelay(socket->handle, true, &value));
+    assert(sent_count == before + 4 && socket->tx_sent == sizeof(payload) + 1);
+    net_socket_handle_tcp(socket, socket->remote_seq, socket->local_seq,
+        65535, TCP_FLAG_ACK, NULL, 0);
+    net_poll_packets();
+    assert(sent_count == before + 5 && socket->tx_sent == 1 && socket->tx_len == 1);
+    value = 0;
+    assert(!net_socket_nodelay(socket->handle, true, &value));
+    assert(!net_socket_send(&request, 0) && request.transferred == 1);
+    assert(sent_count == before + 5 && socket->tx_len == 2);
+    assert(!net_socket_shutdown_fd(socket->handle, SHUT_WR));
+    net_poll_packets();
+    assert(sent_count == before + 6 && socket->tx_sent == 2);
+    assert(!(sent_frame[47] & TCP_FLAG_FIN));
+    net_socket_handle_tcp(socket, socket->remote_seq, socket->local_seq,
+        65535, TCP_FLAG_ACK, NULL, 0);
+    net_poll_packets();
+    assert(socket->fin_sent && (sent_frame[47] & TCP_FLAG_FIN));
+    net_socket_clear(socket);
+    assert(buffers == 0);
+    puts("[tcp-nodelay] PASS Nagle delay, NODELAY flush, ACK/full-MSS release, peer window and close");
 }
 
 static void test_tcp_timeouts_and_read_errors(void)
@@ -1153,6 +1229,7 @@ int main(void)
     test_tcp_route_gateway_change();
     test_tcp_bound_device_local_delivery();
     test_tcp_matching_and_scope_isolation();
+    test_tcp_nodelay();
     test_nonblocking_tcp_send_without_ack();
     test_tcp_peer_window_and_persist();
     test_tcp_timeouts_and_read_errors();

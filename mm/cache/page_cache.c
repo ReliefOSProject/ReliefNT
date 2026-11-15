@@ -600,7 +600,10 @@ static int refresh_hit(const struct storage_node *node,page_cache_loader loader,
     int ret=loader(loaded,context);
     if (ret>=0) ret=merge_loaded_tail(node,existing,loaded);
     mm_free_page(loaded);
-    if (ret<0) { page_cache_release(existing); return ret == -ENOMEM ? ret : -1; }
+    if (ret<0) {
+        page_cache_release(existing);
+        return ret == -ENOMEM || ret == -EAGAIN ? ret : -1;
+    }
     *phys=existing; return 0;
 }
 
@@ -660,7 +663,8 @@ static int page_cache_load_internal(const struct storage_node *node, uint64_t of
     }
     int result = loader(page, context);
     if (result < 0) {
-        mm_free_page(page); kernel_free(spare); return result == -ENOMEM ? result : -1;
+        mm_free_page(page); kernel_free(spare);
+        return result == -ENOMEM || result == -EAGAIN ? result : -1;
     }
 
     for (;;) {

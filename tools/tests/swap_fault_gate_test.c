@@ -24,7 +24,8 @@ static unsigned gate_sleeps;
  * the finite retry limit are exercised by the real pressure-wait fixture. */
 int memory_fault_storage_wait(struct task *task, uint64_t address)
 {
-    assert(task == current && address == fault_address);
+    assert(task == current && address == fault_address && !user_page_fault_lock.state &&
+           writer_owned() && execution_depth[cpu] == 1 && !reader_owned());
     sched_sleep_current_until(time_ticks() + 1u); return -EAGAIN;
 }
 
@@ -159,6 +160,66 @@ int SWAP_FAULT_GATE_FIXTURE_ENTRY(void)
     destroy_task(task);
     assert(!live_pages && !swap_area_unpublish(area));
     swap_area_destroy(area);
+    /* Exercise both ELF-style cached pages and ordinary mmap's uncached
+     * backing path through the actual file fault and hardware dispatcher. */
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        bool cached = mode != 0;
+        struct storage_node node = {.type=RELIEFOS_FS_TYPE_FILE, .flags=STORAGE_NODE_FLAG_FAT32,
+                                    .first_cluster=90+mode, .volume_id=3, .size=4096};
+        memset(file_bytes, 0x4a + mode, sizeof(file_bytes));
+        struct vfs_exec_source *source = exec_fixture_open(&node);
+        if (mode == 2) {
+            struct storage_node partial = node;
+            partial.size = 1024;
+            uint64_t warm = warm_file(source, partial, 0);
+            page_cache_release(warm);
+        }
+        task = file_task(source, node, va, 0, node.size,
+            TASK_VMA_FLAG_FILE | TASK_VMA_FLAG_LAZY | TASK_VMA_FLAG_PRIVATE |
+            (cached ? TASK_VMA_FLAG_SHARED_FILE : TASK_VMA_FLAG_MMAP), LINUX_PROT_READ);
+        work = (struct fault_work){task, va, 4, 0x23, 0, NULL, 0};
+        unsigned baseline = live_pages, sleeps = gate_sleeps, reads = atomic_load(&provider_reads);
+        provider_read_error = -EAGAIN;
+        run_fault(&work);
+        assert(!atomic_load(&signals) && gate_sleeps == sleeps + 1 && task->state == TASK_BLOCKED);
+        assert(live_pages == baseline && atomic_load(&provider_reads) == reads &&
+               !address_space_user_page_phys(sched_task_as(task), va));
+        provider_read_error = 0;
+        run_fault(&work);
+        frame = address_space_user_page_phys(sched_task_as(task), va);
+        assert(frame && !atomic_load(&signals) && !user_page_fault_lock.state);
+        for (unsigned i = 0; i < 4096; ++i)
+            assert(((uint8_t *)mm_phys_to_virt(frame))[i] == 0x4a + mode);
+        destroy_task(task);
+        vfs_exec_source_put(source);
+        (void)page_cache_reclaim(UINT32_MAX);
+        assert(!live_pages);
+    }
+    struct storage_node denied_node = {.type=RELIEFOS_FS_TYPE_FILE, .flags=STORAGE_NODE_FLAG_FAT32,
+                                       .first_cluster=93, .volume_id=3, .size=4096};
+    struct vfs_exec_source *denied_source = exec_fixture_open(&denied_node);
+    task = file_task(denied_source, denied_node, va, 0, denied_node.size,
+        TASK_VMA_FLAG_FILE | TASK_VMA_FLAG_LAZY | TASK_VMA_FLAG_MMAP, LINUX_PROT_READ);
+    work = (struct fault_work){task, va, 4, 0x23, 0, NULL, 0};
+    provider_read_error = -EAGAIN;
+    run_fault(&work);
+    unsigned sleeps = gate_sleeps;
+    assert(!atomic_load(&signals) && task->state == TASK_BLOCKED);
+    task->vmas[0].prot = LINUX_PROT_NONE;
+    provider_read_error = 0;
+    run_fault(&work);
+    assert(atomic_load(&signals) == 1 && gate_sleeps == sleeps &&
+           !address_space_user_page_phys(sched_task_as(task), va));
+    task->vmas[0].prot = LINUX_PROT_READ;
+    provider_read_error = -EIO;
+    run_fault(&work);
+    assert(atomic_load(&signals) == 2 && gate_sleeps == sleeps &&
+           !address_space_user_page_phys(sched_task_as(task), va));
+    provider_read_error = 0;
+    destroy_task(task);
+    vfs_exec_source_put(denied_source);
+    assert(!live_pages);
     puts("PASS real user trap: contention schedules, then page-in preserves bytes and gate boundaries");
+    puts("PASS file faults: cold/cache/refresh EAGAIN rollback, full retry, changed permissions and terminal I/O");
     return 0;
 }

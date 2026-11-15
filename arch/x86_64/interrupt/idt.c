@@ -723,6 +723,22 @@ struct task *page_fault_dispatch(struct trap_frame *frame)
         kernel_execution_unlock_irqrestore(execution_flags);
         return userland_schedule_from_frame(frame);
     }
+    if (frame && (frame->cs & 3ULL) == 3ULL && fault_result == -EAGAIN) {
+        /* A foreign asynchronous disk owner may prevent a valid file page-in
+         * even though this fault forces synchronous reads. Let that owner run;
+         * never sleep with the fault/loader lock or a newly allocated frame.
+         * Re-entering the fault revalidates its VMA, permissions and PTE. */
+        struct task *task = sched_current_task();
+        kernel_spin_unlock(&user_page_fault_lock);
+        int wait = memory_fault_storage_wait(task, cr2);
+        if (wait != -EAGAIN) {
+            memory_wait_cancel(task);
+            if (task) task->page_fault_signal = 7;
+            signal_user_page_fault(frame, cr2);
+        }
+        kernel_execution_unlock_irqrestore(execution_flags);
+        return userland_schedule_from_frame(frame);
+    }
     if (frame && (frame->cs & 3ULL) == 3ULL && fault_result == -ENOMEM) {
         struct task *task = sched_current_task();
         kernel_spin_unlock(&user_page_fault_lock);

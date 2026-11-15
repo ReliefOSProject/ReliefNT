@@ -31,6 +31,7 @@ static _Thread_local struct task *current;
 static _Thread_local int mapping_owner;
 static _Thread_local struct trap_frame *live_frame;
 static atomic_uint schedules, signals, polls, provider_reads;
+static int provider_read_error;
 static atomic_bool fail_alloc;
 static pthread_mutex_t page_mutex = PTHREAD_MUTEX_INITIALIZER;
 #ifdef PRESSURE_REPORTING_FIXTURE
@@ -338,6 +339,7 @@ static int exec_fixture_read(void *context, const struct storage_node *node, uin
     assert(context == &exec_fixture_pins && exec_fixture_pins && exec_fixture_denials);
     assert(writer_owned() && !reader_owned());
     assert(offset + size <= node->size && node->size <= sizeof(file_bytes));
+    if (provider_read_error) { *got = 0; return provider_read_error; }
 #ifdef PRESSURE_FIX5_FIXTURE
     int result = pressure_fixture_provider_before_read();
     if (result < 0) { *got = 0; return result; }

@@ -57,7 +57,7 @@ int memory_fault_oom(struct task *task, uint64_t address);
 /** @brief Bound a fault retry while another accepted storage operation owns I/O.
  * @param task Current execution-owned user task. @param address Fault address.
  * @return -EAGAIN after timed blocking, or terminal negative errno. Does not
- * cancel the other owner's request or submit a replacement slot operation.
+ * cancel the other owner's request or submit a replacement file/slot operation.
  */
 int memory_fault_storage_wait(struct task *task, uint64_t address);
 /** @brief Scope current-instruction page exclusions to one reclaim attempt.

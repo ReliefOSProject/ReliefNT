@@ -16,3 +16,7 @@ with tempfile.TemporaryDirectory(prefix="pipe-capacity-", dir=temporary) as work
                     "tools/tests/pipe_capacity_test.c", "fs/vfs/object.c", "-o", binary],
                    cwd=root, check=True)
     subprocess.run([binary], check=True, timeout=20)
+    probe = str(Path(work) / "fionread")
+    subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
+                    "tools/tests/pipe_fionread_probe.c", "-o", probe], cwd=root, check=True)
+    subprocess.run([probe], check=True, timeout=20)

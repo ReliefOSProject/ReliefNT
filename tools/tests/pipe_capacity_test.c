@@ -58,13 +58,18 @@ int main(void)
     struct task_file *read_end = &descriptors[0], *write_end = &descriptors[1];
     assert(task_pipe_capacity(read_end, false, 0) == 65536);
     assert(task_pipe_capacity(write_end, true, 5000) == 8192);
+    assert(task_pipe_available(read_end) == 0 && task_pipe_available(write_end) == 0);
+    assert(task_pipe_available(NULL) == -RELIEFOS_EBADF);
     unsigned char bytes[7000], result[7000];
     memset(bytes, 0x5a, sizeof(bytes));
     assert(task_pipe_write(write_end, bytes, sizeof(bytes)) == sizeof(bytes));
+    assert(task_pipe_available(read_end) == sizeof(bytes));
+    assert(task_pipe_available(write_end) == sizeof(bytes));
     assert(task_pipe_capacity(read_end, true, 4096) == -RELIEFOS_EBUSY);
     assert(task_pipe_capacity(read_end, true, 20000) == 32768);
     assert(task_pipe_read(read_end, result, sizeof(result)) == sizeof(result));
     assert(!memcmp(bytes, result, sizeof(bytes)));
+    assert(task_pipe_available(read_end) == 0);
     assert(task_pipe_capacity(write_end, true, 0) == 4096);
     assert(task_pipe_capacity(write_end, true, 1048577) == -RELIEFOS_EPERM);
     assert(task_pipe_capacity(write_end, true, UINT32_MAX) == -RELIEFOS_EINVAL);
@@ -76,6 +81,14 @@ int main(void)
     assert(task_pipe_write(write_end, bytes, 3000) == 3000);
     assert(task_pipe_write(write_end, bytes, 2000) == -RELIEFOS_EAGAIN);
     assert(task_pipe_read(read_end, result, sizeof(result)) == 3000);
+    /* Force the ring to wrap and query without changing byte order. */
+    assert(task_pipe_write(write_end, bytes, 3000) == 3000);
+    assert(task_pipe_read(read_end, result, 2000) == 2000);
+    assert(task_pipe_available(read_end) == 1000 && task_pipe_available(write_end) == 1000);
+    assert(task_pipe_write(write_end, bytes, 2000) == 2000);
+    assert(task_pipe_available(read_end) == 3000);
+    assert(task_pipe_read(read_end, result, sizeof(result)) == 3000);
+    assert(task_pipe_available(read_end) == 0);
     for (unsigned i = 0; i < 600; ++i) task_discard_file_fd(&current, (int)i);
     puts("PASS pipe resources: 300 live pipes and final-close reclamation");
 }
