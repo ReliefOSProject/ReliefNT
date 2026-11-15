@@ -221,6 +221,14 @@ static int ed_probe_next(struct storage_volume *v,uint64_t ino,const struct ext4
     int ret=ed_read(v,ino,in,p->node,node,true); if (ret<0) return ret;
     p->leaf=ext4_get_le32(node+12); return 0;
 }
+/** @brief Look up one name without converting retry/resource errors into corruption.
+ * @param v Borrowed mounted volume under storage execution ownership.
+ * @param ino Parent directory inode. @param name Borrowed literal name.
+ * @param found Required result inode. @param type Optional result directory type.
+ * @param prepared Optional caller-owned workspace of three filesystem blocks.
+ * @return Zero or negative lookup errno. Only index I/O/integrity errors latch
+ * fs_error and attempt validated linear reads; EAGAIN remains retryable.
+ */
 static int ed_lookup(struct storage_volume *v,uint64_t ino,const char *name,uint64_t *found,
                      uint8_t *type,uint8_t *prepared)
 {
@@ -240,6 +248,7 @@ static int ed_lookup(struct storage_volume *v,uint64_t ino,const char *name,uint
             if (next) { if (next<0) ret=next; break; }
         }
         if (ret==0 || ret==-RELIEFOS_ENOENT) { if(!prepared)kernel_free(buf); return ret; }
+        if (ret!=-RELIEFOS_EIO) { if(!prepared)kernel_free(buf); return ret; }
         /* Damaged index: validated leaf scanning can still serve reads, but
          * mutations remain disabled until repair/remount. */
         v->ext4.fs_error=1;

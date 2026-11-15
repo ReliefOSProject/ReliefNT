@@ -12,6 +12,8 @@
 static uint8_t *disk;
 static uint64_t disk_len, reads, writes;
 static int fail_read;
+static int transient_read_error;
+static uint64_t transient_read_sector;
 static struct storage_volume volume;
 #ifndef EXT4_JOURNAL_TRANSPORT_FIXTURE
 int storage_ext4_device_flush(const struct storage_volume *v) { (void)v; return 0; }
@@ -43,6 +45,11 @@ int storage_read_device(const struct storage_volume *v, uint64_t lba,
     (void)v;
     reads++;
     if (fail_read) return -RELIEFOS_EIO;
+    if (transient_read_error && lba <= transient_read_sector && transient_read_sector - lba < n) {
+        int error = transient_read_error;
+        transient_read_error = 0;
+        return error;
+    }
     assert(lba <= disk_len / 512 && n <= disk_len / 512 - lba);
     memcpy(out, disk + lba * 512, (size_t)n * 512);
     return 0;
