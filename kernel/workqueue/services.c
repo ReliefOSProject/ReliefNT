@@ -50,10 +50,17 @@ static void graphics_work(struct kernel_work *work,void *context)
  */
 static void audio_work(struct kernel_work *work,void *context)
 { (void)work;(void)context;driver_manager_process_audio_faults(); }
+/** @brief Drain interrupt-notified NICs without running the protocol stack in IRQ.
+ * @param work Permanent core dispatcher. @param context Unused NULL argument.
+ * A full NIC slice coalesces a successor; all callbacks use netdev owner pins.
+ */
+static void network_rx_work(struct kernel_work *work,void *context)
+{ (void)work;(void)context;net_poll_rx_budget(32); }
 static struct kernel_work network=KERNEL_WORK_INIT(network_work,NULL);
 static struct kernel_work services[]={
     KERNEL_WORK_INIT(usb_work,NULL),KERNEL_WORK_INIT(vfs_work,NULL),
-    KERNEL_WORK_INIT(graphics_work,NULL),KERNEL_WORK_INIT(audio_work,NULL)};
+    KERNEL_WORK_INIT(graphics_work,NULL),KERNEL_WORK_INIT(audio_work,NULL),
+    KERNEL_WORK_INIT(network_rx_work,NULL)};
 /** @brief Coalesce a builtin dispatcher while preserving subsystem ownership.
  * @param service Valid permanent service index. IRQ/task safe, no callback.
  */

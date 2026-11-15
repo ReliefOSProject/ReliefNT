@@ -2,7 +2,8 @@
 #ifndef RELIEFNT_DEFERRED_H
 #define RELIEFNT_DEFERRED_H
 #include <reliefnt/types.h>
-enum kernel_deferred_service { DEFERRED_USB, DEFERRED_VFS, DEFERRED_GRAPHICS, DEFERRED_AUDIO };
+enum kernel_deferred_service { DEFERRED_USB, DEFERRED_VFS, DEFERRED_GRAPHICS, DEFERRED_AUDIO,
+                               DEFERRED_NET_RX };
 /** @brief Coalesce a permanent dispatcher without executing provider callbacks.
  * @param service Bounded core service selector; invalid values are ignored.
  * IRQ/task safe, allocation-free. Standalone subsystem fixtures can omit the

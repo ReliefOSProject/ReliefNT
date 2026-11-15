@@ -1,4 +1,6 @@
 #include <reliefnt/sound_service.h>
+#include <reliefnt/pci_irq.h>
+#include <reliefnt/export.h>
 #include "manager_internal.h"
 
 
@@ -111,6 +113,18 @@ int driver_request_pci_irq(const struct reliefos_driver_pci_device *dev,
 {
     return driver_request_pci_irq_owned((uint32_t)loading_slot,dev,handler,opaque,out_handle);
 }
+
+/** @brief Register a single MSI-X table entry with the loading driver's ledger.
+ * @param dev Quiesced PCI identity. @param handler Nonblocking IRQ callback.
+ * @param opaque Context retained until free. @param out_handle Owned token output.
+ * @return Zero or negative errno; init task context, never an unowned allocation.
+ */
+int driver_request_pci_msix_irq(const struct reliefos_driver_pci_device *dev,
+    void (*handler)(void *),void *opaque,uint32_t *out_handle)
+{
+    return driver_request_pci_msix_irq_owned((uint32_t)loading_slot,dev,handler,opaque,out_handle);
+}
+EXPORT_SYMBOL(driver_request_pci_msix_irq);
 
 /** @brief Copy a v2 card contract and bind the currently loading module owner.
  * @param identity Borrowed identity, copied by core.

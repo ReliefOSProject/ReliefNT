@@ -132,7 +132,24 @@ int driver_request_pci_irq_owned(uint32_t owner,const struct reliefos_driver_pci
     if(ret){pci_free_irq(handle);return ret;}
     *out_handle=handle;return 0;
 }
-/** @brief Remove an exact module IRQ lease, then disable and synchronize MSI.
+
+/** @brief Allocate an MSI-X entry with rollback on failed owner registration.
+ * @param owner Loading driver slot. @param dev Quiesced exclusive PCI function.
+ * @param handler Nonblocking IRQ callback. @param opaque Retained driver context.
+ * @param out_handle Owned token output. @return Zero or provider/ledger errno.
+ * Task context, no ledger lock spans table mapping or callback synchronization.
+ */
+int driver_request_pci_msix_irq_owned(uint32_t owner,const struct reliefos_driver_pci_device *dev,
+    void (*handler)(void *),void *opaque,uint32_t *out_handle)
+{
+    if(owner>=RELIEFOS_DRIVER_MAX || !out_handle)return -22;
+    uint32_t handle;int ret=pci_request_msix_irq(dev,handler,opaque,&handle);
+    if(ret)return ret;
+    ret=driver_resource_add(owner,DRIVER_RESOURCE_IRQ,handle,0,0);
+    if(ret){pci_free_irq(handle);return ret;}
+    *out_handle=handle;return 0;
+}
+/** @brief Remove an exact module IRQ lease, then disable and drain MSI/MSI-X.
  * @param handle Owned generation token.
  * @return None. Task context, never from ISR; module stays mapped through return.
  */

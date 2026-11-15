@@ -102,13 +102,19 @@ static int start(const struct reliefos_driver_kernel_api *api)
         devices = d;
         rc = vmx_hardware_start(d);
         if (!rc)
+            vmx_interrupt_prepare(d);
+        if (!rc)
             rc = vmx_allocate(d);
         if (!rc)
             rc = vmx_activate(d);
         if (!rc) {
-            d->active = true;
-            uint32_t ifindex;
+            uint32_t ifindex=0;
             rc = driver_register_netdev(&ops, d, &ifindex);
+            if (!rc) {
+                d->ifindex=ifindex;
+                __atomic_store_n(&d->active,true,__ATOMIC_RELEASE);
+                if (d->irq_handle) netdev_rx_notify(d->ifindex);
+            }
         }
         if (rc) {
             api->console_log(CONSOLE_LOG_WARN, "[vmxnet3] %02x:%02x.%u initialization failed: %d\n",
@@ -123,9 +129,10 @@ static int start(const struct reliefos_driver_kernel_api *api)
         }
         ++registered;
         api->console_log(CONSOLE_LOG_INFO,
-                         "[vmxnet3] %02x:%02x.%u MAC=%02x:%02x:%02x:%02x:%02x:%02x link=%s\n",
+                         "[vmxnet3] %02x:%02x.%u MAC=%02x:%02x:%02x:%02x:%02x:%02x link=%s irq=%s\n",
                          pci.bus, pci.slot, pci.function, d->mac[0], d->mac[1], d->mac[2],
-                         d->mac[3], d->mac[4], d->mac[5], ready(d) ? "up" : "down");
+                         d->mac[3], d->mac[4], d->mac[5], ready(d) ? "up" : "down",
+                         d->irq_mode==1 ? "msix" : d->irq_mode==2 ? "msi" : "poll");
     }
     return registered ? 0 : first_error ? first_error : -19;
 }
@@ -151,7 +158,7 @@ const struct reliefos_driver_module vmxnet3_driver_module = {
     .struct_size = sizeof(struct reliefos_driver_module),
     .kind = RELIEFOS_DRIVER_KIND_NETWORK,
     .name = "vmxnet3",
-    .version = 1,
+    .version = 2,
     .init = start,
     .fini = stop,
 };

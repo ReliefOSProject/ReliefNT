@@ -13,6 +13,7 @@ e1000 tools/test_e1000.py
 e1000e tools/test_e1000e.py
 r8169 tools/test_r8169.py
 vmxnet3 tools/test_vmxnet3.py
+pci_msix tools/test_pci_msix.py
 efi_fs_early tools/test_efi_fs_early.py
 efi_handoff tools/test_efi_handoff.py
 efi_acpi_bootstrap tools/test_efi_acpi_bootstrap.py
@@ -218,5 +219,6 @@ physical_metadata tools/test_physical_metadata.py
 heap_slab tools/test_heap_slab.py
 vfs_lookup_cache tools/test_vfs_lookup_cache.py
 net_device tools/test_net_device.py
+net_rx_budget tools/test_net_rx_budget.py
 net_multi_interface tools/test_net_multi_interface.py
 net_multinic_data tools/test_net_multinic_data.py

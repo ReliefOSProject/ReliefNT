@@ -129,6 +129,11 @@ int e1000_poll(void *frame,uint32_t capacity,uint32_t *len)
   *len=queued_length;queued_length=0;return 1; }
 int netdev_poll(uint32_t index,void *frame,uint32_t capacity,uint32_t *len)
 { if(index==2)return e1000_poll(frame,capacity,len);*len=0;return 0; }
+/* This fixture models poll-only NICs; IRQ admission has a separate host suite. */
+uint32_t netdev_rx_take(uint32_t after) { (void)after;return 0; }
+void netdev_rx_notify(uint32_t index) { (void)index; }
+int netdev_poll_notified(uint32_t index,void *frame,uint32_t capacity,uint32_t *len)
+{ return netdev_poll(index,frame,capacity,len); }
 /** @brief Ignore packet socket mirroring. @param frame Bytes. @param length Byte length. */
 void net_packet_input(const void *frame,uint32_t length) { (void)frame;(void)length; }
 void net_packet_input_on(uint32_t index,const void *frame,uint32_t length)
