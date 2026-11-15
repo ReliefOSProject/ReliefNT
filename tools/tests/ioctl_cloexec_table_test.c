@@ -31,7 +31,12 @@ int storage_inode_get(const struct storage_node *node, struct storage_inode_ref 
 { assert(!(node->flags & STORAGE_NODE_FLAG_EXT2)); *out = NULL; return 0; }
 int storage_inode_put(struct storage_inode_ref *inode) { assert(!inode); return 0; }
 /* This device/O_PATH fixture never acquires a regular inode write lease. */
+int storage_inode_write_get(struct storage_inode_ref *inode){(void)inode;abort();}
 void storage_inode_write_put(struct storage_inode_ref *inode){(void)inode;abort();}
+/* No mount references or remote CPUs are used by this descriptor-table test. */
+struct vfs_mount;
+void vfs_lookup_cache_purge(struct vfs_mount *mount){(void)mount;abort();}
+void smp_send_reschedule(uint32_t cpu){(void)cpu;abort();}
 void task_pipe_release(struct task_file *file) { (void)file; }
 void task_socket_release(struct task_file *file) { (void)file; }
 void task_inet_release(struct task_file *file) { (void)file; }

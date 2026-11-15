@@ -1,5 +1,17 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Unreached host-fixture dependencies trap if invoked. */
+/** @brief Trap if the block-only fixture reaches pipe byte accounting. */
+__attribute__((noreturn)) void task_pipe_available(void) { __builtin_trap(); }
+/** @brief Trap if the block-only fixture reaches network interface control. */
+__attribute__((noreturn)) void net_interface_ioctl(void) { __builtin_trap(); }
+/** @brief Trap if the block-only fixture reaches Internet socket family lookup. */
+__attribute__((noreturn)) void task_inet_family(void) { __builtin_trap(); }
+/** @brief Trap if the block-only fixture reaches IPv6 interface control. */
+__attribute__((noreturn)) void net_ipv6_interface_ioctl(void) { __builtin_trap(); }
+/** @brief Trap if the size-only fixture reaches registered block geometry. */
+__attribute__((noreturn)) void block_device_info(void) { __builtin_trap(); }
+/** @brief Trap if the size-only fixture reaches block sequence querying. */
+__attribute__((noreturn)) void block_device_sequence(void) { __builtin_trap(); }
 /** @brief Trap if the fixture reaches unmodeled address_space_user_page_flags. */
 __attribute__((noreturn)) void address_space_user_page_flags(void) { __builtin_trap(); }
 /** @brief Trap if the fixture reaches unmodeled address_space_user_page_readable. */

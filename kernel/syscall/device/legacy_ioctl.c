@@ -326,6 +326,15 @@ int64_t syscall_legacy_ioctl(uint64_t number, uint64_t a0, uint64_t a1, uint64_t
     if (number == LINUX_SYS_IOCTL) {
         struct task *task = sched_current_task();
         struct task_file *file = task_file_for_io(task, (int)a0);
+        if (file && (file->flags & TASK_FILE_FLAG_PIPE)) {
+            if ((uint32_t)a1 != FIONREAD) return -LINUX_ENOTTY;
+            IOCTL_PREPARE(a2, sizeof(int32_t), true, -RELIEFOS_EFAULT);
+            if (!a2 || !user_range_writable(a2, sizeof(int32_t))) return -RELIEFOS_EFAULT;
+            int count = task_pipe_available(file);
+            if (count < 0) return count;
+            *(int32_t *)(uintptr_t)a2 = count;
+            return 0;
+        }
         if (file && file->kind == TASK_FILE_KIND_INOTIFY) {
             if ((uint32_t)a1 == FIONREAD)
                 return task_inotify_fionread ? task_inotify_fionread(task, file, a2) : -RELIEFOS_ENOSYS;

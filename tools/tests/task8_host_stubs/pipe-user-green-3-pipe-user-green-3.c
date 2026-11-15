@@ -64,3 +64,6 @@ __attribute__((noreturn)) void task_socket_read(void) { __builtin_trap(); }
 __attribute__((noreturn)) void task_socket_write(void) { __builtin_trap(); }
 /** @brief Trap if the fixture reaches unmodeled task_timerfd_update. */
 __attribute__((noreturn)) void task_timerfd_update(void) { __builtin_trap(); }
+/* These cases use only pipe endpoints; socket routing must remain unreachable. */
+/** @brief Trap if the pipe-only fixture reaches socket syscall dispatch. */
+__attribute__((noreturn)) void syscall_socket_dispatch(void) { __builtin_trap(); }

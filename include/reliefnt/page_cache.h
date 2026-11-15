@@ -28,7 +28,8 @@ int page_cache_lookup(const struct storage_node *node, uint64_t offset,
  * @param loader Complete reproducible page loader; NULL permits cache hits only.
  * @param context Borrowed loader state.
  * @param phys Required frame output. @return Zero, PAGE_CACHE_FULL, -ENOMEM
- * for a frame/loader allocation failure, or another negative failure.
+ * for a frame/loader allocation failure, -EAGAIN for temporary loader
+ * contention, or another negative failure.
  * A separately committed clean reclaim after PMM exhaustion may survive a later failure.
  */
 int page_cache_load(const struct storage_node *node, uint64_t offset,
@@ -38,7 +39,8 @@ int page_cache_load(const struct storage_node *node, uint64_t offset,
  * @param loader Complete reproducible page loader; NULL permits hits only.
  * @param context Borrowed loader state. @param phys Required frame output.
  * @return Zero or negative errno, including -ENOMEM when frame or metadata
- * allocation fails. No clean replacement or reclaim scan runs under the fault
+ * allocation fails and -EAGAIN for temporary loader contention. No clean
+ * replacement or reclaim scan runs under the fault
  * and loader locks; the caller reclaims separately at its audited boundary.
  */
 int page_cache_load_fault(const struct storage_node *node, uint64_t offset,

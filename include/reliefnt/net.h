@@ -253,6 +253,14 @@ int net_socket_is_listening(int32_t handle);
  * @param handle Socket. @param set Select update. @param value Input/output flag.
  * @return Zero or negative errno. */
 int net_socket_reuse(int32_t handle,bool set,int *value);
+/** @brief Read or update Nagle suppression on a live TCP socket.
+ * @param handle Execution-owned socket handle.
+ * @param set True to update and flush queued data when enabled.
+ * @param value Required kernel integer input/output; nonzero enables NODELAY.
+ * @return Zero or -EBADF for an invalid handle/value. No usercopy or wait;
+ * enabled sockets still obey peer windows and congestion limits.
+ */
+int net_socket_nodelay(int32_t handle, bool set, int *value);
 struct text_stream;
 /** @brief Apply a validated quoted IPv6 TCP error to the matching tuple.
  * @param source Original local address. @param destination Original peer.

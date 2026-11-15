@@ -1225,7 +1225,7 @@ void task_inet_release(struct task_file *file)
 }
 
 /**
- * @brief Read or update supported socket and IPv6 options for a TCP socket.
+ * @brief Read or update supported socket, TCP and IPv6 options for a TCP socket.
  * @param setting Select setsockopt when true, getsockopt otherwise.
  * @param level Socket option level.
  * @param option Option identifier.
@@ -1248,7 +1248,8 @@ static int inet_socket_option(bool setting, int level, int option,
         if (result < 0) return result;
         return setting ? net_socket_bound_device(handle, true, &index) : 0;
     }
-    if (level == SOL_IPV6 || (level == SOL_SOCKET && option == SO_REUSEADDR)) {
+    bool nodelay = level == SOL_TCP && option == TCP_NODELAY;
+    if (level == SOL_IPV6 || nodelay || (level == SOL_SOCKET && option == SO_REUSEADDR)) {
         int value = 0; uint32_t size = (uint32_t)length;
         if (setting) {
             if ((int32_t)size < (int32_t)sizeof(value)) return -LINUX_EINVAL;
@@ -1256,12 +1257,14 @@ static int inet_socket_option(bool setting, int level, int option,
             if (prep) return prep;
             if (!user_range_ok(address, sizeof(value))) return -LINUX_EFAULT;
             __builtin_memcpy(&value, (void *)(uintptr_t)address, sizeof(value));
-            return level == SOL_IPV6 ? net_socket_ipv6_option(handle, true, (uint32_t)option, &value) :
+            return nodelay ? net_socket_nodelay(handle, true, &value) :
+                   level == SOL_IPV6 ? net_socket_ipv6_option(handle, true, (uint32_t)option, &value) :
                                        net_socket_reuse(handle, true, &value);
         }
         int prep = socket_user_length(sched_current_task(), length, &size); if (prep) return prep;
         if ((int32_t)size < 0) return -LINUX_EINVAL;
-        int ret = level == SOL_IPV6 ? net_socket_ipv6_option(handle, false, (uint32_t)option, &value) :
+        int ret = nodelay ? net_socket_nodelay(handle, false, &value) :
+                  level == SOL_IPV6 ? net_socket_ipv6_option(handle, false, (uint32_t)option, &value) :
                                       net_socket_reuse(handle, false, &value);
         if (ret < 0) return ret;
         if (size > sizeof(value)) size = sizeof(value);

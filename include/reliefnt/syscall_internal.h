@@ -509,6 +509,12 @@ short task_pipe_poll(const struct task_file *file, short events);
  * @return Actual page-rounded capacity or negative EBADF/EINVAL/EBUSY/EPERM/ENOMEM.
  */
 int64_t task_pipe_capacity(struct task_file *file, bool setting, uint32_t bytes);
+/** @brief Snapshot unread bytes for FIONREAD without consuming the pipe.
+ * @param file Borrowed read/write endpoint, pinned by execution ownership.
+ * @return Buffered byte count or -EBADF for a stale/nonpipe endpoint. Takes
+ * only the pipe data lock; no usercopy, allocation, wait or ownership change.
+ */
+int task_pipe_available(const struct task_file *file);
 /**
  * @brief Receive through the original pinned Internet socket without changing OFD flags.
  * @param file Borrowed live socket retained by syscall admission.
