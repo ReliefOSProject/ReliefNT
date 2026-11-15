@@ -32,6 +32,17 @@ int driver_register_netdev(const struct reliefnt_netdev_ops *ops, void *context,
  * @param after Previous index, or zero. @return The next index or zero.
  */
 uint32_t netdev_next(uint32_t after);
+/** @brief Queue a coalesced task-context receive pass for one NIC.
+ * @param ifindex Never-reused registered identity; stale IDs are ignored.
+ * IRQ/task safe, no allocation or provider callback; hints received before
+ * publication are retained, and no module/context pointer is queued.
+ */
+void netdev_rx_notify(uint32_t ifindex);
+/** @brief Claim a pending visible NIC using circular index order.
+ * @param after Previous serviced identity. @return Pending ID or zero.
+ * Task context under network execution; consumers revalidate with netdev_poll.
+ */
+uint32_t netdev_rx_take(uint32_t after);
 /** @brief Query carrier readiness of the exact NIC.
  * @param ifindex Stable NIC index. @return Nonzero only when ready.
  */
@@ -52,6 +63,13 @@ int netdev_send(uint32_t ifindex, const void *frame, uint32_t length);
  * @return One frame, zero if empty, or negative Linux errno.
  */
 int netdev_poll(uint32_t ifindex, void *frame, uint32_t capacity, uint32_t *out_length);
+/** @brief Poll an IRQ-notified NIC without rejecting a carrier-change event.
+ * @param ifindex Stable identity. @param frame Writable buffer.
+ * @param capacity Buffer bytes. @param out_length Optional output size.
+ * @return One, zero or negative errno. Task context under network execution;
+ * keeps the normal provider-owner pin even when its cached carrier is down.
+ */
+int netdev_poll_notified(uint32_t ifindex, void *frame, uint32_t capacity, uint32_t *out_length);
 /** @brief Copy an exact NIC identity, clearing the output if absent.
  * @param ifindex Stable NIC index. @param out Caller-owned nullable output.
  */

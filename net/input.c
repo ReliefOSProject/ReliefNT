@@ -88,6 +88,42 @@ void net_poll_packets(void)
     for (unsigned i = 0; i < 32; ++i) net_poll_once(0, 0, 0, 0);
 }
 
+/** @brief Drain notified NICs in fair slices with a strict descriptor budget.
+ * @param budget Maximum receive attempts, including empty/dropped descriptors.
+ * Task context under network execution ownership. Each slice admits ordinary
+ * netdev_poll owner pins; no module callback/context is retained between turns.
+ * A full slice requeues the NIC so only an observed empty queue completes it.
+ * Administratively down links still drain/rearm control events, but their
+ * packets never enter the protocol stack or AF_PACKET receive path.
+ */
+void net_poll_rx_budget(uint32_t budget)
+{
+    static uint32_t previous;
+    uint8_t frame[NET_FRAME_MAX];
+    uint32_t used=0;
+    while (used<budget) {
+        uint32_t id=netdev_rx_take(previous);
+        if (!id) break;
+        previous=id;
+        unsigned slice=0;
+        bool more=false;
+        while (used<budget && slice<8) {
+            ++used; ++slice;
+            uint32_t length=0;
+            int result=netdev_poll_notified(id,frame,sizeof(frame),&length);
+            more=result>0 || result==-90 || result==-74;
+            if (result>0 && length && net_interface_is_up(id)) {
+                net_packet_input_on(id,frame,length);
+                net_process_frame(id,frame,length,NULL,NULL,NULL,NULL);
+            }
+            if (!more) break;
+        }
+        if (more) netdev_rx_notify(id);
+        net_tcp_service_sockets();
+        net_ipv6_poll();
+    }
+}
+
 /**
  * @brief Test whether TCP or IPv6 work is due for its next maintenance batch.
  * @return True when active work and the current tick permit a bounded poll pass.

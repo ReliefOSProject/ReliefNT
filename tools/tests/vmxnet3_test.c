@@ -20,10 +20,15 @@ struct model {
     unsigned tx_size, rx_size, rxc_size;
     const struct reliefnt_netdev_ops *ops;
     void *context;
+    void (*irq)(void *);
+    void *irq_context;
+    unsigned irq_handle, irq_notifications, link_queries, inject_rearm, rx_doorbells, intr_config;
 };
 static struct model models[2];
 static unsigned count=1, live, maps, allocation_limit=32, registered, teardown_error, allocation_owner;
 static uint64_t next_pa=0x140000000ULL;
+static int msix_result=-95, msi_result=-95;
+static unsigned msix_attempts, msi_attempts;
 static struct allocation { uint64_t pa; uint32_t pages; void *data; unsigned owner; } allocations[32];
 
 /** @brief Allocate host storage for driver-owned metadata. @param size Bytes. @return Zeroed storage. */
@@ -108,11 +113,41 @@ static void log_text(enum console_log_level level,const char *fmt,...) { (void)l
 /** @brief Capture one NIC registration. @param ops Driver operations. @param context Per-device state. @param index Returned index. @return Zero. */
 int driver_register_netdev(const struct reliefnt_netdev_ops *ops,void *context,uint32_t *index)
 { assert(registered<count); models[registered].ops=ops; models[registered].context=context; *index=++registered; return 0; }
+/** @brief Model only the PCI IRQ boundary, retaining a real driver's callback. */
+int driver_request_pci_msix_irq(const struct reliefos_driver_pci_device *p,
+    void (*handler)(void *),void *context,uint32_t *handle)
+{
+    ++msix_attempts;
+    if (msix_result) return msix_result;
+    struct model *m=&models[p->slot-3]; assert(!m->activated && !m->irq);
+    m->irq=handler; m->irq_context=context; *handle=m->irq_handle=p->slot;
+    return 0;
+}
+/** @brief Model the legacy MSI provider for fallback and explicit MSI preference. */
+static int request_msi(const struct reliefos_driver_pci_device *p,
+    void (*handler)(void *),void *context,uint32_t *handle)
+{
+    ++msi_attempts;
+    if (msi_result) return msi_result;
+    struct model *m=&models[p->slot-3]; assert(!m->activated && !m->irq);
+    m->irq=handler; m->irq_context=context; *handle=m->irq_handle=p->slot;
+    return 0;
+}
+/** @brief Synchronize and remove the retained interrupt callback. */
+static void free_irq(uint32_t handle)
+{
+    struct model *m=&models[handle-3];
+    assert(m->bar[0][0]==1); m->irq=NULL; m->irq_context=NULL; m->irq_handle=0;
+}
+/** @brief Record allocation-free notifications, including the init/publication handoff. */
+void netdev_rx_notify(uint32_t id)
+{ assert(id && id<=count); ++models[id-1].irq_notifications; }
 static const struct reliefos_driver_kernel_api api={
     .abi_version=RELIEFOS_DRIVER_ABI_VERSION,.struct_size=sizeof(api),
     .pci_enumerate=enumerate,.pci_read16=read16,.pci_write16=write16,.pci_read32=read32,
     .map_mmio=map,.unmap_mmio=unmap,.alloc_dma=allocate,.free_dma=release,.phys_to_virt=alias,
     .sleep_ms=sleep_ms,.console_log=log_text,.report_teardown_failure=report_failure,
+    .request_pci_irq=request_msi,.free_pci_irq=free_irq,
 };
 
 /** @brief Find the device associated with an MMIO mapping. @param p Register mapping. @param which Returned BAR index. @return Device model. */
@@ -138,7 +173,8 @@ uint32_t vmx_io_read(void *p,unsigned off)
         uint32_t cmd=m->bar[1][off/4];
         if (cmd==0xcafe0000) return m->activated ? 0 : 1;
         if (cmd==0xcafe0001 || cmd==0xcafe0002) return m->fail_stop ? 1 : 0;
-        if (cmd==0xf00d0002) return m->link ? 0x03e80001 : 0;
+        if (cmd==0xf00d0002) { ++m->link_queries; return m->link ? 0x03e80001 : 0; }
+        if (cmd==0xf00d0008) return m->intr_config;
         return 0;
     }
     return m->bar[bar][off/4];
@@ -146,7 +182,14 @@ uint32_t vmx_io_read(void *p,unsigned off)
 /** @brief Issue a modeled VMXNET3 register write. @param p BAR mapping. @param off Register offset. @param value Word. */
 void vmx_io_write(void *p,unsigned off,uint32_t value)
 {
-    unsigned bar; struct model *m=lookup(p,&bar); m->bar[bar][off/4]=value;
+    unsigned bar; struct model *m=lookup(p,&bar);
+    if (!bar && off==0x800) ++m->rx_doorbells;
+    if (bar==1 && off==0x40) { m->bar[bar][off/4]&=~value; return; }
+    m->bar[bar][off/4]=value;
+    if (!bar && !off && !value && m->inject_rearm) {
+        --m->inject_rearm;
+        m->rxc[0].address=3u<<14; m->rxc[0].a=64; m->rxc[0].b=0x80000000;
+    }
     if (bar==1 && off==0x10) m->shared=(m->shared&0xffffffff00000000ULL)|value;
     if (bar==1 && off==0x18) m->shared=(m->shared&0xffffffffULL)|((uint64_t)value<<32);
     if (bar!=1 || off!=0x20) return;
@@ -168,7 +211,8 @@ void vmx_io_write(void *p,unsigned off,uint32_t value)
 static void reset(void)
 {
     assert(!live && !maps); memset(models,0,sizeof(models)); count=1; registered=0;
-    teardown_error=0; allocation_limit=32;
+    teardown_error=0; allocation_limit=32; msix_result=msi_result=-95;
+    msix_attempts=msi_attempts=0;
     for (unsigned i=0;i<2;++i) { models[i].version=models[i].upt=models[i].link=1; models[i].command=7; }
 }
 /** @brief Stop all controllers and verify resources were returned. */
@@ -176,6 +220,68 @@ static void finish(void)
 {
     vmxnet3_driver_module.fini(); assert(!teardown_error && !live && !maps);
     for (unsigned i=0;i<count;++i) assert(models[i].command==7);
+}
+/** @brief Check masking, cached carrier, event handling and the empty/rearm race. */
+static void interrupts(void)
+{
+    reset(); msix_result=0; assert(!vmxnet3_driver_module.init(&api));
+    struct model *m=&models[0]; uint8_t out[2048]; uint32_t length;
+    assert(m->irq && m->irq_notifications && !word(alias(m->shared),108));
+    assert(((const uint8_t *)alias(m->shared))[80]==1);
+    assert(m->rx_doorbells==1);
+    assert(!m->ops->poll(m->context,out,sizeof(out),&length) && !m->bar[0][0]);
+    unsigned queries=m->link_queries;
+    for (unsigned i=0;i<100;++i) assert(m->ops->is_ready(m->context));
+    assert(m->link_queries==queries); /* No GET_LINK for each packet. */
+    unsigned notify=m->irq_notifications;
+    m->irq(m->irq_context);
+    assert(m->bar[0][0]==1 && m->irq_notifications==notify+1);
+    m->inject_rearm=1;
+    assert(!m->ops->poll(m->context,out,sizeof(out),&length));
+    assert(m->bar[0][0]==1 && m->irq_notifications>notify+1);
+    assert(m->ops->poll(m->context,out,sizeof(out),&length)==1 && length==64);
+    assert(m->rx_doorbells==1); /* updateRxProd=false avoids per-packet MMIO. */
+    ((uint8_t *)alias(m->shared))[1024+256]=1;
+    m->rxc[1].address=1u|(3u<<14); m->rxc[1].a=64; m->rxc[1].b=0x80000000;
+    assert(m->ops->poll(m->context,out,sizeof(out),&length)==1 && length==64);
+    assert(m->rx_doorbells==2); /* Honor an explicit producer-update request. */
+    assert(!m->ops->poll(m->context,out,sizeof(out),&length) && !m->bar[0][0]);
+    m->link=0; m->bar[1][0x40/4]=4; m->irq(m->irq_context);
+    assert(!m->ops->poll(m->context,out,sizeof(out),&length));
+    assert(!m->ops->is_ready(m->context) && !m->bar[1][0x40/4]);
+    m->link=1; m->bar[1][0x40/4]=4; m->irq(m->irq_context);
+    assert(!m->ops->poll(m->context,out,sizeof(out),&length) && m->ops->is_ready(m->context));
+    m->bar[1][0x40/4]=1; m->irq(m->irq_context);
+    assert(m->ops->poll(m->context,out,sizeof(out),&length)<0);
+    assert(!m->ops->is_ready(m->context) && m->bar[0][0]==1);
+    finish(); assert(!m->irq);
+    puts("PASS vmxnet3 IRQ mask, cached carrier, rearm race, link/queue events and teardown");
+}
+/** @brief Check negotiated MSI fallback, polling and IRQ lifecycle rollback. */
+static void interrupt_fallbacks(void)
+{
+    reset(); msi_result=0;
+    assert(!vmxnet3_driver_module.init(&api));
+    assert(msix_attempts==1 && msi_attempts==1 && models[0].irq);
+    finish(); assert(!models[0].irq);
+    reset(); msix_result=msi_result=0; models[0].intr_config=2u|(1u<<2);
+    assert(!vmxnet3_driver_module.init(&api));
+    assert(!msix_attempts && msi_attempts==1 && models[0].irq);
+    assert(!((uint8_t *)alias(models[0].shared))[80]); /* Active mask mode. */
+    finish();
+    reset(); msix_result=msi_result=0; models[0].intr_config=1;
+    assert(!vmxnet3_driver_module.init(&api));
+    assert(!msix_attempts && !msi_attempts && !models[0].irq);
+    assert(word(alias(models[0].shared),108)==1); /* No speculative INTx. */
+    finish();
+    reset(); msix_result=0; models[0].fail_activate=1;
+    assert(vmxnet3_driver_module.init(&api)<0); finish(); assert(!models[0].irq);
+    reset(); msix_result=0;
+    assert(!vmxnet3_driver_module.init(&api));
+    models[0].fail_stop=1; vmxnet3_driver_module.fini();
+    assert(teardown_error && live && maps && !models[0].irq);
+    models[0].fail_stop=0; teardown_error=0; finish();
+    puts("PASS vmxnet3 MSI preference/fallback, polling and IRQ failed-stop retention");
 }
 /** @brief Test probing, DMA ownership, packet rings and malformed completions. @return Zero on success. */
 int main(void)
@@ -238,6 +344,8 @@ int main(void)
     m->rxc[1].address=1u|(1u<<14); m->rxc[1].a=64; m->rxc[1].b=0x83000000u;
     assert(m->ops->poll(m->context,out,sizeof(out),&bad_length)==-74 && !bad_length);
     finish();
+    interrupts();
+    interrupt_fallbacks();
     reset(); assert(!vmxnet3_driver_module.init(&api)); m=&models[0];
     m->fail_busmaster_disable=1; vmxnet3_driver_module.fini();
     assert(teardown_error && live && maps);

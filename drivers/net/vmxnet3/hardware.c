@@ -4,7 +4,7 @@
 /** @brief Issue a synchronous VMXNET3 command and read its completion.
  * @param d Mapped device. @param command Command word. @return Device's completion word.
  */
-static uint32_t command(struct vmx_device *d, uint32_t command)
+uint32_t vmx_command(struct vmx_device *d, uint32_t command)
 {
     uint64_t flags;
     kernel_spin_lock_irqsave(&d->command_lock, &flags);
@@ -37,7 +37,7 @@ int vmx_hardware_start(struct vmx_device *d)
     vmx_io_write(d->bar[0], VMX_IMR, 1);
     /* Until quiesced, the function may retain a previous owner's DMA state. */
     d->exposed = true;
-    if (command(d, VMX_QUIESCE) || command(d, VMX_RESET))
+    if (vmx_command(d, VMX_QUIESCE) || vmx_command(d, VMX_RESET))
         return -5;
     d->exposed = false;
     uint32_t revision = vmx_io_read(d->bar[1], VMX_REVISION);
@@ -64,14 +64,13 @@ int vmx_hardware_start(struct vmx_device *d)
  */
 int vmx_hardware_stop(struct vmx_device *d)
 {
-    d->active = false;
-    if (d->bar[0])
-        vmx_io_write(d->bar[0], VMX_IMR, 1);
+    __atomic_store_n(&d->active,false,__ATOMIC_RELEASE);
+    vmx_interrupt_stop(d);
     int failed = 0;
     if (d->exposed && d->bar[1]) {
-        if (command(d, VMX_QUIESCE))
+        if (vmx_command(d, VMX_QUIESCE))
             failed = 1;
-        if (!failed && command(d, VMX_RESET))
+        if (!failed && vmx_command(d, VMX_RESET))
             failed = 1;
     }
     if (d->command_saved) {
@@ -87,13 +86,29 @@ int vmx_hardware_stop(struct vmx_device *d)
     return 0;
 }
 
-/** @brief Query carrier without racing other command-register users.
+/** @brief Read IRQ-cached carrier, or query the device in polling fallback.
  * @param d Device retained by an admitted callback. @return Nonzero if link is up.
+ * Task context under network execution; IRQ events may refresh the cache.
  */
 int vmx_link(struct vmx_device *d)
 {
     if (!d->active || __atomic_load_n(&d->broken, __ATOMIC_RELAXED))
         return 0;
-    uint32_t link = command(d, VMX_GET_LINK);
-    return link != UINT32_MAX && (link & 1u) != 0;
+    if (d->irq_handle) {
+        if (vmx_interrupt_events(d)) return 0;
+        if (!d->link_valid) vmx_refresh_link(d);
+    } else {
+        vmx_refresh_link(d);
+    }
+    return d->link_up;
+}
+
+/** @brief Refresh task-owned carrier state with one serialized device query.
+ * @param d Active device retained through the calling driver callback.
+ */
+void vmx_refresh_link(struct vmx_device *d)
+{
+    uint32_t link=vmx_command(d,VMX_GET_LINK);
+    d->link_up=link!=UINT32_MAX && (link&1u)!=0;
+    d->link_valid=true;
 }

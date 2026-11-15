@@ -113,6 +113,16 @@ void pci_unmap_mmio(void *ptr, uint64_t bytes);
  * exact claims share a pointer. Caller drains device/users before exact unmap.
  */
 void *pci_map_mmio(uint64_t phys, uint64_t bytes);
+/** @brief Map covering pages inside one exact, quiesced device memory BAR.
+ * @param device Exclusive PCI function identity. @param bar Low-dword BAR index.
+ * @param phys Page-aligned physical start, which may be inside the BAR.
+ * @param bytes Nonzero page-aligned mapping length.
+ * @return Owned UC/RW/NX lease or NULL; release with pci_unmap_mmio.
+ * Task context under execution ownership. Validates identity and BAR geometry
+ * before mapping; never probes another function or trusts a high-dword BIR.
+ */
+void *pci_map_device_bar(const struct pci_device *device, uint8_t bar,
+                         uint64_t phys, uint64_t bytes);
 /** @brief Map firmware's assigned BAR0 page without probing or changing decode.
  * @param device Exact present PCI identity retained by the caller.
  * @param phys Expected page-aligned memory BAR0 base, never a caller-chosen range.

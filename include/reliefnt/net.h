@@ -40,6 +40,12 @@ void net_tcp_maintenance(void);
  */
 int net_get_config(struct reliefos_net_config *config);
 void net_poll_packets(void);
+/** @brief Drain IRQ-notified NICs using bounded, fair receive slices.
+ * @param budget Maximum descriptor attempts, including drops and empty polls.
+ * Task context with network execution ownership; full queues request another
+ * permanent dispatcher turn instead of monopolizing an IRQ or worker stack.
+ */
+void net_poll_rx_budget(uint32_t budget);
 /**
  * @brief Transmit a raw IPv4 message over the configured Ethernet route.
  * @param destination Host-order destination address.

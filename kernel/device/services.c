@@ -1,6 +1,7 @@
 #include <reliefnt/proc_stats.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/export.h>
+#include <reliefnt/deferred.h>
 #include "manager_internal.h"
 
 /**
@@ -25,7 +26,7 @@ struct netdev_binding {
     struct reliefnt_netdev_ops ops;
     void *context;
     uint32_t owner, ifindex;
-    bool published;
+    bool published, rx_pending;
     uint8_t mac_cache[6];
     struct net_proc_counters counters;
 };
@@ -442,13 +443,16 @@ EXPORT_SYMBOL(driver_register_netdev);
 void driver_netdev_publish_owner(uint32_t owner)
 {
     for (;;) {
-        uint64_t flags; uint32_t id = 0;
+        uint64_t flags; uint32_t id = 0; bool pending = false;
         kernel_spin_lock_irqsave(&manager_service_lock, &flags);
         for (struct netdev_binding *b=netdev_bindings; b; b=b->next)
-            if (b->owner == owner && !b->published) { b->published=true; id=b->ifindex; break; }
+            if (b->owner == owner && !b->published) {
+                b->published=true; id=b->ifindex; pending=b->rx_pending; break;
+            }
         kernel_spin_unlock_irqrestore(&manager_service_lock, flags);
         if (!id) break;
         net_device_attached(id);
+        if (pending) kernel_deferred_schedule(DEFERRED_NET_RX);
     }
 }
 
@@ -500,6 +504,44 @@ uint32_t netdev_next(uint32_t after)
     return result;
 }
 
+/** @brief Coalesce a receive notification without retaining any provider pointer.
+ * @param ifindex Never-reused device identity; stale/removed IDs are ignored.
+ * IRQ/task safe, allocation-free. COMING devices retain the hint until publish;
+ * task dispatch takes the ordinary owner pin before entering driver code.
+ */
+void netdev_rx_notify(uint32_t ifindex)
+{
+    bool visible=false;
+    uint64_t flags; kernel_spin_lock_irqsave(&manager_service_lock,&flags);
+    for (struct netdev_binding *b=netdev_bindings; b; b=b->next)
+        if (b->ifindex==ifindex) { b->rx_pending=true; visible=b->published; break; }
+    kernel_spin_unlock_irqrestore(&manager_service_lock,flags);
+    if (visible) kernel_deferred_schedule(DEFERRED_NET_RX);
+}
+EXPORT_SYMBOL(netdev_rx_notify);
+
+/** @brief Claim one pending published identity in round-robin index order.
+ * @param after Previously serviced index, or zero to start at the first NIC.
+ * @return Copied pending index or zero, never a context or module callback.
+ * Task context under network execution; registry removal can safely discard
+ * an unclaimed hint and netdev_poll revalidates an already claimed identity.
+ */
+uint32_t netdev_rx_take(uint32_t after)
+{
+    struct netdev_binding *first=NULL, *next=NULL;
+    uint64_t flags; kernel_spin_lock_irqsave(&manager_service_lock,&flags);
+    for (struct netdev_binding *b=netdev_bindings; b; b=b->next) {
+        if (!b->published || !b->rx_pending) continue;
+        if (!first || b->ifindex<first->ifindex) first=b;
+        if (b->ifindex>after && (!next || b->ifindex<next->ifindex)) next=b;
+    }
+    if (!next) next=first;
+    uint32_t result=0;
+    if (next) { next->rx_pending=false; result=next->ifindex; }
+    kernel_spin_unlock_irqrestore(&manager_service_lock,flags);
+    return result;
+}
+
 /** @brief Report the current carrier for one retained NIC.
  * @param ifindex Stable index. @return Nonzero when its provider reports ready.
  */
@@ -548,15 +590,18 @@ int netdev_send(uint32_t ifindex, const void *frame, uint32_t length)
 /** @brief Receive one frame and account it to its actual interface.
  * @param ifindex Stable index. @param frame Writable buffer.
  * @param capacity Buffer bytes. @param out_length Optional returned bytes.
- * @return One frame, zero for empty, or a negative Linux errno.
+ * @param notified Bypass the carrier gate to service IRQ control/link events.
+ * @return One frame, zero for empty, or a negative Linux errno. Task context;
+ * the provider and its module remain pinned through polling and accounting.
  */
-int netdev_poll(uint32_t ifindex, void *frame, uint32_t capacity, uint32_t *out_length)
+static int netdev_receive(uint32_t ifindex, void *frame, uint32_t capacity,
+                          uint32_t *out_length, bool notified)
 {
     if (out_length) *out_length=0;
     struct netdev_binding *b=netdev_pin(ifindex);
     if (!b) return -19;
     uint32_t owner=b->owner, length=0;
-    if (!b->ops.is_ready(b->context)) {
+    if (!notified && !b->ops.is_ready(b->context)) {
         /* No receive descriptor was inspected while carrier is unavailable. */
         driver_manager_service_unpin(owner);
         return -19;
@@ -571,6 +616,24 @@ int netdev_poll(uint32_t ifindex, void *frame, uint32_t capacity, uint32_t *out_
     if (out_length) *out_length=length;
     driver_manager_service_unpin(owner); return ret;
 }
+
+/** @brief Receive one frame while preserving legacy carrier-down behavior.
+ * @param ifindex Stable NIC identity. @param frame Writable receive buffer.
+ * @param capacity Buffer size. @param out_length Optional received byte count.
+ * @return One frame, zero if empty, or negative errno; task context, owner pinned.
+ */
+int netdev_poll(uint32_t ifindex, void *frame, uint32_t capacity, uint32_t *out_length)
+{ return netdev_receive(ifindex,frame,capacity,out_length,false); }
+
+/** @brief Service an IRQ-notified provider even while its carrier is down.
+ * @param ifindex Stable NIC identity. @param frame Writable receive buffer.
+ * @param capacity Buffer bytes. @param out_length Optional returned frame size.
+ * @return One, zero or negative errno. Task context under network execution;
+ * the same owner pin spans control-event acknowledgement and queue processing.
+ * Carrier cannot gate this path: a link-up event itself may be the notification.
+ */
+int netdev_poll_notified(uint32_t ifindex, void *frame, uint32_t capacity, uint32_t *out_length)
+{ return netdev_receive(ifindex,frame,capacity,out_length,true); }
 
 /** @brief Copy one provider's PCI identity and carrier state while pinned.
  * @param ifindex Stable index. @param out Caller-owned nullable output.

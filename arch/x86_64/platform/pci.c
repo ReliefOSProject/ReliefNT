@@ -569,6 +569,18 @@ void *pci_map_mmio(uint64_t phys, uint64_t bytes)
     return pci_map_mmio_lease(phys,bytes);
 }
 
+/** @brief Validate and map pages from the selected quiesced function's BAR.
+ * @param device Exact PCI identity. @param bar Low-dword memory BAR index.
+ * @param phys Aligned physical start. @param bytes Whole-page extent.
+ * @return Owned UC/RW/NX mapping or NULL; caller holds execution ownership.
+ */
+void *pci_map_device_bar(const struct pci_device *device, uint8_t bar,
+                         uint64_t phys, uint64_t bytes)
+{
+    if (!pci_device_bar_contains(device,bar,phys,bytes)) return NULL;
+    return pci_map_mmio_lease(phys,bytes);
+}
+
 /** @brief Read firmware's assigned BAR0 identity without writes or sizing probes.
  * Only capability-header reads are admitted before handoff. A normal memory
  * BAR implements at least16 bytes; the containing page is a mapping granule,

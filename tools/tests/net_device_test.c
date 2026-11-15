@@ -6,6 +6,12 @@
 #include "../../kernel/device/manager_internal.h"
 #include <reliefnt/driver_manager_phase.h>
 #include <reliefnt/proc_stats.h>
+#include <reliefnt/deferred.h>
+
+extern void netdev_rx_notify(uint32_t) __attribute__((weak));
+extern uint32_t netdev_rx_take(uint32_t) __attribute__((weak));
+static unsigned wakeups;
+void kernel_deferred_request(enum kernel_deferred_service service) { (void)service; ++wakeups; }
 
 int32_t loading_slot = -1;
 struct driver_slot driver_slots[RELIEFOS_DRIVER_MAX];
@@ -42,7 +48,16 @@ int main(void)
     assert(!driver_register_netdev(&ops, &a, &ia));
     assert(!driver_register_netdev(&ops, &b, &ib));
     assert(ia == 2 && ib == 3 && netdev_next(0) == 0 && !attaches);
+    if (!netdev_rx_notify || !netdev_rx_take) {
+        fputs("FAIL: IRQ receive notification is unavailable\n", stderr); return 1;
+    }
+    netdev_rx_notify(ia); /* An early IRQ is retained until publication. */
+    assert(!netdev_rx_take(0));
     driver_manager_service_enable(0); driver_netdev_publish_owner(0);
+    assert(netdev_rx_take(0)==ia && !netdev_rx_take(0));
+    netdev_rx_notify(ia); netdev_rx_notify(ia); netdev_rx_notify(ib);
+    assert(netdev_rx_take(ia)==ib && netdev_rx_take(ib)==ia && !netdev_rx_take(0));
+    assert(wakeups);
     loading_slot = 1;
     assert(!driver_register_netdev(&ops, &c, &ic) && ic == 4);
     driver_manager_service_enable(1); driver_netdev_publish_owner(1);
@@ -61,9 +76,16 @@ int main(void)
     assert(netdev_poll(ic, &byte, 1, &length) == -19 && length == 0);
     netdev_counters(ic, &counts);
     assert(counts.rx_packets == 1 && !counts.rx_errors && !counts.rx_drops);
+    assert(netdev_poll_notified(ic,&byte,1,&length)==1 && length==1);
+    netdev_counters(ic,&counts); assert(counts.rx_packets==2 && !counts.rx_errors);
     c.link_down = 0;
     driver_manager_service_close(0); driver_manager_service_drain(0);
+    netdev_rx_notify(ia);
     driver_netdev_remove_owner(0);
+    assert(!netdev_rx_take(0));
+    unsigned before_wakeups=wakeups;
+    netdev_rx_notify(ia); netdev_rx_notify(0xffffffffu);
+    assert(wakeups==before_wakeups && !netdev_rx_take(0));
     assert(detaches == 2 && detached[0] == ia && detached[1] == ib);
     assert(netdev_next(0) == ic && !netdev_is_ready(ia));
     struct e1000_info absent = {.present = 1}; netdev_get_info(ia, &absent);

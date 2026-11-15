@@ -33,14 +33,22 @@ void driver_unmap_mmio(void *ptr,uint64_t bytes);
 /** @brief Register an init-owned MSI callback and its cleanup obligation.
  * @param owner Loading module slot; must be less than RELIEFOS_DRIVER_MAX.
  * @param dev Borrowed quiesced PCI function identity.
- * @param handler Nonblocking W1C callback; read/clear device before returning.
+ * @param handler Nonblocking callback; mask/ack its source before returning.
  * @param opaque Borrowed module context retained until free synchronization.
  * @param out_handle Receives an owned generation token.
  * @return 0 or provider negative errno. Task context, no callback under ledger lock.
  */
 int driver_request_pci_irq_owned(uint32_t owner,const struct reliefos_driver_pci_device *dev,
                                  void (*handler)(void *),void *opaque,uint32_t *out_handle);
-/** @brief Remove an exact module IRQ lease, then disable and synchronize MSI.
+/** @brief Register one init-owned MSI-X entry and its synchronized cleanup.
+ * @param owner Loading slot. @param dev Quiesced exclusive PCI identity.
+ * @param handler Nonblocking IRQ callback. @param opaque Retained context.
+ * @param out_handle Owned token output. @return Zero or negative errno.
+ * Task context; failed ledger admission disables/unmaps the prepared entry.
+ */
+int driver_request_pci_msix_irq_owned(uint32_t owner,const struct reliefos_driver_pci_device *dev,
+    void (*handler)(void *),void *opaque,uint32_t *out_handle);
+/** @brief Remove an exact module IRQ lease, then disable and drain MSI/MSI-X.
  * @param handle Owned generation token.
  * @return None. Task context, never from ISR; module stays mapped through return.
  */

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 obj-$(CONFIG_VMXNET3) += vmxnet3.o
-vmxnet3-y := main.o hardware.o rings.o io.o module.o
+vmxnet3-y := main.o hardware.o rings.o interrupt.o io.o module.o
 
 include $(srctree)/scripts/Makefile.module

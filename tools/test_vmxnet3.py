@@ -7,7 +7,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = ["tools/tests/vmxnet3_test.c", *[
-    "drivers/net/vmxnet3/" + name + ".c" for name in ("main", "hardware", "rings")]]
+    "drivers/net/vmxnet3/" + name + ".c" for name in ("main", "hardware", "rings", "interrupt")]]
 
 
 def main():

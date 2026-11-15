@@ -65,8 +65,10 @@ int vmx_activate(struct vmx_device *d)
     s[60] = 1;
     s[62] = 1;
     s[63] = 1; /* one fragment and one queue each */
+    s[80] = d->irq_handle && d->auto_mask;
     s[81] = 1;
-    put32(s, 108, 1);    /* one vector, globally masked */
+    s[83] = 8; /* UPT adaptive interrupt moderation. */
+    put32(s, 108, d->irq_handle ? 0 : 1); /* Poll-only fallback stays globally masked. */
     put32(s, 120, 0x0d); /* unicast, broadcast and all multicast */
     for (unsigned i = 0; i < 128; ++i)
         put32(s, 136 + i * 4, UINT32_MAX);
@@ -125,22 +127,12 @@ static int broken(struct vmx_device *d)
     return -5;
 }
 
-/** @brief Submit one packet and reclaim only validated TX completions.
- * @param d Active context. @param frame Borrowed frame. @param length Frame bytes.
- * @return Zero, -EINVAL, -EMSGSIZE, -ENETDOWN, -EAGAIN or -EIO.
+/** @brief Reclaim ordered TX completions without waiting for device progress.
+ * @param d Active retained context; caller holds tx_lock with IRQs saved.
+ * @return Zero or negative EIO after marking a corrupt queue unusable.
  */
-int vmx_send(struct vmx_device *d, const void *frame, uint32_t length)
+static int reclaim_tx_locked(struct vmx_device *d)
 {
-    if (!frame || !length)
-        return -22;
-    if (length > VMX_FRAME_MAX)
-        return -90;
-    if (__atomic_load_n(&d->broken, __ATOMIC_RELAXED))
-        return -5;
-    if (!vmx_link(d))
-        return -100;
-    uint64_t flags;
-    kernel_spin_lock_irqsave(&d->tx_lock, &flags);
     while (d->tx_clean != d->tx_next) {
         volatile struct vmx_desc *c = &d->txc[d->txc_next];
         uint32_t last = c->b;
@@ -149,9 +141,7 @@ int vmx_send(struct vmx_device *d, const void *frame, uint32_t length)
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         unsigned index = (unsigned)(c->address & 0xfffu), type = (last >> 24) & 0x7fu;
         if (type || index != d->tx_clean) {
-            int rc = broken(d);
-            kernel_spin_unlock_irqrestore(&d->tx_lock, flags);
-            return rc;
+            return broken(d);
         }
         d->tx_clean = (d->tx_clean + 1) % VMX_TX_COUNT;
         if (++d->txc_next == VMX_TX_COUNT) {
@@ -159,6 +149,35 @@ int vmx_send(struct vmx_device *d, const void *frame, uint32_t length)
             d->txc_gen ^= 1;
         }
     }
+    return 0;
+}
+
+/** @brief Reclaim TX completions even when the next workload is receive-only.
+ * @param d Active retained controller. @return Zero or negative EIO.
+ */
+int vmx_reclaim_tx(struct vmx_device *d)
+{
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&d->tx_lock,&flags);
+    int result=reclaim_tx_locked(d);
+    kernel_spin_unlock_irqrestore(&d->tx_lock,flags);
+    return result;
+}
+
+/** @brief Submit one frame and reclaim already completed descriptors without waiting.
+ * @param d Active retained device. @param frame Borrowed Ethernet bytes.
+ * @param length Frame bytes. @return Zero or negative Linux validation/queue errno.
+ */
+int vmx_send(struct vmx_device *d, const void *frame, uint32_t length)
+{
+    if (!frame || !length) return -22;
+    if (length>VMX_FRAME_MAX) return -90;
+    if (__atomic_load_n(&d->broken,__ATOMIC_RELAXED)) return -5;
+    if (!vmx_link(d)) return -100;
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&d->tx_lock,&flags);
+    int result=reclaim_tx_locked(d);
+    if (result) { kernel_spin_unlock_irqrestore(&d->tx_lock,flags); return result; }
     unsigned index = d->tx_next, next = (index + 1) % VMX_TX_COUNT;
     if (next == d->tx_clean) {
         kernel_spin_unlock_irqrestore(&d->tx_lock, flags);
@@ -195,11 +214,13 @@ int vmx_receive(struct vmx_device *d, void *frame, uint32_t capacity, uint32_t *
         return -5;
     if (!d->active)
         return -19;
+    if (vmx_interrupt_events(d) || vmx_reclaim_tx(d)) return -5;
     uint64_t flags;
     kernel_spin_lock_irqsave(&d->rx_lock, &flags);
     volatile struct vmx_desc *c = &d->rxc[d->rxc_next];
     uint32_t last = c->b;
     if ((last >> 31) != d->rxc_gen) {
+        vmx_interrupt_complete(d);
         kernel_spin_unlock_irqrestore(&d->rx_lock, flags);
         return 0;
     }
@@ -240,7 +261,9 @@ int vmx_receive(struct vmx_device *d, void *frame, uint32_t capacity, uint32_t *
         d->rxc_gen ^= 1;
     }
     __atomic_thread_fence(__ATOMIC_RELEASE);
-    vmx_io_write(d->bar[0], VMX_RX_PROD, d->rx_fill);
+    /* Device-owned updateRxProd requests doorbells only when it needs them. */
+    if (*(volatile uint8_t *)(d->shared+VMX_QUEUE_OFFSET+256))
+        vmx_io_write(d->bar[0], VMX_RX_PROD, d->rx_fill);
     kernel_spin_unlock_irqrestore(&d->rx_lock, flags);
     return rc;
 }

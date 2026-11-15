@@ -27,6 +27,7 @@
 #define VMX_COMMAND 0x20u
 #define VMX_MAC_LOW 0x28u
 #define VMX_MAC_HIGH 0x30u
+#define VMX_EVENT_CAUSE 0x40u
 #define VMX_IMR 0u
 #define VMX_TX_PROD 0x600u
 #define VMX_RX_PROD 0x800u
@@ -36,6 +37,7 @@
 #define VMX_RESET 0xcafe0002u
 #define VMX_UPDATE_RX_MODE 0xcafe0003u
 #define VMX_GET_LINK 0xf00d0002u
+#define VMX_GET_INTR_CONFIG 0xf00d0008u
 #define VMX_GEN 0x80000000u
 
 /* Four dwords provide the hardware's 16-byte ring cell without C bitfields. */
@@ -54,13 +56,16 @@ struct vmx_device {
     uint16_t original_command;
     bool command_saved, exposed, active;
     unsigned broken;
+    uint32_t ifindex, irq_handle, event_pending;
+    unsigned irq_mode;
+    bool link_valid, link_up, auto_mask, irq_masked;
     uint8_t mac[6];
     uint64_t shared_pa, rings_pa, tx_data_pa, rx_data_pa;
     uint8_t *shared, *tx_data, *rx_data;
     volatile struct vmx_desc *tx, *txc, *rx, *rxc;
     unsigned tx_next, tx_clean, txc_next, tx_gen, txc_gen;
     unsigned rx_next, rx_fill, rxc_next, rx_gen, rxc_gen;
-    struct kernel_spinlock command_lock, tx_lock, rx_lock;
+    struct kernel_spinlock command_lock, tx_lock, rx_lock, irq_lock;
 };
 
 /** @brief Read a 32-bit device register from one retained MMIO lease.
@@ -81,10 +86,40 @@ int vmx_hardware_start(struct vmx_device *d);
  * resources.
  */
 int vmx_hardware_stop(struct vmx_device *d);
-/** @brief Read the carrier using the serialized command register.
- * @param d Live context. @return Nonzero only while the device reports link up.
+/** @brief Read cached carrier in IRQ mode or query it in polling fallback.
+ * @param d Live callback-pinned context under network execution.
+ * @return Nonzero only while the device reports link up; task context only.
  */
 int vmx_link(struct vmx_device *d);
+/** @brief Issue a command under the per-device command lock.
+ * @param d Mapped retained controller. @param value Command word.
+ * @return Synchronous completion word; task context, no sleeping.
+ */
+uint32_t vmx_command(struct vmx_device *d, uint32_t value);
+/** @brief Refresh the task-context carrier cache after activation or a link event.
+ * @param d Active retained controller. Command access is serialized.
+ */
+void vmx_refresh_link(struct vmx_device *d);
+/** @brief Prefer one owned MSI-X entry, then MSI, otherwise retain polling.
+ * @param d Quiesced controller whose BARs are mapped; init task context.
+ */
+void vmx_interrupt_prepare(struct vmx_device *d);
+/** @brief Mask the device and synchronously drain the owned IRQ callback.
+ * @param d Retained controller with callback admission closed; task context.
+ */
+void vmx_interrupt_stop(struct vmx_device *d);
+/** @brief Consume event causes in task context and refresh cached carrier.
+ * @param d Retained active controller. @return Zero or negative EIO.
+ */
+int vmx_interrupt_events(struct vmx_device *d);
+/** @brief Rearm only after empty RX/TX service and recheck for a racing completion.
+ * @param d Active retained controller; caller holds rx_lock. Task context only.
+ */
+void vmx_interrupt_complete(struct vmx_device *d);
+/** @brief Reclaim validated TX completions under the queue lock.
+ * @param d Retained active controller. @return Zero or negative EIO.
+ */
+int vmx_reclaim_tx(struct vmx_device *d);
 /** @brief Allocate and initialize coherent shared memory and descriptor rings.
  * @param d Negotiated device. @return Zero or -ENOMEM, retaining partial leases for cleanup.
  */
