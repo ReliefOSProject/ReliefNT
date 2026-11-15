@@ -16,8 +16,17 @@ def main():
                         "tools/tests/pat_test.c", "arch/x86_64/mm/pat.c", "-o", str(binary)],
                        cwd=ROOT, check=True)
         for case in ("normal", "nopat", "unsupported", "layout", "write-failure",
-                     "ap-unsupported", "ap-write-failure"):
+                     "ap-unsupported", "ap-write-failure", "ap-mtrr-failure", "nopat-mtrr-failure"):
             subprocess.run([str(binary), case], cwd=ROOT, check=True, timeout=10)
+        mtrr = Path(directory) / "mtrr"
+        subprocess.run(["clang", "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
+                        "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-Iinclude",
+                        "tools/tests/mtrr_test.c", "arch/x86_64/mm/mtrr.c", "-o", str(mtrr)],
+                       cwd=ROOT, check=True)
+        for case in ("reset-ap", "matching", "unsupported", "ap-only-mtrr", "ap-unsupported", "capability",
+                     "physical-width", "no-fixed", "disabled", "fixed-only", "variable-only",
+                     "write-failure"):
+            subprocess.run([str(mtrr), case], cwd=ROOT, check=True, timeout=10)
         mapping = Path(directory) / "wc-mapping"
         subprocess.run(["clang", "-std=c11", "-O1", "-g", "-Iinclude", "-Iinclude/uapi",
                         "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",

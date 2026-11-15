@@ -8,6 +8,10 @@ static bool supported=true, ignore_write;
 static uint64_t reg=0x0007040600070406ULL;
 static unsigned reads,writes,flushes;
 static uint64_t irq=0x200;
+static bool mtrr_ready, mtrr_compatible=true;
+static unsigned restores;
+void x86_mtrr_capture_boot(void){assert(!irq && !mtrr_ready);mtrr_ready=true;}
+bool x86_mtrr_restore_ap(void){assert(!irq && mtrr_ready);++restores;return mtrr_compatible;}
 uint64_t kernel_irq_save(void){uint64_t old=irq;irq=0;return old;}
 void kernel_irq_restore(uint64_t flags){irq=flags;}
 bool x86_pat_native_supported(void){return supported;}
@@ -23,8 +27,12 @@ int main(int argc,char **argv)
         if(enabled)supported=false;
         assert(!arch_pat_boot_init(enabled));
         assert(!arch_pat_writecombine_ready() && reg==firmware && !writes && !reads);
-        assert(arch_pat_ap_init() && !writes && !reads && irq==0x200);
+        assert(arch_pat_ap_init() && restores==1 && !writes && !reads && irq==0x200);
         assert(!arch_pat_boot_init(true));
+    } else if(!strcmp(argv[1],"nopat-mtrr-failure")) {
+        assert(!arch_pat_boot_init(false));
+        mtrr_compatible=false;
+        assert(!arch_pat_ap_init() && restores==1 && !reads && !writes);
     } else if(!strcmp(argv[1],"layout")) {
         reg=0x0007040600070404ULL; /* RAM slot zero is not WB. */
         assert(!arch_pat_boot_init(true) && !writes && !arch_pat_writecombine_ready());
@@ -37,7 +45,10 @@ int main(int argc,char **argv)
         assert(reg==wc && (reg & ~(0xffULL<<32))==(firmware & ~(0xffULL<<32)));
         assert(irq==0x200 && writes==1);
         assert(arch_pat_boot_init(true) && writes==1);
-        if(!strcmp(argv[1],"ap-unsupported")) {
+        if(!strcmp(argv[1],"ap-mtrr-failure")) {
+            mtrr_compatible=false;unsigned before=reads;
+            assert(!arch_pat_ap_init() && restores==1 && reads==before && writes==1);
+        } else if(!strcmp(argv[1],"ap-unsupported")) {
             supported=false;assert(!arch_pat_ap_init());
         } else if(!strcmp(argv[1],"ap-write-failure")) {
             reg=firmware;ignore_write=true;assert(!arch_pat_ap_init());

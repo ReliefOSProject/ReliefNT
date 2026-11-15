@@ -310,7 +310,7 @@ void smp_ap_entry(uint32_t cpu_index)
      * partially written interrupt gate. */
     idt_load();
     if (!arch_pat_ap_init()) {
-        console_error("[reliefnt] AP %u cannot honor the boot PAT policy; keeping it offline\n",cpu_index);
+        console_error("[reliefnt] AP %u cannot honor the boot cache policy; keeping it offline\n",cpu_index);
         for (;;) __asm__ volatile("hlt");
     }
     apic_enable();

@@ -17,6 +17,7 @@ bool arch_pat_boot_init(bool enabled)
     if (attempted) return arch_pat_writecombine_ready();
     attempted=true;
     uint64_t flags=kernel_irq_save();
+    x86_mtrr_capture_boot();
     if (enabled && x86_pat_native_supported()) {
         uint64_t firmware=x86_pat_native_read();
         if ((firmware & 0xffu)==6u && ((firmware>>24)&0xffu)==0u) {
@@ -32,20 +33,23 @@ bool arch_pat_boot_init(bool enabled)
     return arch_pat_writecombine_ready();
 }
 
-/** @brief Match the published PAT layout before an AP can use WC mappings.
+/** @brief Match BSP MTRRs and PAT before an AP can use shared mappings.
  * @return False if this CPU cannot implement the BSP policy; it stays offline.
  * AP bootstrap only. Preserves IRQ state, takes no shared lock and never changes
- * the BSP policy. A disabled boot policy does not touch unsupported MSRs.
+ * the BSP policy. MTRRs are synchronized even when nopat disables WC pages;
+ * unsupported cache MSRs are never accessed.
  */
 bool arch_pat_ap_init(void)
 {
-    if (!arch_pat_writecombine_ready()) return true;
     uint64_t flags=kernel_irq_save();
     bool compatible=false;
-    if (x86_pat_native_supported()) {
+    if (!x86_mtrr_restore_ap()) goto done;
+    if (!arch_pat_writecombine_ready()) compatible=true;
+    else if (x86_pat_native_supported()) {
         if (x86_pat_native_read()!=boot_layout) x86_pat_native_install(boot_layout);
         compatible=x86_pat_native_read()==boot_layout;
     }
+done:
     kernel_irq_restore(flags);
     return compatible;
 }
