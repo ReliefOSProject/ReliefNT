@@ -101,6 +101,18 @@ msgstr ""
 "function registers its own network interface. See :doc:`realtek` for chip "
 "revisions, firmware sources, and validation coverage."
 
+msgid "``VMXNET3``"
+msgstr "``VMXNET3``"
+
+msgid "``vmxnet3``"
+msgstr "``vmxnet3``"
+
+msgid "VMware 半虚拟化 Ethernet 网卡；每个 PCI 功能独立注册网络接口。 描述符、协商能力、DMA 生命周期和验证范围见 :doc:`vmxnet3`。"
+msgstr ""
+"VMware paravirtual Ethernet adapters; each PCI function registers a separat"
+"e network interface. See :doc:`vmxnet3` for descriptors, negotiated capabil"
+"ities, DMA lifetime, and validation coverage."
+
 msgid "``MOUSE_PS2`` / ``USB_UHCI_HCD``"
 msgstr "``MOUSE_PS2`` / ``USB_UHCI_HCD``"
 
@@ -181,11 +193,11 @@ msgstr ""
 "The respective filesystems; ISO9660 is read-only, and formatting is "
 "available only where the corresponding implementation supports it."
 
-msgid "``EXT2_FS`` / ``EXT4_FS``"
-msgstr "``EXT2_FS`` / ``EXT4_FS``"
+msgid "``EXT2_FS`` / ``EXT3_FS`` / ``EXT4_FS``"
+msgstr "``EXT2_FS`` / ``EXT3_FS`` / ``EXT4_FS``"
 
-msgid "``ext2`` / ``ext4``，共同依赖 ``ext_common``"
-msgstr "``ext2`` / ``ext4``, both depending on ``ext_common``"
+msgid "``ext2`` / ``ext3`` / ``ext4``，共同依赖 ``ext_common``"
+msgstr "``ext2`` / ``ext3`` / ``ext4``, all depending on ``ext_common``"
 
 msgid "各自注册文件系统类型，共用实际 ext 引擎。隐藏公共选项取所需最高链接等级。"
 msgstr ""

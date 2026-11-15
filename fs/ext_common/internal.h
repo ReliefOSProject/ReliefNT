@@ -294,6 +294,13 @@ int storage_ext4_free_inode(struct storage_volume *volume, uint64_t ino,
  * pin required across all writes; no graph/module lock or pointer retention.
  */
 int install_format_ext2(struct install_disk_state *disk,uint64_t start_lba,uint64_t sector_count);
+/** @brief Write ext3 metadata and its internal JBD journal to an unmounted extent.
+ * @param disk Borrowed authorized target under storage execution ownership.
+ * @param start_lba First validated sector of the filesystem.
+ * @param sector_count Validated extent length in 512-byte sectors.
+ * @return Zero or negative layout/I/O errno. The admitted provider remains pinned.
+ */
+int install_format_ext3(struct install_disk_state *disk,uint64_t start_lba,uint64_t sector_count);
 /** @brief Write native ext4 metadata into an authorized unmounted extent.
  * @param disk Borrowed managed target. @param start_lba First validated sector.
  * @param sector_count Validated extent length in 512-byte sectors.

@@ -12,6 +12,7 @@ drm tools/test_drm.py
 e1000 tools/test_e1000.py
 e1000e tools/test_e1000e.py
 r8169 tools/test_r8169.py
+vmxnet3 tools/test_vmxnet3.py
 efi_fs_early tools/test_efi_fs_early.py
 efi_handoff tools/test_efi_handoff.py
 efi_acpi_bootstrap tools/test_efi_acpi_bootstrap.py
@@ -25,6 +26,7 @@ exit_logging tools/test_exit_logging.py
 ext2_cache tools/test_ext2_cache.py
 ext2_performance tools/test_ext2_performance.py --output {output}/ext2-performance.json
 ext2_write_batch tools/test_ext2_write_batch.py
+ext3_format tools/test_ext3_format.py
 ext4_dir tools/test_ext4_dir.py
 ext4_read tools/test_ext4_read.py
 ext4_vfs tools/test_ext4_vfs.py --filesystem ext4

@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+config VMXNET3
+    tristate "VMware VMXNET3 Ethernet"
+    default y
+    help
+      Native VMware VMXNET3 (15ad:07b0) Ethernet using revision 1 and UPT 1,
+      one TX and RX queue, and software protocol checksums. Each PCI function
+      registers an independent NIC with the existing network stack.
+      With M, build vmxnet3.ko with owner-aware STOP and cleanup.

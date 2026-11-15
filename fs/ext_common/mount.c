@@ -99,37 +99,16 @@ int storage_ext4_feature_policy(const struct storage_ext4_super_view *view,
     return 0;
 }
 
-/* Ruling 3: any ext3/4-era feature classifies as EXT4; only a feature set
- * made of classic ext2 bits is "pure ext2".  Anything else stays with the
- * new backend so its read-only policy is enforced. */
+/** @brief Map feature-based on-disk identity to the native volume kind.
+ * @param view Required validated superblock view.
+ * @return Ext2, ext3, or ext4 kind; policy validation is performed separately.
+ */
 static uint8_t ext4_classify(const struct storage_ext4_super_view *view)
 {
-    if ((view->feature_compat &
-         (EXT4_FEATURE_COMPAT_HAS_JOURNAL | EXT4_FEATURE_COMPAT_SPARSE_SUPER2)) != 0) {
-        return STORAGE_FILESYSTEM_EXT4;
-    }
-    if ((view->feature_incompat & (EXT4_FEATURE_INCOMPAT_EXTENTS |
-                                   EXT4_FEATURE_INCOMPAT_64BIT |
-                                   EXT4_FEATURE_INCOMPAT_FLEX_BG)) != 0) {
-        return STORAGE_FILESYSTEM_EXT4;
-    }
-    if ((view->feature_ro_compat & (EXT4_FEATURE_RO_COMPAT_METADATA_CSUM |
-                                    EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE |
-                                    EXT4_FEATURE_RO_COMPAT_DIR_NLINK |
-                                    EXT4_FEATURE_RO_COMPAT_HUGE_FILE |
-                                    EXT4_FEATURE_RO_COMPAT_GDT_CSUM)) != 0) {
-        return STORAGE_FILESYSTEM_EXT4;
-    }
-    if ((view->feature_compat &
-         ~(EXT4_FEATURE_COMPAT_DIR_PREALLOC | EXT4_FEATURE_COMPAT_IMAGIC_INODES |
-           EXT4_FEATURE_COMPAT_EXT_ATTR | EXT4_FEATURE_COMPAT_RESIZE_INODE |
-           EXT4_FEATURE_COMPAT_DIR_INDEX)) == 0 &&
-        (view->feature_incompat & ~EXT4_FEATURE_INCOMPAT_FILETYPE) == 0 &&
-        (view->feature_ro_compat &
-         ~(EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER | EXT4_FEATURE_RO_COMPAT_LARGE_FILE |
-           EXT4_FEATURE_RO_COMPAT_BTREE_DIR)) == 0) {
-        return STORAGE_FILESYSTEM_EXT2;
-    }
+    enum storage_ext_format format = storage_ext_detect_format(view->feature_compat,
+        view->feature_incompat, view->feature_ro_compat);
+    if (format == STORAGE_EXT_FORMAT_EXT2) return STORAGE_FILESYSTEM_EXT2;
+    if (format == STORAGE_EXT_FORMAT_EXT3) return STORAGE_FILESYSTEM_EXT3;
     return STORAGE_FILESYSTEM_EXT4;
 }
 
@@ -234,6 +213,11 @@ int storage_ext4_mount(struct storage_volume *volume)
         goto fail;
     }
     filesystem = ext4_classify(&view);
+    if (volume->fs_type.type && !__builtin_strcmp(volume->fs_type.type->name, "ext3") &&
+        filesystem != STORAGE_FILESYSTEM_EXT3) {
+        ret = -RELIEFOS_EINVAL;
+        goto fail;
+    }
 
     /* Publish the geometry before the cache-backed reads below. */
     volume->ext4.partition_start_lba = volume->ext_start_lba;
@@ -416,7 +400,8 @@ int storage_ext4_mount(struct storage_volume *volume)
                              : decision.read_only_reason == STORAGE_EXT4_READ_ONLY_JOURNAL_CORRUPT
                                    ? " journal-corrupt" : "";
     console_info("[reliefnt] ext4 mount ok fs=%s blocks=%llu groups=%llu%s\n",
-                   filesystem == STORAGE_FILESYSTEM_EXT4 ? "ext4" : "ext2",
+                   filesystem == STORAGE_FILESYSTEM_EXT4 ? "ext4" :
+                   filesystem == STORAGE_FILESYSTEM_EXT3 ? "ext3" : "ext2",
                    (unsigned long long)view.blocks_count,
                    (unsigned long long)view.group_count, reason);
     return 0;

@@ -11,6 +11,7 @@
 #include <reliefnt/text_stream.h>
 #include <reliefnt/module.h>
 #include <reliefnt/moduleparam.h>
+#include "../ext_common/storage_ext4_types.h"
 
 #define SYSFS_PCI_MAX 256u
 static struct pci_device pci_devices[SYSFS_PCI_MAX];
@@ -172,7 +173,9 @@ static int sys_block_fs_info(uint32_t disk, int32_t part, char type[8], char ver
         return 0;
     uint32_t compat = sys_fs_le32(super + 92);
     uint32_t incompat = sys_fs_le32(super + 96);
-    const char *name = (incompat & 0x40u) ? "ext4" : (compat & 0x4u) ? "ext3" : "ext2";
+    enum storage_ext_format format = storage_ext_detect_format(compat, incompat, sys_fs_le32(super + 100));
+    const char *name = format == STORAGE_EXT_FORMAT_EXT4 ? "ext4" :
+        format == STORAGE_EXT_FORMAT_EXT3 ? "ext3" : "ext2";
     __builtin_memcpy(type, name, __builtin_strlen(name) + 1);
     __builtin_memcpy(version, "1.0", 4);
     bool nonzero = false;

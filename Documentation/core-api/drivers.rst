@@ -36,6 +36,10 @@ drivers/ 按 console、tty、video、storage、net、input、usb、sound 等设�
      - ``r8169``
      - Realtek RTL8111/8168 千兆与 RTL8125 2.5GbE PCIe 网卡；每个 PCI 功能
        独立注册网络接口。芯片版本、固件来源和验证范围见 :doc:`realtek`。
+   * - ``VMXNET3``
+     - ``vmxnet3``
+     - VMware 半虚拟化 Ethernet 网卡；每个 PCI 功能独立注册网络接口。
+       描述符、协商能力、DMA 生命周期和验证范围见 :doc:`vmxnet3`。
    * - ``MOUSE_PS2`` / ``USB_UHCI_HCD``
      - ``mouse`` / ``uhci``
      - PS/2、VMware 鼠标与 UHCI HID；键盘基础输入和分发入口内置。
@@ -58,8 +62,8 @@ drivers/ 按 console、tty、video、storage、net、input、usb、sound 等设�
    * - ``FAT_FS`` / ``EXFAT_FS`` / ``ISO9660_FS``
      - ``vfat`` / ``exfat`` / ``isofs``
      - 对应文件系统；ISO9660 只读，格式化仅在对应实现支持时提供。
-   * - ``EXT2_FS`` / ``EXT4_FS``
-     - ``ext2`` / ``ext4``，共同依赖 ``ext_common``
+   * - ``EXT2_FS`` / ``EXT3_FS`` / ``EXT4_FS``
+     - ``ext2`` / ``ext3`` / ``ext4``，共同依赖 ``ext_common``
      - 各自注册文件系统类型，共用实际 ext 引擎。隐藏公共选项取所需最高链接等级。
 
 所有表中生产选项在 defconfig 中为 ``y``。``MODULE_TESTS`` 的 provider、

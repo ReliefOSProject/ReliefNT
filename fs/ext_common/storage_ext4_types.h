@@ -110,6 +110,35 @@
 #define EXT4_FEATURE_INCOMPAT_ENCRYPT 0x10000u
 #define EXT4_FEATURE_INCOMPAT_CASEFOLD 0x20000u
 
+/** @brief On-disk ext generation determined by its compatible feature words. */
+enum storage_ext_format {
+    STORAGE_EXT_FORMAT_EXT2 = 2,
+    STORAGE_EXT_FORMAT_EXT3 = 3,
+    STORAGE_EXT_FORMAT_EXT4 = 4,
+};
+
+/** @brief Classify ext metadata consistently before optional filesystem code loads.
+ * @param compat Little-endian-decoded compatible feature word.
+ * @param incompat Little-endian-decoded incompatible feature word.
+ * @param ro_compat Little-endian-decoded read-only-compatible feature word.
+ * @return Legacy ext2, journaled ext3, or ext4 for newer/unknown feature sets.
+ * This pure classification does not grant permission to mount unsupported bits.
+ */
+static inline enum storage_ext_format storage_ext_detect_format(uint32_t compat,
+    uint32_t incompat, uint32_t ro_compat)
+{
+    uint32_t legacy_compat = EXT4_FEATURE_COMPAT_DIR_PREALLOC | EXT4_FEATURE_COMPAT_IMAGIC_INODES |
+        EXT4_FEATURE_COMPAT_HAS_JOURNAL | EXT4_FEATURE_COMPAT_EXT_ATTR |
+        EXT4_FEATURE_COMPAT_RESIZE_INODE | EXT4_FEATURE_COMPAT_DIR_INDEX;
+    uint32_t legacy_incompat = EXT4_FEATURE_INCOMPAT_FILETYPE | EXT4_FEATURE_INCOMPAT_RECOVER;
+    uint32_t legacy_ro = EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER | EXT4_FEATURE_RO_COMPAT_LARGE_FILE |
+        EXT4_FEATURE_RO_COMPAT_BTREE_DIR;
+    if ((compat & ~legacy_compat) || (incompat & ~legacy_incompat) || (ro_compat & ~legacy_ro))
+        return STORAGE_EXT_FORMAT_EXT4;
+    if (compat & EXT4_FEATURE_COMPAT_HAS_JOURNAL) return STORAGE_EXT_FORMAT_EXT3;
+    return incompat & EXT4_FEATURE_INCOMPAT_RECOVER ? STORAGE_EXT_FORMAT_EXT4 : STORAGE_EXT_FORMAT_EXT2;
+}
+
 /* Parsed superblock: 64-bit counts are combined from the _lo/_hi words
  * only when feature_incompat has EXT4_FEATURE_INCOMPAT_64BIT. */
 struct storage_ext4_super_view {

@@ -33,7 +33,7 @@ Kconfig 选择内置或编译为可加载 ELF 模块，默认保持内置。模�
 
 * 路径：``fs/vfs/``、``security/``; 职责：路径/挂载、文件和目录操作、设备节点、权限与旁路元数据。
 
-* 路径：``fs/{ext2,ext4,ext_common,exfat,fat,iso9660,tmpfs,proc,sysfs}/``; 职责：文件系统注册与实现。``ext2/``、``ext4/`` 是分别带 owner 的注册入口，两者显式依赖 ``ext_common/`` 的实际分配、缓存、目录、extent、journal、格式化和挂载实现。隐藏的公共配置取两个入口所需的最高链接等级，避免内置代码引用外置实现。
+* 路径：``fs/{ext2,ext3,ext4,ext_common,exfat,fat,iso9660,tmpfs,proc,sysfs}/``; 职责：文件系统注册与实现。``ext2/``、``ext3/``、``ext4/`` 分别提供带 owner 的注册入口，共同依赖 ``ext_common/`` 的分配、缓存、目录、extent、journal、格式化和挂载实现。隐藏的公共配置取三个入口所需的最高链接等级。
 
 * 路径：``net/{interface,link,ipv4,tcp,services,socket}/``; 职责：接口与配置、ARP/以太网、IP/UDP/ICMP、TCP 状态和收发、DHCP/DNS/NTP/HTTP、socket 生命周期和操作。
 

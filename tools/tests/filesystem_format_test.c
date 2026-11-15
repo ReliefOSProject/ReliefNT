@@ -16,6 +16,11 @@ static uint8_t *backing;
 static const uint64_t first=2048,sectors=262144;
 static unsigned writes,allocations;
 static bool fail_write;
+/** @brief Reject unexpected journal flushes in this ext2/ext4-only fixture.
+ * @param volume Unused borrowed formatter volume. This test never formats ext3.
+ * @return Never returns because a flush indicates the wrong fixture path.
+ */
+int storage_ext4_device_flush(const struct storage_volume *volume) { (void)volume; abort(); }
 void *kernel_malloc(size_t bytes) { void *p=calloc(1,bytes);if(p)++allocations;return p; }
 void kernel_free(void *p) { if(p){assert(allocations);--allocations;free(p);} }
 void module_memory_free(struct module_memory *memory) { assert(!memory); }

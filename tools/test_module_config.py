@@ -36,7 +36,7 @@ class ModuleConfiguration(unittest.TestCase):
         self.assertIn("CONFIG_MODULES=y\n", text)
         self.assertIn("CONFIG_MODULE_UNLOAD=y\n", text)
         self.assertNotIn("=m\n", text)
-        for symbol in ("DRM", "SND", "FAT_FS", "EXFAT_FS", "EXT2_FS", "EXT4_FS", "EXT_FS_COMMON", "ISO9660_FS"):
+        for symbol in ("DRM", "SND", "VMXNET3", "FAT_FS", "EXFAT_FS", "EXT2_FS", "EXT3_FS", "EXT4_FS", "EXT_FS_COMMON", "ISO9660_FS"):
             self.assertIn("CONFIG_" + symbol + "=y\n", text)
 
     def test_native_dependency_and_disabled_modules(self):
@@ -113,12 +113,14 @@ class ModuleConfiguration(unittest.TestCase):
         output = self.directory / "filesystems"
         run_config(["make", "-s", "-C", str(ROOT), "O=" + str(output), "allmodconfig"])
         text = (output / ".config").read_text()
-        symbols = ("FAT_FS", "EXFAT_FS", "EXT2_FS", "EXT4_FS", "EXT_FS_COMMON", "ISO9660_FS")
+        symbols = ("FAT_FS", "EXFAT_FS", "EXT2_FS", "EXT3_FS", "EXT4_FS", "EXT_FS_COMMON", "ISO9660_FS")
         for symbol in symbols:
             self.assertIn("CONFIG_" + symbol + "=m\n", text)
-        for ext2, ext4, common in (("y", "m", "y"), ("m", "y", "y"), ("m", "n", "m"), ("n", "n", "n")):
+        for ext2, ext3, ext4, common in (("y", "m", "m", "y"), ("m", "n", "y", "y"),
+                                       ("m", "m", "n", "m"), ("n", "m", "n", "m"),
+                                       ("m", "y", "n", "y"), ("n", "n", "n", "n")):
             (output / ".config").write_text("CONFIG_MODULES=y\nCONFIG_EXT2_FS=" + ext2 +
-                "\nCONFIG_EXT4_FS=" + ext4 + "\n")
+                "\nCONFIG_EXT3_FS=" + ext3 + "\nCONFIG_EXT4_FS=" + ext4 + "\n")
             run_config(["make", "-s", "-C", str(ROOT), "O=" + str(output), "olddefconfig"])
             text = (output / ".config").read_text()
             if common == "n":

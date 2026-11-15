@@ -231,6 +231,7 @@ static const struct vfs_backend_ops storage_vfs_ops={
 static int storage_vfs_describe(struct vfs_mount *mount,const struct storage_volume *volume)
 {
     const char *filesystem=volume->filesystem==STORAGE_FILESYSTEM_EXT2 ? "ext2" :
+        volume->filesystem==STORAGE_FILESYSTEM_EXT3 ? "ext3" :
         volume->fs_ops ? volume->fs_ops->name : NULL;
     if(!filesystem)return -EOPNOTSUPP;
     char source[RELIEFOS_FS_PATH_LEN];

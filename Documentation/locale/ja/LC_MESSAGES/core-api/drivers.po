@@ -93,6 +93,17 @@ msgstr ""
 "機能ごとに独立したネットワークインターフェースを登録します。チップのリビジョン、ファームウェアの出所、検証範囲は :doc:`realtek` "
 "を参照してください。"
 
+msgid "``VMXNET3``"
+msgstr "``VMXNET3``"
+
+msgid "``vmxnet3``"
+msgstr "``vmxnet3``"
+
+msgid "VMware 半虚拟化 Ethernet 网卡；每个 PCI 功能独立注册网络接口。 描述符、协商能力、DMA 生命周期和验证范围见 :doc:`vmxnet3`。"
+msgstr ""
+"VMware の準仮想化 Ethernet ネットワークアダプター。PCI ファンクションごとに独立したネットワークインターフェースを登録します。記述"
+"子、交渉する機能、DMA のライフサイクル、検証範囲は :doc:`vmxnet3` を参照してください。"
+
 msgid "``MOUSE_PS2`` / ``USB_UHCI_HCD``"
 msgstr "``MOUSE_PS2`` / ``USB_UHCI_HCD``"
 
@@ -161,11 +172,11 @@ msgstr "``vfat`` / ``exfat`` / ``isofs``"
 msgid "对应文件系统；ISO9660 只读，格式化仅在对应实现支持时提供。"
 msgstr "それぞれに対応するファイルシステム。ISO9660 は読み取り専用で、フォーマットは各実装が対応する場合にのみ提供されます。"
 
-msgid "``EXT2_FS`` / ``EXT4_FS``"
-msgstr "``EXT2_FS`` / ``EXT4_FS``"
+msgid "``EXT2_FS`` / ``EXT3_FS`` / ``EXT4_FS``"
+msgstr "``EXT2_FS`` / ``EXT3_FS`` / ``EXT4_FS``"
 
-msgid "``ext2`` / ``ext4``，共同依赖 ``ext_common``"
-msgstr "``ext2`` / ``ext4``。どちらも ``ext_common`` に依存します。"
+msgid "``ext2`` / ``ext3`` / ``ext4``，共同依赖 ``ext_common``"
+msgstr "``ext2`` / ``ext3`` / ``ext4``。いずれも ``ext_common`` に依存します。"
 
 msgid "各自注册文件系统类型，共用实际 ext 引擎。隐藏公共选项取所需最高链接等级。"
 msgstr ""

@@ -193,14 +193,30 @@ static int storage_mount_runtime_boot(void)
     return ret;
 }
 
-/** @brief Probe an ext-family root through registered feature-checked code.
+/** @brief Select an ext-family root provider from bounded feature metadata.
  * @param root Exclusive unpublished native context with ext partition geometry.
  * @return Zero with an instance-owned provider reference or negative errno.
- * BSP boot execution only; provider admission precedes parsing/I/O and cleanup
- * restores failure ownership without a global pathname or callback lock.
+ * BSP boot execution only; the caller retains its block provider before the
+ * bounded probe. Filesystem admission precedes full parsing and journal I/O.
  */
 static int storage_mount_ext_family(struct storage_volume *root)
-{ return storage_mount_filesystem(root,"ext4"); }
+{
+    if (!root || root->ext_sector_count <= 2 || root->ext_start_lba > UINT64_MAX - 2)
+        return -EINVAL;
+    uint8_t super[512];
+    int rc = storage_read_device(root, root->ext_start_lba + 2, 1, super);
+    if (rc) return rc;
+    if (super[56] != 0x53 || super[57] != 0xef) return -EINVAL;
+    uint32_t features[3];
+    storage_memcpy(features, super + 92, sizeof(features));
+    enum storage_ext_format format = storage_ext_detect_format(features[0], features[1], features[2]);
+    const char *name = format == STORAGE_EXT_FORMAT_EXT3 ? "ext3" :
+        format == STORAGE_EXT_FORMAT_EXT2 ? "ext2" : "ext4";
+    rc = storage_mount_filesystem(root, name);
+    if ((rc == -ENOENT || rc == -ENODEV) && format != STORAGE_EXT_FORMAT_EXT4)
+        rc = storage_mount_filesystem(root, "ext4");
+    return rc;
+}
 
 /**
  * @brief Probe one borrowed discovered disk as the reserved runtime-root instance.
@@ -260,6 +276,7 @@ static int storage_try_mount_root_disk(struct install_disk_state *disk)
                        disk->transport == STORAGE_TRANSPORT_NVME ? disk->nvme_nsid : disk->port,
                        root->filesystem == STORAGE_FILESYSTEM_EXFAT ? "exfat" :
                        (root->filesystem == STORAGE_FILESYSTEM_EXT4 ? "ext4" :
+                        root->filesystem == STORAGE_FILESYSTEM_EXT3 ? "ext3" :
                         (root->filesystem == STORAGE_FILESYSTEM_EXT2 ? "ext2" : "fat32")));
     } else {
         /* Failed root mount: release the ext4 state and its caches before
@@ -440,7 +457,13 @@ int storage_mount_ramdisk_root(uint64_t image_phys, uint64_t len)
         rc=block_device_get(device,&ref);
         if(!rc)rc=block_device_read(&ref,2,1,sector);
         block_device_put(&ref);if(rc)return rc;
-        if(sector[56]==0x53 && sector[57]==0xef)filesystem="ext4";
+        if(sector[56]==0x53 && sector[57]==0xef) {
+            uint32_t features[3];
+            storage_memcpy(features, sector + 92, sizeof(features));
+            enum storage_ext_format format = storage_ext_detect_format(features[0], features[1], features[2]);
+            filesystem = format == STORAGE_EXT_FORMAT_EXT3 ? "ext3" :
+                format == STORAGE_EXT_FORMAT_EXT2 ? "ext2" : "ext4";
+        }
     }
     rc=storage_mount_whole_filesystem(root,disk,filesystem);
     if(rc){*root=(struct storage_volume){0};return rc;}

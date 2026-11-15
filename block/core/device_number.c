@@ -24,8 +24,7 @@ uint64_t storage_volume_device_number(const struct storage_volume *volume)
             device = storage_block_rdev(STORAGE_BLOCK_VOLUME_ID(
                 volume->source_disk_id, volume->source_partition_index));
         else if (volume->filesystem == STORAGE_FILESYSTEM_FAT32) device = volume->esp_device;
-        else if (volume->filesystem == STORAGE_FILESYSTEM_EXT2 ||
-                 volume->filesystem == STORAGE_FILESYSTEM_EXT4) device = volume->ext_device;
+        else if (storage_filesystem_is_ext(volume)) device = volume->ext_device;
         else if (volume->filesystem == STORAGE_FILESYSTEM_EXFAT) device = volume->exfat_device;
     }
     return device ? device : (uint64_t)volume->volume_id + 1;

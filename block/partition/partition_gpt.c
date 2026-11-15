@@ -14,6 +14,7 @@ static const char *disk_formatter_name(uint32_t filesystem)
     case RELIEFOS_DISK_FILESYSTEM_FAT32:return "vfat";
     case RELIEFOS_DISK_FILESYSTEM_EXFAT:return "exfat";
     case RELIEFOS_DISK_FILESYSTEM_EXT2:return "ext2";
+    case RELIEFOS_DISK_FILESYSTEM_EXT3:return "ext3";
     case RELIEFOS_DISK_FILESYSTEM_EXT4:return "ext4";
     default:return NULL;
     }
@@ -243,9 +244,10 @@ int disk_partition_filesystem(struct install_disk_state *disk,
         const struct ext2_superblock *super =
             (const struct ext2_superblock *)(const void *)storage_scratch;
         if (super->magic == EXT2_SUPER_MAGIC) {
-            *out_filesystem = (super->feature_incompat & EXT4_FEATURE_INCOMPAT_EXTENTS) != 0
-                                  ? RELIEFOS_DISK_FILESYSTEM_EXT4
-                                  : RELIEFOS_DISK_FILESYSTEM_EXT2;
+            enum storage_ext_format format = storage_ext_detect_format(super->feature_compat,
+                super->feature_incompat, super->feature_ro_compat);
+            *out_filesystem = format == STORAGE_EXT_FORMAT_EXT4 ? RELIEFOS_DISK_FILESYSTEM_EXT4 :
+                format == STORAGE_EXT_FORMAT_EXT3 ? RELIEFOS_DISK_FILESYSTEM_EXT3 : RELIEFOS_DISK_FILESYSTEM_EXT2;
         }
     }
     return 0;
@@ -340,12 +342,13 @@ int disk_partition_mutable(const struct install_disk_state *disk)
 /**
  * @brief Tests a user-visible filesystem selection accepted by the formatter.
  * @param filesystem RELIEFOS_DISK_FILESYSTEM value.
- * @return Nonzero when the selection is FAT32, exFAT, ext4, or legacy ext2.
+ * @return Nonzero when the selection is FAT32, exFAT, ext2, ext3, or ext4.
  */
 int disk_filesystem_format_supported(uint32_t filesystem)
 {
     return filesystem == RELIEFOS_DISK_FILESYSTEM_FAT32 ||
            filesystem == RELIEFOS_DISK_FILESYSTEM_EXT2 ||
+           filesystem == RELIEFOS_DISK_FILESYSTEM_EXT3 ||
            filesystem == RELIEFOS_DISK_FILESYSTEM_EXT4 ||
            filesystem == RELIEFOS_DISK_FILESYSTEM_EXFAT;
 }
@@ -386,6 +389,7 @@ static void disk_gpt_set_filesystem_type(struct gpt_entry *entry, uint32_t files
         filesystem == RELIEFOS_DISK_FILESYSTEM_EXFAT) {
         storage_memcpy(entry->type_guid, basic_data_guid, sizeof(entry->type_guid));
     } else if (filesystem == RELIEFOS_DISK_FILESYSTEM_EXT2 ||
+               filesystem == RELIEFOS_DISK_FILESYSTEM_EXT3 ||
                filesystem == RELIEFOS_DISK_FILESYSTEM_EXT4) {
         storage_memcpy(entry->type_guid, linux_filesystem_guid, sizeof(entry->type_guid));
     }

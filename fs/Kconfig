@@ -22,7 +22,16 @@ config EXT2_FS
     help
       Register the ext2 filesystem using ReliefNT's shared native ext engine.
       The shared ext_common module contains the actual format, allocation,
-      journal, cache and inode implementation used by both ext frontends.
+      journal, cache and inode implementation used by the ext frontends.
+
+config EXT3_FS
+    tristate "ext3 journaled filesystem and formatter"
+    default y
+    select EXT_FS_COMMON
+    help
+      Register ext3 using the shared native ext engine and ordered JBD
+      metadata transactions. Choose M to build ext3.ko. The shared engine
+      uses the highest linkage level selected by the enabled ext frontends.
 
 config EXT4_FS
     tristate "ext4 filesystem and formatter"

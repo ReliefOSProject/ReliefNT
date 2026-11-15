@@ -2305,6 +2305,12 @@ static void runtime_mount_syscalls(struct vfs_namespace *ns,const struct vfs_pat
     struct storage_volume *volume=vfs_path_context(&mounted);
     assert(volume->tmpfs);
     assert((vfs_path_mount_flags(&mounted)&(MS_RELATIME|MS_NOSUID|MS_NODEV))==(MS_RELATIME|MS_NOSUID|MS_NODEV));
+    strcpy(user.options,"data=ordered");
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,UINT64_MAX,target,UINT64_MAX,
+                            MS_REMOUNT|MS_NOSUID|MS_NODEV,options)==-EOPNOTSUPP);
+    user.options[0]=0;
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,UINT64_MAX,target,UINT64_MAX,
+                             MS_REMOUNT|MS_NOSUID|MS_NODEV,options));
     assert(scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,target,0,0,0,0)==-EBUSY);
     vfs_path_put(&mounted);
     assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,UINT64_MAX,target,UINT64_MAX,MS_REMOUNT|MS_RDONLY|MS_NOSUID|MS_NODEV|MS_SILENT,0));
@@ -2331,6 +2337,17 @@ static void runtime_mount_syscalls(struct vfs_namespace *ns,const struct vfs_pat
     assert(scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,source,UMOUNT_NOFOLLOW,0,0,0)==-EINVAL);
     assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,source,0,0,0,0));
     assert(!volume->ready && !actor.lookup_scope.armed);
+    strcpy(user.source,"/syscall-source");
+    strcpy(user.type,"ext3");
+    strcpy(user.options,"data=ordered");
+    /* Ordered mode must reach source validation. This source is a directory. */
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,source,target,type,0,options)==-ENOTBLK);
+    strcpy(user.options,"data=writeback");
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,source,target,type,0,options)==-EOPNOTSUPP);
+    strcpy(user.options,"data=journal");
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,source,target,type,0,options)==-EOPNOTSUPP);
+    strcpy(user.options,"data=ordered,unknown=1");
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,source,target,type,0,options)==-EOPNOTSUPP);
     vfs_path_put(&actor.fs_paths.root);vfs_path_put(&actor.fs_paths.cwd);
     puts("PASS actual mount/remount/MS_MOVE/umount syscalls: scoped objects, capability, busy refs, atime preservation, ignored remount source/type and nofollow");
 }

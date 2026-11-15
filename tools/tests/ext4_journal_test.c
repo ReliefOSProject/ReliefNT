@@ -86,7 +86,9 @@ static void commit_crc(uint8_t *raw,uint8_t *js,unsigned profile)
 }
 int main(int argc,char **argv)
 {
-    assert(argc==5);
+    /* Optional prefix records each recovered power-cut image and preserves
+     * the input journal features for a native-formatted ext3 fixture. */
+    assert(argc==5 || argc==6);
     disk=load(argv[1],&disk_len); load_geometry();
     uint64_t payload_ino=strtoull(argv[2],NULL,10);
     uint64_t target=file_block(payload_ino,0);
@@ -94,7 +96,8 @@ int main(int argc,char **argv)
     uint32_t bs=volume.ext4.block_size;
     uint8_t *js=disk+jb*bs;
     unsigned profile=strtoul(argv[3],NULL,0);
-    b32(js+36,profile==1 ? 1 : 0); b32(js+40,profile==1 ? 1 : profile|1);
+    if (argc==6) assert(profile==0 && be32(js+36)==0 && be32(js+40)==0);
+    else { b32(js+36,profile==1 ? 1 : 0); b32(js+40,profile==1 ? 1 : profile|1); }
     /* Force both physical ring wrap and transaction sequence wrap. */
     b32(js+88,be32(js+16)-2); b32(js+24,UINT32_MAX);
     js[80]=(profile & 24) ? 4 : 0;
@@ -141,6 +144,7 @@ int main(int argc,char **argv)
     /* Later committed revokes suppress earlier writes. More than 512 entries
      * forces bounded-table overflow and its streaming fallback. */
     memcpy(disk,committed_image,disk_len); load_geometry(); js=disk+jb*bs;
+    if (argc==6) b32(js+40,1); /* Only the synthetic revoke test enables revokes. */
     uint32_t pos=be32(js+28), sequence=be32(js+24)+1;
     for (unsigned i=0;i<3;i++) pos=next_log(js,pos); /* after first commit */
     unsigned revoked=0, record_size=(profile&2)?8:4;
@@ -182,6 +186,11 @@ int main(int argc,char **argv)
         assert(storage_ext4_journal_replay(&volume)==0);
         assert(!memcmp(disk+target*bs,old,bs)||!memcmp(disk+target*bs,next,bs));
         if (!committed) assert(!memcmp(disk+target*bs,next,bs));
+        if (argc==6) {
+            char recovered[4096];
+            assert(snprintf(recovered,sizeof(recovered),"%s-%02u.img",argv[5],cut)<(int)sizeof(recovered));
+            save(recovered);
+        }
         storage_ext4_journal_close(&volume); invalidate();
     }
     memcpy(disk,initial,disk_len); load_geometry();

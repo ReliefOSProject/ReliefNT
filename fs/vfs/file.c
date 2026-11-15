@@ -140,6 +140,24 @@ int vfs_path_remount(const struct vfs_path *path,uint64_t flags)
     if(!rc)mount->policy=policy;return rc;
 }
 
+/** @brief Accept an unchanged ext3 ordered mode on the actual selected mount.
+ * @param path Retained mounted filesystem root, required.
+ * @param flags Requested final mount and filesystem policy.
+ * @param options Optional copied filesystem data, empty or data=ordered.
+ * @return Zero or negative option/type/provider errno. Option validation occurs
+ * before policy changes. Execution ownership retains metadata and provider code.
+ */
+int vfs_path_remount_options(const struct vfs_path *path,uint64_t flags,const char *options)
+{
+    if (!vfs_path_valid(path)) return -EINVAL;
+    if (options && options[0]) {
+        const char *filesystem=path->mount->filesystem;
+        if (!filesystem || __builtin_strcmp(filesystem,"ext3") ||
+            __builtin_strcmp(options,"data=ordered")) return -EOPNOTSUPP;
+    }
+    return vfs_path_remount(path,flags);
+}
+
 int vfs_path_dirent_stat(const struct vfs_path *directory,const char *name,struct linux_stat_abi *out)
 {
     if(!out)return -EINVAL;*out=(struct linux_stat_abi){0};

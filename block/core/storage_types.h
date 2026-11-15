@@ -67,6 +67,7 @@ enum storage_filesystem_kind {
     STORAGE_FILESYSTEM_EXFAT = 4,
     STORAGE_FILESYSTEM_TMPFS = 5,
     STORAGE_FILESYSTEM_EXT4 = 6,
+    STORAGE_FILESYSTEM_EXT3 = 7,
 };
 
 
@@ -174,11 +175,12 @@ struct storage_volume {
 
 /** @brief Query the native format family using only permanent volume geometry.
  * @param volume Borrowed stable instance, nullable.
- * @return True for ext2/ext4 enum identities, false otherwise. Pure metadata
+ * @return True for ext2/ext3/ext4 enum identities, false otherwise. Pure metadata
  * observation under caller ownership; no optional code, I/O or reference change.
  */
 static inline bool storage_filesystem_is_ext(const struct storage_volume *volume)
-{ return volume && (volume->filesystem==STORAGE_FILESYSTEM_EXT2 || volume->filesystem==STORAGE_FILESYSTEM_EXT4); }
+{ return volume && (volume->filesystem==STORAGE_FILESYSTEM_EXT2 ||
+    volume->filesystem==STORAGE_FILESYSTEM_EXT3 || volume->filesystem==STORAGE_FILESYSTEM_EXT4); }
 
 /* Spec section 8: the ext2 partition range was renamed to the ext-family
  * spelling.  Keep the old field names working as access macros so existing

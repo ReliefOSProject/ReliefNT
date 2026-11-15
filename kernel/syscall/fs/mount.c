@@ -72,20 +72,24 @@ static int mount_unmount(struct vfs_namespace *ns,struct task *task,uint64_t tar
  * @param task Authorized calling task with retry-stable lookup scope.
  * @param target User target pathname pointer, required.
  * @param flags Final requested policy with MS_REMOUNT already stripped.
+ * @param options_user Optional user filesystem data copied before use.
  * @return Zero or lookup/type/unsupported/busy/provider errno. Linux retains
  * existing atime policy when remount supplies none of its controlling bits.
  * Local path owns provider lifetime; no graph/module lock spans the callback.
  */
-static int mount_remount(struct vfs_namespace *ns,struct task *task,uint64_t target,uint64_t flags)
+static int mount_remount(struct vfs_namespace *ns,struct task *task,uint64_t target,uint64_t flags,
+                         uint64_t options_user)
 {
     struct vfs_lookup_result found={0};
-    int rc=resolve_user_object_at_flags(ns,task,LINUX_AT_FDCWD,target,false,false,VFS_LOOKUP_FOLLOW,&found);
+    struct task_user_text options={0};
+    int rc=task_lookup_user_text(task,options_user,VFS_PATH_MAX,true,&options);
+    if(!rc)rc=resolve_user_object_at_flags(ns,task,LINUX_AT_FDCWD,target,false,false,VFS_LOOKUP_FOLLOW,&found);
     if(!rc) {
         const uint64_t atime=MS_NOATIME|MS_NODIRATIME|MS_RELATIME|MS_STRICTATIME;
         if(!(flags&atime))flags|=vfs_path_mount_flags(&found.path)&atime;
-        rc=vfs_path_remount(&found.path,flags);
+        rc=vfs_path_remount_options(&found.path,flags,options.text);
     }
-    vfs_path_put(&found.path);return rc;
+    vfs_path_put(&found.path);kernel_free(options.allocation);return rc;
 }
 
 /** @brief Construct one supported backend without publishing a pathname alias.
@@ -94,7 +98,7 @@ static int mount_remount(struct vfs_namespace *ns,struct task *task,uint64_t tar
  * @param source Copied kernel source label; its user pointer is passed separately.
  * @param source_user Original user source pathname for a disk filesystem.
  * @param type Copied filesystem type, empty for existing native detection.
- * @param options Copied option string; only tmpfs currently consumes options.
+ * @param options Copied tmpfs, FAT ownership, or ext3 ordered-mode options.
  * @param flags Final mount policy without operation bits.
  * @param out Receives one owned detached mount, empty on failure.
  * @return Zero or unsupported/device/lookup/provider errno. Source resolution
@@ -105,6 +109,10 @@ static int mount_backend(struct vfs_namespace *ns,struct task *task,const char *
                              const char *type,const char *options,uint64_t flags,struct vfs_mount **out)
 {
     if(!__builtin_strcmp(type,"tmpfs"))return storage_new_tmpfs_mount(source,flags,options,task->fsuid,task->fsgid,out);
+    /* The ext3 engine always uses ordered metadata transactions. Consume only
+     * that supported mode before the common FAT option validation/application. */
+    if (!__builtin_strcmp(type,"ext3") && !__builtin_strcmp(options,"data=ordered"))
+        options="";
     if (options[0]) {
         if (__builtin_strcmp(type,"vfat") && __builtin_strcmp(type,"exfat"))
             return -RELIEFOS_EOPNOTSUPP;
@@ -171,7 +179,7 @@ int64_t syscall_mount_control(struct vfs_namespace *ns,struct task *task,uint64_
     if(number!=LINUX_SYS_MOUNT)return -RELIEFOS_ENOSYS;
     if((a3&MS_MGC_MSK)==MS_MGC_VAL)a3&=~MS_MGC_MSK;
     a3&=~MS_SILENT;
-    if(a3&MS_REMOUNT)return a4 ? -RELIEFOS_EOPNOTSUPP : mount_remount(ns,task,a1,a3&~MS_REMOUNT);
+    if(a3&MS_REMOUNT)return mount_remount(ns,task,a1,a3&~MS_REMOUNT,a4);
     if(a3&MS_MOVE)return a3!=MS_MOVE ? -RELIEFOS_EOPNOTSUPP : mount_move(ns,task,a0,a1);
     if(a3&MS_BIND)return a3!=MS_BIND ? -RELIEFOS_EOPNOTSUPP : mount_bind(ns,task,a0,a1);
     const uint64_t supported=MS_RDONLY|MS_NOSUID|MS_NODEV|MS_NOEXEC|MS_SYNCHRONOUS|MS_DIRSYNC|

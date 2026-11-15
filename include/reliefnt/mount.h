@@ -224,6 +224,15 @@ int vfs_namespace_context_mountpoint(const struct vfs_namespace *ns,const void *
  * Execution-owned task context without graph/module locks across callbacks.
  */
 int vfs_path_remount(const struct vfs_path *path,uint64_t flags);
+/** @brief Validate filesystem-specific options before changing remount policy.
+ * @param path Retained mounted filesystem root, required.
+ * @param flags Final policy excluding MS_REMOUNT.
+ * @param options Optional copied data, empty or ext3 data=ordered.
+ * @return Zero or negative option/type/provider errno. Unsupported data leaves
+ * the attachment unchanged. The retained mount determines the filesystem type.
+ * Caller holds execution ownership and has checked CAP_SYS_ADMIN.
+ */
+int vfs_path_remount_options(const struct vfs_path *path,uint64_t flags,const char *options);
 struct vfs_boot_mount {
     const char *target;
     /* Transfer one detached owned mount only on success; callbacks/context
