@@ -17,6 +17,50 @@ int main(int argc,char **argv)
     }
     check(storage_ext4_create(&volume,2,"native",0040755,0,0,NULL,&parent));
     check(storage_ext4_create(&volume,2,"other",0040755,0,0,NULL,&other));
+    const char *certificate = "/usr/share/ca-certificates/mozilla/HARICA_TLS_RSA_Root_CA_2021.crt";
+    check(storage_ext4_create(&volume,other,"certificate-link",0120777,0,0,certificate,&ino));
+    struct ext4_inode_view link_inode;
+    check(storage_ext4_read_inode(&volume,ino,&link_inode));
+    char link_target[256] = {0};
+    uint32_t link_length = 0;
+    check(storage_ext4_read_file_range(&volume,ino,&link_inode,0,link_target,sizeof(link_target),&link_length));
+    assert(link_length == strlen(certificate) && !memcmp(link_target,certificate,link_length));
+    check(storage_ext4_unlink(&volume,other,"certificate-link",false));
+    assert(!volume.ext4.fs_error && !volume.read_only_reason);
+    for (unsigned index = 0; index < 200; ++index) {
+        char temporary[64], final[128];
+        snprintf(temporary,sizeof(temporary),".reliefos-link-%06u",index);
+        snprintf(final,sizeof(final),"ca-cert-fixture-Certificate_Authority_Root_%06u.pem",index);
+        check(storage_ext4_create(&volume,other,temporary,0100600,0,0,NULL,&ino));
+        check(storage_ext4_unlink(&volume,other,temporary,false));
+        check(storage_ext4_create(&volume,other,temporary,0120777,0,0,certificate,&ino));
+        check(storage_ext4_rename(&volume,other,temporary,other,final));
+        assert(!volume.ext4.fs_error && !volume.read_only_reason);
+    }
+    sync_image();
+    struct ext4_inode_view indexed_directory;
+    check(storage_ext4_read_inode(&volume,other,&indexed_directory));
+    assert(indexed_directory.flags & EXT4_INDEX_FL);
+    struct storage_ext4_map_result index_block;
+    check(storage_ext4_map_block(&volume,other,&indexed_directory,0,false,&index_block));
+    const int transient_errors[] = {-RELIEFOS_EAGAIN, -RELIEFOS_ENOMEM};
+    uint8_t prepared_lookup[3 * EXT4_MAX_BLOCK_SIZE];
+    for (unsigned prepared = 0; prepared < 2; ++prepared) {
+        for (unsigned index = 0; index < sizeof(transient_errors) / sizeof(transient_errors[0]); ++index) {
+            invalidate();
+            transient_read_sector = volume.ext_start_lba + index_block.physical * (volume.ext4.block_size / 512);
+            transient_read_error = transient_errors[index];
+            int result = prepared
+                ? storage_ext4_dir_lookup_prepared(&volume,other,"ca-cert-fixture-Certificate_Authority_Root_000050.pem",&found,&type,prepared_lookup)
+                : storage_ext4_dir_lookup(&volume,other,"ca-cert-fixture-Certificate_Authority_Root_000050.pem",&found,&type);
+            assert(result == transient_errors[index]);
+            assert(!transient_read_error && !volume.ext4.fs_error && !volume.read_only_reason);
+            check(storage_ext4_dir_lookup(&volume,other,"ca-cert-fixture-Certificate_Authority_Root_000050.pem",&found,&type));
+            assert(type == 7);
+            check(storage_ext4_create(&volume,other,"after-retry",0100600,0,0,NULL,&ino));
+            check(storage_ext4_unlink(&volume,other,"after-retry",false));
+        }
+    }
     /* Find a real major-hash collision with the independent Linux library. */
     struct collision_slot { uint32_t hash,index; };
     struct collision_slot *table=calloc(1u<<19,sizeof(*table)); assert(table);
