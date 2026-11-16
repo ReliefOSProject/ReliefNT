@@ -1,10 +1,13 @@
 #include <assert.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 static int allocation_fail_after = -1;
 static unsigned allocation_attempts;
+/* A sibling CPU can keep a readable translation while another resolves COW. */
+static uint64_t sibling_cached_phys;
 
 static int test_page_alloc_allowed(void)
 {
@@ -120,7 +123,7 @@ int page_cache_owns(uint64_t p) { (void)p; return 0; }
 void page_cache_mark_shared_writable(uint64_t p) { (void)p; abort(); }
 void page_cache_release(uint64_t p) { (void)p; abort(); }
 void x86_64_load_cr3(uint64_t p) { (void)p; }
-void smp_flush_user_tlb(void) { }
+void smp_flush_user_tlb(void) { sibling_cached_phys = 0; }
 void x86_64_invlpg(uint64_t p) { (void)p; }
 #ifndef RELIEFNT_PAGING_FIXTURE_EXTERNAL_SPINLOCKS
 void kernel_spin_lock(struct kernel_spinlock *lock) { (void)lock; }
@@ -167,10 +170,18 @@ static void test_parent_cow_write_isolation(void)
     assert(!address_space_user_page_readable(&parent, protnone_va));
     assert(!address_space_user_page_readable(&child, protnone_va));
 
+    sibling_cached_phys = shared_phys;
     assert(address_space_handle_cow_fault(&parent, va));
     uint64_t parent_private = address_space_user_page_phys(&parent, va);
     assert(parent_private != shared_phys);
     *(uint8_t *)mm_phys_to_virt(parent_private) = 0x91;
+    /* No syscall or context switch is required for the sibling to see a
+     * write to its own process's private mapping. Local INVLPG cannot evict
+     * that CPU's old translation. */
+    if (!sibling_cached_phys)
+        sibling_cached_phys = address_space_user_page_phys(&parent, va);
+    assert(*(uint8_t *)mm_phys_to_virt(sibling_cached_phys) == 0x91);
+    sibling_cached_phys = 0;
     assert(*(uint8_t *)mm_phys_to_virt(shared_phys) == 0x42);
 
     assert(address_space_handle_cow_fault(&child, va));
