@@ -7,11 +7,21 @@
 /** @brief Read a feature-validated model-specific register.
  * @param msr Supported register number. @return Its complete 64-bit value.
  */
-static uint64_t pat_read_msr(uint32_t msr)
+uint64_t x86_cache_native_read(uint32_t msr)
 {
     uint32_t low,high;
     __asm__ volatile("rdmsr" : "=a"(low),"=d"(high) : "c"(msr));
     return (uint64_t)high<<32 | low;
+}
+
+/** @brief Query local architectural feature bits without a shared cache.
+ * @return CPUID leaf-one EDX, including PAT and MTRR availability.
+ */
+uint32_t x86_cache_native_features(void)
+{
+    uint32_t a,b,c,d;
+    __asm__ volatile("cpuid" : "=a"(a),"=b"(b),"=c"(c),"=d"(d) : "a"(1),"c"(0));
+    return d;
 }
 
 /** @brief Require PAT and enabled MTRRs before installing WC page policies.
@@ -19,14 +29,23 @@ static uint64_t pat_read_msr(uint32_t msr)
  */
 bool x86_pat_native_supported(void)
 {
-    uint32_t a,b,c,d;
-    __asm__ volatile("cpuid" : "=a"(a),"=b"(b),"=c"(c),"=d"(d) : "a"(1),"c"(0));
-    return (d & ((1u<<16)|(1u<<12)))==((1u<<16)|(1u<<12)) &&
-           (pat_read_msr(IA32_MTRR_DEF_TYPE)&(1u<<11));
+    uint32_t required=(1u<<16)|(1u<<12);
+    return (x86_cache_native_features() & required)==required &&
+           (x86_cache_native_read(IA32_MTRR_DEF_TYPE)&(1u<<11));
 }
 
 /** @brief Read IA32_PAT after local capability validation. @return Eight entries. */
-uint64_t x86_pat_native_read(void) { return pat_read_msr(IA32_PAT); }
+uint64_t x86_pat_native_read(void) { return x86_cache_native_read(IA32_PAT); }
+
+/** @brief Write one cache MSR inside a boot-only serialized update.
+ * @param msr Feature-validated register. @param value Valid register value.
+ * Caller masks IRQs and disables caching before entry.
+ */
+void x86_cache_native_write(uint32_t msr, uint64_t value)
+{
+    __asm__ volatile("wrmsr" :: "c"(msr),"a"((uint32_t)value),
+                     "d"((uint32_t)(value>>32)) : "memory");
+}
 
 /** @brief Flush all local translations, including global leaves.
  * IRQs are masked by the boot caller; CR4 is restored without changing policy.
@@ -43,6 +62,30 @@ static void pat_flush_tlb(void)
     if(cr4 & (1u<<7)) __asm__ volatile("mov %0,%%cr4" :: "r"(cr4) : "memory");
 }
 
+/** @brief Begin a local boot-time cache policy update with IRQs already masked.
+ * @return Original CR0, to be restored by x86_cache_native_end.
+ * Drains stores, disables caching, and invalidates caches/global translations.
+ */
+uint64_t x86_cache_native_begin(void)
+{
+    uint64_t cr0;
+    __asm__ volatile("mfence; mov %%cr0,%0" : "=r"(cr0) :: "memory");
+    uint64_t disabled=(cr0 | (1ULL<<30)) & ~(1ULL<<29);
+    __asm__ volatile("mov %0,%%cr0; wbinvd" :: "r"(disabled) : "memory");
+    pat_flush_tlb();
+    return cr0;
+}
+
+/** @brief Finish a local cache policy update while preserving CR0/CR4.
+ * @param cr0 Original CR0 from x86_cache_native_begin. IRQs remain masked.
+ */
+void x86_cache_native_end(uint64_t cr0)
+{
+    __asm__ volatile("wbinvd" ::: "memory");
+    pat_flush_tlb();
+    __asm__ volatile("mov %0,%%cr0" :: "r"(cr0) : "memory");
+}
+
 /** @brief Serialize a boot-only PAT replacement with caches temporarily disabled.
  * @param layout Valid, capability-checked IA32_PAT entries.
  * Caller masks IRQs; preserves CR0/CR4 and drains WC/WB stores and translations
@@ -50,16 +93,9 @@ static void pat_flush_tlb(void)
  */
 void x86_pat_native_install(uint64_t layout)
 {
-    uint64_t cr0;
-    __asm__ volatile("mfence; mov %%cr0,%0" : "=r"(cr0) :: "memory");
-    uint64_t disabled=(cr0 | (1ULL<<30)) & ~(1ULL<<29);
-    __asm__ volatile("mov %0,%%cr0; wbinvd" :: "r"(disabled) : "memory");
-    pat_flush_tlb();
-    __asm__ volatile("wrmsr" :: "c"(IA32_PAT),"a"((uint32_t)layout),
-                     "d"((uint32_t)(layout>>32)) : "memory");
-    __asm__ volatile("wbinvd" ::: "memory");
-    pat_flush_tlb();
-    __asm__ volatile("mov %0,%%cr0" :: "r"(cr0) : "memory");
+    uint64_t cr0=x86_cache_native_begin();
+    x86_cache_native_write(IA32_PAT,layout);
+    x86_cache_native_end(cr0);
 }
 
 /** @brief Drain local stores/caches and invalidate translations during BSP retyping.

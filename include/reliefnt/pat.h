@@ -11,9 +11,10 @@
  * The first attempt fixes the boot policy; subsequent calls cannot enable it.
  */
 bool arch_pat_boot_init(bool enabled);
-/** @brief Install the BSP's PAT layout before an AP is published online.
- * @return True for a matching CPU or disabled boot policy, false when this AP
- * cannot honor already-published WC pages and must remain offline.
+/** @brief Match the BSP's MTRR and PAT layouts before publishing an AP online.
+ * @return True for matching cache policy, false when this AP cannot honor
+ * shared mappings and must remain offline. Firmware MTRRs are synchronized
+ * even with nopat; unsupported MSRs are never accessed.
  * AP boot only, IRQs masked and no shared lock held.
  */
 bool arch_pat_ap_init(void);
