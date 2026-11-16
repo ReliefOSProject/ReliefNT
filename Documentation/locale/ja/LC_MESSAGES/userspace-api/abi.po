@@ -56,3 +56,18 @@ msgstr ""
 "root フィールドは元ディレクトリーのファイルシステム内のパスを報告し、名前空間のパス、``..``、chroot "
 "境界は新マウントを基準に計算します。バインドが残る間は元ファイルシステムをアンマウントできず、バインド解除で元ファイルシステムを破棄することもありません。再帰バインド、ファイルバインド、bind "
 "remount は未対応で、明示的なエラーを返します。"
+
+msgid "按任务选择 uname 系统名"
+msgstr "タスクごとの uname システム名の選択"
+
+msgid "``<reliefos/prctl.h>`` 提供以下不需要特权的 ``prctl`` 扩展："
+msgstr "``<reliefos/prctl.h>`` は、特権不要の次の ``prctl`` 拡張を提供します。"
+
+msgid "``RELIEFOS_PR_SET_UNAME_LINUX``（``0x52550001``）：arg2 为 0 或 1， 关闭或开启当前任务的 Linux 系统名；arg3、arg4、arg5 必须为零。"
+msgstr "``RELIEFOS_PR_SET_UNAME_LINUX``（``0x52550001``）：arg2 を 0 または 1 として、呼び出しタスクの Linux システム名を無効または有効にします。arg3、arg4、arg5 はゼロにします。"
+
+msgid "``RELIEFOS_PR_GET_UNAME_LINUX``（``0x52550002``）：所有参数为零， 返回当前选择 0 或 1。"
+msgstr "``RELIEFOS_PR_GET_UNAME_LINUX``（``0x52550002``）：すべての引数をゼロにし、現在の選択 0 または 1 を取得します。"
+
+msgid "非法值及非零保留参数返回 EINVAL，状态不变。新任务默认使用 ReliefNT； fork、vfork、clone 复制调用任务的选择，exec 保留选择。已经存在的其他任务 不受影响，线程也可独立设置该值。该开关仅将 ``uname(2)`` 返回的 ``sysname`` 改为 Linux，其余字段、全局 UTS 状态及 procfs 均不改变。 使用标准 libc prctl 包装或原始系统调用均可；不改变 personality 数值语义。"
+msgstr "不正な値やゼロ以外の予約引数には、状態を変更せず EINVAL を返します。新しいタスクは既定で ReliefNT を使用します。fork、vfork、clone は呼び出しタスクの選択をコピーし、exec は選択を保持します。既存の別タスクは影響を受けず、スレッドも独立に選択できます。このスイッチは ``uname(2)`` の ``sysname`` だけを Linux に変更し、他のフィールド、グローバルな UTS 状態、procfs は変更しません。標準 libc の prctl ラッパーとシステムコールの直接呼び出しに対応し、personality 値の意味は変更しません。"

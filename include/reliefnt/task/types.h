@@ -524,6 +524,8 @@ struct task {
     uint64_t start_uptime_ms;
     bool no_new_privs;
     bool nproc_exceeded;
+    /* Copied by fork/clone and retained by exec; only uname.sysname changes. */
+    bool uname_linux;
     struct task_rlimit_state limits;
     struct task_rlimit_state *shared_limits;
     uint32_t tgid;

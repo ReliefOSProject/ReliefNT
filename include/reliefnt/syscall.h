@@ -339,6 +339,15 @@ void syscall_trace_configure(const char *cmdline);
  */
 int64_t syscall_process_control(uint64_t number, uint64_t a0, uint64_t a1,
                                 uint64_t a2, uint64_t a3);
+/**
+ * @brief Apply Linux or ReliefNT prctl operations to the execution-owned caller.
+ * @param option Unsigned-int operation selector.
+ * @param arg2 Operation-specific value or user address checked by the handler.
+ * @param arg3 Operation-specific value or reserved zero.
+ * @param arg4 Operation-specific value or reserved zero.
+ * @param arg5 Operation-specific value or reserved zero.
+ * @return Operation result or negative errno; uname selection is task-local.
+ */
 int64_t syscall_process_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
                               uint64_t arg4, uint64_t arg5);
 /**

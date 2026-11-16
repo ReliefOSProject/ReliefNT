@@ -63,3 +63,18 @@ msgstr ""
 "paths, ``..``, and chroot boundaries are computed relative to the new mount. The source filesystem"
 " cannot be unmounted while the bind remains, and unbinding does not destroy it. Recursive binds, "
 "file binds, and bind remounts are not yet supported and return explicit errors."
+
+msgid "按任务选择 uname 系统名"
+msgstr "Selecting the uname system name per task"
+
+msgid "``<reliefos/prctl.h>`` 提供以下不需要特权的 ``prctl`` 扩展："
+msgstr "``<reliefos/prctl.h>`` provides the following unprivileged ``prctl`` extensions:"
+
+msgid "``RELIEFOS_PR_SET_UNAME_LINUX``（``0x52550001``）：arg2 为 0 或 1， 关闭或开启当前任务的 Linux 系统名；arg3、arg4、arg5 必须为零。"
+msgstr "``RELIEFOS_PR_SET_UNAME_LINUX`` (``0x52550001``): arg2 is 0 or 1 to disable or enable the calling task's Linux system name; arg3, arg4, and arg5 must be zero."
+
+msgid "``RELIEFOS_PR_GET_UNAME_LINUX``（``0x52550002``）：所有参数为零， 返回当前选择 0 或 1。"
+msgstr "``RELIEFOS_PR_GET_UNAME_LINUX`` (``0x52550002``): all arguments must be zero; returns the current selection, 0 or 1."
+
+msgid "非法值及非零保留参数返回 EINVAL，状态不变。新任务默认使用 ReliefNT； fork、vfork、clone 复制调用任务的选择，exec 保留选择。已经存在的其他任务 不受影响，线程也可独立设置该值。该开关仅将 ``uname(2)`` 返回的 ``sysname`` 改为 Linux，其余字段、全局 UTS 状态及 procfs 均不改变。 使用标准 libc prctl 包装或原始系统调用均可；不改变 personality 数值语义。"
+msgstr "Invalid values and nonzero reserved arguments return EINVAL without changing state. New tasks use ReliefNT by default. fork, vfork, and clone copy the calling task's selection, and exec preserves it. Other existing tasks are unaffected; threads may also set their selection independently. The switch changes only the ``sysname`` returned by ``uname(2)`` to Linux; other fields, global UTS state, and procfs are unchanged. Both the standard libc prctl wrapper and raw syscalls are supported. Linux personality values retain their existing meaning."

@@ -31,6 +31,7 @@
 #include <linux/securebits.h>
 #include <reliefos/auth_abi.h>
 #include <reliefos/system_abi.h>
+#include <reliefos/prctl.h>
 #include <stdint.h>
 
 
@@ -326,12 +327,29 @@ int64_t syscall_linux_signal(uint64_t number, uint64_t signal_number,
     return -RELIEFOS_ENOSYS;
 }
 
+/**
+ * @brief Apply a process-control operation to the execution-owned calling task.
+ * @param option Linux or ReliefNT prctl selector, narrowed to unsigned int.
+ * @param arg2 Selector-specific value or validated user address.
+ * @param arg3 Selector-specific value; reserved for uname selection.
+ * @param arg4 Selector-specific value; reserved for uname selection.
+ * @param arg5 Selector-specific value; reserved for uname selection.
+ * @return Operation result or negative errno. Uname selection needs no
+ * capability and affects only this task and subsequently created descendants.
+ */
 int64_t syscall_process_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
                               uint64_t arg4, uint64_t arg5)
 {
     struct task *task = sched_current_task();
     if (!task) return -LINUX_ESRCH;
     switch ((uint32_t)option) {
+    case RELIEFOS_PR_SET_UNAME_LINUX:
+        if (arg2 > 1 || arg3 || arg4 || arg5) return -LINUX_EINVAL;
+        task->uname_linux = arg2 != 0;
+        return 0;
+    case RELIEFOS_PR_GET_UNAME_LINUX:
+        if (arg2 || arg3 || arg4 || arg5) return -LINUX_EINVAL;
+        return task->uname_linux;
     case LINUX_PR_SET_PDEATHSIG:
         /* Linux valid_signal() admits 0 (clear) through _NSIG. */
         if (arg2 > LINUX_NSIG) return -LINUX_EINVAL;
@@ -813,12 +831,16 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
     }
     if (number == LINUX_SYS_UNAME) {
         struct utsname info = {0};
+        const struct task *task = sched_current_task();
         const struct reliefos_system_info *system = reliefnt_system_info();
         if (a0) { int prep=process_prepare_user(sched_current_task(),a0,sizeof(info),true);if(prep)return prep; }
         if (!a0 || !user_range_writable(a0, sizeof(info))) return -RELIEFOS_EFAULT;
         {
             uint32_t i;
-            __builtin_memcpy(info.sysname, LINUX_UTS_SYSNAME, sizeof(LINUX_UTS_SYSNAME));
+            if (task && task->uname_linux)
+                __builtin_memcpy(info.sysname, "Linux", sizeof("Linux"));
+            else
+                __builtin_memcpy(info.sysname, LINUX_UTS_SYSNAME, sizeof(LINUX_UTS_SYSNAME));
             if (system) {
                 for (i = 0; i < sizeof(info.release) - 1u && system->kernel_version[i]; ++i) {
                     info.release[i] = system->kernel_version[i];

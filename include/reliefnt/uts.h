@@ -1,7 +1,7 @@
 #ifndef RELIEFNT_UTS_H
 #define RELIEFNT_UTS_H
 #include <stdint.h>
-/* The native userspace personality is Linux; version metadata stays ReliefNT. */
+/* Native identity; callers may opt into Linux sysname through ReliefNT prctl. */
 #define LINUX_UTS_SYSNAME "ReliefNT"
 /**
  * @brief Copy a coherent snapshot under the UTS spinlock.
