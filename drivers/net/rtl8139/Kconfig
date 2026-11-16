@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+config RTL8139
+    tristate "Realtek RTL8139 10/100 PCI Ethernet (classic mode)"
+    default y
+    help
+      Native driver for PCI 10ec:8139, including the QEMU RTL8139 model.
+      Uses the I/O BAR, DMA32 receive ring and four transmit buffers, with
+      task-context polling and device interrupts masked. Each PCI function
+      registers a separate interface. M builds rtl8139.ko for this kernel.
+      C+ descriptor mode, hardware offloads and shared INTx are not enabled.
