@@ -13,6 +13,7 @@ virtio tools/test_virtio.py
 e1000 tools/test_e1000.py
 e1000e tools/test_e1000e.py
 r8169 tools/test_r8169.py
+rtl8139 tools/test_rtl8139.py
 vmxnet3 tools/test_vmxnet3.py
 pci_msix tools/test_pci_msix.py
 efi_fs_early tools/test_efi_fs_early.py

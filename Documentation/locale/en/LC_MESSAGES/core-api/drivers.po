@@ -297,3 +297,15 @@ msgstr ""
 " modesetting or hardware vblank. VirtIO-GPU uses an independent modern PCI and 2D/VirGL protocol "
 "path with the Linux VirtGPU UAPI. Never fabricate a render node or successful operation without "
 "the required device capabilities."
+
+msgid "``RTL8139``"
+msgstr "``RTL8139``"
+
+msgid "``rtl8139``"
+msgstr "``rtl8139``"
+
+msgid "Realtek RTL8139 10/100 PCI 网卡，使用经典模式、DMA32 和任务轮询； 每个 PCI 功能独立注册接口。范围与恢复语义见 :doc:`rtl8139`。"
+msgstr ""
+"Realtek RTL8139 10/100 PCI Ethernet, using classic mode, DMA32 and task-context polling. Each"
+" PCI function registers an independent interface. See :doc:`rtl8139` for scope and recovery "
+"semantics."

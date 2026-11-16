@@ -36,7 +36,7 @@ class ModuleConfiguration(unittest.TestCase):
         self.assertIn("CONFIG_MODULES=y\n", text)
         self.assertIn("CONFIG_MODULE_UNLOAD=y\n", text)
         self.assertNotIn("=m\n", text)
-        for symbol in ("DRM", "SND", "VMXNET3", "FAT_FS", "EXFAT_FS", "EXT2_FS", "EXT3_FS", "EXT4_FS", "EXT_FS_COMMON", "ISO9660_FS"):
+        for symbol in ("DRM", "SND", "VMXNET3", "RTL8139", "FAT_FS", "EXFAT_FS", "EXT2_FS", "EXT3_FS", "EXT4_FS", "EXT_FS_COMMON", "ISO9660_FS"):
             self.assertIn("CONFIG_" + symbol + "=y\n", text)
 
     def test_native_dependency_and_disabled_modules(self):
@@ -64,7 +64,7 @@ class ModuleConfiguration(unittest.TestCase):
         output = self.directory / "all-drivers"
         run_config(["make", "-s", "-C", str(ROOT), "O=" + str(output), "allmodconfig"])
         text = (output / ".config").read_text()
-        for symbol in ("DRM", "SND", "E1000", "SND_INTEL8X0", "SND_ENS1371", "SND_HDA_INTEL",
+        for symbol in ("DRM", "SND", "E1000", "RTL8139", "SND_INTEL8X0", "SND_ENS1371", "SND_HDA_INTEL",
                        "MOUSE_PS2", "SERIAL_8250", "USB_UHCI_HCD", "SATA_AHCI", "PATA_IDE", "BLK_DEV_NVME"):
             self.assertIn("CONFIG_" + symbol + "=m\n", text)
 

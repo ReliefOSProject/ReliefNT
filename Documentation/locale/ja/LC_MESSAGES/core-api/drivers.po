@@ -262,3 +262,14 @@ msgstr ""
 "framebuffer は基本的な表示を提供します。DRM/vmwgfx は有界な SVGA-II/VGPU9 機能、リソース、コマンド検証、fence を実装しますが、汎用のデバイス間 "
 "DMA-BUF、atomic modesetting、hardware vblank は保証しません。VirtIO-GPU は独立した modern PCI、2D/VirGL プロトコルと "
 "Linux VirtGPU UAPI を使用します。デバイス機能が確認できない場合に render node や成功状態を偽ってはいけません。"
+
+msgid "``RTL8139``"
+msgstr "``RTL8139``"
+
+msgid "``rtl8139``"
+msgstr "``rtl8139``"
+
+msgid "Realtek RTL8139 10/100 PCI 网卡，使用经典模式、DMA32 和任务轮询； 每个 PCI 功能独立注册接口。范围与恢复语义见 :doc:`rtl8139`。"
+msgstr ""
+"Realtek RTL8139 10/100 PCI ネットワークカード。従来モード、DMA32、タスクコンテキストのポーリングを使用し、PCI "
+"機能ごとに独立したインターフェースを登録します。対応範囲と復旧の意味は :doc:`rtl8139` を参照してください。"

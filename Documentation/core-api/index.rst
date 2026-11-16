@@ -20,6 +20,7 @@
    network-devices
    e1000e
    realtek
+   rtl8139
    vmxnet3
    ext3
    usb

@@ -41,6 +41,10 @@ drivers/ 按 console、tty、video、storage、net、input、usb、sound 等设�
      - ``vmxnet3``
      - VMware 半虚拟化 Ethernet 网卡；每个 PCI 功能独立注册网络接口。
        描述符、协商能力、DMA 生命周期和验证范围见 :doc:`vmxnet3`。
+   * - ``RTL8139``
+     - ``rtl8139``
+     - Realtek RTL8139 10/100 PCI 网卡，使用经典模式、DMA32 和任务轮询；
+       每个 PCI 功能独立注册接口。范围与恢复语义见 :doc:`rtl8139`。
    * - ``MOUSE_PS2`` / ``USB_UHCI_HCD``
      - ``mouse`` / ``uhci``
      - PS/2、VMware 鼠标与 UHCI HID；键盘基础输入和分发入口内置。
