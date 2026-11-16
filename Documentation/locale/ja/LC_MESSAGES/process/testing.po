@@ -179,3 +179,6 @@ msgstr ""
 "検証には実際の例外と画面も必要で、ロゴは個数、間隔、消去を確認します。メインリポジトリーは統合 QEMU "
 "ツールを提供しますが、本リポジトリーの新規製品ではありません。毎回ソースとバイナリーのダイジェストを記録し、元イメージを保持します。VMware "
 "と物理ハードウェアは未検証なら合格と記録してはなりません。"
+
+msgid "``tools/tests/uname_runtime_probe.c`` 使用 libc 与原始 uname 系统调用，检查 原生/Linux 系统名、其他字段不变、prctl 参数拒绝、fork/线程/exec/vfork 继承及相互隔离。编译时使用导出的 ``<reliefos/prctl.h>`` 和 pthread； 来宾原生运行不带参数，Linux 模式运行时传入 ``Linux``，可分别编译静态和 动态程序。仅在 ReliefNT 来宾执行，其扩展不要求宿主 Linux 实现。"
+msgstr "``tools/tests/uname_runtime_probe.c`` は libc と uname システムコールの直接呼び出しを使い、ネイティブ/Linux のシステム名、他のフィールドの維持、prctl 引数の拒否、fork/スレッド/exec/vfork での継承と相互分離を検証します。公開された ``<reliefos/prctl.h>`` と pthread を使用してコンパイルします。ゲストのネイティブモードでは引数なし、Linux モードでは ``Linux`` を指定し、静的版と動的版を別々にビルドできます。ReliefNT ゲストだけで実行し、ホスト Linux にこれらの拡張の実装は要求しません。"

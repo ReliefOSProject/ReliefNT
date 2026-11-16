@@ -210,3 +210,6 @@ msgstr ""
 "spacing, and removal checks. The main repository provides integrated QEMU tools, but they are not "
 "new products of this repository. Record source and binary digests each time and retain source "
 "images. Unvalidated VMware and physical hardware must not be marked passed."
+
+msgid "``tools/tests/uname_runtime_probe.c`` 使用 libc 与原始 uname 系统调用，检查 原生/Linux 系统名、其他字段不变、prctl 参数拒绝、fork/线程/exec/vfork 继承及相互隔离。编译时使用导出的 ``<reliefos/prctl.h>`` 和 pthread； 来宾原生运行不带参数，Linux 模式运行时传入 ``Linux``，可分别编译静态和 动态程序。仅在 ReliefNT 来宾执行，其扩展不要求宿主 Linux 实现。"
+msgstr "``tools/tests/uname_runtime_probe.c`` uses libc and raw uname syscalls to check native/Linux system names, unchanged remaining fields, rejected prctl arguments, inheritance through fork/threads/exec/vfork, and isolation. Compile with the exported ``<reliefos/prctl.h>`` and pthread. Run without arguments for the guest's native mode, or pass ``Linux`` for Linux mode. Build static and dynamic versions separately. Run only in a ReliefNT guest; host Linux is not required to implement these extensions."

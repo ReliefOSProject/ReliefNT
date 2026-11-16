@@ -117,6 +117,12 @@ SVGA 夹具检查 FIFO 初始化不把已保留的 WC 显存重新声明为 UC�
 目标运行
 ========
 
+``tools/tests/uname_runtime_probe.c`` 使用 libc 与原始 uname 系统调用，检查
+原生/Linux 系统名、其他字段不变、prctl 参数拒绝、fork/线程/exec/vfork
+继承及相互隔离。编译时使用导出的 ``<reliefos/prctl.h>`` 和 pthread；
+来宾原生运行不带参数，Linux 模式运行时传入 ``Linux``，可分别编译静态和
+动态程序。仅在 ReliefNT 来宾执行，其扩展不要求宿主 Linux 实现。
+
 启动检查固件与内核完成、PID 1；系统调用探针必须实际进入来宾。
 panic 验证还需真实异常与画面，徽标需检查数量、留距和移除。
 主仓提供集成 QEMU 工具，但它们不是本仓新增产品；每次记录源码与二进制

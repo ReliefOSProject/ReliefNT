@@ -21,6 +21,22 @@ vDSO 的 ELF 符号版本、辅助向量、vvar 邻接映射及时间读取均�
 接口修改同步内核、导出头、用户态包装、消费者和必要验证，不以更新 golden
 替代布局或语义审查。
 
+按任务选择 uname 系统名
+========================
+
+``<reliefos/prctl.h>`` 提供以下不需要特权的 ``prctl`` 扩展：
+
+* ``RELIEFOS_PR_SET_UNAME_LINUX``（``0x52550001``）：arg2 为 0 或 1，
+  关闭或开启当前任务的 Linux 系统名；arg3、arg4、arg5 必须为零。
+* ``RELIEFOS_PR_GET_UNAME_LINUX``（``0x52550002``）：所有参数为零，
+  返回当前选择 0 或 1。
+
+非法值及非零保留参数返回 EINVAL，状态不变。新任务默认使用 ReliefNT；
+fork、vfork、clone 复制调用任务的选择，exec 保留选择。已经存在的其他任务
+不受影响，线程也可独立设置该值。该开关仅将 ``uname(2)`` 返回的
+``sysname`` 改为 Linux，其余字段、全局 UTS 状态及 procfs 均不改变。
+使用标准 libc prctl 包装或原始系统调用均可；不改变 personality 数值语义。
+
 目录 bind mount
 ===============
 

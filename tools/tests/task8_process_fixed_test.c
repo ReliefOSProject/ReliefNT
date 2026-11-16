@@ -51,5 +51,21 @@ int main(void)
     assert(!current.name_storage[0]);contended=false;
     assert(!syscall_process_prctl(LINUX_PR_SET_NAME,(uintptr_t)name,0,0,0));
     assert(!strcmp(current.name_storage,"worker") && prepares);
+    assert(syscall_process_prctl(RELIEFOS_PR_GET_UNAME_LINUX,0,0,0,0)==0);
+    assert(!syscall_process_prctl(RELIEFOS_PR_SET_UNAME_LINUX,1,0,0,0));
+    assert(current.uname_linux &&
+           syscall_process_prctl(RELIEFOS_PR_GET_UNAME_LINUX,0,0,0,0)==1);
+    assert(syscall_process_prctl(RELIEFOS_PR_SET_UNAME_LINUX,2,0,0,0)==-LINUX_EINVAL);
+    assert(syscall_process_prctl(RELIEFOS_PR_SET_UNAME_LINUX,1ULL<<32,0,0,0)==-LINUX_EINVAL);
+    assert(syscall_process_prctl(RELIEFOS_PR_SET_UNAME_LINUX,0,1,0,0)==-LINUX_EINVAL);
+    assert(syscall_process_prctl(RELIEFOS_PR_SET_UNAME_LINUX,0,0,1,0)==-LINUX_EINVAL);
+    assert(syscall_process_prctl(RELIEFOS_PR_SET_UNAME_LINUX,0,0,0,1)==-LINUX_EINVAL);
+    assert(syscall_process_prctl(RELIEFOS_PR_GET_UNAME_LINUX,1,0,0,0)==-LINUX_EINVAL);
+    assert(syscall_process_prctl(RELIEFOS_PR_GET_UNAME_LINUX,0,1,0,0)==-LINUX_EINVAL);
+    assert(syscall_process_prctl(RELIEFOS_PR_GET_UNAME_LINUX,0,0,1,0)==-LINUX_EINVAL);
+    assert(syscall_process_prctl(RELIEFOS_PR_GET_UNAME_LINUX,0,0,0,1)==-LINUX_EINVAL);
+    assert(current.uname_linux);
+    assert(!syscall_process_prctl(RELIEFOS_PR_SET_UNAME_LINUX,0,0,0,0));
+    assert(!current.uname_linux);
     puts("PASS process fixed operands: clocks, multi-output atomicity, robust list and prctl");
 }
