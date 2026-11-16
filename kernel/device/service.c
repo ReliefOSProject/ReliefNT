@@ -34,7 +34,10 @@ static int service_binding_stop(void *value)
     uint64_t flags;kernel_spin_lock_irqsave(&service_binding_lock,&flags);
     int rc=binding->users ? -EBUSY : 0;
     if(!rc && binding->linked) {
-        if(binding->slot->binding==binding)binding->slot->binding=NULL;
+        if(binding->slot->binding==binding) {
+            __atomic_store_n(&binding->slot->panic_operations,NULL,__ATOMIC_RELEASE);
+            binding->slot->binding=NULL;
+        }
         binding->linked=false;binding->active=false;detached=true;
     }
     kernel_spin_unlock_irqrestore(&service_binding_lock,flags);
@@ -66,7 +69,10 @@ int kernel_service_register(struct kernel_service_slot *slot,const struct kernel
     if(rc){service_binding_put(binding);(void)service_binding_stop(binding);}
     else {
         kernel_spin_lock_irqsave(&service_binding_lock,&flags);
-        if(binding->linked)binding->active=true;else rc=-EBUSY;
+        if(binding->linked) {
+            binding->active=true;
+            __atomic_store_n(&slot->panic_operations,descriptor->operations,__ATOMIC_RELEASE);
+        } else rc=-EBUSY;
         kernel_spin_unlock_irqrestore(&service_binding_lock,flags);
     }
     service_binding_put(binding);return rc;
@@ -121,6 +127,12 @@ bool kernel_service_present(struct kernel_service_slot *slot)
     bool present=slot->binding && slot->binding->active;
     kernel_spin_unlock_irqrestore(&service_binding_lock,flags);return present;
 }
+/** @brief Read the last-published immutable table without taking interrupted locks.
+ * @param slot Permanent core slot. @return Table or NULL. Only the fatal owner
+ * may call after stopping peer CPUs, with no subsequent normal execution.
+ */
+const void *kernel_service_panic_operations(const struct kernel_service_slot *slot)
+{ return slot ? __atomic_load_n(&slot->panic_operations,__ATOMIC_ACQUIRE) : NULL; }
 /** @brief Consume one returned callback's binding/user/execution reference set.
  * @param call Owned admitted record, nullable; cleared before any final put.
  * IRQ/task safe without callbacks or waits. Owner is captured before releasing

@@ -13,6 +13,7 @@
 static unsigned checks;
 static bool panic_phase;
 static unsigned allocations, locking, io_writes, vga_bytes;
+static unsigned provider_prepares, provider_damages, provider_presents;
 static char serial_output[32768];
 static size_t serial_used;
 struct svga_device svga;
@@ -45,6 +46,28 @@ uint32_t smp_current_cpu(void) {return 0;}
 uint32_t smp_cpu_count(void) {return 2;}
 void smp_membarrier_poll(void) {}
 
+/** @brief Observe fatal display takeover without allocation or normal locks. */
+void graphics_service_panic_prepare(void)
+{ CHECK(panic_phase); ++provider_prepares; }
+
+/** @brief Validate each panic damage rectangle forwarded to a GPU provider.
+ * @param x Left pixel. @param y Top pixel.
+ * @param width Painted width. @param height Painted height.
+ */
+void graphics_service_panic_damage(uint32_t x, uint32_t y,
+                                   uint32_t width, uint32_t height)
+{
+    CHECK(panic_phase);
+    CHECK(width && height);
+    CHECK((uint64_t)x + width <= fb.width);
+    CHECK((uint64_t)y + height <= fb.height);
+    ++provider_damages;
+}
+
+/** @brief Observe bounded emergency submission after the fatal owner takes over. */
+void graphics_service_panic_present(void)
+{ CHECK(panic_phase); ++provider_presents; }
+
 /** @brief Check pitch/guards, actual glyphs, VT ownership and fatal diagnostics. */
 static void scenario(uint8_t bytes,bool graphical)
 {
@@ -58,6 +81,7 @@ static void scenario(uint8_t bytes,bool graphical)
         .green_field_position=8,.green_mask_size=8,.blue_field_position=0,.blue_mask_size=8,.available=true};
     panic_phase=false;serial_used=0;serial_output[0]=0;
     console_boot_logo_active=false;console_active_vt=0;console_vt_graphical=false;
+    fb_console_panic_overlay=false;fb_console_panic_clipped=false;
     memset(vt_text,0,sizeof(vt_text));log_len=log_start=0;
     fb_console_render_target=NULL;fb_console_enabled=false;
     console_graphic_saved=NULL;console_graphic_saved_bytes=0;
@@ -71,6 +95,8 @@ static void scenario(uint8_t bytes,bool graphical)
         framebuffer_drm_scanout_owned=true;
     }
     unsigned old_alloc=allocations,old_locks=locking;
+    unsigned old_prepares=provider_prepares,old_damages=provider_damages;
+    unsigned old_presents=provider_presents;
     fb_console_render_vt=3;
     vt_text[console_active_vt-1].charset[0]=1;
     vt_text[console_active_vt-1].charset_bank=0;
@@ -91,6 +117,9 @@ static void scenario(uint8_t bytes,bool graphical)
     render_bugcheck_text(&info);
     console_panic_flush();
     CHECK(allocations==old_alloc);CHECK(locking==old_locks);
+    CHECK(provider_prepares==old_prepares+1);
+    CHECK(provider_damages>old_damages);
+    CHECK(provider_presents==old_presents+1);
     CHECK(strstr(serial_output,"KERNEL PANIC")!=NULL);
     CHECK(strstr(serial_output,"Unhandled Page Fault")!=NULL);
     CHECK(strstr(serial_output,"0x0000000008022334")!=NULL);

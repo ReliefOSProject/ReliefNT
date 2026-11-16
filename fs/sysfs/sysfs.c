@@ -45,6 +45,8 @@ enum attribute {
     A_FB_BPP,
     A_FB_STRIDE,
     A_FB_MODES,
+    A_DRM_MODES,
+    A_DRM_EDID,
     A_CONNECTED,
     A_ENABLED,
     A_PCI_UEVENT,
@@ -130,6 +132,30 @@ static int sys_emit(sys_visit visit, void *ctx, const char *path, enum attribute
 {
     struct sys_node n = {.path=path, .attr=attr, .index=index, .target=target};
     return visit(&n, ctx);
+}
+/** @brief Enumerate every provider connector using Linux Virtual-N naming.
+ * @param visit Visitor. @param ctx Visitor context. @param pci PCI index.
+ * @return Visitor result; execution-owned, only copied provider data escapes.
+ */
+static int sys_drm_connectors(sys_visit visit,void *ctx,uint32_t pci)
+{
+    static const char *suffixes[]={"","/status","/enabled","/modes","/edid"};
+    static const enum attribute attrs[]={A_DIR,A_CONNECTED,A_ENABLED,A_DRM_MODES,A_DRM_EDID};
+    for(uint32_t output=0;output<16;++output) {
+        struct graphics_connector_info info;
+        if(graphics_service_connector_info(output,&info))break;
+        char path[RELIEFOS_FS_PATH_LEN],suffix[RELIEFOS_FS_PATH_LEN],target[RELIEFOS_FS_PATH_LEN];
+        for(unsigned j=0;j<sizeof(attrs)/sizeof(attrs[0]);++j) {
+            sys_path(suffix,"/drm/card0/card0-Virtual-",output+1,suffixes[j]);
+            sys_pci_path(path,"/sys/devices/pci0000:00/",pci,suffix);
+            int rc=sys_emit(visit,ctx,path,attrs[j],output,NULL);if(rc)return rc;
+        }
+        sys_path(suffix,"/drm/card0/card0-Virtual-",output+1,"");
+        sys_pci_path(target,"../../devices/pci0000:00/",pci,suffix);
+        sys_path(path,"/sys/class/drm/card0-Virtual-",output+1,"");
+        int rc=sys_emit(visit,ctx,path,A_LINK,output,target);if(rc)return rc;
+    }
+    return 0;
 }
 static int sys_block_name(char *out, uint32_t disk, int32_t part)
 {
@@ -539,28 +565,9 @@ static int sys_walk(sys_visit visit, void *ctx)
             sys_pci_path(target, "../../devices/pci0000:00/", i, "/drm/card0");
             if ((ret = sys_emit(visit, ctx, "/sys/class/drm/card0", A_LINK, i, target)))
                 return ret;
-            sys_pci_path(path, "/sys/devices/pci0000:00/", i,
-                         "/drm/card0/card0-Virtual-1");
-            if ((ret = sys_emit(visit, ctx, path, A_DIR, i, 0))) return ret;
-            const char *connector_suffixes[] = {"/status", "/enabled", "/modes"};
-            const enum attribute connector_attrs[] = {
-                A_CONNECTED, A_ENABLED, A_FB_MODES,
-            };
-            for (uint32_t j = 0; j < sizeof(connector_attrs) / sizeof(connector_attrs[0]); ++j) {
-                sys_pci_path(path, "/sys/devices/pci0000:00/", i,
-                             "/drm/card0/card0-Virtual-1");
-                size_t path_length = __builtin_strlen(path);
-                size_t suffix_length = __builtin_strlen(connector_suffixes[j]);
-                if (path_length + suffix_length >= sizeof(path)) return -1;
-                __builtin_memcpy(path + path_length, connector_suffixes[j], suffix_length + 1u);
-                if ((ret = sys_emit(visit, ctx, path, connector_attrs[j], i, 0))) return ret;
-            }
             if ((ret = sys_emit(visit, ctx, "/sys/dev/char/226:0", A_LINK, i, target)))
                 return ret;
-            sys_pci_path(target, "../../devices/pci0000:00/", i,
-                         "/drm/card0/card0-Virtual-1");
-            if ((ret = sys_emit(visit, ctx, "/sys/class/drm/card0-Virtual-1",
-                                A_LINK, i, target))) return ret;
+            if((ret=sys_drm_connectors(visit,ctx,i)))return ret;
             if (graphics_service_render_node_ready()) {
                 sys_pci_path(path, "/sys/devices/pci0000:00/", i,
                              "/drm/renderD128");
@@ -820,11 +827,23 @@ static void sys_value(const struct sys_node *n, struct text_stream *s)
         text_unsigned(s, fb->height);
         break;
     case A_CONNECTED:
-        text_string(s, "connected");
-        break;
     case A_ENABLED:
-        text_string(s, graphics_service_kms_scanout_active() ? "enabled" : "disabled");
+    case A_DRM_MODES:
+    case A_DRM_EDID: {
+        struct graphics_connector_info info;
+        if(graphics_service_connector_info(n->index,&info))return;
+        if(n->attr==A_CONNECTED)text_string(s,info.connected ? "connected" : "disconnected");
+        else if(n->attr==A_ENABLED)text_string(s,info.enabled ? "enabled" : "disabled");
+        else if(n->attr==A_DRM_EDID){text_bytes(s,info.edid,info.edid_size);return;}
+        else {
+            for(unsigned i=0;i<info.mode_count;++i) {
+                text_unsigned(s,info.widths[i]);text_string(s,"x");
+                text_unsigned(s,info.heights[i]);text_string(s,"\n");
+            }
+            return;
+        }
         break;
+    }
     case A_BLOCK_NUMBER:
         text_unsigned(s, n->value);
         break;

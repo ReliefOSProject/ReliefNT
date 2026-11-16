@@ -1,4 +1,5 @@
 #include "internal.h"
+#include <reliefnt/export.h>
 
 static void framebuffer_write_native(uint32_t x, uint32_t y, uint32_t color);
 
@@ -166,10 +167,15 @@ void framebuffer_put_pixel(uint32_t x, uint32_t y, uint32_t color)
     framebuffer_write_native(x, y, framebuffer_native_color(color));
 }
 
+/** @brief Read one boot-console pixel as logical RGB without locks or allocation.
+ * @param x Column. @param y Row. @return RGB or zero outside the available frame.
+ * Caller serializes drawing; fatal owners may use it after stopping peer CPUs.
+ */
 uint32_t framebuffer_get_pixel_public(uint32_t x, uint32_t y)
 {
     return framebuffer_get_pixel(x, y);
 }
+EXPORT_SYMBOL(framebuffer_get_pixel_public);
 
 void framebuffer_put_pixel_public(uint32_t x, uint32_t y, uint32_t color)
 {

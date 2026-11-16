@@ -165,7 +165,8 @@ void task_lookup_scope_begin(struct task *task,const struct trap_frame *frame)
        (uint32_t)frame->rsi==BLKGETSIZE || (uint32_t)frame->rsi==BLKGETSIZE64))scoped=true;
     if(frame->rax==LINUX_SYS_IOCTL && task->syscall_file &&
        task->syscall_file->character_file &&
-       (task->syscall_file->drm_file || task->syscall_file->drm_prime_file))scoped=true;
+       (task->syscall_file->drm_file || task->syscall_file->drm_prime_file ||
+        task->syscall_file->kind==TASK_FILE_KIND_DRM_SYNC))scoped=true;
     if(frame->rax==LINUX_SYS_IOCTL && task->syscall_file &&
        task->syscall_file->character_file &&
        (task->syscall_file->audio_file || task->syscall_file->audio_control_file ||

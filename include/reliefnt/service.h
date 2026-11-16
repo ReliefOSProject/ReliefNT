@@ -5,7 +5,10 @@
 
 struct kernel_service_binding;
 /* Slots are permanent zero-initialized core storage, never provider memory. */
-struct kernel_service_slot {struct kernel_service_binding *binding;};
+struct kernel_service_slot {
+    struct kernel_service_binding *binding;
+    const void *panic_operations; /* published last, cleared before code release */
+};
 /* Immutable descriptor/table remain valid until unregister/ledger release.
  * Publication owns no external self-reference. A queued asynchronous job must
  * obtain its own persistent module user pin; a call below lasts only until
@@ -34,6 +37,13 @@ int kernel_service_unregister(struct kernel_service_slot *slot,const struct kern
  * IRQ/task-safe registry snapshot; no borrowed provider pointer escapes.
  */
 bool kernel_service_present(struct kernel_service_slot *slot);
+/** @brief Borrow an emergency table after all other CPUs have stopped forever.
+ * @param slot Permanent core slot. @return Published table or NULL. Fatal owner
+ * only, interrupts disabled; no registry/module locks, references or allocation.
+ * Normal execution may never resume. Detach clears this pointer before either
+ * the binding or its provider code is freed, including cleanup-ledger detach.
+ */
+const void *kernel_service_panic_operations(const struct kernel_service_slot *slot);
 /** @brief Snapshot a LIVE table with user/execution pins before entering its code.
  * @param slot Permanent core slot, nullable for an unavailable service.
  * @param call Empty caller-owned output, populated only on successful admission.

@@ -1,4 +1,7 @@
 #include "drm_internal.h"
+#ifdef CONFIG_DRM_VIRTIO_GPU
+#include "virtio/internal.h"
+#endif
 
 #include <drm/drm_mode.h>
 #include <drm/vmwgfx_drm.h>
@@ -28,6 +31,8 @@ struct drm_bo {
     uint64_t size;
     uint64_t physical;
     uint64_t map_offset;
+    struct vg_resource *virtio;
+    struct task_file *prime_description; /* weak; execution owner serializes close */
 };
 
 struct drm_bo_handle {
@@ -67,6 +72,10 @@ void drm_bo_put(struct drm_bo *bo)
 {
     if (!bo || __atomic_sub_fetch(&bo->references, 1u, __ATOMIC_ACQ_REL) != 0)
         return;
+#ifdef CONFIG_DRM_VIRTIO_GPU
+    /* A protocol timeout never frees pages that the device can still DMA. */
+    if (bo->virtio && !vg_resource_destroy(bo->virtio)) return;
+#endif
     uint64_t flags;
     kernel_spin_lock_irqsave(&drm_bo_lock, &flags);
     if (drm_bo_bytes >= bo->size) drm_bo_bytes -= bo->size;
@@ -87,6 +96,44 @@ uint64_t drm_bo_size(const struct drm_bo *bo)
 {
     return bo ? bo->size : 0;
 }
+
+/** @brief Borrow metadata only while the caller retains the associated GEM BO.
+ * @param bo Retained BO. @return VirtIO resource or NULL; execution-owned.
+ */
+struct vg_resource *drm_bo_virtio(const struct drm_bo *bo)
+{ return bo ? bo->virtio : NULL; }
+/** @brief Adopt one resource in an exclusive, unpublished GEM BO.
+ * @param bo Exclusive BO. @param resource Owned backend allocation.
+ */
+void drm_bo_set_virtio(struct drm_bo *bo, struct vg_resource *resource)
+{ bo->virtio = resource; }
+/** @brief Return a retained BO's immutable mmap byte selector.
+ * @param bo Retained BO. @return Selector or zero.
+ */
+uint64_t drm_bo_offset(const struct drm_bo *bo)
+{ return bo ? bo->map_offset : 0; }
+
+/** @brief Borrow a canonical DMA-BUF OFD while execution ownership excludes close.
+ * @param bo Retained BO. @return Weak cached description or NULL; not a new ref.
+ */
+struct task_file *drm_bo_prime_description(struct drm_bo *bo)
+{ return bo ? bo->prime_description : NULL; }
+
+/** @brief Associate an unpublished export without creating a reference cycle.
+ * @param bo Retained BO. @param description Canonical export OFD, weakly held.
+ * @return Zero or EEXIST; task/execution ownership excludes concurrent mutation.
+ */
+int drm_bo_prime_bind(struct drm_bo *bo,struct task_file *description)
+{
+    if(bo->prime_description)return -LINUX_EEXIST;
+    bo->prime_description=description;return 0;
+}
+
+/** @brief Clear a dying export's weak cache before releasing its last BO ref.
+ * @param bo Retained BO. @param description Final canonical OFD; execution-owned.
+ */
+void drm_bo_prime_unbind(struct drm_bo *bo,struct task_file *description)
+{ if(bo && bo->prime_description==description)bo->prime_description=NULL; }
 
 int drm_bo_gpu_reserve(struct drm_bo *bo)
 {
@@ -236,6 +283,33 @@ static uint32_t drm_bo_allocate_handle_locked(struct drm_file *file)
             ? DRM_BO_HANDLE_MIN : candidate + 1u;
     } while (candidate != first);
     return 0;
+}
+
+/** @brief Create or find the per-OFD handle for an existing same-device GEM BO.
+ * @param file Target OFD. @param bo Retained source. @param handle Output ID.
+ * @param created True only for a newly allocated logical handle.
+ * @return Zero or -EINVAL/-ENOMEM/-ENOSPC; task context, no allocation under lock.
+ */
+int drm_bo_handle_import(struct drm_file *file, struct drm_bo *bo, uint32_t *handle, bool *created)
+{
+    if(!file || !bo || !handle || !created)return -LINUX_EINVAL;
+    struct drm_bo_handle *entry=kernel_malloc(sizeof(*entry));
+    if(!entry)return -LINUX_ENOMEM;
+    uint64_t flags;kernel_spin_lock_irqsave(&drm_bo_lock,&flags);
+    for(struct drm_bo_handle *old=file->bo_handles;old;old=old->next) {
+        if(old->bo==bo) {
+            *handle=old->handle;*created=false;
+            kernel_spin_unlock_irqrestore(&drm_bo_lock,flags);kernel_free(entry);return 0;
+        }
+    }
+    uint32_t id=drm_bo_allocate_handle_locked(file);
+    if(id) {
+        drm_bo_get(bo);*entry=(struct drm_bo_handle){.next=file->bo_handles,.bo=bo,.handle=id};
+        file->bo_handles=entry;*handle=id;*created=true;
+    }
+    kernel_spin_unlock_irqrestore(&drm_bo_lock,flags);
+    if(!id)kernel_free(entry);
+    return id ? 0 : -LINUX_ENOSPC;
 }
 
 /** @brief Allocate a per-file BO, respecting the owning device's address mask.
@@ -490,6 +564,16 @@ static int drm_bo_create_dumb(struct drm_file *file,
     uint64_t map_offset;
     int ret = drm_bo_create(file, diagnostics, size, &handle, &map_offset);
     if (ret < 0) return ret;
+#ifdef CONFIG_DRM_VIRTIO_GPU
+    if(drm_is_virtio()) {
+        if(bpp!=32 && bpp!=24){(void)drm_bo_handle_delete(file,handle);return -LINUX_EINVAL;}
+        struct drm_bo *bo=drm_bo_lookup_handle_get(file,handle);
+        struct drm_virtgpu_resource_create parameters={.width=width,.height=height,.depth=1,
+            .array_size=1,.format=VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM,.target=2,.stride=pitch};
+        ret=vg_resource_create(bo,&parameters,false);drm_bo_put(bo);
+        if(ret){(void)drm_bo_handle_delete(file,handle);return ret;}
+    }
+#endif
     arg->handle = handle;
     arg->pitch = pitch;
     arg->size = size;
@@ -512,7 +596,8 @@ int drm_bo_ioctl(struct drm_file *file, uint32_t command, void *data,
         struct drm_mode_map_dumb *arg = data;
         if (!arg) return -LINUX_EFAULT;
         arg->offset = 0;
-        return drm_bo_map_offset(file, arg->handle, &arg->offset);
+        int rc=drm_bo_map_offset(file, arg->handle, &arg->offset);
+        return drm_is_virtio() && rc==-LINUX_EINVAL ? -LINUX_ENOENT : rc;
     }
     case DRM_IOCTL_MODE_DESTROY_DUMB: {
         struct drm_mode_destroy_dumb *arg = data;

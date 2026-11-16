@@ -4,5 +4,7 @@ obj-$(CONFIG_DRM) := drm.o
 drm-y := memory.o services.o event_io.o file_ops.o mapping.o drm_bo.o drm_device.o drm_faildiag.o drm_file.o drm_ioctl.o drm_kms.o drm_prime.o
 include $(src)/vmwgfx/Kbuild
 drm-y += $(addprefix vmwgfx/,$(drm-vmwgfx-y))
+include $(src)/virtio/Kbuild
+drm-$(CONFIG_DRM_VIRTIO_GPU) += $(addprefix virtio/,$(drm-virtio-y))
 
 include $(srctree)/scripts/Makefile.module

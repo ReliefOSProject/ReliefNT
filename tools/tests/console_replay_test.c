@@ -77,6 +77,18 @@ uint32_t boot_logo_draw(const struct framebuffer *target, uint32_t cpu_count)
 }
 void smp_membarrier_poll(void) {}
 
+/** @brief Reject a panic-only provider call during ordinary console replay.
+ * @param x Unused left pixel. @param y Unused top pixel.
+ * @param width Unused width. @param height Unused height.
+ * This fixture has no GPU provider; normal replay must never enter this path.
+ */
+void graphics_service_panic_damage(uint32_t x, uint32_t y,
+                                   uint32_t width, uint32_t height)
+{
+    (void)x; (void)y; (void)width; (void)height;
+    assert(!"normal console replay entered the fatal display path");
+}
+
 static void set_default_rgb_format(struct framebuffer *target)
 {
     target->type = MULTIBOOT2_FRAMEBUFFER_TYPE_RGB;

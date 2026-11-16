@@ -5,6 +5,10 @@
 #include <reliefnt/futex.h>
 #include <reliefnt/storage.h>
 #include <reliefnt/time.h>
+#include <reliefnt/syscall.h>
+#ifdef CONFIG_DRM_VIRTIO_GPU
+#include "virtio/kms.h"
+#endif
 
 static bool drm_task_admin(const struct task *task)
 {
@@ -91,6 +95,9 @@ void drm_file_close(struct task_file *task_file)
      * VMA-held task_file references defer this final close until the last
      * mapping is gone. */
     drm_kms_file_release(file);
+#ifdef CONFIG_DRM_VIRTIO_GPU
+    if(drm_is_virtio())vg_context_close(file);
+#endif
     drm_vmwgfx_execbuf_file_release(file);
     drm_bo_file_release(file);
     /* Resource close only drops file-local metadata and queues retirement;
@@ -160,6 +167,12 @@ int drm_file_read(struct task *task, struct task_file *task_file,
     struct drm_file *file = task_file ? task_file->drm_file : NULL;
     if (!file) return -LINUX_EBADF;
     if (!length) return 0;
+#ifdef CONFIG_DRM_VIRTIO_GPU
+    if(drm_is_virtio()) {
+        int count=vg_events_read(task,file,(uintptr_t)buffer,length);
+        if(count)return count;
+    }
+#endif
     if (task_file->flags & RELIEFOS_O_NONBLOCK) return -LINUX_EAGAIN;
     if (kernel_wait_queue_add(&file->event_wait, task) == 0)
         sched_block_current();
@@ -173,6 +186,10 @@ int drm_file_read(struct task *task, struct task_file *task_file,
 
 uint32_t drm_file_poll(struct task_file *task_file, uint32_t events)
 {
+#ifdef CONFIG_DRM_VIRTIO_GPU
+    struct drm_file *file=task_file ? task_file->drm_file : NULL;
+    if(file && drm_is_virtio() && file->virtio_events)return events&(POLLIN|POLLRDNORM);
+#endif
     (void)events;
     (void)task_file;
     return 0;

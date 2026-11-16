@@ -64,6 +64,17 @@ uint32_t smp_current_cpu(void) { return 0; }
 uint32_t smp_cpu_count(void) { return 1; }
 void smp_membarrier_poll(void) {}
 
+/** @brief Reject panic-only GPU publication during ordinary VT rendering.
+ * @param x Unused left pixel. @param y Unused top pixel.
+ * @param width Unused width. @param height Unused height.
+ */
+void graphics_service_panic_damage(uint32_t x, uint32_t y,
+                                   uint32_t width, uint32_t height)
+{
+    (void)x; (void)y; (void)width; (void)height;
+    assert(!"ordinary VT output entered the fatal display path");
+}
+
 /** @brief Keep text intact during BS motion and erase only explicitly overwritten cells. */
 static void test_backspace_preserves_text(void)
 {

@@ -13,6 +13,13 @@ static uint32_t framebuffer_drm_pending_x1;
 static uint32_t framebuffer_drm_pending_y1;
 static uint32_t framebuffer_drm_pending_x2;
 static uint32_t framebuffer_drm_pending_y2;
+static uint64_t framebuffer_damage_generation;
+
+/** @brief Read the permanent CPU framebuffer's explicit publication generation.
+ * @return Atomic damage snapshot; no lock, allocation or optional code.
+ */
+uint64_t framebuffer_generation(void)
+{ return __atomic_load_n(&framebuffer_damage_generation,__ATOMIC_ACQUIRE); }
 bool framebuffer_drm_owned(void)
 {
     return __atomic_load_n(&framebuffer_drm_scanout_owned, __ATOMIC_ACQUIRE);
@@ -121,6 +128,7 @@ static void framebuffer_present_region_internal(uint32_t x, uint32_t y,
 
 void framebuffer_present_region(uint32_t x, uint32_t y, uint32_t width, uint32_t height)
 {
+    __atomic_add_fetch(&framebuffer_damage_generation,1,__ATOMIC_RELEASE);
     framebuffer_present_region_internal(x, y, width, height, false);
 }
 
@@ -252,3 +260,4 @@ int framebuffer_drm_present_region(const void *pixels, uint32_t pitch,
 EXPORT_SYMBOL(framebuffer_drm_present_region);
 EXPORT_SYMBOL(framebuffer_drm_scanout_begin);
 EXPORT_SYMBOL(framebuffer_drm_scanout_release);
+EXPORT_SYMBOL(framebuffer_generation);

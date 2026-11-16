@@ -4,6 +4,14 @@
 #include <reliefnt/service.h>
 #include <reliefnt/pci.h>
 struct task;
+/* A copied, pointer-free snapshot for permanent sysfs consumers. */
+#define GRAPHICS_CONNECTOR_MODES 16u
+struct graphics_connector_info {
+    bool connected,enabled;
+    uint32_t mode_count,edid_size;
+    uint32_t widths[GRAPHICS_CONNECTOR_MODES],heights[GRAPHICS_CONNECTOR_MODES];
+    uint8_t edid[1024];
+};
 /* Internal kernel interface, not a Linux userspace ABI. The permanent broker
  * admits only LIVE owners. Async objects require independent persistent pins;
  * one call keeps both user and execution references until its return. */
@@ -17,6 +25,10 @@ struct graphics_service_operations {
     void (*cancel_task_continuation)(struct task *task);
     bool (*task_uninterruptible)(const struct task *task);
     bool (*task_signal_busy)(const struct task *task);
+    void (*panic_prepare)(void);
+    void (*panic_damage)(uint32_t x,uint32_t y,uint32_t width,uint32_t height);
+    void (*panic_present)(void);
+    int (*connector_info)(uint32_t index,struct graphics_connector_info *out);
 };
 /** @brief Publish one graphics table without taking a permanent self-reference.
  * @param provider Persistent immutable table and owner descriptor.
@@ -91,4 +103,23 @@ bool graphics_service_task_uninterruptible(const struct task *task);
  * The core drops both pins only after optional code returns; nothing escapes.
  */
 bool graphics_service_task_signal_busy(const struct task *task);
+/** @brief Copy one connector's connected state, modes and validated EDID.
+ * @param index Zero-based output. @param out Required pointer-free destination.
+ * @return Zero or -ENOENT/-ENODEV. Execution-owned task context; the provider
+ * remains admitted only during the copy and no optional data pointer escapes.
+ */
+int graphics_service_connector_info(uint32_t index,struct graphics_connector_info *out);
+/** @brief Select a preallocated fatal-output target without taking normal locks.
+ * Panic owner only after stopping other CPUs; no normal execution may resume.
+ */
+void graphics_service_panic_prepare(void);
+/** @brief Publish exactly the text cells painted on the permanent framebuffer.
+ * @param x Left pixel. @param y Top pixel. @param width Painted width.
+ * @param height Painted height. Fatal owner only, no allocation or normal locks.
+ */
+void graphics_service_panic_damage(uint32_t x,uint32_t y,uint32_t width,uint32_t height);
+/** @brief Flush fatal damage with a bounded emergency hardware exchange.
+ * Fatal owner only after peers stop, interrupts disabled; never takes normal locks.
+ */
+void graphics_service_panic_present(void);
 #endif
