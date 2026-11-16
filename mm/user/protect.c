@@ -84,8 +84,8 @@ void task_unmap_pages(struct task *task, uint64_t start, uint64_t end)
  * @param len Byte length rounded to pages; zero is a no-op.
  * @param prot Linux PROT bits bounded by every affected VMA's maximum access.
  * @return Zero or negative EINVAL/ENOMEM/EACCES/EOPNOTSUPP. Metadata slots are
- * reserved before PTE changes; device and shared-cache permission changes
- * synchronously flush remote user TLBs. No graph/module lock spans heap growth or backing release;
+ * reserved before PTE changes; effective permission changes synchronously
+ * flush remote user TLBs for every mapping type. No graph/module lock spans heap growth or backing release;
  * successful splits acquire independent core references to the original lease.
  */
 int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
@@ -107,11 +107,10 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
      * VMAs with different attributes, but rejects a range containing a hole. */
     uint64_t cursor = addr;
     uint32_t split_count = 0;
-    bool device_tlb = false, shared_cache_tlb = false, vma_changed = false;
+    bool vma_changed = false;
     while (cursor < end) {
         struct task_vma *vma = task_vma_containing(task, cursor, cursor + PAGE_SIZE);
         if (!vma) return -RELIEFOS_ENOMEM;
-        if (vma->device_mapping) device_tlb = true;
         if (prot & ~vma->max_prot) return -RELIEFOS_EACCES;
 #ifdef CONFIG_SWAP
         if ((prot&LINUX_PROT_WRITE) &&
@@ -154,7 +153,7 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
     if (revision_marked) mm_context_vma_changed(sched_task_as(task));
     /* Apply the PTE change with each mapping's own device/cache attributes. */
     cursor = addr;
-    bool pte_changed = false;
+    bool translation_changed = false;
     while (cursor < end) {
         struct task_vma *vma = task_vma_containing(task, cursor, cursor + PAGE_SIZE);
         if (!vma) return -RELIEFOS_ENOMEM;
@@ -181,18 +180,16 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
                     (TASK_VMA_FLAG_FILE | TASK_VMA_FLAG_SHARED) &&
                 !(vma->flags & (TASK_VMA_FLAG_DEVICE | TASK_VMA_FLAG_SYSV_SHM)) &&
                 !(vma->file_node.flags & STORAGE_NODE_FLAG_TMPFS) && page_cache_owns(phys)) {
-                shared_cache_tlb=true;
                 if (prot & LINUX_PROT_WRITE) {
                     page_cache_mark_shared_writable(phys);
                     leaf_flags=(leaf_flags&~RELIEFNT_PAGE_WRITABLE)|RELIEFNT_PAGE_WRITE_NOTIFY;
                 }
             }
-            if (old_flags & RELIEFNT_PAGE_WRITE_NOTIFY) shared_cache_tlb=true;
             if (!address_space_protect_user_page(sched_task_as(task), page,
                                                  leaf_flags)) {
-                /* Earlier pages may already have changed. Revoke stale remote
-                 * device and cache translations even if this operation fails. */
-                if ((device_tlb || shared_cache_tlb) && pte_changed) smp_flush_user_tlb();
+                /* Earlier pages may already have changed; retire their remote
+                 * translations even when a later page rejects protection. */
+                if (translation_changed) smp_flush_user_tlb();
                 return -RELIEFOS_EACCES;
             }
             /* PTEs can change even when VMA protection is equal (notably COW).
@@ -203,19 +200,22 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
                 RELIEFNT_PAGE_WRITABLE | RELIEFNT_PAGE_NOEXEC | RELIEFNT_PAGE_PROTNONE |
                 RELIEFNT_PAGE_COW | RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_SHARED | RELIEFNT_PAGE_WRITE_NOTIFY |
                 RELIEFNT_PAGE_PWT | RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_PAT;
-            if (!revision_marked && ((old_flags ^
-                address_space_user_page_flags(sched_task_as(task), page)) & relevant)) {
-                mm_context_vma_changed(sched_task_as(task));
-                revision_marked = true;
+            bool page_changed = ((old_flags ^
+                address_space_user_page_flags(sched_task_as(task), page)) & relevant) != 0;
+            if (page_changed) {
+                translation_changed = true;
+                if (!revision_marked) {
+                    mm_context_vma_changed(sched_task_as(task));
+                    revision_marked = true;
+                }
             }
-            pte_changed = true;
             page_cursor = page + PAGE_SIZE;
         }
         cursor = piece_end;
     }
-    /* The page-table helper invalidates only the current CPU. Device and
-     * shared-cache protection changes synchronously flush remote user TLBs. */
-    if ((device_tlb || shared_cache_tlb) && pte_changed) smp_flush_user_tlb();
+    /* mprotect changes affect every thread sharing this MM, including peers
+     * currently running outside the kernel with cached translations. */
+    if (translation_changed) smp_flush_user_tlb();
 
     /**
  * @brief A partial protection change needs independent VMA metadata. In particular, PT_GNU_RELRO protects only the GOT page while BSS in the same original load segment must remain writable and lazily mappable.

@@ -2664,6 +2664,31 @@ static void test_adjacent_vmas(void)
 
 static void device_test_release(void *value){assert(value);}
 static uint64_t device_test_physical(void *value,uint64_t offset){return *(uint64_t *)value+offset;}
+static void test_private_mprotect_flushes_remote_translations(void)
+{
+    setup(1);
+    uint32_t last = sched_task_vma_capacity(current) - 1;
+    struct task_vma *vma = sched_task_vma_at(current, last);
+    uint64_t physical = mm_alloc_page();
+    assert(vma && vma->used && physical);
+    *vma = (struct task_vma){.used = 1, .start = base, .end = base + 4096,
+        .prot = LINUX_PROT_READ | LINUX_PROT_WRITE,
+        .max_prot = LINUX_PROT_READ | LINUX_PROT_WRITE,
+        .flags = TASK_VMA_FLAG_ANON | TASK_VMA_FLAG_PRIVATE};
+    assert(address_space_map_user_page(sched_task_as(current), base, physical,
+           RELIEFNT_PAGE_WRITABLE | RELIEFNT_PAGE_NOEXEC));
+
+    user_tlb_flush_calls = 0;
+    user_tlb_flush_probe_page = base;
+    assert(syscall_mm_mprotect(base, 4096, LINUX_PROT_READ) == 0);
+    assert(user_tlb_flush_calls == 1);
+    assert(!address_space_user_page_writable(sched_task_as(current), base));
+
+    assert(syscall_mm_munmap(base, 4096) == 0);
+    user_tlb_flush_probe_page = 0;
+    teardown();
+}
+
 static void test_drm_mprotect_flushes_remote_translations(void)
 {
     setup(1);
@@ -2880,6 +2905,9 @@ static void test_reclaim_context_emergency_page(void)
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "private-mprotect-tlb")) {
+        test_private_mprotect_flushes_remote_translations(); return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "fix1-device-cache")) {
         test_drm_mprotect_flushes_remote_translations();
         test_device_remap_preserves_actual_pages_and_shared_lease();return 0;
@@ -2988,6 +3016,7 @@ int main(int argc, char **argv)
     test_allocation_failure(16); /* allocation fails on the first needed slot */
     test_append_with_spare_capacity();
     test_adjacent_vmas();
+    test_private_mprotect_flushes_remote_translations();
     test_drm_mprotect_flushes_remote_translations();
     test_device_remap_preserves_actual_pages_and_shared_lease();
     test_elf_source_split_and_clone();

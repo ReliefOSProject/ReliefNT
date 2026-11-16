@@ -2946,7 +2946,8 @@ bool address_space_map_user_stack_page(struct address_space *as, uint64_t page)
 /** @brief Resolve a private COW write by copying its backing page.
  * @param as Address space containing the faulting leaf.
  * @param vaddr Faulting virtual byte address.
- * @return True once the new private page is writable.
+ * @return True once the new private page is writable on every CPU sharing
+ * this address space. The old frame stays retained through TLB invalidation.
  */
 bool address_space_handle_cow_fault(struct address_space *as, uint64_t vaddr)
 {
@@ -2971,6 +2972,10 @@ bool address_space_handle_cow_fault(struct address_space *as, uint64_t vaddr)
                      RELIEFNT_PAGE_PCD | RELIEFNT_PAGE_PAT));
     x86_64_invlpg(page);
     paging_note_mm_change();
+    /* CLONE_VM siblings can still read the old leaf without entering the
+     * kernel. Retire their cached translations before releasing the frame,
+     * otherwise they can miss private writes or read a recycled page. */
+    smp_flush_user_tlb();
     if (page_cache_owns(old_phys)) page_cache_release(old_phys);
     else mm_free_page(old_phys);
     return true;

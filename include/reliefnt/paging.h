@@ -578,6 +578,8 @@ bool address_space_map_user_stack_page(struct address_space *as, uint64_t page);
  * @param as Faulting process address space.
  * @param vaddr User virtual address that raised the write fault.
  * @return True when the page was made private and writable, otherwise false.
+ * Synchronously invalidates sibling CPU translations before releasing the
+ * old frame; the caller serializes mutations of this address space.
  */
 bool address_space_handle_cow_fault(struct address_space *as, uint64_t vaddr);
 
