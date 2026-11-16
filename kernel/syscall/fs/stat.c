@@ -93,7 +93,7 @@ void linux_stat_fd_type(struct linux_stat_abi *out, const struct task_file *file
         out->st_nlink = 1;
         return;
     }
-    if (file && file->drm_prime_file) {
+    if (file && (file->drm_prime_file || file->kind==TASK_FILE_KIND_DRM_SYNC)) {
         /* TTM's anonymous dma-buf inode deliberately has no S_IFMT type. */
         out->st_dev = 0;
         out->st_ino = file->drm_prime_ino;

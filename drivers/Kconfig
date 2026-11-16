@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 menu "Device drivers"
+source "drivers/virtio/Kconfig"
 source "drivers/storage/Kconfig"
 source "drivers/net/Kconfig"
 source "drivers/sound/Kconfig"

@@ -1,5 +1,10 @@
 #include "drm_internal.h"
 #include "file_ops.h"
+#ifdef CONFIG_DRM_VIRTIO_GPU
+#include "virtio/internal.h"
+#include <reliefnt/futex.h>
+#include <reliefnt/time.h>
+#endif
 
 #include <drm/drm.h>
 #include <drm/vmwgfx_drm.h>
@@ -25,6 +30,7 @@
 struct drm_prime_file {
     struct drm_vmwgfx_surface *surface;
     struct drm_device *device;
+    struct drm_bo *bo;
     bool cache_bound;
 };
 
@@ -235,7 +241,7 @@ static int drm_prime_export_surface(struct task *task, struct drm_file *file,
     slot->fd_flags = (argument->flags & DRM_PRIME_FD_CLOEXEC)
                          ? RELIEFOS_FD_CLOEXEC : 0;
 
-    ret=drm_character_attach_prime(task,slot);
+    ret=drm_character_attach_anonymous(task,slot);
     if(ret) {
         /* Admission can fail before open or after its partial-close callback.
          * This idempotent cleanup covers both without dropping a surface twice. */
@@ -308,6 +314,60 @@ static int drm_prime_import_surface(struct task *task, struct drm_file *file,
     return 0;
 }
 
+/** @brief Export a file-authorized VirtGPU GEM object using a canonical DMA-BUF.
+ * @param task Execution-owned caller. @param file GEM namespace. @param argument
+ * Copied Linux export. @param created_fd_out Rollback output.
+ * @return Zero or errno; provider/BO pins precede publication and unwind together.
+ */
+static int drm_prime_export_bo(struct task *task,struct drm_file *file,
+                              struct drm_prime_handle *argument,int *created_fd_out)
+{
+    if(argument->flags&~(DRM_PRIME_FD_CLOEXEC|DRM_PRIME_FD_RDWR))return -LINUX_EINVAL;
+    struct drm_bo *bo=drm_bo_lookup_handle_get(file,argument->handle);
+    if(!bo || !drm_bo_virtio(bo)){drm_bo_put(bo);return -LINUX_ENOENT;}
+    struct task_file *cached=drm_bo_prime_description(bo);
+    int fd=-1,rc;
+    if(cached) {
+        rc=drm_prime_dup_cached(task,cached,argument->flags,&fd);
+        drm_bo_put(bo);if(rc)return rc;
+    } else {
+        struct drm_prime_file *prime=kernel_malloc(sizeof(*prime));
+        if(!prime){drm_bo_put(bo);return -LINUX_ENOMEM;}
+        *prime=(struct drm_prime_file){.bo=bo,.device=file->device};
+        struct task_file *slot=NULL;fd=task_allocate_fd(task,0,&slot);
+        if(fd<0){kernel_free(prime);drm_bo_put(bo);return fd;}
+        uint64_t ino=__atomic_add_fetch(&drm_prime_next_ino,1,__ATOMIC_RELAXED);
+        if(!ino)ino=__atomic_add_fetch(&drm_prime_next_ino,1,__ATOMIC_RELAXED);
+        slot->kind=TASK_FILE_KIND_DRM_PRIME;
+        slot->flags=(argument->flags&DRM_PRIME_FD_RDWR) ? RELIEFOS_O_RDWR : RELIEFOS_O_RDONLY;
+        slot->node.type=RELIEFOS_FS_TYPE_FILE;slot->node.size=drm_bo_size(bo);
+        slot->drm_prime_file=prime;slot->drm_prime_size=drm_bo_size(bo);slot->drm_prime_ino=ino;
+        slot->drm_prime_uid=task->fsuid;slot->drm_prime_gid=task->fsgid;
+        slot->fd_flags=(argument->flags&DRM_PRIME_FD_CLOEXEC) ? RELIEFOS_FD_CLOEXEC : 0;
+        rc=drm_character_attach_anonymous(task,slot);
+        if(rc){drm_prime_file_close(slot);task_discard_file_fd(task,fd);return rc;}
+        struct task_file *description=task_file_get(slot);
+        if(!description){task_discard_file_fd(task,fd);return -LINUX_ENOMEM;}
+        rc=drm_bo_prime_bind(bo,description);if(!rc)prime->cache_bound=true;
+        task_file_put(description);
+        if(rc){task_discard_file_fd(task,fd);return rc;}
+    }
+    argument->fd=fd;if(created_fd_out)*created_fd_out=fd;return 0;
+}
+
+/** @brief Resolve retained GEM pages for an admitted DMA-BUF mapping.
+ * @param file Provider-pinned PRIME OFD. @param offset Byte offset. @param length
+ * Page-rounded range. @param out Owned BO output. @return Zero or errno.
+ */
+int drm_prime_mmap_bo(struct task_file *file,uint64_t offset,uint64_t length,struct drm_bo **out)
+{
+    if(!out)return -LINUX_EINVAL;*out=NULL;
+    struct drm_prime_file *prime=file ? file->drm_prime_file : NULL;
+    if(!prime || !prime->bo || (offset&4095) || !length || offset>drm_bo_size(prime->bo) ||
+       length>drm_bo_size(prime->bo)-offset)return -LINUX_EINVAL;
+    drm_bo_get(prime->bo);*out=prime->bo;return 0;
+}
+
 /**
  * @brief Handle the two supported core PRIME ioctls on an authorized DRM OFD.
  * @param task Caller for fd allocation and user-independent input processing.
@@ -316,15 +376,31 @@ static int drm_prime_import_surface(struct task *task, struct drm_file *file,
  * @param data Copied kernel ioctl structure with fields in/out as specified.
  * @param created_fd_out Optional syscall rollback output for exported fd.
  * @param receipt Required import rollback receipt for failed output copy.
+ * @param created_handle_out Optional output for newly granted GEM handles.
  * @return Zero on supported success, negative errno for invalid/unsupported
  *         requests; descriptor and handle outputs remain failure-atomic.
  */
 int drm_prime_ioctl(struct task *task, struct drm_file *file,
                     uint32_t command, void *data, int *created_fd_out,
-                    struct drm_vmwgfx_rollback_receipt *receipt)
+                    struct drm_vmwgfx_rollback_receipt *receipt,uint32_t *created_handle_out)
 {
     if (created_fd_out) *created_fd_out = -1;
     if (!task || !file || !data || !receipt) return -LINUX_EINVAL;
+    if(drm_is_virtio()) {
+        struct drm_prime_handle *argument=data;
+        if(command==DRM_IOCTL_PRIME_HANDLE_TO_FD)
+            return drm_prime_export_bo(task,file,argument,created_fd_out);
+        if(command!=DRM_IOCTL_PRIME_FD_TO_HANDLE)return -LINUX_EOPNOTSUPP;
+        if(argument->flags)return -LINUX_EINVAL;
+        struct task_file *source=task_file_for_fd(task,argument->fd);
+        if(!source)return -LINUX_EBADF;
+        struct drm_prime_file *prime=source->drm_prime_file;
+        if(!prime || prime->device!=file->device || !prime->bo)return -LINUX_EINVAL;
+        bool created=false;
+        int rc=drm_bo_handle_import(file,prime->bo,&argument->handle,&created);
+        if(!rc && created && created_handle_out)*created_handle_out=argument->handle;
+        return rc;
+    }
     if (command == DRM_IOCTL_PRIME_HANDLE_TO_FD)
         return drm_prime_export_surface(task, file, data, created_fd_out);
     if (command == DRM_IOCTL_PRIME_FD_TO_HANDLE)
@@ -350,6 +426,10 @@ void drm_prime_file_close(struct task_file *file)
             drm_vmwgfx_surface_prime_unbind(prime->surface, file);
         drm_vmwgfx_surface_put(prime->surface);
     }
+    if(prime->bo) {
+        if(prime->cache_bound)drm_bo_prime_unbind(prime->bo,file);
+        drm_bo_put(prime->bo);
+    }
     kernel_free(prime);
 }
 
@@ -363,6 +443,8 @@ void drm_prime_file_close(struct task_file *file)
 uint32_t drm_prime_file_poll(const struct task_file *file, uint32_t events)
 {
     if (!file || !file->drm_prime_file) return 0;
+    const struct drm_prime_file *prime=file->drm_prime_file;
+    if(prime->bo && drm_bo_gpu_busy(prime->bo))return 0;
     const uint32_t ready = POLLIN | POLLRDNORM | POLLOUT | POLLWRNORM;
     return events & ready;
 }
@@ -425,6 +507,20 @@ int64_t drm_prime_file_ioctl(struct task *task, struct task_file *file,
                         DRM_DMA_BUF_SYNC_END)) ||
         !(sync.flags & DRM_DMA_BUF_SYNC_RW))
         return -LINUX_EINVAL;
+#ifdef CONFIG_DRM_VIRTIO_GPU
+    struct drm_prime_file *prime=file->drm_prime_file;
+    if(prime->bo && !(sync.flags&DRM_DMA_BUF_SYNC_END)) {
+        vg_process_retirements(128);
+        if(vg.fault)return -LINUX_EIO;
+        struct vg_resource *resource=drm_bo_virtio(prime->bo);
+        if(resource && resource->error)return resource->error;
+        if(drm_bo_gpu_busy(prime->bo)) {
+            sched_sleep_current_until(time_ticks()+1);
+            return KERNEL_SYSCALL_BLOCKED;
+        }
+    }
+#endif
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
     return 0;
 }
 
@@ -445,5 +541,5 @@ int drm_prime_file_mmap(struct task_file *file, uint64_t flags,
     if ((flags & LINUX_MAP_SHARED) && (protection & LINUX_PROT_WRITE) &&
         !file_can_write(file))
         return -LINUX_EACCES;
-    return -LINUX_EINVAL;
+    return file->drm_prime_file->bo ? 0 : -LINUX_EINVAL;
 }

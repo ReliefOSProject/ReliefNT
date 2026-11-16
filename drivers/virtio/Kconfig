@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+config VIRTIO_PCI
+    bool "Modern VirtIO PCI transport"
+    default y
+    help
+      VirtIO 1.x PCI capabilities, coherent split queues and MSI-X/MSI.
+      Transport stays built in; device providers may be loadable modules.

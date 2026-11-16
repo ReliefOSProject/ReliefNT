@@ -1,4 +1,5 @@
 #include "internal.h"
+#include <reliefnt/graphics_service.h>
 
 /**
  * @brief Record panic bytes in the kernel ring and the current VT only.
@@ -127,6 +128,10 @@ void console_panic_write(const char *text, size_t length, uint32_t foreground)
     for (size_t i = 0; i < length; ++i) {
         if (fb_console_enabled) fb_console_putc(text[i]);
         else vga_panic_putc(text[i], vga_foreground);
+    }
+    if(fb_console_enabled && !fb_console_panic_overlay) {
+        const struct framebuffer *frame=framebuffer_get();
+        graphics_service_panic_damage(0,0,frame->width,frame->height);
     }
 }
 

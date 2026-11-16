@@ -1,6 +1,9 @@
 #include "drm_internal.h"
 
 #include <reliefnt/heap.h>
+#ifdef CONFIG_DRM_VIRTIO_GPU
+#include "virtio/internal.h"
+#endif
 
 static struct drm_device drm_primary;
 
@@ -11,8 +14,11 @@ struct drm_device *drm_device_get(void)
 
 int drm_device_register(const struct pci_device *device)
 {
-    if (!device || device->vendor_id != DRM_VMWARE_VENDOR ||
-        device->device_id != DRM_VMWARE_SVGA2)
+    if (!device || !((device->vendor_id == DRM_VMWARE_VENDOR && device->device_id == DRM_VMWARE_SVGA2)
+#ifdef CONFIG_DRM_VIRTIO_GPU
+        || (device->vendor_id == 0x1af4 && device->device_id == 0x1050)
+#endif
+        ))
         return -LINUX_EINVAL;
     if (drm_primary.registered) {
         if (drm_primary.pci.bus == device->bus &&
@@ -32,6 +38,9 @@ bool drm_device_is_registered(void)
 
 bool drm_device_render_node_ready(void)
 {
+#ifdef CONFIG_DRM_VIRTIO_GPU
+    if(drm_is_virtio())return vg.ready && vg.virgl && !vg.fault;
+#endif
     struct svga_info info;
     return drm_primary.registered && drm_vmwgfx_vgpu9_ready(&info);
 }

@@ -164,6 +164,7 @@ struct task_file {
 #define TASK_FILE_KIND_SIGNALFD 1u
 #define TASK_FILE_KIND_DRM_PRIME 4u
 #define TASK_FILE_KIND_INOTIFY 5u
+#define TASK_FILE_KIND_DRM_SYNC 6u /* aux: OFD-owned Linux sync_file. */
 
 static inline struct task_file *task_file_description(struct task_file *file)
 {

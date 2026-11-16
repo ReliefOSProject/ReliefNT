@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "file_ops.h"
+#include "drm_internal.h"
 #include <reliefnt/device_mapping.h>
 #include <reliefnt/drm.h>
 #include <reliefnt/heap.h>
@@ -53,15 +54,20 @@ int drm_character_mmap(struct task *task,struct task_file *file,uint64_t offset,
 {
     (void)task;
     if(!out)return -EINVAL;*out=NULL;
-    if(file->drm_prime_file)return drm_prime_file_mmap(file,flags,prot);
-    if(!file->drm_file)return -EBADF;
+    if(file->drm_prime_file) {
+        int access=drm_prime_file_mmap(file,flags,prot);if(access)return access;
+    } else if(!file->drm_file)return -EBADF;
     if((flags&(LINUX_MAP_SHARED|LINUX_MAP_PRIVATE))!=LINUX_MAP_SHARED || (prot&LINUX_PROT_EXEC))
         return prot&LINUX_PROT_EXEC ? -EACCES : -EINVAL;
     if(!file_can_read(file))return -EACCES;
     uint32_t max_prot=LINUX_PROT_READ|(file_can_write(file) ? LINUX_PROT_WRITE : 0);
     if(prot&~max_prot)return -EACCES;
     struct drm_bo *bo=NULL;uint64_t bo_offset=0;
-    int rc=drm_file_mmap_bo(file,offset,length,&bo,&bo_offset);if(rc)return rc;
+    int rc;
+    if(file->drm_prime_file) {
+        rc=drm_prime_mmap_bo(file,offset,length,&bo);bo_offset=offset;
+    } else rc=drm_file_mmap_bo(file,offset,length,&bo,&bo_offset);
+    if(rc)return rc;
     struct task_file *pin=task_file_get(file);
     if(!pin){drm_bo_put(bo);return -ENOMEM;}
     struct drm_mapping_context *context=kernel_malloc(sizeof(*context));

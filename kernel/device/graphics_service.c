@@ -2,6 +2,7 @@
 #include <reliefnt/graphics_service.h>
 #include <reliefnt/export.h>
 #include <reliefnt/deferred.h>
+#include <reliefnt/framebuffer.h>
 #include <linux/errno.h>
 static struct kernel_service_slot graphics_service_slot;
 /** @brief Keep maintenance queued while a provider initializes or owns the slot.
@@ -147,3 +148,54 @@ bool graphics_service_task_signal_busy(const struct task *task)
 }
 EXPORT_SYMBOL(graphics_service_register);
 EXPORT_SYMBOL(graphics_service_unregister);
+
+/** @brief Copy current connector metadata while the exact graphics owner is pinned.
+ * @param index Zero-based output. @param out Required permanent caller storage.
+ * @return Zero or errno. Task/execution context; generic single-output providers
+ * retain their existing firmware mode without exposing optional pointers.
+ */
+int graphics_service_connector_info(uint32_t index,struct graphics_connector_info *out)
+{
+    if(!out)return -EINVAL;
+    struct kernel_service_call call={0};
+    if(!kernel_service_acquire(&graphics_service_slot,&call))return -ENODEV;
+    const struct graphics_service_operations *ops=call.operations;
+    *out=(struct graphics_connector_info){0};
+    int rc;
+    if(ops->connector_info)rc=ops->connector_info(index,out);
+    else if(index)rc=-ENOENT;
+    else {
+        const struct framebuffer *fb=framebuffer_get();
+        out->connected=fb->available;
+        out->enabled=ops->kms_scanout_active && ops->kms_scanout_active();
+        if(fb->available){out->mode_count=1;out->widths[0]=fb->width;out->heights[0]=fb->height;}
+        rc=0;
+    }
+    kernel_service_release(&call);return rc;
+}
+
+/** @brief Select a retained panic target after all ordinary CPUs have parked.
+ * Fatal context only; never acquires a service/module lock or returns to tasks.
+ */
+void graphics_service_panic_prepare(void)
+{
+    const struct graphics_service_operations *ops=kernel_service_panic_operations(&graphics_service_slot);
+    if(ops && ops->panic_prepare)ops->panic_prepare();
+}
+/** @brief Copy only already-rendered fatal text cells into retained scanout backing.
+ * @param x Left. @param y Top. @param width Painted pixels. @param height Rows.
+ * Fatal owner only after other CPUs stop; no normal registry admission or locks.
+ */
+void graphics_service_panic_damage(uint32_t x,uint32_t y,uint32_t width,uint32_t height)
+{
+    const struct graphics_service_operations *ops=kernel_service_panic_operations(&graphics_service_slot);
+    if(ops && ops->panic_damage)ops->panic_damage(x,y,width,height);
+}
+/** @brief Submit preallocated fatal damage without entering normal display locks.
+ * Fatal owner only after other CPUs stop; no references escape or tasks resume.
+ */
+void graphics_service_panic_present(void)
+{
+    const struct graphics_service_operations *ops=kernel_service_panic_operations(&graphics_service_slot);
+    if(ops && ops->panic_present)ops->panic_present();
+}

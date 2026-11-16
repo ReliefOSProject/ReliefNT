@@ -1,4 +1,5 @@
 #include "internal.h"
+#include <reliefnt/graphics_service.h>
 
 
 
@@ -8,6 +9,7 @@
  */
 void framebuffer_panic_prepare(void)
 {
+    graphics_service_panic_prepare();
     __atomic_store_n(&framebuffer_drm_scanout_owned, false, __ATOMIC_RELEASE);
     framebuffer_drm_damage_pending = false;
     if (fb.backend == FRAMEBUFFER_BACKEND_VMWARE_SVGA && vmware_svga.present) {
@@ -22,6 +24,7 @@ void framebuffer_panic_prepare(void)
  */
 void framebuffer_panic_present(void)
 {
+    graphics_service_panic_present();
     if (!fb.available || fb.backend != FRAMEBUFFER_BACKEND_VMWARE_SVGA ||
         !vmware_svga.present) return;
     vmware_svga_memory_fence();

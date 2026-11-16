@@ -1,4 +1,5 @@
 #include "internal.h"
+#include <reliefnt/graphics_service.h>
 #include "dec_graphics.h"
 
 /**
@@ -353,6 +354,8 @@ static void fb_console_scalar(uint32_t ch)
             fb_console_rect(x, y + RELIEFOS_FONT_H - 2u, RELIEFOS_FONT_W, 1u,
                             fb_console_underline_color_set ? fb_console_underline_color : fg);
         }
+        if(fb_console_panic_overlay)
+            graphics_service_panic_damage(x,y,cells*RELIEFOS_FONT_W,RELIEFOS_FONT_H);
     }
     fb_col += cells;
 }

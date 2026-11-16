@@ -22,6 +22,17 @@ that file merely because it is distributed in the same repository or image.
 Third-party components in this repository
 -----------------------------------------
 
+* Linux v6.12 VirtIO-GPU and sync_file userspace headers, taken unchanged
+  from torvalds/linux commit adc218676eef25575469234709c2d87185ca223a:
+  include/uapi/linux/virtio_gpu.h retains Red Hat's 2013-2014 BSD notice;
+  include/uapi/drm/virtgpu_drm.h retains Red Hat's 2013 MIT-style notice;
+  include/uapi/linux/sync_file.h is Copyright (C) 2012 Google, Inc.,
+  GPL-1.0-or-later WITH Linux-syscall-note. GPL version 2 is one permitted
+  version; see LICENSES/preferred/GPL-2.0 and
+  LICENSES/exceptions/Linux-syscall-note. The first two headers contain
+  their complete license texts. The independent implementation in
+  drivers/virtio/ and drivers/video/drm/virtio/ is Apache-2.0; no Linux
+  DRM driver implementation is imported or relicensed.
 * GNU Unifont 18.0.01 (unifont_all-18.0.01.hex.gz, the pinned build input
   fetched into cache/downloads by `make fetch` from the URL recorded in
   configs/dependencies.lock.json): the compiled fonts are covered by the SIL

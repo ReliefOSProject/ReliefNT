@@ -1,11 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 config DRM
-    tristate "DRM/KMS for the VMware SVGA framebuffer"
+    tristate "DRM/KMS graphics"
     default y
     help
-      Linux DRM and vmwgfx userspace interfaces for the VMware SVGA II
-      function already bound by the boot framebuffer. Selecting M builds
-      drm.ko. Device discovery and publication occur when the module loads;
+      Linux DRM/KMS with VMware SVGA II and optional VirtIO-GPU backends.
+      The VMware function is bound by the boot framebuffer; VirtIO uses
+      modern PCI discovery. Selecting M builds drm.ko. Device discovery
+      and publication occur when the module loads;
       the early framebuffer and console remain permanent kernel services.
       Open card/PRIME descriptors, mappings, asynchronous jobs, resources and
       hardware callbacks retain the exact module until safely retired.
+
+config DRM_VIRTIO_GPU
+    bool "VirtIO-GPU 2D and VirGL DRM/KMS"
+    depends on DRM && VIRTIO_PCI
+    default y
+    help
+      Modern VirtIO PCI GPU support, Linux VirtGPU GEM/ioctls, KMS,
+      hardware cursor and VirGL rendering with an unmodified Mesa driver.
+      Included in drm.ko when DRM is modular. Venus and host-visible blob
+      resources are not advertised by this configuration.

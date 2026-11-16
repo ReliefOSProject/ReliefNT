@@ -190,6 +190,10 @@ void framebuffer_blit(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t s
  * @brief Flush the back buffer so pending drawing becomes visible.
  */
 void framebuffer_present(void);
+/** @brief Snapshot CPU framebuffer publication without entering a display lock.
+ * @return Monotonic damage generation; task/IRQ safe, no provider pointers.
+ */
+uint64_t framebuffer_generation(void);
 /**
  * @brief Reclaim fatal scanout without locks after other CPUs have stopped.
  * Restores legacy GFB tracing where supported; never resets the video mode.

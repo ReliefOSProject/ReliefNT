@@ -23,13 +23,13 @@ int64_t drm_event_read(struct task *task,struct task_file *file,uint64_t buffer,
  */
 int64_t drm_event_readv(struct task *task,struct task_file *file,const struct iovec *vectors,
                        uint64_t count,bool positional,uint64_t position,uint64_t flags);
-/** @brief Bind an unpublished PRIME OFD to the same retained DRM operation table.
- * @param task Execution-owned caller. @param file OFD already owning PRIME state.
+/** @brief Bind an unpublished PRIME/sync_file OFD to the same retained DRM operation table.
+ * @param task Execution-owned caller. @param file OFD already owning typed anonymous state.
  * @return Zero or errno. Success transfers a new provider handle to file;
  * failure leaves the handle empty and may have already closed partial state.
  * No registry lock spans callbacks or allocation. Caller rolls back its FD.
  */
-int drm_character_attach_prime(struct task *task,struct task_file *file);
+int drm_character_attach_anonymous(struct task *task,struct task_file *file);
 /** @brief Acquire one BO/OFD lease behind a provider-pinned generic mapping.
  * @param task Execution-owned caller. @param file Original retained OFD.
  * @param offset DRM BO selector/offset. @param length Rounded mapping bytes.

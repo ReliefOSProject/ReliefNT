@@ -1,5 +1,8 @@
 #include "memory.h"
 #include "drm_internal.h"
+#ifdef CONFIG_DRM_VIRTIO_GPU
+#include "virtio/internal.h"
+#endif
 #ifdef CONFIG_SWAP
 #include "vmwgfx/execbuf_internal.h"
 #endif
@@ -66,6 +69,9 @@ static struct drm_kms_pending_damage drm_kms_pending_damage;
 
 bool drm_device_kms_scanout_active(void)
 {
+#ifdef CONFIG_DRM_VIRTIO_GPU
+    if(drm_is_virtio())return vg_kms_active();
+#endif
     return __atomic_load_n(&drm_kms_scanout_enabled, __ATOMIC_ACQUIRE);
 }
 
@@ -1023,6 +1029,9 @@ static int drm_kms_get_object_properties(struct drm_mode_obj_get_properties *arg
 int drm_kms_ioctl(struct task *task, struct drm_file *file, uint32_t command,
                   void *data, uint32_t *created_fb_out,uint64_t user_argument)
 {
+#ifdef CONFIG_DRM_VIRTIO_GPU
+    if(drm_is_virtio())return vg_kms_ioctl(task,file,command,data,created_fb_out);
+#endif
     if (created_fb_out) *created_fb_out = 0;
     if (!file || !data) return -LINUX_EFAULT;
 #ifdef CONFIG_SWAP
@@ -1070,11 +1079,17 @@ int drm_kms_ioctl(struct task *task, struct drm_file *file, uint32_t command,
 
 void drm_kms_remove_fb(struct drm_file *file, uint32_t fb_id)
 {
+#ifdef CONFIG_DRM_VIRTIO_GPU
+    if(drm_is_virtio()){if(file && fb_id)vg_kms_remove_fb(file,fb_id);return;}
+#endif
     if (file && fb_id) (void)drm_kms_rmfb(file, fb_id);
 }
 
 void drm_kms_drop_master(struct drm_file *file)
 {
+#ifdef CONFIG_DRM_VIRTIO_GPU
+    if(drm_is_virtio()){if(file && file->is_master)vg_kms_vt_release();return;}
+#endif
     if (drm_kms_active_fb && drm_kms_active_fb->owner == file)
         drm_kms_drop_active();
     else if ((drm_kms_pending_damage.valid &&
@@ -1085,6 +1100,9 @@ void drm_kms_drop_master(struct drm_file *file)
 
 void drm_kms_vt_release(void)
 {
+#ifdef CONFIG_DRM_VIRTIO_GPU
+    if(drm_is_virtio()){vg_kms_vt_release();return;}
+#endif
     if (drm_kms_active_fb) drm_kms_drop_active();
     else {
         drm_kms_cancel_pending();
@@ -1100,6 +1118,9 @@ void drm_device_kms_vt_release(void)
 
 void drm_kms_file_release(struct drm_file *file)
 {
+#ifdef CONFIG_DRM_VIRTIO_GPU
+    if(drm_is_virtio()){if(file)vg_kms_file_release(file);return;}
+#endif
     if (!file) return;
     drm_kms_drop_master(file);
     while (file->kms_fbs) {

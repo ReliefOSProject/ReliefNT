@@ -24,3 +24,4 @@
    ext3
    usb
    svga
+   virtio-gpu

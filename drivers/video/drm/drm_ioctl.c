@@ -1,4 +1,7 @@
 #include "drm_internal.h"
+#ifdef CONFIG_DRM_VIRTIO_GPU
+#include "virtio/internal.h"
+#endif
 
 #include <drm/drm_mode.h>
 #include <drm/vmwgfx_drm.h>
@@ -73,6 +76,7 @@ enum drm_ioctl_handler {
     DRM_HANDLER_VMW_CAPS,
     DRM_HANDLER_VMW_RESOURCE,
     DRM_HANDLER_VMW_EXECBUF,
+    DRM_HANDLER_VIRTIO,
 };
 
 enum drm_ioctl_permission {
@@ -97,6 +101,7 @@ static const char *drm_ioctl_handler_name(enum drm_ioctl_handler handler)
     case DRM_HANDLER_VMW_CAPS: return "vmw_caps";
     case DRM_HANDLER_VMW_RESOURCE: return "vmw_resource";
     case DRM_HANDLER_VMW_EXECBUF: return "execbuf";
+    case DRM_HANDLER_VIRTIO: return "virtio";
     case DRM_HANDLER_VERSION: return "version";
     case DRM_HANDLER_GET_UNIQUE: return "get_unique";
     case DRM_HANDLER_GET_MAGIC: return "get_magic";
@@ -308,11 +313,30 @@ static const struct drm_ioctl_desc drm_ioctl_table[] = {
       .permission = DRM_PERMISSION_RENDER_ALLOW },
 };
 
+#ifdef CONFIG_DRM_VIRTIO_GPU
+#define VG_IOCTL_ENTRY(command_) { .command=(command_),.handler=DRM_HANDLER_VIRTIO,.permission=DRM_PERMISSION_RENDER_ALLOW }
+static const struct drm_ioctl_desc virtio_ioctl_table[]={
+    VG_IOCTL_ENTRY(DRM_IOCTL_VIRTGPU_MAP),VG_IOCTL_ENTRY(DRM_IOCTL_VIRTGPU_EXECBUFFER),
+    VG_IOCTL_ENTRY(DRM_IOCTL_VIRTGPU_GETPARAM),VG_IOCTL_ENTRY(DRM_IOCTL_VIRTGPU_RESOURCE_CREATE),
+    VG_IOCTL_ENTRY(DRM_IOCTL_VIRTGPU_RESOURCE_INFO),VG_IOCTL_ENTRY(DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST),
+    VG_IOCTL_ENTRY(DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST),VG_IOCTL_ENTRY(DRM_IOCTL_VIRTGPU_WAIT),
+    VG_IOCTL_ENTRY(DRM_IOCTL_VIRTGPU_GET_CAPS),VG_IOCTL_ENTRY(DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB),
+    VG_IOCTL_ENTRY(DRM_IOCTL_VIRTGPU_CONTEXT_INIT),
+};
+#endif
+
 static const struct drm_ioctl_desc *drm_ioctl_find(uint32_t command)
 {
     uint32_t type = _IOC_TYPE(command);
     uint32_t number = _IOC_NR(command);
     if (type != DRM_IOCTL_BASE) return NULL;
+#ifdef CONFIG_DRM_VIRTIO_GPU
+    if(drm_is_virtio() && number>=DRM_COMMAND_BASE && number<DRM_COMMAND_END) {
+        for(unsigned i=0;i<sizeof(virtio_ioctl_table)/sizeof(virtio_ioctl_table[0]);++i)
+            if(_IOC_NR(virtio_ioctl_table[i].command)==number)return &virtio_ioctl_table[i];
+        return NULL;
+    }
+#endif
     for (uint32_t i = 0; i < sizeof(drm_ioctl_table) / sizeof(drm_ioctl_table[0]); ++i) {
         if (_IOC_TYPE(drm_ioctl_table[i].command) == type &&
             _IOC_NR(drm_ioctl_table[i].command) == number)
@@ -365,13 +389,16 @@ static int drm_copy_field(struct task *task, uint64_t address, size_t *length,
 
 static int drm_ioctl_version(struct task *task, struct drm_version *version)
 {
+    const char *name="vmwgfx",*description="Linux drm driver for VMware graphics devices";
+#ifdef CONFIG_DRM_VIRTIO_GPU
+    if(drm_is_virtio()){name="virtio_gpu";description="virtio GPU";}
+#endif
 #ifdef CONFIG_SWAP
     /* Prepare every actually used output before the first field is copied. */
     const uint64_t addresses[]={(uint64_t)(uintptr_t)version->name,
         (uint64_t)(uintptr_t)version->date,(uint64_t)(uintptr_t)version->desc};
     const size_t lengths[]={version->name_len,version->date_len,version->desc_len};
-    const size_t actual[]={sizeof("vmwgfx")-1,sizeof("0")-1,
-        sizeof("Linux drm driver for VMware graphics devices")-1};
+    const size_t actual[]={__builtin_strlen(name),1,__builtin_strlen(description)};
     for(unsigned i=0;i<3;++i) {
         size_t n=lengths[i]<actual[i] ? lengths[i] : actual[i];
         if(!addresses[i] || !n)continue;
@@ -381,17 +408,20 @@ static int drm_ioctl_version(struct task *task, struct drm_version *version)
     }
 #endif
     int ret = drm_copy_field(task, (uint64_t)(uintptr_t)version->name,
-                             &version->name_len, "vmwgfx");
+                             &version->name_len, name);
     if (!ret)
         ret = drm_copy_field(task, (uint64_t)(uintptr_t)version->date,
                              &version->date_len, "0");
     if (!ret)
         ret = drm_copy_field(task, (uint64_t)(uintptr_t)version->desc,
                              &version->desc_len,
-                             "Linux drm driver for VMware graphics devices");
+                             description);
     version->version_major = DRM_IOCTL_DRIVER_MAJOR;
     version->version_minor = DRM_IOCTL_DRIVER_MINOR;
     version->version_patchlevel = 0;
+#ifdef CONFIG_DRM_VIRTIO_GPU
+    if(drm_is_virtio()){version->version_major=0;version->version_minor=1;}
+#endif
     return ret;
 }
 
@@ -499,6 +529,16 @@ out:
 static int drm_ioctl_get_cap(struct drm_get_cap *cap)
 {
     cap->value = 0;
+#ifdef CONFIG_DRM_VIRTIO_GPU
+    if(drm_is_virtio()) {
+        switch(cap->capability) {
+        case DRM_CAP_CURSOR_WIDTH:case DRM_CAP_CURSOR_HEIGHT:cap->value=64;return 0;
+        case DRM_CAP_ADDFB2_MODIFIERS:case DRM_CAP_ASYNC_PAGE_FLIP:cap->value=0;return 0;
+        case DRM_CAP_CRTC_IN_VBLANK_EVENT:cap->value=1;return 0;
+        default:break;
+        }
+    }
+#endif
     if (cap->capability == DRM_CAP_TIMESTAMP_MONOTONIC) {
         cap->value = 1;
         return 0;
@@ -546,6 +586,14 @@ static int drm_ioctl_dispatch(struct task *task, struct drm_file *file,
     case DRM_HANDLER_GET_CAP:
         return drm_ioctl_get_cap(data);
     case DRM_HANDLER_SET_CLIENT_CAP:
+#ifdef CONFIG_DRM_VIRTIO_GPU
+        if(drm_is_virtio()) {
+            struct drm_set_client_cap *cap=data;
+            if(cap->capability==DRM_CLIENT_CAP_UNIVERSAL_PLANES && cap->value<=1) {
+                file->universal_planes=cap->value;return 0;
+            }
+        }
+#endif
         return -LINUX_EOPNOTSUPP;
     case DRM_HANDLER_SET_VERSION:
         return drm_ioctl_set_version(file, data);
@@ -562,7 +610,7 @@ static int drm_ioctl_dispatch(struct task *task, struct drm_file *file,
                             diagnostics);
     case DRM_HANDLER_PRIME:
         return drm_prime_ioctl(task, file, command, data, created_fd_out,
-                               resource_receipt);
+                               resource_receipt,created_handle_out);
     case DRM_HANDLER_KMS:
         return drm_kms_ioctl(task, file, command, data, created_fb_out,user_argument);
     case DRM_HANDLER_VMW_CAPS:
@@ -574,7 +622,16 @@ static int drm_ioctl_dispatch(struct task *task, struct drm_file *file,
         return (int)drm_vmwgfx_execbuf_ioctl(task, file, command, data,
                                              user_argument, diagnostics);
     case DRM_HANDLER_UNSUPPORTED:
+#ifdef CONFIG_DRM_VIRTIO_GPU
+        if(drm_is_virtio())return vg_kms_ioctl(task,file,desc->command,data,created_fb_out);
+#endif
         return -LINUX_EOPNOTSUPP;
+    case DRM_HANDLER_VIRTIO:
+#ifdef CONFIG_DRM_VIRTIO_GPU
+        return vg_ioctl(task,file,desc->command,data,created_handle_out,created_fd_out);
+#else
+        return -LINUX_EOPNOTSUPP;
+#endif
     }
     return -LINUX_EINVAL;
 }
@@ -636,7 +693,8 @@ int64_t drm_file_ioctl(struct task *task, struct task_file *task_file,
         allocated = true;
     }
     if (kernel_size) __builtin_memset(data, 0, kernel_size);
-    ret = (int)drm_vmwgfx_prepare_ioctl_continuation(task, task_file, file,
+    ret = 0;
+    if(!drm_is_virtio())ret = (int)drm_vmwgfx_prepare_ioctl_continuation(task, task_file, file,
         command, argument, data, kernel_size, &continuation_handled,
         &skip_input);
     if (continuation_handled) goto out;

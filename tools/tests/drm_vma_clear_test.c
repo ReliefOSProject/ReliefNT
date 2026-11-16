@@ -40,6 +40,8 @@ int file_can_read(const struct task_file *file){return (file->flags&LINUX_O_ACCM
 int file_can_write(const struct task_file *file){return (file->flags&LINUX_O_ACCMODE)!=LINUX_O_RDONLY;}
 int drm_prime_file_mmap(struct task_file *file,uint64_t flags,uint64_t prot)
 {(void)file;(void)flags;(void)prot;assert(!"unexpected PRIME path");return -EINVAL;}
+int drm_prime_mmap_bo(struct task_file *file,uint64_t offset,uint64_t length,struct drm_bo **out)
+{(void)file;(void)offset;(void)length;(void)out;assert(!"unexpected PRIME mapping");return -EINVAL;}
 void sysv_shm_vma_release(struct task *task,struct task_vma *vma){(void)task;(void)vma;}
 int storage_inode_put(struct storage_inode_ref *reference){assert(!reference);return 0;}
 #ifndef DRM_MM_SOURCE
