@@ -157,7 +157,8 @@ static int setup_link(struct i225_device *d)
     if (!rc)
         rc = mdio(d, 0, &value, false);
     if (!rc) {
-        value = (value & ~(1u << 11)) | (1u << 12) | (1u << 9);
+        value = (value & ~((1u << 14) | (1u << 11) | (1u << 10))) |
+                (1u << 12) | (1u << 9);
         rc = mdio(d, 0, &value, true);
     }
     int release_rc = resource_release(d, I225_SWFW_PHY0);
@@ -167,7 +168,8 @@ static int setup_link(struct i225_device *d)
         return rc;
 
     uint32_t control = i225_read(d, I225_CTRL);
-    control &= ~((1u << 11) | (1u << 12) | (3u << 8) | 1u);
+    control &= ~((1u << 11) | (1u << 12) | (3u << 8) | 1u |
+                 I225_CTRL_RFCE | I225_CTRL_TFCE | I225_CTRL_VME);
     i225_write(d, I225_CTRL, control | I225_CTRL_SLU);
     i225_flush(d);
     return 0;
@@ -199,14 +201,20 @@ static int read_station_address(struct i225_device *d)
         int rc = resource_acquire(d, I225_SWFW_EEP);
         if (rc)
             return rc;
-        for (unsigned word = 0; word < 3; ++word) {
+        uint16_t checksum = 0;
+        for (unsigned word = 0; word < I225_NVM_WORDS; ++word) {
             uint16_t value;
             rc = read_nvm_word(d, word, &value);
             if (rc)
                 break;
-            d->mac[word * 2] = (uint8_t)value;
-            d->mac[word * 2 + 1] = (uint8_t)(value >> 8);
+            checksum = (uint16_t)(checksum + value);
+            if (word < 3) {
+                d->mac[word * 2] = (uint8_t)value;
+                d->mac[word * 2 + 1] = (uint8_t)(value >> 8);
+            }
         }
+        if (!rc && checksum != I225_NVM_SUM)
+            rc = -5;
         int release_rc = resource_release(d, I225_SWFW_EEP);
         if (!rc)
             rc = release_rc;
@@ -255,6 +263,7 @@ int i225_hardware_start(struct i225_device *d)
     d->api->pci_write16(p->bus, p->slot, p->function, 4,
                         (d->original_command & ~7u) | 2u | (1u << 10));
 
+    i225_write(d, I225_IAM, 0);
     i225_write(d, I225_IMC, UINT32_MAX);
     (void)i225_read(d, I225_ICR);
     i225_write(d, I225_RCTL, 0);
@@ -273,6 +282,7 @@ int i225_hardware_start(struct i225_device *d)
     rc = wait_bits(d, I225_EECD, I225_EECD_AUTO_RD, I225_EECD_AUTO_RD, 100);
     if (rc)
         return rc;
+    i225_write(d, I225_IAM, 0);
     i225_write(d, I225_IMC, UINT32_MAX);
     (void)i225_read(d, I225_ICR);
     rc = read_station_address(d);
@@ -316,7 +326,8 @@ int i225_hardware_stop(struct i225_device *d)
     const struct reliefos_driver_pci_device *p = &d->pci;
     uint16_t command = d->api->pci_read16(p->bus, p->slot, p->function, 4);
     d->api->pci_write16(p->bus, p->slot, p->function, 4, command & ~4u);
-    (void)d->api->pci_read16(p->bus, p->slot, p->function, 4);
+    if (d->api->pci_read16(p->bus, p->slot, p->function, 4) & 4u)
+        return -5;
     int rc = wait_bits(d, I225_STATUS, I225_STATUS_MASTER, 0, 100);
     if (rc)
         return rc;

@@ -7,13 +7,15 @@
 
 #define I225_CTRL          0x00000u
 #define I225_STATUS        0x00008u
+#define I225_ICR           0x01500u
+#define I225_IMS           0x01508u
+#define I225_IMC           0x0150cu
+#define I225_IAM           0x01510u
 #define I225_EECD          0x00010u
 #define I225_MDIC          0x00020u
 #define I225_SWSM          0x05b50u
 #define I225_SW_FW_SYNC    0x05b5cu
 #define I225_EERD          0x12014u
-#define I225_ICR           0x01500u
-#define I225_IMC           0x0150cu
 #define I225_RCTL          0x00100u
 #define I225_TCTL          0x00400u
 #define I225_SRRCTL0       0x0c00cu
@@ -32,13 +34,26 @@
 #define I225_RAL0          0x05400u
 #define I225_RAH0          0x05404u
 #define I225_MTA           0x05200u
+#define I225_RXCSUM        0x05000u
+#define I225_RLPML         0x05004u
+#define I225_MRQC          0x05818u
 #define I225_MMIO_BYTES    0x13000u
 
 #define I225_CTRL_RST      (1u << 26)
 #define I225_CTRL_SLU      (1u << 6)
 #define I225_CTRL_GIO_DIS  (1u << 2)
+#define I225_CTRL_RFCE     (1u << 27)
+#define I225_CTRL_TFCE     (1u << 28)
+#define I225_CTRL_VME      (1u << 30)
 #define I225_STATUS_LINK   (1u << 1)
 #define I225_STATUS_MASTER (1u << 19)
+#define I225_IRQ_LSC       (1u << 2)
+#define I225_IRQ_RXDMT0    (1u << 4)
+#define I225_IRQ_RXT0      (1u << 7)
+#define I225_IRQ_MASK      (I225_IRQ_LSC | I225_IRQ_RXDMT0 | I225_IRQ_RXT0)
+#define I225_PCI_IRQ_API_SIZE \
+    (offsetof(struct reliefos_driver_kernel_api, free_pci_irq) + \
+     sizeof(((struct reliefos_driver_kernel_api *)0)->free_pci_irq))
 #define I225_EECD_AUTO_RD  (1u << 9)
 #define I225_SWSM_SMBI     (1u << 0)
 #define I225_SWSM_SWESMBI  (1u << 1)
@@ -48,6 +63,8 @@
 #define I225_EERD_DONE     (1u << 1)
 #define I225_EERD_ADDR(a)  ((uint32_t)(a) << 2)
 #define I225_EERD_DATA(v)  ((uint16_t)((v) >> 16))
+#define I225_NVM_WORDS     64u
+#define I225_NVM_SUM       0xbabau
 #define I225_RAH_AV        (1u << 31)
 #define I225_RCTL_EN       (1u << 1)
 #define I225_RCTL_MPE      (1u << 4)
@@ -107,21 +124,25 @@ struct i225_device {
     struct reliefos_driver_pci_device pci;
     volatile uint8_t *registers;
     uint16_t original_command;
-    bool command_saved, present, active, dropping_fragments;
+    bool command_saved, present, active, dropping_fragments, irq_masked;
+    uint32_t ifindex, irq_handle;
     uint8_t mac[6];
     uint64_t rx_physical, tx_physical, rx_data_physical, tx_data_physical;
     volatile struct i225_rx_desc *rx;
     volatile struct i225_tx_desc *tx;
     uint8_t *rx_data, *tx_data;
     unsigned rx_next, tx_next, tx_clean;
-    struct kernel_spinlock rx_lock, tx_lock;
+    struct kernel_spinlock rx_lock, tx_lock, irq_lock;
 };
 
+uint32_t i225_io_read(const volatile uint8_t *base, unsigned offset);
+void i225_io_write(volatile uint8_t *base, unsigned offset, uint32_t value);
+
 static inline uint32_t i225_read(const struct i225_device *d, unsigned offset)
-{ return *(volatile uint32_t *)(d->registers + offset); }
+{ return i225_io_read(d->registers, offset); }
 
 static inline void i225_write(struct i225_device *d, unsigned offset, uint32_t value)
-{ *(volatile uint32_t *)(d->registers + offset) = value; }
+{ i225_io_write(d->registers, offset, value); }
 
 static inline void i225_flush(struct i225_device *d)
 { (void)i225_read(d, I225_STATUS); }
@@ -135,5 +156,9 @@ void i225_enable_rings(struct i225_device *d);
 void i225_free_rings(struct i225_device *d);
 int i225_send(struct i225_device *d, const void *frame, uint32_t length);
 int i225_receive(struct i225_device *d, void *frame, uint32_t capacity, uint32_t *length);
+void i225_interrupt_prepare(struct i225_device *d);
+void i225_interrupt_start(struct i225_device *d, uint32_t ifindex);
+void i225_interrupt_complete(struct i225_device *d);
+void i225_interrupt_stop(struct i225_device *d);
 
 #endif

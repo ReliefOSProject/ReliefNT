@@ -28,14 +28,23 @@ msgstr "Configuration and features"
 msgid "``CONFIG_I225_V`` 为 tristate，defconfig 默认内置。选择 ``m`` 时生成 ``drivers/net/i225/i225.ko``，并由 ReliefOS 按精确 PCI 别名加载。每个匹配的 PCI 功能拥有独立的 DMA 环和网络接口，并接入现有 ``netdev`` owner 生命周期。"
 msgstr "``CONFIG_I225_V`` is tristate and defaults to built in. With ``m``, it builds ``drivers/net/i225/i225.ko``, which ReliefOS loads using its exact PCI alias. Each matching PCI function owns separate DMA rings and a network interface within the existing ``netdev`` owner lifecycle."
 
-msgid "当前实现使用 I225 advanced descriptor、单个 RX/TX 队列和任务上下文轮询。链路 初始化通过 PHY 管理接口配置 10/100/1000/2500 Mb/s 全双工自动协商；2.5GBASE-T 广告写入 AN MMD 7.32。有效 MAC 优先取自硬件 RAR；只有 RAR 无效时才在固件同步 锁内读取只读 NVM shadow。驱动不写入 NVM。"
-msgstr "The current implementation uses I225 advanced descriptors, one RX/TX queue, and task-context polling. Link initialization configures full-duplex auto-negotiation at 10/100/1000/2500 Mb/s through the PHY management interface; the 2.5GBASE-T advertisement is written to AN MMD 7.32. A valid MAC is taken from the hardware RAR first; read-only NVM shadow is read under the firmware synchronization lock only when the RAR is invalid. The driver never writes NVM."
+msgid "当前实现使用 I225 advanced descriptor 和单个 RX/TX 队列。MSI 可用时由设备中断通知 网络服务，再由任务上下文轮询和复制帧；没有 MSI 服务时退回纯轮询。中断处理只屏蔽 并确认设备中断源，不在 IRQ 上下文执行网络栈操作。链路初始化通过 PHY 管理接口配置 10/100/1000/2500 Mb/s 全双工自动协商；2.5GBASE-T 广告写入 AN MMD 7.32。PHY 初始化 会清除遗留的 loopback、power-down 和 isolate 状态。有效 MAC 优先取自硬件 RAR；只有 RAR 无效时才在固件同步锁内读取只读 NVM shadow，并检查前 64 个字的 16 位累加值为 ``0xBABA``；校验失败时拒绝注册接口。驱动不写入 NVM。"
+msgstr "The current implementation uses I225 advanced descriptors and one RX/TX queue. When MSI is available, device interrupts notify the network service, which polls and copies frames in task context; systems without MSI support fall back to pure polling. The interrupt handler only masks and acknowledges device sources and never runs the network stack in IRQ context. Link initialization configures full-duplex auto-negotiation at 10/100/1000/2500 Mb/s through the PHY management interface; the 2.5GBASE-T advertisement is written to AN MMD 7.32. PHY initialization clears stale loopback, power-down, and isolate states. A valid MAC is taken from the hardware RAR first; only when the RAR is invalid does the driver read the read-only NVM shadow under the firmware synchronization lock and check that the 16-bit sum of its first 64 words equals ``0xBABA``. A checksum failure prevents interface registration. The driver never writes NVM."
 
-msgid "支持标准 1500 字节 MTU 和 1518 字节以太网帧。当前不支持 VLAN、巨帧、硬件校验和 或分段卸载、多队列、RSS、时间戳、EEE 配置及运行期间的 PHY 重配置。中断保持屏蔽， 收发由现有网络服务轮询。"
-msgstr "The driver supports the standard 1500-byte MTU and 1518-byte Ethernet frames. It does not currently support VLAN, jumbo frames, hardware checksum or segmentation offload, multiple queues, RSS, timestamps, EEE configuration, or runtime PHY reconfiguration. Interrupts remain masked; the existing network service polls for transmit and receive work."
+msgid "支持标准 1500 字节 MTU 和 1518 字节以太网帧。当前不支持 VLAN、巨帧、硬件校验和 或分段卸载、多队列、RSS、时间戳、EEE 配置及运行期间的 PHY 重配置。数据收发始终由 现有网络服务在任务上下文处理。"
+msgstr "The driver supports the standard 1500-byte MTU and 1518-byte Ethernet frames. It does not currently support VLAN, jumbo frames, hardware checksum or segmentation offload, multiple queues, RSS, timestamps, EEE configuration, or runtime PHY reconfiguration. Transmit and receive work always runs in task context through the existing network service."
 
 msgid "验证范围"
 msgstr "Validation coverage"
 
-msgid "``tools/test_i225.py`` 使用 ASan/UBSan 编译真实驱动对象，以 PCI/MMIO/DMA 边界 模型覆盖精确设备匹配、64 位 BAR 和 DMA 地址、NVM/PHY 管理、advanced ring、TX/RX 回绕、错误帧、分配失败、无网线启动、注册失败及卸载回收。该模型不模拟 I225 PHY 电气链路；当前没有实体 I225-V 验证记录，物理链路协商与实际线速仍待目标硬件测试。"
-msgstr "``tools/test_i225.py`` compiles the real driver objects with ASan/UBSan and uses a PCI/MMIO/DMA boundary model to cover exact device matching, 64-bit BAR and DMA addresses, NVM/PHY management, advanced rings, TX/RX wraparound, malformed frames, allocation failure, startup without a cable, registration failure, and unload cleanup. The model does not simulate the I225 PHY electrical link. No physical I225-V validation has been recorded; link negotiation and actual throughput still require target hardware testing."
+msgid "``tools/test_i225.py`` 使用 ASan/UBSan 编译真实驱动对象，以 PCI/MMIO/DMA 边界 模型覆盖精确设备匹配、64 位 BAR 和 DMA 地址、NVM/PHY 管理、advanced ring、TX/RX 回绕、错误帧、分配失败、无网线启动、注册失败及卸载回收。"
+msgstr "``tools/test_i225.py`` compiles the real driver objects with ASan/UBSan and uses a PCI/MMIO/DMA boundary model to cover exact device matching, 64-bit BAR and DMA addresses, NVM/PHY management, advanced rings, TX/RX wraparound, malformed frames, allocation failure, startup without a cable, registration failure, and unload cleanup."
+
+msgid "错误路径测试覆盖 NVM 校验和不符、NVM/MDIO 超时或错误后的固件锁释放，以及 DMA 停止失败时保留全部 DMA 资源并在重试卸载成功后释放。"
+msgstr "Failure-path tests cover an invalid NVM checksum, firmware-lock release after NVM/MDIO timeouts or errors, and retention of all DMA resources when DMA fails to stop, followed by release after a successful unload retry."
+
+msgid "中断模型覆盖 MSI 通知、没有 MSI 时的轮询回退、ICR 读取清除、IMS 写 1 置位和 IMC 写 1 清除语义，以及重新启用中断时到包或链路状态变化（LSC）的竞态。卸载测试还覆盖 停止通知接入后到达的迟到 IRQ，验证它不会再次通知网络服务。"
+msgstr "The interrupt model covers MSI notifications, polling fallback when MSI is unavailable, ICR clear-on-read behavior, IMS write-one-to-set and IMC write-one-to-clear semantics, and packet-arrival or link-status-change (LSC) races while interrupts are re-enabled. Unload tests also deliver a late IRQ after notification admission closes and verify that it does not notify the network service again."
+
+msgid "该模型不模拟 I225 PHY 电气链路；当前没有实体 I225-V 验证记录，物理链路协商与实际 线速仍待目标硬件测试。"
+msgstr "The model does not simulate the I225 PHY electrical link. No physical I225-V validation has been recorded; link negotiation and actual throughput still require target hardware testing."

@@ -15,8 +15,10 @@ int i225_allocate_rings(struct i225_device *d)
     d->tx_data = d->api->phys_to_virt(d->tx_data_physical);
     if (!d->rx || !d->tx || !d->rx_data || !d->tx_data)
         return -12;
-    for (unsigned i = 0; i < I225_RX_COUNT; ++i)
+    for (unsigned i = 0; i < I225_RX_COUNT; ++i) {
         d->rx[i].read.packet = d->rx_data_physical + (uint64_t)i * I225_BUFFER_BYTES;
+        d->rx[i].read.header = 0;
+    }
     for (unsigned i = 0; i < I225_TX_COUNT; ++i)
         d->tx[i].writeback.status = I225_TX_DONE;
     return 0;
@@ -28,6 +30,9 @@ void i225_configure_rings(struct i225_device *d)
     i225_write(d, I225_TCTL, 0);
     i225_write(d, I225_RXDCTL0, 0);
     i225_write(d, I225_TXDCTL0, 0);
+    i225_write(d, I225_RXCSUM, 0); /* The network stack verifies IP and transport checksums. */
+    i225_write(d, I225_MRQC, 0); /* All accepted frames belong to queue zero. */
+    i225_write(d, I225_RLPML, I225_MAX_FRAME);
     i225_write(d, I225_RDBAL0, (uint32_t)d->rx_physical);
     i225_write(d, I225_RDBAH0, (uint32_t)(d->rx_physical >> 32));
     i225_write(d, I225_RDLEN0, I225_RX_COUNT * sizeof(*d->rx));
@@ -44,6 +49,7 @@ void i225_configure_rings(struct i225_device *d)
     for (unsigned i = 0; i < 128; ++i)
         i225_write(d, I225_MTA + i * 4, 0);
     d->rx_next = d->tx_next = d->tx_clean = 0;
+    d->dropping_fragments = false;
     __atomic_thread_fence(__ATOMIC_RELEASE);
     i225_flush(d);
 }
@@ -122,6 +128,7 @@ int i225_receive(struct i225_device *d, void *frame, uint32_t capacity, uint32_t
     uint32_t status = d->rx[index].writeback.status_error;
     if (!(status & I225_RX_DD)) {
         kernel_spin_unlock_irqrestore(&d->rx_lock, flags);
+        i225_interrupt_complete(d);
         return 0;
     }
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
@@ -141,8 +148,8 @@ int i225_receive(struct i225_device *d, void *frame, uint32_t capacity, uint32_t
         if (length)
             *length = bytes;
     }
-    d->rx[index].writeback.length = 0;
-    d->rx[index].writeback.status_error = 0;
+    d->rx[index].read.packet = d->rx_data_physical + (uint64_t)index * I225_BUFFER_BYTES;
+    d->rx[index].read.header = 0;
     __atomic_thread_fence(__ATOMIC_RELEASE);
     i225_write(d, I225_RDT0, index);
     d->rx_next = (index + 1) % I225_RX_COUNT;

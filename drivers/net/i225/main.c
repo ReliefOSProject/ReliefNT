@@ -38,6 +38,7 @@ static const struct reliefnt_netdev_ops ops = {
 
 static int stop_device(struct i225_device *d)
 {
+    i225_interrupt_stop(d);
     int rc = i225_hardware_stop(d);
     if (rc)
         return rc;
@@ -68,8 +69,11 @@ static int start(const struct reliefos_driver_kernel_api *api)
         int rc = api->pci_enumerate(index, &pci);
         if (rc == -19)
             break;
-        if (rc)
-            return rc;
+        if (rc) {
+            if (!first_error)
+                first_error = rc;
+            break;
+        }
         if (pci.vendor_id != 0x8086 || pci.device_id != 0x15f3 ||
             pci.class_code != 2 || pci.subclass != 0 || (pci.header_type & 0x7f) != 0)
             continue;
@@ -84,6 +88,8 @@ static int start(const struct reliefos_driver_kernel_api *api)
         devices = d;
         rc = i225_hardware_start(d);
         if (!rc)
+            i225_interrupt_prepare(d);
+        if (!rc)
             rc = i225_allocate_rings(d);
         if (!rc) {
             i225_configure_rings(d);
@@ -92,8 +98,10 @@ static int start(const struct reliefos_driver_kernel_api *api)
         if (!rc) {
             i225_enable_rings(d);
             d->active = true;
-            uint32_t ifindex;
+            uint32_t ifindex = 0;
             rc = driver_register_netdev(&ops, d, &ifindex);
+            if (!rc)
+                i225_interrupt_start(d, ifindex);
         }
         if (rc) {
             api->console_log(CONSOLE_LOG_WARN,
@@ -108,9 +116,10 @@ static int start(const struct reliefos_driver_kernel_api *api)
             continue;
         }
         api->console_log(CONSOLE_LOG_INFO,
-            "[i225] %02x:%02x.%u Intel I225-V MAC=%02x:%02x:%02x:%02x:%02x:%02x; link=%s\n",
+            "[i225] %02x:%02x.%u Intel I225-V MAC=%02x:%02x:%02x:%02x:%02x:%02x; link=%s irq=%s\n",
             pci.bus, pci.slot, pci.function, d->mac[0], d->mac[1], d->mac[2],
-            d->mac[3], d->mac[4], d->mac[5], ready(d) ? "up" : "down");
+            d->mac[3], d->mac[4], d->mac[5], ready(d) ? "up" : "down",
+            d->irq_handle ? "msi" : "poll");
         ++registered;
     }
     return registered ? 0 : first_error ? first_error : -19;
