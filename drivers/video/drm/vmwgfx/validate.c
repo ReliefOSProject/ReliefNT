@@ -475,6 +475,8 @@ int drm_vmwgfx_exec_validate_packet(uint32_t command,
         struct drm_vmwgfx_bo_ref *bo;
         int ret = drm_vmwgfx_exec_hold_bo(work, file, result.gmrId, &bo);
         if (ret) return ret;
+        /* Query END/WAIT may span EXECBUFs; retain their stable cached MOB. */
+        bo->query = true;
         uint64_t end;
         if ((result.offset & 3u) ||
             !drm_vmwgfx_add_u64(result.offset, sizeof(SVGA3dQueryResult),

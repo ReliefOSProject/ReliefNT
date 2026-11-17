@@ -24,11 +24,11 @@
 #define DRM_VMW_FENCE_MAX_GLOBAL 128u
 #define DRM_VMW_EXEC_WORK_MAX 32u
 #define DRM_VMW_EXEC_WORK_BYTES_MAX (8u * 1024u * 1024u)
-#define DRM_VMW_EXEC_ATTACHMENTS_MAX 128u
+#define DRM_VMW_EXEC_ATTACHMENTS_MAX SVGA_BATCH_MAX_GMR_REFS
 #define DRM_VMW_EXEC_ATTACHMENT_BYTES_MAX (128u * 1024u * 1024u)
 #define DRM_VMW_EXEC_CONTEXTS_MAX 64u
 #define DRM_VMW_EXEC_SURFACES_MAX 256u
-#define DRM_VMW_EXEC_BOS_MAX 128u
+#define DRM_VMW_EXEC_BOS_MAX SVGA_BATCH_MAX_GMR_REFS
 #define DRM_VMW_EXEC_OUTPUT_BYTES_MAX (256u * 1024u)
 #define DRM_VMW_EXEC_ATTACHMENT_CACHE_TICKS 100u
 #define DRM_VMW_FENCE_WAIT_FAST_POLL_US 500u
@@ -36,6 +36,12 @@
 #define DRM_VMW_FENCE_WAIT_FAST_CLOCK_RESOLUTION_NS 1000
 
 struct drm_vmwgfx_exec_work;
+/** @brief Progress a work-owned scatter registration without releasing its BOs.
+ * @param work Validated work, retained through retry and final host detach.
+ * @return Zero when ready, EBUSY on bounded asynchronous progress, or errno.
+ * Task/execution context; no graphics lock may span this call.
+ */
+int drm_vmwgfx_exec_group_prepare(struct drm_vmwgfx_exec_work *work);
 
 struct drm_vmwgfx_attachment {
     struct drm_vmwgfx_attachment *next;
@@ -70,6 +76,8 @@ struct drm_vmwgfx_bo_ref {
     struct drm_bo *object;
     struct drm_vmwgfx_attachment *attachment;
     uint32_t drm_id;
+    uint32_t group_offset;
+    bool query;
 };
 
 struct drm_vmwgfx_exec_work {
@@ -87,6 +95,10 @@ struct drm_vmwgfx_exec_work {
     struct drm_vmwgfx_surface_ref surfaces[DRM_VMW_EXEC_SURFACES_MAX];
     struct drm_vmwgfx_bo_ref bos[DRM_VMW_EXEC_BOS_MAX];
     struct svga_batch batch;
+    struct svga_gmr_segment *segments;
+    svga_handle group_gmr;
+    uint32_t group_bytes;
+    uint32_t group_count;
     struct drm_vmwgfx_fence *fence_object;
     svga_handle fence;
     bool batch_open;
@@ -99,6 +111,7 @@ enum drm_vmwgfx_continuation_kind {
     DRM_VMW_CONT_FENCE_WAIT = 1,
     DRM_VMW_CONT_SYNCCPU = 2,
     DRM_VMW_CONT_FENCE_REPLY_FAULT = 3,
+    DRM_VMW_CONT_EXEC_PREPARE = 6,
 #ifdef CONFIG_SWAP
     DRM_VMW_CONT_SURFACE_REPLY = 4,
     DRM_VMW_CONT_KMS_ENUM = 5,
@@ -119,9 +132,11 @@ struct drm_vmwgfx_task_continuation {
     union {
         struct drm_vmw_fence_wait_arg wait;
         struct drm_vmw_synccpu_arg synccpu;
+        struct drm_vmw_execbuf_arg exec;
     } snapshot;
     struct drm_bo *bo;
     struct drm_vmwgfx_fence *fence_object;
+    struct drm_vmwgfx_exec_work *work;
 #ifdef CONFIG_SWAP
     struct drm_vmwgfx_surface *surface;
     struct task_file *prime_file;

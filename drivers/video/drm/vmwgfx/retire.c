@@ -11,6 +11,7 @@ static void drm_vmwgfx_exec_queue_cleanup(struct drm_vmwgfx_exec_work *work);
 
 static void drm_vmwgfx_exec_attachment_put(
     struct drm_vmwgfx_attachment *attachment);
+static void drm_vmwgfx_exec_trim_idle(void);
 
 static void drm_vmwgfx_exec_work_alloc_diag(
     struct drm_faildiag_context *diagnostics, int error, const char *stage,
@@ -21,6 +22,61 @@ static struct drm_vmwgfx_exec_work *drm_vmwgfx_exec_jobs;
 static struct drm_vmwgfx_exec_work *drm_vmwgfx_exec_jobs_tail;
 static struct drm_vmwgfx_exec_work *drm_vmwgfx_exec_cleanup;
 static uint32_t drm_vmwgfx_attachment_progress_cursor;
+
+/** @brief Acknowledge final group detach while its cleanup work remains owned.
+ * @param opaque Work kept alive by the caller until this callback returns.
+ * Execution-owned callback outside the device lock; it never frees its caller.
+ */
+static void drm_vmwgfx_exec_group_owner_put(void *opaque)
+{
+    struct drm_vmwgfx_exec_work *work = opaque;
+    work->group_gmr = 0;
+}
+
+int drm_vmwgfx_exec_group_prepare(struct drm_vmwgfx_exec_work *work)
+{
+    if (!work || !work->bo_count) return -LINUX_EINVAL;
+    if (!work->segments) {
+        uint64_t bytes = 0;
+        uint32_t vector_bytes = work->bo_count * sizeof(*work->segments);
+        for (uint32_t i = 0; i < work->bo_count; ++i) {
+            if (work->bos[i].query) continue;
+            uint64_t size = drm_bo_size(work->bos[i].object);
+            if (!size || (size & 4095u) ||
+                size > DRM_VMW_EXEC_ATTACHMENT_BYTES_MAX - bytes)
+                return -LINUX_ENOMEM;
+            work->bos[i].group_offset = (uint32_t)bytes;
+            bytes += size;
+        }
+        uint64_t flags;
+        kernel_spin_lock_irqsave(&drm_vmwgfx_exec_lock, &flags);
+        if (bytes > DRM_VMW_EXEC_ATTACHMENT_BYTES_MAX - drm_vmwgfx_attachment_bytes ||
+            vector_bytes > DRM_VMW_EXEC_WORK_BYTES_MAX - drm_vmwgfx_exec_work_bytes) {
+            kernel_spin_unlock_irqrestore(&drm_vmwgfx_exec_lock, flags);
+            drm_vmwgfx_exec_trim_idle();
+            return -LINUX_EBUSY;
+        }
+        drm_vmwgfx_attachment_bytes += bytes;
+        work->group_bytes = (uint32_t)bytes;
+        drm_vmwgfx_exec_work_bytes += vector_bytes;
+        work->allocation_bytes += vector_bytes;
+        kernel_spin_unlock_irqrestore(&drm_vmwgfx_exec_lock, flags);
+        work->segments = kernel_malloc(vector_bytes);
+        if (!work->segments) return -LINUX_ENOMEM;
+        for (uint32_t i = 0; i < work->bo_count; ++i) {
+            if (work->bos[i].query) continue;
+            work->segments[work->group_count++] = (struct svga_gmr_segment){
+                .phys = drm_bo_page_physical(work->bos[i].object, 0),
+                .bytes = (uint32_t)drm_bo_size(work->bos[i].object)};
+        }
+    }
+    int status = svga_gmr_borrowed_attachv(work->segments, work->group_count,
+        work, drm_vmwgfx_exec_group_owner_put, THIS_MODULE, &work->group_gmr);
+    if (status == SVGA_EBUSY && !work->group_gmr)
+        drm_vmwgfx_exec_trim_idle();
+    return drm_vmwgfx_map_svga_status(status);
+}
+
 static bool drm_vmwgfx_exec_maintenance_pending;
 void drm_vmwgfx_exec_publish_maintenance_locked(void)
 {
@@ -70,6 +126,40 @@ static void drm_vmwgfx_exec_attachment_owner_put(void *opaque)
     drm_async_free(attachment);
 }
 
+/** @brief Evict idle cached registrations when the host residency pool is full.
+ * @note Execution ownership serializes object membership. The exec lock only
+ * selects an unreferenced entry; no lock spans the backend call or owner put.
+ * A published destroy remains detaching until its real retirement fence passes.
+ * Active work, including its preparing attachments, is never selected.
+ */
+static void drm_vmwgfx_exec_trim_idle(void)
+{
+    for (uint32_t pass = 0; pass < 8u; ++pass) {
+        uint64_t flags;
+        struct drm_vmwgfx_attachment *victim = NULL;
+        kernel_spin_lock_irqsave(&drm_vmwgfx_exec_lock, &flags);
+        for (struct drm_vmwgfx_attachment *entry = drm_vmwgfx_attachments;
+             entry; entry = entry->next) {
+            if (entry->references) continue;
+            if (!victim || entry->idle_since < victim->idle_since) victim = entry;
+        }
+        if (victim) victim->detaching = true;
+        kernel_spin_unlock_irqrestore(&drm_vmwgfx_exec_lock, flags);
+        if (!victim) return;
+        if (!victim->gmr) {
+            drm_vmwgfx_exec_attachment_owner_put(victim);
+        } else if (svga_gmr_borrowed_detach(victim->gmr)) {
+            /* Preserve the in-flight destroy and resume on the next retry. */
+            return;
+        }
+    }
+}
+
+/** @brief Progress one pinned registration, reclaiming idle residency on pressure.
+ * @param attachment Referenced cache entry, borrowed during the call.
+ * @return Zero when ready, EBUSY for residency/FIFO contention, or persistent
+ * backing/validation error. No retryable result poisons the cached entry.
+ */
 static int drm_vmwgfx_exec_attachment_progress(
     struct drm_vmwgfx_attachment *attachment)
 {
@@ -83,7 +173,10 @@ static int drm_vmwgfx_exec_attachment_progress(
         return -LINUX_EINVAL;
     int status = svga_gmr_borrowed_attach(phys, (uint32_t)size, attachment,
         drm_vmwgfx_exec_attachment_owner_put, THIS_MODULE, &attachment->gmr);
-    if (status == SVGA_EBUSY) return -LINUX_EBUSY;
+    if (status == SVGA_EBUSY) {
+        if (!attachment->gmr) drm_vmwgfx_exec_trim_idle();
+        return -LINUX_EBUSY;
+    }
     if (status) {
         attachment->error = drm_vmwgfx_map_svga_status(status);
         return attachment->error;
@@ -192,7 +285,8 @@ int drm_vmwgfx_exec_attachment_get(
         drm_bo_put(bo);
         drm_async_free(candidate);
         if (failure_stage) *failure_stage = "exec.attach.quota";
-        return -LINUX_ENOMEM;
+        drm_vmwgfx_exec_trim_idle();
+        return -LINUX_EBUSY;
     }
     candidate->next = drm_vmwgfx_attachments;
     drm_vmwgfx_attachments = candidate;
@@ -221,6 +315,10 @@ void drm_vmwgfx_exec_work_release(struct drm_vmwgfx_exec_work *work)
         }
         work->batch_open = false;
     }
+    if (work->group_gmr && svga_gmr_borrowed_detach(work->group_gmr)) {
+        drm_vmwgfx_exec_queue_cleanup(work);
+        return;
+    }
     for (uint32_t i = 0; i < work->context_count; ++i)
         drm_vmwgfx_context_put(work->contexts[i].object);
     for (uint32_t i = 0; i < work->surface_count; ++i)
@@ -234,8 +332,11 @@ void drm_vmwgfx_exec_work_release(struct drm_vmwgfx_exec_work *work)
     kernel_free(work->snapshot);
     kernel_free(work->scratch);
     kernel_free(work->output);
+    kernel_free(work->segments);
     uint64_t flags;
     kernel_spin_lock_irqsave(&drm_vmwgfx_exec_lock, &flags);
+    if (work->group_bytes)
+        drm_vmwgfx_attachment_bytes -= work->group_bytes;
     if (drm_vmwgfx_exec_work_count) --drm_vmwgfx_exec_work_count;
     drm_vmwgfx_exec_publish_maintenance_locked();
     if (drm_vmwgfx_exec_work_bytes >= work->allocation_bytes)
@@ -351,9 +452,13 @@ retry_quota:
 
     struct drm_vmwgfx_exec_work *work = drm_async_alloc(sizeof(*work));
     if (!work) goto no_memory;
-    *work = (struct drm_vmwgfx_exec_work){.source_bytes = source_bytes,
-        .packet_count = packet_count, .output_capacity = output_capacity,
-        .allocation_bytes = (uint32_t)allocation};
+    /* Initialize the heap object in place. At -O0 a compound literal puts
+     * the full BO-reference array on the much smaller kernel-thread stack. */
+    __builtin_memset(work, 0, sizeof(*work));
+    work->source_bytes = source_bytes;
+    work->packet_count = packet_count;
+    work->output_capacity = output_capacity;
+    work->allocation_bytes = (uint32_t)allocation;
     if (source_bytes) {
         work->snapshot = kernel_malloc(source_bytes);
         work->scratch = kernel_malloc(source_bytes);

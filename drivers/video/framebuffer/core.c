@@ -285,7 +285,9 @@ int framebuffer_set_mode(uint32_t width, uint32_t height)
     }
 
     if (previous.backend == FRAMEBUFFER_BACKEND_VMWARE_SVGA) {
-        (void)framebuffer_vmware_set_mode(previous.width, previous.height);
+        /* SVGA owns rollback of both the device and descriptor. Retrying here
+         * would discard its result and can hide an unrecoverable mapping. */
+        return -1;
     } else if (previous.backend == FRAMEBUFFER_BACKEND_BOCHS_VBE) {
         (void)framebuffer_vbe_set_mode(previous.width, previous.height);
     }

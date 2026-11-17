@@ -128,11 +128,13 @@ static uint64_t mm_pages_allocated;
 static uint64_t mm_pages_freed;
 static bool mm_allocation_fails;
 static uint64_t fail_copyout_address;
+#define DRM_TEST_GMR_IDS 512u
 static struct svga_info drm_test_svga_info = {
     .fifo_caps = 0x12345679u,
     .host_version = 0x00020001u,
     .guest_version = 0x00020001u,
     .generation = 1,
+    .gmr_limit = DRM_TEST_GMR_IDS,
     .surface_limit_bytes = 64u * 1024u * 1024u,
     .compat_surface_limit_bytes = 64u * 1024u * 1024u,
     .fifo_ready = true,
@@ -255,8 +257,9 @@ struct drm_test_borrowed {
     uint32_t retirement_fence_seq;
     bool destruction_published;
 };
-static struct drm_test_borrowed drm_test_borrowed[128];
+static struct drm_test_borrowed drm_test_borrowed[DRM_TEST_GMR_IDS];
 static uint32_t drm_test_borrowed_count;
+static uint32_t drm_test_borrowed_limit = DRM_TEST_GMR_IDS;
 static svga_handle drm_test_next_gmr = 0xa000000000000001ULL;
 
 int svga_fence_try_insert(svga_handle *out)
@@ -524,13 +527,25 @@ int svga_gmr_borrowed_attach(uint64_t phys, uint32_t bytes, void *owner,
                              void (*owner_put)(void *owner), struct module *code_owner, svga_handle *out)
 {
     if (!phys || !bytes || !owner || !owner_put || !out ||
-        drm_test_borrowed_count >= 128) return SVGA_EINVAL;
+        drm_test_borrowed_count >= DRM_TEST_GMR_IDS) return SVGA_EINVAL;
+    if (drm_test_borrowed_count >= drm_test_borrowed_limit) return SVGA_EBUSY;
     if(!try_module_get(code_owner))return SVGA_ENODEV;
     svga_handle handle = drm_test_next_gmr++;
     drm_test_borrowed[drm_test_borrowed_count++] = (struct drm_test_borrowed){
         .handle = handle, .owner = owner, .owner_put = owner_put, .code_owner = code_owner};
     *out = handle;
     return 0;
+}
+
+int svga_gmr_borrowed_attachv(const struct svga_gmr_segment *segments,
+    uint32_t count, void *owner, void (*owner_put)(void *),
+    struct module *code_owner, svga_handle *out)
+{
+    if (!segments || !count) return SVGA_EINVAL;
+    if (*out) return 0;
+    int status = svga_gmr_borrowed_attach(segments[0].phys, segments[0].bytes,
+        owner, owner_put, code_owner, out);
+    return status ? status : SVGA_EBUSY;
 }
 
 int svga_gmr_borrowed_mob_id(svga_handle handle, uint32_t *mobid)
@@ -2812,6 +2827,10 @@ static void test_vmwgfx_resource_contract(void)
     drm_test_svga_caps[SVGA3D_DEVCAP_MAX_VOLUME_EXTENT] = UINT32_MAX;
     drm_test_svga_caps[SVGA3D_DEVCAP_MAX_CONTEXT_IDS] = UINT32_MAX;
     drm_test_svga_caps[SVGA3D_DEVCAP_MAX_SURFACE_IDS] = UINT32_MAX;
+    drm_test_svga_caps[SVGA3D_DEVCAP_MAX_VERTEX_SHADER_INSTRUCTIONS] = 512u;
+    drm_test_svga_caps[SVGA3D_DEVCAP_MAX_FRAGMENT_SHADER_INSTRUCTIONS] = 512u;
+    drm_test_svga_caps[SVGA3D_DEVCAP_MAX_VERTEX_SHADER_TEMPS] = 32u;
+    drm_test_svga_caps[SVGA3D_DEVCAP_MAX_FRAGMENT_SHADER_TEMPS] = 32u;
     drm_test_svga_caps[SVGA3D_DEVCAP_SURFACEFMT_X8R8G8B8] =
         SVGA3DFORMAT_OP_TEXTURE | SVGA3DFORMAT_OP_CUBETEXTURE |
         SVGA3DFORMAT_OP_OFFSCREEN_RENDERTARGET | SVGA3DFORMAT_OP_SRGBREAD |
@@ -2944,6 +2963,10 @@ static void test_vmwgfx_resource_contract(void)
     assert(drm_test_find_capability(caps, SVGA3D_DEVCAP_MAX_VOLUME_EXTENT) == 256u);
     assert(drm_test_find_capability(caps, SVGA3D_DEVCAP_MAX_CONTEXT_IDS) == 63u);
     assert(drm_test_find_capability(caps, SVGA3D_DEVCAP_MAX_SURFACE_IDS) == 255u);
+    assert(drm_test_find_capability(caps, SVGA3D_DEVCAP_MAX_VERTEX_SHADER_INSTRUCTIONS) == 512u);
+    assert(drm_test_find_capability(caps, SVGA3D_DEVCAP_MAX_FRAGMENT_SHADER_INSTRUCTIONS) == 512u);
+    assert(drm_test_find_capability(caps, SVGA3D_DEVCAP_MAX_VERTEX_SHADER_TEMPS) == 32u);
+    assert(drm_test_find_capability(caps, SVGA3D_DEVCAP_MAX_FRAGMENT_SHADER_TEMPS) == 32u);
     assert(drm_test_find_capability(caps, SVGA3D_DEVCAP_MAX_LIGHTS) == 0u);
     assert(drm_test_find_capability(caps, 262u - 1u) == 0u);
     assert(drm_test_find_capability(caps, SVGA3D_DEVCAP_SURFACEFMT_X8R8G8B8) ==
@@ -5822,6 +5845,138 @@ static void test_faildiag_parameter_bootstrapping(void)
     assert(!parameter_arguments(&values, "drm.faildiag=Y", false));
 }
 
+/** @brief Model VMware GMR pressure before the ordinary cache expiry time. */
+static void test_attachment_pressure_reclaims_only_idle(void)
+{
+    struct task task = make_task(9011, true);
+    struct task_file file = {0};
+    assert(!drm_file_open(&task, &file));
+    assert(!drm_vmwgfx_attachment_count && !drm_test_borrowed_count);
+    uint32_t handles[2]; uint64_t offsets[2]; struct drm_bo *bos[2];
+    for (unsigned i = 0; i < 2; ++i) {
+        assert(!drm_bo_create(file.drm_file, NULL, 4096, &handles[i], &offsets[i]));
+        bos[i] = drm_bo_lookup_handle_get(file.drm_file, handles[i]);
+        assert(bos[i]);
+    }
+    drm_test_borrowed_limit = 1;
+    struct drm_vmwgfx_attachment *first = NULL, *second = NULL;
+    assert(!drm_vmwgfx_exec_attachment_get(bos[0], &first, NULL));
+    assert(drm_vmwgfx_exec_attachment_get(bos[1], &second, NULL) == -LINUX_EBUSY);
+    assert(drm_test_borrowed_count == 1 && !first->detaching);
+    drm_vmwgfx_exec_attachment_put(second);
+    drm_vmwgfx_exec_attachment_put(first);
+    assert(drm_vmwgfx_exec_attachment_get(bos[1], &second, NULL) == -LINUX_EBUSY);
+    assert(!drm_test_borrowed_count); /* idle entry evicted before 100 ticks */
+    drm_vmwgfx_exec_attachment_put(second);
+    assert(!drm_vmwgfx_exec_attachment_get(bos[1], &second, NULL));
+    drm_vmwgfx_exec_attachment_put(second);
+    drm_test_borrowed_limit = DRM_TEST_GMR_IDS;
+    drm_test_ticks += 101;
+    drm_vmwgfx_execbuf_process_retirements(8);
+    assert(!drm_vmwgfx_attachment_count && !drm_test_borrowed_count);
+    for (unsigned i = 0; i < 2; ++i) drm_bo_put(bos[i]);
+    drm_file_close(&file);
+}
+
+/** @brief Keep more than 128 upload BOs live until their real work retires.
+ * Reproduces a valid Minecraft texture-upload submission with many distinct
+ * GMRs. The existing byte quota and complete ownership cleanup remain active.
+ */
+static void test_large_upload_reference_set(void)
+{
+    enum { count = 192 };
+    unsigned before = allocations;
+    struct task task = make_task(9012, true);
+    struct task_file file = {0};
+    assert(!drm_file_open(&task, &file));
+    int error = 0;
+    struct drm_vmwgfx_exec_work *work =
+        drm_vmwgfx_exec_work_alloc(count * 64u, count, &error, NULL);
+    assert(work && !error);
+    for (unsigned i = 0; i < count; ++i) {
+        uint32_t handle = 0;
+        uint64_t offset = 0;
+        assert(!drm_bo_create(file.drm_file, NULL, 4096, &handle, &offset));
+        struct drm_vmwgfx_bo_ref *ref = NULL;
+        assert(!drm_vmwgfx_exec_hold_bo(work, file.drm_file, handle, &ref) &&
+               "valid upload batch was truncated at 128 BOs");
+        assert(ref && !drm_vmwgfx_exec_attachment_get(ref->object,
+                                                    &ref->attachment, NULL));
+        assert(!drm_bo_handle_delete(file.drm_file, handle));
+    }
+    assert(work->bo_count == count && drm_vmwgfx_attachment_count == count);
+    drm_vmwgfx_exec_work_release(work);
+    drm_test_ticks += 101;
+    for (unsigned i = 0; i < count && drm_vmwgfx_attachment_count; ++i)
+        drm_vmwgfx_execbuf_process_retirements(8);
+    assert(!drm_vmwgfx_attachment_count && !drm_test_borrowed_count);
+    assert(!drm_vmwgfx_exec_work_count && !drm_vmwgfx_exec_work_bytes);
+    drm_file_close(&file);
+    assert(allocations == before);
+}
+
+/** @brief Submit uploads and readbacks with more BOs than hardware GMR IDs. */
+static void test_many_buffers_on_small_gmr_host(void)
+{
+    enum { count = 192, words = count * 24 };
+    unsigned before = allocations;
+    struct task task = make_task(9013, true);
+    struct task_file file = {0};
+    assert(!drm_file_open(&task, &file));
+    task.syscall_file = &file;
+    task.syscall_fd = 5;
+    task.syscall_file_number = 16;
+    struct drm_vmw_size size = {.width = 1, .height = 1, .depth = 1};
+    union drm_vmw_surface_create_arg surface = {0};
+    surface.req.format = SVGA3D_X8R8G8B8;
+    surface.req.mip_levels[0] = 1;
+    surface.req.size_addr = (uintptr_t)&size;
+    assert(!ioctl_call(&task, &file, DRM_IOCTL_VMW_CREATE_SURFACE, &surface));
+    uint32_t handles[count], stream[words], used = 0;
+    for (unsigned i = 0; i < count; ++i) {
+        uint64_t offset;
+        assert(!drm_bo_create(file.drm_file, NULL, 4096, &handles[i], &offset));
+        struct {
+            SVGA3dCmdSurfaceDMA dma;
+            SVGA3dCopyBox box;
+            SVGA3dCmdSurfaceDMASuffix suffix;
+        } packet = {
+            .dma = {.guest = {.ptr = {.gmrId = handles[i]}, .pitch = 4},
+                .host = {.sid = (uint32_t)surface.rep.sid},
+                .transfer = i & 1 ? SVGA3D_READ_HOST_VRAM : SVGA3D_WRITE_HOST_VRAM},
+            .box = {.w = 1, .h = 1, .d = 1},
+            .suffix = {.suffixSize = sizeof(SVGA3dCmdSurfaceDMASuffix),
+                       .maximumOffset = 4},
+        };
+        used = test_append_packet(stream, words, used, SVGA_3D_CMD_SURFACE_DMA,
+                                  &packet, sizeof(packet));
+    }
+    struct drm_vmw_execbuf_arg exec = {.commands = (uintptr_t)stream,
+        .command_size = used * 4, .version = 1};
+    drm_test_borrowed_limit = 64;
+    drm_test_svga_info.gmr_limit = 64;
+    int status = -LINUX_EBUSY;
+    for (unsigned attempt = 0; attempt < 256 && status; ++attempt) {
+        status = ioctl_call(&task, &file, DRM_IOCTL_VMW_EXECBUF, &exec);
+        assert(!status || status == -LINUX_EBUSY || status == KERNEL_SYSCALL_BLOCKED);
+        drm_test_ticks++;
+        drm_vmwgfx_execbuf_process_retirements(8);
+    }
+    assert(!status && "valid texture batch cannot fit the host's 64 GMR IDs");
+    for (unsigned i = 0; i < count; ++i)
+        assert(!drm_bo_handle_delete(file.drm_file, handles[i]));
+    drm_test_fence_passed = drm_test_fence_issued;
+    drm_test_ticks += 101;
+    for (unsigned i = 0; i < 256; ++i)
+        drm_vmwgfx_execbuf_process_retirements(8);
+    drm_test_borrowed_limit = DRM_TEST_GMR_IDS;
+    drm_test_svga_info.gmr_limit = DRM_TEST_GMR_IDS;
+    assert(!drm_vmwgfx_attachment_count && !drm_test_borrowed_count);
+    drm_file_close(&file);
+    drm_vmwgfx_process_retirements(8);
+    assert(allocations == before);
+}
+
 int main(void)
 {
 #ifdef RELIEFNT_DRM_NATIVE_OWNER_TEST
@@ -5857,6 +6012,9 @@ int main(void)
     test_kms_surface_present_pressure();
     test_vgpu9_execbuf_v1_empty_fence_abi();
     test_exec_work_byte_pressure();
+    test_attachment_pressure_reclaims_only_idle();
+    test_large_upload_reference_set();
+    test_many_buffers_on_small_gmr_host();
     assert(mm_pages_freed == mm_pages_allocated);
     drm_character_exit();
 #ifdef RELIEFNT_DRM_NATIVE_OWNER_TEST

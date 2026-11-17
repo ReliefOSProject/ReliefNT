@@ -14,7 +14,6 @@ void framebuffer_panic_prepare(void)
     framebuffer_drm_damage_pending = false;
     if (fb.backend == FRAMEBUFFER_BACKEND_VMWARE_SVGA && vmware_svga.present) {
         vmware_svga_write(VMWARE_SVGA_REG_TRACES, 1u);
-        framebuffer_vmware_kick();
     }
 }
 
@@ -29,11 +28,10 @@ void framebuffer_panic_present(void)
         !vmware_svga.present) return;
     vmware_svga_memory_fence();
     for (uint32_t attempt = 0; attempt < 4096u; ++attempt) {
-        if (framebuffer_vmware_fifo_update(0, 0, fb.width, fb.height)) {
-            framebuffer_vmware_kick();
+        if (!svga_update_panic(fb.width, fb.height)) {
             return;
         }
-        if (!vmware_svga.fifo_present) return;
+        if (!svga.fifo_ready) return;
         (void)vmware_svga_read(VMWARE_SVGA_REG_BUSY);
         __asm__ volatile("pause");
     }

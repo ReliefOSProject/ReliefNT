@@ -145,6 +145,14 @@ static uint32_t drm_vmw_filtered_cap(uint32_t index, bool ready)
         return value && drm_vmw_filtered_cap(
             SVGA3D_DEVCAP_FRAGMENT_SHADER_VERSION, ready) >=
                 DRM_VMW_FRAGMENT_SHADER_VERSION_30;
+    case SVGA3D_DEVCAP_MAX_VERTEX_SHADER_INSTRUCTIONS:
+    case SVGA3D_DEVCAP_MAX_FRAGMENT_SHADER_INSTRUCTIONS:
+        /* A zero limit disables the stage in Mesa even when its version is
+         * SM3. The command validator accepts the SM3 instruction stream. */
+        return value > 512u ? 512u : value;
+    case SVGA3D_DEVCAP_MAX_VERTEX_SHADER_TEMPS:
+    case SVGA3D_DEVCAP_MAX_FRAGMENT_SHADER_TEMPS:
+        return value > 32u ? 32u : value;
     case SVGA3D_DEVCAP_MAX_RENDER_TARGETS:
     case SVGA3D_DEVCAP_MAX_SIMULTANEOUS_RENDER_TARGETS:
         return value > DRM_VMW_LOCAL_RENDER_TARGETS

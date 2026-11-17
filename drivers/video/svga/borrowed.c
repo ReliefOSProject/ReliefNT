@@ -12,8 +12,19 @@ static int submit_mapping_chunk_locked(uint32_t id, struct svga_gmr *g)
     uint32_t count = g->pages - offset;
     if (count > 256u) count = 256u;
     uint32_t ppns[256];
-    uint32_t base = (uint32_t)(g->phys >> 12);
-    for (uint32_t i = 0; i < count; ++i) ppns[i] = base + offset + i;
+    if (g->segments) {
+        uint32_t run = 0, page = offset;
+        while (run < g->segment_count && page >= g->segments[run].bytes / 4096u)
+            page -= g->segments[run++].bytes / 4096u;
+        for (uint32_t i = 0; i < count; ++i) {
+            if (run >= g->segment_count) return SVGA_EINVAL;
+            ppns[i] = (uint32_t)(g->segments[run].phys >> 12) + page;
+            if (++page == g->segments[run].bytes / 4096u) { ++run; page = 0; }
+        }
+    } else {
+        uint32_t base = (uint32_t)(g->phys >> 12);
+        for (uint32_t i = 0; i < count; ++i) ppns[i] = base + offset + i;
+    }
 
     uint32_t words[14u + 256u];
     uint32_t at = 0;
@@ -63,9 +74,9 @@ static int submit_mapping_chunk_locked(uint32_t id, struct svga_gmr *g)
  * Caller retains resources/backing and its independent module call pin through
  * return, and through the real fence or successful teardown when asynchronous.
  */
-int svga_gmr_borrowed_attach(uint64_t phys, uint32_t bytes, void *owner,
-                             void (*owner_put)(void *owner), struct module *code_owner,
-                             svga_handle *out)
+static int borrowed_attach(uint64_t phys, uint32_t bytes,
+    const struct svga_gmr_segment *segments, uint32_t count, void *owner,
+    void (*owner_put)(void *owner), struct module *code_owner, svga_handle *out)
 {
     if (!out) return SVGA_EINVAL;
     bool retained=!*out;
@@ -85,7 +96,8 @@ int svga_gmr_borrowed_attach(uint64_t phys, uint32_t bytes, void *owner,
         g = &svga.gmrs[id];
         if (!g->borrowed || g->phys != phys || g->bytes != bytes ||
             g->owner != owner || g->owner_put != owner_put ||
-            g->code_owner != code_owner || g->retiring)
+            g->code_owner != code_owner || g->retiring ||
+            g->segments != segments || g->segment_count != count)
             goto done;
     } else {
         ret = SVGA_ENODEV;
@@ -95,23 +107,25 @@ int svga_gmr_borrowed_attach(uint64_t phys, uint32_t bytes, void *owner,
             (phys >> 12) > UINT32_MAX) goto done;
         uint32_t pages = svga_bytes_to_pages(bytes);
         if (!pages || pages > SVGA_MOB_MAX_PAGES ||
-            !svga_ppn32_run(phys, pages) || bytes > svga.mob_max_bytes) {
+            (!segments && !svga_ppn32_run(phys, pages)) || bytes > svga.mob_max_bytes) {
             ret = SVGA_EINVAL;
             goto done;
         }
         for (id = 0; id < svga.gmr_limit && svga.gmrs[id].handle; ++id) {}
         if (id == svga.gmr_limit || id >= SVGA_GMRS) {
-            ret = SVGA_ENOMEM;
+            ret = SVGA_EBUSY;
             goto done;
         }
         if (!svga_gmr_page_budget_allows(pages)) {
-            ret = SVGA_ENOMEM;
+            ret = pages > svga.gmr_page_limit ? SVGA_ENOMEM : SVGA_EBUSY;
             goto done;
         }
         svga_handle handle = svga_new_handle(SVGA_KIND_GMR, id);
         if (!handle) { ret = SVGA_ENOMEM; goto done; }
         struct svga_mob mob = {0};
-        ret = svga_gb_backing_borrow_locked(&mob, phys, pages, bytes);
+        ret = segments
+            ? svga_gb_backing_borrow_vector_locked(&mob, segments, count, bytes)
+            : svga_gb_backing_borrow_locked(&mob, phys, pages, bytes);
         if (ret) goto done;
         ret = svga_mode_lease_acquire_locked();
         if (ret) {
@@ -122,6 +136,7 @@ int svga_gmr_borrowed_attach(uint64_t phys, uint32_t bytes, void *owner,
         *g = (struct svga_gmr){.handle = handle, .phys = phys, .bytes = bytes,
             .pages = pages, .mobid = svga.external_mob_base + id,
             .owner = owner, .owner_put = owner_put, .code_owner = code_owner, .borrowed = true,
+            .segments = segments, .segment_count = count,
             .mode_lease = true};
         /* Retain the PTable root and ownership bit in the reserved context-sized
          * MOB record. This slot is disjoint from shader and surface IDs. */
@@ -150,6 +165,42 @@ done:
     svga_unlock(flags);
     if(retained)module_put(code_owner);
     return ret;
+}
+
+/** @brief Register or progress one contiguous run with its original owner. */
+int svga_gmr_borrowed_attach(uint64_t phys, uint32_t bytes, void *owner,
+    void (*owner_put)(void *owner), struct module *code_owner, svga_handle *out)
+{
+    return borrowed_attach(phys, bytes, NULL, 0, owner, owner_put, code_owner, out);
+}
+
+/** @brief Validate immutable scatter runs before registering one GMR/MOB.
+ * @param segments Pinned page-aligned physical runs with page-multiple sizes.
+ * @param count Run count, bounded by the accepted command-buffer reference bound.
+ * @param owner Required caller-owned backing identity.
+ * @param owner_put Final callback after fenced destruction, outside the lock.
+ * @param code_owner Callback code module, retained on handle publication.
+ * @param out Required in/out handle; zero initially, preserved across EBUSY.
+ * @return Zero, EBUSY while mapping, or an SVGA error. Task context only;
+ * the owner must retain the complete immutable vector and every run until detach.
+ */
+int svga_gmr_borrowed_attachv(const struct svga_gmr_segment *segments,
+    uint32_t count, void *owner, void (*owner_put)(void *),
+    struct module *code_owner, svga_handle *out)
+{
+    if (!segments || !count || count > SVGA_BATCH_MAX_GMR_REFS)
+        return SVGA_EINVAL;
+    uint64_t bytes = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!segments[i].phys || (segments[i].phys & 4095u) ||
+            !segments[i].bytes || (segments[i].bytes & 4095u) ||
+            !svga_ppn32_run(segments[i].phys, segments[i].bytes / 4096u))
+            return SVGA_EINVAL;
+        bytes += segments[i].bytes;
+        if (bytes > UINT32_MAX) return SVGA_EINVAL;
+    }
+    return borrowed_attach(segments[0].phys, (uint32_t)bytes, segments, count,
+                             owner, owner_put, code_owner, out);
 }
 
 /**
@@ -245,5 +296,6 @@ done:
 }
 
 EXPORT_SYMBOL(svga_gmr_borrowed_attach);
+EXPORT_SYMBOL(svga_gmr_borrowed_attachv);
 EXPORT_SYMBOL(svga_gmr_borrowed_detach);
 EXPORT_SYMBOL(svga_gmr_borrowed_mob_id);

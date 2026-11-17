@@ -180,10 +180,13 @@ int drm_vmwgfx_exec_translate_packet(uint32_t command,
             drm_vmwgfx_exec_find_surface(work, packet.host.sid);
         struct drm_vmwgfx_bo_ref *bo =
             drm_vmwgfx_exec_find_bo(work, packet.guest.ptr.gmrId);
-        if (!host || !bo || !bo->attachment || !bo->attachment->ready)
+        bool grouped = work->group_gmr && bo && !bo->query;
+        if (!host || !bo || (!grouped &&
+            (!bo->attachment || !bo->attachment->ready)))
             return -LINUX_EINVAL;
         packet.host.sid = host->backend_id;
-        packet.guest.ptr.gmrId = svga_resource_id(bo->attachment->gmr);
+        packet.guest.ptr.gmrId = svga_resource_id(grouped
+            ? work->group_gmr : bo->attachment->gmr);
         if (packet.guest.ptr.gmrId == SVGA3D_INVALID_ID)
             return -LINUX_EINVAL;
         uint64_t bo_size = drm_bo_size(bo->object);
@@ -192,6 +195,7 @@ int drm_vmwgfx_exec_translate_packet(uint32_t command,
         if (suffix.maximumOffset > available)
             suffix.maximumOffset = available > UINT32_MAX
                 ? UINT32_MAX : (uint32_t)available;
+        if (grouped) packet.guest.ptr.offset += bo->group_offset;
         __builtin_memcpy(translated, &packet, sizeof(packet));
         __builtin_memcpy(translated + boxes_bytes, &suffix, sizeof(suffix));
         return drm_vmwgfx_map_svga_status(svga_batch_append(&work->batch,
@@ -306,11 +310,12 @@ int drm_vmwgfx_exec_translate_packet(uint32_t command,
             drm_vmwgfx_exec_find_bo(work, result.gmrId);
         if (!bo || !bo->attachment || !bo->attachment->ready)
             return -LINUX_EINVAL;
+        svga_handle gmr = bo->attachment->gmr;
         int ret = command == SVGA_3D_CMD_END_QUERY
             ? svga_batch_query_end(&work->batch, context->backend, type,
-                                   bo->attachment->gmr, result.offset)
+                                   gmr, result.offset)
             : svga_batch_query_wait(&work->batch, context->backend, type,
-                                    bo->attachment->gmr, result.offset);
+                                    gmr, result.offset);
         return drm_vmwgfx_map_svga_status(ret);
     }
     default:

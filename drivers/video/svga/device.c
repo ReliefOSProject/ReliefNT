@@ -583,6 +583,7 @@ void svga_get_info(struct svga_info *out)
     *out = (struct svga_info){ .device_caps = svga.caps, .fifo_caps = svga.fifo_caps,
         .host_version = svga.host_version, .guest_version = SVGA3D_HWVERSION_WS8_B1,
         .generation = svga.generation, .guest_pages = svga.pages,
+        .gmr_limit = svga.gmr_limit,
         .surfaces = svga.live_surface_count,
         .surface_bytes = svga.surface_bytes,
         .surface_limit_bytes = svga.surface_limit_bytes,
@@ -760,14 +761,12 @@ int svga_update(uint32_t x, uint32_t y, uint32_t width, uint32_t height)
     svga_unlock(flags);
     return ret;
 }
-int svga_mode_begin(uint64_t *flags)
+/** @brief Quiesce one modeset under the caller's existing device lock.
+ * Live leases reject the transition before any device state is changed.
+ */
+int svga_mode_prepare_locked(void)
 {
-    if (!flags) return SVGA_EINVAL;
-    *flags = svga_lock();
-    if (svga.mode_leases) {
-        svga_unlock(*flags);
-        return SVGA_EBUSY;
-    }
+    if (svga.mode_leases) return SVGA_EBUSY;
     int ret = svga_shutdown_locked();
     if (!ret && svga.bound) {
         svga.ops.write(SVGA_REG_CONFIG_DONE, 0);
@@ -775,6 +774,14 @@ int svga_mode_begin(uint64_t *flags)
         svga.fifo_ready = false;
         svga.available = false;
     }
+    return ret;
+}
+
+int svga_mode_begin(uint64_t *flags)
+{
+    if (!flags) return SVGA_EINVAL;
+    *flags = svga_lock();
+    int ret = svga_mode_prepare_locked();
     if (ret) svga_unlock(*flags);
     return ret;
 }
@@ -808,16 +815,26 @@ int svga_mode_lease_release(void)
     svga_unlock(flags);
     return ret;
 }
-void svga_mode_end(uint64_t flags)
+/** @brief Restart the retained FIFO, reporting loss of the negotiated 3D path.
+ * Caller holds svga_lock after a completed mode_begin. Failed acceleration
+ * falls back to the same transport's 2D mode after retiring GB tables.
+ */
+int svga_mode_configure_locked(void)
 {
     int ret = svga_configure_locked(svga.memory_ready);
     if (ret || (svga.memory_ready && !svga.available)) {
-        if (!svga_gb_shutdown_locked()) {
-            svga.ops.write(SVGA_REG_CONFIG_DONE, 0);
-            svga.fifo_ready = false;
-            (void)svga_configure_locked(false);
-        }
+        int failure = ret ? ret : svga.probe.status;
+        int retired = svga_gb_shutdown_locked();
+        if (retired) return retired;
+        ret = svga_configure_locked(false);
+        return ret ? ret : failure;
     }
+    return 0;
+}
+
+void svga_mode_end(uint64_t flags)
+{
+    (void)svga_mode_configure_locked();
     svga_unlock(flags);
 }
 
