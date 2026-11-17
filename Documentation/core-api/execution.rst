@@ -23,6 +23,15 @@ LAPIC 向量唤醒远端 CPU；同一未处理标志只发送一次 IPI。自 CP
 调度检查；内核帧继续执行，到原有安全检查点再切换，不抢占持锁内核代码。
 任务的 CPU 预留、亲和性、停止状态和 EEVDF 权重保持原有规则。
 
+用户帧离开直接返回路径后，必须在释放 CPU 预留之前保存 FPU/SSE 状态。
+空闲等待会释放执行事务，原任务可能在另一 CPU 运行并更新快照；因此即使
+最终选回同一任务，也必须恢复其最新快照。尚未进入用户态的选中任务若因
+信号或 exec 继续重试，不拥有当前硬件寄存器，不能用这些寄存器覆盖其快照。
+已完成且允许直接返回的 syscall 仍保留省略保存/恢复的原有快路径。
+``tools/test_user_return_gate.py`` 覆盖跨 CPU 空闲交接与选择重试，
+``tools/tests/fpu_context_runtime_probe.c`` 在来宾中用原始 nanosleep syscall
+检查 XMM0、XMM7 和 XMM15 跨阻塞调度后的内容。
+
 ``setpriority(PRIO_PROCESS, tid, nice)`` 允许有效 UID 与目标真实/有效 UID
 相同的调用者降低目标的调度优先级，因此用户态 ``renice`` 子进程可以把
 同属主的父进程从 nice=-10 恢复到 0。提高优先级或修改其他属主需要

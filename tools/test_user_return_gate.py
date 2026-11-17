@@ -22,6 +22,7 @@ BODIES = [
     ("pressure_maintenance_body.inc", "kernel/exec/userland.c", "sched_pressure_maintenance"),
     ("pressure_maintenance_runner_body.inc", "kernel/exec/userland.c", "sched_run_pressure_maintenance"),
     ("idle_service_body.inc", "kernel/exec/userland.c", "sched_idle_service_wait"),
+    ("wait_runnable_body.inc", "kernel/exec/userland.c", "wait_for_runnable_task"),
     ("int80_return_body.inc", "arch/x86_64/interrupt/idt.c", "int80_dispatch"),
 ]
 
