@@ -23,6 +23,7 @@
 #include <reliefnt/module.h>
 #include <reliefnt/syscall_internal.h>
 #include <reliefnt/storage.h>
+#include <reliefnt/storage_wait.h>
 #include <reliefnt/swap.h>
 #include <reliefnt/swap_internal.h>
 #include <reliefnt/memory_pressure.h>
@@ -56,6 +57,10 @@ static void test_idle_wait(void);
 static bool exclusive(void) { return execution_owner==cpu && execution_depth[cpu]==1; }
 static struct task current, replacement;
 static struct task *selected;
+static struct task *active_task;
+static uint8_t live_fpu[SMP_MAX_CPUS][512];
+static bool fpu_idle_roundtrip, stop_selected;
+static unsigned fpu_idle_returns;
 static atomic_bool key_pending;
 static unsigned drained, delivered, released, fpu_saved, fpu_restored;
 static uint64_t installed_fs;
@@ -70,6 +75,11 @@ int userland_exec_continue(struct task *task)
 void userland_exec_cancel(struct task *task) { assert(task==staged_exec);staged_exec=NULL;++exec_cancellations; }
 int swap_prepare_user_range(struct task *task,uint64_t address,uint64_t length,bool writing)
 { (void)task;(void)address;(void)length;(void)writing;return 0; }
+/* These scheduler cases never request a storage/MM reclaim continuation. */
+int64_t syscall_regular_read_reclaim(struct task *task,const struct trap_frame *frame)
+{ (void)task;(void)frame;abort(); }
+int64_t syscall_mm_mincore_reclaim(struct task *task,const struct trap_frame *frame)
+{ (void)task;(void)frame;abort(); }
 /** @brief Reject process_vm ownership, outside this scheduler-gate fixture.
  * @param state Unexpected private process_vm scope.
  */
@@ -121,7 +131,7 @@ uint64_t kernel_irq_save(void) { uint64_t saved=irq_state; irq_state=0; return s
 void kernel_irq_restore(uint64_t saved) { irq_state=saved; }
 void input_process_pending(void)
 { assert(exclusive()); if (atomic_exchange(&key_pending, false)) ++drained; }
-struct task *sched_current_task(void) { return &current; }
+struct task *sched_current_task(void) { return active_task; }
 bool sched_try_resume_current_user_frame(const struct trap_frame *frame)
 {
     assert(exclusive());
@@ -133,11 +143,16 @@ bool sched_try_resume_current_user_frame(const struct trap_frame *frame)
     return true;
 }
 bool sched_capture_current_user_frame(const struct trap_frame *frame)
-{ assert(exclusive()); current.frame=*frame; return true; }
+{ assert(exclusive()); active_task->frame=*frame; return true; }
 struct task *sched_select_next_user(void) { assert(exclusive());
 #ifdef CONFIG_SWAP
     if (staged_exec==&current && current.state==TASK_BLOCKED && selected==&current) return &replacement;
 #endif
+    if (fpu_idle_roundtrip && !fpu_idle_returns) return NULL;
+    if (fpu_idle_roundtrip || stop_selected || active_task==&replacement) {
+        active_task=selected;
+        if (selected) selected->state=TASK_RUNNING;
+    }
     return selected; }
 struct task *sched_reclaim_current_user(void) { assert(exclusive()); return selected; }
 void sched_quiesce_exited_current(void) { assert(exclusive()); }
@@ -153,6 +168,9 @@ void sched_exit(uint32_t pid, uint64_t code) {
 int kernel_signal_deliver_pending_outer(struct task *task, struct trap_frame *frame)
 {
     assert(exclusive());
+    if (stop_selected && task==&replacement) {
+        stop_selected=false;task->state=TASK_STOPPED;selected=&current;
+    }
     if (sched_task_pending(task)&~task->blocked_signals) {
         ++delivered; task->pending_signals=task->process_pending_signals=0;
         frame->rax=0x51a7;
@@ -164,16 +182,16 @@ void arch_set_user_fs(uint64_t base)
     assert(!irq_state && exclusive());
     installed_fs=base;
 }
-void arch_fpu_save(void *state) { (void)state; assert(exclusive()); ++fpu_saved; }
-void arch_fpu_restore(const void *state) { (void)state; assert(exclusive()); ++fpu_restored; }
+void arch_fpu_save(void *state)
+{ assert(exclusive()); memcpy(state,live_fpu[cpu],512); ++fpu_saved; }
+void arch_fpu_restore(const void *state)
+{ assert(exclusive()); memcpy(live_fpu[cpu],state,512); ++fpu_restored; }
 uint64_t paging_kernel_cr3(void) { return 0x1000; }
 void paging_load_cr3(uint64_t cr3) { assert(exclusive() && cr3==0x1000); }
 void console_log(enum console_log_level level, const char *format, ...)
 { (void)level;(void)format; assert(exclusive()); }
 static bool userland_load_task_image(struct task *task)
 { (void)task; assert(exclusive()); return true; }
-static struct task *wait_for_runnable_task(uint64_t *flags)
-{ (void)flags; assert(false); return NULL; }
 
 /* The runner inserts the complete, unmodified production dispatch function.
  * The real scheduler's eligibility rules have separate sched_resume coverage. */
@@ -182,6 +200,7 @@ static struct task *wait_for_runnable_task(uint64_t *flags)
 #include "pressure_maintenance_body.inc"
 #include "pressure_maintenance_runner_body.inc"
 #include "idle_service_body.inc"
+#include "wait_runnable_body.inc"
 #include "user_return_entry_body.inc"
 #include "user_return_body.inc"
 #include "user_timer_return_body.inc"
@@ -197,6 +216,8 @@ static void reset(void)
     replacement.pid=42;replacement.kind=TASK_KIND_USER;replacement.state=TASK_RUNNING;
     replacement.fs_base=0x5678000;replacement.frame=current.frame;
     selected=&current;drained=delivered=released=fpu_saved=fpu_restored=0;
+    active_task=&current;memset(live_fpu,0,sizeof(live_fpu));
+    fpu_idle_roundtrip=stop_selected=false;fpu_idle_returns=0;
     network_due=false;network_stack_active=false;
     network_maintenance_calls=network_stack_maintenance_calls=network_stack_calls=0;
     pressure_calls=0;
@@ -237,6 +258,10 @@ uint64_t time_uptime_ms(void)
 }
 void sched_sleep_current_until(uint64_t tick)
 { assert(exclusive() && tick==101); current.state=TASK_BLOCKED; ++slept; }
+/* No transport completion is published here; model its one-tick fallback. */
+uint64_t storage_wait_begin(void) { assert(exclusive()); return 0; }
+void storage_wait_sleep(uint64_t generation)
+{ assert(!generation); sched_sleep_current_until(time_ticks()+1); }
 int64_t kernel_signal_rt_sigreturn(struct task *task, struct trap_frame *frame)
 { assert(exclusive() && task==&current); frame->rax=0x5151; return 0; }
 int64_t sched_clone_current(const struct trap_frame *frame, uint64_t flags,
@@ -361,6 +386,17 @@ static void hotplug_service(void *context)
 }
 static void test_idle_wait(void)
 {
+    if (fpu_idle_roundtrip) {
+        /* The task runs on CPU 1 while CPU 0 is idle. CPU 0 retains its
+         * old hardware image; CPU 1 must receive the latest saved image. */
+        assert(!exclusive() && !fpu_idle_returns);
+        cpu=1;uint64_t flags;kernel_execution_lock_irqsave(&flags);
+        arch_fpu_restore(current.fpu_state);
+        for (unsigned i=0;i<512;++i) assert(live_fpu[1][i]==0x31);
+        memset(live_fpu[1],0x62,512);arch_fpu_save(current.fpu_state);
+        kernel_execution_unlock_irqrestore(flags);cpu=0;++fpu_idle_returns;
+        return;
+    }
     assert(!exclusive() && idle_poll);
     irq_state|=1u<<9;usb_poll();irq_state=0;
     assert(!hotplug_visible && usb_service_pending());
@@ -440,8 +476,41 @@ static void test_restored_context_and_fallback(void)
     frame=prepare(LINUX_SYS_GETPID);frame.cs=8;
     assert(!int80_dispatch(&frame));
 }
+/** @brief Preserve the outgoing image and restore a task that ran elsewhere during idle. */
+static void test_fpu_idle_handoff(void)
+{
+    for (unsigned same=0;same<2;++same) {
+        struct trap_frame frame=prepare(LINUX_SYS_GETPID);
+        current.state=TASK_BLOCKED;fpu_idle_roundtrip=true;
+        selected=same ? &current : &replacement;
+        memset(live_fpu[0],0x31,512);memset(current.fpu_state,0x10,512);
+        memset(replacement.fpu_state,0x73,512);
+        assert(userland_schedule_from_frame(&frame)==selected);
+        assert(fpu_idle_returns==1 && !irq_state);
+        for (unsigned i=0;i<512;++i) {
+            assert(current.fpu_state[i]==0x62);
+            assert(live_fpu[0][i]==(same ? 0x62 : 0x73));
+        }
+    }
+}
+/** @brief A selected task stopped before user entry never owns the hardware FPU image. */
+static void test_fpu_selection_retry(void)
+{
+    struct trap_frame frame=prepare(LINUX_SYS_GETPID);
+    current.state=TASK_READY;selected=&replacement;stop_selected=true;
+    memset(live_fpu[0],0x31,512);memset(current.fpu_state,0x10,512);
+    memset(replacement.fpu_state,0x73,512);
+    assert(userland_schedule_from_frame(&frame)==&current);
+    assert(replacement.state==TASK_STOPPED);
+    for (unsigned i=0;i<512;++i) {
+        assert(current.fpu_state[i]==0x31 && live_fpu[0][i]==0x31);
+        assert(replacement.fpu_state[i]==0x73);
+    }
+}
 int main(void)
 {
+    test_fpu_idle_handoff();
+    test_fpu_selection_retry();
 #ifdef CONFIG_SWAP
     test_exec_continues_without_old_user_instruction();
     test_committed_exec_rejects_unexpected_syscall();
@@ -453,7 +522,7 @@ int main(void)
     test_usb_work_without_syscall();
     test_signal_input_and_retry();
     test_restored_context_and_fallback();
-    puts("PASS syscall user return: one transaction, result/TLS, signal, deferred input, retry, exec/sigreturn and retirement");
+    puts("PASS syscall user return: one transaction, result/TLS, signal, deferred input, retry, exec/sigreturn, retirement and FPU idle handoff");
 }
 
 /* These socket/return fixtures never create an executable guard. Scope

@@ -854,6 +854,8 @@ static struct task *wait_for_runnable_task(uint64_t *execution_flags)
  * @param frame Current user frame, or NULL on AP entry or a selection retry.
  * @param timer True only for an acknowledged user timer-return entry.
  * Caller has interrupts disabled and must not hold the execution transaction.
+ * Saves a live frame's FPU image before releasing its CPU reservation; retries
+ * without a live frame only consume saved images, never overwrite them.
  * @return A CPU-reserved task ready for user entry, or NULL for an invalid frame.
  */
 static struct task *userland_schedule_entry(struct trap_frame *frame, bool timer)
@@ -899,6 +901,12 @@ retry:
                 kernel_execution_unlock_irqrestore(execution_flags);
                 return current;
             }
+            /* Selection can publish this task to another CPU, and idle can
+             * release execution ownership entirely. Snapshot while this live
+             * frame still owns the hardware image. A selection retry has no
+             * live frame and must preserve the selected task's saved image. */
+            if (!live_fpu_saved && current->state != TASK_EXITED)
+                arch_fpu_save(current->fpu_state);
             if (current->state != TASK_EXITED && !sched_capture_current_user_frame(frame)) {
                 console_error("[reliefnt] rejected scheduler frame pid=%u rip=0x%llx cs=0x%llx\n",
                                current->pid,
@@ -936,13 +944,6 @@ retry:
     if (!next) {
         kernel_execution_unlock_irqrestore(execution_flags);
         return NULL;
-    }
-    /* A task that was woken for a pending signal never passed through the
-     * live-frame path above; prepare its saved frame before entering it. */
-    if (next == current && !live_fpu_saved &&
-        (sched_task_pending(next) & ~next->blocked_signals)) {
-        arch_fpu_save(next->fpu_state);
-        live_fpu_saved = 1;
     }
     if (kernel_signal_deliver_pending_outer(next, &next->frame) == SWAP_STORAGE_CONTENDED)
         sched_sleep_current_until(time_ticks() + 1);
@@ -983,15 +984,9 @@ retry:
         goto retry;
     }
     arch_set_user_fs(next->fs_base);
-    /* The kernel is general-regs-only, so the hardware FPU state is still
-     * live and clean when the same task resumes: both the snapshot and the
-     * reload are only needed across a real switch. */
-    if (next != current) {
-        if (!live_fpu_saved && current && current->kind == TASK_KIND_USER &&
-            current->state != TASK_EXITED)
-            arch_fpu_save(current->fpu_state);
-        arch_fpu_restore(next->fpu_state);
-    }
+    /* Even the original task may have run elsewhere while this CPU idled.
+     * Only its saved image is authoritative after ownership was released. */
+    arch_fpu_restore(next->fpu_state);
     sched_account_mode(false);
     kernel_execution_unlock_irqrestore(execution_flags);
     return next;
