@@ -19,6 +19,7 @@
    storage-completion
    network-devices
    e1000e
+   i225
    realtek
    rtl8139
    vmxnet3

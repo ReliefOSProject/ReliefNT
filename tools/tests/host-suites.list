@@ -12,6 +12,7 @@ drm tools/test_drm.py
 virtio tools/test_virtio.py
 e1000 tools/test_e1000.py
 e1000e tools/test_e1000e.py
+i225 tools/test_i225.py
 r8169 tools/test_r8169.py
 rtl8139 tools/test_rtl8139.py
 vmxnet3 tools/test_vmxnet3.py

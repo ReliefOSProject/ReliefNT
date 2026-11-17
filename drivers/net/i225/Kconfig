@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+config I225_V
+    tristate "Intel I225-V 2.5GbE Ethernet"
+    default y
+    help
+      Native PCIe Ethernet for Intel I225-V (8086:15f3). The initial driver
+      uses one polled RX/TX queue and the existing network device interface.
+      Other I225 variants and I226 controllers are not matched.

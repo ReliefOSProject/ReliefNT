@@ -33,6 +33,10 @@ drivers/ 按 console、tty、video、storage、net、input、usb、sound 等设�
      - ``e1000e``
      - Intel 82574L/82574IT、82583V PCIe 千兆网卡；每个 PCI 功能独立注册
        网络接口。设备范围和验证边界见 :doc:`e1000e`。
+   * - ``I225_V``
+     - ``i225``
+     - Intel I225-V PCIe 2.5GbE 网卡（8086:15f3）；单队列轮询式收发。
+       仅支持 I225-V，实体卡验证状态见 :doc:`i225`。
    * - ``R8169``
      - ``r8169``
      - Realtek RTL8111/8168 千兆与 RTL8125 2.5GbE PCIe 网卡；每个 PCI 功能

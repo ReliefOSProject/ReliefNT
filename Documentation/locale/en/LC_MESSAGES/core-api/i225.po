@@ -1,0 +1,41 @@
+# ReliefNT core API documentation translations.
+# Copyright (C) 2021-2026, ReliefOS contributors
+# This file is distributed under the same license as the ReliefNT package.
+msgid ""
+msgstr ""
+"Project-Id-Version: ReliefNT 5.3.3\n"
+"PO-Revision-Date: 2026-11-17 00:00+0000\n"
+"Last-Translator: ReliefOS contributors\n"
+"Language-Team: English\n"
+"Language: en\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "Intel I225-V 2.5GbE Ethernet"
+msgstr "Intel I225-V 2.5GbE Ethernet"
+
+msgid "设备范围"
+msgstr "Device coverage"
+
+msgid "``drivers/net/i225/`` 提供独立的原生 PCIe 网卡驱动，只匹配 Intel I225-V （PCI ``8086:15f3``）。I225-LM、其他 I225 变体和 I226 不在设备表中；驱动不会 仅凭产品家族名称把它们绑定到同一套硬件初始化流程。"
+msgstr "``drivers/net/i225/`` provides a separate native PCIe network driver that matches only the Intel I225-V (PCI ``8086:15f3``). I225-LM, other I225 variants, and I226 are outside its device table; the driver does not bind them to the same hardware initialization path based on the product family name alone."
+
+msgid "配置与功能"
+msgstr "Configuration and features"
+
+msgid "``CONFIG_I225_V`` 为 tristate，defconfig 默认内置。选择 ``m`` 时生成 ``drivers/net/i225/i225.ko``，并由 ReliefOS 按精确 PCI 别名加载。每个匹配的 PCI 功能拥有独立的 DMA 环和网络接口，并接入现有 ``netdev`` owner 生命周期。"
+msgstr "``CONFIG_I225_V`` is tristate and defaults to built in. With ``m``, it builds ``drivers/net/i225/i225.ko``, which ReliefOS loads using its exact PCI alias. Each matching PCI function owns separate DMA rings and a network interface within the existing ``netdev`` owner lifecycle."
+
+msgid "当前实现使用 I225 advanced descriptor、单个 RX/TX 队列和任务上下文轮询。链路 初始化通过 PHY 管理接口配置 10/100/1000/2500 Mb/s 全双工自动协商；2.5GBASE-T 广告写入 AN MMD 7.32。有效 MAC 优先取自硬件 RAR；只有 RAR 无效时才在固件同步 锁内读取只读 NVM shadow。驱动不写入 NVM。"
+msgstr "The current implementation uses I225 advanced descriptors, one RX/TX queue, and task-context polling. Link initialization configures full-duplex auto-negotiation at 10/100/1000/2500 Mb/s through the PHY management interface; the 2.5GBASE-T advertisement is written to AN MMD 7.32. A valid MAC is taken from the hardware RAR first; read-only NVM shadow is read under the firmware synchronization lock only when the RAR is invalid. The driver never writes NVM."
+
+msgid "支持标准 1500 字节 MTU 和 1518 字节以太网帧。当前不支持 VLAN、巨帧、硬件校验和 或分段卸载、多队列、RSS、时间戳、EEE 配置及运行期间的 PHY 重配置。中断保持屏蔽， 收发由现有网络服务轮询。"
+msgstr "The driver supports the standard 1500-byte MTU and 1518-byte Ethernet frames. It does not currently support VLAN, jumbo frames, hardware checksum or segmentation offload, multiple queues, RSS, timestamps, EEE configuration, or runtime PHY reconfiguration. Interrupts remain masked; the existing network service polls for transmit and receive work."
+
+msgid "验证范围"
+msgstr "Validation coverage"
+
+msgid "``tools/test_i225.py`` 使用 ASan/UBSan 编译真实驱动对象，以 PCI/MMIO/DMA 边界 模型覆盖精确设备匹配、64 位 BAR 和 DMA 地址、NVM/PHY 管理、advanced ring、TX/RX 回绕、错误帧、分配失败、无网线启动、注册失败及卸载回收。该模型不模拟 I225 PHY 电气链路；当前没有实体 I225-V 验证记录，物理链路协商与实际线速仍待目标硬件测试。"
+msgstr "``tools/test_i225.py`` compiles the real driver objects with ASan/UBSan and uses a PCI/MMIO/DMA boundary model to cover exact device matching, 64-bit BAR and DMA addresses, NVM/PHY management, advanced rings, TX/RX wraparound, malformed frames, allocation failure, startup without a cable, registration failure, and unload cleanup. The model does not simulate the I225 PHY electrical link. No physical I225-V validation has been recorded; link negotiation and actual throughput still require target hardware testing."

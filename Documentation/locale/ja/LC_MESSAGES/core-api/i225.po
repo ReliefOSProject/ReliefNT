@@ -1,0 +1,41 @@
+# ReliefNT core API documentation translations.
+# Copyright (C) 2021-2026, ReliefOS contributors
+# This file is distributed under the same license as the ReliefNT package.
+msgid ""
+msgstr ""
+"Project-Id-Version: ReliefNT 5.3.3\n"
+"PO-Revision-Date: 2026-11-17 00:00+0000\n"
+"Last-Translator: ReliefOS contributors\n"
+"Language-Team: Japanese\n"
+"Language: ja\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+msgid "Intel I225-V 2.5GbE Ethernet"
+msgstr "Intel I225-V 2.5GbE イーサネット"
+
+msgid "设备范围"
+msgstr "対象デバイス"
+
+msgid "``drivers/net/i225/`` 提供独立的原生 PCIe 网卡驱动，只匹配 Intel I225-V （PCI ``8086:15f3``）。I225-LM、其他 I225 变体和 I226 不在设备表中；驱动不会 仅凭产品家族名称把它们绑定到同一套硬件初始化流程。"
+msgstr "``drivers/net/i225/`` は独立したネイティブ PCIe ネットワークドライバーを提供し、Intel I225-V（PCI ``8086:15f3``）のみを照合します。I225-LM、その他の I225 変種、I226 は対象デバイス表に含まれません。製品ファミリー名だけを根拠に、同じハードウェア初期化手順へ割り当てることはありません。"
+
+msgid "配置与功能"
+msgstr "構成と機能"
+
+msgid "``CONFIG_I225_V`` 为 tristate，defconfig 默认内置。选择 ``m`` 时生成 ``drivers/net/i225/i225.ko``，并由 ReliefOS 按精确 PCI 别名加载。每个匹配的 PCI 功能拥有独立的 DMA 环和网络接口，并接入现有 ``netdev`` owner 生命周期。"
+msgstr "``CONFIG_I225_V`` は tristate で、defconfig の既定値は組み込みです。``m`` を選ぶと ``drivers/net/i225/i225.ko`` が生成され、ReliefOS は正確な PCI エイリアスを使ってロードします。照合された PCI 機能ごとに独立した DMA リングとネットワークインターフェースを持ち、既存の ``netdev`` owner ライフサイクルに参加します。"
+
+msgid "当前实现使用 I225 advanced descriptor、单个 RX/TX 队列和任务上下文轮询。链路 初始化通过 PHY 管理接口配置 10/100/1000/2500 Mb/s 全双工自动协商；2.5GBASE-T 广告写入 AN MMD 7.32。有效 MAC 优先取自硬件 RAR；只有 RAR 无效时才在固件同步 锁内读取只读 NVM shadow。驱动不写入 NVM。"
+msgstr "現在の実装は I225 advanced descriptor、単一の RX/TX キュー、タスクコンテキストでのポーリングを使用します。リンク初期化では PHY 管理インターフェースを通じて 10/100/1000/2500 Mb/s の全二重オートネゴシエーションを設定し、2.5GBASE-T の広告を AN MMD 7.32 に書き込みます。有効な MAC はまずハードウェア RAR から取得します。RAR が無効な場合に限り、ファームウェア同期ロックを保持して読み取り専用 NVM shadow を読みます。NVM への書き込みは行いません。"
+
+msgid "支持标准 1500 字节 MTU 和 1518 字节以太网帧。当前不支持 VLAN、巨帧、硬件校验和 或分段卸载、多队列、RSS、时间戳、EEE 配置及运行期间的 PHY 重配置。中断保持屏蔽， 收发由现有网络服务轮询。"
+msgstr "標準の 1500 バイト MTU と 1518 バイトの Ethernet フレームをサポートします。現在、VLAN、ジャンボフレーム、ハードウェアチェックサムまたはセグメンテーションオフロード、複数キュー、RSS、タイムスタンプ、EEE 設定、実行中の PHY 再構成には対応しません。割り込みはマスクしたままにし、既存のネットワークサービスが送受信をポーリングします。"
+
+msgid "验证范围"
+msgstr "検証範囲"
+
+msgid "``tools/test_i225.py`` 使用 ASan/UBSan 编译真实驱动对象，以 PCI/MMIO/DMA 边界 模型覆盖精确设备匹配、64 位 BAR 和 DMA 地址、NVM/PHY 管理、advanced ring、TX/RX 回绕、错误帧、分配失败、无网线启动、注册失败及卸载回收。该模型不模拟 I225 PHY 电气链路；当前没有实体 I225-V 验证记录，物理链路协商与实际线速仍待目标硬件测试。"
+msgstr "``tools/test_i225.py`` は実際のドライバーオブジェクトを ASan/UBSan 付きでコンパイルし、PCI/MMIO/DMA 境界モデルで正確なデバイス照合、64 ビット BAR と DMA アドレス、NVM/PHY 管理、advanced ring、TX/RX の折り返し、不正フレーム、割り当て失敗、ケーブル未接続での起動、登録失敗、アンロード時の解放を検証します。このモデルは I225 PHY の電気的リンクを再現しません。I225-V 実機の検証記録はなく、リンクネゴシエーションと実効速度は対象ハードウェアでの試験が必要です。"
