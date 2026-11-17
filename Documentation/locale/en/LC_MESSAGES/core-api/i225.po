@@ -31,8 +31,20 @@ msgstr "``CONFIG_I225_V`` is tristate and defaults to built in. With ``m``, it b
 msgid "当前实现使用 I225 advanced descriptor 和单个 RX/TX 队列。MSI 可用时由设备中断通知 网络服务，再由任务上下文轮询和复制帧；没有 MSI 服务时退回纯轮询。中断处理只屏蔽 并确认设备中断源，不在 IRQ 上下文执行网络栈操作。链路初始化通过 PHY 管理接口配置 10/100/1000/2500 Mb/s 全双工自动协商；2.5GBASE-T 广告写入 AN MMD 7.32。PHY 初始化 会清除遗留的 loopback、power-down 和 isolate 状态。有效 MAC 优先取自硬件 RAR；只有 RAR 无效时才在固件同步锁内读取只读 NVM shadow，并检查前 64 个字的 16 位累加值为 ``0xBABA``；校验失败时拒绝注册接口。驱动不写入 NVM。"
 msgstr "The current implementation uses I225 advanced descriptors and one RX/TX queue. When MSI is available, device interrupts notify the network service, which polls and copies frames in task context; systems without MSI support fall back to pure polling. The interrupt handler only masks and acknowledges device sources and never runs the network stack in IRQ context. Link initialization configures full-duplex auto-negotiation at 10/100/1000/2500 Mb/s through the PHY management interface; the 2.5GBASE-T advertisement is written to AN MMD 7.32. PHY initialization clears stale loopback, power-down, and isolate states. A valid MAC is taken from the hardware RAR first; only when the RAR is invalid does the driver read the read-only NVM shadow under the firmware synchronization lock and check that the 16-bit sum of its first 64 words equals ``0xBABA``. A checksum failure prevents interface registration. The driver never writes NVM."
 
-msgid "支持标准 1500 字节 MTU 和 1518 字节以太网帧。当前不支持 VLAN、巨帧、硬件校验和 或分段卸载、多队列、RSS、时间戳、EEE 配置及运行期间的 PHY 重配置。数据收发始终由 现有网络服务在任务上下文处理。"
-msgstr "The driver supports the standard 1500-byte MTU and 1518-byte Ethernet frames. It does not currently support VLAN, jumbo frames, hardware checksum or segmentation offload, multiple queues, RSS, timestamps, EEE configuration, or runtime PHY reconfiguration. Transmit and receive work always runs in task context through the existing network service."
+msgid "发送路径会将不足 60 字节的合法以太网帧用零补齐至 60 字节（不含 FCS），避免 I225 硬件短帧填充的限制，并防止复用 DMA 缓冲区中的旧数据进入填充区域。 启动时显式配置 RX/TX packet buffer，清除主机用附加 RAR 中的遗留地址，保留管理 固件专用条目，并禁用未使用的 IPv6 扩展头解析。只有确认 RX/TX 队列启用后才发布 网络接口；队列状态检查有超时，失败时按既有 DMA 停止流程回收资源。"
+msgstr "The transmit path zero-pads valid Ethernet frames shorter than 60 bytes to 60 bytes, excluding FCS. This avoids the I225 hardware's short-frame padding limitation and keeps stale data in reused DMA buffers out of the padding. Startup explicitly configures the RX/TX packet buffers, clears stale addresses from additional host RAR entries, preserves the management firmware entry, and disables unused IPv6 extension-header parsing. The network interface is published only after both RX and TX queues are confirmed enabled. Queue-state checks have a timeout; failures use the existing DMA stop procedure to release resources."
+
+msgid "MSI 模式将 ``EITR0`` 设为 196 个 256 ns 单位，固定节流间隔约 50 微秒。 启动时检查 PCI 电源管理能力链，必要时恢复 D0；能力链损坏或状态切换未生效时拒绝 初始化，避免在低功耗设备上访问 MMIO 或启用 DMA。"
+msgstr "MSI mode sets ``EITR0`` to 196 units of 256 ns, giving a fixed interrupt-throttling interval of about 50 microseconds. Startup checks the PCI power-management capability chain and restores D0 when needed. A malformed chain or an ineffective power-state transition prevents initialization, avoiding MMIO access or DMA activation while the device is in a low-power state."
+
+msgid "PHY 初始化在 SW/FW 同步锁内执行硬件复位，并等待内部复位完成；管理固件禁止 PHY 复位时拒绝接管，不覆盖固件策略。MDIO 完成状态同时检查错误位和返回的寄存器编号。 SWSM 的软件锁与硬件锁分阶段获取，释放时清除两层锁。驱动通过 ``DRV_LOAD`` 标记 与固件交接，并显式关闭 EEE 广告及低功耗空闲，保证启动策略不依赖先前系统的配置。"
+msgstr "PHY initialization performs a hardware reset under the SW/FW synchronization lock and waits for the internal reset to complete. If management firmware blocks PHY reset, the driver refuses to take over and preserves that policy. MDIO completion checks both the error bit and the returned register number. The SWSM software and hardware locks are acquired in separate stages and both are cleared on release. The driver coordinates ownership with firmware through the ``DRV_LOAD`` flag and explicitly disables EEE advertisement and low-power idle, making startup independent of settings left by the previous system."
+
+msgid "驱动记录自身取得的 ``SW_FW_SYNC`` 软件资源位。若 SWSM 竞争导致资源无法释放， 保留 MMIO 映射与 ``DRV_LOAD``，并在后续 STOP 时重试；释放只清除自身持有的位， 保留固件及其他软件的资源位。"
+msgstr "The driver tracks the ``SW_FW_SYNC`` software-resource bits it has acquired. If SWSM contention prevents resource release, it retains the MMIO mapping and ``DRV_LOAD`` and retries on a later STOP. Release clears only the bits held by this driver, preserving firmware and other software resource bits."
+
+msgid "支持标准 1500 字节 MTU。软件收发接口的帧长度不含 FCS，最大为 1514 字节；加上 FCS 后的线上帧最大为 1518 字节。当前不支持 VLAN、巨帧、硬件校验和或分段卸载、 多队列、RSS、时间戳、EEE 配置及运行期间的 PHY 重配置。数据收发始终由现有网络 服务在任务上下文处理。"
+msgstr "The driver supports the standard 1500-byte MTU. Frame lengths at the software transmit/receive interface exclude FCS and are limited to 1514 bytes; the maximum frame on the wire is 1518 bytes including FCS. It does not currently support VLAN, jumbo frames, hardware checksum or segmentation offload, multiple queues, RSS, timestamps, EEE configuration, or runtime PHY reconfiguration. Transmit and receive work always runs in task context through the existing network service."
 
 msgid "验证范围"
 msgstr "Validation coverage"
@@ -42,6 +54,12 @@ msgstr "``tools/test_i225.py`` compiles the real driver objects with ASan/UBSan 
 
 msgid "错误路径测试覆盖 NVM 校验和不符、NVM/MDIO 超时或错误后的固件锁释放，以及 DMA 停止失败时保留全部 DMA 资源并在重试卸载成功后释放。"
 msgstr "Failure-path tests cover an invalid NVM checksum, firmware-lock release after NVM/MDIO timeouts or errors, and retention of all DMA resources when DMA fails to stop, followed by release after a successful unload retry."
+
+msgid "NVM 和 PHY 同步资源分别覆盖释放失败、重复 STOP 仍失败，以及竞争消失后 STOP 成功的路径，验证映射与驱动所有权标记在资源释放前保留。"
+msgstr "Separate NVM and PHY synchronization-resource tests cover release failure, repeated STOP failure, and successful STOP after contention ends. They verify that the mapping and driver ownership flag are retained until the resources are released."
+
+msgid "模型还覆盖 PCI 电源管理能力链和 D0 恢复、PHY 复位被固件禁止或未能完成、SWSM 读取获取软件锁的语义、MDIO 返回寄存器编号不符、队列启用超时及短帧清零补齐。"
+msgstr "The model also covers the PCI power-management capability chain and D0 restoration, firmware-blocked or incomplete PHY resets, SWSM read-to-acquire software-lock semantics, mismatched register numbers in MDIO responses, queue-enable timeouts, and zero-padding of short frames."
 
 msgid "中断模型覆盖 MSI 通知、没有 MSI 时的轮询回退、ICR 读取清除、IMS 写 1 置位和 IMC 写 1 清除语义，以及重新启用中断时到包或链路状态变化（LSC）的竞态。卸载测试还覆盖 停止通知接入后到达的迟到 IRQ，验证它不会再次通知网络服务。"
 msgstr "The interrupt model covers MSI notifications, polling fallback when MSI is unavailable, ICR clear-on-read behavior, IMS write-one-to-set and IMC write-one-to-clear semantics, and packet-arrival or link-status-change (LSC) races while interrupts are re-enabled. Unload tests also deliver a late IRQ after notification admission closes and verify that it does not notify the network service again."

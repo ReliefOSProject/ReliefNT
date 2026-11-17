@@ -18,9 +18,16 @@ static void i225_irq(void *context)
         netdev_rx_notify(ifindex);
 }
 
+/** @brief Set a bounded interrupt rate and request an optional MSI lease.
+ * @param d Initializing mapped device with all interrupt sources masked.
+ * Failure to acquire MSI leaves task polling available; no interface is published.
+ */
 void i225_interrupt_prepare(struct i225_device *d)
 {
     d->irq_masked = true;
+    /* Bound MSI frequency at about 20,000/s while task polling drains bursts. */
+    i225_write(d, I225_EITR0, I225_EITR_20K);
+    i225_flush(d);
     if (d->api->struct_size < I225_PCI_IRQ_API_SIZE ||
         !d->api->request_pci_irq || !d->api->free_pci_irq)
         return;

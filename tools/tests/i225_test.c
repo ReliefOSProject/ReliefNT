@@ -17,13 +17,21 @@ extern const struct reliefos_driver_module i225_driver_module __attribute__((wea
 #define IMS 0x01508u
 #define IMC 0x0150cu
 #define IAM 0x01510u
+#define EITR 0x01680u
 #define EECD 0x00010u
 #define EERD 0x12014u
 #define MDIC 0x00020u
+#define CTRL_EXT 0x00018u
+#define PHPM 0x00e14u
+#define EEER 0x00e30u
+#define IPCNFG 0x00e38u
+#define MANC 0x05820u
 #define SWSM 0x05b50u
 #define SW_FW_SYNC 0x05b5cu
 #define RCTL 0x00100u
 #define TCTL 0x00400u
+#define RXPBS 0x02404u
+#define TXPBS 0x03404u
 #define RDBAL 0x0c000u
 #define RDBAH 0x0c004u
 #define RDLEN 0x0c008u
@@ -36,6 +44,7 @@ extern const struct reliefos_driver_module i225_driver_module __attribute__((wea
 #define TDT 0x0e018u
 #define TXDCTL 0x0e028u
 #define RXCSUM 0x05000u
+#define RFCTL 0x05008u
 #define RLPML 0x05004u
 #define MRQC 0x05818u
 #define RX_COUNT 256u
@@ -66,6 +75,10 @@ struct dma_allocation { uint64_t address; unsigned pages; uint8_t *bytes; };
 static uint32_t registers[0x13000 / 4];
 #define REG(offset) registers[(offset) / 4]
 static uint16_t device_id = 0x15f3, command = 7;
+static uint16_t config[128];
+static uint8_t pm_capability;
+static bool refuse_d0;
+static unsigned d0_writes;
 static uint16_t phy[32], mmd_address, mmd_aneg;
 static unsigned mmd_data_mode;
 static uint64_t bar = 0x120000000ULL, physical_next = 0x140000000ULL;
@@ -81,8 +94,14 @@ static unsigned inject_rx_index;
 static const struct reliefnt_netdev_ops *network;
 static void *network_context;
 static uint16_t nvm[64];
-static bool nvm_timeout, mdio_timeout, mdio_error;
-static unsigned nvm_reads;
+static bool nvm_timeout, mdio_timeout, mdio_error, mdio_wrong_register;
+static bool phy_reset_timeout;
+static bool block_phy_release, block_nvm_release;
+static unsigned phy_resets, mdio_commands, nvm_reads, semaphore_rejections;
+static unsigned semaphore_requests;
+static unsigned queue_delay, pending_rx_enable, pending_tx_enable;
+static bool reject_rx_enable, reject_tx_enable;
+static uint32_t rx_enable_value, tx_enable_value;
 static bool reject_busmaster_disable;
 static int enumeration_error;
 
@@ -143,12 +162,55 @@ uint32_t i225_io_read(const volatile uint8_t *base, unsigned offset)
     uint32_t value = REG(offset);
     if (offset == ICR)
         REG(ICR) = 0;
+    if (offset == SWSM)
+        REG(SWSM) |= 1u; /* Read-to-acquire SMBI returns its previous value. */
     return value;
 }
 
 void i225_io_write(volatile uint8_t *base, unsigned offset, uint32_t value)
 {
     assert(base == (volatile uint8_t *)registers && offset < sizeof(registers));
+    if (offset == CTRL && (value & (1u << 31)) && !(REG(CTRL) & (1u << 31))) {
+        assert(REG(SW_FW_SYNC) & 2u);
+        assert(!(REG(MANC) & (1u << 18)));
+        REG(PHPM) &= ~(1u << 8);
+        ++phy_resets;
+    }
+    if (offset == CTRL && !(value & (1u << 31)) && (REG(CTRL) & (1u << 31)) &&
+        !phy_reset_timeout)
+        REG(PHPM) |= 1u << 8;
+    if (offset == SWSM && (value & 2u)) {
+        assert(REG(SWSM) & 1u);
+        ++semaphore_requests;
+        if (semaphore_rejections) {
+            --semaphore_rejections;
+            value &= ~2u;
+        }
+    }
+    if (offset == MDIC) {
+        assert(REG(SW_FW_SYNC) & 2u);
+        assert(phy_resets && (REG(PHPM) & (1u << 8)));
+        ++mdio_commands;
+    }
+    if ((offset == RXDCTL || offset == TXDCTL) && (value & (1u << 25))) {
+        if ((offset == RXDCTL && reject_rx_enable) || (offset == TXDCTL && reject_tx_enable))
+            value &= ~(1u << 25);
+        else if (queue_delay) {
+            if (offset == RXDCTL) {
+                pending_rx_enable = queue_delay;
+                rx_enable_value = value;
+            } else {
+                pending_tx_enable = queue_delay;
+                tx_enable_value = value;
+            }
+            value &= ~(1u << 25);
+        }
+    }
+    if (offset == RDT && value) {
+        assert(REG(RXDCTL) & (1u << 25));
+        assert(REG(TXDCTL) & (1u << 25));
+        assert(REG(RCTL) & (1u << 1));
+    }
     if (offset == IMC) {
         REG(IMS) &= ~value;
         REG(IMC) = value;
@@ -190,12 +252,25 @@ static int enumerate(uint32_t index, struct reliefos_driver_pci_device *out)
 }
 
 static uint16_t pci_read16(uint8_t bus, uint8_t slot, uint8_t function, uint8_t offset)
-{ assert(bus == 2 && slot == 3 && !function && offset == 4); return command; }
+{
+    assert(bus == 2 && slot == 3 && !function && !(offset & 1));
+    return offset == 4 ? command : config[offset / 2];
+}
 
 static void pci_write16(uint8_t bus, uint8_t slot, uint8_t function,
                         uint8_t offset, uint16_t value)
 {
-    assert(bus == 2 && slot == 3 && !function && offset == 4);
+    assert(bus == 2 && slot == 3 && !function && !(offset & 1));
+    if (offset != 4) {
+        assert(pm_capability && offset == pm_capability + 4);
+        uint16_t old = config[offset / 2];
+        config[offset / 2] = (value & ~0x8000u) | (old & ~value & 0x8000u);
+        if (refuse_d0)
+            config[offset / 2] |= old & 3u;
+        assert(!(command & 4u));
+        ++d0_writes;
+        return;
+    }
     if (reject_busmaster_disable)
         value |= command & 4u;
     command = value;
@@ -208,12 +283,14 @@ static uint32_t pci_read32(uint8_t bus, uint8_t slot, uint8_t function, uint8_t 
         return (uint32_t)bar | 4u;
     if (offset == 0x14)
         return (uint32_t)(bar >> 32);
-    return 0;
+    return config[offset / 2] | ((uint32_t)config[offset / 2 + 1] << 16);
 }
 
 static void *map_mmio(uint64_t address, uint64_t bytes)
 {
     assert(address == bar && bytes == 0x13000 && !(command & 7u));
+    if (pm_capability)
+        assert(!(config[(pm_capability + 4) / 2] & 3u));
     if (mapping_failure)
         return NULL;
     ++maps;
@@ -229,6 +306,12 @@ static void unmap_mmio(void *pointer, uint64_t bytes)
 static void sleep_ms(uint64_t milliseconds)
 {
     (void)milliseconds;
+    if (pending_rx_enable || pending_tx_enable)
+        assert(!(command & 4u));
+    if (pending_rx_enable && !--pending_rx_enable)
+        REG(RXDCTL) = rx_enable_value;
+    if (pending_tx_enable && !--pending_tx_enable)
+        REG(TXDCTL) = tx_enable_value;
     if (REG(CTRL) & (1u << 26)) {
         REG(CTRL) &= ~(1u << 26);
         REG(EECD) |= 1u << 9;
@@ -239,6 +322,8 @@ static void sleep_ms(uint64_t milliseconds)
         if (!nvm_timeout) {
             REG(EERD) = 2u | (word << 2) | ((uint32_t)nvm[word] << 16);
             ++nvm_reads;
+            if (word == 63 && block_nvm_release)
+                REG(SWSM) = 1; /* A different software agent acquired SMBI. */
         }
     }
     uint32_t mdic = REG(MDIC);
@@ -266,13 +351,18 @@ static void sleep_ms(uint64_t milliseconds)
             mmd_address = value;
         } else {
             phy[reg] = value;
+            if (reg == 0 && block_phy_release)
+                REG(SWSM) = 1;
         }
-        REG(MDIC) = (1u << 28) | value;
+        REG(MDIC) = (1u << 28) | ((mdio_wrong_register ? reg ^ 1u : reg) << 16) | value;
     }
 }
 
 int driver_register_netdev(const struct reliefnt_netdev_ops *ops, void *context, uint32_t *id)
 {
+    assert(command & 4u);
+    assert((REG(RXDCTL) & (1u << 25)) && (REG(TXDCTL) & (1u << 25)));
+    assert(REG(CTRL_EXT) & (1u << 28));
     if (registration_error)
         return registration_error;
     network = ops;
@@ -331,17 +421,34 @@ static void reset_fixture(void)
     memset(registers, 0, sizeof(registers));
     memset(phy, 0, sizeof(phy));
     memset(nvm, 0, sizeof(nvm));
+    memset(config, 0, sizeof(config));
+    pm_capability = 0;
+    refuse_d0 = false;
+    d0_writes = 0;
     nvm[0] = 0x5452;
     nvm[1] = 0x1200;
     nvm[2] = 0x5634;
     nvm[63] = (uint16_t)(0xbaba - nvm[0] - nvm[1] - nvm[2]);
-    nvm_timeout = mdio_timeout = mdio_error = false;
+    nvm_timeout = mdio_timeout = mdio_error = mdio_wrong_register = false;
+    phy_reset_timeout = false;
+    block_phy_release = block_nvm_release = false;
+    phy_resets = mdio_commands = semaphore_rejections = semaphore_requests = 0;
+    queue_delay = pending_rx_enable = pending_tx_enable = 0;
+    reject_rx_enable = reject_tx_enable = false;
     nvm_reads = 0;
     REG(STATUS) = 1u << 1;
     REG(EECD) = 1u << 9;
     REG(IAM) = UINT32_MAX;
     REG(RXCSUM) = REG(MRQC) = UINT32_MAX;
     REG(CTRL) = (1u << 27) | (1u << 28) | (1u << 30);
+    REG(CTRL_EXT) = 0x55aa;
+    REG(EEER) = (7u << 16) | 0x125;
+    REG(IPCNFG) = 0x11c;
+    REG(RXPBS) = REG(TXPBS) = REG(RFCTL) = UINT32_MAX;
+    for (unsigned i = 1; i < 16; ++i) {
+        REG(0x5400 + i * 8) = 0xa5a5a5a5;
+        REG(0x5404 + i * 8) = 0x80001234;
+    }
     REG(0x5400) = 0x12005452;
     REG(0x5404) = (1u << 31) | 0x5634;
     phy[2] = 0x0141;
@@ -369,6 +476,7 @@ static void finish(void)
 {
     i225_driver_module.fini();
     assert(!teardown_error && !live && maps == unmaps && command == 7);
+    assert(!(REG(CTRL_EXT) & (1u << 28)));
     assert(!irq_callback && !irq_context);
     network = NULL;
     network_context = NULL;
@@ -392,6 +500,222 @@ static struct tx_desc *tx_ring(void)
     return result;
 }
 
+static void test_power_management(void)
+{
+    /* Traverse an unrelated MSI capability before PM; preserve pending PME. */
+    reset_fixture();
+    config[6 / 2] = 1u << 4;
+    config[0x34 / 2] = 0x40;
+    config[0x40 / 2] = 0x6005;
+    config[0x60 / 2] = 1;
+    pm_capability = 0x60;
+    config[0x64 / 2] = 0x8103;
+    assert(!i225_driver_module.init(&api));
+    assert(d0_writes == 1 && config[0x64 / 2] == 0x8100);
+    assert(network && network->is_ready(network_context));
+    finish();
+
+    reset_fixture();
+    config[6 / 2] = 1u << 4;
+    config[0x34 / 2] = 0x40;
+    config[0x40 / 2] = 5; /* No PM capability is also a valid conventional chain. */
+    assert(!i225_driver_module.init(&api));
+    assert(!d0_writes);
+    finish();
+
+    const uint8_t corrupt[] = {0x3c, 0x42, 0xff};
+    for (unsigned i = 0; i < sizeof(corrupt); ++i) {
+        reset_fixture();
+        config[6 / 2] = 1u << 4;
+        config[0x34 / 2] = corrupt[i];
+        unsigned previous_maps = maps;
+        assert(i225_driver_module.init(&api) == -22);
+        assert(maps == previous_maps && !network && !live);
+        finish();
+    }
+
+    reset_fixture();
+    config[6 / 2] = 1u << 4;
+    config[0x34 / 2] = 0x40;
+    config[0x40 / 2] = 0x6005;
+    config[0x60 / 2] = 0x4005; /* A cycle must terminate without MMIO. */
+    unsigned previous_maps = maps;
+    assert(i225_driver_module.init(&api) == -22);
+    assert(maps == previous_maps && !network && !live);
+    finish();
+
+    reset_fixture();
+    config[6 / 2] = 1u << 4;
+    config[0x34 / 2] = 0xfc;
+    config[0xfc / 2] = 1; /* PMCSR would extend past conventional config space. */
+    previous_maps = maps;
+    assert(i225_driver_module.init(&api) == -22);
+    assert(maps == previous_maps && !network);
+    finish();
+
+    reset_fixture();
+    config[6 / 2] = 1u << 4;
+    config[0x34 / 2] = pm_capability = 0x50;
+    config[0x50 / 2] = 1;
+    config[0x54 / 2] = 0x8103;
+    refuse_d0 = true;
+    previous_maps = maps;
+    assert(i225_driver_module.init(&api) == -5);
+    assert(d0_writes == 1 && config[0x54 / 2] == 0x8103);
+    assert(maps == previous_maps && !network && !live);
+    finish();
+}
+
+static void test_phy_and_semaphores(void)
+{
+    reset_fixture();
+    REG(MANC) = 1u << 18;
+    assert(i225_driver_module.init(&api) == -16);
+    assert(!phy_resets && !mdio_commands && !network && !live);
+    assert(REG(EEER) == ((7u << 16) | 0x125) && REG(IPCNFG) == 0x11c);
+    finish();
+
+    reset_fixture();
+    phy_reset_timeout = true;
+    assert(i225_driver_module.init(&api) == -110);
+    assert(phy_resets == 1 && !mdio_commands && !network && !live);
+    assert(!(REG(CTRL) & (1u << 31)) && !REG(SW_FW_SYNC) && !REG(SWSM));
+    finish();
+
+    reset_fixture();
+    mdio_wrong_register = true;
+    assert(i225_driver_module.init(&api) == -5);
+    assert(mdio_commands == 1 && !network && !live);
+    assert(!REG(SW_FW_SYNC) && !REG(SWSM));
+    finish();
+
+    reset_fixture();
+    semaphore_rejections = 3;
+    assert(!i225_driver_module.init(&api));
+    assert(semaphore_requests >= 4 && !semaphore_rejections);
+    assert(!REG(SW_FW_SYNC) && !REG(SWSM));
+    assert(phy_resets == 1 && REG(EEER) == 0x125 && REG(IPCNFG) == 0x100);
+    assert(REG(CTRL_EXT) == ((1u << 28) | 0x55aa));
+    finish();
+    assert(REG(CTRL_EXT) == 0x55aa);
+
+    reset_fixture();
+    semaphore_rejections = 100;
+    assert(i225_driver_module.init(&api) == -16);
+    assert(semaphore_requests == 100 && !REG(SWSM) && !REG(SW_FW_SYNC));
+    assert(!phy_resets && !network && !live);
+    finish();
+
+    reset_fixture();
+    REG(SWSM) = 1; /* Another software owner must not have its lock cleared. */
+    assert(i225_driver_module.init(&api) == -16);
+    assert(REG(SWSM) == 1 && !semaphore_requests && !phy_resets && !network);
+    finish();
+
+    reset_fixture();
+    REG(SW_FW_SYNC) = 2u << 16; /* Firmware owns the PHY resource. */
+    assert(i225_driver_module.init(&api) == -16);
+    assert(REG(SW_FW_SYNC) == (2u << 16) && !REG(SWSM));
+    assert(!phy_resets && !mdio_commands && !network);
+    finish();
+
+    /* Ownership survives release failure until STOP can obtain SWSM again. */
+    for (unsigned use_nvm = 0; use_nvm < 2; ++use_nvm) {
+        reset_fixture();
+        uint32_t unrelated = (1u << 4) | (1u << 20);
+        REG(SW_FW_SYNC) = unrelated;
+        if (use_nvm) {
+            REG(0x5404) = 0;
+            block_nvm_release = true;
+        } else {
+            block_phy_release = true;
+        }
+        uint32_t owned = use_nvm ? 1 : 2;
+        unsigned previous_unmaps = unmaps;
+        assert(i225_driver_module.init(&api) == -16);
+        assert(!network && !live && maps == previous_unmaps + 1 && unmaps == previous_unmaps);
+        assert(REG(SW_FW_SYNC) == (unrelated | owned) && REG(SWSM) == 1);
+        assert(REG(CTRL_EXT) & (1u << 28));
+        i225_driver_module.fini();
+        assert(teardown_error == -16 && unmaps == previous_unmaps);
+        assert(REG(SW_FW_SYNC) == (unrelated | owned) && REG(SWSM) == 1);
+        REG(SWSM) = 0; /* External owner releases; normal unload may now finish. */
+        teardown_error = 0;
+        finish();
+        assert(REG(SW_FW_SYNC) == unrelated && !REG(SWSM));
+    }
+}
+
+static void test_queue_startup(void)
+{
+    reset_fixture();
+    queue_delay = 3;
+    assert(!i225_driver_module.init(&api));
+    assert(!pending_rx_enable && !pending_tx_enable && network);
+    assert(REG(RDT) == RX_COUNT - 1);
+    assert(REG(RXPBS) == 0xa2 && REG(TXPBS) == 0x04000014);
+    assert(REG(RFCTL) == (1u << 16) && (REG(RCTL) & (1u << 22)));
+    for (unsigned i = 1; i < 15; ++i)
+        assert(!REG(0x5400 + i * 8) && !REG(0x5404 + i * 8));
+    assert(REG(0x5478) == 0xa5a5a5a5 && REG(0x547c) == 0x80001234);
+    finish();
+
+    for (unsigned i = 0; i < 2; ++i) {
+        reset_fixture();
+        irq_request_error = 0;
+        reject_rx_enable = i == 0;
+        reject_tx_enable = i == 1;
+        assert(i225_driver_module.init(&api) == -110);
+        assert(!network && !live && irq_frees == 1 && !irq_callback && !REG(RDT));
+        finish();
+    }
+}
+
+static void test_frame_boundaries(void)
+{
+    reset_fixture();
+    assert(!i225_driver_module.init(&api));
+    struct tx_desc *tx = tx_ring();
+    uint8_t long_frame[1515];
+    memset(long_frame, 0xa5, sizeof(long_frame));
+    /* Fill every slot once with a long packet so padding must erase reused data. */
+    for (unsigned i = 0; i < TX_COUNT; ++i) {
+        assert(!network->send(network_context, long_frame, 1514));
+        tx[i].wb.status = TX_DD;
+    }
+    for (unsigned length = 14; length <= 61; ++length) {
+        uint8_t *frame = malloc(length);
+        assert(frame);
+        memset(frame, 0x5a, length);
+        unsigned index = REG(TDT);
+        assert(!network->send(network_context, frame, length));
+        free(frame);
+        unsigned wire_length = length < 60 ? 60 : length;
+        assert((tx[index].read.command & 0xffffu) == wire_length);
+        assert(tx[index].read.offload == wire_length << 14);
+        uint8_t *bytes = alias(tx[index].read.address);
+        for (unsigned i = 0; i < wire_length; ++i)
+            assert(bytes[i] == (i < length ? 0x5a : 0));
+        assert(bytes[wire_length] == 0xa5);
+        tx[index].wb.status = TX_DD;
+    }
+    unsigned tail = REG(TDT);
+    assert(network->send(network_context, long_frame, 1515) == -90 && REG(TDT) == tail);
+    struct rx_desc *rx = rx_ring();
+    uint8_t output[1518];
+    memcpy(alias(rx[0].read.packet), long_frame, 1514);
+    rx[0].wb.length = 1514;
+    rx[0].wb.status = RX_DD | RX_EOP;
+    uint32_t length = 0;
+    assert(REG(RLPML) == 1518);
+    assert(network->poll(network_context, output, sizeof(output), &length) == 1);
+    assert(length == 1514 && !memcmp(output, long_frame, length));
+    rx[1].wb.length = 1515;
+    rx[1].wb.status = RX_DD | RX_EOP;
+    assert(network->poll(network_context, output, sizeof(output), &length) == -90 && !length);
+    finish();
+}
+
 int main(void)
 {
     if (!&i225_driver_module) {
@@ -404,6 +728,11 @@ int main(void)
     struct reliefos_driver_kernel_api truncated_api = api;
     truncated_api.struct_size = RELIEFOS_DRIVER_PHYS_MAP_API_SIZE - 1;
     assert(i225_driver_module.init(&truncated_api) == -22);
+
+    test_power_management();
+    test_phy_and_semaphores();
+    test_queue_startup();
+    test_frame_boundaries();
 
     reset_fixture();
     device_id = 0x125c; /* I226-V is deliberately outside the first device table. */
@@ -473,6 +802,7 @@ int main(void)
     assert(irq_requests == 1 && !irq_callback && !(REG(IMS) & IRQ_MASK));
     assert(network && network->is_ready(network_context));
     assert(!REG(IAM));
+    assert(REG(EITR) == (196u | (1u << 31)));
     assert(!REG(RXCSUM) && !REG(MRQC) && REG(RLPML) == 1518);
     assert(!(REG(CTRL) & ((1u << 27) | (1u << 28) | (1u << 30))));
     assert(REG(RDLEN) == RX_COUNT * 16 && REG(TDLEN) == TX_COUNT * 16);
@@ -667,6 +997,6 @@ int main(void)
     assert(network && network->is_ready(network_context));
     finish();
 
-    puts("PASS i225: advanced TX/RX wrap, MSI/rearm races, PHY/NVM errors, DMA STOP retention and cleanup");
+    puts("PASS i225: PCI D0, PHY reset/semaphores, queue startup, frame padding/limits, MSI races, DMA STOP");
     return 0;
 }

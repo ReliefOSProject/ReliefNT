@@ -11,6 +11,7 @@
 #define I225_IMS           0x01508u
 #define I225_IMC           0x0150cu
 #define I225_IAM           0x01510u
+#define I225_EITR0         0x01680u
 #define I225_EECD          0x00010u
 #define I225_MDIC          0x00020u
 #define I225_SWSM          0x05b50u
@@ -18,6 +19,8 @@
 #define I225_EERD          0x12014u
 #define I225_RCTL          0x00100u
 #define I225_TCTL          0x00400u
+#define I225_RXPBS         0x02404u
+#define I225_TXPBS         0x03404u
 #define I225_SRRCTL0       0x0c00cu
 #define I225_RDBAL0        0x0c000u
 #define I225_RDBAH0        0x0c004u
@@ -35,6 +38,7 @@
 #define I225_RAH0          0x05404u
 #define I225_MTA           0x05200u
 #define I225_RXCSUM        0x05000u
+#define I225_RFCTL         0x05008u
 #define I225_RLPML         0x05004u
 #define I225_MRQC          0x05818u
 #define I225_MMIO_BYTES    0x13000u
@@ -69,6 +73,7 @@
 #define I225_RCTL_EN       (1u << 1)
 #define I225_RCTL_MPE      (1u << 4)
 #define I225_RCTL_BAM      (1u << 15)
+#define I225_RCTL_DPF      (1u << 22)
 #define I225_RCTL_SECRC    (1u << 26)
 #define I225_TCTL_EN       (1u << 1)
 #define I225_TCTL_PSP      (1u << 3)
@@ -87,11 +92,15 @@
 #define I225_RX_ERR_MASK   0xff000000u
 #define I225_MDIC_READY    (1u << 28)
 #define I225_MDIC_ERROR    (1u << 30)
+#define I225_RFCTL_IPV6_EX_DIS (1u << 16)
+#define I225_EITR_20K      (196u | (1u << 31)) /* 196 * 256 ns, retain timer on writes. */
 
 #define I225_RX_COUNT      256u
 #define I225_TX_COUNT      64u
 #define I225_BUFFER_BYTES  2048u
-#define I225_MAX_FRAME     1518u
+#define I225_MIN_FRAME     60u /* FCS is appended by the MAC. */
+#define I225_MAX_FRAME     1514u /* Ethernet header + 1500-byte payload, without FCS. */
+#define I225_WIRE_FRAME    (I225_MAX_FRAME + 4u)
 #define I225_RX_PAGES      (I225_RX_COUNT * I225_BUFFER_BYTES / 4096u)
 #define I225_TX_PAGES      (I225_TX_COUNT * I225_BUFFER_BYTES / 4096u)
 
@@ -126,6 +135,7 @@ struct i225_device {
     uint16_t original_command;
     bool command_saved, present, active, dropping_fragments, irq_masked;
     uint32_t ifindex, irq_handle;
+    uint32_t swfw_owned; /* Resources acquired here and still requiring release. */
     uint8_t mac[6];
     uint64_t rx_physical, tx_physical, rx_data_physical, tx_data_physical;
     volatile struct i225_rx_desc *rx;
@@ -151,11 +161,25 @@ int i225_hardware_start(struct i225_device *d);
 int i225_hardware_stop(struct i225_device *d);
 int i225_activate_busmaster(struct i225_device *d);
 int i225_allocate_rings(struct i225_device *d);
-void i225_configure_rings(struct i225_device *d);
+/** @brief Program stopped rings and wait at most 10 ms for each queue to enable.
+ * @param d Device owning initialized DMA; bus mastering remains disabled.
+ * @return Zero or -ETIMEDOUT; failure retains resources for normal STOP cleanup.
+ */
+int i225_configure_rings(struct i225_device *d);
+/** @brief Enable the MAC and publish receive descriptors before interface registration.
+ * @param d Initialized queue pair with bus mastering enabled.
+ */
 void i225_enable_rings(struct i225_device *d);
 void i225_free_rings(struct i225_device *d);
+/** @brief Copy a 14..1514-byte Ethernet frame without FCS; zero-pad up to 60 bytes.
+ * @param d Published device held by its owner. @param frame Borrowed frame bytes.
+ * @param length Input byte count. @return Zero or -EINVAL/-EMSGSIZE/-ENETDOWN/-EAGAIN.
+ */
 int i225_send(struct i225_device *d, const void *frame, uint32_t length);
 int i225_receive(struct i225_device *d, void *frame, uint32_t capacity, uint32_t *length);
+/** @brief Program interrupt moderation and acquire optional MSI, falling back to polling.
+ * @param d Mapped initializing device with all interrupt sources masked.
+ */
 void i225_interrupt_prepare(struct i225_device *d);
 void i225_interrupt_start(struct i225_device *d, uint32_t ifindex);
 void i225_interrupt_complete(struct i225_device *d);

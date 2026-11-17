@@ -24,40 +24,80 @@ int i225_allocate_rings(struct i225_device *d)
     return 0;
 }
 
-void i225_configure_rings(struct i225_device *d)
+/** @brief Confirm descriptor fetching was enabled before publishing a queue.
+ * @param d Initializing device; no spinlocks held. @param reg RXDCTL or TXDCTL.
+ * @param enable Required enable bit. @return Zero or -ETIMEDOUT after 10 ms.
+ */
+static int wait_queue(struct i225_device *d, unsigned reg, uint32_t enable)
+{
+    for (unsigned elapsed = 0;; ++elapsed) {
+        if (i225_read(d, reg) & enable)
+            return 0;
+        if (elapsed == 10)
+            return -110;
+        d->api->sleep_ms(1);
+    }
+}
+
+/** @brief Configure a single standard-MTU queue pair from owned DMA storage.
+ * @param d Device with bus mastering disabled and initialized DMA descriptors.
+ * @return Zero or -ETIMEDOUT; no interface may be published after failure.
+ */
+int i225_configure_rings(struct i225_device *d)
 {
     i225_write(d, I225_RCTL, 0);
     i225_write(d, I225_TCTL, 0);
     i225_write(d, I225_RXDCTL0, 0);
     i225_write(d, I225_TXDCTL0, 0);
+    /* Restore normal I225 packet-buffer partitioning, including after TSN firmware. */
+    i225_write(d, I225_RXPBS, 0x000000a2u);
+    i225_write(d, I225_TXPBS, 0x04000014u);
     i225_write(d, I225_RXCSUM, 0); /* The network stack verifies IP and transport checksums. */
     i225_write(d, I225_MRQC, 0); /* All accepted frames belong to queue zero. */
-    i225_write(d, I225_RLPML, I225_MAX_FRAME);
+    /* Disable IPv6 extension-header parsing as required by the hardware erratum. */
+    i225_write(d, I225_RFCTL, I225_RFCTL_IPV6_EX_DIS);
+    i225_write(d, I225_RLPML, I225_WIRE_FRAME);
     i225_write(d, I225_RDBAL0, (uint32_t)d->rx_physical);
     i225_write(d, I225_RDBAH0, (uint32_t)(d->rx_physical >> 32));
     i225_write(d, I225_RDLEN0, I225_RX_COUNT * sizeof(*d->rx));
     i225_write(d, I225_RDH0, 0);
-    i225_write(d, I225_RDT0, I225_RX_COUNT - 1);
+    i225_write(d, I225_RDT0, 0);
     i225_write(d, I225_SRRCTL0, I225_SRRCTL_2048 | I225_SRRCTL_ADV);
-    i225_write(d, I225_RXDCTL0, 8u | (8u << 8) | (4u << 16) | I225_RXDCTL_ENABLE);
     i225_write(d, I225_TDBAL0, (uint32_t)d->tx_physical);
     i225_write(d, I225_TDBAH0, (uint32_t)(d->tx_physical >> 32));
     i225_write(d, I225_TDLEN0, I225_TX_COUNT * sizeof(*d->tx));
     i225_write(d, I225_TDH0, 0);
     i225_write(d, I225_TDT0, 0);
-    i225_write(d, I225_TXDCTL0, 8u | (1u << 8) | (16u << 16) | I225_TXDCTL_ENABLE);
+    /* RAR[15] belongs to manageability; discard stale host filters in 1..14. */
+    for (unsigned i = 1; i < 15; ++i) {
+        i225_write(d, I225_RAL0 + i * 8, 0);
+        i225_write(d, I225_RAH0 + i * 8, 0);
+    }
     for (unsigned i = 0; i < 128; ++i)
         i225_write(d, I225_MTA + i * 4, 0);
     d->rx_next = d->tx_next = d->tx_clean = 0;
     d->dropping_fragments = false;
     __atomic_thread_fence(__ATOMIC_RELEASE);
+    i225_write(d, I225_TXDCTL0, 8u | (1u << 8) | (16u << 16) | I225_TXDCTL_ENABLE);
+    i225_write(d, I225_RXDCTL0, 8u | (8u << 8) | (4u << 16) | I225_RXDCTL_ENABLE);
     i225_flush(d);
+    int rc = wait_queue(d, I225_TXDCTL0, I225_TXDCTL_ENABLE);
+    if (!rc)
+        rc = wait_queue(d, I225_RXDCTL0, I225_RXDCTL_ENABLE);
+    return rc;
 }
 
+/** @brief Enable the MAC and publish the initial receive descriptor budget.
+ * @param d Initialized queue pair with bus mastering enabled, before publication.
+ */
 void i225_enable_rings(struct i225_device *d)
 {
     i225_write(d, I225_TCTL, I225_TCTL_EN | I225_TCTL_PSP | (15u << 4) | (64u << 12));
-    i225_write(d, I225_RCTL, I225_RCTL_EN | I225_RCTL_BAM | I225_RCTL_MPE | I225_RCTL_SECRC);
+    i225_write(d, I225_RCTL, I225_RCTL_EN | I225_RCTL_BAM | I225_RCTL_MPE |
+               I225_RCTL_DPF | I225_RCTL_SECRC);
+    i225_flush(d);
+    /* Publish descriptors only after both queue fetching and receive are enabled. */
+    i225_write(d, I225_RDT0, I225_RX_COUNT - 1);
     i225_flush(d);
 }
 
@@ -77,6 +117,12 @@ void i225_free_rings(struct i225_device *d)
     d->rx_data = d->tx_data = NULL;
 }
 
+/** @brief Copy and queue one Ethernet frame, padding short frames with zeros.
+ * @param d Published device; callback owner pin keeps DMA storage alive.
+ * @param frame Borrowed nonnull Ethernet bytes, excluding FCS.
+ * @param length 14..1514 bytes. @return Zero, -EINVAL, -EMSGSIZE, -ENETDOWN
+ * or -EAGAIN when the ring is full; serialized by the TX IRQ spinlock.
+ */
 int i225_send(struct i225_device *d, const void *frame, uint32_t length)
 {
     if (!frame || length < 14)
@@ -102,10 +148,13 @@ int i225_send(struct i225_device *d, const void *frame, uint32_t length)
     const uint8_t *input = frame;
     for (unsigned i = 0; i < length; ++i)
         output[i] = input[i];
+    uint32_t wire_length = length < I225_MIN_FRAME ? I225_MIN_FRAME : length;
+    for (unsigned i = length; i < wire_length; ++i)
+        output[i] = 0;
     d->tx[index].read.address = d->tx_data_physical + (uint64_t)index * I225_BUFFER_BYTES;
     d->tx[index].read.command = I225_TX_DTYP_DATA | I225_TX_DEXT | I225_TX_IFCS |
-                                I225_TX_EOP | I225_TX_RS | length;
-    d->tx[index].read.offload = length << 14;
+                                I225_TX_EOP | I225_TX_RS | wire_length;
+    d->tx[index].read.offload = wire_length << 14;
     __atomic_thread_fence(__ATOMIC_RELEASE);
     d->tx_next = next;
     i225_write(d, I225_TDT0, next);

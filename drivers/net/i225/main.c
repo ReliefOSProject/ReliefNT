@@ -91,10 +91,10 @@ static int start(const struct reliefos_driver_kernel_api *api)
             i225_interrupt_prepare(d);
         if (!rc)
             rc = i225_allocate_rings(d);
-        if (!rc) {
-            i225_configure_rings(d);
+        if (!rc)
+            rc = i225_configure_rings(d);
+        if (!rc)
             rc = i225_activate_busmaster(d);
-        }
         if (!rc) {
             i225_enable_rings(d);
             d->active = true;
