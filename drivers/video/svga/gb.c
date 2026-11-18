@@ -69,20 +69,23 @@ int svga_gb_backing_alloc_locked(struct svga_mob *m, uint32_t bytes)
  * @param phys Caller-owned page-aligned PPN32 backing, including the final PPN.
  * @param pages Nonzero backing page count within the MOB page-table format.
  * @param bytes Nonzero accessible byte count, at most pages * 4096 and MOB_MAX_SIZE.
- * @return Zero, EINVAL for invalid backing, or ENOMEM for budget/allocation failure.
+ * @return Zero, EINVAL for invalid backing, EBUSY for temporary budget pressure,
+ * or ENOMEM for a request exceeding total capacity or a failed allocation.
  * Caller holds svga_lock. Both owned page-table and borrowed payload charges stay
  * reserved until fenced backing_free; this function never frees caller payload.
  */
-int svga_gb_backing_borrow_locked(struct svga_mob *m, uint64_t phys,
-                                  uint32_t pages, uint32_t bytes)
+static int backing_borrow(struct svga_mob *m, uint64_t phys,
+                           uint32_t pages, uint32_t bytes,
+                           const struct svga_gmr_segment *segments,
+                           uint32_t count)
 {
     if (!m || !phys || (phys & 4095u) || !pages || !bytes ||
         bytes > (uint64_t)pages * 4096u || pages > SVGA_MOB_MAX_PAGES || bytes > svga.mob_max_bytes ||
-        !svga_ppn32_run(phys, pages))
+        (!segments && !svga_ppn32_run(phys, pages)))
         return SVGA_EINVAL;
     uint32_t tables = pages <= 1 ? 0 : pages <= 1024 ? 1 : 1 + (pages + 1023u) / 1024u;
     if (!svga_page_budget_allows(pages + tables))
-        return SVGA_ENOMEM;
+        return pages + tables > svga.page_limit ? SVGA_ENOMEM : SVGA_EBUSY;
     uint64_t pt_phys = tables ? backing_alloc_pages(tables) : 0;
     if (tables && !pt_phys) return SVGA_ENOMEM;
     *m = (struct svga_mob){.phys = phys, .pt_phys = pt_phys, .pages = pages,
@@ -95,13 +98,40 @@ int svga_gb_backing_borrow_locked(struct svga_mob *m, uint64_t phys,
         if (tables > 1)
             for (uint32_t i = 0; i < tables - 1; ++i)
                 pt[i] = (uint32_t)(pt_phys >> 12) + i + 1;
-        for (uint32_t i = 0; i < pages; ++i)
-            leaves[i] = (uint32_t)(phys >> 12) + i;
+        if (segments) {
+            uint32_t at = 0;
+            for (uint32_t run = 0; run < count; ++run)
+                for (uint32_t i = 0; i < segments[run].bytes / 4096u; ++i)
+                    leaves[at++] = (uint32_t)(segments[run].phys >> 12) + i;
+        } else {
+            for (uint32_t i = 0; i < pages; ++i)
+                leaves[i] = (uint32_t)(phys >> 12) + i;
+        }
     }
     svga.pages += tables;
     svga.borrowed_mob_pages += pages;
     svga_barrier();
     return 0;
+}
+
+/** @brief Borrow one contiguous pinned run; caller holds the device lock. */
+int svga_gb_backing_borrow_locked(struct svga_mob *m, uint64_t phys,
+                                  uint32_t pages, uint32_t bytes)
+{
+    return backing_borrow(m, phys, pages, bytes, NULL, 0);
+}
+
+/** @brief Borrow prevalidated page-multiple runs; caller holds the device lock.
+ * @param m Exclusive output. @param segments Immutable validated pinned runs.
+ * @param count Nonzero run count. @param bytes Sum of validated run lengths.
+ * @return Zero or SVGA allocation/budget error. Caller retains every run.
+ */
+int svga_gb_backing_borrow_vector_locked(struct svga_mob *m,
+    const struct svga_gmr_segment *segments, uint32_t count, uint32_t bytes)
+{
+    if (!segments || !count) return SVGA_EINVAL;
+    return backing_borrow(m, segments[0].phys, bytes / 4096u, bytes,
+                           segments, count);
 }
 
 void svga_gb_backing_free_locked(struct svga_mob *m)

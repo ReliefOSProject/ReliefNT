@@ -6,6 +6,8 @@
 
 #define BOOT_BASE 0x30000000ULL
 #define DEVICE_BASE 0x70000000ULL
+#define FIFO_BASE (DEVICE_BASE + 65536u)
+#define FIFO_BYTES 16384u
 struct framebuffer fb;
 struct vmware_svga_state vmware_svga;
 struct svga_device svga;
@@ -79,7 +81,11 @@ int framebuffer_range_valid(uint64_t p, uint64_t n) { return p && n; }
  * @return True unless this case injects a claim failure.
  */
 bool paging_mmio_uncached(uint64_t p, uint64_t n)
-{ assert(p == DEVICE_BASE && n == 65536); return !deny_uc; }
+{
+    assert((p == DEVICE_BASE && n == 65536) ||
+           (p == FIFO_BASE && n == FIFO_BYTES));
+    return !deny_uc;
+}
 /** @brief Resolve a device alias or inject mapping failure. @param p Physical base.
  * @return Synthetic direct-map pointer or NULL when failure is selected.
  */
@@ -99,9 +105,27 @@ uint64_t svga_lock(void) { return 0; }
 void svga_unlock(uint64_t flags) { (void)flags; }
 /** @brief Accept fixture tracing restoration. @return True. */
 bool svga_restore_traces_locked(void) { return true; }
-/** @brief Ignore unused FIFO binding. @param port I/O port. @param fifo FIFO alias. @param bytes FIFO size. */
+/** @brief Retain the boot FIFO binding for the device configuration fixture.
+ * @param port I/O port. @param fifo FIFO alias. @param bytes FIFO size.
+ */
 void svga_platform_bind(uint16_t port, volatile uint32_t *fifo, uint32_t bytes)
-{ (void)port; (void)fifo; (void)bytes; }
+{
+    assert(port == 0x1000 && bytes == FIFO_BYTES);
+    svga.fifo = fifo;
+    svga.fifo_bytes = bytes;
+    svga.bound = true;
+}
+/** @brief Emulate successful configuration of the already-bound boot FIFO.
+ * @param extended Whether the optional extended register block is requested.
+ * @return Zero when the fixture has a valid binding, otherwise SVGA_ENODEV.
+ */
+int svga_configure_locked(bool extended)
+{
+    assert(!extended);
+    if (!svga.bound || !svga.fifo || !svga.fifo_bytes) return SVGA_ENODEV;
+    svga.fifo_ready = true;
+    return 0;
+}
 
 /** @brief Exercise one real probe with distinct GOP and SVGA surfaces.
  * @param argc Argument count. @param argv Required scenario name.
@@ -127,6 +151,8 @@ int main(int argc, char **argv)
     registers[VMWARE_SVGA_REG_FB_OFFSET] = 0;
     registers[VMWARE_SVGA_REG_FB_MAX_SIZE] = 65536;
     registers[VMWARE_SVGA_REG_FB_SIZE] = 65536;
+    registers[VMWARE_SVGA_REG_MEM_START] = FIFO_BASE;
+    registers[VMWARE_SVGA_REG_MEM_SIZE] = FIFO_BYTES;
     registers[VMWARE_SVGA_REG_WIDTH] = already_enabled ? 16 : 23;
     registers[VMWARE_SVGA_REG_HEIGHT] = already_enabled ? 1 : 3;
     registers[VMWARE_SVGA_REG_DEPTH] = already_enabled ? 24 : 16;
@@ -177,10 +203,11 @@ int main(int argc, char **argv)
         pixel_bar=DEVICE_BASE|12u;pixel_bar_high=1;
         assert(!framebuffer_enable_writecombine_boot());pixel_bar_high=0;
         pixel_bar=DEVICE_BASE|8u;
-        registers[VMWARE_SVGA_REG_MEM_START]=DEVICE_BASE;
-        registers[VMWARE_SVGA_REG_MEM_SIZE]=4096;
+        fb.auxiliary_reservation_start=DEVICE_BASE;
+        fb.auxiliary_reservation_bytes=4096;
         assert(!framebuffer_enable_writecombine_boot() && !wc_promotions);
-        registers[VMWARE_SVGA_REG_MEM_START]=DEVICE_BASE+65536;
+        fb.auxiliary_reservation_start=FIFO_BASE;
+        fb.auxiliary_reservation_bytes=FIFO_BYTES;
         deny_wc=already_enabled;
         assert(framebuffer_enable_writecombine_boot()==!deny_wc && wc_promotions==1);
         if(!deny_wc) {

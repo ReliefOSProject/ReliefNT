@@ -36,15 +36,25 @@ bool svga_try_lock_irqsave(uint64_t *flags)
     return true;
 }
 void svga_unlock(uint64_t flags) { (void)flags; }
+void svga_barrier(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+void svga_relax(void) {}
+static uint32_t fifo_read(uint32_t reg) { (void)reg; return 0; }
+static void fifo_write(uint32_t reg, uint32_t value)
+{
+    (void)value;
+    if (reg == SVGA_REG_SYNC) ++doorbells;
+}
 int svga_update_try_locked(uint32_t x, uint32_t y, uint32_t width, uint32_t height)
 {
-    (void)x; (void)y; (void)width; (void)height;
-    return 0;
+    uint32_t words[] = {x, y, width, height};
+    struct svga_span span = {words, sizeof(words)};
+    return svga_fifo_packet_try_locked(SVGA_CMD_UPDATE, false, &span, 1);
 }
 int svga_update_locked(uint32_t x, uint32_t y, uint32_t width, uint32_t height)
 {
-    (void)x; (void)y; (void)width; (void)height;
-    return 0;
+    uint32_t words[] = {x, y, width, height};
+    struct svga_span span = {words, sizeof(words)};
+    return svga_fifo_packet_locked(SVGA_CMD_UPDATE, false, &span, 1);
 }
 bool svga_restore_traces_locked(void) { return false; }
 void x86_64_outl(uint32_t value, uint16_t port)
@@ -73,13 +83,17 @@ static void setup_fifo_full(void)
     memset(&vmware_svga, 0, sizeof(vmware_svga));
     memset(&svga, 0, sizeof(svga));
     vmware_svga.present = true;
-    vmware_svga.fifo_present = true;
     vmware_svga.io_port = 0x456;
-    vmware_svga.fifo = fifo_words;
-    vmware_svga.fifo_min = 16;
-    vmware_svga.fifo_max = 64;
-    fifo_words[VMWARE_SVGA_FIFO_NEXT_CMD] = 40;
-    fifo_words[VMWARE_SVGA_FIFO_STOP] = 60;
+    svga.fifo = fifo_words;
+    svga.bound = svga.fifo_ready = true;
+    svga.min = 16;
+    svga.fifo_bytes = 64;
+    svga.ops.read = fifo_read;
+    svga.ops.write = fifo_write;
+    fifo_words[SVGA_FIFO_MIN] = 16;
+    fifo_words[SVGA_FIFO_MAX] = 64;
+    fifo_words[SVGA_FIFO_NEXT_CMD] = 40;
+    fifo_words[SVGA_FIFO_STOP] = 60;
     framebuffer_drm_scanout_owned = false;
     framebuffer_drm_damage_pending = false;
     doorbells = 0;
@@ -109,12 +123,12 @@ static void test_full_fifo_damage_is_retained_and_retried(void)
            framebuffer_drm_pending_x2 == 9 && framebuffer_drm_pending_y2 == 11);
     assert(gfb[10u * 16u + 8u] == 0xffabcdefu);
 
-    fifo_words[VMWARE_SVGA_FIFO_NEXT_CMD] = 40;
-    fifo_words[VMWARE_SVGA_FIFO_STOP] = 40;
+    fifo_words[SVGA_FIFO_NEXT_CMD] = 40;
+    fifo_words[SVGA_FIFO_STOP] = 40;
     framebuffer_display_tick();
     assert(!framebuffer_drm_damage_pending);
-    assert(fifo_words[VMWARE_SVGA_FIFO_NEXT_CMD] == 60);
-    assert(fifo_words[10] == VMWARE_SVGA_CMD_UPDATE);
+    assert(fifo_words[SVGA_FIFO_NEXT_CMD] == 60);
+    assert(fifo_words[10] == SVGA_CMD_UPDATE);
     assert(fifo_words[11] == 1 && fifo_words[12] == 2 &&
            fifo_words[13] == 8 && fifo_words[14] == 9);
     assert(doorbells > 0);
@@ -122,9 +136,26 @@ static void test_full_fifo_damage_is_retained_and_retried(void)
     framebuffer_drm_scanout_release();
     assert(!framebuffer_drm_damage_pending && !framebuffer_drm_scanout_owned);
     framebuffer_display_tick();
-    assert(fifo_words[4] == VMWARE_SVGA_CMD_UPDATE);
-    assert(fifo_words[5] == 0 && fifo_words[6] == 0 &&
-           fifo_words[7] == 16 && fifo_words[8] == 16);
+    /* Wrap through the tail instead of skipping bytes the host will parse. */
+    assert(fifo_words[SVGA_FIFO_NEXT_CMD] == 32);
+    assert(fifo_words[15] == SVGA_CMD_UPDATE);
+    assert(fifo_words[4] == 0 && fifo_words[5] == 0 &&
+           fifo_words[6] == 16 && fifo_words[7] == 16);
+}
+
+static void test_panic_forces_deferred_notification(void)
+{
+    setup_fifo_full();
+    svga.fifo_notify_deferred = true;
+    fifo_words[SVGA_FIFO_STOP] = 40;
+    assert(!svga_update_panic(16, 16));
+    assert(doorbells && !svga.fifo_notify_deferred);
+    assert(fifo_words[10] == SVGA_CMD_UPDATE);
+    /* A half-written RESERVE transaction must not be overwritten. */
+    svga.fifo_caps = SVGA_FIFO_CAP_RESERVE;
+    fifo_words[SVGA_FIFO_RESERVED] = 24;
+    assert(svga_update_panic(16, 16) == SVGA_EBUSY);
+    assert(fifo_words[SVGA_FIFO_NEXT_CMD] == 60);
 }
 
 static void test_exact_pixel_extents(void)
@@ -155,6 +186,7 @@ int main(void)
 {
     test_exact_pixel_extents();
     test_full_fifo_damage_is_retained_and_retried();
+    test_panic_forces_deferred_notification();
     puts("framebuffer-drm: PASS");
     return 0;
 }

@@ -41,6 +41,7 @@ void drm_vmwgfx_continuation_release(
     struct drm_vmwgfx_task_continuation *continuation)
 {
     if (!continuation) return;
+    drm_vmwgfx_exec_work_release(continuation->work);
     drm_bo_put(continuation->bo);
     drm_vmwgfx_fence_put(continuation->fence_object);
 #ifdef CONFIG_SWAP
@@ -116,6 +117,9 @@ static int64_t drm_vmwgfx_resume_continuation(
     else if (continuation->kind == DRM_VMW_CONT_SYNCCPU)
         __builtin_memcpy(data, &continuation->snapshot.synccpu,
                          sizeof(continuation->snapshot.synccpu));
+    else if (continuation->kind == DRM_VMW_CONT_EXEC_PREPARE)
+        __builtin_memcpy(data, &continuation->snapshot.exec,
+                         sizeof(continuation->snapshot.exec));
     else {
         drm_vmwgfx_cancel_task_continuation(task);
         if (handled) *handled = true;

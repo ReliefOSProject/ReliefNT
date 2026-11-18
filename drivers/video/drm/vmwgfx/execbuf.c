@@ -152,6 +152,43 @@ static void drm_vmwgfx_exec_submit_fail(
         output_bytes, output_capacity, &failure);
 }
 
+/** @brief Park validated work without dropping buffers needed for registration.
+ * @param task Current syscall owner. @param file Retained original DRM file.
+ * @param command Original ioctl. @param user_argument Original argument address.
+ * @param arg Imported immutable header. @param work Independently pinned work.
+ * @return Blocked, or ENOMEM after queuing safe work cleanup on allocation failure.
+ */
+static int drm_vmwgfx_exec_prepare_wait(struct task *task, struct drm_file *file,
+    uint32_t command, uint64_t user_argument, const struct drm_vmw_execbuf_arg *arg,
+    struct drm_vmwgfx_exec_work *work)
+{
+    struct drm_vmwgfx_task_continuation *continuation = task->drm_vmwgfx_continuation;
+    if (!continuation) {
+        continuation = drm_async_alloc(sizeof(*continuation));
+        if (!continuation) {
+            drm_vmwgfx_exec_work_release(work);
+            return -LINUX_ENOMEM;
+        }
+        *continuation = (struct drm_vmwgfx_task_continuation){
+            .kind = DRM_VMW_CONT_EXEC_PREPARE, .work = work,
+            .snapshot.exec = *arg, .snapshot_bytes = sizeof(*arg)};
+        drm_vmwgfx_continuation_set_key(continuation, task, file, command, user_argument);
+        task->drm_vmwgfx_continuation = continuation;
+    }
+    sched_sleep_current_until(time_ticks() + 1u);
+    return KERNEL_SYSCALL_BLOCKED;
+}
+
+/** @brief Return preparation ownership to the active syscall without freeing work. */
+static void drm_vmwgfx_exec_prepare_finish(struct task *task)
+{
+    struct drm_vmwgfx_task_continuation *continuation = task->drm_vmwgfx_continuation;
+    if (!continuation || continuation->kind != DRM_VMW_CONT_EXEC_PREPARE) return;
+    continuation->work = NULL;
+    task->drm_vmwgfx_continuation = NULL;
+    drm_vmwgfx_continuation_release(continuation);
+}
+
 /**
  * @brief Submit validated GPU commands while retaining work and fault continuations.
  * @param task Execution-owned caller.
@@ -195,10 +232,17 @@ static int drm_vmwgfx_execbuf(struct task *task, struct drm_file *file,
     /* Linux 6.12 ignores this field for every version-1 payload, including
      * the full-size encoding. Keep the local copy canonical as well. */
     arg->context_handle = SVGA3D_INVALID_ID;
+    struct drm_vmwgfx_task_continuation *continuation = task->drm_vmwgfx_continuation;
+    bool resumed = continuation && continuation->kind == DRM_VMW_CONT_EXEC_PREPARE &&
+        drm_vmwgfx_continuation_matches(continuation, task, task->syscall_file,
+                                         file, command, user_argument);
     int allocation_error = 0;
-    struct drm_vmwgfx_exec_work *work = drm_vmwgfx_exec_work_alloc(
-        arg->command_size, 0, &allocation_error, diagnostics);
+    struct drm_vmwgfx_exec_work *work = resumed ? continuation->work :
+        drm_vmwgfx_exec_work_alloc(arg->command_size, 0, &allocation_error, diagnostics);
     if (!work) return allocation_error;
+    int status = 0;
+    struct drm_vmwgfx_exec_walk walk = {.work = work, .file = file};
+    if (resumed) goto registration;
     int input_result=0;
     if (arg->command_size) {
 #ifdef CONFIG_SWAP
@@ -226,8 +270,6 @@ static int drm_vmwgfx_execbuf(struct task *task, struct drm_file *file,
     }
 #endif
 
-    int status = 0;
-    struct drm_vmwgfx_exec_walk walk = {.work = work, .file = file};
     if (arg->command_size) {
         status = drm_vmwgfx_validate_stream(work->snapshot,
                                              arg->command_size,
@@ -247,7 +289,32 @@ static int drm_vmwgfx_execbuf(struct task *task, struct drm_file *file,
             return status;
         }
 
+registration:
+        ;
+        struct svga_info info;
+        svga_get_info(&info);
+        if (!info.available || !info.fifo_ready) {
+            drm_vmwgfx_exec_prepare_finish(task);
+            drm_vmwgfx_exec_work_fail(work, diagnostics, -LINUX_ENODEV, "exec.device");
+            return -LINUX_ENODEV;
+        }
+        uint32_t dma_count = 0;
+        for (uint32_t i = 0; i < work->bo_count; ++i)
+            dma_count += !work->bos[i].query;
+        if (resumed || (dma_count && info.gmr_limit &&
+                        work->bo_count > info.gmr_limit / 2u)) {
+            status = drm_vmwgfx_exec_group_prepare(work);
+            if (status == -LINUX_EBUSY)
+                return drm_vmwgfx_exec_prepare_wait(task, file, command,
+                    user_argument, arg, work);
+            drm_vmwgfx_exec_prepare_finish(task);
+            if (status) {
+                drm_vmwgfx_exec_attachment_fail(work, diagnostics, status, "exec.attach.group");
+                return status;
+            }
+        }
         for (uint32_t i = 0; i < work->bo_count; ++i) {
+            if (work->group_gmr && !work->bos[i].query) continue;
             const char *failure_stage = NULL;
             status = drm_vmwgfx_exec_attachment_get(work->bos[i].object,
                 &work->bos[i].attachment, &failure_stage);
@@ -258,13 +325,6 @@ static int drm_vmwgfx_execbuf(struct task *task, struct drm_file *file,
             }
         }
 
-        struct svga_info info;
-        svga_get_info(&info);
-        if (!info.available || !info.fifo_ready) {
-            drm_vmwgfx_exec_work_fail(work, diagnostics, -LINUX_ENODEV,
-                                      "exec.device");
-            return -LINUX_ENODEV;
-        }
         status = drm_vmwgfx_map_svga_status(svga_batch_init_sized(
             &work->batch, info.generation, work->output,
             work->output_capacity, work->source_bytes));
@@ -280,7 +340,11 @@ static int drm_vmwgfx_execbuf(struct task *task, struct drm_file *file,
         for (uint32_t i = 0; i < work->surface_count && !status; ++i)
             status = drm_vmwgfx_map_svga_status(svga_batch_retain_surface(
                 &work->batch, work->surfaces[i].backend));
+        if (work->group_gmr)
+            status = drm_vmwgfx_map_svga_status(svga_batch_retain_gmr(
+                &work->batch, work->group_gmr));
         for (uint32_t i = 0; i < work->bo_count && !status; ++i) {
+            if (work->group_gmr && !work->bos[i].query) continue;
             if (!work->bos[i].attachment || !work->bos[i].attachment->ready)
                 status = -LINUX_EBUSY;
             else

@@ -34,7 +34,10 @@ typedef uint64_t svga_handle;
 #define SVGA_BATCH_MAX_REFS 32u /* Deprecated; typed limits below are authoritative. */
 #define SVGA_BATCH_MAX_CONTEXT_REFS 64u
 #define SVGA_BATCH_MAX_SURFACE_REFS 256u
-#define SVGA_BATCH_MAX_GMR_REFS 128u
+/* Accepted GMR-bearing packets occupy at least 24 bytes. A power-of-two
+ * capacity derived from the command-buffer bound covers every such reference
+ * and keeps the batch's open-addressed hash table correctly sized. */
+#define SVGA_BATCH_MAX_GMR_REFS (SVGA_BATCH_MAX_INPUT_BYTES / 16u)
 #define SVGA_BATCH_MAX_QUERY_OPS (SVGA_BATCH_MAX_INPUT_BYTES / 8u)
 #define SVGA_BATCH_SUBMIT_FAILURE_SNAPSHOT 1u
 #define SVGA_BATCH_SUBMIT_INDEX_NONE UINT32_MAX
@@ -182,6 +185,7 @@ struct svga_probe_info {
 struct svga_info {
     uint32_t device_caps, fifo_caps, host_version, guest_version;
     uint32_t generation, contexts, surfaces, gmrs, guest_pages;
+    uint32_t gmr_limit;
     uint64_t surface_bytes, surface_limit_bytes;
     uint64_t compat_surface_limit_bytes;
     bool fifo_ready, available;
@@ -197,6 +201,8 @@ struct svga_surface_desc {
 struct svga_dma_box {
     uint32_t x, y, z, w, h, d, srcx, srcy, srcz;
 };
+/* Kernel-owned, immutable, page-aligned physical runs retained by the owner. */
+struct svga_gmr_segment { uint64_t phys; uint32_t bytes; };
 struct svga_present_rect { uint32_t x, y, w, h, srcx, srcy; };
 
 struct svga_batch_query_op {
@@ -315,6 +321,21 @@ int svga_gmr_borrowed_attach(uint64_t phys, uint32_t bytes, void *owner,
  * Execution-owned task context; try-lock only and no reference transfer. Caller keeps the borrowed backing and callback owner alive until final detach.
  */
 int svga_gmr_borrowed_mob_id(svga_handle buffer, uint32_t *mobid);
+
+/** @brief Register disjoint pinned runs as one GMR/MOB address space.
+ * @param segments Immutable page-aligned runs with page-multiple byte lengths.
+ * @param count Nonzero number of runs; retained until owner_put returns.
+ * @param owner Required backing identity kept alive by the caller.
+ * @param owner_put Final callback outside the device lock after retirement.
+ * @param code_owner LIVE callback module, or NULL for permanent code.
+ * @param out In/out handle, initially zero; publication transfers the callback pin.
+ * @return Zero when mapped, EBUSY while progressing, or an SVGA error.
+ * Task/execution context only; never hold the device lock. The caller must keep
+ * every run and the vector immutable and pinned through successful final detach.
+ */
+int svga_gmr_borrowed_attachv(const struct svga_gmr_segment *segments,
+    uint32_t count, void *owner, void (*owner_put)(void *),
+    struct module *code_owner, svga_handle *out);
 /** @brief Retire hardware backing before invoking and releasing its original callback.
  * @param buffer Exact borrowed GMR handle, including partially mapped objects.
  * @return Zero after final callback return, EBUSY while hardware/fences progress,

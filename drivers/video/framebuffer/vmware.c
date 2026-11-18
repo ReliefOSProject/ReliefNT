@@ -1,556 +1,289 @@
+// SPDX-License-Identifier: Apache-2.0
 #include <reliefnt/export.h>
 #include "internal.h"
-
 #include <reliefnt/mm.h>
 #include <reliefnt/paging.h>
 #include <reliefnt/pat.h>
 #include <linux/errno.h>
 
-/** @brief Copy the immutable identity established by successful boot binding.
- * @param out Required writable PCI output; unchanged when unavailable.
- * @return Zero or -ENODEV. Called after boot framebuffer binding, with no
- * allocation, I/O, optional-provider dependency or ownership transfer.
- */
-int framebuffer_vmware_pci_identity(struct pci_device *out)
-{
-    if(!out || !vmware_svga.present)return -ENODEV;
-    *out=vmware_svga.pci;return 0;
-}
+/* Only geometry is rolled back. FIFO cursors and completed generations must
+ * never be copied back after the host has consumed commands. */
+struct vmware_mode {
+    uint32_t enable, width, height, depth, bpp, pseudocolor, traces;
+};
 
-/** @brief Keep a retained WC pixel aperture, or establish its initial UC map.
- * @param physical Device pixel base. @param bytes Aperture byte extent.
- * @return True for compatible permanent coverage, false on a mapping failure.
- * Called under boot or existing modeset serialization; never changes WC to UC.
- */
-static bool vmware_map_pixels(uint64_t physical,uint64_t bytes)
-{
-    return paging_mmio_writecombined(physical,bytes) || paging_mmio_uncached(physical,bytes);
-}
-
-/** @brief Promote only a prefetchable PCI pixel BAR during single-CPU boot.
- * @return True for a verified WC aperture; false preserves its existing mapping.
- * Sparse-map/allocator setup is complete, APs/users have not started. The FIFO
- * must be disjoint; PCI config space and SVGA registers keep their UC mappings.
- */
-bool framebuffer_enable_writecombine_boot(void)
-{
-    if (!arch_pat_writecombine_ready() || !vmware_svga.present ||
-        fb.backend!=FRAMEBUFFER_BACKEND_VMWARE_SVGA) return false;
-    const struct pci_device *pci=&vmware_svga.pci;
-    uint32_t bar=pci_config_read32(pci->bus,pci->slot,pci->function,0x14);
-    uint64_t physical=bar & ~0xfULL;
-    if ((bar&1u) || !(bar&8u)) return false;
-    uint32_t type=bar&6u;
-    if (type==4u) physical|=(uint64_t)pci_config_read32(pci->bus,pci->slot,pci->function,0x18)<<32;
-    else if (type!=0) return false;
-    if (physical!=fb.reservation_start || !fb.reservation_bytes) return false;
-    uint64_t fifo=vmware_svga_read(VMWARE_SVGA_REG_MEM_START);
-    uint64_t fifo_bytes=vmware_svga_read(VMWARE_SVGA_REG_MEM_SIZE);
-    uint64_t bytes=fb.reservation_bytes;
-    if (fifo_bytes && physical<fifo+fifo_bytes && fifo<physical+bytes) return false;
-    if (!paging_mmio_writecombine_boot(physical,bytes)) return false;
-    console_info("[framebuffer] VMware SVGA pixel cache=WC physical=%p bytes=%llu\n",
-        (void *)(uintptr_t)physical,(unsigned long long)bytes);
-    return true;
-}
-
-
-
+/** @brief Read a register during boot, modeset, or single-owner panic. */
 uint32_t vmware_svga_read(uint32_t reg)
 {
     x86_64_outl(reg, vmware_svga.io_port);
     return x86_64_inl((uint16_t)(vmware_svga.io_port + 1u));
 }
 
+/** @brief Write a register under the same serialization as register reads. */
 void vmware_svga_write(uint32_t reg, uint32_t value)
 {
     x86_64_outl(reg, vmware_svga.io_port);
     x86_64_outl(value, (uint16_t)(vmware_svga.io_port + 1u));
 }
 
+/** @brief Order WC pixels before the UC FIFO or device doorbell. */
 void vmware_svga_memory_fence(void)
 {
     __asm__ volatile("mfence" ::: "memory");
 }
 
-/**
- * @brief Enable VMware GFB write tracing for mmap-backed fbdev clients.
- * @return None.
- *
- * Xorg's fbdev shadow framebuffer writes the scan-out surface through its
- * mmap.  Once the SVGA FIFO is enabled those writes do not imply an UPDATE
- * unless SVGA_REG_TRACES is explicitly enabled.  Keep the capability check
- * here so mode/FIFO reinitialisation restores the same display semantics.
+/** @brief Snapshot writable scanout state before disabling the device. */
+static struct vmware_mode vmware_mode_read(void)
+{
+    return (struct vmware_mode){
+        vmware_svga_read(VMWARE_SVGA_REG_ENABLE),
+        vmware_svga_read(VMWARE_SVGA_REG_WIDTH),
+        vmware_svga_read(VMWARE_SVGA_REG_HEIGHT),
+        vmware_svga_read(VMWARE_SVGA_REG_DEPTH),
+        vmware_svga_read(VMWARE_SVGA_REG_BITS_PER_PIXEL),
+        vmware_svga_read(VMWARE_SVGA_REG_PSEUDOCOLOR),
+        vmware_svga_read(VMWARE_SVGA_REG_TRACES),
+    };
+}
+
+/** @brief Program a complete mode with scanout disabled during geometry writes. */
+static void vmware_mode_write(const struct vmware_mode *mode)
+{
+    vmware_svga_write(VMWARE_SVGA_REG_ENABLE, 0);
+    vmware_svga_write(VMWARE_SVGA_REG_WIDTH, mode->width);
+    vmware_svga_write(VMWARE_SVGA_REG_HEIGHT, mode->height);
+    vmware_svga_write(VMWARE_SVGA_REG_DEPTH, mode->depth);
+    vmware_svga_write(VMWARE_SVGA_REG_BITS_PER_PIXEL, mode->bpp);
+    vmware_svga_write(VMWARE_SVGA_REG_PSEUDOCOLOR, mode->pseudocolor);
+    vmware_svga_write(VMWARE_SVGA_REG_ENABLE, mode->enable);
+}
+
+/** @brief Preserve a retained WC aperture; otherwise establish its UC mapping. */
+static bool vmware_map_pixels(uint64_t physical, uint64_t bytes)
+{
+    return paging_mmio_writecombined(physical, bytes) ||
+           paging_mmio_uncached(physical, bytes);
+}
+
+/** @brief Validate actual enabled scanout and prepare an unpublished descriptor.
+ * @param candidate Caller-owned copy of the existing framebuffer.
+ * @param width Requested width, or zero to accept the live boot mode.
+ * @param height Requested height, or zero to accept the live boot mode.
+ * @return True after mapping the actual FB_START/FB_OFFSET aperture. No global
+ * framebuffer state is changed on any failure. Caller serializes device I/O.
  */
-void framebuffer_vmware_enable_traces(void)
+static bool vmware_scanout_read(struct framebuffer *candidate,
+                                uint32_t width, uint32_t height)
 {
-    uint64_t flags = svga_lock();
-    if (!vmware_svga.present || !vmware_svga.fifo_present) {
-        svga.traces_enabled = false;
-        svga_unlock(flags);
-        return;
-    }
-    (void)svga_restore_traces_locked();
-    svga_unlock(flags);
+    struct vmware_mode mode = vmware_mode_read();
+    uint32_t pitch = vmware_svga_read(VMWARE_SVGA_REG_BYTES_PER_LINE);
+    uint32_t start = vmware_svga_read(VMWARE_SVGA_REG_FB_START);
+    uint32_t offset = vmware_svga_read(VMWARE_SVGA_REG_FB_OFFSET);
+    uint32_t capacity = vmware_svga_read(VMWARE_SVGA_REG_FB_MAX_SIZE);
+    uint64_t visible = (uint64_t)pitch * mode.height;
+    if (!(mode.enable & 1u) || !mode.width || !mode.height ||
+        mode.width > FRAMEBUFFER_MODE_MAX_WIDTH ||
+        mode.height > FRAMEBUFFER_MODE_MAX_HEIGHT ||
+        (width && mode.width != width) || (height && mode.height != height) ||
+        mode.depth != 24u || mode.bpp != 32u || mode.pseudocolor ||
+        (uint64_t)pitch < (uint64_t)mode.width * 4u || (pitch & 3u) ||
+        !capacity || capacity > FRAMEBUFFER_MAX_VRAM_BYTES || offset >= capacity ||
+        visible > (uint64_t)capacity - offset ||
+        !framebuffer_range_valid(start, capacity) ||
+        !framebuffer_range_valid((uint64_t)start + offset, visible) ||
+        !vmware_map_pixels(start, capacity))
+        return false;
+    uint32_t *pixels = mm_phys_to_virt((uint64_t)start + offset);
+    if (!pixels) return false;
+    candidate->pixels = pixels;
+    candidate->width = mode.width;
+    candidate->height = mode.height;
+    candidate->pitch = pitch;
+    candidate->bpp = 32;
+    candidate->bytes_per_pixel = 4;
+    candidate->max_bytes = capacity - offset;
+    candidate->reservation_start = start;
+    candidate->reservation_bytes = capacity;
+    candidate->available = true;
+    return true;
 }
 
-void framebuffer_vmware_fifo_init(bool report, bool device_lock_held)
+/** @brief Bind the boot FIFO once and configure the shared transport.
+ * @return Zero or an SVGA error. Boot-only, caller holds svga_lock. Mapping is
+ * validated before touching CONFIG_DONE. Later modesets retain this binding.
+ */
+static int vmware_fifo_bind_locked(struct framebuffer *candidate)
 {
-    uint32_t mem_start = vmware_svga_read(VMWARE_SVGA_REG_MEM_START);
-    uint32_t mem_size = vmware_svga_read(VMWARE_SVGA_REG_MEM_SIZE);
-
-    /* SVGA II may discard the FIFO contents when ENABLE or the display mode
-     * changes.  Keep the device in the unconfigured state while replacing
-     * the guest-owned ring, then publish CONFIG_DONE only after every header
-     * field has been written. */
-    vmware_svga_write(VMWARE_SVGA_REG_CONFIG_DONE, 0u);
-    svga.traces_enabled = false;
-    vmware_svga.fifo = 0;
-    vmware_svga.fifo_present = false;
-    fb.auxiliary_reservation_start = 0;
-    fb.auxiliary_reservation_bytes = 0;
-    /* The producer must retain one free byte to distinguish a full ring from
-     * an empty one; a command-sized ring can therefore never carry a packet. */
-    if (mem_size <= VMWARE_SVGA_FIFO_MIN_BYTES +
-                        VMWARE_SVGA_UPDATE_WORDS * sizeof(uint32_t) ||
-        mem_size > FRAMEBUFFER_MAX_VRAM_BYTES ||
-        (mem_start & (sizeof(uint32_t) - 1u)) != 0u ||
-        !framebuffer_range_valid(mem_start, mem_size)) {
-        if (report) {
-            console_warn("[reliefnt] VMware SVGA FIFO unavailable mem=%p size=%u\n",
-                           (void *)(uintptr_t)mem_start, mem_size);
-        }
-        return;
-    }
-
-    if (!paging_mmio_uncached(mem_start, mem_size)) {
-        if (report) {
-            console_warn("[reliefnt] VMware SVGA FIFO cannot be mapped uncached mem=%p size=%u\n",
-                         (void *)(uintptr_t)mem_start, mem_size);
-        }
-        return;
-    }
-    vmware_svga.fifo = (volatile uint32_t *)mm_phys_to_virt(mem_start);
-    if (!vmware_svga.fifo) return;
-    vmware_svga.fifo_min = VMWARE_SVGA_FIFO_MIN_BYTES;
-    vmware_svga.fifo_max = mem_size;
-    vmware_svga.fifo[VMWARE_SVGA_FIFO_MIN] = vmware_svga.fifo_min;
-    vmware_svga.fifo[VMWARE_SVGA_FIFO_MAX] = vmware_svga.fifo_max;
-    vmware_svga.fifo[VMWARE_SVGA_FIFO_NEXT_CMD] = vmware_svga.fifo_min;
-    vmware_svga.fifo[VMWARE_SVGA_FIFO_STOP] = vmware_svga.fifo_min;
-    vmware_svga_memory_fence();
-    vmware_svga_write(VMWARE_SVGA_REG_CONFIG_DONE, 1u);
-
-    /* A broken or stale MMIO mapping must not be treated as a working FIFO.
-     * Read back all four control words after CONFIG_DONE so the present path
-     * can recover instead of silently dropping every update. */
-    if (vmware_svga.fifo[VMWARE_SVGA_FIFO_MIN] != vmware_svga.fifo_min ||
-        vmware_svga.fifo[VMWARE_SVGA_FIFO_MAX] != vmware_svga.fifo_max ||
-        vmware_svga.fifo[VMWARE_SVGA_FIFO_NEXT_CMD] != vmware_svga.fifo_min ||
-        vmware_svga.fifo[VMWARE_SVGA_FIFO_STOP] != vmware_svga.fifo_min) {
-        vmware_svga.fifo = 0;
-        if (report) {
-            console_error("[reliefnt] VMware SVGA FIFO header validation failed\n");
-        }
-        return;
-    }
-    vmware_svga.fifo_full_logged = false;
-    vmware_svga.fifo_present = true;
-    svga_platform_bind(vmware_svga.io_port, vmware_svga.fifo, mem_size);
-    if (device_lock_held) {
-        (void)svga_restore_traces_locked();
-    } else {
-        framebuffer_vmware_enable_traces();
-    }
-    fb.auxiliary_reservation_start = mem_start;
-    fb.auxiliary_reservation_bytes = mem_size;
-}
-
-int framebuffer_vmware_fifo_update(uint32_t x, uint32_t y,
-                                          uint32_t width, uint32_t height)
-{
-    uint32_t next;
-    uint32_t stop;
-    uint32_t bytes = VMWARE_SVGA_UPDATE_WORDS * sizeof(uint32_t);
-    uint32_t index;
-    uint32_t fifo_min = (svga.bound && svga.fifo_ready) ? svga.min : vmware_svga.fifo_min;
-
-    if (!vmware_svga.fifo_present || !vmware_svga.fifo || !width || !height) {
-        return 0;
-    }
-    next = vmware_svga.fifo[VMWARE_SVGA_FIFO_NEXT_CMD];
-    stop = vmware_svga.fifo[VMWARE_SVGA_FIFO_STOP];
-    if (next < fifo_min || next >= vmware_svga.fifo_max ||
-        stop < fifo_min || stop >= vmware_svga.fifo_max) {
-        vmware_svga.fifo_present = false;
-        return 0;
-    }
-    if (!framebuffer_fifo_reserve(fifo_min, vmware_svga.fifo_max, next, stop,
-                                  bytes, &index, &next)) {
-        goto full;
-    }
-
-    index /= sizeof(uint32_t);
-    vmware_svga.fifo[index] = VMWARE_SVGA_CMD_UPDATE;
-    vmware_svga.fifo[index + 1u] = x;
-    vmware_svga.fifo[index + 2u] = y;
-    vmware_svga.fifo[index + 3u] = width;
-    vmware_svga.fifo[index + 4u] = height;
-    vmware_svga_memory_fence();
-    vmware_svga.fifo[VMWARE_SVGA_FIFO_NEXT_CMD] = next;
-    vmware_svga_memory_fence();
-    return 1;
-
-full:
-    if (!vmware_svga.fifo_full_logged) {
-        vmware_svga.fifo_full_logged = true;
-    }
-    /* A legacy host may leave STOP unchanged until it receives a doorbell.
-     * The preceding packet normally rings the doorbell, but a burst can fill
-     * the ring after that publication and leave the next periodic refresh
-     * with no packet to wake the host.  Re-issue the non-blocking doorbell on
-     * the full path; a later tick retries once the host advances STOP. */
-    framebuffer_vmware_kick();
+    uint32_t start = vmware_svga_read(VMWARE_SVGA_REG_MEM_START);
+    uint32_t bytes = vmware_svga_read(VMWARE_SVGA_REG_MEM_SIZE);
+    if (bytes < 16384u || bytes > FRAMEBUFFER_MAX_VRAM_BYTES ||
+        ((start | bytes) & 3u) || !framebuffer_range_valid(start, bytes) ||
+        ((uint64_t)start < candidate->reservation_start + candidate->reservation_bytes &&
+         candidate->reservation_start < (uint64_t)start + bytes) ||
+        !paging_mmio_uncached(start, bytes))
+        return SVGA_ENODEV;
+    volatile uint32_t *fifo = mm_phys_to_virt(start);
+    if (!fifo) return SVGA_ENODEV;
+    svga_platform_bind(vmware_svga.io_port, fifo, bytes);
+    int status = svga_configure_locked(false);
+    if (status) return status;
+    candidate->auxiliary_reservation_start = start;
+    candidate->auxiliary_reservation_bytes = bytes;
     return 0;
 }
 
-void framebuffer_vmware_kick(void)
+/** @brief Copy the immutable PCI identity after successful boot binding. */
+int framebuffer_vmware_pci_identity(struct pci_device *out)
 {
-    if (!vmware_svga.present) {
-        return;
-    }
-    vmware_svga_write(VMWARE_SVGA_REG_SYNC, 1u);
+    if (!out || !vmware_svga.present) return -ENODEV;
+    *out = vmware_svga.pci;
+    return 0;
 }
 
-void framebuffer_vmware_sync(bool report)
+/** @brief Promote only the prefetchable pixel BAR during single-CPU boot.
+ * FIFO/register memory retains its separate mapping. Failure preserves UC.
+ */
+bool framebuffer_enable_writecombine_boot(void)
 {
-    if (!vmware_svga.present) {
-        return;
-    }
-    vmware_svga_write(VMWARE_SVGA_REG_SYNC, 1u);
-    for (uint32_t spins = 0; spins < VMWARE_SVGA_SYNC_POLL_LIMIT; ++spins) {
-        if (vmware_svga_read(VMWARE_SVGA_REG_BUSY) == 0u) {
-            return;
-        }
-    }
-    if (!vmware_svga.sync_timeout_logged) {
-        if (report) {
-            console_warn("[reliefnt] VMware SVGA sync timed out; continuing asynchronously\n");
-        }
-        vmware_svga.sync_timeout_logged = true;
-    }
+    if (!arch_pat_writecombine_ready() || !vmware_svga.present ||
+        fb.backend != FRAMEBUFFER_BACKEND_VMWARE_SVGA) return false;
+    const struct pci_device *pci = &vmware_svga.pci;
+    uint32_t bar = pci_config_read32(pci->bus, pci->slot, pci->function, 0x14);
+    uint64_t physical = bar & ~0xfULL;
+    if ((bar & 1u) || !(bar & 8u)) return false;
+    uint32_t type = bar & 6u;
+    if (type == 4u)
+        physical |= (uint64_t)pci_config_read32(pci->bus, pci->slot, pci->function, 0x18) << 32;
+    else if (type != 0) return false;
+    if (physical != fb.reservation_start || !fb.reservation_bytes) return false;
+    uint64_t fifo = fb.auxiliary_reservation_start;
+    uint64_t fifo_bytes = fb.auxiliary_reservation_bytes;
+    if (fifo_bytes && physical < fifo + fifo_bytes &&
+        fifo < physical + fb.reservation_bytes) return false;
+    if (!paging_mmio_writecombine_boot(physical, fb.reservation_bytes)) return false;
+    console_info("[framebuffer] VMware SVGA pixel cache=WC physical=%p bytes=%llu\n",
+        (void *)(uintptr_t)physical, (unsigned long long)fb.reservation_bytes);
+    return true;
 }
 
-/** @brief Probe VMware scanout and publish it only after all checks succeed.
- * @return 1 when the device surface is selected; 0 retaining the boot surface.
- * The replacement aperture is claimed UC before its alias is published. If
- * an initially disabled device is reprogrammed and a later check fails, its
- * enable and writable geometry registers are restored before returning.
+/** @brief Restore mmap write tracing while the console owns the scanout. */
+void framebuffer_vmware_enable_traces(void)
+{
+    uint64_t flags = svga_lock();
+    if (vmware_svga.present && svga.bound && svga.fifo_ready &&
+        !framebuffer_drm_owned())
+        (void)svga_restore_traces_locked();
+    svga_unlock(flags);
+}
+
+/** @brief Select a verified SVGA II scanout and its single FIFO at boot.
+ * @return One on selection, zero preserving the boot surface. Boot runs before
+ * other producers. Failed probes restore PCI decoding and writable geometry.
  */
 int framebuffer_vmware_probe(void)
 {
     struct pci_device device;
-    uint32_t bar;
-    uint32_t id;
-    uint32_t fb_start;
-    uint32_t fb_offset;
-    uint32_t fb_max_size;
-    uint32_t fb_size;
-    uint32_t width;
-    uint32_t height;
-    uint32_t depth;
-    uint32_t bpp;
-    uint32_t pseudocolor;
-    uint32_t pitch;
-    uint32_t enabled;
-    int device_mode_valid;
-    int boot_mode_valid;
-    uint64_t usable_bytes;
-    uint32_t io_base;
-    uint32_t *device_pixels;
-    uint32_t old_enable, old_width, old_height, old_depth, old_bpp, old_pseudocolor;
-    bool reprogrammed = false;
-
     if (!fb.available || pci_find_device(VMWARE_VENDOR_ID, VMWARE_SVGA_DEVICE_ID,
-                                         &device) < 0) {
-        return 0;
-    }
-    bar = pci_config_read32(device.bus, device.slot, device.function, 0x10);
-    io_base = bar & 0xfffcu;
-    if ((bar & 1u) == 0 || io_base == 0 || io_base > 0xfffeu) {
-        return 0;
-    }
-    vmware_svga.io_port = (uint16_t)io_base;
+                                         &device) < 0) return 0;
+    uint32_t bar = pci_config_read32(device.bus, device.slot, device.function, 0x10);
+    uint32_t port = bar & 0xfffcu;
+    if (!(bar & 1u) || !port || port > 0xfffeu) return 0;
+    uint16_t command = pci_config_read16(device.bus, device.slot, device.function, 0x04);
     pci_config_write16(device.bus, device.slot, device.function, 0x04,
-                       (uint16_t)(pci_config_read16(device.bus, device.slot,
-                                                     device.function, 0x04) |
-                                  VMWARE_PCI_COMMAND_IO |
-                                  VMWARE_PCI_COMMAND_MEMORY));
+                      command | VMWARE_PCI_COMMAND_IO | VMWARE_PCI_COMMAND_MEMORY);
+    vmware_svga.io_port = (uint16_t)port;
+    uint32_t old_id = vmware_svga_read(VMWARE_SVGA_REG_ID);
     vmware_svga_write(VMWARE_SVGA_REG_ID, VMWARE_SVGA_ID_2);
-    id = vmware_svga_read(VMWARE_SVGA_REG_ID);
-    if (id < VMWARE_SVGA_ID_2) {
+    if (vmware_svga_read(VMWARE_SVGA_REG_ID) != VMWARE_SVGA_ID_2) {
+        vmware_svga_write(VMWARE_SVGA_REG_ID, old_id);
+        pci_config_write16(device.bus, device.slot, device.function, 0x04, command);
         return 0;
     }
-
-    fb_start = vmware_svga_read(VMWARE_SVGA_REG_FB_START);
-    fb_offset = vmware_svga_read(VMWARE_SVGA_REG_FB_OFFSET);
-    fb_max_size = vmware_svga_read(VMWARE_SVGA_REG_FB_MAX_SIZE);
-    fb_size = vmware_svga_read(VMWARE_SVGA_REG_FB_SIZE);
-    if (!fb_max_size || fb_max_size > FRAMEBUFFER_MAX_VRAM_BYTES ||
-        fb_offset >= fb_max_size ||
-        !framebuffer_range_valid(fb_start, fb_max_size)) {
-        return 0;
+    struct vmware_mode old_mode = vmware_mode_read();
+    uint32_t old_config = vmware_svga_read(VMWARE_SVGA_REG_CONFIG_DONE);
+    struct framebuffer candidate = fb;
+    bool changed = !(old_mode.enable & 1u);
+    if (changed) {
+        struct vmware_mode requested = {1, fb.width, fb.height, 24, 32, 0, 0};
+        vmware_mode_write(&requested);
     }
-    /* FB_SIZE describes the current scan-out surface.  It grows and shrinks
-     * with the mode, whereas FB_MAX_SIZE is the SVGA II VRAM capacity. */
-    usable_bytes = (uint64_t)fb_max_size - fb_offset;
-    if (usable_bytes < framebuffer_current_bytes()) {
-        console_error("[reliefnt] VMware SVGA framebuffer too small fb=%p offset=%u "
-                       "size=%u max=%u current=%u\n",
-                       (void *)(uintptr_t)fb_start, fb_offset, fb_size, fb_max_size,
-                       (uint32_t)framebuffer_current_bytes());
-        return 0;
-    }
-
-    /* The boot protocol framebuffer is only a hint.  SVGA II exposes the
-     * scan-out surface through FB_START/FB_OFFSET, which may differ from the
-     * address supplied at boot (notably the EFI GOP surface).  Keep
-     * fbdev mmap and native drawing on the device's actual linear surface and
-     * publish the active SVGA mode so a same-mode Xorg probe does not retain
-     * stale boot geometry or pitch. */
-    width = vmware_svga_read(VMWARE_SVGA_REG_WIDTH);
-    height = vmware_svga_read(VMWARE_SVGA_REG_HEIGHT);
-    depth = vmware_svga_read(VMWARE_SVGA_REG_DEPTH);
-    bpp = vmware_svga_read(VMWARE_SVGA_REG_BITS_PER_PIXEL);
-    pseudocolor = vmware_svga_read(VMWARE_SVGA_REG_PSEUDOCOLOR);
-    pitch = vmware_svga_read(VMWARE_SVGA_REG_BYTES_PER_LINE);
-    enabled = vmware_svga_read(VMWARE_SVGA_REG_ENABLE);
-    old_enable = enabled;
-    old_width = width;
-    old_height = height;
-    old_depth = depth;
-    old_bpp = bpp;
-    old_pseudocolor = pseudocolor;
-    device_mode_valid = width && height && depth == 24u && bpp == 32u &&
-        pseudocolor == 0u && (uint64_t)pitch >= (uint64_t)width * 4u &&
-        (uint64_t)pitch * height <= usable_bytes &&
-        framebuffer_range_valid((uint64_t)fb_start + fb_offset,
-                                (uint64_t)pitch * height);
-    boot_mode_valid = fb.available && fb.width && fb.height &&
-        (uint64_t)fb.pitch >= (uint64_t)fb.width * 4u &&
-        (uint64_t)fb.pitch * fb.height <= usable_bytes &&
-        framebuffer_range_valid(mm_virt_to_phys(fb.pixels),
-                                (uint64_t)fb.pitch * fb.height);
-    /* The geometry registers describe the live scan-out only once the device
-     * has been enabled.  While REG_ENABLE is clear they still hold the
-     * power-on default; activate the device at the boot handover geometry below so
-     * Xorg inherits the same surface without the stale default pitch. */
-    if ((enabled & 1u) == 0u && boot_mode_valid) {
-        /* SVGA stays disabled while the boot handover GOP surface is visible.
-         * Xorg later writes the same mmap, so leave the device enabled before
-         * it starts; otherwise REG_TRACES is accepted but never drives the
-         * host scan-out and the first client that clears the greeter leaves a
-         * black screen.  Reprogram the boot handover geometry explicitly so the
-         * device surface and the inherited framebuffer stay identical. */
-        reprogrammed = true;
-        vmware_svga_write(VMWARE_SVGA_REG_ENABLE, 0u);
-        vmware_svga_write(VMWARE_SVGA_REG_WIDTH, fb.width);
-        vmware_svga_write(VMWARE_SVGA_REG_HEIGHT, fb.height);
-        vmware_svga_write(VMWARE_SVGA_REG_DEPTH, 24u);
-        vmware_svga_write(VMWARE_SVGA_REG_BITS_PER_PIXEL, 32u);
-        vmware_svga_write(VMWARE_SVGA_REG_PSEUDOCOLOR, 0u);
-        vmware_svga_write(VMWARE_SVGA_REG_ENABLE, 1u);
-        width = vmware_svga_read(VMWARE_SVGA_REG_WIDTH);
-        height = vmware_svga_read(VMWARE_SVGA_REG_HEIGHT);
-        depth = vmware_svga_read(VMWARE_SVGA_REG_DEPTH);
-        bpp = vmware_svga_read(VMWARE_SVGA_REG_BITS_PER_PIXEL);
-        pseudocolor = vmware_svga_read(VMWARE_SVGA_REG_PSEUDOCOLOR);
-        pitch = vmware_svga_read(VMWARE_SVGA_REG_BYTES_PER_LINE);
-        enabled = vmware_svga_read(VMWARE_SVGA_REG_ENABLE);
-        device_mode_valid = (enabled & 1u) != 0u && width && height &&
-            depth == 24u && bpp == 32u && pseudocolor == 0u &&
-            (uint64_t)pitch >= (uint64_t)width * 4u &&
-            (uint64_t)pitch * height <= usable_bytes &&
-            framebuffer_range_valid((uint64_t)fb_start + fb_offset,
-                                    (uint64_t)pitch * height);
-    }
-    if (device_mode_valid && (enabled & 1u) != 0u) {
-        if (!vmware_map_pixels(fb_start, fb_max_size)) goto restore_scanout;
-        device_pixels = (uint32_t *)mm_phys_to_virt((uint64_t)fb_start + fb_offset);
-        if (!device_pixels) goto restore_scanout;
-    } else {
-        console_warn("[reliefnt] VMware SVGA active mode unavailable "
-                       "mode=%ux%u depth=%u bpp=%u pseudo=%u pitch=%u\n",
-                       width, height, depth, bpp, pseudocolor, pitch);
-        goto restore_scanout;
-    }
-
-    vmware_svga.max_width = vmware_svga_read(VMWARE_SVGA_REG_MAX_WIDTH);
-    vmware_svga.max_height = vmware_svga_read(VMWARE_SVGA_REG_MAX_HEIGHT);
-    if (!vmware_svga.max_width || !vmware_svga.max_height) {
-        goto restore_scanout;
-    }
-    if (vmware_svga.max_width > FRAMEBUFFER_MODE_MAX_WIDTH) {
-        vmware_svga.max_width = FRAMEBUFFER_MODE_MAX_WIDTH;
-    }
-    if (vmware_svga.max_height > FRAMEBUFFER_MODE_MAX_HEIGHT) {
-        vmware_svga.max_height = FRAMEBUFFER_MODE_MAX_HEIGHT;
-    }
-    if (reprogrammed) {
-        console_info("[reliefnt] VMware SVGA scan-out enabled at boot mode "
-                       "%ux%u pitch=%u\n", width, height, pitch);
-    }
-    fb.pixels = device_pixels;
-    fb.width = width;
-    fb.height = height;
-    fb.pitch = pitch;
-    fb.bpp = (uint8_t)bpp;
-    fb.bytes_per_pixel = 4u;
-    framebuffer_set_default_format();
+    uint32_t max_width = vmware_svga_read(VMWARE_SVGA_REG_MAX_WIDTH);
+    uint32_t max_height = vmware_svga_read(VMWARE_SVGA_REG_MAX_HEIGHT);
+    if (!max_width || !max_height ||
+        !vmware_scanout_read(&candidate, changed ? fb.width : 0,
+                             changed ? fb.height : 0)) goto failed;
+    uint64_t flags = svga_lock();
+    int status = vmware_fifo_bind_locked(&candidate);
+    svga_unlock(flags);
+    if (status) goto failed;
+    if (max_width > FRAMEBUFFER_MODE_MAX_WIDTH) max_width = FRAMEBUFFER_MODE_MAX_WIDTH;
+    if (max_height > FRAMEBUFFER_MODE_MAX_HEIGHT) max_height = FRAMEBUFFER_MODE_MAX_HEIGHT;
     vmware_svga.pci = device;
+    vmware_svga.max_width = max_width;
+    vmware_svga.max_height = max_height;
     vmware_svga.present = true;
-    framebuffer_vmware_fifo_init(true, false);
-
-    fb.max_width = vmware_svga.max_width;
-    fb.max_height = vmware_svga.max_height;
-    fb.max_bytes = (uint32_t)usable_bytes;
-    fb.backend = FRAMEBUFFER_BACKEND_VMWARE_SVGA;
-    fb.capabilities = FRAMEBUFFER_CAP_MODE_SET;
-    fb.reservation_start = fb_start;
-    fb.reservation_bytes = fb_max_size;
-    console_info("[reliefnt] VMware SVGA detected io=0x%x fb=%p offset=%u size=%u "
-                   "max=%u limits=%ux%u fifo=%p\n",
-                   vmware_svga.io_port, (void *)(uintptr_t)fb_start, fb_offset,
-                   fb_size, fb_max_size, vmware_svga.max_width,
-                   vmware_svga.max_height, (void *)vmware_svga.fifo);
+    candidate.max_width = max_width;
+    candidate.max_height = max_height;
+    candidate.backend = FRAMEBUFFER_BACKEND_VMWARE_SVGA;
+    candidate.capabilities = FRAMEBUFFER_CAP_MODE_SET;
+    fb = candidate;
+    framebuffer_set_default_format();
+    console_info("[reliefnt] VMware SVGA detected io=0x%x fb=%p mode=%ux%u pitch=%u fifo=%p\n",
+        port, fb.pixels, fb.width, fb.height, fb.pitch, (void *)svga.fifo);
     return 1;
-
-restore_scanout:
-    if (reprogrammed) {
-        vmware_svga_write(VMWARE_SVGA_REG_ENABLE, 0u);
-        vmware_svga_write(VMWARE_SVGA_REG_WIDTH, old_width);
-        vmware_svga_write(VMWARE_SVGA_REG_HEIGHT, old_height);
-        vmware_svga_write(VMWARE_SVGA_REG_DEPTH, old_depth);
-        vmware_svga_write(VMWARE_SVGA_REG_BITS_PER_PIXEL, old_bpp);
-        vmware_svga_write(VMWARE_SVGA_REG_PSEUDOCOLOR, old_pseudocolor);
-        vmware_svga_write(VMWARE_SVGA_REG_ENABLE, old_enable);
-    }
+failed:
+    if (changed) vmware_mode_write(&old_mode);
+    vmware_svga_write(VMWARE_SVGA_REG_CONFIG_DONE, old_config);
+    vmware_svga_write(VMWARE_SVGA_REG_TRACES, old_mode.traces);
+    pci_config_write16(device.bus, device.slot, device.function, 0x04, command);
     return 0;
 }
 
+/** @brief Change geometry transactionally after draining all previous users.
+ * @return One on commit, zero on rejection. The old descriptor stays published
+ * until geometry, mapping and FIFO restart succeed. Failed changes restore the
+ * old hardware mode and reconfigure a fresh FIFO generation, never old cursors.
+ */
 int framebuffer_vmware_set_mode(uint32_t width, uint32_t height)
 {
-    uint32_t actual_width;
-    uint32_t actual_height;
-    uint32_t depth;
-    uint32_t bpp;
-    uint32_t pseudocolor;
-    uint32_t pitch;
-    uint32_t fb_start;
-    uint32_t fb_offset;
-    uint32_t fb_max_size;
-    uint32_t fb_size;
-    uint64_t usable_bytes;
-    uint64_t svga_flags = 0;
-    uint64_t legacy_flags = 0;
-    bool restart_3d = svga.available;
-
-    if (!vmware_svga.present) {
+    if (!vmware_svga.present || !width || !height ||
+        width > vmware_svga.max_width || height > vmware_svga.max_height) return 0;
+    uint64_t flags = svga_lock();
+    bool accelerated = svga.available;
+    struct vmware_mode old_mode = vmware_mode_read();
+    if (svga_mode_prepare_locked()) {
+        svga_unlock(flags);
         return 0;
     }
-    if (restart_3d && svga_mode_begin(&svga_flags) != 0) {
-        return 0;
+    struct framebuffer candidate = fb;
+    struct vmware_mode requested = {1, width, height, 24, 32, 0, 0};
+    vmware_mode_write(&requested);
+    bool mapped = vmware_scanout_read(&candidate, width, height);
+    int status = mapped ? svga_mode_configure_locked() : SVGA_EIO;
+    if (mapped && svga.fifo_ready && (!accelerated || !status)) {
+        fb = candidate;
+        framebuffer_set_default_format();
+        svga_unlock(flags);
+        return 1;
     }
-    if (!restart_3d) {
-        legacy_flags = svga_lock();
-    }
-    fb.auxiliary_reservation_start = 0;
-    fb.auxiliary_reservation_bytes = 0;
-    vmware_svga_write(VMWARE_SVGA_REG_ENABLE, 0u);
-    vmware_svga_write(VMWARE_SVGA_REG_WIDTH, width);
-    vmware_svga_write(VMWARE_SVGA_REG_HEIGHT, height);
-    vmware_svga_write(VMWARE_SVGA_REG_DEPTH, 24u);
-    vmware_svga_write(VMWARE_SVGA_REG_BITS_PER_PIXEL, 32u);
-    vmware_svga_write(VMWARE_SVGA_REG_PSEUDOCOLOR, 0u);
-    vmware_svga_write(VMWARE_SVGA_REG_ENABLE, 1u);
-    /* Rebuild the legacy FIFO before 3D is initialized. When 3D was already
-     * active, mode_begin left the FIFO disabled and mode_end restores the
-     * extended register block after the mode is accepted. */
-    if (!restart_3d) {
-        framebuffer_vmware_fifo_init(false, true);
-    }
-
-    actual_width = vmware_svga_read(VMWARE_SVGA_REG_WIDTH);
-    actual_height = vmware_svga_read(VMWARE_SVGA_REG_HEIGHT);
-    depth = vmware_svga_read(VMWARE_SVGA_REG_DEPTH);
-    bpp = vmware_svga_read(VMWARE_SVGA_REG_BITS_PER_PIXEL);
-    pseudocolor = vmware_svga_read(VMWARE_SVGA_REG_PSEUDOCOLOR);
-    pitch = vmware_svga_read(VMWARE_SVGA_REG_BYTES_PER_LINE);
-    fb_start = vmware_svga_read(VMWARE_SVGA_REG_FB_START);
-    fb_offset = vmware_svga_read(VMWARE_SVGA_REG_FB_OFFSET);
-    fb_max_size = vmware_svga_read(VMWARE_SVGA_REG_FB_MAX_SIZE);
-    fb_size = vmware_svga_read(VMWARE_SVGA_REG_FB_SIZE);
-    if (actual_width != width || actual_height != height || depth != 24u ||
-        bpp != 32u || pseudocolor != 0u ||
-        !fb_max_size || fb_max_size > FRAMEBUFFER_MAX_VRAM_BYTES ||
-        fb_offset >= fb_max_size || pitch < width * 4u ||
-        !framebuffer_range_valid(fb_start, fb_max_size)) {
-        if (restart_3d) svga_mode_end(svga_flags);
-        else svga_unlock(legacy_flags);
-        console_error("[reliefnt] VMware SVGA rejected mode req=%ux%u got=%ux%u "
-                       "depth=%u bpp=%u pseudo=%u pitch=%u fb=%p offset=%u size=%u max=%u\n",
-                       width, height, actual_width, actual_height, depth, bpp,
-                       pseudocolor, pitch, (void *)(uintptr_t)fb_start, fb_offset,
-                       fb_size, fb_max_size);
-        return 0;
-    }
-    usable_bytes = (uint64_t)fb_max_size - fb_offset;
-    if ((uint64_t)pitch * height > usable_bytes) {
-        if (restart_3d) svga_mode_end(svga_flags);
-        else svga_unlock(legacy_flags);
-        return 0;
-    }
-    if (!vmware_map_pixels(fb_start, fb_max_size)) {
-        if (restart_3d) svga_mode_end(svga_flags);
-        else svga_unlock(legacy_flags);
-        return 0;
-    }
-    fb.pixels = (uint32_t *)mm_phys_to_virt((uint64_t)fb_start + fb_offset);
-    if (!fb.pixels) {
-        if (restart_3d) svga_mode_end(svga_flags);
-        else svga_unlock(legacy_flags);
-        return 0;
-    }
-    fb.width = width;
-    fb.height = height;
-    fb.pitch = pitch;
-    fb.bpp = 32u;
-    fb.bytes_per_pixel = 4u;
-    fb.max_width = vmware_svga.max_width;
-    fb.max_height = vmware_svga.max_height;
-    fb.max_bytes = (uint32_t)usable_bytes;
-    fb.reservation_start = fb_start;
-    fb.reservation_bytes = fb_max_size;
-    framebuffer_set_default_format();
-    fb.available = true;
-    if (restart_3d) {
-        svga_mode_end(svga_flags);
-        vmware_svga.fifo_min = svga.min;
-        vmware_svga.fifo_max = svga.fifo_bytes;
-        /* ENABLE=0 and CONFIG_DONE=0 may reset trace-based GFB updates.
-         * Restore them after the extended FIFO has been configured so mmap
-         * writers retain the same scan-out semantics across a mode switch. */
-        framebuffer_vmware_enable_traces();
+    /* A failed 3D restart may have created GB tables. Retire them before the
+     * old geometry is restored; never free pages without completion proof. */
+    int retired = svga_shutdown_locked();
+    if (!retired) {
+        vmware_mode_write(&old_mode);
+        int restored = svga_mode_configure_locked();
+        struct framebuffer check = fb;
+        if (!svga.fifo_ready || (accelerated && restored) ||
+            !vmware_scanout_read(&check, old_mode.width, old_mode.height) ||
+            check.pixels != fb.pixels || check.pitch != fb.pitch)
+            fb.available = false;
+        vmware_svga_write(VMWARE_SVGA_REG_TRACES, old_mode.traces);
+        svga.traces_enabled = old_mode.traces != 0;
     } else {
-        framebuffer_vmware_sync(false);
-        svga_unlock(legacy_flags);
+        fb.available = false;
     }
-    console_info("[reliefnt] VMware SVGA mode=%ux%u depth=%u bpp=%u pseudo=%u "
-                   "pitch=%u fb=%p offset=%u size=%u max=%u\n",
-                   fb.width, fb.height, depth, bpp, pseudocolor,
-                   fb.pitch, (void *)(uintptr_t)fb_start, fb_offset, fb_size,
-                   fb_max_size);
-    return 1;
+    svga_unlock(flags);
+    console_warn("[reliefnt] VMware SVGA rejected mode=%ux%u status=%d restored=%u\n",
+                 width, height, status, fb.available);
+    return 0;
 }
-
-EXPORT_SYMBOL(framebuffer_vmware_pci_identity);

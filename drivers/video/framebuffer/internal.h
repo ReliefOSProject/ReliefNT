@@ -6,7 +6,6 @@
 #include <reliefnt/framebuffer.h>
 #include <reliefnt/pci.h>
 #include <reliefnt/port.h>
-#include "framebuffer_fifo.h"
 #include "../svga/device.h"
 
 /** @brief Copy complete pixels into a UC/WC 32-bit scanout aperture.
@@ -77,28 +76,14 @@ void framebuffer_copy_io32(void *destination, const void *source, size_t pixels)
 #define VMWARE_SVGA_REG_BUSY 22u
 #define VMWARE_SVGA_REG_TRACES 45u
 #define VMWARE_SVGA_CAP_TRACES 0x00200000u
-#define VMWARE_SVGA_SYNC_POLL_LIMIT 4000u
 
-#define VMWARE_SVGA_FIFO_MIN 0u
-#define VMWARE_SVGA_FIFO_MAX 1u
-#define VMWARE_SVGA_FIFO_NEXT_CMD 2u
-#define VMWARE_SVGA_FIFO_STOP 3u
-#define VMWARE_SVGA_FIFO_MIN_BYTES (4u * sizeof(uint32_t))
-#define VMWARE_SVGA_CMD_UPDATE 1u
-#define VMWARE_SVGA_UPDATE_WORDS 5u
 
 struct vmware_svga_state {
     struct pci_device pci;
     uint16_t io_port;
     uint32_t max_width;
     uint32_t max_height;
-    volatile uint32_t *fifo;
-    uint32_t fifo_min;
-    uint32_t fifo_max;
     bool present;
-    bool fifo_present;
-    bool fifo_full_logged;
-    bool sync_timeout_logged;
 };
 
 struct bochs_vbe_state {
@@ -377,13 +362,6 @@ void vmware_svga_memory_fence(void);
  */
 void framebuffer_vmware_enable_traces(void);
 
-void framebuffer_vmware_fifo_init(bool report, bool device_lock_held);
-
-int framebuffer_vmware_fifo_update(uint32_t x, uint32_t y,
-                                          uint32_t width, uint32_t height);
-
-void framebuffer_vmware_kick(void);
-
 /**
  * @brief Reclaim the legacy framebuffer after stopping other panic CPUs.
  * Bypasses the device lock, which the interrupted CPU may already own.
@@ -395,8 +373,6 @@ void framebuffer_panic_prepare(void);
  * The panic owner is the only remaining producer. A wedged GPU is best effort.
  */
 void framebuffer_panic_present(void);
-
-void framebuffer_vmware_sync(bool report);
 
 /** @brief Probe VMware, restoring reprogrammed scanout on selection failure.
  * @return 1 for a published device surface, or 0 for the unchanged boot surface.

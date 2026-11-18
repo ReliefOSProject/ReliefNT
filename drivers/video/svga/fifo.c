@@ -241,6 +241,7 @@ static int fifo_packet_locked(uint32_t id, bool three_d,
         svga_relax();
     }
     bool reserve = (svga.fifo_caps & SVGA_FIFO_CAP_RESERVE) != 0;
+    __atomic_store_n(&svga.fifo_writer_active, true, __ATOMIC_RELEASE);
     if (reserve) { svga.fifo[SVGA_FIFO_RESERVED] = bytes; svga_barrier(); }
     put_word(&next, id, reserve);
     if (three_d) put_word(&next, bytes - 8, reserve);
@@ -250,6 +251,7 @@ static int fifo_packet_locked(uint32_t id, bool three_d,
     svga_barrier();
     svga.fifo[SVGA_FIFO_NEXT_CMD] = next;
     svga_barrier();
+    __atomic_store_n(&svga.fifo_writer_active, false, __ATOMIC_RELEASE);
     if (reserve) svga.fifo[SVGA_FIFO_RESERVED] = 0;
     if (!svga.fifo_notify_deferred) fifo_wake_locked();
     return 0;
@@ -267,16 +269,26 @@ int svga_fifo_packet_try_locked(uint32_t id, bool three_d,
     return fifo_packet_locked(id, three_d, spans, count, false);
 }
 
-/** @brief Write one batch DWORD and wrap at FIFO_MAX back to FIFO_MIN.
- * Caller holds svga_lock and reserved enough ring space for the full batch.
- * @param next Mutable FIFO cursor in bytes.
- * @param value DWORD to place in the FIFO.
+/** @brief Best-effort scanout publication after other panic CPUs have stopped.
+ * No lock or allocation is permitted: the panic CPU may have interrupted the
+ * lock owner. An unfinished packet cannot be overwritten, even on a legacy
+ * ring without RESERVE. Force the doorbell if the interrupted transaction
+ * deferred its notification.
  */
-static void batch_write_word(uint32_t *next, uint32_t value)
+int svga_update_panic(uint32_t width, uint32_t height)
 {
-    svga.fifo[*next / 4] = value;
-    *next += 4;
-    if (*next == svga.fifo_bytes) *next = svga.min;
+    if (!svga.bound || !svga.fifo_ready || !svga.fifo) return SVGA_ENODEV;
+    if (__atomic_load_n(&svga.fifo_writer_active, __ATOMIC_ACQUIRE))
+        return SVGA_EBUSY;
+    if ((svga.fifo_caps & SVGA_FIFO_CAP_RESERVE) &&
+        svga.fifo[SVGA_FIFO_RESERVED]) return SVGA_EBUSY;
+    svga.fifo_notify_deferred = false;
+    uint32_t data[] = {0, 0, width, height};
+    struct svga_span span = {data, sizeof(data)};
+    int ret = fifo_packet_locked(SVGA_CMD_UPDATE, false, &span, 1, false);
+    if (ret == SVGA_EIO)
+        __atomic_store_n(&svga.fifo_ready, false, __ATOMIC_RELEASE);
+    return ret;
 }
 
 /** @brief Publish a batch body and fence, recording final-submit failures.
@@ -385,16 +397,18 @@ static int fifo_batch_try_locked(const uint32_t *words, uint32_t bytes,
     }
 
     bool reserve = (svga.fifo_caps & SVGA_FIFO_CAP_RESERVE) != 0;
+    __atomic_store_n(&svga.fifo_writer_active, true, __ATOMIC_RELEASE);
     if (reserve) {
         svga.fifo[SVGA_FIFO_RESERVED] = total;
         svga_barrier();
     }
-    for (uint32_t i = 0; i < bytes / 4; ++i) batch_write_word(&next, words[i]);
-    batch_write_word(&next, SVGA_CMD_FENCE);
-    batch_write_word(&next, seq);
+    for (uint32_t i = 0; i < bytes / 4; ++i) put_word(&next, words[i], reserve);
+    put_word(&next, SVGA_CMD_FENCE, reserve);
+    put_word(&next, seq, reserve);
     svga_barrier();
     svga.fifo[SVGA_FIFO_NEXT_CMD] = next;
     svga_barrier();
+    __atomic_store_n(&svga.fifo_writer_active, false, __ATOMIC_RELEASE);
     if (reserve) svga.fifo[SVGA_FIFO_RESERVED] = 0;
     svga.issued_fence = seq;
     svga.next_fence = seq + 1u;

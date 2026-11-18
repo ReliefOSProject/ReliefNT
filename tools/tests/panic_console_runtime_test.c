@@ -5,6 +5,7 @@
 #include <string.h>
 #include "modules/framebuffer.h"
 #include "modules/console.h"
+#include "../../drivers/video/svga/fifo.c"
 #include "../../lib/bugcheck.c"
 
 #define WIDTH 640u
@@ -31,6 +32,11 @@ void x86_64_outl(uint32_t value,uint16_t port) {(void)value;(void)port;++io_writ
 uint32_t x86_64_inl(uint16_t port) {(void)port;return 0;}
 void x86_64_outw(uint16_t value,uint16_t port) {(void)value;(void)port;}
 uint16_t x86_64_inw(uint16_t port) {(void)port;return 0;}
+void svga_barrier(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+void svga_relax(void) {}
+static uint32_t panic_fifo_read(uint32_t reg) { (void)reg; return 0; }
+static void panic_fifo_write(uint32_t reg,uint32_t value)
+{(void)reg;(void)value;++io_writes;}
 void *kernel_malloc(size_t bytes) {CHECK(!panic_phase);++allocations;return malloc(bytes);}
 void kernel_free(void *pointer) {CHECK(!panic_phase);free(pointer);}
 void serial_write(const char *text) {(void)text;CHECK(!panic_phase);}
@@ -155,23 +161,31 @@ static void fifo_scenario(void)
     uint32_t ring[256]={0};
     fb=(struct framebuffer){.available=true,.width=800,.height=600,
                            .backend=FRAMEBUFFER_BACKEND_VMWARE_SVGA};
-    vmware_svga=(struct vmware_svga_state){.present=true,.fifo_present=true,
-        .io_port=0x1000,.fifo=ring,.fifo_min=64,.fifo_max=sizeof(ring)};
-    ring[VMWARE_SVGA_FIFO_NEXT_CMD]=ring[VMWARE_SVGA_FIFO_STOP]=64;
+    vmware_svga=(struct vmware_svga_state){.present=true,.io_port=0x1000};
+    svga=(struct svga_device){.bound=true,.fifo_ready=true,.fifo=ring,
+        .min=64,.fifo_bytes=sizeof(ring),
+        .ops={.read=panic_fifo_read,.write=panic_fifo_write}};
+    ring[SVGA_FIFO_MIN]=64;ring[SVGA_FIFO_MAX]=sizeof(ring);
+    ring[SVGA_FIFO_NEXT_CMD]=ring[SVGA_FIFO_STOP]=64;
     panic_phase=true;
     framebuffer_panic_prepare();framebuffer_panic_present();
-    CHECK(ring[VMWARE_SVGA_FIFO_NEXT_CMD]==84);
-    CHECK(ring[16]==VMWARE_SVGA_CMD_UPDATE && ring[19]==800 && ring[20]==600);
-    ring[VMWARE_SVGA_FIFO_NEXT_CMD]=64;ring[VMWARE_SVGA_FIFO_STOP]=68;
+    CHECK(ring[SVGA_FIFO_NEXT_CMD]==84);
+    CHECK(ring[16]==SVGA_CMD_UPDATE && ring[19]==800 && ring[20]==600);
+    __atomic_store_n(&svga.fifo_writer_active,true,__ATOMIC_RELEASE);
+    framebuffer_panic_present();
+    CHECK(ring[SVGA_FIFO_NEXT_CMD]==84);
+    __atomic_store_n(&svga.fifo_writer_active,false,__ATOMIC_RELEASE);
+    ring[SVGA_FIFO_NEXT_CMD]=64;ring[SVGA_FIFO_STOP]=68;
     unsigned before=io_writes;
     framebuffer_panic_present();
     CHECK(io_writes>before && io_writes-before<30000); /* finite stuck-FIFO path */
-    CHECK(ring[VMWARE_SVGA_FIFO_NEXT_CMD]==64);
-    ring[VMWARE_SVGA_FIFO_NEXT_CMD]=sizeof(ring)+4;
+    CHECK(ring[SVGA_FIFO_NEXT_CMD]==64);
+    ring[SVGA_FIFO_NEXT_CMD]=sizeof(ring)+4;
+    before=io_writes;
     framebuffer_panic_present();
-    CHECK(!vmware_svga.fifo_present);
+    CHECK(!svga.fifo_ready && io_writes==before);
     panic_phase=false;
-    vmware_svga=(struct vmware_svga_state){0};fb=(struct framebuffer){0};
+    vmware_svga=(struct vmware_svga_state){0};svga=(struct svga_device){0};fb=(struct framebuffer){0};
 }
 
 /** @brief A GOP mapping rejected at boot must stay disabled during a panic. */
@@ -180,8 +194,7 @@ static void disabled_framebuffer_scenario(void)
     fb=(struct framebuffer){.available=true,.pixels=(uint32_t *)(uintptr_t)0x1000000000ULL,
         .width=800,.height=600,.pitch=3200,.bytes_per_pixel=4,
         .backend=FRAMEBUFFER_BACKEND_VMWARE_SVGA};
-    vmware_svga=(struct vmware_svga_state){.present=true,.fifo_present=true,
-        .fifo=(volatile uint32_t *)(uintptr_t)0x1000000000ULL};
+    vmware_svga=(struct vmware_svga_state){.present=true};
     fb_console_enabled=false;
     fb_console_tty_cursor_visible=true; /* no cursor restore through bad pixels */
     fb_console_tty_cursor_x=fb_console_tty_cursor_y=0;

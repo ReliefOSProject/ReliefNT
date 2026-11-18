@@ -5,7 +5,8 @@
 
 #define SVGA_CONTEXTS 64u
 #define SVGA_SURFACES SVGA3D_MAX_SURFACE_IDS
-#define SVGA_GMRS 128u
+/* Host GMR_MAX_IDS and page/MOB budgets further constrain this namespace. */
+#define SVGA_GMRS SVGA_BATCH_MAX_GMR_REFS
 /* Legacy hosts have no GB memory register. Preserve their fallback budget. */
 #define SVGA_LEGACY_GUEST_PAGES 16384u
 #define SVGA_LEGACY_SURFACE_BYTES (128ULL * 1024 * 1024)
@@ -120,6 +121,8 @@ struct svga_gmr {
     struct module *code_owner;
     bool defined, retiring, mode_lease;
     bool borrowed, mob_defined, map_inflight;
+    const struct svga_gmr_segment *segments;
+    uint32_t segment_count;
 };
 struct svga_shader {
     svga_handle context, ready_fence, last_use_fence, retire_fence;
@@ -220,6 +223,8 @@ struct svga_device {
     bool fifo_notify_deferred;
     /** Whether this configured FIFO header advertises the optional BUSY word. */
     bool fifo_busy_present;
+    /** Lock-free panic readers must not append to an interrupted packet. */
+    bool fifo_writer_active;
     uint32_t cap_values[SVGA3D_DEVCAP_MAX];
     bool cap_valid[SVGA3D_DEVCAP_MAX];
     uint32_t context_limit, surface_limit, gmr_limit, gmr_page_limit, page_limit, pages;
@@ -405,6 +410,9 @@ int svga_gb_backing_alloc_locked(struct svga_mob *mob, uint32_t bytes);
  */
 int svga_gb_backing_borrow_locked(struct svga_mob *mob, uint64_t phys,
                                   uint32_t pages, uint32_t bytes);
+/** @brief Borrow validated page-multiple runs, with the device lock held. */
+int svga_gb_backing_borrow_vector_locked(struct svga_mob *mob,
+    const struct svga_gmr_segment *segments, uint32_t count, uint32_t bytes);
 void svga_gb_backing_free_locked(struct svga_mob *mob);
 uint32_t svga_gb_backing_root(const struct svga_mob *mob);
 bool svga_fence_reached_locked(svga_handle fence);
@@ -431,6 +439,12 @@ int svga_update(uint32_t x, uint32_t y, uint32_t width, uint32_t height);
 /** @brief Restore CAP_TRACES policy while the shared device lock is held. */
 bool svga_restore_traces_locked(void);
 int svga_mode_begin(uint64_t *flags);
+/** @brief Quiesce a mode transition while the caller holds svga_lock. */
+int svga_mode_prepare_locked(void);
+/** @brief Publish panic scanout with a stopped-world, single-owner producer. */
+int svga_update_panic(uint32_t width, uint32_t height);
+/** @brief Reconfigure after mode_begin with the device lock still held. */
+int svga_mode_configure_locked(void);
 void svga_mode_end(uint64_t flags);
 uint32_t svga_read_register(uint32_t reg);
 void svga_write_register(uint32_t reg, uint32_t value);

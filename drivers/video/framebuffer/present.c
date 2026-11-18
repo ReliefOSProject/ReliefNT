@@ -52,14 +52,7 @@ static void framebuffer_present_region_internal(uint32_t x, uint32_t y,
             uint32_t y1 = framebuffer_drm_pending_y1;
             uint32_t x2 = framebuffer_drm_pending_x2;
             uint32_t y2 = framebuffer_drm_pending_y2;
-            int published;
-            if (svga.available) {
-                published = svga_update_try_locked(x1, y1, x2 - x1, y2 - y1) == 0;
-            } else {
-                published = framebuffer_vmware_fifo_update(x1, y1,
-                                                            x2 - x1, y2 - y1);
-                if (published) framebuffer_vmware_kick();
-            }
+            int published = svga_update_try_locked(x1, y1, x2 - x1, y2 - y1) == 0;
             if (published) framebuffer_drm_damage_pending = false;
         }
         svga_unlock(flags);
@@ -79,50 +72,13 @@ static void framebuffer_present_region_internal(uint32_t x, uint32_t y,
         svga_unlock(flags);
         return;
     }
-    if (svga.available) {
-        if (timer_refresh) {
-            (void)svga_update_try_locked(x, y, width, height);
-        } else {
-            (void)svga_update_locked(x, y, width, height);
-        }
-        svga_unlock(flags);
-        return;
-    }
-    if (!framebuffer_vmware_fifo_update(x, y, width, height)) {
-        if (timer_refresh) {
-            /* One BUSY read lets legacy VMware hosts advance STOP; the next
-             * periodic full-frame refresh retries after host progress. */
-            (void)vmware_svga_read(VMWARE_SVGA_REG_BUSY);
-            svga_unlock(flags);
-            return;
-        }
-        /* A legacy host may only advance STOP while REG_BUSY is read.  A
-         * doorbell alone can therefore leave a full ring stuck forever and
-         * drop every later UPDATE, which presents as a black Xorg desktop.
-         * Drain with the bounded SVGA poll, rebuild an invalid ring, and
-         * retry this exact region before returning. */
-        framebuffer_vmware_sync(false);
-        if (!vmware_svga.fifo_present) {
-            framebuffer_vmware_fifo_init(false, true);
-        }
-        if (framebuffer_vmware_fifo_update(x, y, width, height)) {
-            framebuffer_vmware_kick();
-        }
-        svga_unlock(flags);
-        return;
-    }
-    /* Publish asynchronously. Draining after every update (the previous
-     * behaviour) forced a synchronous SVGA_REG_BUSY wait inside the global
-     * execution transaction on each frame, which pinned one core spinning and
-     * serialised every other core's syscall behind it; that is exactly what a
-     * compositor/Doom present loop must not do. We still ring the doorbell so
-     * the host processes the queued update; the newer SVGA path already kicks
-     * its own doorbell at packet publish, so this only affects the legacy
-     * ring. Backpressure is handled on the failure path above: if NEXT_CMD has
-     * filled the ring, the next update fails, we drain there, and the region
-     * is retried, so the ring cannot silently overrun STOP and freeze the
-     * pointer. */
-    framebuffer_vmware_kick();
+    /* Boot console, fbdev and DRM use one producer and one ring. A display
+     * tick never waits for space; explicit drawing retains bounded backpressure.
+     * A corrupt ring is not reset here because it may still own GPU resources. */
+    if (timer_refresh)
+        (void)svga_update_try_locked(x, y, width, height);
+    else
+        (void)svga_update_locked(x, y, width, height);
     svga_unlock(flags);
 }
 
@@ -179,7 +135,7 @@ void framebuffer_drm_scanout_release(void)
     framebuffer_drm_damage_pending = false;
     framebuffer_drm_pending_x1 = framebuffer_drm_pending_y1 = 0;
     framebuffer_drm_pending_x2 = framebuffer_drm_pending_y2 = 0;
-    if (vmware_svga.fifo_present && svga.bound)
+    if (svga.fifo_ready && svga.bound)
         (void)svga_restore_traces_locked();
     svga_unlock(flags);
 }
@@ -188,11 +144,7 @@ static int framebuffer_drm_publish_locked(uint32_t x1, uint32_t y1,
                                           uint32_t x2, uint32_t y2)
 {
     if (x1 >= x2 || y1 >= y2) return 1;
-    if (svga.available)
-        return svga_update_try_locked(x1, y1, x2 - x1, y2 - y1) == 0;
-    if (!framebuffer_vmware_fifo_update(x1, y1, x2 - x1, y2 - y1)) return 0;
-    framebuffer_vmware_kick();
-    return 1;
+    return svga_update_try_locked(x1, y1, x2 - x1, y2 - y1) == 0;
 }
 
 /**
