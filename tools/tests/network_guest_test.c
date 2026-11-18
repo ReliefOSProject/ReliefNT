@@ -42,11 +42,8 @@ static int unprivileged_management(void)
           "ordinary user DHCP requires authorization");
     CHECK(reliefos_net_config(&config) == 0 && config.local_ip == 0x0a25000f,
           "network service remains usable after denied update");
-    char *direct[] = {"/usr/lib/reliefos/apps/netctl/netctl.elf", "--renew-dhcp", NULL};
-    CHECK(run(direct) == 128 + EACCES, "DHCP helper rejects direct unprivileged execution");
-    char *authorized[] = {"/usr/bin/sudo", "-n", "--", "/usr/lib/reliefos/apps/netctl/netctl.elf",
-                          "--renew-dhcp", NULL};
-    CHECK(run(authorized) == 0, "upstream sudo authorizes actual DHCP worker");
+    /* The GUI privilege workflow is covered by ReliefOS's Network Controller
+     * integration test; this kernel network test stays independent of apps. */
     return failures != 0;
 }
 
