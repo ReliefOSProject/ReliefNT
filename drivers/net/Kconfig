@@ -2,6 +2,7 @@
 menu "Network device drivers"
 source "drivers/net/e1000/Kconfig"
 source "drivers/net/e1000e/Kconfig"
+source "drivers/net/i225/Kconfig"
 source "drivers/net/r8169/Kconfig"
 source "drivers/net/rtl8139/Kconfig"
 source "drivers/net/vmxnet3/Kconfig"

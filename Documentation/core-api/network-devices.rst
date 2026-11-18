@@ -3,7 +3,7 @@ Multiple network devices
 ========================
 
 ReliefNT 为每个受支持的 Ethernet PCI 功能分配独立网络接口。e1000、e1000e、
-r8169、rtl8139 和 vmxnet3 可以同时注册，多张相同型号网卡也分别拥有设备状态和 DMA 环。
+i225、r8169、rtl8139 和 vmxnet3 可以同时注册，多张相同型号网卡也分别拥有设备状态和 DMA 环。
 
 Device identity
 ===============

@@ -17,10 +17,10 @@ msgid "Multiple network devices"
 msgstr "複数のネットワークデバイス"
 
 msgid ""
-"ReliefNT 为每个受支持的 Ethernet PCI 功能分配独立网络接口。e1000、e1000e、 r8169、rtl8139 和 vmxnet3 "
+"ReliefNT 为每个受支持的 Ethernet PCI 功能分配独立网络接口。e1000、e1000e、 i225、r8169、rtl8139 和 vmxnet3 "
 "可以同时注册，多张相同型号网卡也分别拥有设备状态和 DMA 环。"
 msgstr ""
-"ReliefNT は対応する Ethernet PCI 機能ごとに独立したネットワークインターフェースを割り当てます。e1000、e1000e、r8169、rtl8139、vmxnet3"
+"ReliefNT は対応する Ethernet PCI 機能ごとに独立したネットワークインターフェースを割り当てます。e1000、e1000e、i225、r8169、rtl8139、vmxnet3"
 " を同時に登録でき、同型カードが複数あってもデバイス状態と DMA リングは個別に管理されます。"
 
 msgid "Device identity"
