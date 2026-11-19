@@ -238,7 +238,7 @@ void *kernel_malloc(size_t size){return malloc(size);}
 void kernel_free(void *pointer){free(pointer);}
 void task_release_syscall_file(struct task *task) { assert(exclusive()); task_lookup_scope_cancel(task); }
 static int syscall_eagain_is_nonblocking_device(struct task *task, uint64_t nr, uint64_t fd)
-{ (void)task; (void)nr; (void)fd; return 0; }
+{ (void)task; (void)fd; return nr == LINUX_SYS_CONNECT; }
 uint32_t graphics_service_process_retirements(uint32_t budget)
 { (void)budget; assert(exclusive()); return 0; }
 void driver_manager_process_audio_faults(void) { assert(exclusive()); }
@@ -461,6 +461,26 @@ static void test_signal_input_and_retry(void)
         assert(!current.restart_syscall && io_releases==1 && !async_io);
     }
 }
+/** @brief An internal pathname wait and a full queue have distinct connect results. */
+static void test_nonblocking_connect_path_wait(void)
+{
+    struct trap_frame frame = prepare(LINUX_SYS_CONNECT);
+    uint64_t rip = frame.rip;
+    backend_result = KERNEL_SYSCALL_UNIX_CONNECT_IO_WAIT;
+    selected = &replacement;
+    assert(int80_dispatch(&frame) == &replacement);
+    assert(frame.rax == LINUX_SYS_CONNECT && frame.rip == rip - 2 && slept == 1);
+    assert(current.restart_syscall == LINUX_SYS_CONNECT + 1 && !io_releases);
+    assert(current.lookup_scope.armed && !async_io);
+
+    frame = prepare(LINUX_SYS_CONNECT);
+    rip = frame.rip;
+    backend_result = -RELIEFOS_EAGAIN;
+    assert(int80_dispatch(&frame) == &current);
+    assert((int64_t)frame.rax == -RELIEFOS_EAGAIN && frame.rip == rip && !slept);
+    assert(!current.restart_syscall && io_releases == 1);
+    assert(!current.lookup_scope.armed && !async_io);
+}
 static void test_restored_context_and_fallback(void)
 {
     struct trap_frame frame=prepare(LINUX_SYS_RT_SIGRETURN);
@@ -521,6 +541,7 @@ int main(void)
     test_idle_usb_work_without_syscall();
     test_usb_work_without_syscall();
     test_signal_input_and_retry();
+    test_nonblocking_connect_path_wait();
     test_restored_context_and_fallback();
     puts("PASS syscall user return: one transaction, result/TLS, signal, deferred input, retry, exec/sigreturn, retirement and FPU idle handoff");
 }

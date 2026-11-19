@@ -30,6 +30,8 @@ struct storage_inode_ref;
 #define KERNEL_SYSCALL_OPEN_PATH_RECLAIM (-4106LL)
 /* Private VFS signal: a native lookup's workspace failed before its I/O. */
 #define VFS_NATIVE_LOOKUP_RECLAIM (-4107)
+/* AF_UNIX connect is waiting for pathname I/O before checking the listener. */
+#define KERNEL_SYSCALL_UNIX_CONNECT_IO_WAIT (-4108LL)
 #ifdef CONFIG_SWAP
 /** @brief Reclaim before an open's import, walk or unsubmitted native lookup.
  * @param task Current task under sole outer execution ownership.
