@@ -2827,6 +2827,8 @@ static int64_t unix_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
         return 0;
     }
     if (number == __NR_connect) {
+        /* Complete pathname I/O even with O_NONBLOCK. Only a socket wait,
+         * such as a full listen queue below, should reach userspace as EAGAIN. */
         if (socket->passcred) unix_autobind(socket);
         if (socket->type == SOCK_DGRAM) {
             if (a2 < 2 || !user_range_ok(a1, 2)) return -RELIEFOS_EINVAL;
@@ -2839,6 +2841,7 @@ static int64_t unix_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
             }
             struct unix_socket *peer;
             int ret = unix_packet_peer(socket, (const void *)(uintptr_t)a1, (uint32_t)a2, &peer);
+            if (ret == -RELIEFOS_EAGAIN) return KERNEL_SYSCALL_UNIX_CONNECT_IO_WAIT;
             if (ret < 0) return ret;
             socket->peer_handle = peer->handle;
             socket->peer_path_len = peer->path_len;
@@ -2851,6 +2854,7 @@ static int64_t unix_socket_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
         struct unix_socket *listener,*server;
         if(socket->state!=UNIX_SOCKET_OPEN)return -RELIEFOS_EISCONN;
         int ret=syscall_unix_address(vfs_system_namespace(),task,a1,(uint32_t)a2,false,&target);
+        if (ret == -RELIEFOS_EAGAIN) return KERNEL_SYSCALL_UNIX_CONNECT_IO_WAIT;
         if(ret)return ret;
         if(!target.length)return -RELIEFOS_EINVAL;
         listener=unix_find_path(target.path,target.length,&target.object);
