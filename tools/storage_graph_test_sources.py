@@ -7,6 +7,8 @@ STORAGE_GRAPH_SOURCES = [
     "block/partition/mbr.c",
     'kernel/dma/buffer.c',
     'drivers/storage/ahci/dma.c',
+    'drivers/storage/nvme/queue.c',
+    'fs/vfs/fat_options.c',
     'fs/vfs/mount_tree.c', 'fs/vfs/lookup_cache.c',
     'fs/vfs/filesystems.c',
     'fs/vfs/filesystem_instance.c',

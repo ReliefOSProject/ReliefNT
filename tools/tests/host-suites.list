@@ -40,6 +40,7 @@ ext4_io_search tools/test_ext4_io_search.py
 exfat_boot tools/test_exfat_boot.py
 fat_directory_growth tools/test_fat_directory_growth.py
 fat_read_split tools/test_fat_read_split.py
+fat_async_read tools/test_fat_async_read.py
 fbdev tools/test_fbdev.py
 vbe_boot_surface tools/test_vbe_boot_surface.py
 vmware_boot_surface tools/test_vmware_boot_surface.py
