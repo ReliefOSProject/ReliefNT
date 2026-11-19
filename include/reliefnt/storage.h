@@ -247,16 +247,26 @@ int storage_inode_utimensat(const struct storage_node *node, int64_t atime, int6
 int storage_statfs(const struct storage_node *node, struct linux_statfs_abi *value);
 
 /**
- * @brief Maintains the next FAT32 cluster for one sequential file reader.
+ * @brief Retain a FAT32 reader's validated cluster and resumable chain walk.
  *
  * The cursor is deliberately owned by the open file descriptor.  It is not
  * part of a storage node because several descriptors may read the same node
- * at different offsets.
+ * at different offsets. Volume-owned fallback cursors serve callers without
+ * an open-file hint. Identity, size and metadata generation must match before
+ * reuse. chain_offset is the cluster's file offset, which may precede offset
+ * while a seek is waiting for another FAT sector. No buffer is retained.
  */
 struct storage_read_cursor {
     uint64_t offset;
+    uint64_t chain_offset;
+    uint64_t size;
+    uint64_t metadata_generation;
     uint32_t cluster;
     uint32_t valid;
+    uint32_t first_cluster;
+    uint32_t volume_id;
+    uint32_t mount_generation;
+    uint32_t inode_generation;
 };
 
 #define STORAGE_NODE_FLAG_ROOT    0x00000001u

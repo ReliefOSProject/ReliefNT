@@ -2,6 +2,63 @@
 
 static int fat32_dirent_is_acl_metadata(const struct fat32_dirent *de);
 
+struct fat32_scan_cursor {
+    struct storage_volume *volume;
+    uint64_t epoch, index, emitted;
+    uint32_t mount_generation, first_cluster, cluster, offset, walked, lfn_count;
+    uint16_t lfn_parts[20][13];
+    char name[RELIEFOS_FS_NAME_LEN];
+    bool valid;
+};
+static struct fat32_scan_cursor fat32_lookup_cursor, fat32_iterator_cursor;
+
+/** @brief Retain a metadata scan across async reads, bound to its exact operand.
+ * @param cursor Execution-owned checkpoint. @param directory Original chain head.
+ * @param name Literal lookup name, NULL for enumeration. @param index Directory cookie.
+ * No inode/buffer pointer is retained; volume, mount and metadata epochs reject
+ * stale state. A different lookup or seek starts a new bounded scan.
+ */
+static void fat32_scan_prepare(struct fat32_scan_cursor *cursor,uint32_t directory,
+                                const char *name,uint64_t index)
+{
+    uint64_t epoch=storage_metadata_generation();
+    if (cursor->valid && cursor->volume==g_active_volume && cursor->epoch==epoch &&
+        cursor->mount_generation==g_storage.mount_generation && cursor->first_cluster==directory &&
+        (name ? storage_text_eq_ci(name,cursor->name) : cursor->index==index)) return;
+    *cursor=(struct fat32_scan_cursor){.volume=g_active_volume,.epoch=epoch,
+        .mount_generation=g_storage.mount_generation,.first_cluster=directory,
+        .cluster=directory,.index=index,.valid=true};
+    if (name) storage_copy_text(cursor->name,sizeof(cursor->name),name);
+}
+
+/** @brief Preserve only a retryable scan; all terminal results retire its checkpoint.
+ * @param cursor Execution-owned scan. @param result Native result to return.
+ * @return The unchanged errno/result, with no I/O or reference transfer.
+ */
+static int fat32_scan_result(struct fat32_scan_cursor *cursor,int result)
+{
+    if (result!=-RELIEFOS_EAGAIN) cursor->valid=false;
+    return result;
+}
+
+/** @brief Advance a scanned directory cluster without replaying its LFN records.
+ * @param cursor Execution-owned scan at the current cluster's end.
+ * @return Zero, EAGAIN with the same checkpoint, ENOENT at EOC or native errno.
+ * FAT I/O is performed without a registry/graph lock. Malformed/cyclic chains
+ * fail within the volume's bounded cluster inventory.
+ */
+static int fat32_scan_advance(struct fat32_scan_cursor *cursor)
+{
+    uint32_t next;
+    int result=fat32_read_fat_entry(cursor->cluster,&next);
+    if (result) return fat32_scan_result(cursor,storage_read_failure(result));
+    if (next>=FAT32_EOC) return fat32_scan_result(cursor,-RELIEFOS_ENOENT);
+    if (next<2 || next>g_storage.data_cluster_count+1u || ++cursor->walked>=g_storage.data_cluster_count)
+        return fat32_scan_result(cursor,-RELIEFOS_EIO);
+    cursor->cluster=next;
+    cursor->offset=0;
+    return 0;
+}
 
 static int fat32_dirent_is_acl_metadata(const struct fat32_dirent *de)
 {
@@ -34,43 +91,49 @@ static bool fat32_acl_long_name(const struct fat32_lfn *lfn)
 
 int fat32_find_in_dir(uint32_t dir_cluster, const char *name, struct storage_node *out)
 {
-    uint32_t cluster = dir_cluster;
-    uint16_t lfn_parts[20][13];
-    uint32_t lfn_count = 0;
+    if (!name || dir_cluster<2) return -RELIEFOS_EINVAL;
     if (storage_dir_index_lookup(dir_cluster, name, out)) {
         return out ? storage_inode_cache_node(out) : 0;
     }
+    struct fat32_scan_cursor *scan=&fat32_lookup_cursor;
+    fat32_scan_prepare(scan,dir_cluster,name,0);
     for (;;) {
+        if (scan->offset>=g_storage.cluster_bytes) {
+            int result=fat32_scan_advance(scan);
+            if (result) return result;
+        }
+        uint32_t cluster=scan->cluster;
         int ret = fat32_read_lookup_cluster(cluster, storage_cluster_buf);
         if (ret < 0) {
-            return storage_read_failure(ret);
+            return fat32_scan_result(scan,storage_read_failure(ret));
         }
-        for (uint32_t off = 0; off < g_storage.cluster_bytes; off += sizeof(struct fat32_dirent)) {
+        for (uint32_t off = scan->offset; off < g_storage.cluster_bytes; off += sizeof(struct fat32_dirent)) {
+            scan->offset=off+sizeof(struct fat32_dirent);
             struct fat32_dirent *de = (struct fat32_dirent *)(void *)(storage_cluster_buf + off);
             if (de->name[0] == 0x00) {
-                return -2;
+                return fat32_scan_result(scan,-RELIEFOS_ENOENT);
             }
             if (de->name[0] == 0xe5) {
-                lfn_count = 0;
+                scan->lfn_count = 0;
                 continue;
             }
             if (de->attr == FAT32_ATTR_LFN) {
                 const struct fat32_lfn *lfn = (const struct fat32_lfn *)(const void *)de;
                 uint8_t order = lfn->order & 0x1fu;
                 if (order == 0 || order > 20) {
-                    lfn_count = 0;
+                    scan->lfn_count = 0;
                     continue;
                 }
-                storage_memzero(lfn_parts[order - 1], sizeof(lfn_parts[0]));
+                storage_memzero(scan->lfn_parts[order - 1], sizeof(scan->lfn_parts[0]));
                 uint32_t len = 0;
-                fat32_lfn_extract_utf16(lfn, lfn_parts[order - 1], &len, 13);
-                if (order > lfn_count) {
-                    lfn_count = order;
+                fat32_lfn_extract_utf16(lfn, scan->lfn_parts[order - 1], &len, 13);
+                if (order > scan->lfn_count) {
+                    scan->lfn_count = order;
                 }
                 continue;
             }
             if ((de->attr & 0x08u) != 0) {
-                lfn_count = 0;
+                scan->lfn_count = 0;
                 continue;
             }
             int matched = 0;
@@ -82,34 +145,25 @@ int fat32_find_in_dir(uint32_t dir_cluster, const char *name, struct storage_nod
                 .size = de->size,
                 .entry_id = (uint64_t)cluster<<32 | off,
             };
-            if (lfn_count) {
+            if (scan->lfn_count) {
                 char full[RELIEFOS_FS_NAME_LEN];
-                fat32_build_lfn_name(lfn_parts, lfn_count, full, sizeof(full));
+                fat32_build_lfn_name(scan->lfn_parts, scan->lfn_count, full, sizeof(full));
                 storage_dir_index_store(dir_cluster, full, &candidate);
                 matched = storage_text_eq_ci(full, name) || fat32_name_match_short(de, name);
             } else {
                 matched = fat32_name_match_short(de, name);
             }
-            lfn_count = 0;
+            scan->lfn_count = 0;
             if (!matched) {
                 continue;
             }
             ret=storage_inode_cache_node(&candidate);
-            if(ret)return ret;
+            if(ret)return fat32_scan_result(scan,ret);
             if (out) {
                 *out = candidate;
             }
-            return 0;
+            return fat32_scan_result(scan,0);
         }
-        uint32_t next = 0;
-        ret = fat32_read_fat_entry(cluster, &next);
-        if (ret < 0) {
-            return storage_read_failure(ret);
-        }
-        if (next >= FAT32_EOC) {
-            return -2;
-        }
-        cluster = next;
     }
 }
 
@@ -528,60 +582,52 @@ int fat32_dir_is_empty(uint32_t dir_cluster)
 
 int fat32_iter_dir_entry(uint32_t dir_cluster, uint64_t index, struct reliefos_dir_entry *entry)
 {
-    uint32_t cluster = dir_cluster;
-    uint64_t emitted = 0;
-    uint16_t lfn_parts[20][13];
-    uint32_t lfn_count = 0;
-    uint32_t first_offset = 0;
     if (!entry || dir_cluster < 2) {
         return -22;
     }
-    if (storage_dir_iter_cache.valid &&
-        storage_dir_iter_cache.volume == g_active_volume &&
-        storage_dir_iter_cache.first_cluster == dir_cluster &&
-        storage_dir_iter_cache.next_index == index) {
-        cluster = storage_dir_iter_cache.cluster;
-        first_offset = storage_dir_iter_cache.entry_offset;
-        emitted = index;
-    } else {
-        storage_dir_iter_cache.valid = 0;
-    }
+    struct fat32_scan_cursor *scan=&fat32_iterator_cursor;
+    fat32_scan_prepare(scan,dir_cluster,NULL,index);
     for (;;) {
-        int ret = fat32_read_cluster(cluster, storage_cluster_buf);
-        if (ret < 0) {
-            return storage_read_failure(ret);
+        if (scan->offset>=g_storage.cluster_bytes) {
+            int result=fat32_scan_advance(scan);
+            if (result) return result;
         }
-        for (uint32_t off = first_offset; off < g_storage.cluster_bytes;
+        uint32_t cluster=scan->cluster;
+        int ret = fat32_read_lookup_cluster(cluster, storage_cluster_buf);
+        if (ret < 0) {
+            return fat32_scan_result(scan,storage_read_failure(ret));
+        }
+        for (uint32_t off = scan->offset; off < g_storage.cluster_bytes;
              off += sizeof(struct fat32_dirent)) {
+            scan->offset=off+sizeof(struct fat32_dirent);
             struct fat32_dirent *de = (struct fat32_dirent *)(void *)(storage_cluster_buf + off);
             if (de->name[0] == 0x00) {
-                storage_dir_iter_cache.valid = 0;
-                return -2;
+                return fat32_scan_result(scan,-RELIEFOS_ENOENT);
             }
             if (de->name[0] == 0xe5) {
-                lfn_count = 0;
+                scan->lfn_count = 0;
                 continue;
             }
             if (de->attr == FAT32_ATTR_LFN) {
                 const struct fat32_lfn *lfn = (const struct fat32_lfn *)(const void *)de;
                 uint8_t order = lfn->order & 0x1fu;
                 if (order && order <= 20) {
-                    storage_memzero(lfn_parts[order - 1], sizeof(lfn_parts[0]));
+                    storage_memzero(scan->lfn_parts[order - 1], sizeof(scan->lfn_parts[0]));
                     uint32_t len = 0;
-                    fat32_lfn_extract_utf16(lfn, lfn_parts[order - 1], &len, 13);
-                    if (order > lfn_count) {
-                        lfn_count = order;
+                    fat32_lfn_extract_utf16(lfn, scan->lfn_parts[order - 1], &len, 13);
+                    if (order > scan->lfn_count) {
+                        scan->lfn_count = order;
                     }
                 }
                 continue;
             }
             if ((de->attr & 0x08u) != 0) {
-                lfn_count = 0;
+                scan->lfn_count = 0;
                 continue;
             }
             char name[RELIEFOS_FS_NAME_LEN];
-            if (lfn_count) {
-                fat32_build_lfn_name(lfn_parts, lfn_count, name, sizeof(name));
+            if (scan->lfn_count) {
+                fat32_build_lfn_name(scan->lfn_parts, scan->lfn_count, name, sizeof(name));
             } else {
                 struct storage_node tmp;
                 (void)tmp;
@@ -609,7 +655,7 @@ int fat32_iter_dir_entry(uint32_t dir_cluster, uint64_t index, struct reliefos_d
                 }
                 name[pos] = 0;
             }
-            lfn_count = 0;
+            scan->lfn_count = 0;
             if ((name[0] == '.' && name[1] == 0) ||
                 (name[0] == '.' && name[1] == '.' && name[2] == 0)) {
                 continue;
@@ -617,39 +663,13 @@ int fat32_iter_dir_entry(uint32_t dir_cluster, uint64_t index, struct reliefos_d
             if (storage_is_acl_metadata_name(name)) {
                 continue;
             }
-            if (emitted++ != index) {
+            if (scan->emitted++ != index) {
                 continue;
             }
             entry->type = (de->attr & FAT32_ATTR_DIRECTORY) ? RELIEFOS_FS_TYPE_DIR : RELIEFOS_FS_TYPE_FILE;
             storage_copy_text(entry->name, sizeof(entry->name), name);
-            storage_dir_iter_cache.volume = g_active_volume;
-            storage_dir_iter_cache.first_cluster = dir_cluster;
-            storage_dir_iter_cache.cluster = cluster;
-            storage_dir_iter_cache.entry_offset = off + sizeof(struct fat32_dirent);
-            storage_dir_iter_cache.next_index = index + 1u;
-            if (storage_dir_iter_cache.entry_offset >= g_storage.cluster_bytes) {
-                uint32_t next = 0;
-                if (fat32_read_fat_entry(cluster, &next) < 0 || next >= FAT32_EOC) {
-                    storage_dir_iter_cache.valid = 0;
-                } else {
-                    storage_dir_iter_cache.cluster = next;
-                    storage_dir_iter_cache.entry_offset = 0;
-                    storage_dir_iter_cache.valid = 1;
-                }
-            } else {
-                storage_dir_iter_cache.valid = 1;
-            }
+            scan->index=index+1;
             return 0;
         }
-        uint32_t next = 0;
-        ret = fat32_read_fat_entry(cluster, &next);
-        if (ret < 0) {
-            return storage_read_failure(ret);
-        }
-        if (next >= FAT32_EOC) {
-            return -2;
-        }
-        cluster = next;
-        first_offset = 0;
     }
 }

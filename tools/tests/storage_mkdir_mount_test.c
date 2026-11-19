@@ -146,6 +146,8 @@ uint64_t time_uptime_ms(void)
     return 0;
 } /* Synchronous fixture clock. */
 struct task *sched_current_task(void) { return NULL; }
+/** @brief Synchronous memory transports in this fixture have no IRQ waiters. */
+__attribute__((weak)) void storage_completion_notify(void) {}
 #ifndef RELIEFNT_FIXTURE_REAL_DAC
 bool task_in_group(const struct task *task, uint32_t gid, bool real)
 { (void)task; (void)gid; (void)real; abort(); }

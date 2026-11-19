@@ -34,48 +34,67 @@ static int fat_native_lookup(struct storage_volume *volume,const struct storage_
  */
 static int fat_native_mount(struct storage_volume *volume)
 { (void)volume;return fat32_mount(); }
+/** @brief Prepare an inode/volume/epoch-bound hint without discarding a pending walk.
+ * @param volume Selected mounted FAT instance under execution ownership.
+ * @param node Refreshed retained file metadata. @param offset Requested file byte.
+ * @param cursor Caller-owned hint or the selected volume's bounded fallback.
+ * No I/O, allocation or pointer ownership is retained. A metadata mutation,
+ * different inode, remount or changed offset restarts from the actual chain head.
+ */
+static void fat_read_prepare(struct storage_volume *volume,const struct storage_node *node,
+                               uint64_t offset,struct storage_read_cursor *cursor)
+{
+    uint64_t generation=storage_metadata_generation();
+    if (cursor->valid && cursor->offset==offset && cursor->chain_offset<=offset &&
+        !(cursor->chain_offset%volume->cluster_bytes) && cursor->cluster>=2 &&
+        (uint64_t)cursor->cluster<=(uint64_t)volume->data_cluster_count+1 &&
+        cursor->size==node->size && cursor->first_cluster==node->first_cluster &&
+        cursor->volume_id==volume->volume_id && cursor->mount_generation==volume->mount_generation &&
+        cursor->inode_generation==node->inode_generation && cursor->metadata_generation==generation)
+        return;
+    *cursor=(struct storage_read_cursor){.offset=offset,.cluster=node->first_cluster,.valid=1,
+        .size=node->size,.first_cluster=node->first_cluster,.volume_id=volume->volume_id,
+        .mount_generation=volume->mount_generation,.inode_generation=node->inode_generation,
+        .metadata_generation=generation};
+}
 /** @brief Read the selected provider's actual retained file extent/stream.
  * @param volume Borrowed selected/pinned instance. @param node Retained file.
  * @param offset Byte position. @param bytes Validated writable destination.
  * @param capacity Available bytes, bounded by refreshed inode size.
- * @param length Optional actual-count output, initially zero.
- * @param cursor Optional caller-owned hint. @param mount_flags Access-local flags.
- * @return Zero or negative provider errno. Execution ownership required across
- * native I/O; no graph/module lock, code/instance lifetime held by caller.
+ * @param length Optional actual-count output, including bytes before a later error.
+ * @param cursor Optional caller-owned hint; NULL uses a volume-owned checkpoint.
+ * @param mount_flags Access-local flags.
+ * @return Zero or negative provider errno. EAGAIN preserves completed bytes and
+ * the exact chain position for retry. Execution ownership required across native
+ * I/O; no graph/module lock, code/instance lifetime held by caller.
+ * Readahead stays within one FAT cache window so its chain probe can complete
+ * without replaying an earlier window and discarding a different pending read.
  */
 static int fat_native_read(struct storage_volume *volume,const struct storage_node *node,uint64_t offset,
                                   void *bytes,uint32_t capacity,uint32_t *length,
                                   struct storage_read_cursor *cursor,uint64_t mount_flags)
 {
-    (void)volume;(void)mount_flags;
-    uint8_t *dst=bytes;uint32_t done=0;int ret;
-    uint32_t cluster = node->first_cluster;
-    uint64_t skip_clusters = offset / g_storage.cluster_bytes;
+    (void)mount_flags;
+    uint8_t *dst=bytes;uint32_t done=0;int ret=0;
+    if (length) *length=0;
+    if (!capacity) return 0;
+    if (!cursor) cursor=&volume->fat_read_cursor;
+    fat_read_prepare(volume,node,offset,cursor);
+    uint32_t cluster = cursor->cluster;
+    uint64_t skip_clusters = (offset-cursor->chain_offset) / g_storage.cluster_bytes;
     uint32_t cluster_off = (uint32_t)(offset % g_storage.cluster_bytes);
-    /* FAT32 directory/file reads alternate between the installer root and a
-     * mounted /target or /target/boot volume. A cached cluster cursor can
-     * survive a volume switch and turn a valid fragmented file into EIO.
-     * FAT cursors are an optimization only; re-walk the chain for each
-     * syscall slice until the read cache can be keyed by volume as well. */
-    if (cursor) cursor->valid = 0;
-    if (cursor && cursor->valid) {
-        cluster = cursor->cluster;
-    } else {
-        while (skip_clusters--) {
-            uint32_t next = 0;
-            ret = fat32_read_fat_entry(cluster, &next);
-            if (ret < 0) {
-
-                return storage_read_failure(ret);
-            }
-            if (next >= FAT32_EOC || next < 2u) {
-                console_error("[storage] fat skip invalid cluster=%u next=%u off=%llu\n",
-                               cluster, next, (unsigned long long)offset);
-
-                return -5;
-            }
-            cluster = next;
+    while (skip_clusters--) {
+        uint32_t next = 0;
+        ret = fat32_read_fat_entry(cluster, &next);
+        if (ret < 0) { ret=storage_read_failure(ret); goto out; }
+        if (next >= FAT32_EOC || next < 2u) {
+            console_error("[storage] fat skip invalid cluster=%u next=%u off=%llu\n",
+                           cluster, next, (unsigned long long)offset);
+            ret=-5; goto out;
         }
+        cluster = next;
+        cursor->cluster=cluster;
+        cursor->chain_offset+=g_storage.cluster_bytes;
     }
 
     while (done < capacity) {
@@ -97,6 +116,9 @@ static int fat_native_read(struct storage_volume *volume,const struct storage_no
         if (max_clusters > STORAGE_READAHEAD_SECTORS / g_storage.sectors_per_cluster) {
             max_clusters = STORAGE_READAHEAD_SECTORS / g_storage.sectors_per_cluster;
         }
+        uint32_t fat_entries=STORAGE_FAT_CACHE_SECTORS*SECTOR_SIZE/sizeof(uint32_t);
+        uint32_t fat_remaining=fat_entries-cluster%fat_entries;
+        if (max_clusters>fat_remaining) max_clusters=fat_remaining;
         if (storage_read_cache_lookup(cluster, &cache_offset, &cache_clusters)) {
             if (cache_clusters > max_clusters) {
                 cache_clusters = max_clusters;
@@ -104,19 +126,19 @@ static int fat_native_read(struct storage_volume *volume,const struct storage_no
             ret = fat32_read_fat_entry(cluster + cache_clusters - 1u, &next);
             if (ret < 0) {
 
-                return storage_read_failure(ret);
+                ret=storage_read_failure(ret); goto out;
             }
         } else {
             ret = storage_read_contiguous_clusters(cluster, max_clusters,
                                                    &cache_clusters, &next);
             if (ret < 0) {
 
-                return storage_read_failure(ret);
+                ret=storage_read_failure(ret); goto out;
             }
             ret = storage_read_cache_fill(cluster, cache_clusters);
             if (ret < 0) {
 
-                return storage_read_failure(ret);
+                ret=storage_read_failure(ret); goto out;
             }
             cache_offset = 0;
         }
@@ -127,65 +149,39 @@ static int fat_native_read(struct storage_volume *volume,const struct storage_no
         storage_memcpy(dst + done, storage_read_cache_data + cache_offset + cluster_off,
                        take);
         done += take;
-        if (done >= capacity) {
-            if (cursor && offset + done < node->size) {
-                uint32_t consumed = cluster_off + take;
-                uint32_t advanced = consumed / g_storage.cluster_bytes;
-                uint32_t next_cluster = cluster + advanced;
-                if ((consumed % g_storage.cluster_bytes) == 0u &&
-                    advanced >= cache_clusters) {
-                    next_cluster = next;
-                }
-                if (next_cluster < 2u || next_cluster >= FAT32_EOC) {
-                    console_error("[storage] fat cursor invalid cluster=%u next=%u next_cluster=%u advanced=%u cache_clusters=%u consumed=%u off=%llu size=%llu\n",
-                                   cluster, next, next_cluster, advanced, cache_clusters,
-                                   consumed, (unsigned long long)offset,
-                                   (unsigned long long)node->size);
-                    cursor->valid = 0;
-
-                    return -5;
-                }
-                cursor->offset = offset + done;
-                cursor->cluster = next_cluster;
-                cursor->valid = 1;
-            } else if (cursor) {
-                cursor->valid = 0;
+        if (offset + done < node->size) {
+            uint32_t consumed = cluster_off + take;
+            uint32_t advanced = consumed / g_storage.cluster_bytes;
+            uint32_t next_cluster = cluster + advanced;
+            if ((consumed % g_storage.cluster_bytes) == 0u && advanced >= cache_clusters)
+                next_cluster = next;
+            if (next_cluster < 2u || next_cluster >= FAT32_EOC) {
+                console_error("[storage] fat cursor invalid cluster=%u next=%u next_cluster=%u advanced=%u cache_clusters=%u consumed=%u off=%llu size=%llu\n",
+                               cluster, next, next_cluster, advanced, cache_clusters,
+                               consumed, (unsigned long long)offset,
+                               (unsigned long long)node->size);
+                ret=-5; goto out;
             }
+            cursor->offset = offset + done;
+            cursor->chain_offset=cursor->offset-cursor->offset%g_storage.cluster_bytes;
+            cursor->cluster = next_cluster;
+            cursor->valid = 1;
+        } else {
+            cursor->valid = 0;
+        }
+        if (done >= capacity) {
             break;
         }
-        if (next >= FAT32_EOC) {
-            console_error("[storage] fat mid eoc cluster=%u next=%u done=%u capacity=%u off=%llu size=%llu\n",
-                           cluster, next, done, capacity, (unsigned long long)offset,
-                           (unsigned long long)node->size);
-            if (cursor) {
-                cursor->valid = 0;
-            }
-
-            return -5;
-        }
-        if (next < 2u) {
-            console_error("[storage] fat mid bad cluster=%u next=%u done=%u capacity=%u off=%llu size=%llu\n",
-                           cluster, next, done, capacity, (unsigned long long)offset,
-                           (unsigned long long)node->size);
-            if (cursor) {
-                cursor->valid = 0;
-            }
-
-            return -5;
-        }
-        if (cursor) {
-            cursor->offset = offset + done;
-            cursor->cluster = next;
-            cursor->valid = 1;
-        }
-        cluster = next;
+        cluster = cursor->cluster;
         cluster_off = 0;
     }
+out:
+    if (ret && ret!=-RELIEFOS_EAGAIN) cursor->valid=0;
     if (length) {
         *length = done;
     }
 
-    return 0;
+    return ret;
 }
 /** @brief Enumerate the selected provider's actual retained directory.
  * @param volume Borrowed selected/pinned instance. @param node Actual directory.
