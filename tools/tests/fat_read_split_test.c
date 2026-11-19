@@ -7,12 +7,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../../fs/fat/internal.h"
+#ifndef RELIEFNT_FAT_NATIVE_SOURCE
+#define RELIEFNT_FAT_NATIVE_SOURCE "../../fs/fat/native.c"
+#endif
+/* Keep the production static read callback reachable without retaining the
+ * unrelated write/mount/provider callbacks and inventing fake VFS adapters. */
+#include RELIEFNT_FAT_NATIVE_SOURCE
 
 static uint8_t media[1024 * 512], output[64 * 512];
 static unsigned calls, completed, discarded, max_sectors, fail_at;
 static unsigned synchronous_calls, asynchronous_calls;
 static int injected_error;
 static uint64_t deferred_start;
+static uint64_t fail_lba = UINT64_MAX;
 static struct { bool active; uint64_t lba; uint32_t count; void *buffer; } pending;
 
 struct task *sched_current_task(void) { return NULL; }
@@ -47,7 +54,9 @@ static int read_media(void *context, uint64_t lba, uint32_t sectors, void *buffe
     ++calls;
     if (storage_async_can_yield()) ++asynchronous_calls;
     else ++synchronous_calls;
-    if (calls == fail_at) { pending.active = false; return injected_error; }
+    if (calls == fail_at || (lba <= fail_lba && fail_lba - lba < sectors)) {
+        pending.active = false; return injected_error;
+    }
     if (pending.active) {
         bool matches = pending.lba == lba && pending.count == sectors && pending.buffer == buffer;
         pending.active = false;
@@ -114,6 +123,7 @@ static void begin_read(bool asynchronous, bool write_started,
     memset(&found, 0, sizeof(found)); memset(&entry, 0, sizeof(entry));
     calls = completed = discarded = synchronous_calls = asynchronous_calls = 0;
     memset(&pending, 0, sizeof(pending)); fail_at = 0;
+    fail_lba = UINT64_MAX;
     /* Delay a second native chunk when split, otherwise delay the only one. */
     deferred_start = first_lba + (sectors > max_sectors ? max_sectors : 0);
     storage_set_io_async_context(true); assert(!storage_acquire_task_io());
@@ -139,6 +149,111 @@ static void check_output(enum operation operation)
     case FAT_CACHE: assert(next_cluster == 0x0fffffff); break;
     default: abort();
     }
+}
+
+/** @brief Encode a fragmented file independently of native chain/read helpers. */
+static void encode_file(unsigned cluster_sectors)
+{
+    static const uint32_t chain[] = {2, 5, 3, 7};
+    memset(media, 0, sizeof(media));
+    g_storage.data_cluster_count = 12;
+    for (unsigned logical = 0; logical < 4; ++logical) {
+        uint32_t next = logical == 3 ? 0x0fffffff : chain[logical + 1];
+        for (unsigned byte = 0; byte < 4; ++byte)
+            media[512 + chain[logical] * 4 + byte] = (uint8_t)(next >> (byte * 8));
+        uint8_t *data = media + (64 + (chain[logical] - 2) * cluster_sectors) * 512;
+        for (unsigned within = 0; within < cluster_sectors * 512; ++within)
+            data[within] = (uint8_t)(logical * 37 + within * 11 + 7);
+    }
+}
+
+/** @brief Verify a native file read against its independent logical-byte model. */
+static void check_file_bytes(const uint8_t *bytes, uint64_t offset, unsigned count)
+{
+    for (unsigned i = 0; i < count; ++i) {
+        uint64_t position = offset + i;
+        uint8_t expected = (uint8_t)((position / g_storage.cluster_bytes) * 37 +
+                                      (position % g_storage.cluster_bytes) * 11 + 7);
+        assert(bytes[i] == expected);
+    }
+}
+
+/** @brief Consume actual-count/EAGAIN results without repeating completed data.
+ * Validate the caller-owned or volume fallback cursor through fragmented
+ * skips, unaligned boundaries, large clusters and a short final cluster read.
+ */
+static void verify_native_range(const struct storage_node *node, uint64_t offset,
+                                 unsigned count, struct storage_read_cursor *cursor)
+{
+    uint8_t *bytes = malloc(count + 1); assert(bytes); memset(bytes, 0xa5, count + 1);
+    unsigned received = 0, attempts = 0; bool partial_eagain = false;
+    while (received < count) {
+        uint32_t length = UINT32_MAX;
+        int ret = fat_native_read(&g_storage, node, offset + received,
+                                   bytes + received, count - received, &length, cursor, 0);
+        if (ret != 0 && ret != -RELIEFOS_EAGAIN)
+            fprintf(stderr, "FAILED native file limit=%u cluster=%u offset=%llu count=%u ret=%d length=%u\n",
+                    max_sectors, g_storage.sectors_per_cluster, (unsigned long long)offset, count, ret, length);
+        assert(ret == 0 || ret == -RELIEFOS_EAGAIN);
+        assert(length <= count - received && (length || ret == -RELIEFOS_EAGAIN));
+        if (ret == -RELIEFOS_EAGAIN && length) partial_eagain = true;
+        received += length; assert(++attempts < 64);
+    }
+    assert(!pending.active && !discarded && bytes[count] == 0xa5);
+    if (g_storage.sectors_per_cluster <= max_sectors && count > 2 * g_storage.cluster_bytes)
+        assert(partial_eagain);
+    check_file_bytes(bytes, offset, count); free(bytes);
+    assert(storage_io_async_context && !storage_io_write_started && storage_task_io_owner == 7);
+}
+
+/** @brief Exercise the real native file callback through the same block provider. */
+static void native_read_tests(unsigned cluster_sectors)
+{
+    encode_file(cluster_sectors);
+    uint32_t bs = g_storage.cluster_bytes;
+    struct storage_node node = {.type = RELIEFOS_FS_TYPE_FILE, .flags = STORAGE_NODE_FLAG_FAT32,
+        .volume_id = g_storage.volume_id, .mount_generation = g_storage.mount_generation,
+        .inode_generation = 9, .first_cluster = 2, .size = (uint64_t)4 * bs - 11};
+    for (unsigned fallback = 0; fallback < 2; ++fallback) {
+        begin_read(true, false, 64, 1);
+        g_storage.fat_read_cursor = (struct storage_read_cursor){0};
+        struct storage_read_cursor cursor = {0};
+        verify_native_range(&node, 37, 3 * bs + 13, fallback ? NULL : &cursor);
+        /* A reverse seek invalidates the old cursor, then a partial boundary
+         * read leaves a reusable hint for a different request size. */
+        verify_native_range(&node, 1, 1, fallback ? NULL : &cursor);
+        verify_native_range(&node, 2, bs + 7, fallback ? NULL : &cursor);
+        verify_native_range(&node, node.size - 39, 39, fallback ? NULL : &cursor);
+        assert(!(fallback ? g_storage.fat_read_cursor.valid : cursor.valid));
+        storage_release_task_io(7);
+    }
+    /* A later permanent error must preserve actual bytes already returned,
+     * invalidate the cursor and permit an explicit continuation at that byte. */
+    for (unsigned asynchronous = 0; asynchronous < 2; ++asynchronous) {
+        begin_read(asynchronous, false, 64, 1);
+        struct storage_read_cursor cursor = {0};
+        uint8_t *bytes = malloc(2 * bs); assert(bytes); memset(bytes, 0xa5, 2 * bs);
+        fail_lba = 64 + 3 * cluster_sectors; injected_error = -RELIEFOS_EIO;
+        unsigned received = 0, attempts = 0; int ret;
+        do {
+            uint32_t length = UINT32_MAX;
+            ret = fat_native_read(&g_storage, &node, received, bytes + received,
+                                   2 * bs - received, &length, &cursor, 0);
+            assert(length <= 2 * bs - received); received += length;
+            assert(++attempts < 64);
+        } while (ret == -RELIEFOS_EAGAIN);
+        assert(ret == -RELIEFOS_EIO && received == bs && !cursor.valid && !pending.active && !discarded);
+        check_file_bytes(bytes, 0, bs);
+        assert(bytes[bs] == 0xa5 && storage_io_async_context == !!asynchronous && !storage_io_write_started);
+        fail_lba = UINT64_MAX;
+        /* The verifier uses asynchronous context and consumes only remaining
+         * bytes; the permanent error must not leave a hidden pending request. */
+        storage_io_async_context = true;
+        verify_native_range(&node, bs, bs, &cursor);
+        free(bytes); storage_release_task_io(7);
+    }
+    printf("PASS native-file max_sectors=%u cluster_sectors=%u fragmented/unaligned/cursor/EOF/partial-error\n",
+           max_sectors, cluster_sectors);
 }
 
 int main(int argc, char **argv)
@@ -226,6 +341,7 @@ int main(int argc, char **argv)
                     storage_release_task_io(7);
                 }
             }
+            if (!baseline) native_read_tests(cluster_sectors);
         }
         block_device_put(&g_storage.device_ref); assert(!unregister_block_device(&device));
     }

@@ -212,3 +212,6 @@ msgstr "When one read exceeds the device request limit, the common block transfe
 
 msgid "``tools/test_fat_read_split.py`` 使用真实 FAT 目录、块传输、registry 和上下文实现，检查设备上限小于簇大小时的读取进展、单命令异步接续，以及错误后的上下文恢复。"
 msgstr "``tools/test_fat_read_split.py`` uses the production FAT directory, block transfer, registry and context implementations to verify progress when the device limit is smaller than a cluster, single-command asynchronous continuation, and context restoration after errors."
+
+msgid "FAT32 大于预读缓存的合法簇通过现有簇缓冲区逐簇读取，保留碎片链游标、部分读取和错误语义，不扩大预读缓存。"
+msgstr "Legal FAT32 clusters larger than the read-ahead cache are read individually through the existing cluster buffer. Fragmented-chain cursors, partial-read and error semantics are retained without enlarging the read-ahead cache."
