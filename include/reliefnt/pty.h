@@ -144,10 +144,21 @@ int pty_slave_open_allowed(uint32_t pty_id);
 /** Set or read the Unix98 PTY slave lock state. */
 int pty_set_lock(uint32_t pty_id, int locked);
 int pty_get_lock(uint32_t pty_id, int *locked);
+int pty_set_packet_mode(uint32_t pty_id, int enabled);
+int pty_get_packet_mode(uint32_t pty_id, int *enabled);
+short pty_poll_endpoint(uint32_t pty_id, bool master);
+
+/* The packet read state lasts for one read/readv, never across syscalls. */
+enum pty_read_phase {
+    PTY_READ_FIRST,
+    PTY_READ_DATA,
+    PTY_READ_CONTROL,
+};
 /**
  * @brief Copy up to length bytes of pty_id's terminal output into buffer; returns bytes read.
  */
-int64_t pty_read_output(uint32_t owner_pid, uint32_t pty_id, char *buffer, uint32_t length);
+int64_t pty_read_output(uint32_t owner_pid, uint32_t pty_id, char *buffer,
+                        uint32_t length, enum pty_read_phase *phase);
 /**
  * @brief Feed up to length bytes of buffer into pty_id as terminal input; returns bytes accepted.
  */
@@ -175,6 +186,7 @@ int pty_get_termios(uint32_t pty_id, struct reliefos_pty_termios *termios);
  */
 int pty_set_termios(uint32_t pty_id, const struct reliefos_pty_termios *termios);
 void pty_flush_input(uint32_t pty_id);
+int pty_flush(uint32_t pty_id, bool master, uint64_t queue);
 /**
  * @brief Copy pty_id's terminal window size into winsize; 0 on success.
  */

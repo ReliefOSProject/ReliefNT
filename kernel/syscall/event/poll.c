@@ -81,21 +81,8 @@ static int64_t syscall_poll_impl_core(struct task *task, struct pollfd *fds,
         {
             struct task_pty_fd *endpoint = task_pty_for_io(task, fd);
             if (endpoint) {
-                if (pty_is_hungup(endpoint->pty_id)) {
-                    if (events & POLLIN) revents |= POLLIN;
-                    revents |= POLLHUP;
-                    if (endpoint->endpoint == TASK_PTY_ENDPOINT_SLAVE) {
-                        revents |= POLLERR;
-                    }
-                } else {
-                    if (events & POLLIN) {
-                        uint32_t available = endpoint->endpoint == TASK_PTY_ENDPOINT_MASTER
-                                                 ? pty_output_available(endpoint->pty_id)
-                                                 : pty_input_available(endpoint->pty_id);
-                        if (available) revents |= POLLIN;
-                    }
-                    if (events & POLLOUT) revents |= POLLOUT;
-                }
+                bool master = endpoint->endpoint == TASK_PTY_ENDPOINT_MASTER;
+                revents = pty_poll_endpoint(endpoint->pty_id, master) & (events | POLLERR | POLLHUP);
                 fds[i].revents = revents;
                 if (revents) ++ready;
                 continue;

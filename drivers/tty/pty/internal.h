@@ -29,6 +29,9 @@ struct pty_session {
     uint8_t output_reported;
     uint8_t input_reported;
     uint8_t locked;
+    uint8_t packet_mode;
+    uint8_t packet_status;
+    uint8_t output_stopped;
     uint32_t owner_pid;
     uint32_t generation;
     struct reliefos_permissions permissions;
@@ -333,7 +336,8 @@ int pty_get_lock(uint32_t pty_id, int *locked);
 /**
  * @brief Drain up to length bytes of terminal output for the owner; returns bytes read, or -22 if not owned.
  */
-int64_t pty_read_output(uint32_t owner_pid, uint32_t pty_id, char *buffer, uint32_t length);
+int64_t pty_read_output(uint32_t owner_pid, uint32_t pty_id, char *buffer,
+                        uint32_t length, enum pty_read_phase *phase);
 
 /**
  * @brief Process input bytes through termios (CR->NL, signals, line editing) and queue the results; returns bytes consumed.
