@@ -1,4 +1,6 @@
 #include "internal.h"
+#include <linux/errno.h>
+#include <linux/poll.h>
 
 /** @brief Queue terminal query traffic without turning it into keyboard echo. */
 void pty_vt_reply(uint32_t number, const char *bytes, size_t len)
@@ -60,28 +62,96 @@ static int pty_canonical_mode(const struct pty_session *session)
            (session->termios.c_lflag & RELIEFOS_PTY_LFLAG_ICANON) != 0;
 }
 
+int pty_set_packet_mode(uint32_t pty_id, int enabled)
+{
+    struct pty_session *session = find_session(pty_id);
+    if (!session || session->console) return -LINUX_ENOTTY;
+    if (session->packet_mode != (enabled != 0)) {
+        session->packet_status = 0;
+        session->packet_mode = enabled != 0;
+    }
+    return 0;
+}
+
+int pty_get_packet_mode(uint32_t pty_id, int *enabled)
+{
+    struct pty_session *session = find_session(pty_id);
+    if (!session || session->console) return -LINUX_ENOTTY;
+    *enabled = session->packet_mode;
+    return 0;
+}
+
+static void pty_packet_event(struct pty_session *session, uint8_t set, uint8_t clear)
+{
+    if (!session->packet_mode) return;
+    session->packet_status = (session->packet_status & ~clear) | set;
+    kernel_poll_readiness_notify();
+}
+
+short pty_poll_endpoint(uint32_t pty_id, bool master)
+{
+    struct pty_session *session = find_session(pty_id);
+    if (!session) return POLLHUP | POLLERR;
+    if (session->hungup) return POLLIN | POLLRDNORM | POLLHUP | (master ? 0 : POLLERR);
+    short ready = 0;
+    if (master ? session->output_head != session->output_tail :
+                 session->input_head != session->input_tail)
+        ready |= POLLIN | POLLRDNORM;
+    if (master && session->packet_mode && session->packet_status)
+        ready |= POLLIN | POLLRDNORM | POLLPRI;
+    if (master || !session->output_stopped) ready |= POLLOUT | POLLWRNORM;
+    return ready;
+}
+
 /**
  * @brief Drain up to length bytes of terminal output for the owner; returns bytes read, or -22 if not owned.
  */
-int64_t pty_read_output(uint32_t owner_pid, uint32_t pty_id, char *buffer, uint32_t length)
+int64_t pty_read_output(uint32_t owner_pid, uint32_t pty_id, char *buffer,
+                        uint32_t length, enum pty_read_phase *phase)
 {
     struct pty_session *session = find_session(pty_id);
     if (!session || (owner_pid && session->owner_pid != owner_pid)) {
-        return -22;
+        return -LINUX_EINVAL;
     }
-    if (!buffer || length == 0) {
-        return 0;
+    if (!buffer || !length || (phase && *phase == PTY_READ_CONTROL)) return 0;
+    bool first = !phase || *phase == PTY_READ_FIRST;
+    if (first && session->packet_mode && session->packet_status) {
+        *buffer = (char)session->packet_status;
+        session->packet_status = 0;
+        if (phase) *phase = PTY_READ_CONTROL;
+        return 1;
     }
-    {
-        int64_t queued = (int64_t)ring_pop(session->output, PTY_OUTPUT_CAP,
-                                           &session->output_head,
-                                           &session->output_tail,
-                                           buffer, length);
-        if (queued != 0 || !session->hungup) {
-            return queued;
+    if (session->output_head == session->output_tail)
+        return !first || session->hungup ? 0 : -LINUX_EAGAIN;
+    uint32_t prefix = 0;
+    if (session->packet_mode) {
+        if (first) {
+            *buffer = TIOCPKT_DATA;
+            prefix = 1;
         }
+        if (phase) *phase = PTY_READ_DATA;
     }
-    return 0;
+    return prefix + ring_pop(session->output, PTY_OUTPUT_CAP,
+                             &session->output_head, &session->output_tail,
+                             buffer + prefix, length - prefix);
+}
+
+static void pty_stop_output(struct pty_session *session, bool stopped)
+{
+    if (session->output_stopped == stopped) return;
+    session->output_stopped = stopped;
+    if (session->packet_mode) {
+        pty_packet_event(session, stopped ? TIOCPKT_STOP : TIOCPKT_START,
+                         stopped ? TIOCPKT_START : TIOCPKT_STOP);
+    } else if (!stopped) {
+        kernel_poll_readiness_notify();
+    }
+}
+
+static void pty_clear_input(struct pty_session *session)
+{
+    session->input_tail = session->input_head;
+    session->canonical_length = 0;
 }
 
 /**
@@ -107,52 +177,54 @@ int64_t pty_write_input(uint32_t owner_pid, uint32_t pty_id, const char *buffer,
                        pty_id, session->owner_pid, length);
     }
     for (uint32_t i = 0; i < length; ++i) {
-        char input = buffer[i];
+        uint8_t input = (uint8_t)buffer[i];
+        if (!session->console && (session->termios.c_iflag & LINUX_IXON)) {
+            if (input && input == session->termios.c_cc[RELIEFOS_PTY_CC_VSTART]) {
+                pty_stop_output(session, false);
+                ++written;
+                continue;
+            }
+            if (input && input == session->termios.c_cc[RELIEFOS_PTY_CC_VSTOP]) {
+                pty_stop_output(session, true);
+                ++written;
+                continue;
+            }
+            if (session->termios.c_iflag & LINUX_IXANY) pty_stop_output(session, false);
+        }
         if (input == '\r' &&
             (session->termios.c_iflag & RELIEFOS_PTY_IFLAG_ICRNL)) {
             input = '\n';
         }
-        if ((session->termios.c_lflag & RELIEFOS_PTY_LFLAG_ISIG) != 0 &&
-            input == (char)session->termios.c_cc[RELIEFOS_PTY_CC_VINTR]) {
-            session->canonical_length = 0;
-            if (session->foreground_pgid) {
-                (void)sched_signal_kernel_group(session->foreground_pgid, 2);
+        if (input && (session->termios.c_lflag & RELIEFOS_PTY_LFLAG_ISIG)) {
+            int signal = input == session->termios.c_cc[RELIEFOS_PTY_CC_VINTR] ? 2 :
+                         input == session->termios.c_cc[RELIEFOS_PTY_CC_VSUSP] ? 20 :
+                         input == session->termios.c_cc[RELIEFOS_PTY_CC_VQUIT] ? 3 : 0;
+            if (signal) {
+                if (!(session->termios.c_lflag & LINUX_NOFLSH)) {
+                    pty_clear_input(session);
+                    pty_packet_event(session, TIOCPKT_FLUSHREAD | TIOCPKT_FLUSHWRITE, 0);
+                }
+                if (session->termios.c_iflag & LINUX_IXON) pty_stop_output(session, false);
+                if (session->foreground_pgid)
+                    (void)sched_signal_kernel_group(session->foreground_pgid, signal);
+                ++written;
+                continue;
             }
-            ++written;
-            continue;
-        }
-        if ((session->termios.c_lflag & RELIEFOS_PTY_LFLAG_ISIG) != 0 &&
-            input == (char)session->termios.c_cc[RELIEFOS_PTY_CC_VSUSP]) {
-            session->canonical_length = 0;
-            if (session->foreground_pgid) {
-                (void)sched_signal_kernel_group(session->foreground_pgid, 20);
-            }
-            ++written;
-            continue;
-        }
-        if ((session->termios.c_lflag & RELIEFOS_PTY_LFLAG_ISIG) != 0 &&
-            input == (char)session->termios.c_cc[RELIEFOS_PTY_CC_VQUIT]) {
-            session->canonical_length = 0;
-            if (session->foreground_pgid) {
-                (void)sched_signal_kernel_group(session->foreground_pgid, 3);
-            }
-            ++written;
-            continue;
         }
         if (!pty_canonical_mode(session)) {
             written += ring_push(session->input, PTY_INPUT_CAP,
                                  &session->input_head, &session->input_tail,
-                                 &input, 1);
+                                 (const char *)&input, 1);
             continue;
         }
 
-        if (input == (char)session->termios.c_cc[RELIEFOS_PTY_CC_VERASE]) {
+        if (input == session->termios.c_cc[RELIEFOS_PTY_CC_VERASE]) {
             if (session->canonical_length) {
                 --session->canonical_length;
             }
-        } else if (input == (char)session->termios.c_cc[RELIEFOS_PTY_CC_VKILL]) {
+        } else if (input == session->termios.c_cc[RELIEFOS_PTY_CC_VKILL]) {
             session->canonical_length = 0;
-        } else if (input == (char)session->termios.c_cc[RELIEFOS_PTY_CC_VEOF]) {
+        } else if (input == session->termios.c_cc[RELIEFOS_PTY_CC_VEOF]) {
             /**
  * @brief VEOF is a delimiter, not a byte delivered to the reader.
  */
@@ -163,7 +235,7 @@ int64_t pty_write_input(uint32_t owner_pid, uint32_t pty_id, const char *buffer,
             }
             if (input == '\n' ||
                 (session->termios.c_cc[RELIEFOS_PTY_CC_VEOL] != 0 &&
-                 input == (char)session->termios.c_cc[RELIEFOS_PTY_CC_VEOL])) {
+                 input == session->termios.c_cc[RELIEFOS_PTY_CC_VEOL])) {
                 pty_commit_canonical_input(session);
             }
         }
@@ -329,6 +401,7 @@ int64_t pty_write_output(uint32_t pty_id, const char *buffer, uint32_t length)
     if (!buffer || length == 0) {
         return 0;
     }
+    if (session->output_stopped) return -LINUX_EAGAIN;
     if (!session->console && !session->output_reported) {
         session->output_reported = 1;
         console_debug("[reliefnt] pty=%u first slave output len=%u\n",
@@ -397,8 +470,34 @@ void pty_flush_input(uint32_t pty_id)
 {
     struct pty_session *session = find_session(pty_id);
     if (!session) return;
-    session->input_tail = session->input_head;
-    session->canonical_length = 0;
+    pty_clear_input(session);
+    pty_packet_event(session, TIOCPKT_FLUSHREAD, 0);
+}
+
+int pty_flush(uint32_t pty_id, bool master, uint64_t queue)
+{
+    struct pty_session *session = find_session(pty_id);
+    if (!session) return -LINUX_ENOTTY;
+    if (queue > LINUX_TCIOFLUSH) return -LINUX_EINVAL;
+    if (master) {
+        if (queue != LINUX_TCOFLUSH) session->output_tail = session->output_head;
+    } else {
+        if (queue != LINUX_TCOFLUSH) pty_clear_input(session);
+        /* Writes enter the peer's receive queue synchronously. Bytes already
+         * received by the master survive a slave output flush, as on Linux. */
+        uint8_t status = queue == LINUX_TCIFLUSH ? TIOCPKT_FLUSHREAD :
+                         queue == LINUX_TCOFLUSH ? TIOCPKT_FLUSHWRITE :
+                         TIOCPKT_FLUSHREAD | TIOCPKT_FLUSHWRITE;
+        pty_packet_event(session, status, 0);
+    }
+    return 0;
+}
+
+static bool pty_default_flow(const struct reliefos_pty_termios *termios)
+{
+    return (termios->c_iflag & LINUX_IXON) &&
+           termios->c_cc[RELIEFOS_PTY_CC_VSTART] == 17 &&
+           termios->c_cc[RELIEFOS_PTY_CC_VSTOP] == 19;
 }
 
 int pty_set_termios(uint32_t pty_id, const struct reliefos_pty_termios *termios)
@@ -414,12 +513,22 @@ int pty_set_termios(uint32_t pty_id, const struct reliefos_pty_termios *termios)
         (termios->c_lflag & RELIEFOS_PTY_LFLAG_ICANON) == 0) {
         pty_commit_canonical_input(session);
     }
+    uint8_t status = ((session->termios.c_lflag | termios->c_lflag) & LINUX_EXTPROC)
+                         ? TIOCPKT_IOCTL : 0;
+    uint8_t clear = 0;
+    bool default_flow = pty_default_flow(termios);
+    if (pty_default_flow(&session->termios) != default_flow) {
+        clear = TIOCPKT_DOSTOP | TIOCPKT_NOSTOP;
+        status |= default_flow ? TIOCPKT_DOSTOP : TIOCPKT_NOSTOP;
+    }
     session->termios = *termios;
     uint32_t output = termios->c_cflag & LINUX_CBAUD;
     uint32_t input = (termios->c_cflag & LINUX_CIBAUD) >> LINUX_IBSHIFT;
     session->termios.c_ospeed = pty_baud_rate(output, termios->c_ospeed);
     session->termios.c_ispeed = input ? pty_baud_rate(input, termios->c_ispeed)
                                      : session->termios.c_ospeed;
+    if (!(termios->c_iflag & LINUX_IXON)) pty_stop_output(session, false);
+    if (status) pty_packet_event(session, status, clear);
     return 0;
 }
 

@@ -27,7 +27,10 @@ def function(source, name):
 def io_backend(source, operation):
     name = "syscall_io_" + operation
     if re.search(r"^(?:static )?int64_t " + name + r"\(", source, re.M):
-        return function(source, name)
+        backend = function(source, name)
+        if "syscall_io_read_iter(" in backend:
+            return function(source, "syscall_io_read_iter") + "\n" + backend
+        return backend
     # Characterize the old backend without copying it into the fixture. This
     # option also permits semantic comparisons with archived pre-extraction code.
     start = source.index("    if (number == LINUX_SYS_" + operation.upper() + ") {\n")

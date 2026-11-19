@@ -8,6 +8,7 @@
 #undef main
 #include <reliefos/auth_abi.h>
 #include <reliefos/text.h>
+#include <reliefnt/pty.h>
 #include <reliefnt/swap.h>
 #include <reliefnt/net_udp.h>
 #include <reliefnt/net_packet.h>

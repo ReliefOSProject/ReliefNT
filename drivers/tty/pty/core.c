@@ -197,7 +197,7 @@ static void pty_initialize_session(struct pty_session *session, uint32_t owner_p
     session->permissions = *permissions;
     if (!++next_generation) ++next_generation;
     session->generation = next_generation;
-    session->termios.c_iflag = RELIEFOS_PTY_IFLAG_ICRNL;
+    session->termios.c_iflag = RELIEFOS_PTY_IFLAG_ICRNL | (owner_pid ? LINUX_IXON : 0);
     session->termios.c_oflag = LINUX_OPOST | LINUX_ONLCR;
     session->termios.c_cflag = LINUX_CLOCAL | LINUX_CREAD | LINUX_CS8 | LINUX_B115200;
     session->termios.c_lflag = RELIEFOS_PTY_LFLAG_ECHO |

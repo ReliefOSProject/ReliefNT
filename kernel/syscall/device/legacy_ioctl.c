@@ -679,11 +679,11 @@ int64_t syscall_legacy_ioctl(uint64_t number, uint64_t a0, uint64_t a1, uint64_t
     }
 
     if (number == LINUX_SYS_IOCTL &&
-        (a1 == TCGETS || a1 == TCSETS || a1 == TCSETSW || a1 == TCSETSF ||
+        (a1 == TCGETS || a1 == TCSETS || a1 == TCSETSW || a1 == TCSETSF || a1 == TCFLSH ||
          a1 == LINUX_TCGETS2 || a1 == LINUX_TCSETS2 ||
          a1 == LINUX_TCSETSW2 || a1 == LINUX_TCSETSF2 ||
          a1 == TIOCGWINSZ || a1 == TIOCSWINSZ || a1 == TIOCGPTN ||
-         a1 == TIOCSPTLCK || a1 == TIOCGPTLCK || a1 == TIOCSCTTY ||
+         a1 == TIOCSPTLCK || a1 == TIOCGPTLCK || a1 == TIOCPKT || a1 == TIOCGPKT || a1 == TIOCSCTTY ||
          a1 == TIOCGPGRP || a1 == TIOCSPGRP || a1 == TIOCGSID || a1 == TIOCNOTTY)) {
         struct task *task = sched_current_task();
         struct task_pty_fd *endpoint = task_pty_for_io(task, (int)a0);
@@ -698,6 +698,25 @@ int64_t syscall_legacy_ioctl(uint64_t number, uint64_t a0, uint64_t a1, uint64_t
         int master = endpoint && endpoint->endpoint == TASK_PTY_ENDPOINT_MASTER;
         if (!master && pty_is_hungup(pty_id))
             return a1 == TIOCSPGRP ? -RELIEFOS_ENOTTY : -RELIEFOS_EIO;
+        if (a1 == TIOCPKT || a1 == TIOCGPKT) {
+            if (!master) return -RELIEFOS_ENOTTY;
+            bool get = a1 == TIOCGPKT;
+            IOCTL_PREPARE(a2, sizeof(int), get, -RELIEFOS_EFAULT);
+            int *value = (int *)(uintptr_t)a2;
+            if (!get) {
+                if (!user_range_ok(a2, sizeof(*value))) return -RELIEFOS_EFAULT;
+                return pty_set_packet_mode(pty_id, *value);
+            }
+            if (!user_range_writable(a2, sizeof(*value))) return -RELIEFOS_EFAULT;
+            int enabled;
+            int rc = pty_get_packet_mode(pty_id, &enabled);
+            if (!rc) *value = enabled;
+            return rc;
+        }
+        if (a1 == TCFLSH) {
+            int64_t change = master ? 0 : pty_check_change(pty_id, task->pid, 22);
+            return change ? change : pty_flush(pty_id, master, a2);
+        }
         if (a1 == TIOCNOTTY) {
             if (master) return -RELIEFOS_ENOTTY;
             return pty_detach_controlling(pty_id, task->pid);

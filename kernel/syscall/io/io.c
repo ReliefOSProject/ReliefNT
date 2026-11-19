@@ -258,12 +258,13 @@ int64_t syscall_io_write(uint64_t a0, uint64_t a1, uint64_t a2)
  * @param a0 Descriptor number; entry may already pin its open description.
  * @param a1 User buffer, validated by the backend before accessing its bytes.
  * @param a2 Requested byte count, subject to each backend's existing limits.
+ * @param phase Optional in/out packet phase shared across readv segments.
  * @return Byte count, negative errno (including EISDIR for directories), or
  * internal retry. Ordinary reads use the actual OFD provider/open capture;
  * diagnostic paths never select an inode. Entry owns the OFD through waits,
  * under execution ownership without graph/module locks across callbacks.
  */
-int64_t syscall_io_read(uint64_t a0, uint64_t a1, uint64_t a2)
+int64_t syscall_io_read_iter(uint64_t a0, uint64_t a1, uint64_t a2, enum pty_read_phase *phase)
 {
     /* Standalone scalar-I/O fixtures may omit the anonymous inotify provider. */
     extern int64_t task_inotify_read(struct task *, struct task_file *, uint64_t, uint64_t) __attribute__((weak));
@@ -303,13 +304,8 @@ int64_t syscall_io_read(uint64_t a0, uint64_t a1, uint64_t a2)
             uint32_t request = a2 > RELIEFOS_FS_IO_SLICE_BYTES
                                    ? RELIEFOS_FS_IO_SLICE_BYTES : (uint32_t)a2;
             if (endpoint->endpoint == TASK_PTY_ENDPOINT_MASTER) {
-                if ((task_pty_status(endpoint) & RELIEFOS_O_NONBLOCK) &&
-                    !pty_output_available(endpoint->pty_id) &&
-                    !pty_is_hungup(endpoint->pty_id)) {
-                    return -RELIEFOS_EAGAIN;
-                }
                 return pty_read_output(0, endpoint->pty_id,
-                                       (char *)(uintptr_t)a1, request);
+                                       (char *)(uintptr_t)a1, request, phase);
             }
             if ((task_pty_status(endpoint) & RELIEFOS_O_NONBLOCK) &&
                 !pty_input_available(endpoint->pty_id) &&
@@ -408,4 +404,15 @@ int64_t syscall_io_read(uint64_t a0, uint64_t a1, uint64_t a2)
     if (file->node.type == RELIEFOS_FS_TYPE_DIR) return -RELIEFOS_EISDIR;
     if (file->node.type != RELIEFOS_FS_TYPE_FILE) return -RELIEFOS_EBADF;
     return syscall_regular_io(task, file, a1, a2, 0, false, false);
+}
+
+/** @brief Perform a scalar read with a fresh PTY packet phase.
+ * @param a0 Descriptor number.
+ * @param a1 User buffer address.
+ * @param a2 Requested number of bytes.
+ * @return Bytes read, negative errno, or an internal blocking/retry result.
+ */
+int64_t syscall_io_read(uint64_t a0, uint64_t a1, uint64_t a2)
+{
+    return syscall_io_read_iter(a0, a1, a2, NULL);
 }

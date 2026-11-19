@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <pty.h>
 #include <stdio.h>
 #include <stddef.h>
@@ -12,6 +13,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -27,10 +29,60 @@ static long long milliseconds(void)
     return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000;
 }
 
+static int test_packet_mode(void)
+{
+    int on = 1, off = 0, mode = -1;
+    int master = posix_openpt(O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+    CHECK(master >= 0 && ioctl(master, TIOCPKT, &on) == 0);
+    CHECK(ioctl(master, TIOCGPKT, &mode) == 0 && mode == 1);
+    CHECK(ioctl(master, TIOCPKT, NULL) == -1 && errno == EFAULT);
+    CHECK(grantpt(master) == 0 && unlockpt(master) == 0);
+    const char *path = ptsname(master);
+    CHECK(path != NULL);
+    int slave = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+    CHECK(slave >= 0 && ioctl(slave, TIOCPKT, &on) == -1 && errno == ENOTTY);
+    char prefix, data[4];
+    struct iovec iov[] = {{&prefix, 1}, {data, sizeof(data)}};
+    struct pollfd pollfd = {.fd = master, .events = POLLIN | POLLPRI | POLLRDNORM};
+    CHECK(read(master, data, sizeof(data)) == -1 && errno == EAGAIN);
+    CHECK(write(slave, "xyz", 3) == 3);
+    CHECK(poll(&pollfd, 1, 1000) == 1 && pollfd.revents == (POLLIN | POLLRDNORM));
+    CHECK(read(master, &prefix, 1) == 1 && prefix == TIOCPKT_DATA);
+    CHECK(readv(master, iov, 2) == 4 && prefix == TIOCPKT_DATA && !memcmp(data, "xyz", 3));
+
+    struct termios attr;
+    CHECK(tcgetattr(slave, &attr) == 0 && (attr.c_iflag & IXON));
+    CHECK(write(master, "\023", 1) == 1);
+    CHECK(poll(&pollfd, 1, 1000) == 1 && pollfd.revents == (POLLIN | POLLPRI | POLLRDNORM));
+    CHECK(read(master, &prefix, 1) == 1 && prefix == TIOCPKT_STOP);
+    CHECK(write(slave, "!", 1) == -1 && errno == EAGAIN);
+    CHECK(write(master, "\021", 1) == 1);
+    CHECK(poll(&pollfd, 1, 1000) == 1 && (pollfd.revents & POLLPRI));
+    CHECK(read(master, &prefix, 1) == 1 && prefix == TIOCPKT_START);
+
+    CHECK(write(slave, "ab", 2) == 2);
+    CHECK(poll(&pollfd, 1, 1000) == 1 && (pollfd.revents & POLLIN));
+    CHECK(tcflush(slave, TCIOFLUSH) == 0);
+    CHECK(readv(master, iov, 2) == 1 && prefix == (TIOCPKT_FLUSHREAD | TIOCPKT_FLUSHWRITE));
+    CHECK(readv(master, iov, 2) == 3 && prefix == TIOCPKT_DATA && !memcmp(data, "ab", 2));
+    attr.c_iflag &= ~IXON;
+    CHECK(tcsetattr(slave, TCSANOW, &attr) == 0);
+    CHECK(read(master, &prefix, 1) == 1 && prefix == TIOCPKT_NOSTOP);
+    CHECK(ioctl(master, TIOCPKT, &off) == 0);
+    CHECK(ioctl(master, TIOCGPKT, &mode) == 0 && mode == 0);
+    CHECK(write(slave, "plain", 5) == 5);
+    CHECK(poll(&pollfd, 1, 1000) == 1 && pollfd.revents == (POLLIN | POLLRDNORM));
+    CHECK(readv(master, iov, 2) == 5 && prefix == 'p' && !memcmp(data, "lain", 4));
+    CHECK(close(slave) == 0 && close(master) == 0);
+    puts("[epoll-pty] PASS Unix98 packet framing, priority, flow control and flush");
+    return 0;
+}
+
 int main(void)
 {
     setbuf(stdout, NULL);
     alarm(5);
+    if (test_packet_mode()) return 1;
     int master, slave, saved_stderr = dup(2);
     struct termios settings;
     CHECK(saved_stderr >= 0 && openpty(&master, &slave, NULL, NULL, NULL) == 0);
