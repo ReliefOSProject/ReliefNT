@@ -260,6 +260,7 @@ int64_t syscall_vector_io(struct task *task,uint64_t number,uint64_t a0,uint64_t
         return task_socket_vector(file, iov, (uint32_t)a2, requested, writing);
     }
     total = 0;
+    enum pty_read_phase phase = PTY_READ_FIRST;
     for (uint64_t i = 0; i < a2; ++i) {
         if (!iov[i].iov_len) continue;
         /* Once a vector copied a record, never park on a later empty vector. */
@@ -270,13 +271,13 @@ int64_t syscall_vector_io(struct task *task,uint64_t number,uint64_t a0,uint64_t
          * dispatcher frame for every iovec. */
         int64_t part = writing
             ? syscall_io_write(a0, (uintptr_t)iov[i].iov_base, iov[i].iov_len)
-            : syscall_io_read(a0, (uintptr_t)iov[i].iov_base, iov[i].iov_len);
+            : syscall_io_read_iter(a0, (uintptr_t)iov[i].iov_base, iov[i].iov_len, &phase);
         if (part < 0) {
             if (restore_position) file->offset = saved_offset;
             return total ? total : part;
         }
         total += part;
-        if ((uint64_t)part < iov[i].iov_len) break;
+        if (phase == PTY_READ_CONTROL || (uint64_t)part < iov[i].iov_len) break;
     }
     if (restore_position) file->offset = saved_offset;
     return total;

@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <linux/uio.h>
+#include <reliefnt/pty.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/syscall.h>
 #include <reliefnt/syscall_internal.h>
@@ -38,8 +39,9 @@ int64_t syscall_io_write(uint64_t fd, uint64_t address, uint64_t length)
     assert(fd == 3 && calls < 4); seen[calls++] = address;
     return contended && address == blocked ? KERNEL_SYSCALL_SWAP_CONTENDED : (int64_t)length;
 }
-int64_t syscall_io_read(uint64_t fd, uint64_t address, uint64_t length)
-{ return syscall_io_write(fd, address, length); }
+int64_t syscall_io_read_iter(uint64_t fd, uint64_t address, uint64_t length,
+                              enum pty_read_phase *phase)
+{ (void)phase; return syscall_io_write(fd, address, length); }
 void storage_drain_task_io(uint32_t pid) { assert(pid == current.pid); }
 void vfs_walk_cancel(struct vfs_walk **walk) { assert(!*walk); }
 void vfs_path_put(struct vfs_path *path) { assert(!path->mount); }

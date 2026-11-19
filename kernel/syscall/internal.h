@@ -1625,6 +1625,14 @@ int64_t syscall_io_write(uint64_t a0, uint64_t a1, uint64_t a2);
  * @return Existing byte count, errno, or internal blocking/retry result.
  */
 int64_t syscall_io_read(uint64_t a0, uint64_t a1, uint64_t a2);
+/** @brief Read one vector segment while preserving the PTY packet phase.
+ * @param a0 Descriptor number.
+ * @param a1 User buffer address.
+ * @param a2 Requested number of bytes.
+ * @param phase Optional in/out state shared by the segments of one readv call.
+ * @return Bytes read, negative errno, or an internal blocking/retry result.
+ */
+int64_t syscall_io_read_iter(uint64_t a0, uint64_t a1, uint64_t a2, enum pty_read_phase *phase);
 
 /** @brief Dispatch borrowed raw arguments through the ordinary Linux syscall backends.
  * @param number Linux x86-64 syscall number.

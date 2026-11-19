@@ -23,6 +23,7 @@ struct linux_winsize {
 #define TCSETS     0x5402UL
 #define TCSETSW    0x5403UL
 #define TCSETSF    0x5404UL
+#define TCFLSH     0x540BUL
 #define LINUX_TCGETS2  0x802c542aUL
 #define LINUX_TCSETS2  0x402c542bUL
 #define LINUX_TCSETSW2 0x402c542cUL
@@ -34,8 +35,23 @@ struct linux_winsize {
 #define FIOCLEX    0x5451UL
 
 /* Unix98 PTY helpers. */
+#define TIOCPKT    0x5420UL
 #define TIOCGPTN   0x80045430UL
 #define TIOCSPTLCK 0x40045431UL
+#define TIOCGPKT   0x80045438UL
 #define TIOCGPTLCK 0x80045439UL
+
+#define TIOCPKT_DATA       0x00u
+#define TIOCPKT_FLUSHREAD  0x01u
+#define TIOCPKT_FLUSHWRITE 0x02u
+#define TIOCPKT_STOP       0x04u
+#define TIOCPKT_START      0x08u
+#define TIOCPKT_NOSTOP     0x10u
+#define TIOCPKT_DOSTOP     0x20u
+#define TIOCPKT_IOCTL      0x40u
+
+#define LINUX_TCIFLUSH  0u
+#define LINUX_TCOFLUSH  1u
+#define LINUX_TCIOFLUSH 2u
 
 #endif

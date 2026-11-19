@@ -150,6 +150,14 @@ int audio_timer_close(struct task_file *file) { (void)file; return 0; }
 int audio_oss_close(struct task_file *file) { (void)file; return 0; }
 void input_evdev_release(uint32_t device_kind, uint64_t grab_token)
 { (void)device_kind; (void)grab_token; }
+/* The fixture owns only AF_UNIX and PTY objects. These dispatch branches must stay cold. */
+uint64_t input_evdev_event_generation_vt(uint32_t kind, uint64_t token,
+                                        uint32_t vt)
+{ (void)kind; (void)token; (void)vt; abort(); }
+short task_netlink_poll(const struct task_file *file, short events)
+{ (void)file; (void)events; abort(); }
+void task_netlink_release(struct task_file *file)
+{ (void)file; abort(); }
 void pty_transfer_put(uint32_t pty_id, uint32_t endpoint) { (void)pty_id; (void)endpoint; }
 void pty_reap_hungup(uint32_t pty_id) { (void)pty_id; }
 
@@ -173,7 +181,8 @@ struct task_file *task_descriptor_for_fd(struct task *task, int fd)
 uint32_t pty_vt_number(uint32_t pty_id) { (void)pty_id; return 1; }
 int pty_is_hungup(uint32_t pty_id) { (void)pty_id; return 0; }
 uint32_t pty_input_available(uint32_t pty_id) { (void)pty_id; return 0; }
-uint32_t pty_output_available(uint32_t pty_id) { (void)pty_id; return 0; }
+short pty_poll_endpoint(uint32_t pty_id, bool master)
+{ (void)pty_id; (void)master; return POLLOUT | POLLWRNORM; }
 short task_signalfd_poll(struct task *task, const struct task_file *file)
 { (void)task; (void)file; return 0; }
 short task_pipe_poll(const struct task_file *file, short events)

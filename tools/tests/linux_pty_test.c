@@ -335,13 +335,13 @@ int main(void)
         assert(pty_get_termios(id, &mode) == 0);
         assert((mode.c_oflag & LINUX_OPOST) && (mode.c_oflag & LINUX_ONLCR));
         assert(pty_write_output(id, "ab\ncd\n", 6) == 6);
-        assert(pty_read_output(owner.pid, id, out, sizeof(out)) == 8);
+        assert(pty_read_output(owner.pid, id, out, sizeof(out), NULL) == 8);
         assert(!memcmp(out, "ab\r\ncd\r\n", 8));
         /* OPOST off: bytes pass through untouched. */
         mode.c_oflag &= ~LINUX_OPOST;
         assert(pty_set_termios(id, &mode) == 0);
         assert(pty_write_output(id, "x\ny", 3) == 3);
-        assert(pty_read_output(owner.pid, id, out, sizeof(out)) == 3 && !memcmp(out, "x\ny", 3));
+        assert(pty_read_output(owner.pid, id, out, sizeof(out), NULL) == 3 && !memcmp(out, "x\ny", 3));
         /* OPOST on with ONLCR off: NL stays NL. */
         pty_init();
         id = pty_create(owner.pid);
@@ -349,7 +349,7 @@ int main(void)
         mode.c_oflag &= ~LINUX_ONLCR;
         assert(pty_set_termios(id, &mode) == 0);
         assert(pty_write_output(id, "q\nr\n", 4) == 4);
-        assert(pty_read_output(owner.pid, id, out, sizeof(out)) == 4 && !memcmp(out, "q\nr\n", 4));
+        assert(pty_read_output(owner.pid, id, out, sizeof(out), NULL) == 4 && !memcmp(out, "q\nr\n", 4));
         /* ONOCR suppresses CR at column 0 and keeps it elsewhere. */
         pty_init();
         id = pty_create(owner.pid);
@@ -357,9 +357,9 @@ int main(void)
         mode.c_oflag = LINUX_OPOST | LINUX_ONOCR;
         assert(pty_set_termios(id, &mode) == 0);
         assert(pty_write_output(id, "\ra", 2) == 2);
-        assert(pty_read_output(owner.pid, id, out, sizeof(out)) == 1 && out[0] == 'a');
+        assert(pty_read_output(owner.pid, id, out, sizeof(out), NULL) == 1 && out[0] == 'a');
         assert(pty_write_output(id, "\rb", 2) == 2);
-        assert(pty_read_output(owner.pid, id, out, sizeof(out)) == 2 && !memcmp(out, "\rb", 2));
+        assert(pty_read_output(owner.pid, id, out, sizeof(out), NULL) == 2 && !memcmp(out, "\rb", 2));
         /* OCRNL maps CR to NL. */
         pty_init();
         id = pty_create(owner.pid);
@@ -367,7 +367,7 @@ int main(void)
         mode.c_oflag = LINUX_OPOST | LINUX_OCRNL;
         assert(pty_set_termios(id, &mode) == 0);
         assert(pty_write_output(id, "a\rb", 3) == 3);
-        assert(pty_read_output(owner.pid, id, out, sizeof(out)) == 3 && !memcmp(out, "a\nb", 3));
+        assert(pty_read_output(owner.pid, id, out, sizeof(out), NULL) == 3 && !memcmp(out, "a\nb", 3));
         /* OLCUC upper-cases and TAB3 expands to the next 8-column stop. */
         pty_init();
         id = pty_create(owner.pid);
@@ -375,7 +375,7 @@ int main(void)
         mode.c_oflag = LINUX_OPOST | LINUX_OLCUC | LINUX_TAB3;
         assert(pty_set_termios(id, &mode) == 0);
         assert(pty_write_output(id, "a\tb", 3) == 3);
-        assert(pty_read_output(owner.pid, id, out, sizeof(out)) == 9);
+        assert(pty_read_output(owner.pid, id, out, sizeof(out), NULL) == 9);
         assert(!memcmp(out, "A       B", 9));
         /* Console sessions take the same translated path into the VT. */
         pty_init();

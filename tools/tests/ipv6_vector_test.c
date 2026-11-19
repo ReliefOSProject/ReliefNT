@@ -2,6 +2,7 @@
 #define TASK8_INET_READY_TEST 1
 #define IPV6_TRANSPORT_FIXTURE 1
 #include "task8_inet_message_user_test.c"
+#include <reliefnt/pty.h>
 
 static const struct in6_addr loop6={.s6_addr={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1}};
 void kernel_poll_readiness_notify(void) {}
@@ -48,8 +49,10 @@ int64_t syscall_io_write(uint64_t fd, uint64_t address, uint64_t length)
     if(prep<0)return prep;
     return task_udp_send(&files[fd],(const void *)(uintptr_t)address,length,0,0,0);
 }
-int64_t syscall_io_read(uint64_t fd, uint64_t address, uint64_t length)
+int64_t syscall_io_read_iter(uint64_t fd, uint64_t address, uint64_t length,
+                              enum pty_read_phase *phase)
 {
+    (void)phase;
     int prep=swap_prepare_user_range(&current,address,length,true);
     if(prep==SWAP_STORAGE_CONTENDED)return KERNEL_SYSCALL_SWAP_CONTENDED;
     if(prep<0)return prep;

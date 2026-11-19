@@ -42,6 +42,8 @@ __attribute__((noreturn)) void pty_acquire_controlling(void) { __builtin_trap();
 __attribute__((noreturn)) void pty_check_change(void) { __builtin_trap(); }
 /** @brief Trap if the fixture reaches unmodeled pty_detach_controlling. */
 __attribute__((noreturn)) void pty_detach_controlling(void) { __builtin_trap(); }
+/** @brief Trap if the fixture reaches unmodeled pty_flush. */
+__attribute__((noreturn)) void pty_flush(void) { __builtin_trap(); }
 /** @brief Trap if the fixture reaches unmodeled pty_flush_input. */
 __attribute__((noreturn)) void pty_flush_input(void) { __builtin_trap(); }
 /** @brief Trap if the fixture reaches unmodeled pty_get_foreground_pgid. */
@@ -50,6 +52,8 @@ __attribute__((noreturn)) void pty_get_foreground_pgid(void) { __builtin_trap();
 __attribute__((noreturn)) void pty_get_linux_winsize(void) { __builtin_trap(); }
 /** @brief Trap if the fixture reaches unmodeled pty_get_lock. */
 __attribute__((noreturn)) void pty_get_lock(void) { __builtin_trap(); }
+/** @brief Trap if the fixture reaches unmodeled pty_get_packet_mode. */
+__attribute__((noreturn)) void pty_get_packet_mode(void) { __builtin_trap(); }
 /** @brief Trap if the fixture reaches unmodeled pty_get_session. */
 __attribute__((noreturn)) void pty_get_session(void) { __builtin_trap(); }
 /** @brief Trap if the fixture reaches unmodeled pty_get_termios. */
@@ -64,6 +68,8 @@ __attribute__((noreturn)) void pty_set_foreground_pgid(void) { __builtin_trap();
 __attribute__((noreturn)) void pty_set_linux_winsize(void) { __builtin_trap(); }
 /** @brief Trap if the fixture reaches unmodeled pty_set_lock. */
 __attribute__((noreturn)) void pty_set_lock(void) { __builtin_trap(); }
+/** @brief Trap if the fixture reaches unmodeled pty_set_packet_mode. */
+__attribute__((noreturn)) void pty_set_packet_mode(void) { __builtin_trap(); }
 /** @brief Trap if the fixture reaches unmodeled pty_set_termios. */
 __attribute__((noreturn)) void pty_set_termios(void) { __builtin_trap(); }
 /** @brief Trap if the fixture reaches unmodeled pty_vt_active. */

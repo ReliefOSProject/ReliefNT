@@ -391,8 +391,9 @@ int task_shm_write(struct task_file *file, const void *buffer, uint32_t length)
 int kernel_random_fill(void *buffer,size_t length){(void)buffer;(void)length;abort();}
 int64_t pty_read_input(uint32_t id,char *buffer,uint32_t length)
 {(void)id;(void)buffer;(void)length;abort();}
-int64_t pty_read_output(uint32_t owner,uint32_t id,char *buffer,uint32_t length)
-{(void)owner;(void)id;(void)buffer;(void)length;abort();}
+int64_t pty_read_output(uint32_t owner,uint32_t id,char *buffer,uint32_t length,
+                        enum pty_read_phase *phase)
+{(void)owner;(void)id;(void)buffer;(void)length;(void)phase;abort();}
 int64_t task_signalfd_read(struct task *task,struct task_file *file,uint64_t buffer,uint64_t count)
 {(void)task;(void)file;(void)buffer;(void)count;abort();}
 int64_t task_signalfd_readv(struct task *task,struct task_file *file,uint64_t vectors,uint64_t count,uint32_t flags)
@@ -490,7 +491,11 @@ int pty_is_hungup(uint32_t pty_id) { (void)pty_id; return 0; }
 static uint32_t descriptor_pty_input_available;
 uint32_t pty_input_available(uint32_t pty_id)
 { return pty_id == 7 ? descriptor_pty_input_available : 0; }
-uint32_t pty_output_available(uint32_t pty_id) { (void)pty_id; return 0; }
+short pty_poll_endpoint(uint32_t pty_id, bool master)
+{
+    short ready = POLLOUT | POLLWRNORM;
+    return !master && pty_input_available(pty_id) ? ready | POLLIN | POLLRDNORM : ready;
+}
 uint32_t pty_vt_number(uint32_t pty_id) { (void)pty_id; return 1; }
 uint64_t net_socket_get_timeout_ticks(int32_t handle, bool send)
 { (void)handle; (void)send; abort(); }
