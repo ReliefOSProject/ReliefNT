@@ -134,7 +134,7 @@ def main():
              "mm/swap/area.c", "mm/swap/slot.c", "mm/swap/paging.c", "-o", str(metadata)])
         run([str(metadata)])
         engine = work / "pressure_engine"
-        engine_sources = ["tools/tests/memory_pressure_engine_test.c"]
+        engine_sources = ["tools/tests/memory_pressure_engine_test.c", "fs/vfs/lookup_cache.c"]
         if (ROOT / "mm/reclaim/pressure.c").exists():
             engine_sources.append("mm/reclaim/pressure.c")
         run([*common, "-DCONFIG_SWAP=1", "-no-pie", "-Wl,--gc-sections",
@@ -143,7 +143,7 @@ def main():
         cross = work / "cross_pte"
         run([*common, "-DCONFIG_SWAP=1", "-fno-pie", "-no-pie", "-Wl,--gc-sections",
              "tools/tests/memory_pressure_cross_pte_test.c", "kernel/exec/usercopy.c",
-             "kernel/sched/oom.c", "mm/reclaim/pressure.c", "mm/swap/area.c",
+             "kernel/sched/oom.c", "mm/reclaim/pressure.c", "fs/vfs/lookup_cache.c", "mm/swap/area.c",
              "mm/swap/slot.c", "mm/swap/paging.c", "-o", str(cross)])
         run([str(cross)])
         timer = work / "timer_entry"
@@ -162,12 +162,12 @@ def main():
             run([str(oom), case])
         oom_lifecycle = work / "oom_lifecycle"
         run([*common, "-Wl,--gc-sections", "tools/tests/memory_pressure_oom_lifecycle_test.c",
-             "kernel/signal/signal_queue.c", "kernel/sched/oom.c", "mm/reclaim/oom.c",
+             "kernel/signal/signal_queue.c", "kernel/sched/oom.c", "mm/reclaim/oom.c", "fs/vfs/lookup_cache.c",
              "-o", str(oom_lifecycle)])
         run([str(oom_lifecycle)])
         fault = work / "fault_pressure"
         run([*common, "-DCONFIG_SWAP=1", "-fno-pie", "-no-pie", "-Wl,--gc-sections",
-             "tools/tests/memory_pressure_fault_test.c", "kernel/sched/core.c",
+             "tools/tests/memory_pressure_fault_test.c", "kernel/sched/core.c", "kernel/sched/accounting.c",
              "mm/cache/page_cache.c", "fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c", "fs/vfs/file.c",
              "fs/vfs/open.c", "fs/vfs/attributes.c", "fs/vfs/exec_file.c",
              "mm/swap/area.c", "mm/swap/slot.c", "mm/swap/paging.c",
@@ -175,7 +175,7 @@ def main():
         run([str(fault)])
         integration = work / "fault_integration"
         run([*common, "-DCONFIG_SWAP=1", "-fno-pie", "-no-pie", "-Wl,--gc-sections",
-             "tools/tests/memory_pressure_fault_integration_test.c", "kernel/sched/core.c",
+             "tools/tests/memory_pressure_fault_integration_test.c", "kernel/sched/core.c", "kernel/sched/accounting.c",
              "kernel/sched/wait.c", "kernel/sched/oom.c", "kernel/sync/wait.c",
              "mm/reclaim/pressure.c", "mm/reclaim/wait.c", "mm/cache/page_cache.c",
              "fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c", "fs/vfs/file.c", "fs/vfs/open.c",
@@ -185,7 +185,7 @@ def main():
         run([str(integration)])
         waiting = work / "pressure_wait"
         run([*common, "-Wl,--gc-sections", "tools/tests/memory_pressure_wait_test.c",
-             "kernel/sync/wait.c", "kernel/sched/oom.c", "mm/reclaim/wait.c", "-o", str(waiting)])
+             "kernel/sync/wait.c", "kernel/sched/oom.c", "mm/reclaim/wait.c", "fs/vfs/lookup_cache.c", "-o", str(waiting)])
         run([str(waiting)])
         probe = work / "memory_pressure_guest_probe"
         run([*common, "tools/tests/memory_pressure_guest_probe.c", "-o", str(probe)])

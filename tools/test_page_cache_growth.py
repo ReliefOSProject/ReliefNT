@@ -17,6 +17,7 @@ def main():
         env={**os.environ,'TMPDIR':str(temporary)}
         for name,sources in (
             ('page_cache_growth',['kernel/sync/lock.c']),
+            ('page_cache_inode_index',['kernel/sync/lock.c','-DRELIEFNT_CACHE_PROBE']),
             ('elf_file_page',['fs/vfs/mount_tree.c', 'fs/vfs/lookup_cache.c','fs/vfs/file.c','fs/vfs/attributes.c','fs/vfs/exec_file.c']),
         ):
             binary=Path(directory)/name

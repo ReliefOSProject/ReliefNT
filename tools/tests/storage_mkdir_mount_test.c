@@ -29,6 +29,7 @@
 #undef ahci_flush_cache
 #endif
 #include "../../drivers/storage/nvme/storage_nvme.c"
+#include "../../drivers/storage/nvme/queue.c"
 /* Optional ISO-sector hardware boundary for the referenced-backend fixture. */
 #ifdef RELIEFNT_FIXTURE_ISO_READER
 #define storage_read_iso_blocks storage_reference_hardware_iso_blocks
@@ -103,6 +104,8 @@ void *kernel_malloc(size_t size)
     return malloc(size);
 }
 void kernel_free(void *p) { free(p); }
+/** @brief Reject physical NVMe completions in this memory-device fixture. */
+void storage_completion_notify(void) { abort(); }
 void pci_unmap_mmio(void *pointer, uint64_t bytes)
 { (void)pointer; (void)bytes; abort(); }
 uint64_t mm_alloc_pages_below(uint32_t pages, uint64_t mask)

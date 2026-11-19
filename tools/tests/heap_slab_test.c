@@ -24,9 +24,17 @@ static unsigned mapping_failure;
 static unsigned checked_clears;
 static pthread_mutex_t pmm_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Thread_local unsigned heap_lock_depth;
+static uint64_t bitmap_probes;
 static _Thread_local unsigned publication_race_role;
 static unsigned publication_race_waiting;
 static unsigned publication_race_published;
+
+/** @brief Count production bitmap search steps while verifying heap exclusion. */
+void kernel_heap_test_probe(void)
+{
+    assert(heap_lock_depth == 1);
+    __atomic_add_fetch(&bitmap_probes, 1, __ATOMIC_RELAXED);
+}
 
 /** @brief Check that production slot clearing occurs without the heap lock.
  * @param dest Slot payload. @param value Fill byte. @param bytes Fill length.
@@ -160,6 +168,49 @@ static void density(void)
 #endif
     for (unsigned i = 0; i < N; ++i) kernel_free(objects[(i * 1597u) % N]);
     assert(free_pages() == start);
+}
+
+/** @brief Bound locked search work across full bitmap words, tails and reused holes. */
+static void bitmap_search(void)
+{
+    enum { N = 1024 };
+    void *objects[N];
+    uint32_t initial = free_pages();
+    for (size_t unit = 16; unit <= 2048; unit *= 2) {
+        uint64_t before = __atomic_load_n(&bitmap_probes, __ATOMIC_RELAXED);
+        for (unsigned i = 0; i < N; ++i) {
+            unsigned char *p = kernel_malloc(unit);
+            check_zero(p, unit);
+            assert(((uintptr_t)p & (PAGE - 1u)) + unit <= PAGE);
+            uint64_t identity = i + 1;
+            memcpy(p, &identity, sizeof(identity));
+            memcpy(p + unit - sizeof(identity), &identity, sizeof(identity));
+            objects[i] = p;
+        }
+        uint64_t allocated_probes = __atomic_load_n(&bitmap_probes, __ATOMIC_RELAXED) - before;
+        assert(initial - free_pages() == kernel_heap_small_page_bound(unit, N));
+        for (unsigned i = 0; i < N; ++i) {
+            unsigned char *p = objects[i];
+            uint64_t first, last;
+            memcpy(&first, p, sizeof(first));
+            memcpy(&last, p + unit - sizeof(last), sizeof(last));
+            assert(first == i + 1 && last == first);
+        }
+        for (unsigned i = 0; i < N; i += 2) kernel_free(objects[i]);
+        before = __atomic_load_n(&bitmap_probes, __ATOMIC_RELAXED);
+        for (unsigned i = 0; i < N; i += 2) {
+            objects[i] = kernel_malloc(unit);
+            check_zero(objects[i], unit);
+        }
+        uint64_t reused_probes = __atomic_load_n(&bitmap_probes, __ATOMIC_RELAXED) - before;
+        fprintf(stderr, "heap size=%zu allocations=%u search_steps=%llu reuse_steps=%llu\n",
+                unit, N, (unsigned long long)allocated_probes, (unsigned long long)reused_probes);
+        /* Four 64-bit words cover every small-object page, independent of occupancy. */
+        assert(allocated_probes <= N * 4u && reused_probes <= (N / 2) * 4u);
+        assert(initial - free_pages() == kernel_heap_small_page_bound(unit, N));
+        for (unsigned i = 0; i < N; ++i) kernel_free(objects[i]);
+        assert(free_pages() == initial);
+    }
 }
 /** @brief Check the full payload at size-class boundaries without overlap. */
 static void classes(void)
@@ -469,6 +520,7 @@ int main(int argc, char **argv)
     ram = mmap(NULL, (size_t)PAGES * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     assert(ram != MAP_FAILED && !((uintptr_t)ram & (PAGE - 1)));
     if (!strcmp(argv[1], "density")) density();
+    else if (!strcmp(argv[1], "bitmap_search")) bitmap_search();
     else if (!strcmp(argv[1], "classes")) classes();
     else if (!strcmp(argv[1], "reuse")) reuse();
     else if (!strcmp(argv[1], "invalid")) invalid();

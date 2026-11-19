@@ -14,7 +14,7 @@ with tempfile.TemporaryDirectory(prefix="cache-clustered-",dir=os.environ["TMPDI
         "-fsanitize=address,undefined","-mllvm","-asan-globals=0","-fno-sanitize-recover=all",
         "-no-pie","-ffunction-sections","-fdata-sections","-Wl,--gc-sections",
         "-Iinclude","-Iinclude/uapi","tools/tests/cache_clustered_lifetime_test.c",
-        "mm/cache/page_cache.c","fs/tmpfs/core.c","fs/vfs/exec_file.c","lib/text_utf16.c",
+        "mm/cache/page_cache.c","mm/physical/proc.c","fs/tmpfs/core.c","fs/vfs/exec_file.c","lib/text_utf16.c",
         *STORAGE_GRAPH_SOURCES,"-o",str(binary)],cwd=ROOT,check=True)
     env=dict(os.environ,ASAN_OPTIONS="detect_leaks=0")
     failed=False

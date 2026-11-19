@@ -2,6 +2,7 @@
  * swap slots; modeled PMM admission and storage, with real swap eviction. */
 #define TASK12_FORK_RECLAIM_FIXTURE 1
 #define TASK8_FIX3_DEVICE_FORK 1
+#define PAGING_PROTECTION_CUSTOM_FREE_MEMORY 1
 #include "task8_clone_tid_real_test.c"
 #include "../../mm/swap/internal.h"
 

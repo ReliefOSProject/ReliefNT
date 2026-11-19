@@ -50,6 +50,17 @@ struct host_page_ref {
     unsigned references;
 };
 static struct host_page_ref host_page_refs[64];
+#ifndef PRIVATE_ANON_CUSTOM_FREE_MEMORY
+/** @brief Report unowned physical slots in this anonymous-page fixture.
+ * @return Actual free capacity in KiB; injected allocation denial does not consume pages.
+ */
+uint64_t mm_free_memory_kib(void)
+{
+    uint64_t capacity = sizeof(host_page_refs) / sizeof(host_page_refs[0]);
+    assert(allocated <= capacity);
+    return (capacity - allocated) * 4u;
+}
+#endif
 uint64_t mm_alloc_page(void)
 {
     if (fail_alloc || (fail_after_allocation && !--fail_after_allocation)) return 0;
@@ -166,11 +177,17 @@ static void test_stack_usercopy(void)
 
 int main(void)
 {
+#ifndef PRIVATE_ANON_CUSTOM_FREE_MEMORY
+    assert(mm_free_memory_kib() == sizeof(host_page_refs) / sizeof(host_page_refs[0]) * 4u);
+#endif
     struct task *task = calloc(1, sizeof(*task));
     assert(task);
     task->kind = TASK_KIND_USER;
     nx_enabled = true;
     assert(address_space_create(sched_task_as(task)));
+#ifndef PRIVATE_ANON_CUSTOM_FREE_MEMORY
+    assert(mm_free_memory_kib() == (sizeof(host_page_refs) / sizeof(host_page_refs[0]) - allocated) * 4u);
+#endif
     uint64_t va = RELIEFNT_USER_BASE + 4096;
     struct task_vma *vma = &task->vmas[0];
     *vma = (struct task_vma){.used = 1, .start = va, .end = va + 8192,
@@ -238,5 +255,8 @@ int main(void)
     assert(!allocated);
     free(task);
     test_stack_usercopy();
+#ifndef PRIVATE_ANON_CUSTOM_FREE_MEMORY
+    assert(mm_free_memory_kib() == sizeof(host_page_refs) / sizeof(host_page_refs[0]) * 4u);
+#endif
     puts("PASS private faults: demand zero, ownership, protections, fallback, allocation failure");
 }

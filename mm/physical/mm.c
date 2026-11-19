@@ -25,6 +25,14 @@ static uint64_t proc_allocated, proc_freed, proc_faults;
 static bool runtime_ready;
 static struct kernel_spinlock mm_lock = KERNEL_SPINLOCK_INIT;
 
+#ifdef RELIEFNT_PMM_PROBE
+/** @brief Observe a locked scan step in host tests, without reentering the allocator. */
+extern void mm_test_scan_probe(void);
+#define MM_SCAN_PROBE() mm_test_scan_probe()
+#else
+#define MM_SCAN_PROBE() ((void)0)
+#endif
+
 /**
  * @brief Raise the appropriate free-page hint to include one available PFN.
  * @param section Section containing pfn.
@@ -167,11 +175,11 @@ static bool test_bit(const uint64_t *bits, uint64_t offset)
 { return (bits[offset / 64] & (1ULL << (offset % 64))) != 0; }
 
 /**
- * @brief Decrease a zone hint when a just-claimed run covers its upper bound.
+ * @brief Lower a zone hint covered by a now-occupied run or scanned empty prefix.
  * @param hint Mutable zone hint under the allocator lock.
  * @param first_section Section containing the beginning of the claimed run.
- * @param first Inclusive first PFN of the run.
- * @param last Inclusive final PFN of the run.
+ * @param first Inclusive first PFN with no remaining free page through last.
+ * @param last Inclusive last PFN proved unavailable after the claim.
  */
 static void lower_hint(struct mm_hint *hint, struct mm_page_section *first_section,
                        uint64_t first, uint64_t last)
@@ -217,6 +225,7 @@ static uint64_t scan(struct mm_hint hint, uint64_t minimum, uint64_t maximum, ui
 {
     if (!hint.section || !count || count > free_page_count || maximum < minimum) return 0;
     if (hint.pfn > maximum) hint.pfn = maximum;
+    uint64_t scanned_top = hint.pfn;
     uint64_t run = 0, previous = UINT64_MAX;
     for (struct mm_page_section *s = hint.section; s; s = s->prev) {
         if (s->first_pfn > hint.pfn) continue;
@@ -226,18 +235,33 @@ static uint64_t scan(struct mm_hint hint, uint64_t minimum, uint64_t maximum, ui
         if (!s->free_count) { run = 0; previous = UINT64_MAX; continue; }
         uint64_t pfn = top;
         for (;;) {
+            MM_SCAN_PROBE();
             uint64_t offset = pfn - s->first_pfn;
             if (test_bit(s->free, offset)) {
                 if (previous != UINT64_MAX && previous != pfn + 1) run = 0;
                 ++run;
-                if (run == count) { claim(s, pfn, count); return pfn * MM_PHYS_PAGE_SIZE; }
+                if (run == count) {
+                    claim(s, pfn, count);
+                    /* A single-page search proves the entire scanned prefix
+                     * empty. Multi-page searches may leave smaller free runs
+                     * above their result; masked searches prove nothing above
+                     * the clipped upper bound. */
+                    if (count == 1) {
+                        lower_hint(&low_hint, s, pfn, scanned_top);
+                        lower_hint(&high_hint, s, pfn, scanned_top);
+                    }
+                    return pfn * MM_PHYS_PAGE_SIZE;
+                }
             } else {
                 run = 0;
-                if (!(s->free[offset / 64])) {
-                    uint64_t skip = offset % 64;
-                    if (skip > pfn - minimum) skip = pfn - minimum;
-                    pfn -= skip;
-                }
+                /* Skip occupied bits even when another part of this word is
+                 * free. Keep the next candidate for the loop's decrement and
+                 * never cross the inclusive lower allocation boundary. */
+                unsigned position = (unsigned)(offset % 64u);
+                uint64_t candidates = s->free[offset / 64] & (UINT64_MAX >> (63u - position));
+                uint64_t skip = candidates ? position - (63u - (unsigned)__builtin_clzll(candidates)) - 1u : position;
+                if (skip > pfn - minimum) skip = pfn - minimum;
+                pfn -= skip;
             }
             previous = pfn;
             if (pfn == s->first_pfn || pfn == minimum) break;

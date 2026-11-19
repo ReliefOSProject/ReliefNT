@@ -593,7 +593,7 @@ static void stale_supervisor(void)
     puts("PASS supervisor first write and stale retry under real futex lock without allocation, I/O or scheduling");
 }
 
-/** @brief Genuine denied or non-cache leaves never take the stale-write retry. */
+/** @brief Denied permissions and ineligible first-write leaves never become writable. */
 static void stale_negative(void)
 {
     const uint64_t address=0x30000000; struct storage_node node;struct vfs_exec_source *source;
@@ -602,25 +602,40 @@ static void stale_negative(void)
     assert(syscall_handle_user_page_fault_detailed(address,7,true)==1);
     uint64_t *pte=address_space_pte(as,address); assert(pte); uint64_t old=*pte, flushes=fixture_invlpg_count;
     uint32_t prot=task->vmas[0].prot, flags=task->vmas[0].flags, node_flags=task->vmas[0].file_node.flags;
-#define DENIED(addr,error) do { assert(!syscall_handle_user_page_fault_detailed((addr),(error),true)); \
+#define DENIED(addr,error) do { uint64_t before_leaf=*pte; \
+    assert(!syscall_handle_user_page_fault_detailed((addr),(error),true)); \
     assert(!syscall_handle_user_page_fault_detailed((addr),(error)&~0x4ULL,false)); \
-    assert(fixture_invlpg_count==flushes); } while (0)
-    task->vmas[0].prot=LINUX_PROT_READ; DENIED(address,7);
-    task->vmas[0].prot=LINUX_PROT_NONE; DENIED(address,7); task->vmas[0].prot=prot;
+    assert(fixture_invlpg_count==flushes && *pte==before_leaf); } while (0)
+    /* A committed permission change updates both VMA and PTE. Merely editing
+     * VMA metadata leaves a writable PTE eligible for generic stale retry. */
+    task->vmas[0].max_prot=prot;
+    assert(!syscall_mm_mprotect(address,4096,LINUX_PROT_READ));
+    flushes=fixture_invlpg_count; DENIED(address,7);
+    assert(!syscall_mm_mprotect(address,4096,LINUX_PROT_NONE));
+    flushes=fixture_invlpg_count; DENIED(address,7);
+    assert(!syscall_mm_mprotect(address,4096,prot));
+    assert(syscall_handle_user_page_fault_detailed(address,7,true)==1);
+    old=*pte; flushes=fixture_invlpg_count;
     DENIED(address,15); DENIED(address,23); DENIED(address,39); DENIED(address,71);
     DENIED(RELIEFNT_USER_TOP,7); DENIED(address+4096,7);
+    /* Model first-write notification, rather than an already-authorized
+     * writable leaf, while testing each VMA eligibility rejection. */
+    *pte=(old&~RELIEFNT_PAGE_WRITABLE)|RELIEFNT_PAGE_WRITE_NOTIFY;
     task->vmas[0].flags=(flags&~TASK_VMA_FLAG_SHARED)|TASK_VMA_FLAG_PRIVATE; DENIED(address,7);
     task->vmas[0].flags=flags|TASK_VMA_FLAG_DEVICE; DENIED(address,7);
     task->vmas[0].flags=flags&~TASK_VMA_FLAG_SHARED_FILE; DENIED(address,7);
     task->vmas[0].flags=flags;task->vmas[0].file_node.flags=node_flags|STORAGE_NODE_FLAG_TMPFS; DENIED(address,7);
     task->vmas[0].file_node.flags=node_flags;
-    *pte=old|RELIEFNT_PAGE_DEVICE; DENIED(address,7);
+    *pte=old|RELIEFNT_PAGE_DEVICE; assert(!address_space_shared_write_fault(as,address));
+    *pte&=~RELIEFNT_PAGE_WRITABLE; DENIED(address,7);
     *pte=old&~RELIEFNT_PAGE_WRITABLE; DENIED(address,7);
     *pte=(old&~RELIEFNT_PAGE_PRESENT)|RELIEFNT_PAGE_PROTNONE; DENIED(address,7);
     *pte=RELIEFNT_PAGE_USER|RELIEFNT_PAGE_SWAP; DENIED(address,7);
     *pte=0; assert(!address_space_shared_write_fault(as,address)); assert(fixture_invlpg_count==flushes);
     uint64_t foreign=mm_alloc_page();assert(foreign);
     *pte=foreign|RELIEFNT_PAGE_PRESENT|RELIEFNT_PAGE_USER|RELIEFNT_PAGE_SHARED|RELIEFNT_PAGE_WRITABLE;
+    assert(!address_space_shared_write_fault(as,address));
+    *pte=(*pte&~RELIEFNT_PAGE_WRITABLE)|RELIEFNT_PAGE_WRITE_NOTIFY;
     DENIED(address,7); *pte=old; mm_free_page(foreign);
     uint64_t pml4=as->pml4[(address>>39)&511], *pdpt=mm_phys_to_virt(pml4&RELIEFNT_PHYS_ADDR_MASK);
     uint64_t *pd=mm_phys_to_virt(pdpt[(address>>30)&511]&RELIEFNT_PHYS_ADDR_MASK);
@@ -629,7 +644,7 @@ static void stale_negative(void)
 #undef DENIED
     kernel_execution_unlock_irqrestore(lock);destroy_task(task);page_cache_forget_node(&node);
     vfs_exec_source_put(source);assert(!live_pages);
-    puts("PASS denied, reserved, fetch, private, device, non-cache, swap, missing and upper-level protection faults stay denied");
+    puts("PASS committed mprotect denial, reserved/fetch errors, ineligible first-write leaves and upper-level protection");
 }
 
 int main(int argc, char **argv)

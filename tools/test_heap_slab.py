@@ -8,7 +8,7 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-CASES = ("density", "classes", "reuse", "invalid", "large", "exhaustion", "mapping",
+CASES = ("density", "bitmap_search", "classes", "reuse", "invalid", "large", "exhaustion", "mapping",
          "publication", "publication_enomem", "duplicate", "trees", "concurrency")
 with tempfile.TemporaryDirectory(prefix="reliefnt-heap-") as work:
     compiler = shutil.which("clang") or "cc"
@@ -21,7 +21,8 @@ with tempfile.TemporaryDirectory(prefix="reliefnt-heap-") as work:
                             "-include", "tools/tests/heap_checked_memset.h"]
                            if variant == "checked-clearing" else [])
         subprocess.run([compiler, "-std=c11", "-O1", "-g", "-pthread", "-Wall", "-Wextra",
-                        "-Werror", "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
+                        "-Werror", "-DRELIEFNT_HEAP_PROBE",
+                        "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
                         "-fno-omit-frame-pointer", "-no-pie", "-Iinclude", "-Iinclude/uapi",
                         *instrumentation, *sources, "-o", str(binary)], cwd=ROOT, check=True)
         for case in (sys.argv[1:] or CASES):

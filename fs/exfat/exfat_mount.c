@@ -102,7 +102,9 @@ int exfat_mount(void)
         if (entry[0] == 0u) break;
         if (entry[0] == 0x83u) {
             if (label_found || entry[1] > 11u) { console_error("[reliefnt] exfat_mount: invalid volume label entry\n"); return -5; }
-            for (uint32_t byte = 2u + entry[1] * 2u; byte < EXFAT_ENTRY_SIZE; ++byte) {
+            /* The label occupies bytes 2..23. Bytes 24..31 are reserved,
+             * which exFAT readers preserve rather than interpret (1.2/7.3). */
+            for (uint32_t byte = 2u + entry[1] * 2u; byte < 24u; ++byte) {
                 if (entry[byte] != 0u) { console_error("[reliefnt] exfat_mount: volume label padding nonzero\n"); return -5; }
             }
             label_found = 1u;

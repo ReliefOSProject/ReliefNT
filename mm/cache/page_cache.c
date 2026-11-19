@@ -321,19 +321,25 @@ static uint32_t requested_bytes(const struct page_cache_entry *entry,const struc
 /** @brief Test whether an inode has any lookup-visible cached page.
  * @param node Borrowed stable inode key. @return Nonzero while resident.
  * IRQ-safe, without retaining a frame; storage execution serializes metadata
- * eviction against file-page publication and terminal inode retirement.
+ * eviction against file-page publication and terminal inode retirement. The
+ * identity index excludes retired entries and bounds the search logarithmically.
  */
 int page_cache_has_inode(const struct storage_node *node)
 {
     if (!node) return 0;
     uint64_t flags; int found = 0;
     kernel_spin_lock_irqsave(&cache_lock, &flags);
-    for (uint32_t i = 0; i < PAGE_CACHE_MAX && !found; ++i)
-        found = entries[i].used && !entries[i].retired && node_same_inode(&entries[i].node, node);
-    for (struct page_cache_overflow *chunk = overflow; chunk && !found; chunk = chunk->next)
-        for (uint32_t i = 0; i < PAGE_CACHE_OVERFLOW_ENTRIES && !found; ++i)
-            found = chunk->entries[i].used && !chunk->entries[i].retired &&
-                    node_same_inode(&chunk->entries[i].node, node);
+    /* The lower bound of (inode, 0) is either this inode's first cached page
+     * or a different inode. There need not be a page at offset zero: sparse
+     * mappings, overflow slots and pinned/dirty pages all use the same index. */
+    struct page_cache_entry *entry = key_root, *first = NULL;
+    while (entry) {
+        CACHE_PROBE(1);
+        int order = compare_key(&entry->node, entry->offset, node, 0);
+        if (order >= 0) { first = entry; entry = entry->key_tree.left; }
+        else entry = entry->key_tree.right;
+    }
+    found = first && node_same_inode(&first->node, node);
     kernel_spin_unlock_irqrestore(&cache_lock, flags);
     return found;
 }

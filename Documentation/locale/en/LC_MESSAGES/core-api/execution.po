@@ -432,3 +432,6 @@ msgstr ""
 "Statistics <https://docs.kernel.org/locking/lockstat.html>`_; this reference"
 " explains the boundaries and does not justify labeling this file as Linux-"
 "compatible output."
+
+msgid "睡眠唤醒、进程 alarm 和 POSIX timer 分别保存下一到期 tick 的保守提示， 在调度锁内随新超时收紧；到期扫描后重新计算。取消可保留较早提示，多做一次 扫描，但不会延后到期。没有到期超时时跳过这三类任务表扫描，仍执行 CPU 记账、抢占请求和原有负载采样。周期补偿、信号唤醒和 CPU 预留规则保持不变。"
+msgstr "Sleep wakeups, process alarms and POSIX timers each retain a conservative hint for the next expiry tick. New timeouts tighten it under the scheduler lock, and an expiry scan recomputes it. Cancellation may leave an earlier hint and cause one extra scan, but cannot delay expiry. Ticks with no due timeout skip these three task-table scans while retaining CPU accounting, preemption requests and existing load sampling. Periodic catch-up, signal wakeups and CPU reservations retain their existing rules."

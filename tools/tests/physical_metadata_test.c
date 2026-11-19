@@ -41,8 +41,13 @@ static unsigned mapping_count;
 static bool sparse_mapping;
 static uint64_t clear_watch;
 static unsigned clear_checks;
+static uint64_t scan_probes;
 static jmp_buf panic_resume;
 static bool panic_expected;
+
+/** @brief Count production PMM candidate checks without taking allocator locks. */
+void mm_test_scan_probe(void)
+{ __atomic_add_fetch(&scan_probes, 1, __ATOMIC_RELAXED); }
 /** @brief Report no extra ACPI reservations in physical allocator fixtures.
  * @return Zero fixture resources.
  */
@@ -492,6 +497,70 @@ static void fragments(void)
     puts("hundreds of fragments remain tracked and disjoint: PASS");
 }
 
+/** @brief Reclaim isolated bitmap bits without walking their occupied neighbors. */
+static void bitmap_scan(void)
+{
+    map_ram(LOW, 2048);
+    struct multiboot2_mmap_entry entry = {.addr=LOW, .len=2048*PAGE, .type=1};
+    boot_memory(&entry, 1, 0);
+    uint64_t pages[2048], expected[64];
+    unsigned count = 0, released = 0;
+    while (count < 2048 && (pages[count] = mm_alloc_emergency_page())) ++count;
+    assert(count > 2000 && !mm_free_memory_kib());
+    for (unsigned i = 0; i < count; ++i) {
+        struct mm_page_section *section = owned_section(pages[i]);
+        assert(section);
+        if (!((pages[i] / PAGE - section->first_pfn) % 64u)) {
+            assert(released < sizeof(expected) / sizeof(expected[0]));
+            expected[released++] = pages[i];
+            mm_free_page(pages[i]);
+        }
+    }
+    assert(released >= 16 && mm_free_memory_kib() == released * 4u);
+    uint64_t before = __atomic_load_n(&scan_probes, __ATOMIC_RELAXED);
+    for (unsigned i = 0; i < released; ++i) assert(mm_alloc_emergency_page() == expected[i]);
+    uint64_t steps = __atomic_load_n(&scan_probes, __ATOMIC_RELAXED) - before;
+    fprintf(stderr, "PMM fragmented allocations=%u candidate_checks=%llu\n",
+           released, (unsigned long long)steps);
+    assert(steps <= released * 2u && !mm_free_memory_kib());
+    for (unsigned i = 0; i < count; ++i) mm_free_page(pages[i]);
+    assert(mm_free_memory_kib() == count * 4u);
+}
+
+/** @brief Preserve smaller free runs and unscanned masked pages across bitmap boundaries. */
+static void bitmap_boundaries(void)
+{
+    map_ram(LOW, 2048);
+    struct multiboot2_mmap_entry entry = {.addr=LOW, .len=2048*PAGE, .type=1};
+    boot_memory(&entry, 1, 0);
+    uint64_t pages[2048];
+    unsigned count = 0;
+    while (count < 2048 && (pages[count] = mm_alloc_emergency_page())) ++count;
+    assert(count > 2000 && !mm_free_memory_kib());
+    struct mm_page_section *section = owned_section(pages[count / 2]);
+    assert(section && section->pages > 100 && section->next &&
+           section->next->first_pfn == section->first_pfn + section->pages);
+    uint64_t first = section->first_pfn * PAGE;
+    mm_free_pages(first + 61 * PAGE, 6);
+    mm_free_page(first + 100 * PAGE);
+    assert(mm_alloc_emergency_pages_below(2, first + 66 * PAGE - 2) == first + 63 * PAGE);
+    assert(mm_alloc_emergency_page() == first + 100 * PAGE);
+    assert(mm_alloc_emergency_pages(2) == first + 65 * PAGE);
+    assert(mm_alloc_emergency_page() == first + 62 * PAGE);
+    assert(mm_alloc_emergency_page() == first + 61 * PAGE);
+    assert(!mm_free_memory_kib());
+
+    uint64_t crossing = (section->first_pfn + section->pages - 2) * PAGE;
+    mm_free_pages(crossing, 4);
+    assert(mm_alloc_emergency_pages(4) == crossing && !mm_free_memory_kib());
+    mm_free_page(first + 63 * PAGE);
+    assert(!mm_alloc_emergency_pages_below(1, first + 64 * PAGE - 2));
+    assert(mm_alloc_emergency_page() == first + 63 * PAGE && !mm_free_memory_kib());
+    for (unsigned i = 0; i < count; ++i) mm_free_page(pages[i]);
+    assert(mm_free_memory_kib() == count * 4u);
+    puts("PMM word/section crossings and masked hints: PASS");
+}
+
 static pthread_mutex_t owners_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t thread_owners[4];
 /**
@@ -776,6 +845,8 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "crossings")) crossings();
     else if (!strcmp(argv[1], "crossing_partial")) crossing_partial_free();
     else if (!strcmp(argv[1], "fragments")) fragments();
+    else if (!strcmp(argv[1], "bitmap_scan")) bitmap_scan();
+    else if (!strcmp(argv[1], "bitmap_boundaries")) bitmap_boundaries();
     else if (!strcmp(argv[1], "concurrency")) concurrency();
     else if (!strcmp(argv[1], "model")) reference_model();
     else if (!strcmp(argv[1], "tail")) tail_bits();

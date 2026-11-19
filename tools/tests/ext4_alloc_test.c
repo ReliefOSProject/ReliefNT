@@ -79,6 +79,7 @@
 
 #include "../../block/core/storage_internal.h"
 #include "../../block/core/storage_state_data.c"
+#include "storage_codec_context_fixture.h"
 
 /* The two cache-internal helpers are test seams: the textual
  * storage_ext4_mount.c below must call the fakes in this file, while the
@@ -91,6 +92,13 @@
 /* ---- kernel fakes and fake disk layer --------------------------------- */
 static uint8_t *disk_bytes;
 static uint64_t disk_size;
+int block_device_info(const struct block_device_ref *ref, struct block_device_info *out)
+{
+    assert(ref && out);
+    *out = (struct block_device_info){.blocks = disk_size / 512,
+        .block_size = 512, .max_blocks = 256};
+    return 0;
+}
 static uint64_t test_read_commands, test_write_commands;
 static char console_log_buffer[16384];
 

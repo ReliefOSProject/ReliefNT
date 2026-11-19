@@ -675,6 +675,52 @@ struct ext4_scan_result {
     uint32_t best_len;
 };
 
+#ifdef RELIEFNT_EXT4_ALLOC_TEST
+/* Host-only work counters; no production storage or branch is emitted. */
+static uint64_t ext4_alloc_scan_words;
+static uint64_t ext4_alloc_scan_bit_tests;
+#endif
+
+/** @brief Load one aligned bitmap word without reading past the final byte.
+ * @param bitmap Borrowed little-endian bitmap covering [0, hi).
+ * @param base First bit of this 64-bit word, strictly below hi and aligned to 64.
+ * @param hi Exclusive bitmap limit. @return Zero-extended occupied bit word.
+ */
+static uint64_t ext4_bitmap_word(const uint8_t *bitmap, uint32_t base, uint32_t hi)
+{
+    uint32_t bits = hi - base;
+    uint64_t word = 0;
+    if (bits >= 64) word = ext4_get_le64(bitmap + base / 8);
+    else for (uint32_t byte = 0; byte < (bits + 7) / 8; ++byte)
+        word |= (uint64_t)bitmap[base / 8 + byte] << (byte * 8);
+#ifdef RELIEFNT_EXT4_ALLOC_TEST
+    ++ext4_alloc_scan_words;
+#endif
+    return word;
+}
+
+/** @brief Find the next set or clear bitmap bit using bounded 64-bit words.
+ * @param bitmap Borrowed bitmap covering bits [0, hi), in ext little-endian order.
+ * @param lo First candidate bit, inclusive. @param hi Exclusive bitmap limit.
+ * @param set True searches occupied bits; false searches free bits.
+ * @return The first matching bit in [lo, hi), or hi when no match exists.
+ * No load extends beyond the bytes covering hi; caller retains bitmap ownership.
+ */
+static uint32_t ext4_bitmap_next(const uint8_t *bitmap, uint32_t lo,
+                                 uint32_t hi, bool set)
+{
+    while (lo < hi) {
+        uint32_t base = lo & ~63u;
+        uint32_t bits = hi - base;
+        uint64_t word = ext4_bitmap_word(bitmap, base, hi);
+        uint64_t candidates = (set ? word : ~word) & (UINT64_MAX << (lo - base));
+        if (bits < 64) candidates &= (UINT64_C(1) << bits) - 1;
+        if (candidates) return base + (uint32_t)__builtin_ctzll(candidates);
+        lo = base + 64;
+    }
+    return hi;
+}
+
 static int ext4_bit_free(const struct storage_volume *volume, const uint8_t *bitmap,
                          uint64_t block, uint32_t bit, bool window_owner)
 {
@@ -716,19 +762,51 @@ static void ext4_scan_bits(const struct storage_volume *volume,
                            uint32_t lo, uint32_t hi, uint64_t hint, uint32_t need,
                            bool window_owner, struct ext4_scan_result *out)
 {
-    uint32_t run_start = 0;
-    uint32_t run_len = 0;
-
-    for (uint32_t bit = lo; bit < hi; ++bit) {
-        if (ext4_bit_free(volume, bitmap, first_block + bit, bit,
-                          window_owner)) {
-            if (run_len == 0)
-                run_start = bit;
-            ++run_len;
-            continue;
+    uint32_t run_start = 0, run_len = 0;
+    for (uint32_t bit = lo; bit < hi;) {
+        uint32_t base = bit & ~63u;
+        uint32_t width = 64 - (bit - base);
+        if (width > hi - bit) width = hi - bit;
+        uint64_t mask = width == 64 ? UINT64_MAX : (UINT64_C(1) << width) - 1;
+        uint64_t occupied = ext4_bitmap_word(bitmap, base, hi) >> (bit - base);
+        /* A reservation is occupied for other writers without modifying the
+         * persisted bitmap. Clip its mask to the current word and group. */
+        uint64_t first = first_block + bit;
+        if (!window_owner && volume->ext4.next_goal_block < volume->ext4.reserved_window_end &&
+            volume->ext4.reserved_window_end > first) {
+            uint64_t start = volume->ext4.next_goal_block > first ?
+                volume->ext4.next_goal_block - first : 0;
+            uint64_t end = volume->ext4.reserved_window_end - first;
+            if (start < width) {
+                if (end > width) end = width;
+                uint64_t end_mask = end == 64 ? UINT64_MAX : (UINT64_C(1) << end) - 1;
+                occupied |= end_mask & (UINT64_MAX << start);
+            }
         }
-        ext4_scan_run(out, run_start, run_len, hint, need);
-        run_len = 0;
+        occupied &= mask;
+        if (!occupied) {
+            if (!run_len) run_start = bit;
+            run_len += width;
+        } else if (occupied == mask) {
+            ext4_scan_run(out, run_start, run_len, hint, need);
+            run_len = 0;
+        } else {
+            /* Mixed words retain the simple bit walk: repeatedly looking up
+             * next set/clear bits regresses heavily fragmented bitmaps. */
+            for (uint32_t i = 0; i < width; ++i, occupied >>= 1) {
+#ifdef RELIEFNT_EXT4_ALLOC_TEST
+                ++ext4_alloc_scan_bit_tests;
+#endif
+                if (!(occupied & 1)) {
+                    if (!run_len) run_start = bit + i;
+                    ++run_len;
+                } else {
+                    ext4_scan_run(out, run_start, run_len, hint, need);
+                    run_len = 0;
+                }
+            }
+        }
+        bit += width;
     }
     ext4_scan_run(out, run_start, run_len, hint, need);
 }
@@ -1248,13 +1326,8 @@ static int ext4_alloc_inode_in_group(struct storage_volume *volume, uint64_t gro
     ret = ext4_load_inode_bitmap(volume, group, &view, &bitmap, false);
     if (ret < 0)
         return ret;
-    for (uint32_t bit = lo; bit < hi; ++bit) {
-        if (!ext4_test_bit(bitmap, bit)) {
-            found = bit;
-            break;
-        }
-    }
-    if (found == UINT32_MAX)
+    found = ext4_bitmap_next(bitmap, lo, hi, false);
+    if (found == hi)
         return -RELIEFOS_ENOSPC;
     if (view.free_inodes_count == 0) {
         volume->ext4.fs_error = 1;

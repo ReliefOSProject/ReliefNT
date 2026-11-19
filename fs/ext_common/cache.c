@@ -1,4 +1,5 @@
 #include "../../block/core/storage_internal.h"
+#include <reliefnt/storage_context.h>
 /* ext4 bounded block caches: fixed-capacity, generation-guarded, lazily
  * allocated.  This file only caches and performs bounded device I/O; it does
  * no on-disk format parsing (see ext_common/internal.h for the entry contract).
@@ -256,8 +257,8 @@ int storage_ext4_cache_read(struct storage_volume *volume, uint64_t block, void 
 /* Batch adjacent cache misses, splitting at every cached block so dirty data
  * is never replaced by stale device bytes. Read fill never evicts dirty or
  * pinned entries: pressure only disables read caching for that block. */
-int storage_ext4_cache_read_blocks(struct storage_volume *v, uint64_t first,
-                                   uint32_t count, void *out)
+static int ext4_cache_read_blocks(struct storage_volume *v, uint64_t first,
+                                   uint32_t count, void *out, bool caching)
 {
     struct ext4_cache_table *table = &ext4_cache_tables[EXT4_CACHE_TABLE_BLOCK];
     uint64_t lba;
@@ -266,7 +267,6 @@ int storage_ext4_cache_read_blocks(struct storage_volume *v, uint64_t first,
         count > v->ext4.blocks_count - first) return -RELIEFOS_EINVAL;
     int ret = ext4_cache_block_range(v, first + count - 1, &lba, &sectors);
     if (ret < 0) return ret;
-    bool caching = ext4_cache_ensure(table);
     uint32_t bs = v->ext4.block_size;
     for (uint32_t done = 0; done < count;) {
         struct storage_ext4_cache_entry *entry = ext4_cache_lookup(table, v, first + done);
@@ -302,6 +302,50 @@ int storage_ext4_cache_read_blocks(struct storage_volume *v, uint64_t first,
         done += run;
     }
     return 0;
+}
+
+/** @brief Read filesystem blocks with replay-safe native request boundaries.
+ * @param v Mounted volume retaining its exact device reference.
+ * @param first First physical filesystem block. @param count Nonzero block count.
+ * @param out Writable count*block_size bytes valid during this call only.
+ * @return Zero or native errno, including -EAGAIN with no retained caller pointer.
+ * Storage execution ownership required. An asynchronous miss is one command
+ * covering the complete range. Multi-command or mixed cached/uncached ranges
+ * temporarily use synchronous context, so an unwind cannot lose a completed
+ * prefix or change the pending command's identity after metadata cache churn.
+ */
+int storage_ext4_cache_read_blocks(struct storage_volume *v, uint64_t first,
+                                   uint32_t count, void *out)
+{
+    if (!out || !count || !v || first >= v->ext4.blocks_count ||
+        count > v->ext4.blocks_count - first) return -RELIEFOS_EINVAL;
+    uint64_t lba;
+    uint32_t sectors;
+    int ret = ext4_cache_block_range(v, first + count - 1, &lba, &sectors);
+    if (ret < 0) return ret;
+    struct block_device_info info;
+    ret = block_device_info(&v->device_ref, &info);
+    if (ret < 0) return ret;
+    if (info.block_size != SECTOR_SIZE || !info.max_blocks) return -RELIEFOS_EOPNOTSUPP;
+    struct ext4_cache_table *table = &ext4_cache_tables[EXT4_CACHE_TABLE_BLOCK];
+    bool caching = ext4_cache_ensure(table);
+    uint32_t hits = 0;
+    for (uint32_t i = 0; caching && i < table->capacity; ++i) {
+        const struct storage_ext4_cache_entry *e = &table->entries[i];
+        if (e->valid && e->volume == v &&
+            e->volume_generation == v->mount_generation &&
+            e->block >= first && e->block - first < count) ++hits;
+    }
+    /* A replay restarts at first, potentially after inode/extent lookups evict
+     * earlier data. Cache capacity alone cannot guarantee prefix residency.
+     * Only an entirely uncached single command has a stable retry identity. */
+    bool synchronous = count > info.max_blocks / sectors ||
+        count > EXT4_READAHEAD_BLOCKS || (hits && hits < count);
+    struct storage_io_context saved;
+    if (synchronous) storage_kernel_context_enter(&saved);
+    ret = ext4_cache_read_blocks(v, first, count, out, caching);
+    if (synchronous) storage_kernel_context_leave(&saved);
+    return ret;
 }
 
 int storage_ext4_cache_get(struct storage_volume *volume, uint64_t block, uint8_t **data,

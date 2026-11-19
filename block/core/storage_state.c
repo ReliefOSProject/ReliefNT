@@ -619,3 +619,5 @@ EXPORT_SYMBOL(storage_text_eq);
 EXPORT_SYMBOL(storage_text_eq_ci);
 
 EXPORT_SYMBOL(storage_async_can_yield);
+EXPORT_SYMBOL(storage_kernel_context_enter);
+EXPORT_SYMBOL(storage_kernel_context_leave);

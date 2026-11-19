@@ -45,6 +45,7 @@
 
 #include "../../block/core/storage_internal.h"
 #include "../../block/core/storage_state_data.c"
+#include "storage_codec_context_fixture.h"
 
 /* ---- kernel fakes ---------------------------------------------------- */
 static uint8_t *disk_bytes;
@@ -163,7 +164,12 @@ int block_device_flush(const struct block_device_ref *ref)
     ++test_transport_flushes;test_transport_flush_step=++test_step;return 0;
 }
 int block_device_info(const struct block_device_ref *ref,struct block_device_info *out)
-{(void)ref;(void)out;abort();}
+{
+    assert(ref && out);
+    *out = (struct block_device_info){.blocks = disk_size / 512,
+        .block_size = 512, .max_blocks = 256};
+    return 0;
+}
 
 
 #include "../../fs/ext_common/format.c"

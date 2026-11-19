@@ -8,7 +8,8 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("translation", "framebuffer", "small", "high", "ownership", "saturation",
-         "crossings", "crossing_partial", "fragments", "concurrency", "model", "tail", "failure",
+         "crossings", "crossing_partial", "fragments", "bitmap_scan", "bitmap_boundaries",
+         "concurrency", "model", "tail", "failure",
          "init_panic", "heap", "wide", "clipped", "mapped_sparse_runs")
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--case", choices=CASES, help="run only one PMM case")
@@ -33,7 +34,7 @@ with tempfile.TemporaryDirectory(prefix="reliefnt-pmm-") as work:
     heap_object = Path(work) / "heap.o"
     subprocess.run([*common, "-Dmm_virt_to_phys=fixture_heap_virt_to_phys", "-c",
                     "mm/heap/heap.c", "-o", str(heap_object)], cwd=ROOT, check=True)
-    subprocess.run([*common, "-Wl,--gc-sections",
+    subprocess.run([*common, "-Wl,--gc-sections", "-DRELIEFNT_PMM_PROBE",
                     "tools/tests/physical_metadata_test.c", "mm/physical/mm.c",
                     "mm/physical/metadata.c", "mm/physical/topology.c",
                     "mm/physical/bootstrap.c", "arch/x86_64/boot/multiboot2.c", str(heap_object),

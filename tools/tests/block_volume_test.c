@@ -20,7 +20,7 @@ uint64_t time_uptime_ms(void)
     return 0;
 }
 void console_log(enum console_log_level level,const char *format,...) {(void)level;(void)format;}
-static unsigned allocations,reads,writes,cancels;
+static unsigned allocations,reads,writes,cancels,cache_notifications;
 static int pending;
 static unsigned char media[8192];
 struct storage_volume g_volumes[STORAGE_MAX_VOLUMES];
@@ -46,6 +46,10 @@ void storage_memcpy(void *p,const void *q,size_t n){memcpy(p,q,n);}
 void storage_copy_text(char *p,uint32_t n,const char *q){snprintf(p,n,"%s",q);}
 void storage_filesystem_cache_event(const struct storage_volume *v,uint64_t l,uint32_t n)
 {(void)v;(void)l;(void)n;assert(!storage_transport_lock.state);}
+/* Direct block callers invalidate aliases before each native write as well as
+ * the outer volume notification. No filesystem is mounted in this fixture. */
+void storage_filesystem_cache_event_device(const struct block_device *device,uint64_t lba,uint32_t count)
+{assert(device && storage_transport_lock.state && lba>=2 && count==2);++cache_notifications;}
 static int rd(void *c,uint64_t l,uint32_t n,void *p)
 {assert(c==media && storage_transport_lock.state);++reads;if(pending){pending=0;return -11;}memcpy(p,media+l*512,n*512);return 0;}
 static int wr(void *c,uint64_t l,uint32_t n,const void *p)
@@ -66,7 +70,7 @@ int main(void)
     assert(unregister_block_device(&r)==-16);
     assert(storage_volume_from_install_disk(&v,d)==-16);
     unsigned char input[2048],output[2048];memset(input,0x5a,sizeof(input));
-    assert(!storage_write_device(&v,2,4,input) && writes==2);
+    assert(!storage_write_device(&v,2,4,input) && writes==2 && cache_notifications==2);
     pending=1;assert(storage_read_device(&v,2,2,output)==-11);
     assert(!storage_read_device(&v,2,4,output) && reads==3 && !memcmp(input,output,2048));
     assert(storage_read_device(&v,15,2,output)==-22);

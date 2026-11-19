@@ -14,7 +14,7 @@ with tempfile.TemporaryDirectory(prefix="cache-ext-partial-",dir=os.environ["TMP
         "-fsanitize=address,undefined","-mllvm","-asan-globals=0","-fno-sanitize-recover=all",
         "-no-pie","-ffunction-sections","-fdata-sections","-Wl,--gc-sections",
         "-Iinclude","-Iinclude/uapi","tools/tests/cache_ext_partial_test.c",
-        "mm/cache/page_cache.c","fs/tmpfs/core.c","fs/vfs/exec_file.c","lib/text_utf16.c",
+        "mm/cache/page_cache.c","mm/physical/proc.c","fs/tmpfs/core.c","fs/vfs/exec_file.c","lib/text_utf16.c",
         *STORAGE_GRAPH_SOURCES,"-o",str(binary)],cwd=ROOT,check=True)
     with image.open("wb") as stream: stream.truncate(64*1024*1024)
     subprocess.run(["mke2fs","-q","-F","-t","ext2","-b","4096","-I","256",

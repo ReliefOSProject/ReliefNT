@@ -453,6 +453,24 @@ extern uint32_t current_pid[SMP_MAX_CPUS];
 extern struct task *current_task[SMP_MAX_CPUS];
 extern uint32_t next_session_id;
 extern uint64_t scheduler_ticks;
+
+/* Conservative deadline hints. Zero forces an initial scan; cancellations
+ * may leave an earlier hint and cost one extra scan, never a late expiry. */
+extern uint64_t scheduler_next_wake_tick;
+extern uint64_t scheduler_next_alarm_tick;
+extern uint64_t scheduler_next_posix_timer_tick;
+
+/**
+ * @brief Include a newly armed deadline in a scheduler-lock-owned hint.
+ * @param next Required hint; zero requests an unconditional next scan.
+ * @param deadline Absolute expiry tick, or zero for a disarmed timeout.
+ * No lock, allocation, callback or ownership change occurs. Existing earlier
+ * hints remain valid after cancellation or task/identity retirement.
+ */
+static inline void sched_deadline_include(uint64_t *next, uint64_t deadline)
+{
+    if (deadline && deadline < *next) *next = deadline;
+}
 extern uint64_t scheduler_loads[3];
 extern struct cpu_runtime_accounting cpu_accounting[SMP_MAX_CPUS];
 extern struct kernel_spinlock scheduler_lock;

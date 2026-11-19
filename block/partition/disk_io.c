@@ -5,6 +5,31 @@
 #endif
 #include "mbr.h"
 
+/* Execution ownership and storage_acquire_task_io() serialize users of this
+ * stable CPU staging area, including read continuations. Never expose a user
+ * mapping to a transport or retain a temporary allocation across EAGAIN.
+ * Providers retain their own DMA backing and their advertised request limit. */
+#define DISK_RAW_STAGE_SECTORS 128u
+static uint8_t disk_raw_stage[DISK_RAW_STAGE_SECTORS * SECTOR_SIZE]
+    __attribute__((aligned(4096)));
+
+/** @brief Bound raw staging to one native request and the core's fixed budget.
+ * @param reference Held exact disk identity for the complete transaction.
+ * @param out_bytes Required output for a nonzero multiple of 512 bytes.
+ * @return Zero or geometry/reference errno; no I/O, allocation or lock transfer.
+ */
+static int disk_raw_stage_size(const struct block_device_ref *reference,uint32_t *out_bytes)
+{
+    struct block_device_info info;
+    int ret=block_device_info(reference,&info);
+    if(ret)return ret;
+    if(info.block_size!=SECTOR_SIZE)return -95;
+    uint32_t sectors=min_u32(info.max_blocks,DISK_RAW_STAGE_SECTORS);
+    if(!sectors)return -22;
+    *out_bytes=sectors*SECTOR_SIZE;
+    return 0;
+}
+
 /** @brief Read one512-byte DOS metadata sector through the held block transport. */
 static int disk_mbr_read(void *context,uint64_t sector,uint8_t bytes[512])
 { return install_read_sectors(context,sector,1,bytes); }
@@ -435,7 +460,7 @@ static int storage_disk_partition_uuid_owned(uint32_t disk_id, uint32_t partitio
 
 static int storage_disk_block_read_owned(uint32_t disk_id, int32_t partition_index,
                             uint64_t offset, void *buffer, uint32_t length,
-                            uint32_t *out_read)
+                            uint32_t *out_read,const struct block_device_ref *reference)
 {
     uint64_t first_lba, sectors;
     uint32_t done = 0;
@@ -455,18 +480,21 @@ static int storage_disk_block_read_owned(uint32_t disk_id, int32_t partition_ind
     uint64_t bytes = sectors * 512u;
     if (offset >= bytes) return 0;
     if (length > bytes - offset) length = bytes - offset;
+    uint32_t stage_bytes;
+    ret=disk_raw_stage_size(reference,&stage_bytes);
+    if(ret<0)return ret;
     /* Block drivers program DMA with physical kernel addresses.  A raw
      * device syscall receives a user virtual address, so it must never be
      * used directly as a DMA target.  Transfer through the kernel-owned,
-     * page-aligned scratch buffer in bounded chunks instead. */
+     * stable, page-aligned staging buffer in bounded chunks instead. */
     while (done < length) {
         uint64_t position = offset + done;
         uint32_t skip = position % 512u;
-        uint32_t take = min_u32(STORAGE_SCRATCH_SECTORS * 512u - skip, length - done);
-        ret = install_read_sectors(disk, first_lba + position / 512u,
-                                   (skip + take + 511u) / 512u, storage_scratch);
+        uint32_t take = min_u32(stage_bytes - skip, length - done);
+        ret = storage_read_install_disk(disk, first_lba + position / 512u,
+                                   (skip + take + 511u) / 512u, disk_raw_stage);
         if (ret < 0) { if (out_read) *out_read = done; return ret; }
-        storage_memcpy(destination + done, storage_scratch + skip, take);
+        storage_memcpy(destination + done, disk_raw_stage + skip, take);
         done += take;
     }
     if (out_read) *out_read = length;
@@ -495,6 +523,9 @@ static int storage_disk_block_write_owned(uint32_t disk_id, int32_t partition_in
     uint64_t bytes = sectors * 512u;
     if (offset >= bytes) return -28;
     if (length > bytes - offset) length = bytes - offset;
+    uint32_t stage_bytes;
+    ret=disk_raw_stage_size(reference,&stage_bytes);
+    if(ret<0)return ret;
 #ifdef CONFIG_SWAP
     uint64_t raw_first=first_lba+offset/512u;
     uint64_t raw_count=((offset%512u)+(uint64_t)length+511u)/512u;
@@ -514,20 +545,28 @@ static int storage_disk_block_write_owned(uint32_t disk_id, int32_t partition_in
         disk_block_cache_invalidate(disk_id);
     }
     storage_begin_mutation();
+    storage_cache_invalidate();
     /* See storage_disk_block_read(): source user mappings are not DMA-safe.
      * Copy each sector-aligned request into kernel memory before submitting it
      * to the controller. */
     while (done < length) {
         uint64_t position = offset + done;
         uint32_t skip = position % 512u;
-        uint32_t take = min_u32(STORAGE_SCRATCH_SECTORS * 512u - skip, length - done);
+        uint32_t take = min_u32(stage_bytes - skip, length - done);
         uint32_t chunk = (skip + take + 511u) / 512u;
-        if (skip || (take & 511u)) {
-            ret = install_read_sectors(disk, first_lba + position / 512u, chunk, storage_scratch);
+        /* Preserve only sectors containing bytes outside this write. Interior
+         * sectors are overwritten completely and need no read-before-write. */
+        if (skip) {
+            ret = storage_read_install_disk(disk, first_lba + position / 512u, 1, disk_raw_stage);
             if (ret < 0) { if (out_written) *out_written = done; return ret; }
         }
-        storage_memcpy(storage_scratch + skip, source + done, take);
-        ret = install_write_sectors(disk, first_lba + position / 512u, chunk, storage_scratch);
+        if (((skip + take) & 511u) && (!skip || chunk > 1u)) {
+            ret = storage_read_install_disk(disk, first_lba + position / 512u + chunk - 1u,
+                                       1, disk_raw_stage + (chunk - 1u) * 512u);
+            if (ret < 0) { if (out_written) *out_written = done; return ret; }
+        }
+        storage_memcpy(disk_raw_stage + skip, source + done, take);
+        ret = storage_write_install_disk(disk, first_lba + position / 512u, chunk, disk_raw_stage);
         if (ret < 0) { if (out_written) *out_written = done; return ret; }
         done += take;
     }
@@ -618,7 +657,7 @@ int storage_disk_block_read(uint32_t disk_id, int32_t partition_index,
     struct block_device_ref ref={0};int rc=storage_disk_block_get(disk_id,&ref);
     if(!rc && (disk_id&STORAGE_BLOCK_OPTICAL_BIT))
         rc=partition_index==-1 ? storage_optical_read(&ref,offset,buffer,length,out_read) : -22;
-    else if(!rc)rc=storage_disk_block_read_owned(disk_id,partition_index,offset,buffer,length,out_read);
+    else if(!rc)rc=storage_disk_block_read_owned(disk_id,partition_index,offset,buffer,length,out_read,&ref);
     block_device_put(&ref);return rc;
 }
 

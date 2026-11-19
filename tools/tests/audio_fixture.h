@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <stdio.h>
+#include "paging_cpu_fixture.h"
 #ifndef AUDIO_FIXTURE_NO_PTHREAD
 #include <pthread.h>
 #endif
@@ -14,7 +15,6 @@ uint32_t kernel_wait_queue_wake_all(struct kernel_wait_queue *queue)
 }
 #endif
 static __thread uint64_t audio_fixture_irq_flags = 1ULL << 9;
-uint32_t smp_current_cpu(void) { return 0; }
 void smp_membarrier_poll(void) { }
 uint64_t kernel_irq_save(void) {
     uint64_t saved = audio_fixture_irq_flags;

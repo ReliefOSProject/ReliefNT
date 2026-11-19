@@ -38,6 +38,7 @@ void sched_itimer_task(struct task *task, const struct linux_itimerval *value, s
             ? maximum : scheduler_ticks + duration;
         leader->alarm_interval_ns = duration ? timeval_ns(value->it_interval) : 0;
         leader->alarm_last_expiry = leader->alarm_deadline;
+        sched_deadline_include(&scheduler_next_alarm_tick, leader->alarm_deadline);
     }
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
 }
@@ -65,17 +66,29 @@ void sched_alarm_rearm(struct task *task)
         uint64_t periods = scheduler_ticks >= expired ? (scheduler_ticks - expired) / interval + 1 : 1;
         leader->alarm_deadline = expired + periods * interval;
         leader->alarm_last_expiry = leader->alarm_deadline;
+        sched_deadline_include(&scheduler_next_alarm_tick, leader->alarm_deadline);
     }
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
 }
 
+/**
+ * @brief Expire due process alarms and remember the next possible deadline.
+ * Caller holds scheduler_lock. Lazy cancellation can cause one unnecessary
+ * scan; new alarms tighten the hint before publication and cannot expire late.
+ * No allocation or user callback occurs; existing signal wake rules apply.
+ */
 void sched_alarm_expire(void)
 {
+    if (scheduler_ticks < scheduler_next_alarm_tick) return;
+    scheduler_next_alarm_tick = UINT64_MAX;
     const uint64_t bit = 1ULL << 13;
     for (uint32_t i = 0; i < task_count; ++i) {
         struct task *leader = tasks[i];
-        if (leader->pid != sched_task_tgid(leader) || !leader->alarm_deadline ||
-            leader->alarm_deadline > scheduler_ticks) continue;
+        if (leader->pid != sched_task_tgid(leader) || !leader->alarm_deadline) continue;
+        if (leader->alarm_deadline > scheduler_ticks) {
+            sched_deadline_include(&scheduler_next_alarm_tick, leader->alarm_deadline);
+            continue;
+        }
         leader->alarm_deadline = 0;
         for (uint32_t j = 0; j < task_count; ++j) {
             struct task *live = tasks[j];
@@ -193,6 +206,7 @@ int sched_timer_settime(struct task *task, int32_t timerid, uint32_t flags,
     timer->interval_ticks = interval;
     timer->overrun = 0;
     timer->expiry_tick = initial ? ((flags & LINUX_TIMER_ABSTIME) ? initial : scheduler_ticks + initial) : 0;
+    sched_deadline_include(&scheduler_next_posix_timer_tick, timer->expiry_tick);
     kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
     return 0;
 }
@@ -226,14 +240,26 @@ int sched_timer_getoverrun(struct task *task, int32_t timerid)
     return result;
 }
 
+/**
+ * @brief Expire due POSIX timers while skipping scans before the next deadline.
+ * Caller holds scheduler_lock; arming and periodic rearming update the same
+ * conservative hint. Cancellation/exec need no queue removal or allocation.
+ * Existing notification, overrun, signal and task-reservation rules remain.
+ */
 void sched_posix_timer_expire(void)
 {
+    if (scheduler_ticks < scheduler_next_posix_timer_tick) return;
+    scheduler_next_posix_timer_tick = UINT64_MAX;
     for (uint32_t i = 0; i < task_count; ++i) {
         struct task *owner = tasks[i];
         if (!owner || owner->state == TASK_EXITED) continue;
         for (uint32_t j = 0; j < SCHED_TASK_TIMER_MAX; ++j) {
             struct task_posix_timer *timer = &owner->timers[j];
-            if (!timer->used || !timer->expiry_tick || timer->expiry_tick > scheduler_ticks) continue;
+            if (!timer->used || !timer->expiry_tick) continue;
+            if (timer->expiry_tick > scheduler_ticks) {
+                sched_deadline_include(&scheduler_next_posix_timer_tick, timer->expiry_tick);
+                continue;
+            }
             if (timer->notify != 1) {
                 uint64_t bit = 1ULL << (uint32_t)(timer->signo - 1);
                 if (timer->notify == 4) {
@@ -269,6 +295,7 @@ void sched_posix_timer_expire(void)
                 uint64_t periods = (scheduler_ticks - timer->expiry_tick) / timer->interval_ticks + 1;
                 if (periods > 1) timer->overrun += periods - 1;
                 timer->expiry_tick += periods * timer->interval_ticks;
+                sched_deadline_include(&scheduler_next_posix_timer_tick, timer->expiry_tick);
             }
         }
     }

@@ -14,7 +14,8 @@ bool paging_kernel_direct_map_range(uint64_t physical, uint64_t length)
         (uintptr_t)start + length - 1;
 }
 void *paging_kernel_direct_map(uint64_t physical) { return mm_phys_to_virt(physical); }
-void storage_memzero(void *memory, size_t size) { memset(memory, 0, size); }
+static size_t zeroed_bytes;
+void storage_memzero(void *memory, size_t size) { zeroed_bytes+=size;memset(memory, 0, size); }
 void console_log(enum console_log_level level, const char *format, ...)
 { (void)level; (void)format; }
 static bool asynchronous;
@@ -52,6 +53,16 @@ void pci_unmap_mmio(void *pointer,uint64_t bytes)
 { assert(pointer==expected_mmio && bytes==NVME_MMIO_BYTES && !g_nvme_controllers[0].dma_active);++unmaps; }
 int main(void)
 {
+    for (unsigned mdts=0;mdts<=UINT8_MAX;++mdts) {
+        uint32_t expected=NVME_MAX_SECTORS;
+        if(mdts) {
+            expected=8u; /* CAP.MPSMIN=0 => 4096-byte MDTS units. */
+            for(unsigned power=0;power<mdts && expected<NVME_MAX_SECTORS;++power)
+                expected*=2u;
+            if(expected>NVME_MAX_SECTORS)expected=NVME_MAX_SECTORS;
+        }
+        assert(nvme_transfer_limit((uint8_t)mdts)==expected);
+    }
     unsigned char registers[0x4000] __attribute__((aligned(8))) = {0};
     struct nvme_controller *controller = &g_nvme_controllers[0];
     controller->mmio = registers;expected_mmio=registers;
@@ -67,8 +78,13 @@ int main(void)
     assert(!nvme_allocate_page(&controller->prp_list_phys,
                                (uint8_t **)(void *)&controller->prp_list));
     struct nvme_command command = {0};
-    for (uint32_t count = 1; count <= NVME_IO_BUFFER_PAGES; ++count) {
-        assert(!nvme_prepare_prp(controller, count * 4096, &command));
+    for (uint32_t sectors = 1; sectors <= NVME_MAX_SECTORS; ++sectors) {
+        uint32_t count=(sectors+7u)/8u;
+        for(unsigned i=0;i<NVME_PAGE_SIZE/sizeof(uint64_t);++i)
+            controller->prp_list[i]=UINT64_C(0xabababababababab);
+        zeroed_bytes=0;
+        assert(!nvme_prepare_prp(controller, (uint64_t)sectors*512u, &command));
+        assert(!zeroed_bytes);
         assert(command.prp1 == controller->io_buffer_phys && command.prp1 > UINT32_MAX);
         if (count == 1) assert(!command.prp2);
         else if (count == 2) assert(command.prp2 == command.prp1 + 4096);
@@ -77,6 +93,9 @@ int main(void)
             for (uint32_t page = 1; page < count; ++page)
                 assert(controller->prp_list[page - 1] == command.prp1 + (uint64_t)page * 4096);
         }
+        unsigned consumed=count>2 ? count-1u : 0u;
+        for(unsigned i=consumed;i<NVME_PAGE_SIZE/sizeof(uint64_t);++i)
+            assert(controller->prp_list[i]==UINT64_C(0xabababababababab));
     }
     assert(nvme_prepare_prp(controller, (NVME_IO_BUFFER_PAGES + 1u) * 4096, &command) == -22);
     /* A read awaiting hardware must release the caller with retry ownership,
@@ -85,6 +104,7 @@ int main(void)
     struct nvme_completion cq[32]={0};
     unsigned char destination[512];memset(destination,0x5a,sizeof(destination));
     controller->io_sq=sq;controller->io_cq=cq;controller->queue_depth=32;
+    controller->max_sectors=nvme_transfer_limit(0);
     controller->cq_phase_io=1;controller->ready=1;controller->queues_live=true;
     controller->doorbell_stride=4;asynchronous=true;
     nvme_interrupt_prepare(controller);
@@ -126,6 +146,28 @@ int main(void)
     struct nvme_namespace ns={.controller=controller,.nsid=1};
     nvme_block_cancel(&ns,7);
     assert(!controller->pending_read.active && replacement[0]==0x39);
+    /* A small MDTS controller must never see oversized SQEs. Rejection must
+     * not stage write bytes, drain a different read, or move the SQ tail. */
+    controller->max_sectors=nvme_transfer_limit(1);
+    assert(controller->max_sectors==16);
+    unsigned char bounded[8194];memset(bounded,0x6d,sizeof(bounded));
+    unsigned tail=controller->io_sq_tail;
+    assert(nvme_readwrite_once(controller,1,80,17,bounded+1,0)==-22);
+    assert(controller->io_sq_tail==tail && !controller->pending_read.active);
+    assert(nvme_readwrite_once(controller,1,80,16,bounded+1,0)==-11);
+    tail=controller->io_sq_tail;
+    memset(controller->io_buffer,0x27,8192);
+    assert(nvme_readwrite_once(controller,1,80,17,bounded+1,1)==-22);
+    assert(controller->io_sq_tail==tail && controller->pending_read.active);
+    assert(controller->io_buffer[0]==0x27 && controller->io_buffer[8191]==0x27);
+    head=controller->io_cq_head;
+    cq[head]=(struct nvme_completion){.sq_id=1,.command_id=controller->completion_cid,
+        .status=controller->cq_phase_io};
+    irq_handler(irq_context);
+    assert(!nvme_readwrite_once(controller,1,80,16,bounded+1,0));
+    for(unsigned i=1;i<=8192;++i)assert(bounded[i]==0x27);
+    assert(bounded[0]==0x6d && bounded[8193]==0x6d);
+    controller->max_sectors=NVME_MAX_SECTORS;
     struct nvme_command bad={.cdw0=NVME_IO_READ,.nsid=1};
     assert(!nvme_queue_issue(controller,&bad));head=controller->io_cq_head;
     cq[head]=(struct nvme_completion){.sq_id=1,.command_id=controller->completion_cid+1,
@@ -146,5 +188,5 @@ int main(void)
     assert(allocated == freed && !heap_objects && unmaps==1);
     assert(irq_frees==1);
     assert(!nvme_controller_stop(controller));
-    puts("PASS NVMe PRP64, async resume, MSI-X CQ/phase/CID, stale buffer discard, cancel and failed STOP retention");
+    puts("PASS NVMe PRP64/unused entries, all 256 MDTS values/bounds, async resume, MSI-X CQ/phase/CID, stale buffer discard, cancel and failed STOP retention");
 }

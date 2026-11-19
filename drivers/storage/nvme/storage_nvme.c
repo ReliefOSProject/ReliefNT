@@ -529,6 +529,19 @@ static int nvme_reinitialize_controller(struct nvme_controller *controller)
     return ret;
 }
 
+/** @brief Bound transfers by Identify Controller MDTS and owned DMA capacity.
+ * @param mdts Controller's MDTS byte; zero advertises no protocol limit.
+ * @return Maximum 512-byte sectors, at most NVME_MAX_SECTORS. Initialization
+ * already rejects CAP.MPSMIN != 0, so MDTS units are exactly 4096 bytes.
+ * Large exponents saturate before shifting and cannot overflow the bound.
+ */
+static uint32_t nvme_transfer_limit(uint8_t mdts)
+{
+    if (!mdts || mdts >= 32u) return NVME_MAX_SECTORS;
+    uint64_t sectors = (uint64_t)(NVME_PAGE_SIZE / SECTOR_SIZE) << mdts;
+    return sectors < NVME_MAX_SECTORS ? (uint32_t)sectors : NVME_MAX_SECTORS;
+}
+
 /** @brief Validate native NVMe capabilities and create owned queues/data pages.
  * @param controller Reserved mapped slot, BSP probe or serialized task context.
  * @return Zero or native error; partial allocations are freed only after STOP.
@@ -611,14 +624,16 @@ static int nvme_initialize_controller(struct nvme_controller *controller)
     ret = nvme_identify(controller, 0, NVME_IDENTIFY_CONTROLLER,
                         controller->identify_buffer, controller->identify_phys);
     if (ret < 0) goto fail;
+    controller->max_sectors = nvme_transfer_limit(controller->identify_buffer[77u]);
     controller->namespace_count = storage_get_u32(controller->identify_buffer + 516u);
     nvme_copy_model(controller->model, controller->identify_buffer + 24u);
     if (!controller->model[0]) {
         storage_copy_text(controller->model, sizeof(controller->model), "NVMe Controller");
     }
-    console_info("[reliefnt] NVMe controller ready pci=%u:%u.%u model=\"%s\" namespaces=%u qdepth=%u irq=%s\n",
+    console_info("[reliefnt] NVMe controller ready pci=%u:%u.%u model=\"%s\" namespaces=%u qdepth=%u max_sectors=%u irq=%s\n",
                    controller->bus, controller->slot, controller->function,
                    controller->model, controller->namespace_count, controller->queue_depth,
+                   controller->max_sectors,
                    controller->irq_mode==1 ? "msix" : controller->irq_mode==2 ? "msi" : "poll");
     return 0;
 
@@ -658,7 +673,9 @@ static int nvme_prepare_prp(struct nvme_controller *controller,
     if (pages - 1u > NVME_MAX_PRP_ENTRIES) {
         return -7;
     }
-    storage_memzero(controller->prp_list, NVME_PAGE_SIZE);
+    /* The command length determines the exact number of PRPs the device may
+     * fetch. Overwrite every live entry; unused entries do not need a 4 KiB
+     * clear on each request and are never exposed to caller memory. */
     page_phys = controller->io_buffer_phys + NVME_PAGE_SIZE;
     for (uint32_t i = 0; i < pages - 1u; ++i) {
         controller->prp_list[i] = page_phys + (uint64_t)i * NVME_PAGE_SIZE;
@@ -713,7 +730,8 @@ static int nvme_readwrite_once(struct nvme_controller *controller, uint32_t nsid
     uint64_t bytes;
     int ret;
     if (!controller || !controller->ready || !controller->io_buffer || !buffer ||
-        nsid == 0 || sector_count == 0 || sector_count > NVME_MAX_SECTORS) {
+        nsid == 0 || sector_count == 0 || sector_count > controller->max_sectors ||
+        sector_count > NVME_MAX_SECTORS) {
         return -22;
     }
     bytes = (uint64_t)sector_count * SECTOR_SIZE;
@@ -909,7 +927,7 @@ static int nvme_register_namespace(struct nvme_controller *controller,uint32_t n
     struct nvme_namespace *ns=kernel_malloc(sizeof(*ns));if(!ns)return -12;
     *ns=(struct nvme_namespace){.controller=controller,.nsid=nsid,.registration={
         .info={.device=block_device_allocate_number(false),.blocks=sectors,.block_size=512,
-            .max_blocks=NVME_MAX_SECTORS,.transport=STORAGE_TRANSPORT_NVME,
+            .max_blocks=controller->max_sectors,.transport=STORAGE_TRANSPORT_NVME,
             .bus=controller->bus,.slot=controller->slot,.function=controller->function,
             .port=nsid<256 ? nsid : 255,.controller=controller->controller_index,.namespace_id=nsid},
         .operations=&nvme_operations,.context=ns,.owner=THIS_MODULE}};

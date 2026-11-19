@@ -6,11 +6,17 @@
 #include "../../block/core/storage_internal.h"
 #include "../../block/core/storage_state_data.c"
 #include "../../block/core/device_number.c"
+#include "storage_codec_context_fixture.h"
 
 static FILE *disk;
-/* This codec fixture never enters registered ISO transport metadata. */
+/* File-backed ext codec transport; partition geometry is populated by mount. */
 int block_device_info(const struct block_device_ref *reference,struct block_device_info *out)
-{(void)reference;(void)out;abort();}
+{
+    assert(reference && out && disk);
+    *out = (struct block_device_info){.blocks = g_storage.ext_start_lba + g_storage.ext_sector_count,
+        .block_size = 512, .max_blocks = 256};
+    return 0;
+}
 static struct task *writer;
 static unsigned cache_forgets;
 static uint32_t cache_forgot_inode;
@@ -29,6 +35,9 @@ uint64_t mm_alloc_pages(uint32_t pages)
 static uint64_t test_start_lba = 1;
 static uint64_t test_read_commands, test_write_commands, test_read_bytes, test_write_bytes;
 static unsigned test_fail_write_at, test_partial_write;
+/* Zero counts native callbacks. A nonzero filesystem block size instead
+ * locates the failure inside a batched request without changing I/O stats. */
+static unsigned test_fail_write_block_size;
 int storage_read_sectors(uint64_t lba, uint32_t count, void *out)
 {
     ++test_read_commands;
@@ -48,11 +57,20 @@ int storage_write_sectors(uint64_t lba, uint32_t count, const void *in)
     /* The real storage_block.c write invalidates the shared sector cache. */
     storage_read_cache.valid = 0;
     assert(lba >= test_start_lba && !fseek(disk, (lba - test_start_lba) * 512, SEEK_SET));
-    if (test_fail_write_at && !--test_fail_write_at) {
-        if (test_partial_write) {
-            assert(fwrite(in, 1, 512, disk) == 512 && !fflush(disk));
+    if (test_fail_write_at) {
+        size_t bytes=(size_t)count*512;
+        size_t unit=test_fail_write_block_size ? test_fail_write_block_size : bytes;
+        assert(unit && bytes%unit==0);
+        size_t units=bytes/unit;
+        if (test_fail_write_at<=units) {
+            /* Earlier logical blocks can land inside the same failed native
+             * request. The target block may also write its first sector. */
+            size_t prefix=(test_fail_write_at-1)*unit+(test_partial_write ? 512 : 0);
+            assert(prefix<=bytes);test_fail_write_at=0;
+            if(prefix)assert(fwrite(in,1,prefix,disk)==prefix && !fflush(disk));
+            return -5;
         }
-        return -5;
+        test_fail_write_at-=(unsigned)units;
     }
     return fwrite(in, 512, count, disk) == count && !fflush(disk) ? 0 : -5;
 }

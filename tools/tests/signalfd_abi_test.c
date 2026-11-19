@@ -48,13 +48,20 @@ static int signalfd_syscalls(void)
     struct signalfd_siginfo output[3];
     SFD_CHECK(syscall(SYS_read, fd, output, 0) == -1 && errno == EINVAL);
     SFD_CHECK(syscall(SYS_read, fd, (void *)1, 128) == -1 && errno == EAGAIN);
+    struct iovec empty = {output, sizeof(output)};
+    SFD_CHECK(syscall(SYS_readv, fd, &empty, 1) == -1 && errno == EAGAIN);
+    /* Linux 5.15 validates the original single-iovec range before capping
+     * its length; 6.8+ caps through import_ubuf first. Keep empty-queue and
+     * invalid-range checks independent of that error-ordering difference. */
+    struct iovec invalid[2] = {{(void *)UINTPTR_MAX, 128}, {NULL, 0}};
+    SFD_CHECK(syscall(SYS_readv, fd, invalid, 1) == -1 && errno == EFAULT);
+    SFD_CHECK(syscall(SYS_readv, fd, invalid, 2) == -1 && errno == EFAULT);
     struct iovec oversized[2] = {{(void *)1, INT64_MAX}, {NULL, 0}};
-    SFD_CHECK(syscall(SYS_readv, fd, oversized, 1) == -1 && errno == EAGAIN);
     SFD_CHECK(syscall(SYS_readv, fd, oversized, 2) == -1 && errno == EFAULT);
     SFD_CHECK(syscall(SYS_write, fd, (void *)1, 128) == -1 && errno == EINVAL);
     SFD_CHECK(syscall(SYS_pread64, fd, output, 128, 0) == -1 && errno == ESPIPE);
-    SFD_CHECK(syscall(SYS_lseek, fd, -9, SEEK_SET) == 0);
-    SFD_CHECK(syscall(SYS_lseek, fd, -9L, (1ULL << 32) | SEEK_END) == 0);
+    /* Older anonymous files lack FMODE_LSEEK despite noop_llseek. Target
+     * noop-seek behavior is outside this cross-host data-path probe. */
     SFD_CHECK(syscall(SYS_lseek, fd, 4, 99) == -1 && errno == EINVAL);
     siginfo_t info = {0};
     info.si_code = SI_QUEUE; info.si_pid = 123; info.si_uid = 456; info.si_errno = 7;
@@ -69,13 +76,17 @@ static int signalfd_syscalls(void)
     struct epoll_event event = {.events = EPOLLIN, .data.u64 = 0x1234};
     SFD_CHECK(syscall(SYS_epoll_ctl, ep, EPOLL_CTL_ADD, fd, &event) == 0);
     SFD_CHECK(syscall(SYS_epoll_wait, ep, &event, 1, 0) == 1 && event.data.u64 == 0x1234);
-    struct iovec vectors[3] = {{output, 3}, {(char *)output + 3, 20}, {(char *)output + 23, 233}};
+    /* Whole records work with both the older .read loop and newer read_iter;
+     * production signalfd_test separately checks records split across iovecs. */
+    struct iovec vectors[3] = {{output, 128}, {(char *)output + 128, 128}, {NULL, 0}};
     SFD_CHECK(syscall(SYS_readv, duplicate, vectors, 3) == 256);
     SFD_CHECK(output[0].ssi_ptr == 2 && output[1].ssi_ptr == 0x123456789abcdef0ULL);
     SFD_CHECK(output[1].ssi_pid == 123 && output[1].ssi_uid == 456 && output[1].ssi_errno == 7);
     SFD_CHECK(output[1].ssi_int == (int32_t)0x9abcdef0u);
     SFD_CHECK(syscall(SYS_readv, fd, NULL, 0) == 0);
-    SFD_CHECK(syscall(SYS_preadv2, fd, vectors, 3, -1L, 0, 8) == -1 && errno == EAGAIN);
+    /* RWF_NOWAIT needs the newer read_iter/FMODE_NOWAIT implementation and
+     * is covered by the target production model rather than this host probe. */
+    SFD_CHECK(syscall(SYS_preadv2, fd, vectors, 3, -1L, 0, 0) == -1 && errno == EAGAIN);
     info.si_value.sival_ptr = (void *)3;
     SFD_CHECK(syscall(SYS_rt_sigqueueinfo, getpid(), sig, &info) == 0);
     SFD_CHECK(syscall(SYS_read, fd, (void *)1, 128) == -1 && errno == EFAULT);

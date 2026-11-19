@@ -92,6 +92,7 @@ void sched_signal_wait_current(uint64_t deadline)
     struct task *task = sched_current_task();
     if (task && task->pid && task->state != TASK_EXITED) {
         task->wake_tick = deadline;
+        sched_deadline_include(&scheduler_next_wake_tick, deadline);
         __atomic_store_n(&task->state, TASK_BLOCKED, __ATOMIC_SEQ_CST);
         uint64_t pending = __atomic_load_n(&task->pending_signals, __ATOMIC_SEQ_CST) |
             __atomic_load_n(sched_task_process_pending(task), __ATOMIC_SEQ_CST);

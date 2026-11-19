@@ -33,6 +33,10 @@ uint64_t mm_total_memory_kib(void) { return 8192 * 4; }
 uint64_t mm_free_memory_kib(void)
 { return (free_pages + (jitter_free && (free_reads++ & 1u) ? 1u : 0u)) * 4; }
 uint64_t mm_emergency_reserve_pages(void) { return 64; }
+/** @brief Reject allocation retirement in this explicitly empty name-cache fixture.
+ * @param memory Unexpected cache allocation; this orchestration model creates none.
+ */
+void kernel_free(void *memory) { (void)memory; assert(!"unexpected name-cache allocation"); }
 bool kernel_execution_is_outermost(void) { return writer; }
 struct task *sched_current_task(void) { return &current; }
 uint32_t sched_current_pid(void) { return current.pid; }

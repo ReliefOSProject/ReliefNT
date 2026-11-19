@@ -23,6 +23,16 @@ static unsigned page_alloc_attempts;
 static unsigned page_budget = UINT32_MAX;
 static struct { uint64_t physical; unsigned references; } page_registry[2048];
 
+/** @brief Report the sparse-ELF fixture's unused physical page registry capacity.
+ * @return Free KiB, independent of the temporary page-allocation budget.
+ */
+uint64_t mm_free_memory_kib(void)
+{
+    uint64_t capacity = sizeof(page_registry) / sizeof(page_registry[0]);
+    assert(live_pages <= capacity);
+    return (capacity - live_pages) * 4u;
+}
+
 uint64_t mm_alloc_page(void)
 {
     ++page_alloc_attempts;
@@ -110,6 +120,7 @@ void console_log(enum console_log_level level, const char *format, ...)
 
 int main(void)
 {
+    assert(mm_free_memory_kib() == sizeof(page_registry) / sizeof(page_registry[0]) * 4u);
     struct {
         struct elf64_ehdr eh;
         struct elf64_phdr ph;
@@ -129,6 +140,7 @@ int main(void)
     task.kind = TASK_KIND_USER;
     task.stack_top = RELIEFNT_USER_TOP - 4096;
     assert(address_space_create(sched_task_as(&task)));
+    assert(mm_free_memory_kib() == (sizeof(page_registry) / sizeof(page_registry[0]) - live_pages) * 4u);
 
     image.eh.e_phoff = sizeof(image.eh);
     image.eh.e_phentsize = sizeof(image.ph);
@@ -201,5 +213,6 @@ int main(void)
     vfs_exec_source_put(task.address_space.vmas[0].exec_source);
     assert(!exec_fixture_pins && !exec_fixture_inode_refs && !exec_fixture_denials);
     assert(!live_pages);
+    assert(mm_free_memory_kib() == sizeof(page_registry) / sizeof(page_registry[0]) * 4u);
     puts("PASS sparse 1 TiB ELF BSS: no eager page tables; high map, COW fork/fault and destruction");
 }

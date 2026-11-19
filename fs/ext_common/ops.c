@@ -128,26 +128,36 @@ int storage_ext4_read_file_range(struct storage_volume *v, uint64_t ino,
         return 0;
     }
     const uint32_t bs = v->ext4.block_size;
+    /* Storage execution ownership excludes mapping mutations for this call.
+     * Keep only the validated map's values: data cache fills can evict every
+     * metadata cache pointer, but cannot change this logical/physical run. */
+    struct storage_ext4_map_result map = {0};
+    uint64_t map_logical = 0;
     while (done < len) {
         uint64_t pos = offset + done;
         uint32_t inside = pos % bs;
-        struct storage_ext4_map_result map;
-        ret = storage_ext4_map_block(v, ino, in, pos / bs, false, &map);
-        if (ret < 0) break;
-        uint64_t available = (uint64_t)map.length * bs - inside;
+        uint64_t logical = pos / bs;
+        if (!map.length || logical - map_logical >= map.length) {
+            ret = storage_ext4_map_block(v, ino, in, logical, false, &map);
+            if (ret < 0) break;
+            map_logical = logical;
+        }
+        uint32_t consumed = (uint32_t)(logical - map_logical);
+        uint64_t physical = map.physical + consumed;
+        uint64_t available = (uint64_t)(map.length - consumed) * bs - inside;
         uint32_t take = available < len - done ? (uint32_t)available : len - done;
         if (map.hole || map.unwritten) {
             storage_memzero((uint8_t *)buffer + done, take);
         } else if (inside || take < bs) {
             uint8_t *data;
             if (take > bs - inside) take = bs - inside;
-            ret = storage_ext4_cache_get(v, map.physical, &data, false);
+            ret = storage_ext4_cache_get(v, physical, &data, false);
             if (ret < 0) break;
             storage_memcpy((uint8_t *)buffer + done, data + inside, take);
         } else {
             uint32_t blocks = take / bs;
             if (blocks > EXT4_READAHEAD_BLOCKS) blocks = EXT4_READAHEAD_BLOCKS;
-            ret = storage_ext4_cache_read_blocks(v, map.physical, blocks, (uint8_t *)buffer + done);
+            ret = storage_ext4_cache_read_blocks(v, physical, blocks, (uint8_t *)buffer + done);
             if (ret < 0) break;
             take = blocks * bs;
         }
@@ -168,26 +178,34 @@ static void ext4_ops_touch(struct ext4_inode_view *in)
     struct reliefos_time_info now;
     if (!time_wall_clock(&now)) in->mtime=in->ctime=(uint32_t)now.unix_seconds;
 }
-/* Submit file data one block at a time through kernel memory.  The transport
- * programs the controller's PRDT with the buffer address verbatim, so the
- * caller's pointer must be a physical address: kernel_malloc() returns one
- * because the kernel is identity mapped, but `data` may be a user mapping
- * (the write(2) buffer reaches here unmodified).  Handing a user virtual
- * address to the controller silently writes the data to whatever physical
- * frame shares those low bits, which is how a copied file ends up allocated
- * but full of zeros.  Only the sub-block tail was safe before, because that
- * path already staged its bytes in a kernel scratch buffer.
- * Per-block staging keeps the buffer bounded by one block independent of `n`. */
+/** @brief Stage contiguous file blocks in bounded native-device submissions.
+ * @param v Borrowed mounted volume, held under storage execution ownership.
+ * @param physical First validated physical filesystem block of the extent.
+ * @param n Number of contiguous full filesystem blocks to write.
+ * @param data Readable caller bytes covering n blocks, stable during this call.
+ * @return Zero or allocation/device errno; a failed command is never marked
+ * clean in the cache and no later command is submitted. Earlier commands may
+ * already be committed. Journal ordering remains the caller's responsibility.
+ * Native transports own DMA backing; this workspace is a CPU buffer and never
+ * becomes a physical DMA address. Fall back to single-block staging if the
+ * larger optional allocation fails, preserving low-memory write capability.
+ */
 static int ext4_ops_data_write(struct storage_volume *v,uint64_t physical,uint32_t n,const uint8_t *data)
 {
+    if (!n) return 0;
     uint32_t bs=v->ext4.block_size;
-    uint8_t *bounce=kernel_malloc(bs);
+    uint32_t batch=n<EXT4_READAHEAD_BLOCKS ? n : EXT4_READAHEAD_BLOCKS;
+    uint8_t *bounce=kernel_malloc((size_t)batch*bs);
+    if (!bounce && batch>1) { batch=1; bounce=kernel_malloc(bs); }
     if (!bounce) return -RELIEFOS_ENOMEM;
     int ret=0;
-    for (uint32_t i=0;i<n && !ret;i++) {
-        storage_memcpy(bounce,data+(size_t)i*bs,bs);
-        ret=storage_write_device(v,v->ext_start_lba+(physical+i)*(bs/512),bs/512,bounce);
-        if (!ret) storage_ext4_cache_finish(v,physical+i,bounce);
+    for (uint32_t i=0;i<n && !ret;) {
+        uint32_t run=n-i<batch ? n-i : batch;
+        storage_memcpy(bounce,data+(size_t)i*bs,(size_t)run*bs);
+        ret=storage_write_device(v,v->ext_start_lba+(physical+i)*(bs/512),run*(bs/512),bounce);
+        if (!ret) for (uint32_t j=0;j<run;j++)
+            storage_ext4_cache_finish(v,physical+i+j,bounce+(size_t)j*bs);
+        i+=run;
     }
     kernel_free(bounce);
     return ret;
@@ -200,7 +218,13 @@ int storage_ext4_write_file_range(struct storage_volume *v,uint64_t ino,uint64_t
     uint32_t bs=v->ext4.block_size,done=0; int ret=0;
     if (!bs || offset>(uint64_t)(EXT4_MAX_LOGICAL_BLOCK+1ULL)*bs ||
         len>(uint64_t)(EXT4_MAX_LOGICAL_BLOCK+1ULL)*bs-offset) return -RELIEFOS_EFBIG;
-    uint8_t *scratch=kernel_malloc(bs); if (!scratch) return -RELIEFOS_ENOMEM;
+    uint8_t *scratch=NULL;
+    /* Aligned writes only consume whole blocks, even when a mapping or
+     * allocation shortens the run. Reserve partial-block storage before the
+     * first transaction so its ENOMEM cannot leave any file changes behind. */
+    if (offset%bs || len%bs) {
+        scratch=kernel_malloc(bs); if (!scratch) return -RELIEFOS_ENOMEM;
+    }
     while (done<len) {
         struct storage_ext4_handle h; struct ext4_inode_view in; struct storage_ext4_map_result map;
         ret=storage_ext4_journal_start(v,EXT4_JOURNAL_CREDITS,&h); if (ret<0) break;

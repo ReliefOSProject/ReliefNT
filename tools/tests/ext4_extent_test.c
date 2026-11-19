@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../../block/core/storage_internal.h"
+#include "storage_codec_context_fixture.h"
 
 static uint8_t *disk;
 static uint64_t disk_len, reads, writes;
@@ -15,6 +16,15 @@ static int fail_read;
 static int transient_read_error;
 static uint64_t transient_read_sector;
 static struct storage_volume volume;
+/* This codec fixture owns one synchronous RAM image and bypasses the native
+ * registry. Report its real byte geometry and the 128 KiB transport contract. */
+int block_device_info(const struct block_device_ref *ref, struct block_device_info *out)
+{
+    assert(ref && out);
+    *out = (struct block_device_info){.blocks = disk_len / 512,
+        .block_size = 512, .max_blocks = 256};
+    return 0;
+}
 #ifndef EXT4_JOURNAL_TRANSPORT_FIXTURE
 int storage_ext4_device_flush(const struct storage_volume *v) { (void)v; return 0; }
 #endif

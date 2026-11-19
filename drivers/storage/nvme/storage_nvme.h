@@ -35,6 +35,8 @@ struct nvme_controller {
     uint16_t next_command_id;
     uint32_t doorbell_stride;
     uint32_t namespace_count;
+    /* Minimum of owned DMA capacity and Identify Controller MDTS. */
+    uint32_t max_sectors;
     uint64_t cap;
     volatile uint8_t *mmio;
     uint64_t admin_sq_phys;
@@ -96,7 +98,8 @@ void nvme_interrupt_stop(struct nvme_controller *controller);
 /** @brief Transfer a bounded namespace extent using owned full-width PRPs.
  * @param controller Stable initialized controller. @param nsid Namespace ID.
  * @param lba First 512-byte sector. @param sector_count Nonzero sectors within
- * NVME_MAX_SECTORS. @param buffer Current readable/writable extent.
+ * controller->max_sectors (at most NVME_MAX_SECTORS).
+ * @param buffer Current readable/writable extent.
  * @param write Nonzero for write. @return Zero, retryable -EAGAIN, or native errno. Caller pins
  * code/context and transport exclusion; controller owns queue lock and DMA,
  * failed STOP retains backing and code rather than using retired CPU memory.

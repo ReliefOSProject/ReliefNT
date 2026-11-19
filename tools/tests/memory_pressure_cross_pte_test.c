@@ -2,6 +2,7 @@
  * Host RAM, CPU ownership, clean-cache scan and disk transport are modeled. */
 #include "../../kernel/sched/internal.h"
 #define SWAP_PAGING_FIXTURE_ENTRY old_swap_paging_main
+#define PRIVATE_ANON_CUSTOM_FREE_MEMORY 1
 #define current_task fixture_current_task
 #include "swap_paging_test.c"
 #undef current_task
