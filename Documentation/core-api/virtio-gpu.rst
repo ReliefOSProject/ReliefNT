@@ -29,6 +29,10 @@ DIRTYFB、legacy modeset/page flip、DPMS、primary plane 及 64×64 硬件光�
 翻页事件在 host fence 完成后发送，时间戳使用 CLOCK_MONOTONIC；这不是物理
 vblank 同步保证，不报告硬件 vblank 或 async page flip 能力。
 
+普通 2D framebuffer 的 DIRTYFB 先校验整批区域。只有 2 至 4 个互不重叠的
+矩形，且每多提交一块能节省至少 256 KiB 的像素传输时，才逐块上传；其他
+情况提交一个包围矩形。VirGL 仍使用原有的合并刷新路径。
+
 同设备 PRIME 导入导出使用 canonical DMA-BUF OFD，支持 mmap 和
 DMA_BUF_IOCTL_SYNC。EXECBUFFER 支持输入和输出 sync_file fence；
 poll、SYNC_IOC_FILE_INFO、SYNC_IOC_MERGE 和 deadline hint 使用 Linux UAPI。
@@ -47,6 +51,10 @@ used ring 和发布完成状态，资源回收在任务上下文执行。描述�
 请求超时先 reset，设备状态确认归零后才能释放 DMA；reset 失败保留页面与
 模块引用。退出 Xorg 时将 scanout 重新绑定独立的文本控制台资源。
 
+处于可见文本 VT 时，控制台只复制和上传已绘制的矩形（包括光标），传输
+偏移按该矩形在 2D backing 中的首像素计算。失败的刷新保留区域供设备仍
+可用时重试；从图形 VT 恢复文本扫描输出时重新上传整屏。
+
 panic 通道在初始化时预留命令 DMA 和队列描述符，只供停止其他 CPU 后的
 fatal owner 使用，不获取普通 GPU 锁或执行分配。GUI panic 只上传已绘制文字
 所在矩形，保留其他桌面像素；TTY 使用保留的控制台资源。设备不响应时放弃
@@ -59,6 +67,8 @@ fatal owner 使用，不获取普通 GPU 锁或执行分配。GUI panic 只上�
 131080 次环回绕、背压、非法 used entry 及 fatal 预留链。原生用户态探针
 ``tools/tests/virtgpu_guest.c`` 可用 musl 编译，执行实际 DRM、PRIME、
 sync_file、sysfs、翻页和光标操作；用 ``--no-pause`` 跳过截图握手。
+``tools/test_drm.py`` 覆盖局部文本上传的偏移、失败重试、VT 整屏恢复，
+以及 2D DIRTYFB 的区域拆分、合并和校验。
 完整系统、Mesa/EGL、Xorg、BIOS/UEFI 及模块重载的 QEMU 编排由 ReliefOS 持有。
 离屏 draw 速率不能替代桌面帧率或实体显卡性能。VMware 验证未完成。
 

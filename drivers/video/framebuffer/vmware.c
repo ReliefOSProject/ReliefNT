@@ -263,6 +263,7 @@ int framebuffer_vmware_set_mode(uint32_t width, uint32_t height)
     if (mapped && svga.fifo_ready && (!accelerated || !status)) {
         fb = candidate;
         framebuffer_set_default_format();
+        framebuffer_svga_clear_damage();
         svga_unlock(flags);
         return 1;
     }

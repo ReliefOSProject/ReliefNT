@@ -131,29 +131,14 @@ void console_present(void)
     }
     console_presenting = true;
     fb_console_show_tty_cursor();
-    if (fb_cols && fb_rows && !fb_console_render_target) {
-        framebuffer_present_region(fb_x, fb_y,
-                                   fb_cols * RELIEFOS_FONT_W,
-                                   fb_rows * RELIEFOS_FONT_H);
-    }
+    fb_console_publish_damage();
     console_presenting = false;
 }
 
-/**
- * @brief Refresh the active graphical VT's framebuffer scanout.
- *
- * The VMware legacy FIFO does not observe direct mmap writes from Xorg, so a
- * periodic full-screen UPDATE is required while a graphical VT is active.
- * This path is independent of the text-console renderer: Xorg owns the
- * framebuffer while the active VT is graphical, even if text rendering has
- * been disabled for that hand-off.
- */
+/** @brief Retry scanout damage, including while a text VT is active. */
 void console_display_tick(void)
 {
-    if (!console_vt_graphical || !framebuffer_get()->available) {
-        return;
-    }
-    framebuffer_display_tick();
+    framebuffer_display_tick(console_vt_graphical);
 }
 
 void console_init(void)

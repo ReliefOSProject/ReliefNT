@@ -11,7 +11,7 @@ void framebuffer_panic_prepare(void)
 {
     graphics_service_panic_prepare();
     __atomic_store_n(&framebuffer_drm_scanout_owned, false, __ATOMIC_RELEASE);
-    framebuffer_drm_damage_pending = false;
+    framebuffer_svga_clear_damage();
     if (fb.backend == FRAMEBUFFER_BACKEND_VMWARE_SVGA && vmware_svga.present) {
         vmware_svga_write(VMWARE_SVGA_REG_TRACES, 1u);
     }

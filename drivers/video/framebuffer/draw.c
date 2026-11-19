@@ -3,16 +3,6 @@
 
 static void framebuffer_write_native(uint32_t x, uint32_t y, uint32_t color);
 
-/**
- * @brief Store one native-format pixel in an explicit framebuffer target.
- * @param target Framebuffer whose pixel storage receives the pixel.
- * @param x Pixel column.
- * @param y Pixel row.
- * @param color Native-format pixel value.
- */
-static void framebuffer_write_native_to(const struct framebuffer *target,
-                                        uint32_t x, uint32_t y, uint32_t color);
-
 static uint32_t framebuffer_read_native(uint32_t x, uint32_t y);
 
 static void framebuffer_char(uint32_t x, uint32_t y, char ch, uint32_t fg, uint32_t bg);
@@ -26,21 +16,27 @@ uint8_t *framebuffer_pixel_ptr(uint32_t x, uint32_t y)
            (uint64_t)x * fb.bytes_per_pixel;
 }
 
-/** @brief Store exactly one already converted pixel in the active scanout.
- * @param x Valid column. @param y Valid row. @param color Native pixel value.
+/** @brief Store one already converted pixel using its exact device width.
+ * @param pixel Valid mapped pixel. @param bytes Pixel size from one to four.
+ * @param color Native pixel value.
  * Caller retains display exclusion. An aligned 32-bit format uses one device
  * store; other formats preserve exact byte writes without padding accesses.
  */
-static void framebuffer_write_native(uint32_t x, uint32_t y, uint32_t color)
+static inline void framebuffer_store_native(uint8_t *pixel, uint8_t bytes, uint32_t color)
 {
-    uint8_t *pixel = framebuffer_pixel_ptr(x, y);
-    if (fb.bytes_per_pixel == 4u && !((uintptr_t)pixel & 3u)) {
+    if (bytes == 4u && !((uintptr_t)pixel & 3u)) {
         *(volatile uint32_t *)pixel = color;
         return;
     }
-    for (uint8_t byte = 0; byte < fb.bytes_per_pixel; ++byte) {
+    for (uint8_t byte = 0; byte < bytes; ++byte) {
         pixel[byte] = (uint8_t)(color >> (byte * 8u));
     }
+}
+
+/** @brief Store one native pixel in the active framebuffer. */
+static void framebuffer_write_native(uint32_t x, uint32_t y, uint32_t color)
+{
+    framebuffer_store_native(framebuffer_pixel_ptr(x, y), fb.bytes_per_pixel, color);
 }
 
 /**
@@ -55,12 +51,36 @@ static void framebuffer_write_native_to(const struct framebuffer *target,
 {
     uint8_t *pixel = (uint8_t *)target->pixels + (uint64_t)y * target->pitch +
                      (uint64_t)x * target->bytes_per_pixel;
-    if (target->bytes_per_pixel == 4u && !((uintptr_t)pixel & 3u)) {
-        *(volatile uint32_t *)pixel = color;
+    framebuffer_store_native(pixel, target->bytes_per_pixel, color);
+}
+
+/** @brief Convert both colors once and paint only visible glyph rows. */
+void framebuffer_draw_glyph_to(const struct framebuffer *target, uint32_t x, uint32_t y,
+                               const uint8_t *bits, unsigned columns,
+                               uint32_t fg, uint32_t bg)
+{
+    if (!target || !target->available || !target->pixels ||
+        !target->bytes_per_pixel || target->bytes_per_pixel > 4u ||
+        x >= target->width || y >= target->height ||
+        target->pitch < (uint64_t)target->width * target->bytes_per_pixel)
         return;
-    }
-    for (uint8_t byte = 0; byte < target->bytes_per_pixel; ++byte) {
-        pixel[byte] = (uint8_t)(color >> (byte * 8u));
+
+    uint32_t width = columns * RELIEFOS_FONT_W;
+    uint32_t height = RELIEFOS_FONT_H;
+    if (width > target->width - x) width = target->width - x;
+    if (height > target->height - y) height = target->height - y;
+    fg = framebuffer_native_color_for(target, fg);
+    bg = framebuffer_native_color_for(target, bg);
+
+    uint8_t bytes = target->bytes_per_pixel;
+    for (uint32_t row = 0; row < height; ++row) {
+        uint8_t *pixel = (uint8_t *)target->pixels + (uint64_t)(y + row) * target->pitch +
+                         (uint64_t)x * bytes;
+        const uint8_t *glyph_row = bits + row * columns;
+        for (uint32_t col = 0; col < width; ++col, pixel += bytes) {
+            uint32_t color = glyph_row[col / 8u] & (0x80u >> (col % 8u)) ? fg : bg;
+            framebuffer_store_native(pixel, bytes, color);
+        }
     }
 }
 

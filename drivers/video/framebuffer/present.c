@@ -1,18 +1,10 @@
 #include <reliefnt/export.h>
+#include <reliefnt/lock.h>
 #include "internal.h"
 
-/** @brief Present a region, optionally dropping timer work under backpressure. */
-static void framebuffer_present_region_internal(uint32_t x, uint32_t y,
-                                                uint32_t width, uint32_t height,
-                                                bool timer_refresh);
-
-static int framebuffer_drm_publish_locked(uint32_t x1, uint32_t y1,
-                                          uint32_t x2, uint32_t y2);
-
-static uint32_t framebuffer_drm_pending_x1;
-static uint32_t framebuffer_drm_pending_y1;
-static uint32_t framebuffer_drm_pending_x2;
-static uint32_t framebuffer_drm_pending_y2;
+static struct framebuffer_damage svga_damage;
+static struct framebuffer_damage framebuffer_damage;
+static struct kernel_spinlock framebuffer_damage_lock = KERNEL_SPINLOCK_INIT;
 static uint64_t framebuffer_damage_generation;
 
 /** @brief Read the permanent CPU framebuffer's explicit publication generation.
@@ -20,72 +12,71 @@ static uint64_t framebuffer_damage_generation;
  */
 uint64_t framebuffer_generation(void)
 { return __atomic_load_n(&framebuffer_damage_generation,__ATOMIC_ACQUIRE); }
+
+/** @brief Transfer accumulated pixel bounds to the normal scanout consumer. */
+bool framebuffer_take_damage(uint64_t *generation, struct framebuffer_damage *damage)
+{
+    if (*generation == framebuffer_generation()) return false;
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&framebuffer_damage_lock, &flags);
+    bool pending = framebuffer_damage.x1 < framebuffer_damage.x2;
+    if (pending) {
+        *damage = framebuffer_damage;
+        *generation = __atomic_load_n(&framebuffer_damage_generation, __ATOMIC_RELAXED);
+        framebuffer_damage = (struct framebuffer_damage){0};
+    }
+    kernel_spin_unlock_irqrestore(&framebuffer_damage_lock, flags);
+    return pending;
+}
+
+/** @brief Record a clipped CPU update without holding a hardware lock. */
+static void framebuffer_record_damage(struct framebuffer_damage damage)
+{
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&framebuffer_damage_lock, &flags);
+    framebuffer_damage_union(&framebuffer_damage, damage);
+    uint64_t generation = __atomic_load_n(&framebuffer_damage_generation, __ATOMIC_RELAXED);
+    __atomic_store_n(&framebuffer_damage_generation, generation + 1, __ATOMIC_RELEASE);
+    kernel_spin_unlock_irqrestore(&framebuffer_damage_lock, flags);
+}
+
 bool framebuffer_drm_owned(void)
 {
     return __atomic_load_n(&framebuffer_drm_scanout_owned, __ATOMIC_ACQUIRE);
 }
 
-/** @brief Present a region, optionally dropping timer work under backpressure. */
-static void framebuffer_present_region_internal(uint32_t x, uint32_t y,
-                                                uint32_t width, uint32_t height,
-                                                bool timer_refresh)
+/** @brief Publish a fenced pixel region or retain it in the boot scanout.
+ * The SVGA lock protects the rectangle; the pending flag lets idle ticks
+ * avoid that lock. Callers have already ordered their own aperture writes.
+ */
+static void framebuffer_svga_present_locked(struct framebuffer_damage damage)
 {
-    uint64_t flags;
-    if (timer_refresh) {
-        if (!svga_try_lock_irqsave(&flags)) return;
-    } else {
-        flags = svga_lock();
-    }
-    if (fb.backend != FRAMEBUFFER_BACKEND_VMWARE_SVGA || !fb.available) {
-        svga_unlock(flags);
-        return;
-    }
-    /* A pixel aperture may be WC while FIFO/register storage stays UC. */
-    vmware_svga_memory_fence();
-    if (timer_refresh && svga.traces_enabled) {
-        svga_unlock(flags);
-        return;
-    }
-    if (framebuffer_drm_owned()) {
-        if (timer_refresh && framebuffer_drm_damage_pending) {
-            uint32_t x1 = framebuffer_drm_pending_x1;
-            uint32_t y1 = framebuffer_drm_pending_y1;
-            uint32_t x2 = framebuffer_drm_pending_x2;
-            uint32_t y2 = framebuffer_drm_pending_y2;
-            int published = svga_update_try_locked(x1, y1, x2 - x1, y2 - y1) == 0;
-            if (published) framebuffer_drm_damage_pending = false;
-        }
-        svga_unlock(flags);
-        return;
-    }
-    if (width == UINT32_MAX && height == UINT32_MAX) {
-        width = fb.width;
-        height = fb.height;
-    }
-    if (x >= fb.width || y >= fb.height) {
-        svga_unlock(flags);
-        return;
-    }
-    if (width > fb.width - x) width = fb.width - x;
-    if (height > fb.height - y) height = fb.height - y;
-    if (!width || !height) {
-        svga_unlock(flags);
-        return;
-    }
-    /* Boot console, fbdev and DRM use one producer and one ring. A display
-     * tick never waits for space; explicit drawing retains bounded backpressure.
-     * A corrupt ring is not reset here because it may still own GPU resources. */
-    if (timer_refresh)
-        (void)svga_update_try_locked(x, y, width, height);
-    else
-        (void)svga_update_locked(x, y, width, height);
-    svga_unlock(flags);
+    if (__atomic_load_n(&framebuffer_svga_damage_pending, __ATOMIC_RELAXED))
+        framebuffer_damage_union(&damage, svga_damage);
+    int rc = svga_update_try_locked(damage.x1, damage.y1,
+        damage.x2 - damage.x1, damage.y2 - damage.y1);
+    if (rc) svga_damage = damage;
+    __atomic_store_n(&framebuffer_svga_damage_pending, rc != 0, __ATOMIC_RELAXED);
 }
 
 void framebuffer_present_region(uint32_t x, uint32_t y, uint32_t width, uint32_t height)
 {
-    __atomic_add_fetch(&framebuffer_damage_generation,1,__ATOMIC_RELEASE);
-    framebuffer_present_region_internal(x, y, width, height, false);
+    bool svga_backend = fb.backend == FRAMEBUFFER_BACKEND_VMWARE_SVGA;
+    uint64_t flags = svga_backend ? svga_lock() : 0;
+    if (fb.available && width && height && x < fb.width && y < fb.height) {
+        if (width > fb.width - x) width = fb.width - x;
+        if (height > fb.height - y) height = fb.height - y;
+        struct framebuffer_damage damage = {x, y, x + width, y + height};
+        if (svga_backend) {
+            if (!framebuffer_drm_owned()) {
+                vmware_svga_memory_fence();
+                framebuffer_svga_present_locked(damage);
+            }
+        } else {
+            framebuffer_record_damage(damage);
+        }
+    }
+    if (svga_backend) svga_unlock(flags);
 }
 
 void framebuffer_present(void)
@@ -93,9 +84,24 @@ void framebuffer_present(void)
     framebuffer_present_region(0, 0, UINT32_MAX, UINT32_MAX);
 }
 
-void framebuffer_display_tick(void)
+void framebuffer_display_tick(bool graphical)
 {
-    framebuffer_present_region_internal(0, 0, UINT32_MAX, UINT32_MAX, true);
+    if (fb.backend != FRAMEBUFFER_BACKEND_VMWARE_SVGA ||
+        (!graphical && !__atomic_load_n(&framebuffer_svga_damage_pending, __ATOMIC_RELAXED)))
+        return;
+    uint64_t flags;
+    if (!svga_try_lock_irqsave(&flags)) return;
+    if (fb.available) {
+        if (graphical && !framebuffer_drm_owned() && !svga.traces_enabled) {
+            /* mmap writers cannot declare their damage on legacy hardware. */
+            vmware_svga_memory_fence();
+            if (!svga_update_try_locked(0, 0, fb.width, fb.height))
+                framebuffer_svga_clear_damage();
+        } else if (__atomic_load_n(&framebuffer_svga_damage_pending, __ATOMIC_RELAXED)) {
+            framebuffer_svga_present_locked(svga_damage);
+        }
+    }
+    svga_unlock(flags);
 }
 
 /**
@@ -115,7 +121,7 @@ int framebuffer_drm_scanout_begin(void)
         return 0;
     }
     __atomic_store_n(&framebuffer_drm_scanout_owned, true, __ATOMIC_RELEASE);
-    framebuffer_drm_damage_pending = false;
+    framebuffer_svga_clear_damage();
     if (svga.bound && svga.traces_enabled) {
         svga.ops.write(SVGA_REG_TRACES, 0);
         svga.traces_enabled = false;
@@ -132,19 +138,10 @@ void framebuffer_drm_scanout_release(void)
 {
     uint64_t flags = svga_lock();
     __atomic_store_n(&framebuffer_drm_scanout_owned, false, __ATOMIC_RELEASE);
-    framebuffer_drm_damage_pending = false;
-    framebuffer_drm_pending_x1 = framebuffer_drm_pending_y1 = 0;
-    framebuffer_drm_pending_x2 = framebuffer_drm_pending_y2 = 0;
+    framebuffer_svga_clear_damage();
     if (svga.fifo_ready && svga.bound)
         (void)svga_restore_traces_locked();
     svga_unlock(flags);
-}
-
-static int framebuffer_drm_publish_locked(uint32_t x1, uint32_t y1,
-                                          uint32_t x2, uint32_t y2)
-{
-    if (x1 >= x2 || y1 >= y2) return 1;
-    return svga_update_try_locked(x1, y1, x2 - x1, y2 - y1) == 0;
 }
 
 /**
@@ -187,22 +184,7 @@ int framebuffer_drm_present_region(const void *pixels, uint32_t pitch,
         svga_unlock(flags);
         return -1;
     }
-    uint32_t send_x1 = x1, send_y1 = y1, send_x2 = x2, send_y2 = y2;
-    if (framebuffer_drm_damage_pending) {
-        if (framebuffer_drm_pending_x1 < send_x1) send_x1 = framebuffer_drm_pending_x1;
-        if (framebuffer_drm_pending_y1 < send_y1) send_y1 = framebuffer_drm_pending_y1;
-        if (framebuffer_drm_pending_x2 > send_x2) send_x2 = framebuffer_drm_pending_x2;
-        if (framebuffer_drm_pending_y2 > send_y2) send_y2 = framebuffer_drm_pending_y2;
-    }
-    if (framebuffer_drm_publish_locked(send_x1, send_y1, send_x2, send_y2)) {
-        framebuffer_drm_damage_pending = false;
-    } else {
-        framebuffer_drm_damage_pending = true;
-        framebuffer_drm_pending_x1 = send_x1;
-        framebuffer_drm_pending_y1 = send_y1;
-        framebuffer_drm_pending_x2 = send_x2;
-        framebuffer_drm_pending_y2 = send_y2;
-    }
+    framebuffer_svga_present_locked((struct framebuffer_damage){x1, y1, x2, y2});
     svga_unlock(flags);
     /* FIFO-full damage has already been copied into GFB and is kernel-owned
      * until a nonblocking display tick publishes its coalesced rectangle. */
@@ -213,3 +195,4 @@ EXPORT_SYMBOL(framebuffer_drm_present_region);
 EXPORT_SYMBOL(framebuffer_drm_scanout_begin);
 EXPORT_SYMBOL(framebuffer_drm_scanout_release);
 EXPORT_SYMBOL(framebuffer_generation);
+EXPORT_SYMBOL(framebuffer_take_damage);

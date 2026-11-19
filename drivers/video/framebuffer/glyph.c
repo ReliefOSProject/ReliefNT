@@ -59,11 +59,11 @@ void framebuffer_codepoint_to(const struct framebuffer *target,
                               uint32_t x, uint32_t y, uint32_t cp,
                               uint32_t fg, uint32_t bg)
 {
+    if (cp < 128U) {
+        framebuffer_draw_glyph_to(target, x, y, reliefos_psf_glyph((char)cp), 1u, fg, bg);
+        return;
+    }
     unsigned index = framebuffer_glyph_index(cp);
-    unsigned width = framebuffer_codepoint_width(cp);
-    const uint8_t *bits = cp < 128U ? reliefos_psf_glyph((char)cp) : cjk_glyphs[index].bits;
-    for (unsigned row = 0; row < 16U; row++)
-        for (unsigned col = 0; col < width * 8U; col++)
-            framebuffer_rect_to(target, x + col, y + row, 1, 1,
-                bits[row * width + col / 8] & (0x80U >> (col % 8)) ? fg : bg);
+    framebuffer_draw_glyph_to(target, x, y, cjk_glyphs[index].bits,
+                              cjk_glyphs[index].width, fg, bg);
 }

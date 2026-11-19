@@ -194,6 +194,33 @@ void framebuffer_present(void);
  * @return Monotonic damage generation; task/IRQ safe, no provider pointers.
  */
 uint64_t framebuffer_generation(void);
+/** @brief CPU framebuffer damage bounds, with exclusive right and bottom. */
+struct framebuffer_damage {
+    uint32_t x1, y1, x2, y2;
+};
+/** @brief Expand pixel bounds to cover another nonempty rectangle.
+ * @param bounds Current bounds; equal left and right mark an empty region.
+ * @param rect Nonempty rectangle to merge.
+ */
+static inline void framebuffer_damage_union(struct framebuffer_damage *bounds,
+                                            struct framebuffer_damage rect)
+{
+    if (bounds->x1 == bounds->x2) {
+        *bounds = rect;
+        return;
+    }
+    if (rect.x1 < bounds->x1) bounds->x1 = rect.x1;
+    if (rect.y1 < bounds->y1) bounds->y1 = rect.y1;
+    if (rect.x2 > bounds->x2) bounds->x2 = rect.x2;
+    if (rect.y2 > bounds->y2) bounds->y2 = rect.y2;
+}
+/** @brief Move accumulated CPU damage to the sole normal scanout consumer.
+ * @param generation Consumer's last observed generation, updated on success.
+ * @param damage Output bounds, valid only on true. The consumer owns retries.
+ * @return True when there is a rectangle to upload. Task context, no pixel
+ * copies or I/O. A concurrent publication stays queued for the next take.
+ */
+bool framebuffer_take_damage(uint64_t *generation, struct framebuffer_damage *damage);
 /**
  * @brief Reclaim fatal scanout without locks after other CPUs have stopped.
  * Restores legacy GFB tracing where supported; never resets the video mode.
@@ -206,12 +233,11 @@ void framebuffer_panic_present(void);
  */
 void framebuffer_present_region(uint32_t x, uint32_t y, uint32_t width, uint32_t height);
 /**
- * @brief Periodically publish the mmap-backed framebuffer to the display.
- *
- * This is needed by legacy VMware SVGA devices where guest writes do not
- * generate an UPDATE command themselves.
+ * @brief Retry queued SVGA damage, without waiting for the lock or the FIFO.
+ * @param graphical Allow the periodic full update for mmap-backed graphics
+ * on VMware SVGA hosts without VRAM write tracing or a DRM scanout owner.
  */
-void framebuffer_display_tick(void);
+void framebuffer_display_tick(bool graphical);
 /**
  * @brief Transfer a validated SVGA scanout from console tracing to DRM presentation.
  * @return Zero, including already-owned scanout, or legacy internal -1 for unsupported framebuffer state.

@@ -25,12 +25,6 @@ static void fb_console_codepoint(uint32_t x, uint32_t y, uint32_t cp,
                                  uint32_t fg, uint32_t bg);
 
 /**
- * @brief Clear one text row on the current rendering surface.
- * @param row Text row to clear.
- */
-static void fb_console_clear_log_line(uint32_t row);
-
-/**
  * @brief Render one Unicode scalar on the current text-rendering surface.
  * @param ch Unicode scalar to render or terminal control to process.
  */
@@ -38,8 +32,33 @@ static void fb_console_scalar(uint32_t ch);
 
 static uint32_t fb_console_tty_cursor_x;
 static uint32_t fb_console_tty_cursor_y;
+static const uint32_t *fb_console_tty_cursor_pixels;
+static uint32_t fb_console_tty_cursor_pitch;
 static uint8_t fb_console_tty_cursor_bpp;
 static uint8_t fb_console_tty_cursor_saved[FB_CONSOLE_CURSOR_BYTES];
+static struct framebuffer_damage fb_console_damage;
+
+/** @brief Merge visible text damage; replay and fatal rendering publish separately. */
+void fb_console_mark_damage(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    if (fb_console_render_target || fb_console_panic_overlay) return;
+    const struct framebuffer *fb = framebuffer_get();
+    if (!w || !h || x >= fb->width || y >= fb->height) return;
+    uint32_t right = x + (w > fb->width - x ? fb->width - x : w);
+    uint32_t bottom = y + (h > fb->height - y ? fb->height - y : h);
+    framebuffer_damage_union(&fb_console_damage,
+                             (struct framebuffer_damage){x, y, right, bottom});
+}
+
+/** @brief Publish the current drawing batch, including the software cursor. */
+void fb_console_publish_damage(void)
+{
+    if (!fb_console_damage.x2 || fb_console_render_target) return;
+    struct framebuffer_damage damage = fb_console_damage;
+    fb_console_damage = (struct framebuffer_damage){0};
+    framebuffer_present_region(damage.x1, damage.y1,
+                               damage.x2 - damage.x1, damage.y2 - damage.y1);
+}
 /**
  * @brief Return the framebuffer currently used by the text renderer.
  * @return The temporary replay surface, or the active framebuffer.
@@ -64,6 +83,7 @@ static void fb_console_rect(uint32_t x, uint32_t y, uint32_t width,
         framebuffer_rect_to(fb_console_render_target, x, y, width, height, color);
     } else {
         framebuffer_rect(x, y, width, height, color);
+        fb_console_mark_damage(x, y, width, height);
     }
 }
 
@@ -117,20 +137,6 @@ void fb_console_reset_ansi(void)
     fb_ansi_private = false;
 }
 
-/**
- * @brief Clear one text row on the current rendering surface.
- * @param row Text row to clear.
- */
-static void fb_console_clear_log_line(uint32_t row)
-{
-    const struct framebuffer *fb = fb_console_framebuffer();
-    if (!fb->available || !fb_cols || row >= fb_rows) {
-        return;
-    }
-    fb_console_rect(fb_x, fb_y + row * RELIEFOS_FONT_H,
-                    fb_cols * RELIEFOS_FONT_W, RELIEFOS_FONT_H, fb_console_bg_color);
-}
-
 /** @brief Clear the text grid on the current rendering surface. */
 void fb_console_clear_log(void)
 {
@@ -153,14 +159,15 @@ void fb_console_hide_tty_cursor(void)
         return;
     }
     fb_console_tty_cursor_visible = false;
-    if (!fb->available || !fb->pixels || !fb_console_tty_cursor_bpp ||
-        fb_console_tty_cursor_bpp > 4u ||
+    if (!fb->available || !fb->pixels || fb->pixels != fb_console_tty_cursor_pixels ||
+        fb->pitch != fb_console_tty_cursor_pitch ||
+        fb->bytes_per_pixel != fb_console_tty_cursor_bpp ||
         fb_console_tty_cursor_x + RELIEFOS_FONT_W > fb->width ||
-        fb_console_tty_cursor_y + RELIEFOS_FONT_H > fb->height) {
+        fb_console_tty_cursor_y + FB_CONSOLE_CURSOR_HEIGHT > fb->height) {
         return;
     }
     row_bytes = RELIEFOS_FONT_W * fb_console_tty_cursor_bpp;
-    for (row = 0; row < RELIEFOS_FONT_H; ++row) {
+    for (row = 0; row < FB_CONSOLE_CURSOR_HEIGHT; ++row) {
         uint8_t *dst = (uint8_t *)fb->pixels +
                        (uint64_t)(fb_console_tty_cursor_y + row) * fb->pitch +
                        (uint64_t)fb_console_tty_cursor_x * fb_console_tty_cursor_bpp;
@@ -169,6 +176,8 @@ void fb_console_hide_tty_cursor(void)
             dst[byte] = src[byte];
         }
     }
+    fb_console_mark_damage(fb_console_tty_cursor_x, fb_console_tty_cursor_y,
+                           RELIEFOS_FONT_W, FB_CONSOLE_CURSOR_HEIGHT);
 }
 
 /** @brief Save the underlying pixels and draw the text cursor. */
@@ -187,14 +196,18 @@ void fb_console_show_tty_cursor(void)
         return;
     }
     fb_console_tty_cursor_x = fb_x + fb_col * RELIEFOS_FONT_W;
-    fb_console_tty_cursor_y = fb_y + fb_row * RELIEFOS_FONT_H;
+    uint32_t cell_y = fb_y + fb_row * RELIEFOS_FONT_H;
     if (fb_console_tty_cursor_x + RELIEFOS_FONT_W > fb->width ||
-        fb_console_tty_cursor_y + RELIEFOS_FONT_H > fb->height) {
+        cell_y + RELIEFOS_FONT_H > fb->height ||
+        fb->pitch < (uint64_t)fb->width * fb->bytes_per_pixel) {
         return;
     }
+    fb_console_tty_cursor_y = cell_y + RELIEFOS_FONT_H - FB_CONSOLE_CURSOR_HEIGHT;
+    fb_console_tty_cursor_pixels = fb->pixels;
+    fb_console_tty_cursor_pitch = fb->pitch;
     fb_console_tty_cursor_bpp = fb->bytes_per_pixel;
     row_bytes = RELIEFOS_FONT_W * fb_console_tty_cursor_bpp;
-    for (row = 0; row < RELIEFOS_FONT_H; ++row) {
+    for (row = 0; row < FB_CONSOLE_CURSOR_HEIGHT; ++row) {
         const uint8_t *src = (const uint8_t *)fb->pixels +
                              (uint64_t)(fb_console_tty_cursor_y + row) * fb->pitch +
                              (uint64_t)fb_console_tty_cursor_x * fb_console_tty_cursor_bpp;
@@ -203,14 +216,14 @@ void fb_console_show_tty_cursor(void)
             dst[byte] = src[byte];
         }
     }
-    fb_console_rect(fb_console_tty_cursor_x,
-                    fb_console_tty_cursor_y + RELIEFOS_FONT_H - 2u,
-                    RELIEFOS_FONT_W, 2u, fb_console_fg_color);
+    fb_console_rect(fb_console_tty_cursor_x, fb_console_tty_cursor_y,
+                    RELIEFOS_FONT_W, FB_CONSOLE_CURSOR_HEIGHT, fb_console_fg_color);
     fb_console_tty_cursor_visible = true;
 }
 
 /**
- * @brief Scroll only the active text region with overlap-safe exact row copies.
+ * @brief Scroll an entire ANSI request with one copy of the retained rows.
+ * @param lines Number of text rows to move up.
  * @par Context
  * Caller serializes console state and retains the current rendering surface.
  * Rows move upward, preserving padding and pixels outside the clipped region.
@@ -219,45 +232,39 @@ void fb_console_show_tty_cursor(void)
  * emulated uncached read/write for each byte on hardware-assisted VMs.
  * Forward reads precede their matching stores; upward row order preserves overlap.
  */
-void fb_console_scroll(void)
+void fb_console_scroll(uint32_t lines)
 {
     const struct framebuffer *fb = fb_console_framebuffer();
+    if (!lines || !fb_rows || !fb_cols || !fb->available || !fb->pixels ||
+        !fb->bytes_per_pixel || fb->bytes_per_pixel > 4u || fb_x >= fb->width ||
+        fb_y >= fb->height || fb->pitch < (uint64_t)fb->width * fb->bytes_per_pixel)
+        return;
     uint32_t top = fb_scroll_top < fb_rows ? fb_scroll_top : 0u;
     uint32_t bottom = fb_scroll_bottom < fb_rows ? fb_scroll_bottom : fb_rows - 1u;
     if (bottom <= top) {
         top = 0u;
         bottom = fb_rows - 1u;
     }
-    if (!fb->available || bottom <= top || fb_x >= fb->width || fb_y >= fb->height) {
-        fb_console_clear_log();
-        fb_row = top;
-        return;
-    }
-
     uint32_t width = fb_cols * RELIEFOS_FONT_W;
     if (width > fb->width - fb_x) {
         width = fb->width - fb_x;
     }
 
-    uint32_t src_y = fb_y + (top + 1u) * RELIEFOS_FONT_H;
-    if (src_y >= fb->height) {
-        fb_console_clear_log();
-        fb_row = 0;
-        return;
-    }
+    uint32_t rows = bottom - top + 1u;
+    if (lines > rows) lines = rows;
+    uint32_t dst_y = fb_y + top * RELIEFOS_FONT_H;
+    uint32_t src_y = dst_y + lines * RELIEFOS_FONT_H;
+    uint32_t copy_h = (rows - lines) * RELIEFOS_FONT_H;
+    if (src_y >= fb->height) copy_h = 0;
+    else if (copy_h > fb->height - src_y) copy_h = fb->height - src_y;
 
-    uint32_t copy_h = (bottom - top) * RELIEFOS_FONT_H;
-    if (copy_h > fb->height - src_y) {
-        copy_h = fb->height - src_y;
-    }
-
+    size_t bytes = (size_t)width * fb->bytes_per_pixel;
     for (uint32_t y = 0; y < copy_h; ++y) {
-        uint8_t *dst = (uint8_t *)fb->pixels + (uint64_t)(fb_y + top * RELIEFOS_FONT_H + y) * fb->pitch +
+        uint8_t *dst = (uint8_t *)fb->pixels + (uint64_t)(dst_y + y) * fb->pitch +
                        (uint64_t)fb_x * fb->bytes_per_pixel;
         const uint8_t *src = (const uint8_t *)fb->pixels +
                              (uint64_t)(src_y + y) * fb->pitch +
                              (uint64_t)fb_x * fb->bytes_per_pixel;
-        size_t bytes = (size_t)width * fb->bytes_per_pixel;
         size_t words = bytes / sizeof(uint64_t), tail = bytes % sizeof(uint64_t);
         /* x86 permits unaligned scalar words; neither operation crosses the
          * exact clipped extent, including 24-bit/padded framebuffer layouts. */
@@ -268,7 +275,9 @@ void fb_console_scroll(void)
     }
 
     fb_row = bottom;
-    fb_console_clear_log_line(fb_row);
+    fb_console_rect(fb_x, dst_y + copy_h, width, lines * RELIEFOS_FONT_H,
+                    fb_console_bg_color);
+    fb_console_mark_damage(fb_x, dst_y, width, rows * RELIEFOS_FONT_H);
 }
 
 /** @brief Advance the text cursor; graphical panic overlays clip instead of scrolling. */
@@ -283,7 +292,7 @@ void fb_console_newline(void)
          * Keep the visible prefix; the full report still reaches serial/VT. */
         fb_console_panic_clipped = true;
     } else {
-        fb_console_scroll();
+        fb_console_scroll(1u);
     }
 }
 
@@ -345,17 +354,24 @@ static void fb_console_scalar(uint32_t ch)
         uint32_t bg = fb_console_reverse ? fb_console_fg_color : fb_console_bg_color;
         uint32_t x = fb_x + fb_col * RELIEFOS_FONT_W;
         uint32_t y = fb_y + fb_row * RELIEFOS_FONT_H;
-        fb_console_rect(x, y, RELIEFOS_FONT_W, RELIEFOS_FONT_H, bg);
+        uint32_t width = cells * RELIEFOS_FONT_W;
         fb_console_codepoint(x, y, ch, fg, bg);
-        if (fb_console_bold && x + 1u < fb->width) {
+        if (fb_console_bold && x < fb->width && fb->width - x > 1u) {
             fb_console_codepoint(x + 1u, y, ch, fg, bg);
+            ++width;
         }
         if (fb_console_underline) {
             fb_console_rect(x, y + RELIEFOS_FONT_H - 2u, RELIEFOS_FONT_W, 1u,
                             fb_console_underline_color_set ? fb_console_underline_color : fg);
         }
-        if(fb_console_panic_overlay)
-            graphics_service_panic_damage(x,y,cells*RELIEFOS_FONT_W,RELIEFOS_FONT_H);
+        if (fb_console_panic_overlay) {
+            if (x < fb->width) {
+                if (width > fb->width - x) width = fb->width - x;
+                graphics_service_panic_damage(x, y, width, RELIEFOS_FONT_H);
+            }
+        }
+        else
+            fb_console_mark_damage(x, y, width, RELIEFOS_FONT_H);
     }
     fb_col += cells;
 }
@@ -421,12 +437,6 @@ void fb_console_initialize_fullscreen(void)
     fb_scroll_bottom = fb_rows ? fb_rows - 1u : 0u;
     fb_console_reset_attributes();
     fb_console_reset_ansi();
-    /* The repaint covers the whole screen, so it must be published as a
-     * whole: the scanout only refreshes regions an update command names, and
-     * the grid (`fb_rows * RELIEFOS_FONT_H`) cannot reach the remainder strip
-     * below the last font row. Publishing only the grid left that strip
-     * showing the previous graphical picture after a switch to text. */
-    if (!fb_console_render_target) {
-        framebuffer_present();
-    }
+    /* The full clear marks even the strip below the last font row. Keep it
+     * in the same publication as the replayed text and boot logo. */
 }

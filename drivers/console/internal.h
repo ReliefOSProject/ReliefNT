@@ -18,7 +18,8 @@
 #define CONSOLE_MAX_COLS 512u
 #define CONSOLE_MAX_ROWS 192u
 #define FB_ANSI_MAX_PARAMS 16u
-#define FB_CONSOLE_CURSOR_BYTES (RELIEFOS_FONT_W * RELIEFOS_FONT_H * 4u)
+#define FB_CONSOLE_CURSOR_HEIGHT 2u
+#define FB_CONSOLE_CURSOR_BYTES (RELIEFOS_FONT_W * FB_CONSOLE_CURSOR_HEIGHT * 4u)
 #define CONSOLE_VT_COUNT 6u
 #define CONSOLE_VT_TEXT_CAP 65536u
 
@@ -261,7 +262,9 @@ void fb_console_show_tty_cursor(void);
  * overlap-safe scalar-word copies with a byte tail require no allocation,
  * SIMD state or mapping changes, even for unaligned 24-bit row layouts.
  */
-void fb_console_scroll(void);
+void fb_console_scroll(uint32_t lines);
+void fb_console_mark_damage(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+void fb_console_publish_damage(void);
 
 /** @brief Advance the text cursor; graphical panic overlays clip instead of scrolling. */
 void fb_console_newline(void);

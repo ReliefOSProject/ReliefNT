@@ -1258,7 +1258,7 @@ static void test_display_tick_defers_lock_and_fifo_backpressure(void)
     prepare_graphical_framebuffer();
     assert(svga.traces_enabled && regs[SVGA_REG_TRACES] == 1);
     uint32_t before_next = fifo[SVGA_FIFO_NEXT_CMD];
-    framebuffer_display_tick();
+    framebuffer_display_tick(true);
     assert(fifo[SVGA_FIFO_NEXT_CMD] == before_next);
 
     setup(SVGA_CAP_3D | SVGA_CAP_EXTENDED_FIFO | SVGA_CAP_GMR,
@@ -1269,7 +1269,7 @@ static void test_display_tick_defers_lock_and_fifo_backpressure(void)
     fifo[SVGA_FIFO_STOP] = svga.min + 8;
     uint32_t before_busy = busy_reads;
     before_next = fifo[SVGA_FIFO_NEXT_CMD];
-    framebuffer_display_tick();
+    framebuffer_display_tick(true);
     assert(busy_reads - before_busy <= 1);
     assert(fifo[SVGA_FIFO_NEXT_CMD] == before_next);
 
@@ -1277,10 +1277,10 @@ static void test_display_tick_defers_lock_and_fifo_backpressure(void)
     fifo[SVGA_FIFO_NEXT_CMD] = fifo[SVGA_FIFO_STOP] = svga.min;
     before_next = fifo[SVGA_FIFO_NEXT_CMD];
     uint64_t held = svga_lock();
-    framebuffer_display_tick();
+    framebuffer_display_tick(true);
     svga_unlock(held);
     assert(fifo[SVGA_FIFO_NEXT_CMD] == before_next);
-    framebuffer_display_tick();
+    framebuffer_display_tick(true);
     assert(fifo[SVGA_FIFO_NEXT_CMD] != before_next);
 
     setup(SVGA_CAP_EXTENDED_FIFO, 0, 0);
@@ -1289,10 +1289,10 @@ static void test_display_tick_defers_lock_and_fifo_backpressure(void)
     fifo[SVGA_FIFO_STOP] = svga.min + 4;
     stalled = true;
     before_busy = busy_reads;
-    framebuffer_display_tick();
+    framebuffer_display_tick(true);
     assert(busy_reads - before_busy <= 1);
     fifo[SVGA_FIFO_STOP] = fifo[SVGA_FIFO_NEXT_CMD];
-    framebuffer_display_tick();
+    framebuffer_display_tick(true);
     assert(fifo[SVGA_FIFO_NEXT_CMD] != svga.min);
     stalled = false;
     consume();

@@ -15,7 +15,7 @@ struct vmware_svga_state vmware_svga;
 
 bool framebuffer_drm_scanout_owned;
 
-bool framebuffer_drm_damage_pending;
+bool framebuffer_svga_damage_pending;
 
 int framebuffer_range_valid(uint64_t start, uint64_t bytes)
 {
