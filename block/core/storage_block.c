@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include <reliefnt/export.h>
+#include <reliefnt/storage_context.h>
 #include "storage_internal.h"
 #include <linux/errno.h>
 
@@ -8,9 +9,12 @@
  * @param lba First native logical block. @param count Nonzero native blocks.
  * @param buffer Stable current kernel buffer of count*block_size bytes.
  * @param write Whether buffer is readable write input instead of read output.
- * @return Zero or negative transport errno, preserving -EAGAIN for resumable
- * reads. Execution ownership required; transport lock spans commands but never
- * a registry lock. The complete extent is validated before its first callback.
+ * @return Zero or negative transport errno. Single-command reads preserve
+ * resumable -EAGAIN; split reads temporarily use synchronous context because
+ * this API cannot retain a completed prefix across caller replay. All exits
+ * restore the caller's exact retry/commit flags and retain its I/O owner.
+ * Execution ownership required; transport lock spans commands but never a
+ * registry lock. The complete extent is validated before its first callback.
  */
 static int storage_transfer_blocks(const struct storage_volume *volume,uint64_t lba,
                                       uint32_t count,void *buffer,bool write)
@@ -18,6 +22,13 @@ static int storage_transfer_blocks(const struct storage_volume *volume,uint64_t 
     struct block_device_info info;
     int rc=block_device_info(&volume->device_ref,&info);if(rc)return rc;
     if(!count || lba>=info.blocks || count>info.blocks-lba)return -EINVAL;
+    /* A replay starts at lba again. If a later native command yields, the
+     * first command on retry would discard that pending command's identity.
+     * Complete this bounded extent without unwinding instead; single-command
+     * reads still use the provider's owned asynchronous continuation. */
+    bool synchronous=!write && count>info.max_blocks;
+    struct storage_io_context saved;
+    if(synchronous)storage_kernel_context_enter(&saved);
     kernel_spin_lock(&storage_transport_lock);
     while(count) {
         uint32_t chunk=count<info.max_blocks ? count : info.max_blocks;
@@ -26,14 +37,17 @@ static int storage_transfer_blocks(const struct storage_volume *volume,uint64_t 
         if(rc)break;
         count-=chunk;lba+=chunk;buffer=(uint8_t *)buffer+(size_t)chunk*info.block_size;
     }
-    kernel_spin_unlock(&storage_transport_lock);return rc;
+    kernel_spin_unlock(&storage_transport_lock);
+    if(synchronous)storage_kernel_context_leave(&saved);
+    return rc;
 }
 
 /** @brief Read 512-byte physical sectors from an owned disk or reserved RAM image.
  * @param volume Stable volume retaining device ownership, required.
  * @param lba First sector. @param sector_count Nonzero complete sectors.
  * @param buffer Current writable kernel extent sector_count*512 bytes.
- * @return Zero or negative bounds/transport errno including -EAGAIN unchanged.
+ * @return Zero or negative bounds/transport errno. -EAGAIN is preserved for
+ * a single native request; larger extents complete in scoped synchronous context.
  * Execution ownership required; DMA always belongs to the native provider.
  */
 int storage_read_device(const struct storage_volume *volume,uint64_t lba,uint32_t sector_count,void *buffer)
@@ -96,7 +110,8 @@ int storage_write_install_disk(const struct install_disk_state *disk,uint64_t lb
  * @param lba First physical 512-byte sector.
  * @param sector_count Nonzero complete sector count.
  * @param buffer Writable kernel extent of sector_count times 512 bytes, stable throughout I/O.
- * @return Zero or negative bounds/transport errno, preserving resumable -EAGAIN.
+ * @return Zero or negative bounds/transport errno. Single-native-request reads
+ * preserve resumable -EAGAIN; larger extents use scoped synchronous context.
  * @par Context
  * Caller holds storage execution ownership; shared volume/cache state must remain selected and live throughout the call. Uses the registered device and transport exclusion; no raw RAM backing or ownership transfer.
  */
@@ -251,7 +266,8 @@ static int storage_probe_fat32_signature(uint64_t lba)
 /** @brief Read validated optical logical blocks through an owned block provider.
  * @param lba First 2048-byte optical block. @param block_count Nonzero blocks.
  * @param buffer Current writable extent block_count*2048 bytes.
- * @return Zero or native bounds/transport errno, preserving resumable -EAGAIN.
+ * @return Zero or native bounds/transport errno. Single-native-request reads
+ * preserve resumable -EAGAIN; larger extents use scoped synchronous context.
  * Caller owns selected volume/execution context; the held block reference
  * supports ISO modules loaded after the independent optical device was probed.
  */

@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include "storage_codec_context_fixture.h"
 /* This transport-only fixture has no scheduled caller or elapsed clock. */
 struct task *sched_current_task(void)
 {
