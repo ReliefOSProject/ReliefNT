@@ -286,7 +286,7 @@ static void fb_console_execute_csi(char final)
         }
         break;
     case 'S':
-        for (uint32_t i = 0; i < movement; ++i) fb_console_scroll();
+        fb_console_scroll(movement);
         break;
     case 'X':
     case '@':

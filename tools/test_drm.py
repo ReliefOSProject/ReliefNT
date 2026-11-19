@@ -20,6 +20,8 @@ FIXTURES = [
     ("tools/tests/drm_runtime_sysfs_test.c", "drm-runtime-sysfs"),
     ("tools/tests/framebuffer_drm_test.c", "framebuffer-drm"),
     ("tools/tests/console_replay_test.c", "console-replay"),
+    ("tools/tests/virtgpu_console_test.c", "virtgpu-console"),
+    ("tools/tests/virtgpu_dirty_test.c", "virtgpu-dirty"),
 ]
 
 

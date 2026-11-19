@@ -11,6 +11,7 @@ void kernel_free(void *ptr) { free(ptr); }
 static uint32_t pixels[80 * 48];
 static uint32_t full_clear_count;
 static uint32_t text_present_count;
+static uint32_t presented[4];
 static uint32_t last_codepoint;
 static char serial_output[16384];
 static size_t serial_length;
@@ -42,13 +43,16 @@ void framebuffer_rect_to(const struct framebuffer *target, uint32_t x, uint32_t 
 void framebuffer_clear(uint32_t c) { framebuffer_rect(0, 0, 80, 48, c); }
 void framebuffer_present(void) {}
 void framebuffer_present_region(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
-{ (void)x; (void)y; (void)w; (void)h; ++text_present_count; }
-uint32_t framebuffer_codepoint_width(uint32_t c) { (void)c; return 1; }
+{
+    memcpy(presented, (uint32_t[]){x, y, w, h}, sizeof(presented));
+    ++text_present_count;
+}
+uint32_t framebuffer_codepoint_width(uint32_t c) { return c == 0x4e2du ? 2u : 1u; }
 void framebuffer_codepoint(uint32_t x, uint32_t y, uint32_t c, uint32_t fg, uint32_t bg)
-{ last_codepoint = c; framebuffer_rect(x, y, 8, 16, c == ' ' ? bg : fg); }
+{ last_codepoint = c; framebuffer_rect(x, y, 8 * framebuffer_codepoint_width(c), 16, c == ' ' ? bg : fg); }
 void framebuffer_codepoint_to(const struct framebuffer *target, uint32_t x, uint32_t y,
                               uint32_t c, uint32_t fg, uint32_t bg)
-{ last_codepoint = c; framebuffer_rect_to(target, x, y, 8, 16, c == ' ' ? bg : fg); }
+{ last_codepoint = c; framebuffer_rect_to(target, x, y, 8 * framebuffer_codepoint_width(c), 16, c == ' ' ? bg : fg); }
 void serial_write(const char *text)
 {
     size_t length = strlen(text);
@@ -112,6 +116,50 @@ static void test_backspace_preserves_text(void)
     fb_console_hide_tty_cursor();
     assert(memcmp(saved, pixels, sizeof(saved)) == 0);
     puts("BS cursor motion preserves foreground/background text, first-column bounds and explicit erase");
+}
+
+static void expect_damage(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    assert(text_present_count == 1);
+    if (memcmp(presented, (uint32_t[]){x, y, w, h}, sizeof(presented)))
+        fprintf(stderr, "damage=(%u,%u %ux%u), expected (%u,%u %ux%u)\n",
+                presented[0], presented[1], presented[2], presented[3], x, y, w, h);
+    assert(!memcmp(presented, (uint32_t[]){x, y, w, h}, sizeof(presented)));
+    text_present_count = 0;
+}
+
+static void test_text_damage(void)
+{
+    static const char reset[] = "\033[?25l\033[0m\033[2J\033[H";
+    console_vt_write(2, reset, sizeof(reset) - 1);
+    text_present_count = 0;
+    console_vt_write(2, "\033[32m", 5);
+    assert(text_present_count == 0);
+    console_vt_write(2, "A", 1);
+    expect_damage(0, 0, 8, 16);
+    console_vt_write(2, "\033[?25h", 6);
+    expect_damage(8, 14, 8, 2);
+    console_vt_write(2, "\r", 1);
+    expect_damage(0, 14, 16, 2);
+    console_vt_write(2, "\033[?25l", 6);
+    expect_damage(0, 14, 8, 2);
+    console_vt_write(3, "off-screen", 10);
+    assert(text_present_count == 0);
+    console_vt_write(2, "\xe4\xb8\xad", 3);
+    expect_damage(0, 0, 16, 16);
+    console_vt_write(2, "\033[1mB", sizeof("\033[1mB") - 1);
+    expect_damage(16, 0, 9, 16);
+    console_vt_write(2, "\033[3;10HC", sizeof("\033[3;10HC") - 1);
+    expect_damage(72, 32, 8, 16);
+    uint32_t top[80 * 16];
+    memcpy(top, pixels, sizeof(top));
+    console_vt_write(2, "\033[2;3r\033[42m\033[9999S",
+                     sizeof("\033[2;3r\033[42m\033[9999S") - 1);
+    expect_damage(0, 16, 80, 32);
+    assert(!memcmp(top, pixels, sizeof(top)));
+    for (unsigned i = 80 * 16; i < 80 * 48; ++i)
+        assert(pixels[i] == 0x006fc77au);
+    console_vt_write(2, "\033[1;3r\033[0m", sizeof("\033[1;3r\033[0m") - 1);
 }
 
 int main(void)
@@ -212,6 +260,7 @@ int main(void)
     console_vt_write(2, "\033[?25h", sizeof("\033[?25h") - 1);
     assert(fb_console_tty_cursor_visible);
     test_backspace_preserves_text();
+    test_text_damage();
     static const char full_screen[] = "\033[?25l\033[44m\033[2J\033[H";
     console_vt_write(2, full_screen, sizeof(full_screen) - 1);
     for (unsigned i = 0; i < CONSOLE_VT_TEXT_CAP / 4u + 100u; ++i)

@@ -6,24 +6,34 @@ static struct {
     struct dma_buffer pixels;
     uint32_t resource,width,height;
     uint64_t generation;
-    bool active;
+    struct framebuffer_damage pending;
+    bool active, restore_pending;
 } console;
 
-/** @brief Convert boot pixels into a retained, ordinary 2D VirtIO backing.
- * Caller holds execution ownership; no device access occurs during the copy.
+/** @brief Convert only damaged boot pixels into the retained 2D backing.
+ * @param rect Valid damage bounds in destination resource coordinates.
+ * Caller holds execution ownership; no GPU command occurs during the copy.
  */
-static void copy_pixels(void)
+static void copy_pixels(struct virtio_gpu_rect rect)
 {
     const struct framebuffer *fb=framebuffer_get();
     uint32_t *pixels=console.pixels.cpu;
-    for(uint32_t y=0;y<console.height;++y) {
-        if(fb->bytes_per_pixel==4 && fb->red_field_position==16 &&
-           fb->green_field_position==8 && !fb->blue_field_position &&
-           fb->red_mask_size==8 && fb->green_mask_size==8 && fb->blue_mask_size==8)
-            __builtin_memcpy(pixels+(size_t)y*console.width,
-                (const uint8_t *)fb->pixels+(size_t)y*fb->pitch,console.width*4);
-        else for(uint32_t x=0;x<console.width;++x)
-            pixels[(size_t)y*console.width+x]=framebuffer_get_pixel_public(x,y);
+    bool native=fb->available && fb->pixels && fb->bytes_per_pixel==4 &&
+        fb->red_field_position==16 && fb->green_field_position==8 && !fb->blue_field_position &&
+        fb->red_mask_size==8 && fb->green_mask_size==8 && fb->blue_mask_size==8 &&
+        rect.x+rect.width<=fb->width && rect.y+rect.height<=fb->height;
+    for(uint32_t y=rect.y;y<rect.y+rect.height;++y) {
+        uint32_t *dst=pixels+(size_t)y*console.width+rect.x;
+        if(native) {
+            const uint8_t *src=(const uint8_t *)fb->pixels+(size_t)y*fb->pitch+rect.x*4u;
+            /* The boot pixels may live in uncached MMIO. Read native words. */
+            size_t count=rect.width;
+            __asm__ volatile("cld; rep movsl" : "+D"(dst), "+S"(src), "+c"(count)
+                             : : "memory", "cc");
+        } else {
+            for(uint32_t x=0;x<rect.width;++x)
+                dst[x]=framebuffer_get_pixel_public(rect.x+x,y);
+        }
     }
 }
 
@@ -81,18 +91,38 @@ bool vg_console_snapshot(void **pixels,uint32_t *resource,uint32_t *width,uint32
 int vg_console_update(bool restore)
 {
     if(!console.resource || vg.fault || !vg.transport.live)return 0;
-    if(vg_kms_active()){console.active=false;return 0;}
-    uint64_t generation=framebuffer_generation();
-    if(!restore && (!console.active || console.generation==generation))return 0;
-    copy_pixels();
-    struct virtio_gpu_rect rect={0,0,console.width,console.height};
+    if(vg_kms_active()) {
+        console.active=false;
+        console.restore_pending=false;
+        console.pending=(struct framebuffer_damage){0};
+        return 0;
+    }
+    console.restore_pending |= restore;
+    if(!console.active && !console.restore_pending)return 0;
+    struct framebuffer_damage damage;
+    if(framebuffer_take_damage(&console.generation,&damage)) {
+        if(damage.x2>console.width)damage.x2=console.width;
+        if(damage.y2>console.height)damage.y2=console.height;
+        if(damage.x1<damage.x2 && damage.y1<damage.y2)
+            framebuffer_damage_union(&console.pending,damage);
+    }
+    if(console.restore_pending)
+        console.pending=(struct framebuffer_damage){0,0,console.width,console.height};
+    if(console.pending.x1==console.pending.x2)return 0;
+    damage=console.pending;
+    struct virtio_gpu_rect rect={damage.x1,damage.y1,damage.x2-damage.x1,damage.y2-damage.y1};
+    copy_pixels(rect);
     struct virtio_gpu_transfer_to_host_2d upload={.hdr.type=VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D,
-        .r=rect,.resource_id=console.resource};
+        .r=rect,.resource_id=console.resource,.offset=((uint64_t)rect.y*console.width+rect.x)*4};
     int rc=vg_command(&upload,sizeof(upload),NULL,0,VIRTIO_GPU_RESP_OK_NODATA);
-    if(!rc && restore)rc=vg_scanout(0,console.resource,rect);
+    if(!rc && console.restore_pending)rc=vg_scanout(0,console.resource,rect);
     struct virtio_gpu_resource_flush flush={.hdr.type=VIRTIO_GPU_CMD_RESOURCE_FLUSH,
         .r=rect,.resource_id=console.resource};
     if(!rc)rc=vg_command(&flush,sizeof(flush),NULL,0,VIRTIO_GPU_RESP_OK_NODATA);
-    if(!rc){console.active=true;console.generation=generation;}
+    if(!rc) {
+        console.active=true;
+        console.restore_pending=false;
+        console.pending=(struct framebuffer_damage){0};
+    }
     return rc;
 }

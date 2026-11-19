@@ -2,6 +2,11 @@
 #include "kms.h"
 #include <reliefnt/heap.h>
 #include <reliefnt/usercopy.h>
+#include <reliefnt/framebuffer.h>
+
+#define VG_DIRTY_SPLIT_MAX 4u
+/* Each additional 2D upload and flush must avoid at least 256 KiB of pixels. */
+#define VG_DIRTY_SPLIT_SAVED_PIXELS (64u * 1024u)
 
 static uint32_t next_fb=0x10000;
 
@@ -61,6 +66,11 @@ void vg_kms_remove_fb(struct drm_file *file,uint32_t id)
     *link=fb->next;drm_bo_put(fb->bo);drm_async_free(fb);
 }
 
+static struct virtio_gpu_rect damage_rect(struct framebuffer_damage bounds)
+{
+    return (struct virtio_gpu_rect){bounds.x1,bounds.y1,bounds.x2-bounds.x1,bounds.y2-bounds.y1};
+}
+
 /** @brief Snapshot/validate all damage rectangles before the first GPU operation.
  * @param task Caller. @param file Owner. @param arg Copied damage descriptor.
  * @return Zero, errno or prerequisite retry; aliases and swapped input are snapshotted.
@@ -68,30 +78,60 @@ void vg_kms_remove_fb(struct drm_file *file,uint32_t id)
 static int dirty(struct task *task,struct drm_file *file,struct drm_mode_fb_dirty_cmd *arg)
 {
     struct vg_kms_fb *fb=vg_fb_find(file,arg->fb_id);if(!fb)return -ENOENT;
-    if(arg->flags || arg->num_clips>4096 || (!arg->clips_ptr && arg->num_clips))return -EINVAL;
-    uint32_t x1=fb->width,y1=fb->height,x2=0,y2=0;
-    struct drm_clip_rect *clips=NULL;
-    if(arg->num_clips) {
-        uint32_t bytes=arg->num_clips*sizeof(*clips);
-        clips=kernel_malloc(bytes);if(!clips)return -ENOMEM;
-        int rc;
+    unsigned count=arg->num_clips;
+    if(arg->flags || count>4096 || (!arg->clips_ptr && count))return -EINVAL;
+    if(!count)return vg_resource_flush(fb->bo,(struct virtio_gpu_rect){0,0,fb->width,fb->height});
+
+    struct drm_clip_rect local[VG_DIRTY_SPLIT_MAX],*clips=local;
+    uint32_t bytes=count*sizeof(*clips);
+    if(count>VG_DIRTY_SPLIT_MAX) {
+        clips=kernel_malloc(bytes);
+        if(!clips)return -ENOMEM;
+    }
+    int rc;
 #ifdef CONFIG_SWAP
-        rc=drm_user_import(task,clips,arg->clips_ptr,bytes);
+    rc=drm_user_import(task,clips,arg->clips_ptr,bytes);
 #else
-        rc=user_copy_from_task(task,clips,arg->clips_ptr,bytes)<0 ? -EFAULT : 0;
+    rc=user_copy_from_task(task,clips,arg->clips_ptr,bytes)<0 ? -EFAULT : 0;
 #endif
-        if(rc){kernel_free(clips);return rc;}
-        for(unsigned i=0;i<arg->num_clips;++i) {
-            struct drm_clip_rect r=clips[i];
-            if(r.x1>=r.x2 || r.y1>=r.y2 || r.x2>fb->width || r.y2>fb->height) {
-                kernel_free(clips);return -EINVAL;
-            }
-            if(r.x1<x1)x1=r.x1;if(r.y1<y1)y1=r.y1;
-            if(r.x2>x2)x2=r.x2;if(r.y2>y2)y2=r.y2;
+    struct framebuffer_damage bounds={0};
+    uint64_t pixels=0;
+    bool separate=count>1 && count<=VG_DIRTY_SPLIT_MAX;
+    if(!rc)for(unsigned i=0;i<count;++i) {
+        struct drm_clip_rect r=clips[i];
+        if(r.x1>=r.x2 || r.y1>=r.y2 || r.x2>fb->width || r.y2>fb->height) {
+            rc=-EINVAL;
+            break;
         }
-        kernel_free(clips);
-    } else {x1=y1=0;x2=fb->width;y2=fb->height;}
-    return vg_resource_flush(fb->bo,(struct virtio_gpu_rect){x1,y1,x2-x1,y2-y1});
+        framebuffer_damage_union(&bounds,(struct framebuffer_damage){r.x1,r.y1,r.x2,r.y2});
+        if(separate) {
+            pixels+=(uint64_t)(r.x2-r.x1)*(r.y2-r.y1);
+            for(unsigned j=0;j<i;++j) {
+                struct drm_clip_rect a=clips[j];
+                if(r.x1<a.x2 && a.x1<r.x2 && r.y1<a.y2 && a.y1<r.y2) {
+                    separate=false;
+                    break;
+                }
+            }
+        }
+    }
+    if(clips!=local)kernel_free(clips);
+    if(rc)return rc;
+
+    struct virtio_gpu_rect combined=damage_rect(bounds);
+    if(separate && (uint64_t)combined.width*combined.height >=
+       pixels+(uint64_t)(count-1)*VG_DIRTY_SPLIT_SAVED_PIXELS) {
+        const struct vg_resource *resource=drm_bo_virtio(fb->bo);
+        if(resource && !resource->virgl) {
+            for(unsigned i=0;i<count;++i) {
+                struct drm_clip_rect r=local[i];
+                rc=vg_resource_flush(fb->bo,damage_rect((struct framebuffer_damage){r.x1,r.y1,r.x2,r.y2}));
+                if(rc)return rc;
+            }
+            return 0;
+        }
+    }
+    return vg_resource_flush(fb->bo,combined);
 }
 
 /** @brief Dispatch Linux framebuffer operations supported by the VirtIO backend.

@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <reliefnt/lock.h>
 #include <reliefnt/port.h>
 #include <reliefnt/svga.h>
 
@@ -25,6 +26,11 @@ static uint8_t display_b[FB_GUARD_BYTES + FB_MAX_BYTES + FB_GUARD_BYTES];
 static uint32_t allocation_calls;
 static uint32_t allocation_failures;
 static bool fail_replay_allocations;
+
+void kernel_spin_lock_irqsave(struct kernel_spinlock *lock, uint64_t *flags)
+{ assert(!lock->state); lock->state = 1; *flags = 0; }
+void kernel_spin_unlock_irqrestore(struct kernel_spinlock *lock, uint64_t flags)
+{ assert(lock->state == 1 && !flags); lock->state = 0; }
 
 uint64_t svga_lock(void) { return 0; }
 bool svga_try_lock_irqsave(uint64_t *flags)

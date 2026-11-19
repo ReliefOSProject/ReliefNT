@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <reliefnt/lock.h>
 #include "modules/framebuffer.h"
 #include "modules/console.h"
 #include "../../drivers/video/svga/fifo.c"
@@ -19,6 +20,11 @@ static char serial_output[32768];
 static size_t serial_used;
 struct svga_device svga;
 #define CHECK(c) do {++checks; if (!(c)) {fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#c);exit(1);}} while(0)
+
+void kernel_spin_lock_irqsave(struct kernel_spinlock *lock, uint64_t *flags)
+{ CHECK(!panic_phase && !lock->state); ++locking; lock->state=1; *flags=0; }
+void kernel_spin_unlock_irqrestore(struct kernel_spinlock *lock, uint64_t flags)
+{ CHECK(!panic_phase && lock->state==1 && !flags); lock->state=0; }
 
 uint64_t svga_lock(void) { CHECK(!panic_phase); ++locking; return 0; }
 bool svga_try_lock_irqsave(uint64_t *flags) { if(flags)*flags=0; return false; }

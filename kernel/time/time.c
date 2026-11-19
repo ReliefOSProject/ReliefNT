@@ -709,10 +709,8 @@ void time_on_tick(void)
     sched_on_tick();
     kthread_tick();
     kernel_workqueue_tick();
-    /* Fallback scanout refresh cadence for hosts without framebuffer traces.
-     * This schedules 50 Hz updates at a 100 Hz PIT tick; it is not a hardware
-     * presentation-rate measurement. Trace-capable hosts skip the work in the
-     * framebuffer backend. */
+    /* Give SVGA deferred damage and the legacy mmap fallback a 50 Hz service
+     * cadence. This does not set the hardware presentation rate. */
     if ((ticks % (RELIEFNT_TICK_HZ / 50ULL)) == 0) {
         console_display_tick();
     }

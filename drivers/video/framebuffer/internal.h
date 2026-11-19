@@ -17,6 +17,15 @@
  */
 void framebuffer_copy_io32(void *destination, const void *source, size_t pixels);
 
+/** @brief Paint one opaque 8- or 16-pixel-wide, 16-row glyph.
+ * @param target Destination framebuffer. @param x Left pixel. @param y Top.
+ * @param bits Borrowed MSB-first bitmap, 16 rows of @p columns bytes each.
+ * @param columns Width in eight-pixel units. @param fg Logical foreground RGB.
+ * @param bg Logical background RGB. Clips to visible pixels and retains padding.
+ */
+void framebuffer_draw_glyph_to(const struct framebuffer *target, uint32_t x, uint32_t y,
+                               const uint8_t *bits, unsigned columns,
+                               uint32_t fg, uint32_t bg);
 
 
 
@@ -289,7 +298,12 @@ struct efi_graphics_output_protocol {
 extern struct framebuffer fb;
 extern struct vmware_svga_state vmware_svga;
 extern bool framebuffer_drm_scanout_owned;
-extern bool framebuffer_drm_damage_pending;
+extern bool framebuffer_svga_damage_pending;
+
+static inline void framebuffer_svga_clear_damage(void)
+{
+    __atomic_store_n(&framebuffer_svga_damage_pending, false, __ATOMIC_RELAXED);
+}
 
 /** @brief Return the font's one- or two-column width for a Unicode scalar. */
 uint32_t framebuffer_codepoint_width(uint32_t cp);
@@ -427,7 +441,6 @@ void framebuffer_present_region(uint32_t x, uint32_t y, uint32_t width, uint32_t
 
 void framebuffer_present(void);
 
-void framebuffer_display_tick(void);
 
 int framebuffer_drm_scanout_begin(void);
 

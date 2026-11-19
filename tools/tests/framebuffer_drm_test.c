@@ -28,8 +28,13 @@ struct svga_device svga;
 
 static uint32_t fifo_words[16];
 static uint32_t doorbells;
+static uint32_t busy_reads;
 
 uint64_t svga_lock(void) { return 0; }
+void kernel_spin_lock_irqsave(struct kernel_spinlock *lock, uint64_t *flags)
+{ assert(!lock->state); lock->state = 1; *flags = 0; }
+void kernel_spin_unlock_irqrestore(struct kernel_spinlock *lock, uint64_t flags)
+{ assert(lock->state == 1 && !flags); lock->state = 0; }
 bool svga_try_lock_irqsave(uint64_t *flags)
 {
     if (flags) *flags = 0;
@@ -38,7 +43,11 @@ bool svga_try_lock_irqsave(uint64_t *flags)
 void svga_unlock(uint64_t flags) { (void)flags; }
 void svga_barrier(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 void svga_relax(void) {}
-static uint32_t fifo_read(uint32_t reg) { (void)reg; return 0; }
+static uint32_t fifo_read(uint32_t reg)
+{
+    if (reg == SVGA_REG_BUSY) ++busy_reads;
+    return 0;
+}
 static void fifo_write(uint32_t reg, uint32_t value)
 {
     (void)value;
@@ -55,6 +64,24 @@ int svga_update_locked(uint32_t x, uint32_t y, uint32_t width, uint32_t height)
     uint32_t words[] = {x, y, width, height};
     struct svga_span span = {words, sizeof(words)};
     return svga_fifo_packet_locked(SVGA_CMD_UPDATE, false, &span, 1);
+}
+
+static void test_boot_scanout_takes_only_pending_cpu_damage(void)
+{
+    fb = (struct framebuffer){.width = 16, .height = 16, .available = true};
+    uint64_t seen = framebuffer_generation();
+    struct framebuffer_damage taken;
+    framebuffer_present_region(3, 5, 2, 1);
+    framebuffer_present_region(12, 2, UINT32_MAX, 1);
+    assert(framebuffer_take_damage(&seen, &taken));
+    assert(taken.x1 == 3 && taken.y1 == 2 && taken.x2 == 16 && taken.y2 == 6);
+    assert(!framebuffer_take_damage(&seen, &taken));
+    framebuffer_present_region(7, 1, 2, 0);
+    framebuffer_present_region(16, 1, 2, 2);
+    assert(!framebuffer_take_damage(&seen, &taken));
+    framebuffer_present_region(1, 9, 2, 1);
+    assert(framebuffer_take_damage(&seen, &taken));
+    assert(taken.x1 == 1 && taken.y1 == 9 && taken.x2 == 3 && taken.y2 == 10);
 }
 bool svga_restore_traces_locked(void) { return false; }
 void x86_64_outl(uint32_t value, uint16_t port)
@@ -95,7 +122,7 @@ static void setup_fifo_full(void)
     fifo_words[SVGA_FIFO_NEXT_CMD] = 40;
     fifo_words[SVGA_FIFO_STOP] = 60;
     framebuffer_drm_scanout_owned = false;
-    framebuffer_drm_damage_pending = false;
+    framebuffer_svga_clear_damage();
     doorbells = 0;
     byte_copies_to_scanout = 0;
 }
@@ -108,7 +135,7 @@ static void test_full_fifo_damage_is_retained_and_retried(void)
     for (uint32_t i = 0; i < 16u * 16u; ++i) source[i] = 0xff000000u | i;
     assert(framebuffer_drm_present_region(source, 16u * 4u, 0x34325258u,
                                           1, 2, 3, 4) == 0);
-    assert(framebuffer_drm_damage_pending);
+    assert(framebuffer_svga_damage_pending);
     assert(gfb[2u * 16u + 1u] == source[2u * 16u + 1u]);
     assert(gfb[3u * 16u + 3u] == 0);
     /* Generic RAM memcpy uses REP MOVSB in the native kernel. UC video
@@ -118,15 +145,13 @@ static void test_full_fifo_damage_is_retained_and_retried(void)
     source[10u * 16u + 8u] = 0xffabcdefu;
     assert(framebuffer_drm_present_region(source, 16u * 4u, 0x34325258u,
                                           8, 10, 9, 11) == 0);
-    assert(framebuffer_drm_damage_pending);
-    assert(framebuffer_drm_pending_x1 == 1 && framebuffer_drm_pending_y1 == 2 &&
-           framebuffer_drm_pending_x2 == 9 && framebuffer_drm_pending_y2 == 11);
+    assert(framebuffer_svga_damage_pending);
     assert(gfb[10u * 16u + 8u] == 0xffabcdefu);
 
     fifo_words[SVGA_FIFO_NEXT_CMD] = 40;
     fifo_words[SVGA_FIFO_STOP] = 40;
-    framebuffer_display_tick();
-    assert(!framebuffer_drm_damage_pending);
+    framebuffer_display_tick(false);
+    assert(!framebuffer_svga_damage_pending);
     assert(fifo_words[SVGA_FIFO_NEXT_CMD] == 60);
     assert(fifo_words[10] == SVGA_CMD_UPDATE);
     assert(fifo_words[11] == 1 && fifo_words[12] == 2 &&
@@ -134,13 +159,31 @@ static void test_full_fifo_damage_is_retained_and_retried(void)
     assert(doorbells > 0);
 
     framebuffer_drm_scanout_release();
-    assert(!framebuffer_drm_damage_pending && !framebuffer_drm_scanout_owned);
-    framebuffer_display_tick();
+    assert(!framebuffer_svga_damage_pending && !framebuffer_drm_scanout_owned);
+    framebuffer_display_tick(true);
     /* Wrap through the tail instead of skipping bytes the host will parse. */
     assert(fifo_words[SVGA_FIFO_NEXT_CMD] == 32);
     assert(fifo_words[15] == SVGA_CMD_UPDATE);
     assert(fifo_words[4] == 0 && fifo_words[5] == 0 &&
            fifo_words[6] == 16 && fifo_words[7] == 16);
+}
+
+static void test_explicit_present_has_nonblocking_backpressure(void)
+{
+    setup_fifo_full();
+    busy_reads = 0;
+    framebuffer_present_region(2, 3, 4, 5);
+    assert(busy_reads <= 1);
+    assert(fifo_words[SVGA_FIFO_NEXT_CMD] == 40);
+    framebuffer_present_region(3, 5, 7, 8);
+    assert(busy_reads <= 2);
+    fifo_words[SVGA_FIFO_STOP] = 40;
+    framebuffer_display_tick(false);
+    assert(fifo_words[SVGA_FIFO_NEXT_CMD] == 60);
+    assert(fifo_words[10] == SVGA_CMD_UPDATE && fifo_words[11] == 2 &&
+           fifo_words[12] == 3 && fifo_words[13] == 8 && fifo_words[14] == 10);
+    framebuffer_display_tick(false);
+    assert(fifo_words[SVGA_FIFO_NEXT_CMD] == 60);
 }
 
 static void test_panic_forces_deferred_notification(void)
@@ -184,8 +227,10 @@ static void test_exact_pixel_extents(void)
 
 int main(void)
 {
+    test_boot_scanout_takes_only_pending_cpu_damage();
     test_exact_pixel_extents();
     test_full_fifo_damage_is_retained_and_retried();
+    test_explicit_present_has_nonblocking_backpressure();
     test_panic_forces_deferred_notification();
     puts("framebuffer-drm: PASS");
     return 0;

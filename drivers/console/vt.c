@@ -299,8 +299,9 @@ void console_vt_activate(uint32_t number, bool graphical)
         }
         fb_console_render_target = NULL;
     }
+    const struct framebuffer *active = framebuffer_get();
+    fb_console_mark_damage(0, 0, active->width, active->height);
     console_present();
-    framebuffer_present();
 }
 
 /** @brief Leave a failed VGA transition uncommitted by the VT ownership layer. */
