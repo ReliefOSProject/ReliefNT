@@ -36,6 +36,7 @@ ext4_read tools/test_ext4_read.py
 ext4_vfs tools/test_ext4_vfs.py --filesystem ext4
 ext4_write tools/test_ext4_write.py
 fat_directory_growth tools/test_fat_directory_growth.py
+fat_async_read tools/test_fat_async_read.py
 fbdev tools/test_fbdev.py
 vbe_boot_surface tools/test_vbe_boot_surface.py
 vmware_boot_surface tools/test_vmware_boot_surface.py

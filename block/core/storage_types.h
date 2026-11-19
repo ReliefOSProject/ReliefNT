@@ -91,6 +91,7 @@ struct storage_volume {
     char tmpfs_source[RELIEFOS_FS_PATH_LEN];
     uint64_t mount_flags;
     struct fat_mount_options fat_options;
+    struct storage_read_cursor fat_read_cursor;
     uint64_t vfs_mounts;
     bool vfs_managed; /* Last graph attachment owns backend/cache teardown. */
     uint8_t volume_id;
