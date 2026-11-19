@@ -4,13 +4,12 @@
 #include "modules/scheduler.h"
 #include "sysv_shm_fixture_stubs.h"
 
-_Static_assert(sizeof(struct task) == 104176, "task size changed with EEVDF tree integration");
-_Static_assert(__builtin_offsetof(struct task, fair) == 0, "task fair offset changed");
+/* The private task layout grows independently of EEVDF. The scheduler tree
+ * requires a stable embedded entity and a node outside the copied task prefix;
+ * architecture return stubs access frames/CR3 through scheduler accessors. */
 _Static_assert(sizeof(((struct task *)0)->fair) == 64, "task fair size changed");
-_Static_assert(__builtin_offsetof(struct task, priority) == 5856, "task priority offset changed");
-_Static_assert(__builtin_offsetof(struct task, frame) == 101368, "task frame offset changed");
-_Static_assert(__builtin_offsetof(struct task, running_cpu) == 104160,
-               "task running_cpu offset changed");
+_Static_assert(__builtin_offsetof(struct sched_task_object, fair_node) == sizeof(struct task),
+               "EEVDF node must remain outside the copied task prefix");
 
 static uint32_t fake_cpu;
 static uint64_t fake_time;

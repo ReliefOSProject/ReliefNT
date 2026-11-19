@@ -29,6 +29,14 @@ static struct kernel_spinlock slab_lock = KERNEL_SPINLOCK_INIT;
 static struct heap_tree_node *slab_pages;
 static struct slab_page *partial[SLAB_CLASS_COUNT];
 
+#ifdef RELIEFNT_HEAP_PROBE
+/** @brief Observe bitmap search work in the host fixture, without reentering the heap. */
+extern void kernel_heap_test_probe(void);
+#define HEAP_PROBE() kernel_heap_test_probe()
+#else
+#define HEAP_PROBE() ((void)0)
+#endif
+
 /** @brief Find the smallest fitting size class. @param size Nonzero requested bytes.
  * @return Class index, or SLAB_CLASS_COUNT for an unsupported size.
  */
@@ -71,13 +79,17 @@ static void partial_remove(struct slab_page *page)
  */
 static void *reserve_slot(struct slab_page *page)
 {
-    for (unsigned i = 0; i < page->slot_count; ++i) {
-        uint64_t bit = UINT64_C(1) << (i % 64u);
-        if (!(page->used[i / 64u] & bit)) {
-            page->used[i / 64u] |= bit;
-            if (++page->active == page->slot_count) partial_remove(page);
-            return (uint8_t *)page + SLAB_DATA_OFFSET + (size_t)i * slab_sizes[page->class_index];
-        }
+    for (unsigned word = 0; word * 64u < page->slot_count; ++word) {
+        HEAP_PROBE();
+        unsigned remaining = page->slot_count - word * 64u;
+        uint64_t free = ~page->used[word];
+        if (remaining < 64u) free &= (UINT64_C(1) << remaining) - 1u;
+        if (!free) continue;
+        unsigned bit_index = (unsigned)__builtin_ctzll(free);
+        page->used[word] |= UINT64_C(1) << bit_index;
+        if (++page->active == page->slot_count) partial_remove(page);
+        size_t index = word * 64u + bit_index;
+        return (uint8_t *)page + SLAB_DATA_OFFSET + index * slab_sizes[page->class_index];
     }
     return NULL;
 }

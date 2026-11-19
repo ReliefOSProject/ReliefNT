@@ -155,7 +155,8 @@ int storage_read_iso_blocks(uint64_t lba, uint32_t block_count, void *buffer);
  * @param lba First physical 512-byte sector.
  * @param sector_count Nonzero complete sector count.
  * @param buffer Writable kernel extent of sector_count times 512 bytes, stable throughout I/O.
- * @return Zero or negative bounds/transport errno, preserving resumable -EAGAIN.
+ * @return Zero or negative bounds/transport errno. Single-native-request reads
+ * preserve resumable -EAGAIN; larger extents use scoped synchronous context.
  * @par Context
  * Caller holds storage execution ownership; shared volume/cache state must remain selected and live throughout the call. Uses the registered device and transport exclusion; no raw RAM backing or ownership transfer.
  */
@@ -350,8 +351,10 @@ void storage_memcpy(void *dst, const void *src, size_t len);
 /** @brief Read bounded sectors through the instance's exact block reference.
  * @param volume Borrowed pinned instance. @param lba First sector.
  * @param sector_count Nonzero sectors. @param buffer Current writable output.
- * @return Zero or transport/bounds errno, preserving EAGAIN. Execution ownership
- * required; transport exclusion spans callbacks and no raw backing is exposed.
+ * @return Zero or transport/bounds errno. Single-native-request reads preserve
+ * EAGAIN; larger extents use scoped synchronous context and restore caller flags.
+ * Execution ownership required; transport exclusion spans callbacks and no raw
+ * backing is exposed.
  */
 int storage_read_device(const struct storage_volume *volume, uint64_t lba,
                         uint32_t sector_count, void *buffer);

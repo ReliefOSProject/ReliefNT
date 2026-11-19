@@ -100,6 +100,7 @@ void sched_sleep_current_until(uint64_t wake_tick)
         return;
     }
     task->wake_tick = wake_tick;
+    sched_deadline_include(&scheduler_next_wake_tick, wake_tick);
     /* Keep the CPU reservation until the interrupt frame is captured by
      * userland_schedule_from_frame().  Clearing it here would make that
      * capture look like a second CPU owns the task. */

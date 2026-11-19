@@ -19,12 +19,14 @@ int main(int argc, char **argv)
     g_storage.ext2_sector_count = ftell(disk) / 512;
     assert(ext2_mount() == 0);
     uint32_t bs = g_storage.ext2_block_size, per = bs / 4;
+    /* Inject the same physical prefix failure whether the backend submits
+     * data one block per callback or coalesces all eight blocks together. */
+    test_fail_write_block_size = bs;
     uint8_t data[32768], got[32768];
     for (unsigned i = 0; i < sizeof(data); ++i) data[i] = (uint8_t)(1 + i % 251);
     unsigned fail = (unsigned)strtoul(argv[2], NULL, 0);
     const uint32_t logical[] = {0, 13, 13 + per};
     for (unsigned kind = 0; kind < 3; ++kind) {
-        if (!kind && fail == 6) continue; /* Direct runs commit in five writes. */
         char name[32];
         snprintf(name, sizeof(name), "/batch-%u", kind);
         assert(ext2_write_file(name, NULL, 0) == 0);
@@ -36,6 +38,8 @@ int main(int argc, char **argv)
             assert(!ext2_write_node(&node, (uint64_t)(logical[kind] - 1) * bs,
                                    data, bs, &wrote));
         }
+        /* The counter oracle below reads media directly, bypassing cache. */
+        assert(!storage_ext4_sync(&g_storage));
         struct ext2_inode before, after;
         struct ext2_superblock counts_before, counts_after;
         assert(!ext2_read_inode(node.first_cluster, &before));
@@ -52,6 +56,9 @@ int main(int argc, char **argv)
             assert(!memcmp(&before, &after, sizeof(before)));
             read_super(&counts_after);
             assert(counts_before.free_blocks_count == counts_after.free_blocks_count);
+            uint32_t ino = node.first_cluster;
+            /* Remount deliberately invalidates the previous mount's node. */
+            assert(!ext2_lookup_path(name, &node) && node.first_cluster == ino);
             assert(!ext2_truncate_file(&node, start + 8 * bs));
             uint32_t count;
             memset(got, '#', sizeof(got));
@@ -78,6 +85,10 @@ int main(int argc, char **argv)
     assert(!ext2_read_inode(secret.first_cluster, &secret_inode));
     assert(!ext2_unlink("/secret"));
     g_storage.ext2_next_block = secret_inode.block[0];
+    /* The shared ext allocator owns the live goal/reservation; the legacy
+     * ext2 field alone no longer controls where the next inode data goes. */
+    g_storage.ext4.next_goal_block = secret_inode.block[0];
+    g_storage.ext4.reserved_window_end = secret_inode.block[0];
     assert(!ext2_write_file("/partial", NULL, 0));
     struct storage_node node;
     uint32_t count;
@@ -119,6 +130,8 @@ int main(int argc, char **argv)
     assert(!ext2_write_file("/fragmented", NULL, 0));
     assert(!ext2_lookup_path("/fragmented", &node));
     g_storage.ext2_next_block = gap;
+    g_storage.ext4.next_goal_block = gap;
+    g_storage.ext4.reserved_window_end = gap;
     assert(!ext2_write_node(&node, 0, data, 8 * bs, &count));
     assert(!ext2_read_node(&node, 0, got, 8 * bs, &count) && count == 8 * bs);
     assert(!memcmp(data, got, count));
@@ -131,11 +144,19 @@ int main(int argc, char **argv)
         assert(!ext2_write_file("/group-edge", NULL, 0));
         assert(!ext2_lookup_path("/group-edge", &node));
         g_storage.ext2_next_block = g_storage.ext2_first_data_block + g_storage.ext2_blocks_per_group - 2;
+        g_storage.ext4.next_goal_block = g_storage.ext2_next_block;
+        g_storage.ext4.reserved_window_end = g_storage.ext2_next_block;
+        /* Place a two-block mapped prefix at the end of the group first. A
+         * request for all eight new blocks may validly choose an earlier full
+         * run; this setup makes the following eight-block write really span a
+         * mapped prefix and a new run in the next group. */
+        assert(!ext2_write_node(&node, 0, data, 2 * bs, &count) && count == 2 * bs);
         assert(!ext2_write_node(&node, 0, data, 8 * bs, &count) && count == 8 * bs);
         assert(!ext2_read_inode(node.first_cluster, &inode));
         assert(inode.block[0] / g_storage.ext2_blocks_per_group !=
                inode.block[7] / g_storage.ext2_blocks_per_group);
         assert(ext2_mount() == 0);
+        assert(!ext2_lookup_path("/group-edge", &node));
         assert(!ext2_read_node(&node, 0, got, 8 * bs, &count) && !memcmp(data, got, count));
     }
     assert(!ext2_write_file("/timestamps", NULL, 0));

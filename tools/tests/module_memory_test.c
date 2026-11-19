@@ -65,11 +65,17 @@ void smp_flush_user_tlb(void) { ++tlb_flushes; }
 void kernel_spin_lock(struct kernel_spinlock *p) { assert(!p->state);p->state=1; }
 void kernel_spin_unlock(struct kernel_spinlock *p) { assert(p->state);p->state=0; }
 static unsigned live_pages(void) { unsigned n=0; for(unsigned i=0;i<1024;++i)n+=pages[i].refs!=0; return n; }
+/** @brief Snapshot unused pages in the bounded fixture PMM for allocation-failure reporting.
+ * @return Actual unowned capacity in KiB, independent of injected allocation failures.
+ */
+uint64_t mm_free_memory_kib(void)
+{ return (sizeof(pages) / sizeof(pages[0]) - live_pages()) * 4u; }
 /** @brief Exercise module permissions, shared mappings and allocation rollback.
  * @return Zero after all fixture assertions succeed.
  */
 int main(void)
 {
+    assert(mm_free_memory_kib() == 4096);
     nx_enabled=true; mmio_dynamic_tables_ready=true;
     kernel_pml4[256]=(uintptr_t)kernel_pdpt|3;
     kernel_pml4[511]=(uintptr_t)kernel_shared_pdpt|3;
@@ -81,6 +87,7 @@ int main(void)
     struct address_space parent={0},child={0};
     assert(address_space_create(&parent));
     unsigned baseline=live_pages();
+    assert(mm_free_memory_kib() == (1024 - baseline) * 4u);
     struct module_memory *m=NULL;
     assert(!module_memory_alloc(8193,8192,&m));
     assert(m && m->size==12288 && !(m->address&8191));
@@ -128,5 +135,6 @@ int main(void)
     assert(module_memory_alloc(4096,3,&m)==-22);
     address_space_destroy(&parent);
     assert(!live_pages() && !heaps);
+    assert(mm_free_memory_kib() == 4096);
     puts("PASS module memory: existing CR3/fork, supervisor W^X, alias, TLB, reuse, allocation rollback");
 }

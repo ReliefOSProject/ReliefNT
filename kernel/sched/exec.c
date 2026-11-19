@@ -194,6 +194,9 @@ int sched_prepare_exec_current(struct task *task)
         sched_task_identity_swap(task,leader);
         leader->pid = old_tid;
         task->pid = group;
+        /* A tick may have rescanned while this task was still a nonleader.
+         * Publish the transferred alarm with its new process identity. */
+        sched_deadline_include(&scheduler_next_alarm_tick, task->alarm_deadline);
         for (uint32_t i = 0; i < task_count; ++i)
             if (tasks[i]->pdeath_parent_pid == old_tid) tasks[i]->pdeath_parent_pid = group;
         current_pid[scheduler_cpu_index()] = group;

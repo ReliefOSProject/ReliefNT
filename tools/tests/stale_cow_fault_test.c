@@ -3,8 +3,6 @@
 #include "paging_protection_test.c"
 #undef main
 
-uint64_t mm_free_memory_kib(void) { return 4096; }
-
 int main(void)
 {
     assert(paging_fixture_main() == 0);

@@ -49,6 +49,19 @@ uint64_t mm_alloc_page(void)
 }
 uint64_t mm_alloc_emergency_page(void) { return mm_alloc_page(); }
 
+#ifndef PAGING_PROTECTION_CUSTOM_FREE_MEMORY
+/** @brief Count physically unowned slots in the bounded page-table fixture.
+ * @return Actual free capacity in KiB, independent of allocation-failure injection.
+ */
+uint64_t mm_free_memory_kib(void)
+{
+    uint64_t free_pages = 0;
+    for (unsigned i = 0; i < sizeof(pages) / sizeof(pages[0]); ++i)
+        free_pages += pages[i].refs == 0;
+    return free_pages * 4u;
+}
+#endif
+
 void *mm_phys_to_virt(uint64_t p)
 {
     uintptr_t early_start = (uintptr_t)&mmio_early_pt_tables[0][0];
@@ -247,6 +260,9 @@ static void test_early_mmio_split_uses_reserved_tables(void)
  */
 int main(void)
 {
+#ifndef PAGING_PROTECTION_CUSTOM_FREE_MEMORY
+    assert(mm_free_memory_kib() == sizeof(pages) / sizeof(pages[0]) * 4u);
+#endif
     struct address_space parent = {0}, child = {0};
     const uint64_t va = RELIEFNT_USER_BASE;
     const uint64_t two_meg_boundary = RELIEFNT_USER_BASE + 0x200000ULL;
@@ -439,6 +455,9 @@ int main(void)
     mm_free_page(hole_pd_phys);
     mm_free_page(hole_pdpt_phys);
     for (unsigned i = 0; i < 1024; ++i) assert(!pages[i].refs);
+#ifndef PAGING_PROTECTION_CUSTOM_FREE_MEMORY
+    assert(mm_free_memory_kib() == sizeof(pages) / sizeof(pages[0]) * 4u);
+#endif
     puts("PASS page protection: PROT_NONE, private COW, shared fork, restore, unmap, ownership");
     return 0;
 }

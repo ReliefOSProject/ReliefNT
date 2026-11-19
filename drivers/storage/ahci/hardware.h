@@ -22,7 +22,10 @@
 
 
 #define AHCI_CMDH_PRDTL 1u
-#define AHCI_MAX_SECTORS 64u
+/* Use the complete existing 64 KiB per-port data buffer. One PRDT entry can
+ * describe up to 4 MiB, and READ/WRITE DMA EXT encode this 128-sector count
+ * directly without changing command ownership or allocating more memory. */
+#define AHCI_MAX_SECTORS 128u
 /* Non-replayable writes and boot/reclaim I/O poll synchronously. Retain a bound
  * virtual disk: a too-short limit abandons a live command and turns the next
  * application image read into a spurious -EIO. Filesystem syscalls already

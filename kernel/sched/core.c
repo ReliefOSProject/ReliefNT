@@ -24,6 +24,10 @@ uint32_t next_session_id = 1;
 
 uint64_t scheduler_ticks;
 
+uint64_t scheduler_next_wake_tick;
+uint64_t scheduler_next_alarm_tick;
+uint64_t scheduler_next_posix_timer_tick;
+
 uint64_t scheduler_loads[3];
 
 struct cpu_runtime_accounting cpu_accounting[SMP_MAX_CPUS];
@@ -133,6 +137,9 @@ void sched_init(void)
     }
     next_session_id = 1;
     scheduler_ticks = 0;
+    scheduler_next_wake_tick = 0;
+    scheduler_next_alarm_tick = 0;
+    scheduler_next_posix_timer_tick = 0;
     for (unsigned i = 0; i < 3; ++i) scheduler_loads[i] = 0;
     for (uint32_t i = 0; i < SMP_MAX_CPUS; ++i) {
         fair_queues[i] = (struct eevdf_queue){0};
@@ -251,16 +258,22 @@ void sched_on_tick(void)
         sched_load_update(scheduler_loads, active);
     }
     cpu_accounting_sync();
-    for (uint32_t i = 0; i < task_count; ++i) {
-        if (tasks[i]->state == TASK_BLOCKED && !tasks[i]->vfork_child && tasks[i]->wake_tick &&
-            tasks[i]->wake_tick <= scheduler_ticks) {
-            tasks[i]->wake_tick = 0;
-            tasks[i]->state = TASK_READY;
+    if (scheduler_ticks >= scheduler_next_wake_tick) {
+        scheduler_next_wake_tick = UINT64_MAX;
+        for (uint32_t i = 0; i < task_count; ++i) {
+            struct task *task = tasks[i];
+            if (task->state != TASK_BLOCKED || task->vfork_child || !task->wake_tick)
+                continue;
+            if (task->wake_tick > scheduler_ticks) {
+                sched_deadline_include(&scheduler_next_wake_tick, task->wake_tick);
+                continue;
+            }
+            task->wake_tick = 0;
+            task->state = TASK_READY;
             woke = true;
             /* A blocked task may still be reserved by the CPU that is
-             * finishing its syscall.  Preserve that reservation; the owner
-             * will either reclaim it or release it when selecting another
-             * task. */
+             * finishing its syscall. Preserve that reservation until the
+             * owner reclaims it or retires its live frame. */
         }
     }
     sched_alarm_expire();

@@ -5,6 +5,11 @@
 
 static struct ahci_port_dma *ports;
 
+_Static_assert(AHCI_MAX_SECTORS * 512u <= AHCI_DMA_DATA_BYTES,
+               "ATA request limit must fit the owned DMA data buffer");
+_Static_assert(AHCI_DMA_DATA_BYTES <= (1u << 22),
+               "One AHCI PRDT entry must describe the complete data buffer");
+
 /** @brief Look up a live driver-owned backing without acquiring a self reference.
  * @param port Mapped hardware-port identity, never dereferenced by lookup.
  * @return Borrowed context or NULL; caller holds transport exclusion through use.

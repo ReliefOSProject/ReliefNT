@@ -4,6 +4,7 @@
 #include <string.h>
 #include "../../block/core/storage_internal.h"
 #include "../../block/core/storage_state_data.c"
+#include "storage_codec_context_fixture.h"
 
 #define EXT4_BLOCK_CACHE_ENTRIES 2u
 #include "../../fs/ext_common/cache.c"
@@ -13,6 +14,13 @@ static uint8_t output[8 * 4096];
 static unsigned commands, fail_cache, pending, high_dma;
 static void *pending_buffer;
 static int device_error;
+int block_device_info(const struct block_device_ref *ref, struct block_device_info *out)
+{
+    assert(ref && out);
+    *out = (struct block_device_info){.blocks = sizeof(disk) / 512,
+        .block_size = 512, .max_blocks = 256};
+    return 0;
+}
 
 uint64_t mm_alloc_pages(uint32_t pages)
 {

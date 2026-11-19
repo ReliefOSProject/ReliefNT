@@ -164,7 +164,7 @@ def run_vma() -> int:
             "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-ffunction-sections", "-fdata-sections",
             "-Wl,--gc-sections", "-Iinclude",
             "-Iinclude/uapi", "-Iinclude",
-            str(VMA_PROBE), "kernel/device/mapping.c", "-o", str(binary),
+            str(VMA_PROBE), "kernel/device/mapping.c", "fs/vfs/lookup_cache.c", "-o", str(binary),
         ], cwd=ROOT, check=True, timeout=20)
         subprocess.run([str(binary)], cwd=ROOT, check=True, timeout=10)
     print("PASS audio VMA lifetime")

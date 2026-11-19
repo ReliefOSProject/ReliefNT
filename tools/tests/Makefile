@@ -13,6 +13,7 @@ test-host-smoke:
 	$(Q)$(RELIEFNT_HOST_TEST_RUN) --suite boot_policy --suite brand_identity --suite gpu --suite drm --suite svga \
 	 --suite loadavg --suite input --suite input_routing --suite uapi \
 	 --suite acpi_pm_timer --suite apic_timer --suite cpu_accounting \
+	 --suite fat_async_read --suite fat_read_split \
 	 --suite vdso_mapping --suite vdso_time
 
 test-smp-time:

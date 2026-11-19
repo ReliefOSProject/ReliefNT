@@ -216,9 +216,11 @@ int exfat_boot_region_valid(uint64_t base_lba, uint8_t boot_sector[SECTOR_SIZE])
                        boot_sector[510], boot_sector[511]);
         return -2;
     }
-    /* Every extended boot sector in the region has its own signature.  The
-     * final two sectors are reserved and must remain zero.  Checking these
-     * bytes prevents accepting a boot checksum copied over a damaged region. */
+    /* exFAT sections 3.2/3.3: sectors 1..8 carry a full AA550000 signature.
+     * Sector 9 contains ten opaque 48-byte OEM parameters and a reserved tail.
+     * Section 1.2 recommends not interpreting reserved contents on read: keep
+     * the complete OEM sector opaque and protected by the boot checksum below.
+     * Preserve the existing zero check for the separate reserved sector 10. */
     for (uint32_t sector = 1u; sector <= 10u; ++sector) {
         read_ret = exfat_read_sectors_resilient(base_lba + sector, 1u,
                                                 storage_scratch);
@@ -228,12 +230,12 @@ int exfat_boot_region_valid(uint64_t base_lba, uint8_t boot_sector[SECTOR_SIZE])
             return read_ret;
         }
         if (sector <= 8u) {
-            if (storage_scratch[510] != 0x55u || storage_scratch[511] != 0xaau) {
-                console_error("[reliefnt] exfat_boot_region_valid: extended boot sector %u signature invalid: %x %x\n",
-                               sector, storage_scratch[510], storage_scratch[511]);
+            if (storage_get_u32(storage_scratch + 508u) != 0xaa550000u) {
+                console_error("[reliefnt] exfat_boot_region_valid: extended boot sector %u signature invalid: %x\n",
+                               sector, storage_get_u32(storage_scratch + 508u));
                 return -5;
             }
-        } else {
+        } else if (sector == 10u) {
             for (uint32_t byte = 0; byte < SECTOR_SIZE; ++byte) {
                 if (storage_scratch[byte] != 0u) {
                     console_info("[reliefnt] exfat_boot_region_valid: reserved sector %u not zero at byte %u\n",

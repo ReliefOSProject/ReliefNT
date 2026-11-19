@@ -128,6 +128,47 @@ int main(void)
     assert(!ahci_prepare_command(dma,AHCI_PACKET_CAPACITY,0,1,current));
     assert(table->acmd[0]==0x25 && !table->acmd[8] && table->prdt[0].dbc==7);
     assert(!dma_buffer_end(&dma->data,NULL,true));
+    /* The existing backing supports a complete 64 KiB ATA command. Exercise
+     * real public request admission/resume plus FIS/PRDT at the last valid LBA,
+     * while modelling MMIO completion explicitly rather than RAM W1C writes. */
+    {
+        assert(AHCI_MAX_SECTORS==128 && dma->data.capacity==65536);
+        const uint64_t last_range=(1ull<<48)-128u;
+        unsigned char *large=malloc(65538),*source=malloc(65538);
+        assert(large && source);
+        memset(large,0x71,65538);
+        for(unsigned i=0;i<65538;++i)source[i]=(unsigned char)(i*7u+i/263u);
+        assert(!ahci_prepare_command(dma,AHCI_READ,last_range,128,large+1));
+        struct fis_reg_h2d *fis=(void *)table->cfis;
+        assert(fis->command==ATA_CMD_READ_DMA_EXT && fis->countl==128 && !fis->counth);
+        uint64_t encoded_lba=(uint64_t)fis->lba0|(uint64_t)fis->lba1<<8|
+            (uint64_t)fis->lba2<<16|(uint64_t)fis->lba3<<24|
+            (uint64_t)fis->lba4<<32|(uint64_t)fis->lba5<<40;
+        assert(encoded_lba==last_range && table->prdt[0].dbc==65535);
+        ahci_pending_command=(struct ahci_pending_command){.active=1,.port=&port,.dma=dma,
+            .buffer=large+1,.owner_pid=fixture_pid,.lba=last_range,
+            .sector_count=128,.operation=AHCI_READ,.start_tick=1};
+        port.ci=1;port.is=0;storage_io_async_context=true;
+        assert(ahci_read_lba_retry(&port,last_range,128,large+1)==-RELIEFOS_EAGAIN);
+        assert(dma->data.busy && ahci_pending_command.active && large[1]==0x71);
+        assert(ahci_read_lba_retry(&port,last_range,129,large+1)==-22);
+        assert(ahci_read_lba_retry(&port,last_range+1u,128,large+1)==-22);
+        assert(ahci_pending_command.active && port.ci==1);
+        memcpy(dma->data.cpu,source+1,65536);port.ci=0;
+        assert(!ahci_read_lba_retry(&port,last_range,128,large+1));
+        assert(!memcmp(large+1,source+1,65536) && large[0]==0x71 && large[65537]==0x71);
+        assert(!dma->data.busy && !ahci_pending_command.active);
+        assert(!ahci_prepare_command(dma,AHCI_WRITE,last_range,128,source+1));
+        assert(fis->command==ATA_CMD_WRITE_DMA_EXT && fis->countl==128 && !fis->counth);
+        assert(table->prdt[0].dbc==65535 && !memcmp(dma->data.cpu,source+1,65536));
+        ahci_pending_command=(struct ahci_pending_command){.active=1,.port=&port,.dma=dma,
+            .buffer=source+1,.owner_pid=fixture_pid,.lba=last_range,.write=1,
+            .sector_count=128,.operation=AHCI_WRITE,.start_tick=1};
+        assert(!ahci_write_lba_retry(&port,last_range,128,source+1));
+        assert(!dma->data.busy && !ahci_pending_command.active);
+        assert(ahci_write_lba_retry(&port,0,129,source+1)==-22);
+        free(large);free(source);
+    }
     /* Once a write was issued it must finish synchronously even if the caller
      * accidentally retained read-replay admission. No write may be replayed. */
     {
@@ -193,5 +234,5 @@ int main(void)
     assert(!controller.irq_handle && !hba.ports[0].ie && !(hba.ghc&2));
     assert(!ahci_release_ports());
     assert(!heap_objects && allocated == freed);
-    puts("AHCI completion: retry/cancel, real owned DMA/IDENTIFY/ATAPI, failed STOP retention PASS");
+    puts("AHCI completion: 64 KiB ATA FIS/PRDT/bounds, retry/cancel, real owned DMA/IDENTIFY/ATAPI, failed STOP retention PASS");
 }

@@ -69,6 +69,8 @@ static void fat_read_prepare(struct storage_volume *volume,const struct storage_
  * I/O; no graph/module lock, code/instance lifetime held by caller.
  * Readahead stays within one FAT cache window so its chain probe can complete
  * without replaying an earlier window and discarding a different pending read.
+ * Clusters larger than the read-ahead workspace use the existing bounded
+ * cluster buffer, retaining the same chain cursor and error/partial-read rules.
  */
 static int fat_native_read(struct storage_volume *volume,const struct storage_node *node,uint64_t offset,
                                   void *bytes,uint32_t capacity,uint32_t *length,
@@ -107,6 +109,7 @@ static int fat_native_read(struct storage_volume *volume,const struct storage_no
         uint32_t cache_clusters;
         uint32_t next;
         uint32_t take;
+        const uint8_t *data=storage_read_cache_data;
         if (bytes_from_cluster > bytes_requested) {
             bytes_from_cluster = bytes_requested;
         }
@@ -119,7 +122,19 @@ static int fat_native_read(struct storage_volume *volume,const struct storage_no
         uint32_t fat_entries=STORAGE_FAT_CACHE_SECTORS*SECTOR_SIZE/sizeof(uint32_t);
         uint32_t fat_remaining=fat_entries-cluster%fat_entries;
         if (max_clusters>fat_remaining) max_clusters=fat_remaining;
-        if (storage_read_cache_lookup(cluster, &cache_offset, &cache_clusters)) {
+        if (g_storage.sectors_per_cluster>STORAGE_READAHEAD_SECTORS) {
+            /* A legal FAT cluster can exceed the small read-ahead cache.
+             * Do not truncate its batch count to zero or grow that cache:
+             * the execution-owned cluster workspace already fits the volume's
+             * validated cluster size. Read the chain link before the payload
+             * so an async retry can reuse the completed FAT cache window. */
+            cache_clusters=1;cache_offset=0;
+            ret=fat32_read_fat_entry(cluster,&next);
+            if(ret<0) {ret=storage_read_failure(ret);goto out;}
+            ret=fat32_read_cluster(cluster,storage_cluster_buf);
+            if(ret<0) {ret=storage_read_failure(ret);goto out;}
+            data=storage_cluster_buf;
+        } else if (storage_read_cache_lookup(cluster, &cache_offset, &cache_clusters)) {
             if (cache_clusters > max_clusters) {
                 cache_clusters = max_clusters;
             }
@@ -146,7 +161,7 @@ static int fat_native_read(struct storage_volume *volume,const struct storage_no
         if (take > capacity - done) {
             take = capacity - done;
         }
-        storage_memcpy(dst + done, storage_read_cache_data + cache_offset + cluster_off,
+        storage_memcpy(dst + done, data + cache_offset + cluster_off,
                        take);
         done += take;
         if (offset + done < node->size) {

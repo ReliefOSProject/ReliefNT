@@ -445,3 +445,9 @@ msgstr ""
 "disabled, and caches and TLBs flushed; the boot CPU's firmware ranges are "
 "not modified. ``nopat`` still synchronizes MTRRs; CPUs with mismatched "
 "capabilities, physical-address widths or register readback remain offline."
+
+msgid "slab 空槽查找按 64 位位图字跳过已满部分，再选择最低空闲位；末字先屏蔽 不属于实际 slot 的尾位。该路径保持原有分配顺序、清零和锁边界，减少持有 堆锁时的逐槽检查；``tools/test_heap_slab.py`` 包含工作量计数和并发回归。"
+msgstr "The slab free-slot search skips full 64-bit bitmap words and selects the lowest free bit, masking tail bits outside the actual slot range in the last word. Allocation order, zeroing and lock boundaries remain unchanged while fewer individual slots are checked under the heap lock. ``tools/test_heap_slab.py`` includes work counters and concurrency regressions."
+
+msgid "PMM 从位图字中直接寻找下一个可用位，跳过部分占用字中的已占用前缀。 单页分配还可降低已证明没有剩余空闲页的扫描上界；多页请求保留较短的可用串， DMA mask 裁剪外的区域不据此跳过。``tools/test_physical_metadata.py`` 用独立 页模型检查碎片、跨段、掩码和并发，并统计扫描工作量。"
+msgstr "The PMM finds the next free bit directly in a bitmap word, skipping an occupied prefix even in partially occupied words. A single-page allocation may also lower the scanned upper bound when no free page remains there. Multi-page searches preserve shorter free runs, and regions outside a DMA-mask-clipped search are not skipped on that evidence. ``tools/test_physical_metadata.py`` uses an independent page model to check fragmentation, section boundaries, masks and concurrency, and counts scanning work."

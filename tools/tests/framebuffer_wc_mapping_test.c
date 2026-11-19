@@ -6,7 +6,6 @@
 static bool pat_ready=true, ordinary_ram;
 static unsigned flushes;
 static uint64_t irq=0x200;
-uint64_t mm_free_memory_kib(void){return 1024*1024;}
 bool arch_pat_writecombine_ready(void){return pat_ready;}
 void arch_pat_flush_boot(void){assert(!irq);++flushes;}
 uint64_t kernel_irq_save(void){uint64_t f=irq;irq=0;return f;}

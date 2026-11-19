@@ -92,6 +92,10 @@ uint64_t task_socket_cancel_receive(struct task *task)
 { uint64_t done = task->socket_receive_done; task->socket_receive_done = 0; return done; }
 int64_t task_socket_mmsg_interrupt(struct task *task, uint64_t received)
 { (void)task; (void)received; return -LINUX_EINTR; }
+/* This fixture has no file-transfer continuation. Keep that boundary explicit
+ * while linking the current production signal interruption path. */
+int64_t task_transfer_interrupt(struct task *task)
+{ (void)task; abort(); }
 int time_clock_get(int32_t clock_id, struct linux_timespec *value)
 { (void)clock_id; (void)value; return -LINUX_EINVAL; }
 void futex_cancel_wait(struct task *task)

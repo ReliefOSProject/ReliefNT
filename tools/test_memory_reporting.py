@@ -90,7 +90,7 @@ def run_cases(output, cases):
               "-finstrument-functions", "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
               "-fno-omit-frame-pointer", "-ffunction-sections", "-fdata-sections", "-DCONFIG_SWAP=1", "-DRELIEFNT_CACHE_PROBE=1", "-DRELIEFNT_DIRTY_PROBE=1",
               "-fno-pie", "-no-pie", "-Wl,--gc-sections", "-Iinclude", "-Iinclude/uapi"]
-    sources = ["tools/tests/memory_reporting_test.c", "kernel/sched/core.c", "kernel/sched/wait.c",
+    sources = ["tools/tests/memory_reporting_test.c", "kernel/sched/core.c", "kernel/sched/accounting.c", "kernel/sched/wait.c",
                "kernel/sched/oom.c", "kernel/sync/wait.c", "mm/reclaim/pressure.c", "mm/reclaim/wait.c",
                "mm/cache/page_cache.c", "mm/reclaim/stats.c", "kernel/exec/usercopy.c", "kernel/exec/usercopy_task.c", "fs/vfs/mount_tree.c", "fs/vfs/lookup_cache.c", "fs/vfs/file.c", "fs/vfs/open.c",
                "fs/vfs/attributes.c", "fs/vfs/exec_file.c", "mm/swap/area.c", "mm/swap/slot.c",

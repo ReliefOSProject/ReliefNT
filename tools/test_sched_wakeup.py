@@ -12,7 +12,7 @@ def main():
     temporary = Path(os.environ.get("TMPDIR", ROOT / "out/tmp"))
     temporary.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="sched-wakeup-", dir=temporary) as directory:
-        for name in ("sched_wakeup", "smp_reschedule", "sched_clock"):
+        for name in ("sched_wakeup", "smp_reschedule", "sched_clock", "sched_deadline"):
             binary = Path(directory) / name
             subprocess.run(["clang", "-std=c11", "-O1", "-g",
                 "-fsanitize=address,undefined", "-fno-sanitize-recover=all",

@@ -35,7 +35,11 @@ ext4_dir tools/test_ext4_dir.py
 ext4_read tools/test_ext4_read.py
 ext4_vfs tools/test_ext4_vfs.py --filesystem ext4
 ext4_write tools/test_ext4_write.py
+ext4_write_batch tools/test_ext4_write_batch.py
+ext4_io_search tools/test_ext4_io_search.py
+exfat_boot tools/test_exfat_boot.py
 fat_directory_growth tools/test_fat_directory_growth.py
+fat_read_split tools/test_fat_read_split.py
 fat_async_read tools/test_fat_async_read.py
 fbdev tools/test_fbdev.py
 vbe_boot_surface tools/test_vbe_boot_surface.py
@@ -107,6 +111,7 @@ storage_posix_paths tools/test_storage_posix_paths.py
 storage_rename tools/test_storage_rename.py
 storage_sync tools/test_storage_sync.py
 storage_write_batch tools/test_storage_write_batch.py
+disk_raw_batch tools/test_disk_raw_batch.py
 svga tools/test_svga.py
 syscall_io tools/test_syscall_io.py
 workqueue tools/test_workqueue.py
