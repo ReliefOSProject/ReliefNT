@@ -714,7 +714,6 @@ void sched_release_task_resources(struct task *task)
     task->exec_argv = task->exec_envp = NULL;
     task->exec_data = NULL;
     task->exec_argc = task->exec_envc = task->exec_data_len = 0;
-    svga_gpu_release_owner(task->pid);
     task->flags |= TASK_FLAG_RESOURCES_RELEASED;
     if (sched_oom_membership_changed) sched_oom_membership_changed();
     void (*notify)(void) = __atomic_load_n(&memory_release_notify, __ATOMIC_ACQUIRE);

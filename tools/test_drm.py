@@ -14,7 +14,6 @@ INCLUDES = [
 ]
 FIXTURES = [
     ("tools/tests/drm_abi_test.c", "drm-abi"),
-    ("tools/tests/drm_execbuf_test.c", "drm-execbuf"),
     ("tools/tests/drm_core_test.c", "drm-core"),
     ("tools/tests/drm_vma_clear_test.c", "drm-vma-clear"),
     ("tools/tests/drm_runtime_sysfs_test.c", "drm-runtime-sysfs"),
@@ -38,14 +37,6 @@ def main() -> int:
             "cjk_glyphs[] = {{0xfffd, 1, {0}}};\n",
             encoding="utf-8",
         )
-        # Debug builds must initialize large heap work objects without a
-        # compound-literal temporary overflowing the 64 KiB worker stack.
-        subprocess.run([
-            "clang", "-std=c11", "-O0", "-ffreestanding", "-mgeneral-regs-only",
-            "-Wframe-larger-than=8192", "-Werror=frame-larger-than", *INCLUDES,
-            "-c", "drivers/video/drm/vmwgfx/retire.c",
-            "-o", str(Path(directory) / "retire-debug.o"),
-        ], cwd=ROOT, check=True)
         for source, name in FIXTURES:
             binary = Path(directory) / name
             command = [
@@ -65,8 +56,6 @@ def main() -> int:
             if name in ("framebuffer-drm", "console-replay"):
                 command[1:1] = [f"-I{generated_include}",
                                 "-Idrivers/video/framebuffer"]
-            if name == "framebuffer-drm":
-                command[1:1] = ["drivers/video/svga/fifo.c"]
             print("$ " + " ".join(command))
             subprocess.run(command, cwd=ROOT, check=True)
             if name == "console-replay":

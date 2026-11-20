@@ -806,9 +806,8 @@ static void sys_value(const struct sys_node *n, struct text_stream *s)
         }
         break;
     case A_FB_NAME:
-        text_string(s, fb->backend == FRAMEBUFFER_BACKEND_VMWARE_SVGA ? "vmware-svga"
-                       : fb->backend == FRAMEBUFFER_BACKEND_BOCHS_VBE ? "bochs-vbe"
-                                                                      : "firmware-framebuffer");
+        text_string(s, fb->backend == FRAMEBUFFER_BACKEND_BOCHS_VBE ? "bochs-vbe"
+                                                                  : "firmware-framebuffer");
         break;
     case A_FB_SIZE:
         text_unsigned(s, fb->width);

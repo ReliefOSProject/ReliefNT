@@ -25,7 +25,6 @@
 #include <reliefnt/lock.h>
 #include <reliefnt/memory_pressure.h>
 #include <reliefnt/smp.h>
-#include <reliefnt/svga.h>
 #include <reliefnt/usercopy.h>
 #include <linux/sched.h>
 #include <reliefnt/futex.h>

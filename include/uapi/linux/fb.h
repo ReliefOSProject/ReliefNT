@@ -89,9 +89,6 @@ _Static_assert(sizeof(struct fb_cmap) == 40,
 #define FBIOGET_FSCREENINFO 0x4602UL
 #define FBIOGETCMAP 0x4604UL
 #define FBIOPUTCMAP 0x4605UL
-/* Linux fbdev pan/flush request.  On VMware SVGA the visible surface is
- * refreshed from VRAM only when the host receives an update command, so
- * mmap writers need this to push frames to the display. */
 #define FBIOPAN_DISPLAY 0x4606UL
 #define FBIOBLANK 0x4611UL
 

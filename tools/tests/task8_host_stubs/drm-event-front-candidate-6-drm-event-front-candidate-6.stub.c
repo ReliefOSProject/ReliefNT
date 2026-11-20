@@ -22,10 +22,6 @@ __attribute__((noreturn)) void drm_master_create(void) { __builtin_trap(); }
 __attribute__((noreturn)) void drm_master_get(void) { __builtin_trap(); }
 /** @brief Trap if the fixture reaches unmodeled drm_master_put. */
 __attribute__((noreturn)) void drm_master_put(void) { __builtin_trap(); }
-/** @brief Trap if the fixture reaches unmodeled drm_vmwgfx_execbuf_file_release. */
-__attribute__((noreturn)) void drm_vmwgfx_execbuf_file_release(void) { __builtin_trap(); }
-/** @brief Trap if the fixture reaches unmodeled drm_vmwgfx_resource_file_release. */
-__attribute__((noreturn)) void drm_vmwgfx_resource_file_release(void) { __builtin_trap(); }
 /** @brief Trap if the fixture reaches unmodeled kernel_poll_readiness_notify. */
 __attribute__((noreturn)) void kernel_poll_readiness_notify(void) { __builtin_trap(); }
 /** @brief Trap if the fixture reaches unmodeled kernel_wait_queue_init. */

@@ -3,10 +3,8 @@ config DRM
     tristate "DRM/KMS graphics"
     default y
     help
-      Linux DRM/KMS with VMware SVGA II and optional VirtIO-GPU backends.
-      The VMware function is bound by the boot framebuffer; VirtIO uses
-      modern PCI discovery. Selecting M builds drm.ko. Device discovery
-      and publication occur when the module loads;
+      Linux DRM/KMS with an optional VirtIO-GPU backend. Selecting M builds
+      drm.ko. Device discovery and publication occur when the module loads;
       the early framebuffer and console remain permanent kernel services.
       Open card/PRIME descriptors, mappings, asynchronous jobs, resources and
       hardware callbacks retain the exact module until safely retired.

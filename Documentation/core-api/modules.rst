@@ -41,9 +41,9 @@ Kconfig 选择内置或编译为可加载 ELF 模块，默认保持内置。模�
 
 * 路径：``drivers/tty/{input,pty,serial}/``; 职责：输入路由、PTY/行规程/终端会话、串口。
 
-* 路径：``drivers/video/framebuffer/``; 职责：像素/字形、绘图、呈现、VBE/VMware、启动图标与 panic 显示。
+* ``drivers/video/framebuffer/`` 提供 VBE、像素与字形绘制、呈现、启动图标和 panic 显示。
 
-* 路径：``drivers/video/drm/vmwgfx/``; 职责：SVGA 资源/能力及 execbuf 验证、翻译、fence、retire、continuation。
+* ``drivers/video/drm/virtio/`` 提供 VirtIO-GPU 设备、显示模式、资源与命令提交。
 
 * 路径：``drivers/sound/hda/``; 职责：控制器 I/O、rings、恢复、verbs；codec 探测、路由和控制；stream 实现。
 

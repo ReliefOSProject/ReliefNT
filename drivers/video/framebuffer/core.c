@@ -11,12 +11,6 @@ static void framebuffer_capture_gop_impl(uint64_t system_table_addr);
 struct framebuffer fb;
 static struct framebuffer gop_framebuffer;
 
-struct vmware_svga_state vmware_svga;
-
-bool framebuffer_drm_scanout_owned;
-
-bool framebuffer_svga_damage_pending;
-
 int framebuffer_range_valid(uint64_t start, uint64_t bytes)
 {
     return start != 0 && bytes != 0 && start < FRAMEBUFFER_PHYS_LIMIT &&
@@ -216,9 +210,7 @@ void framebuffer_init(const struct boot_info *boot)
         fb = gop_framebuffer;
     }
     framebuffer_set_boot_limits();
-    if (!framebuffer_vmware_probe()) {
-        (void)framebuffer_vbe_probe();
-    }
+    (void)framebuffer_vbe_probe();
 
     if (fb.available) {
         console_info("[reliefnt] framebuffer %ux%u pitch=%u bpp=%u bytespp=%u type=%u "
@@ -251,11 +243,8 @@ int framebuffer_set_mode(uint32_t width, uint32_t height)
 {
     struct framebuffer previous;
     uint64_t required_bytes;
-    int changed;
 
-    if (framebuffer_drm_owned())
-        return fb.available && fb.width == width && fb.height == height ? 0 : -1;
-    if (!fb.available || !(fb.capabilities & FRAMEBUFFER_CAP_MODE_SET) ||
+    if (!fb.available || fb.backend != FRAMEBUFFER_BACKEND_BOCHS_VBE || !(fb.capabilities & FRAMEBUFFER_CAP_MODE_SET) ||
         width == 0 || height == 0 || width > fb.max_width || height > fb.max_height) {
         return -1;
     }
@@ -263,34 +252,17 @@ int framebuffer_set_mode(uint32_t width, uint32_t height)
     if (required_bytes > fb.max_bytes) {
         return -1;
     }
-    if (fb.width == width && fb.height == height && fb.bpp == 32u) {
-        if (fb.backend == FRAMEBUFFER_BACKEND_VMWARE_SVGA) {
-            framebuffer_vmware_enable_traces();
-        }
+    if (fb.width == width && fb.height == height && fb.bpp == 32u)
         return 0;
-    }
 
     previous = fb;
-    if (fb.backend == FRAMEBUFFER_BACKEND_VMWARE_SVGA) {
-        changed = framebuffer_vmware_set_mode(width, height);
-    } else if (fb.backend == FRAMEBUFFER_BACKEND_BOCHS_VBE) {
-        changed = framebuffer_vbe_set_mode(width, height);
-    } else {
-        return -1;
-    }
-    if (changed) {
+    if (framebuffer_vbe_set_mode(width, height)) {
         console_info("[reliefnt] framebuffer mode changed backend=%u %ux%u pitch=%u\n",
                        fb.backend, fb.width, fb.height, fb.pitch);
         return 0;
     }
 
-    if (previous.backend == FRAMEBUFFER_BACKEND_VMWARE_SVGA) {
-        /* SVGA owns rollback of both the device and descriptor. Retrying here
-         * would discard its result and can hide an unrecoverable mapping. */
-        return -1;
-    } else if (previous.backend == FRAMEBUFFER_BACKEND_BOCHS_VBE) {
-        (void)framebuffer_vbe_set_mode(previous.width, previous.height);
-    }
+    (void)framebuffer_vbe_set_mode(previous.width, previous.height);
     fb = previous;
     return -1;
 }

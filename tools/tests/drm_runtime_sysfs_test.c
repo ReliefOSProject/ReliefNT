@@ -37,9 +37,10 @@ static int scripted_ioctl(int, unsigned long, ...);
 #undef close
 #undef ioctl
 
-static unsigned vgpu, render_present, bad_identity, query_error, render_opens, render_closes;
+static int32_t rendering;
+static unsigned render_present, bad_identity, query_error, render_opens, render_closes;
 static const char *attributes[] = {
-    "PCI_ID=15AD:0405\nPCI_SLOT_NAME=0000:00:0f.0\nMODALIAS=pci:v000015ADd00000405\n",
+    "PCI_ID=1AF4:1050\nPCI_SLOT_NAME=0000:00:0f.0\nMODALIAS=pci:v00001AF4d00001050\n",
     "226:0\n", "226:128\n"
 };
 
@@ -80,27 +81,32 @@ static int scripted_close(int fd)
 { assert(fd>=64 && fd<=67);if(fd==67)++render_closes;return 0; }
 static int scripted_ioctl(int fd, unsigned long request, ...)
 {
-    assert(fd==19 && request==DRM_IOCTL_VMW_GET_PARAM);
-    va_list args;va_start(args,request);struct drm_vmw_getparam_arg *p=va_arg(args,void *);va_end(args);
-    assert(p->param==DRM_VMW_PARAM_3D);
-    if(query_error){errno=EIO;return -1;}p->value=vgpu;return 0;
+    assert(fd == 19 && request == DRM_IOCTL_VIRTGPU_GETPARAM);
+    va_list args;
+    va_start(args, request);
+    struct drm_virtgpu_getparam *params = va_arg(args, struct drm_virtgpu_getparam *);
+    va_end(args);
+    assert(params->param == VIRTGPU_PARAM_3D_FEATURES && params->value);
+    if (query_error) { errno = EIO; return -1; }
+    *(int32_t *)(uintptr_t)params->value = rendering;
+    return 0;
 }
 int main(void)
 {
     /* A rendering device must accept its correctly numbered render node. */
-    vgpu=render_present=1;
+    rendering=render_present=1;
     assert(check_sysfs_identity(19)==0);
     assert(render_opens==1 && render_closes==1);
     /* A 2D device must still reject an unexpected render node. */
-    vgpu=render_present=0;
+    rendering=render_present=0;
     assert(check_sysfs_identity(19)==0);
     render_present=1;assert(check_sysfs_identity(19)!=0);
-    vgpu=1;render_present=0;assert(check_sysfs_identity(19)!=0);
+    rendering=1;render_present=0;assert(check_sysfs_identity(19)!=0);
     render_present=1;
     for(bad_identity=1;bad_identity<=4;++bad_identity)
         assert(check_sysfs_identity(19)!=0);
     bad_identity=0;query_error=1;assert(check_sysfs_identity(19)!=0);
-    query_error=0;vgpu=2;assert(check_sysfs_identity(19)!=0);
+    query_error=0;rendering=2;assert(check_sysfs_identity(19)!=0);
     puts("PASS native DRM identity: 2D absence, 3D render identity/open/close, mismatches and failed capability query");
     return 0;
 }

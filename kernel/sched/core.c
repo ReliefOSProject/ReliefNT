@@ -476,7 +476,6 @@ void sched_quiesce_exited_current(void)
     uint32_t cpu = scheduler_cpu_index();
     uint32_t pid;
     uint64_t flags;
-    uint32_t gpu_owner = 0;
 
     kernel_spin_lock_irqsave(&scheduler_lock, &flags);
     fair_stop_cpu(cpu);
@@ -490,13 +489,11 @@ void sched_quiesce_exited_current(void)
                 ++proc_switches;
                 current_pid[cpu] = 0;
                 current_task[cpu] = NULL;
-                gpu_owner = pid;
             }
             break;
         }
     }
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
-    if (gpu_owner) svga_gpu_release_owner(gpu_owner);
 }
 
 /**

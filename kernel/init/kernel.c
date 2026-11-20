@@ -34,7 +34,6 @@
 #include <reliefnt/smp.h>
 #include <reliefnt/storage.h>
 #include <reliefnt/syscall.h>
-#include <reliefnt/svga.h>
 #include <reliefnt/time.h>
 #include <reliefnt/usb.h>
 #include <reliefnt/userland.h>
@@ -349,8 +348,7 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
     }
     /* Boot strings now use retained aliases. Only this BSP exists and no user
      * roots exist; later APs/users must inherit the same final PAT policy. */
-    if (arch_pat_boot_init(!cmdline_has(&boot,"nopat")))
-        (void)framebuffer_enable_writecombine_boot();
+    (void)arch_pat_boot_init(!cmdline_has(&boot,"nopat"));
     console_info("[memory] total_kib=%llu free_kib=%llu page_bytes=4096\n",
                  (unsigned long long)mm_total_memory_kib(),
                  (unsigned long long)mm_free_memory_kib());
@@ -378,25 +376,7 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
      * the CPU still holds the firmware IDT, whose gates select firmware GDT
      * segments and triple fault on delivery after the GDT switch. */
     idt_init();
-    console_info("[boot] GDT/TSS/IDT installed; probing VMware graphics acceleration\n");
-    /* Bootstrap page tables are complete. svga3d_init drains the legacy FIFO,
-     * retains the selected VRAM policy, and validates the FIFO BAR before
-     * issuing 3D FIFO or guest-memory commands. */
-    int svga_ret = svga3d_init();
-    struct svga_info boot_svga_info;
-    svga_get_info(&boot_svga_info);
-    console_log(svga_ret < 0 && boot_svga_info.available ? CONSOLE_LOG_WARN : CONSOLE_LOG_INFO,
-                "[graphics] svga3d_status=%d available=%u fifo_ready=%u probe=%s probe_status=%d\n",
-                svga_ret, (unsigned)boot_svga_info.available,
-                (unsigned)boot_svga_info.fifo_ready,
-                boot_svga_info.probe.stage ? boot_svga_info.probe.stage : "not-run",
-                boot_svga_info.probe.status);
-    int triangle_ret = svga_ret;
-    if (cmdline_has(&boot, "svga3d-triangle=1")) {
-        triangle_ret = svga_ret == 0 ? svga3d_triangle_test() : svga_ret;
-        console_log(triangle_ret < 0 ? CONSOLE_LOG_WARN : CONSOLE_LOG_INFO,
-                    "[svga3d] triangle-test=%d\n", triangle_ret);
-    }
+    console_info("[boot] GDT/TSS/IDT installed\n");
     irq_init();
     driver_manager_init();
     {
@@ -454,29 +434,7 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
     driver_manager_load_builtin();
     console_info("[boot] input providers initialized; initializing IPv4 networking\n");
     net_init();
-    if (boot_log_pause) {
-        console_info("[svga3d] init=%d available=%u fifo-ready=%u\n",
-                       svga_ret, (unsigned)boot_svga_info.available,
-                       (unsigned)boot_svga_info.fifo_ready);
-        console_info("[svga3d] caps=0x%x fifo=0x%x\n",
-                       boot_svga_info.device_caps, boot_svga_info.fifo_caps);
-        console_info("[svga3d] host=0x%x guest=0x%x\n",
-                       boot_svga_info.host_version, boot_svga_info.guest_version);
-        const struct svga_probe_info *probe = &boot_svga_info.probe;
-        console_info("[svga3d] probe=%s status=%d\n",
-                       probe->stage ? probe->stage : "not-run", probe->status);
-        console_info("[svga3d] probe-fifo=0x%x min=%u mem-regs=%u\n",
-                       probe->fifo_caps, probe->fifo_min, probe->mem_regs);
-        console_info("[svga3d] raw-hw=0x%x revised=0x%x enable=0x%x\n",
-                       probe->host_legacy, probe->host_revised, probe->enable);
-        console_info("[svga3d] gb=%u devcap3d=%u\n",
-                       (unsigned)probe->gb_objects, probe->devcap_3d);
-        if (cmdline_has(&boot, "svga3d-triangle=1")) {
-            console_log(triangle_ret < 0 ? CONSOLE_LOG_WARN : CONSOLE_LOG_INFO,
-                        "[svga3d] triangle-test=%d\n", triangle_ret);
-        }
-        boot_log_wait_for_enter();
-    }
+    if (boot_log_pause) boot_log_wait_for_enter();
     if (pty_vt_init() < 0) {
         console_fatal("[reliefnt] unable to initialize six virtual terminals\n");
         kernel_idle_loop();

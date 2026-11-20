@@ -98,11 +98,7 @@ void drm_file_close(struct task_file *task_file)
 #ifdef CONFIG_DRM_VIRTIO_GPU
     if(drm_is_virtio())vg_context_close(file);
 #endif
-    drm_vmwgfx_execbuf_file_release(file);
     drm_bo_file_release(file);
-    /* Resource close only drops file-local metadata and queues retirement;
-     * backend callbacks run later from the bounded syscall-context reaper. */
-    drm_vmwgfx_resource_file_release(file);
     drm_master_remove_file_magics(file);
     drm_master_release_device(file);
     drm_master_put(file->master);

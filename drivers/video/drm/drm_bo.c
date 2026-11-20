@@ -4,7 +4,6 @@
 #endif
 
 #include <drm/drm_mode.h>
-#include <drm/vmwgfx_drm.h>
 #include <linux/errno.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/lock.h>
@@ -18,15 +17,9 @@
 #define DRM_BO_HANDLE_MAX 0x00ffffffu
 #define DRM_RESOURCE_HANDLE_MIN 0x01000000u
 
-#define DRM_VMW_SYNCCPU_ACCESS (drm_vmw_synccpu_read | drm_vmw_synccpu_write)
-#define DRM_VMW_SYNCCPU_ALLOWED (drm_vmw_synccpu_read | drm_vmw_synccpu_write | \
-                                 drm_vmw_synccpu_dontblock | drm_vmw_synccpu_allow_cs)
-
 struct drm_bo {
     uint32_t references;
     uint32_t page_count;
-    /* Linux vmwgfx blocks command submission for non-ALLOW_CS CPU grabs. */
-    uint32_t cpu_writer_grabs;
     uint32_t gpu_reservations;
     uint64_t size;
     uint64_t physical;
@@ -39,8 +32,6 @@ struct drm_bo_handle {
     struct drm_bo_handle *next;
     struct drm_bo *bo;
     uint32_t handle;
-    /* Aggregate SYNCCPU pairing state; no allocation per successful grab. */
-    uint32_t cpu_writer_grabs;
 };
 
 static struct kernel_spinlock drm_bo_lock = KERNEL_SPINLOCK_INIT;
@@ -141,8 +132,7 @@ int drm_bo_gpu_reserve(struct drm_bo *bo)
     uint64_t flags;
     kernel_spin_lock_irqsave(&drm_bo_lock, &flags);
     int ret = 0;
-    if (bo->cpu_writer_grabs) ret = -LINUX_EBUSY;
-    else if (bo->gpu_reservations == UINT32_MAX) ret = -LINUX_EBUSY;
+    if (bo->gpu_reservations == UINT32_MAX) ret = -LINUX_EBUSY;
     else ++bo->gpu_reservations;
     kernel_spin_unlock_irqrestore(&drm_bo_lock, flags);
     return ret;
@@ -177,51 +167,6 @@ struct drm_bo *drm_bo_lookup_handle_get(struct drm_file *file, uint32_t handle)
     drm_bo_get(bo);
     kernel_spin_unlock_irqrestore(&drm_bo_lock, flags);
     return bo;
-}
-
-int drm_bo_synccpu_lookup_get(struct drm_file *file, uint32_t handle,
-                              uint32_t flags, struct drm_bo **out)
-{
-    if (out) *out = NULL;
-    if (!file || !handle || !out || !(flags & DRM_VMW_SYNCCPU_ACCESS) ||
-        (flags & ~DRM_VMW_SYNCCPU_ALLOWED)) return -LINUX_EINVAL;
-    struct drm_bo *bo = drm_bo_lookup_handle_get(file, handle);
-    if (!bo) return -LINUX_EINVAL;
-    *out = bo;
-    return 0;
-}
-
-int drm_bo_synccpu_grab_retained(struct drm_file *file, uint32_t handle,
-                                 struct drm_bo *bo, uint32_t flags)
-{
-    if (!file || !bo || !handle || !(flags & DRM_VMW_SYNCCPU_ACCESS) ||
-        (flags & ~DRM_VMW_SYNCCPU_ALLOWED)) return -LINUX_EINVAL;
-    uint64_t irq_flags;
-    kernel_spin_lock_irqsave(&drm_bo_lock, &irq_flags);
-    if (bo->gpu_reservations) {
-        kernel_spin_unlock_irqrestore(&drm_bo_lock, irq_flags);
-        return -LINUX_EBUSY;
-    }
-    if (flags & drm_vmw_synccpu_allow_cs) {
-        kernel_spin_unlock_irqrestore(&drm_bo_lock, irq_flags);
-        return 0;
-    }
-    if (bo->cpu_writer_grabs == UINT32_MAX) {
-        kernel_spin_unlock_irqrestore(&drm_bo_lock, irq_flags);
-        return -LINUX_EBUSY;
-    }
-    struct drm_bo_handle *entry = drm_bo_find_handle_locked(file, handle);
-    if (entry && entry->bo == bo && entry->cpu_writer_grabs == UINT32_MAX) {
-        kernel_spin_unlock_irqrestore(&drm_bo_lock, irq_flags);
-        return -LINUX_EBUSY;
-    }
-    ++bo->cpu_writer_grabs;
-    /* A handle may close while the ioctl is parked. The retained BO still
-     * receives the Linux-equivalent writer exclusion, without touching a
-     * replacement handle that reused the number. */
-    if (entry && entry->bo == bo) ++entry->cpu_writer_grabs;
-    kernel_spin_unlock_irqrestore(&drm_bo_lock, irq_flags);
-    return 0;
 }
 
 static int drm_bo_reserve_bytes(uint64_t size, uint64_t *retained_out)
@@ -346,10 +291,7 @@ int drm_bo_create(struct drm_file *file,
                               requested_size, size, retained, page_count);
         return -LINUX_ENOMEM;
     }
-    bool vmwgfx = file->device && file->device->pci.vendor_id == DRM_VMWARE_VENDOR &&
-                  file->device->pci.device_id == DRM_VMWARE_SVGA2;
-    uint64_t physical = vmwgfx ? mm_alloc_pages_below(page_count, (1ULL << 44) - 1) :
-                                 mm_alloc_pages(page_count);
+    uint64_t physical = mm_alloc_pages(page_count);
     if (!physical) {
         kernel_free(entry);
         kernel_free(bo);
@@ -411,10 +353,6 @@ int drm_bo_handle_delete(struct drm_file *file, uint32_t handle)
     if (*link) {
         entry = *link;
         *link = entry->next;
-        if (entry->bo->cpu_writer_grabs >= entry->cpu_writer_grabs)
-            entry->bo->cpu_writer_grabs -= entry->cpu_writer_grabs;
-        else
-            entry->bo->cpu_writer_grabs = 0;
     }
     kernel_spin_unlock_irqrestore(&drm_bo_lock, flags);
     if (!entry) return -LINUX_EINVAL;
@@ -431,10 +369,6 @@ void drm_bo_file_release(struct drm_file *file)
     struct drm_bo_handle *handles = file->bo_handles;
     file->bo_handles = NULL;
     for (struct drm_bo_handle *entry = handles; entry; entry = entry->next) {
-        if (entry->bo->cpu_writer_grabs >= entry->cpu_writer_grabs)
-            entry->bo->cpu_writer_grabs -= entry->cpu_writer_grabs;
-        else
-            entry->bo->cpu_writer_grabs = 0;
     }
     kernel_spin_unlock_irqrestore(&drm_bo_lock, flags);
     while (handles) {
@@ -480,60 +414,6 @@ static int drm_bo_map_offset(struct drm_file *file, uint32_t handle,
     if (entry) *offset_out = entry->bo->map_offset;
     kernel_spin_unlock_irqrestore(&drm_bo_lock, flags);
     return entry ? 0 : -LINUX_EINVAL;
-}
-
-static int drm_bo_synccpu(struct drm_file *file,
-                          struct drm_vmw_synccpu_arg *arg)
-{
-    if (!file || !arg || !arg->handle ||
-        !(arg->flags & DRM_VMW_SYNCCPU_ACCESS) ||
-        (arg->flags & ~DRM_VMW_SYNCCPU_ALLOWED) ||
-        (arg->op != drm_vmw_synccpu_grab &&
-         arg->op != drm_vmw_synccpu_release)) return -LINUX_EINVAL;
-
-    if (arg->op == drm_vmw_synccpu_grab) {
-        struct drm_bo *bo = NULL;
-        int ret = drm_bo_synccpu_lookup_get(file, arg->handle, arg->flags,
-                                           &bo);
-        if (ret) return ret;
-        ret = drm_bo_synccpu_grab_retained(file, arg->handle, bo,
-                                           arg->flags);
-        drm_bo_put(bo);
-        return ret;
-    }
-
-    uint64_t flags;
-    kernel_spin_lock_irqsave(&drm_bo_lock, &flags);
-    struct drm_bo_handle *entry = drm_bo_find_handle_locked(file, arg->handle);
-    if (!entry) {
-        kernel_spin_unlock_irqrestore(&drm_bo_lock, flags);
-        return -LINUX_EINVAL;
-    }
-    /* Linux ALLOW_CS only waits for prior GPU work; it does not create a CPU
-     * writer reservation. Release validates the handle and otherwise has no
-     * effect, including on unrelated non-ALLOW_CS grabs of this BO. */
-    if (arg->flags & drm_vmw_synccpu_allow_cs) {
-        kernel_spin_unlock_irqrestore(&drm_bo_lock, flags);
-        return 0;
-    }
-    uint32_t *handle_count = &entry->cpu_writer_grabs;
-    uint32_t *bo_count = &entry->bo->cpu_writer_grabs;
-    /* Linux's non-ALLOW_CS counter can underflow on an unmatched release.
-     * Keep the valid pairing model without reproducing that kernel bug. */
-    if (!*bo_count) {
-        kernel_spin_unlock_irqrestore(&drm_bo_lock, flags);
-        return -LINUX_EINVAL;
-    }
-    if (*handle_count) --*handle_count;
-    --*bo_count;
-    kernel_spin_unlock_irqrestore(&drm_bo_lock, flags);
-    return 0;
-}
-
-int drm_bo_synccpu_ioctl(struct drm_file *file,
-                         struct drm_vmw_synccpu_arg *arg)
-{
-    return drm_bo_synccpu(file, arg);
 }
 
 static int drm_bo_create_dumb(struct drm_file *file,
@@ -609,38 +489,6 @@ int drm_bo_ioctl(struct drm_file *file, uint32_t command, void *data,
         if (!arg) return -LINUX_EFAULT;
         return drm_bo_handle_delete(file, arg->handle);
     }
-    case DRM_IOWR(DRM_COMMAND_BASE + DRM_VMW_ALLOC_BO,
-                  union drm_vmw_alloc_bo_arg): {
-        union drm_vmw_alloc_bo_arg *arg = data;
-        if (!arg) return -LINUX_EFAULT;
-        uint32_t requested = arg->req.size;
-        if (!requested) return -LINUX_EINVAL;
-        uint32_t handle;
-        uint64_t map_offset;
-        int ret = drm_bo_create(file, diagnostics, requested, &handle,
-                                &map_offset);
-        if (ret < 0) return ret;
-        *arg = (union drm_vmw_alloc_bo_arg){
-            .rep = {
-                .map_handle = map_offset,
-                .handle = handle,
-                .cur_gmr_id = handle,
-                .cur_gmr_offset = 0,
-                .pad64 = 0,
-            },
-        };
-        if (created_handle_out) *created_handle_out = handle;
-        return 0;
-    }
-    case DRM_IOW(DRM_COMMAND_BASE + DRM_VMW_UNREF_DMABUF,
-                 struct drm_vmw_handle_close_arg): {
-        struct drm_vmw_handle_close_arg *arg = data;
-        if (!arg) return -LINUX_EFAULT;
-        return drm_bo_handle_delete(file, arg->handle);
-    }
-    case DRM_IOW(DRM_COMMAND_BASE + DRM_VMW_SYNCCPU,
-                 struct drm_vmw_synccpu_arg):
-        return drm_bo_synccpu(file, data);
     default:
         return -LINUX_EINVAL;
     }

@@ -29,7 +29,7 @@ ABI 变化必须明确审查，不通过重生成历史 golden 消除差异。
     TMPDIR="$PWD/out/tmp" make O=out/check test-ownership test-host-smoke
     TMPDIR="$PWD/out/tmp" make O=out/check test-host
     python3 tools/test_host.py --list
-    python3 tools/test_host.py --suite drm --suite svga --output out/drm-tests
+    python3 tools/test_host.py --suite drm --suite vbe_boot_surface --output out/drm-tests
 
 ``tools/tests/host-suites.list`` 显式登记宿主套件和必要参数；runner 保留各套件
 日志及 ``results.json``，任何失败均返回非零，后续套件仍会执行以形成完整报告。
@@ -110,8 +110,7 @@ Linux 返回值编码；不修改宿主进程的调度状态。整机还需验�
 
 ``pat`` 套件覆盖生产 PAT 引导/AP 策略及真实页表的 UC 到 WC 转换：
 功能缺失、固件布局、写回读失败、冲突别名/租约、RAM、用户页表阶段与
-失败原子性。VMware 引导夹具检查可预取 BAR、FIFO 交叠和模式切换策略；
-SVGA 夹具检查 FIFO 初始化不把已保留的 WC 显存重新声明为 UC。
+失败原子性。``vbe_boot_surface`` 检查启动 framebuffer 的映射和模式切换。
 
 
 目标运行

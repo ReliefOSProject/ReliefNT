@@ -178,7 +178,7 @@ void address_space_destroy(struct address_space *as)
     (void)as;
 #endif
 }
-void svga_gpu_release_owner(uint32_t owner) { (void)owner; }
+
 void pty_process_exit(uint32_t pid) { (void)pid; }
 #ifndef PRESSURE_REAL_SIGNAL
 void kernel_signal_flush(struct task *task, bool process, uint64_t mask)

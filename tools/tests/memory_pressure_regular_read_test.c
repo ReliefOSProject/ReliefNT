@@ -17,7 +17,7 @@ static int provider_cookie;
 void task_vector_cancel(struct task *task) { assert(task==current && !task->vector_io); }
 void task_socket_stage_cancel(struct task *task) { assert(task==current); }
 void task_transfer_cancel(struct task *task) { assert(task==current); }
-void graphics_service_cancel_task_continuation(struct task *task) { assert(task==current); }
+
 void task_pty_release_entry(struct task_pty_fd *entry) { assert(entry && !entry->used); }
 
 static bool pressure_fixture_heap_admitted(size_t size)

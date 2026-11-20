@@ -404,7 +404,7 @@ int64_t syscall_dispatch(const struct syscall_frame *frame)
         task_release_syscall_file(sched_current_task());
         return -RELIEFOS_ENOMEM;
     }
-    if(result==KERNEL_SYSCALL_SWAP_CONTENDED || result==KERNEL_SYSCALL_DRM_ENUM_WAIT) {
+    if(result==KERNEL_SYSCALL_SWAP_CONTENDED) {
         task_release_syscall_file(sched_current_task());
         return -RELIEFOS_EBUSY;
     }
@@ -855,9 +855,6 @@ int64_t syscall_dispatch_regs(struct task *task, uint64_t number, uint64_t a0, u
     }
     if (syscall_security_owns(number, a1)) {
         return syscall_security_dispatch(number, a0, a1, a2, a3, a4, a5);
-    }
-    if (syscall_gpu_device_owns(number, a1)) {
-        return syscall_gpu_device_dispatch(number, a0, a1, a2, a3, a4, a5);
     }
     if (syscall_device_owns(number, a1)) {
         return syscall_device_dispatch(number, a0, a1, a2, a3, a4, a5);

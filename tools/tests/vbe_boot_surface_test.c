@@ -30,8 +30,6 @@ static efi_status_t __attribute__((ms_abi)) fixture_locate(uint64_t search, stru
 static efi_status_t __attribute__((ms_abi)) fixture_protocol(efi_handle_t handle, struct efi_guid *protocol,
                                                              void **interface)
 { (void)protocol; assert(handle == fixture_handle); *interface = &fixture_gop; return 0; }
-/** @brief Model absent VMware hardware. @return Zero. */
-int framebuffer_vmware_probe(void) { return 0; }
 /** @brief Ignore fixture logs. @param level Severity. @param format Format string. */
 void console_log(enum console_log_level level, const char *format, ...) { (void)level; (void)format; }
 /** @brief Select a VBE register. @param value Register index. @param port Output port. */

@@ -1,9 +1,8 @@
 #ifndef RELIEFOS_UAPI_GPU_ABI_H
 #define RELIEFOS_UAPI_GPU_ABI_H
 /*
- * GPU wire ABI between ReliefNT and userland. Userland wrappers live in
- * <reliefos/gpu.h>.
- * UAPI only: nothing here may include a non-UAPI header.
+ * Retired GPU wire ABI. Layouts and request numbers remain reserved for
+ * compatibility with existing userspace.
  */
 
 #include <stdint.h>
@@ -51,18 +50,14 @@ struct reliefos_gpu_vertex {
 };
 
 /* TRIANGLELIST; count is a multiple of three. Transform is the column-major
- * object-to-clip matrix with D3D depth range [0,w]. Color is interpolated by GPU.
- * Vertices are prepared/lit by the caller, transformed and rasterized by SVGA. */
+ * object-to-clip matrix with D3D depth range [0,w]. */
 struct reliefos_gpu_draw {
     uint32_t first, count;
     float transform[16];
 };
 
-/* All pointer fields are user virtual addresses encoded as uint64_t. Output is
- * top-down, tightly packed 00RRGGBB pixels.
- * Render returns a fenced readback. The kernel keeps two offscreen slots, so
- * from the third frame onward it waits for frame N-1 while frame N is already
- * queued on the GPU; the first two calls return the first rendered frame. */
+/* Pointer fields encode user virtual addresses. The pixel layout is top-down,
+ * tightly packed 00RRGGBB. */
 struct reliefos_gpu_frame {
     uint32_t size, version;
     uint64_t handle, vertices, draws, pixels;

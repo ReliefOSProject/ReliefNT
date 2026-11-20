@@ -41,7 +41,7 @@ procfs/sysfs、memfd 必需的 tmpfs 基础及通用 socket/TTY 分发也保留�
 
 * AHCI、IDE/ATAPI、NVMe，e1000，PS/2/USB 设备驱动，串口完整驱动。
 * AC97、ES1371、HDA，以及完成通用设备分发与 owner 引用改造后的 sound core。
-* VMware SVGA/DRM 及 DRM core；基础 framebuffer/启动日志保持内置。
+* DRM 核心与 VirtIO-GPU 后端。基础 framebuffer 和启动日志保持内置。
 * ext2、ext4、FAT、exFAT、ISO9660；公共 ext 辅助代码作为显式依赖。
 * 具有独立注册边界的可选服务，例如内核 HTTP 服务。IPv4/TCP/UDP 核心不为
   追求选项数量强行拆为模块；必须先有真实注册和生命周期边界。

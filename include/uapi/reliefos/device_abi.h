@@ -52,6 +52,7 @@
 #define RELIEFOS_DEV_SERIAL0 "/dev/serial0"
 #define RELIEFOS_DEV_SDA "/dev/sda"
 #define RELIEFOS_DEV_NVME0N1 "/dev/nvme0n1"
+/* Reserved legacy path. */
 #define RELIEFOS_DEV_GPU "/dev/gpu"
 #define RELIEFOS_DEV_SHM0 "/dev/shm0"
 

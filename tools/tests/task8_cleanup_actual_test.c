@@ -12,7 +12,7 @@
 void task_regular_io_stage_cancel(struct task *task) { assert(task == &current); }
 void task_vector_cancel(struct task *task) { assert(task == &current && !task->vector_io); }
 void task_transfer_cancel(struct task *task) { assert(task == &current && !task->transfer_io); }
-void graphics_service_cancel_task_continuation(struct task *task) { assert(task == &current); }
+
 void task_sysv_msg_cancel(struct task *task) { assert(task == &current && !task->sysv_msg.queue); }
 void task_sysv_sem_cancel(struct task *task) { assert(task == &current && !task->sysv_sem.ops); }
 

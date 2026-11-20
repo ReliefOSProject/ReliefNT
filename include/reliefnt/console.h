@@ -51,8 +51,6 @@ void vga_console_configure(const char *cmdline, bool legacy_boot);
  * @return Encoded length, or zero to use the unchanged ordinary key translator.
  * Caller holds TTY execution ownership. */
 unsigned vga_console_key(uint32_t vt, uint8_t keycode, unsigned modifiers, char *bytes);
-/** @brief Refresh the active graphical VT's framebuffer scanout. */
-void console_display_tick(void);
 
 /** Original display owner captured before a fatal console takeover. */
 struct console_panic_context {

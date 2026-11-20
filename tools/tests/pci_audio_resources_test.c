@@ -394,15 +394,15 @@ static void mmio_writeback_second_large_page_split_oom_is_atomic(void) {
                            RELIEFNT_PAGE_PCD|RELIEFNT_PAGE_NOEXEC));
     puts("mmio_writeback_second_2MiB_split_oom_no_partial_policy_or_claim PASS");
 }
-static void pci_vmware_svga_bar2_identity_size_and_restore(void) {
+static void pci_bar2_identity_size_and_restore(void) {
     struct pci_device d={.bus=0,.slot=0,.function=0,
-                         .vendor_id=0x15ad,.device_id=0x0405};
+                         .vendor_id=0x1af4,.device_id=0x1050};
     uint32_t saved_id=cfg[0],saved_command=cfg[1],saved_bar0=cfg[0x10/4],
              saved_bar1=cfg[0x14/4],saved_bar2=cfg[0x18/4],
              saved_bar3=cfg[0x1c/4],saved_mask2=bar_masks[0x18/4],
              saved_mask3=bar_masks[0x1c/4],saved_mask0=bar_masks[0x10/4],
              saved_mask1=bar_masks[0x14/4];
-    cfg[0]=0x040515ad; cfg[1]=0x00000007;
+    cfg[0]=0x10501af4; cfg[1]=0x00000007;
     cfg[0x10/4]=0xc0000000; cfg[0x14/4]=0;
     cfg[0x18/4]=0xf0000000; cfg[0x1c/4]=0;
     bar_masks[0x10/4]=0; bar_masks[0x14/4]=0;
@@ -411,7 +411,7 @@ static void pci_vmware_svga_bar2_identity_size_and_restore(void) {
     assert(pci_device_bar_contains(&d,2,0xf0001000,0xf000));
     assert(!pci_device_bar_contains(&d,2,0xf000f000,0x2000));
     assert(cfg[1]==0x00000007 && cfg[0x18/4]==0xf0000000 && cfg[0x1c/4]==0);
-    struct pci_device wrong=d; wrong.device_id=0x0406;
+    struct pci_device wrong=d; wrong.device_id=0x1051;
     assert(!pci_device_bar_contains(&wrong,2,0xf0000000,4096));
     cfg[0x14/4]=0x00000004; /* BAR2 is the high dword, not an independent BAR. */
     assert(!pci_device_bar_contains(&d,2,0xf0000000,4096));
@@ -710,7 +710,7 @@ int main(void) {
     assert(!pci_map_mmio(0xc0001000,4096));
     pci_unmap_mmio(mmio,8192); for(unsigned i=0;i<PCI_MMIO_MAX;i++)assert(!pci_mappings[i].refs);
     puts("pci_bar_range_and_mapping_ledger PASS");
-    pci_vmware_svga_bar2_identity_size_and_restore();
+    pci_bar2_identity_size_and_restore();
     puts("module_v1_prefix_is_unchanged PASS");
     dma_mask_is_enforced(); puts("dma_mask_is_enforced PASS");
     struct reliefos_driver_pci_device d={0}; uint32_t h; unsigned count=0;

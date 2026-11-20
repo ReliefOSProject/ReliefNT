@@ -43,9 +43,8 @@ fat_read_split tools/test_fat_read_split.py
 fat_async_read tools/test_fat_async_read.py
 fbdev tools/test_fbdev.py
 vbe_boot_surface tools/test_vbe_boot_surface.py
-vmware_boot_surface tools/test_vmware_boot_surface.py
 futimens tools/test_futimens.py
-gpu tools/test_gpu.py
+gpu_usercopy tools/test_gpu.py
 hda tools/test_hda.py
 input tools/test_input.py
 inotify_abi tools/test_inotify_abi.py
@@ -112,7 +111,6 @@ storage_rename tools/test_storage_rename.py
 storage_sync tools/test_storage_sync.py
 storage_write_batch tools/test_storage_write_batch.py
 disk_raw_batch tools/test_disk_raw_batch.py
-svga tools/test_svga.py
 syscall_io tools/test_syscall_io.py
 workqueue tools/test_workqueue.py
 uapi tools/test_uapi.py
@@ -120,7 +118,6 @@ user_return_gate tools/test_user_return_gate.py
 vdso_mapping tools/test_vdso_mapping.py
 vdso_time tools/test_vdso_time.py
 wait_queue_race tools/test_wait_queue_race.py
-xorg_display_refresh tools/test_xorg_display_refresh.py
 xorg_vt_handoff tools/test_xorg_vt_handoff.py
 ext4_dma tools/test_ext4_dma.py
 security_regressions tools/test_security_regressions.py --strict
@@ -196,7 +193,6 @@ module_sound_core_owner tools/test_module_sound_core_owner.py
 graphics_services tools/test_graphics_services.py
 graphics_service_dispatch tools/test_graphics_service_dispatch.py
 module_drm_core_owner tools/test_module_drm_core_owner.py
-module_svga_owner tools/test_module_svga_owner.py
 smp_barrier tools/test_smp_barrier.py
 
 memory_topology tools/test_memory_topology.py
@@ -221,8 +217,6 @@ acpi_directmap tools/test_acpi_directmap.py
 firmware_identity tools/test_firmware_identity.py
 smp_capability tools/test_smp_capability.py
 usercopy_map tools/test_usercopy_map.py
-svga_ppn_alloc tools/test_svga_ppn_alloc.py
-vmwgfx_ppn_bo tools/test_vmwgfx_ppn_bo.py
 physical_metadata tools/test_physical_metadata.py
 heap_slab tools/test_heap_slab.py
 vfs_lookup_cache tools/test_vfs_lookup_cache.py

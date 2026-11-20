@@ -17,9 +17,6 @@
     "kernel/reliefnt/futex.c": [
       "kernel/ipc/futex.c"
     ],
-    "kernel/reliefnt/gpu.c": [
-      "drivers/video/core/gpu.c"
-    ],
     "kernel/reliefnt/input.c": [
       "drivers/tty/input/input.c"
     ],
@@ -96,9 +93,6 @@
     ],
     "kernel/reliefnt/syscall_fs.c": [
       "kernel/syscall/fs/fs.c"
-    ],
-    "kernel/reliefnt/syscall_gui.c": [
-      "kernel/syscall/device/gpu.c"
     ],
     "kernel/reliefnt/syscall_ipc.c": [
       "kernel/syscall/ipc/ipc.c"
@@ -266,9 +260,6 @@
     "kernel/reliefnt/include/reliefnt/futex.h": [
       "include/reliefnt/futex.h"
     ],
-    "kernel/reliefnt/include/reliefnt/gpu.h": [
-      "include/reliefnt/gpu.h"
-    ],
     "kernel/reliefnt/include/reliefnt/heap.h": [
       "include/reliefnt/heap.h"
     ],
@@ -352,9 +343,6 @@
     ],
     "kernel/reliefnt/include/reliefnt/storage.h": [
       "include/reliefnt/storage.h"
-    ],
-    "kernel/reliefnt/include/reliefnt/svga.h": [
-      "include/reliefnt/svga.h"
     ],
     "kernel/reliefnt/include/reliefnt/syscall.h": [
       "include/reliefnt/syscall.h"
@@ -554,26 +542,6 @@
     "block/storage_sync.c": [
       "block/core/storage_sync.c"
     ],
-    "drivers/video/drm/drm_vmwgfx_caps.c": [
-      "drivers/video/drm/vmwgfx/caps.c"
-    ],
-    "drivers/video/drm/drm_vmwgfx_execbuf.c": [
-      "drivers/video/drm/vmwgfx/retire.c",
-      "drivers/video/drm/vmwgfx/execbuf.c",
-      "drivers/video/drm/vmwgfx/fence.c",
-      "drivers/video/drm/vmwgfx/validate.c",
-      "drivers/video/drm/vmwgfx/translate.c",
-      "drivers/video/drm/vmwgfx/continuation.c"
-    ],
-    "drivers/video/drm/drm_vmwgfx_execbuf_parser.c": [
-      "drivers/video/drm/vmwgfx/execbuf_parser.c"
-    ],
-    "drivers/video/drm/drm_vmwgfx_execbuf_parser.h": [
-      "drivers/video/drm/vmwgfx/execbuf_parser.h"
-    ],
-    "drivers/video/drm/drm_vmwgfx_resource.c": [
-      "drivers/video/drm/vmwgfx/resource.c"
-    ],
     "arch/x86_64/apic.c": [
       "arch/x86_64/interrupt/apic.c"
     ],
@@ -664,7 +632,6 @@
       "drivers/video/framebuffer/color.c",
       "drivers/video/framebuffer/core.c",
       "drivers/video/framebuffer/vbe.c",
-      "drivers/video/framebuffer/vmware.c",
       "drivers/video/framebuffer/panic.c",
       "drivers/video/framebuffer/draw.c"
     ],

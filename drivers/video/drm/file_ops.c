@@ -140,8 +140,7 @@ static void drm_character_exit(void)
 module_init(drm_character_init);
 module_exit(drm_character_exit);
 MODULE_LICENSE("Apache-2.0");
-MODULE_DESCRIPTION("ReliefNT DRM/KMS, VMware SVGA and VirtIO-GPU provider");
-MODULE_ALIAS("pci:v000015ADd00000405sv*sd*bc*sc*i*");
+MODULE_DESCRIPTION("ReliefNT DRM/KMS provider");
 #ifdef CONFIG_DRM_VIRTIO_GPU
 MODULE_ALIAS("pci:v00001AF4d00001050sv*sd*bc*sc*i*");
 #endif

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # Objects are owned by this directory; child modules own their own lists.
-obj-y := core/ drm/ framebuffer/ svga/ vga/
+obj-y := drm/ framebuffer/ vga/
 
 include $(srctree)/scripts/Makefile.module

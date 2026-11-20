@@ -48,7 +48,7 @@ uint64_t mm_total_memory_kib(void) { return 256 * 4; }
  * modeled. These fixtures have no vfork relation or external VMA leases. */
 void __wrap_paging_load_cr3(uint64_t cr3) { assert(writer_owned() && cr3==paging_kernel_cr3()); }
 void sched_vfork_child_done(struct task *task) { assert(writer_owned() && !task->vfork_parent); }
-void graphics_service_cancel_task_continuation(struct task *task) { assert(writer_owned() && task); }
+
 void sched_task_vma_release(struct task *task)
 {
     assert(writer_owned() && task);

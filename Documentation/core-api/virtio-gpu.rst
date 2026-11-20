@@ -11,7 +11,7 @@ VirtIO-GPU 与 DRM/KMS
 ``virtio-gpu-pci`` 及其 GL 变体；不实现 legacy-only、MMIO 或 packed ring。
 
 ``VIRTIO_PCI``、``DRM`` 和 ``DRM_VIRTIO_GPU`` 在 defconfig 中默认启用。
-``DRM=m`` 时，VirtIO 后端和 vmwgfx 同属 ``drm.ko``，transport 保持内置；
+``DRM=m`` 时，VirtIO-GPU 后端随 DRM 核心编入 ``drm.ko``，PCI transport 保持内置。
 使用匹配构建的 ``modules_install`` 结果加载，不兼容 Linux 二进制模块。
 
 用户态接口

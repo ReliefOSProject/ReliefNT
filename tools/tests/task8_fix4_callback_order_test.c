@@ -26,7 +26,7 @@ bool smp_cpu_online(uint32_t cpu) { return cpu==0; }
 /** @brief Model cancellation at exec before the original MM is retired.
  * @param task Original task whose new image is being installed.
  */
-void graphics_service_cancel_task_continuation(struct task *task) { assert(task==current); }
+
 
 /* Non-device exit dependencies are controlled host boundaries. The scheduler,
  * address-space destroy, VMA teardown and provider callbacks remain real. */
@@ -60,7 +60,7 @@ void syscall_release_task_files(struct task *task) { assert(task && !scheduler_l
 /** @brief Model empty supplementary groups. @param task Original task. */
 void task_groups_release(struct task *task) { assert(task); }
 /** @brief Model no owned GPU objects. @param pid Original task ID. */
-void svga_gpu_release_owner(uint32_t pid) { (void)pid; }
+
 /** @brief Model PTY process cleanup. @param pid Original task ID. */
 void pty_process_exit(uint32_t pid) { (void)pid; }
 /** @brief Model no pending fatal signal. @param task Original task.

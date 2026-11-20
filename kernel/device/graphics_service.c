@@ -105,47 +105,6 @@ uint32_t graphics_service_process_retirements(uint32_t budget)
     uint32_t result=provider_ops->process_retirements ? provider_ops->process_retirements(budget) : 0;
     kernel_service_release(&call);return result;
 }
-/** @brief Cancel optional graphics syscall continuation ownership for one task.
- * @param task Execution-owned task, nullable; core never dereferences optional state.
- * Execution-owned task context; no registry lock spans the callback or wait.
- * The core drops both pins only after optional code returns; nothing escapes.
- */
-void graphics_service_cancel_task_continuation(struct task *task)
-{
-    struct kernel_service_call call={0};
-    if(!kernel_service_acquire(&graphics_service_slot,&call))return;
-    const struct graphics_service_operations *provider_ops=call.operations;
-    if(provider_ops->cancel_task_continuation)provider_ops->cancel_task_continuation(task);
-    kernel_service_release(&call);
-}
-/** @brief Query optional graphics continuation signal-deferral policy.
- * @param task Execution-owned task, nullable.
- * @return Backend result or false when no method is available.
- * Execution-owned task context; no registry lock spans the callback or wait.
- * The core drops both pins only after optional code returns; nothing escapes.
- */
-bool graphics_service_task_uninterruptible(const struct task *task)
-{
-    struct kernel_service_call call={0};
-    if(!kernel_service_acquire(&graphics_service_slot,&call))return false;
-    const struct graphics_service_operations *provider_ops=call.operations;
-    bool result=provider_ops->task_uninterruptible ? provider_ops->task_uninterruptible(task) : false;
-    kernel_service_release(&call);return result;
-}
-/** @brief Query optional graphics CPU synchronization signal policy.
- * @param task Execution-owned task, nullable.
- * @return Backend result or false when no method is available.
- * Execution-owned task context; no registry lock spans the callback or wait.
- * The core drops both pins only after optional code returns; nothing escapes.
- */
-bool graphics_service_task_signal_busy(const struct task *task)
-{
-    struct kernel_service_call call={0};
-    if(!kernel_service_acquire(&graphics_service_slot,&call))return false;
-    const struct graphics_service_operations *provider_ops=call.operations;
-    bool result=provider_ops->task_signal_busy ? provider_ops->task_signal_busy(task) : false;
-    kernel_service_release(&call);return result;
-}
 EXPORT_SYMBOL(graphics_service_register);
 EXPORT_SYMBOL(graphics_service_unregister);
 

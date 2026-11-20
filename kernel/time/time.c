@@ -709,11 +709,6 @@ void time_on_tick(void)
     sched_on_tick();
     kthread_tick();
     kernel_workqueue_tick();
-    /* Give SVGA deferred damage and the legacy mmap fallback a 50 Hz service
-     * cadence. This does not set the hardware presentation rate. */
-    if ((ticks % (RELIEFNT_TICK_HZ / 50ULL)) == 0) {
-        console_display_tick();
-    }
 }
 
 /**

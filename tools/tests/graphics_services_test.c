@@ -20,18 +20,17 @@ static bool registered(void)
     return true;
 }
 static int identity(struct pci_device *out)
-{assert(owner.runtime->users==1 && owner.runtime->executing==1);out->vendor_id=0x15ad;return 0;}
+{assert(owner.runtime->users==1 && owner.runtime->executing==1);out->vendor_id=0x1af4;return 0;}
 static uint32_t retire(uint32_t budget)
 {assert(owner.runtime->users==1 && owner.runtime->executing==1);return budget+1;}
 int main(void)
 {
     struct pci_device pci={.vendor_id=42};
     assert(!graphics_service_is_registered() && !graphics_service_render_node_ready());
-    assert(!graphics_service_kms_scanout_active() && !graphics_service_task_signal_busy(NULL));
-    assert(!graphics_service_task_uninterruptible(NULL));
+    assert(!graphics_service_kms_scanout_active());
     assert(graphics_service_pci_identity(&pci)==-19 && pci.vendor_id==42);
     assert(!graphics_service_process_retirements(2));
-    graphics_service_kms_vt_release();graphics_service_cancel_task_continuation(NULL);
+    graphics_service_kms_vt_release();
     struct module_runtime *runtime=kernel_malloc(sizeof(*runtime));assert(runtime);
     strcpy(owner.name,"graphics_provider");strcpy(runtime->name,owner.name);
     owner.runtime=runtime;runtime->owner=&owner;runtime->state=MODULE_COMING;
@@ -42,9 +41,8 @@ int main(void)
     assert(!graphics_service_is_registered() && !called);
     runtime->state=MODULE_LIVE;
     assert(graphics_service_is_registered() && called==1 && !runtime->users && !runtime->executing);
-    assert(!graphics_service_pci_identity(&pci) && pci.vendor_id==0x15ad);
+    assert(!graphics_service_pci_identity(&pci) && pci.vendor_id==0x1af4);
     assert(graphics_service_process_retirements(2)==3);
-    assert(!graphics_service_task_uninterruptible(NULL));
     assert(!module_unload(owner.name,0) && !allocated && !module_list);
     assert(!graphics_service_is_registered() && graphics_service_pci_identity(&pci)==-19);
     puts("PASS graphics service broker: absent/partial callbacks, exact LIVE owner pins, reentrant busy unload and ledger teardown");

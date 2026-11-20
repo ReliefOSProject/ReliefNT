@@ -26,7 +26,7 @@ struct futex_exit_cursor *sched_futex_exit_cursor(struct task *task) { assert(ta
 int sched_prepare_exec_current(struct task *task) { assert(task==&target);++cleanup_calls;return cleanup_status; }
 void sched_exec_replace_mm(struct task *task,const struct address_space *replacement)
 { assert(task==&target && replacement->cr3==0x88000);++commits;task->shared_mm=NULL; }
-void svga_gpu_release_owner(uint32_t pid) { assert(pid==target.pid); }
+
 void kernel_free(void *p) { free(p); }
 void address_space_destroy(struct address_space *as) { assert(as);++destroys; }
 void sched_task_vma_release(struct task *task) { assert(task); }
