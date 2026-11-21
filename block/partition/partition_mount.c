@@ -158,6 +158,10 @@ static int storage_filesystem_from_name(const char *filesystem, uint32_t *out_fi
         *out_filesystem = RELIEFOS_DISK_FILESYSTEM_EXFAT;
         return 0;
     }
+    if (storage_text_eq_ci(filesystem, "squashfs")) {
+        *out_filesystem = RELIEFOS_DISK_FILESYSTEM_SQUASHFS;
+        return 0;
+    }
     return -95;
 }
 
@@ -184,7 +188,9 @@ static int storage_existing_block_partition(uint32_t disk,uint32_t partition,uin
             volume->filesystem==STORAGE_FILESYSTEM_EXFAT ? RELIEFOS_DISK_FILESYSTEM_EXFAT :
             volume->filesystem==STORAGE_FILESYSTEM_EXT2 ? RELIEFOS_DISK_FILESYSTEM_EXT2 :
             volume->filesystem==STORAGE_FILESYSTEM_EXT3 ? RELIEFOS_DISK_FILESYSTEM_EXT3 :
-            volume->filesystem==STORAGE_FILESYSTEM_EXT4 ? RELIEFOS_DISK_FILESYSTEM_EXT4 : RELIEFOS_DISK_FILESYSTEM_UNKNOWN;
+            volume->filesystem==STORAGE_FILESYSTEM_EXT4 ? RELIEFOS_DISK_FILESYSTEM_EXT4 :
+            volume->filesystem==STORAGE_FILESYSTEM_SQUASHFS ? RELIEFOS_DISK_FILESYSTEM_SQUASHFS :
+            RELIEFOS_DISK_FILESYSTEM_UNKNOWN;
         if(!actual)return -EOPNOTSUPP;
         if(requested && requested!=actual)return -EINVAL;
         bool readonly=(volume->mount_flags&MS_RDONLY) || volume->read_only_reason;
@@ -266,7 +272,8 @@ static int storage_open_block_partition_owned(uint32_t disk_id, uint32_t partiti
                        disk_id, partition_index, ret);
         return ret;
     }
-    if (!disk_filesystem_format_supported(filesystem)) {
+    if (filesystem == RELIEFOS_DISK_FILESYSTEM_SQUASHFS && !(flags & MS_RDONLY)) return -EROFS;
+    if (filesystem != RELIEFOS_DISK_FILESYSTEM_SQUASHFS && !disk_filesystem_format_supported(filesystem)) {
         console_warn("[storage] mount unsupported filesystem disk=%u part=%u fs=%u\n",
                        disk_id, partition_index, filesystem);
         return -95;
@@ -308,7 +315,8 @@ static int storage_open_block_partition_owned(uint32_t disk_id, uint32_t partiti
     ret = storage_mount_filesystem(volume,filesystem == RELIEFOS_DISK_FILESYSTEM_FAT32 ? "vfat" :
           filesystem == RELIEFOS_DISK_FILESYSTEM_EXFAT ? "exfat" :
           filesystem == RELIEFOS_DISK_FILESYSTEM_EXT2 ? "ext2" :
-          filesystem == RELIEFOS_DISK_FILESYSTEM_EXT3 ? "ext3" : "ext4");
+          filesystem == RELIEFOS_DISK_FILESYSTEM_EXT3 ? "ext3" :
+          filesystem == RELIEFOS_DISK_FILESYSTEM_SQUASHFS ? "squashfs" : "ext4");
     if (ret == 0 &&
         ((filesystem == RELIEFOS_DISK_FILESYSTEM_FAT32 &&
           volume->filesystem != STORAGE_FILESYSTEM_FAT32) ||
@@ -326,6 +334,7 @@ static int storage_open_block_partition_owned(uint32_t disk_id, uint32_t partiti
         console_info("[reliefnt] storage opened data partition disk=%u entry=%u fs=%s\n",
                        disk_id, partition_index,
                        filesystem == RELIEFOS_DISK_FILESYSTEM_FAT32 ? "fat32" :
+                       filesystem == RELIEFOS_DISK_FILESYSTEM_SQUASHFS ? "squashfs" :
                        (filesystem == RELIEFOS_DISK_FILESYSTEM_EXFAT ? "exfat" :
                         (filesystem == RELIEFOS_DISK_FILESYSTEM_EXT4 ? "ext4" :
                          filesystem == RELIEFOS_DISK_FILESYSTEM_EXT3 ? "ext3" : "ext2")));

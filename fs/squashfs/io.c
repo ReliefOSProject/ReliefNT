@@ -55,7 +55,7 @@ static int metadata(struct storage_volume *volume, enum sqfs_table table, uint64
     if (rc) return rc;
     uint32_t length = size;
     if (!raw) {
-        rc = sqfs_inflate(fs->input, size, cache->data, SQFS_META_BYTES, &length);
+        rc = sqfs_decompress(fs, fs->input, size, cache->data, SQFS_META_BYTES, &length);
         if (rc) return rc;
         if (!length) return -EIO;
     }
@@ -91,14 +91,42 @@ int sqfs_meta_read(struct storage_volume *volume, enum sqfs_table table,
     return 0;
 }
 
-int sqfs_id(struct storage_volume *volume, uint16_t index, uint32_t *id)
+/* Keep the raw index bounded regardless of how many fragments or xattrs exist. */
+int sqfs_index_read(struct storage_volume *volume, enum sqfs_table table,
+                    uint32_t index, void *record)
 {
     struct sqfs_super *fs = volume->squashfs;
-    if (index >= fs->id_count) return -EIO;
-    struct sqfs_position pos = {fs->id_blocks[index / SQFS_IDS_PER_BLOCK],
-        index % SQFS_IDS_PER_BLOCK * 4u};
+    const struct sqfs_index *layout = &fs->index[table];
+    if (index >= layout->entries) return -EIO;
+    uint64_t entry = (uint64_t)index * layout->record_size;
+    uint64_t pointer = entry / SQFS_META_BYTES * 8;
+    uint64_t page = pointer / sizeof(fs->index_cache) * sizeof(fs->index_cache);
+    uint64_t disk = layout->disk + page;
+    if (!fs->index_cache_size || fs->index_cache_disk != disk) {
+        uint64_t bytes = ((uint64_t)layout->entries * layout->record_size + SQFS_META_BYTES - 1)
+            / SQFS_META_BYTES * 8;
+        uint32_t count = bytes - page < sizeof(fs->index_cache) ? (uint32_t)(bytes - page) :
+            sizeof(fs->index_cache);
+        fs->index_cache_size = 0;
+        int rc = sqfs_read_at(volume, disk, fs->index_cache, count, fs->bytes_used);
+        if (rc) return rc;
+        fs->index_cache_disk = disk;
+        fs->index_cache_size = count;
+    }
+    struct sqfs_position pos = {sqfs_u64(fs->index_cache + pointer - page), entry % SQFS_META_BYTES};
+    /* Fixed records never straddle a metadata block. */
+    int rc = metadata(volume, table, pos.block);
+    if (rc) return rc;
+    const struct sqfs_meta_cache *cache = &fs->meta[table];
+    if (!sqfs_range(pos.offset, layout->record_size, cache->length)) return -EIO;
+    __builtin_memcpy(record, cache->data + pos.offset, layout->record_size);
+    return 0;
+}
+
+int sqfs_id(struct storage_volume *volume, uint16_t index, uint32_t *id)
+{
     uint8_t field[4];
-    int rc = sqfs_meta_read(volume, SQFS_ID, &pos, field, sizeof(field));
+    int rc = sqfs_index_read(volume, SQFS_ID, index, field);
     if (!rc) *id = sqfs_u32(field);
     return rc;
 }

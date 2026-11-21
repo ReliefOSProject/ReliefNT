@@ -153,6 +153,14 @@ struct vfs_backend_ops {
                        const char *name,const struct vfs_path *target,bool *committed);
     int (*link_node)(void *context,const struct storage_node *source,
                      const struct storage_node *parent,const char *name);
+    /* A zero capacity obtains the required byte count. */
+    int (*getxattr)(void *context,const struct storage_node *node,const char *name,
+                    void *value,uint32_t capacity,uint32_t *length);
+    int (*listxattr)(void *context,const struct storage_node *node,void *names,
+                     uint32_t capacity,uint32_t *length,bool include_trusted);
+    /* Linux getdents accepts up to NAME_MAX bytes regardless of the legacy ABI. */
+    int (*readdir_name)(void *context,const struct storage_node *node,uint64_t *cursor,
+                        char *name,size_t capacity,uint64_t mount_flags);
 };
 struct vfs_path { struct vfs_mount *mount;struct vfs_dentry *dentry; };
 /** @brief Compare the actual pinned inode identity, including hardlink aliases.
@@ -613,7 +621,14 @@ int vfs_path_read(const struct vfs_path *path,uint64_t offset,void *buffer,
  */
 int vfs_path_read_cursor(const struct vfs_path *path,uint64_t offset,void *buffer,
                             uint32_t capacity,uint32_t *read,struct storage_read_cursor *cursor);
-/** @brief Enumerate a retained directory independently of its global name.
+/** @brief Enumerate the next native filename from a retained directory.
+ * @param path Borrowed held directory under execution ownership.
+ * @param cursor Required backend cursor, updated when an entry is returned.
+ * @param name Writable buffer for a NUL-terminated name, up to VFS_NAME_MAX bytes.
+ * @return One for an entry, zero for EOF, or negative errno.
+ */
+int vfs_path_readdir_name(const struct vfs_path *path,uint64_t *cursor,char name[VFS_NAME_MAX+1]);
+/** @brief Enumerate a retained directory into the legacy fixed-size entry ABI.
  * @param path Borrowed held directory under execution ownership.
  * @param cursor Required backend cursor, updated by the provider.
  * @param entry Required writable result entry.
@@ -621,6 +636,26 @@ int vfs_path_read_cursor(const struct vfs_path *path,uint64_t offset,void *buffe
  * pinned; no graph spinlock spans enumeration. Other types return ENOTDIR.
  */
 int vfs_path_readdir(const struct vfs_path *path,uint64_t *cursor,struct reliefos_dir_entry *entry);
+/** @brief Read an extended attribute from a retained path.
+ * @param path Borrowed retained object, with traversal and attribute access authorized.
+ * @param name Borrowed NUL-terminated attribute name including its namespace.
+ * @param value Writable result buffer, optional for a size query.
+ * @param capacity Result buffer size in bytes, or zero to query the required size.
+ * @param length Required output for the value size in bytes on success.
+ * @return Zero or negative errno. The provider stays pinned across I/O.
+ */
+int vfs_path_getxattr(const struct vfs_path *path,const char *name,void *value,
+                     uint32_t capacity,uint32_t *length);
+/** @brief List extended attributes of a retained path as NUL-terminated names.
+ * @param path Borrowed retained object with traversal authorized.
+ * @param names Writable result buffer, optional for a size query.
+ * @param capacity Result buffer size in bytes, or zero to query the required size.
+ * @param length Required output for the total list size in bytes on success.
+ * @param include_trusted True when the caller is authorized to enumerate trusted attributes.
+ * @return Zero or negative errno. The provider stays pinned across I/O.
+ */
+int vfs_path_listxattr(const struct vfs_path *path,void *names,uint32_t capacity,
+                      uint32_t *length,bool include_trusted);
 /** @brief Query or update metadata through an owned filesystem object.
  * @param path Borrowed retained path; its provider stays pinned.
  * @param value Writable result or borrowed new mode/uid/gid.

@@ -37,13 +37,13 @@ int sqfs_inode_read(struct storage_volume *volume, uint64_t ref, struct sqfs_ino
     if (rc) return rc;
     struct sqfs_inode n = {.disk_type = sqfs_u16(field), .mode = sqfs_u16(field + 2),
         .uid = sqfs_u16(field + 4), .gid = sqfs_u16(field + 6),
-        .time = sqfs_u32(field + 8), .number = sqfs_u32(field + 12)};
+        .time = sqfs_u32(field + 8), .number = sqfs_u32(field + 12),
+        .fragment = SQFS_INVALID_INDEX, .xattr = SQFS_INVALID_INDEX};
     if (!n.disk_type || n.disk_type >= sizeof(extra_size) || n.mode > 07777 ||
-        n.uid >= fs->id_count || n.gid >= fs->id_count || !n.number || n.number > fs->inodes)
+        n.uid >= fs->index[SQFS_ID].entries || n.gid >= fs->index[SQFS_ID].entries || !n.number || n.number > fs->inodes)
         return -EIO;
     rc = sqfs_meta_read(volume, SQFS_INODE, &position, field, extra_size[n.disk_type]);
     if (rc) return rc;
-    uint32_t fragment = UINT32_MAX, xattr = UINT32_MAX;
     switch (n.disk_type) {
     case 1:
         n.start = sqfs_u32(field);
@@ -56,11 +56,12 @@ int sqfs_inode_read(struct storage_volume *volume, uint64_t ref, struct sqfs_ino
         n.size = sqfs_u32(field + 4);
         n.start = sqfs_u32(field + 8);
         n.offset = sqfs_u16(field + 18);
-        xattr = sqfs_u32(field + 20);
+        n.xattr = sqfs_u32(field + 20);
         break;
     case 2:
         n.start = sqfs_u32(field);
-        fragment = sqfs_u32(field + 4);
+        n.fragment = sqfs_u32(field + 4);
+        n.fragment_offset = sqfs_u32(field + 8);
         n.size = sqfs_u32(field + 12);
         n.links = 1;
         break;
@@ -69,8 +70,9 @@ int sqfs_inode_read(struct storage_volume *volume, uint64_t ref, struct sqfs_ino
         n.size = sqfs_u64(field + 8);
         n.sparse = sqfs_u64(field + 16);
         n.links = sqfs_u32(field + 24);
-        fragment = sqfs_u32(field + 28);
-        xattr = sqfs_u32(field + 36);
+        n.fragment = sqfs_u32(field + 28);
+        n.fragment_offset = sqfs_u32(field + 32);
+        n.xattr = sqfs_u32(field + 36);
         break;
     case 3: case 10:
         n.links = sqfs_u32(field);
@@ -81,25 +83,33 @@ int sqfs_inode_read(struct storage_volume *volume, uint64_t ref, struct sqfs_ino
             rc = sqfs_meta_read(volume, SQFS_INODE, &after, NULL, (uint32_t)n.size);
             if (!rc) rc = sqfs_meta_read(volume, SQFS_INODE, &after, field, 4);
             if (rc) return rc;
-            xattr = sqfs_u32(field);
+            n.xattr = sqfs_u32(field);
         }
         break;
     case 4: case 5: case 11: case 12:
         n.links = sqfs_u32(field);
         n.rdev = sqfs_u32(field + 4); /* Linux new_encode_dev format. */
-        if (n.disk_type >= 8) xattr = sqfs_u32(field + 8);
+        if (n.disk_type >= 8) n.xattr = sqfs_u32(field + 8);
         break;
     default: /* FIFO and socket inodes */
         n.links = sqfs_u32(field);
-        if (n.disk_type >= 8) xattr = sqfs_u32(field + 4);
+        if (n.disk_type >= 8) n.xattr = sqfs_u32(field + 4);
         break;
     }
-    if (fragment != UINT32_MAX || xattr != UINT32_MAX) return -EOPNOTSUPP;
+    if (n.fragment != SQFS_INVALID_INDEX) {
+        uint32_t tail = n.size % fs->block_size;
+        if (n.fragment >= fs->index[SQFS_FRAGMENT].entries || !tail ||
+            !sqfs_range(n.fragment_offset, tail, fs->block_size)) return -EIO;
+    }
+    if (n.xattr != SQFS_INVALID_INDEX && n.xattr >= fs->index[SQFS_XATTR_ID].entries)
+        return -EIO;
     if (!n.links || n.size > INT64_MAX || n.sparse > n.size) return -EIO;
     if (sqfs_basic_type(n.disk_type) == 1 &&
         (n.size < 3 || n.offset >= SQFS_META_BYTES || (n.size > 3 &&
           n.start >= fs->end[SQFS_DIRECTORY] - fs->begin[SQFS_DIRECTORY]))) return -EIO;
-    if (sqfs_basic_type(n.disk_type) == 2 && n.size && n.start > fs->begin[SQFS_INODE]) return -EIO;
+    if (sqfs_basic_type(n.disk_type) == 2 && n.size &&
+        (n.fragment == SQFS_INVALID_INDEX || n.size >= fs->block_size) &&
+        n.start > fs->begin[SQFS_INODE]) return -EIO;
     n.extra = position;
     *out = n;
     return 0;

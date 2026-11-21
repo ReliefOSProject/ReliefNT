@@ -29,10 +29,10 @@ int swap_prepare_user_range(struct task *task,uint64_t p,uint64_t n,bool writing
 void storage_set_io_async_context(bool async){assert(!async);}
 uint64_t time_uptime_us(void){return 1;}
 uint64_t time_work_counter_us(void) { return time_uptime_us(); }
-int vfs_path_readdir(const struct vfs_path *path,uint64_t *cursor,struct reliefos_dir_entry *entry)
+int vfs_path_readdir_name(const struct vfs_path *path,uint64_t *cursor,char name[VFS_NAME_MAX+1])
 {(void)path;++reads;provider_owned=true;if(pending){pending=false;return -RELIEFOS_EAGAIN;}
  if(*cursor>=entries){provider_owned=false;return 0;}
- snprintf(entry->name,sizeof(entry->name),"%s",*cursor ? "second" : first_name);++*cursor;return 1;}
+ snprintf(name,VFS_NAME_MAX+1,"%s",*cursor ? "second" : first_name);++*cursor;return 1;}
 int vfs_path_dirent_stat(const struct vfs_path *path,const char *name,struct linux_stat_abi *out)
 {(void)path;(void)name;++stats;provider_owned=true;
  if(stat_pending){stat_pending=false;return -RELIEFOS_EAGAIN;}

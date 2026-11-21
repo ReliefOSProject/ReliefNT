@@ -1,11 +1,14 @@
 /* File-system syscall category boundary.  The legacy backend remains shared
  * while individual handlers are moved here incrementally. */
-#include <reliefnt/syscall_internal.h>
-#include <reliefnt/syscall.h>
+#include "../internal.h"
 
 int syscall_fs_owns(uint64_t number)
 {
     switch (number) {
+    case __NR_getxattr: case __NR_lgetxattr: case __NR_fgetxattr:
+    case __NR_listxattr: case __NR_llistxattr: case __NR_flistxattr:
+    case __NR_setxattr: case __NR_lsetxattr: case __NR_fsetxattr:
+    case __NR_removexattr: case __NR_lremovexattr: case __NR_fremovexattr:
     case LINUX_SYS_READ:
     case LINUX_SYS_WRITE:
     case LINUX_SYS_OPEN:
@@ -71,5 +74,7 @@ int syscall_fs_owns(uint64_t number)
 int64_t syscall_fs_dispatch(uint64_t number, uint64_t a0, uint64_t a1,
                             uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
 {
+    if (number >= __NR_setxattr && number <= __NR_fremovexattr)
+        return syscall_xattr(vfs_system_namespace(), sched_current_task(), number, a0, a1, a2, a3, a4);
     return syscall_dispatch_regs_legacy(number, a0, a1, a2, a3, a4, a5);
 }

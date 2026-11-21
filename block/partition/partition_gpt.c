@@ -236,6 +236,10 @@ int disk_partition_filesystem(struct install_disk_state *disk,
         *out_filesystem = RELIEFOS_DISK_FILESYSTEM_EXFAT;
         return 0;
     }
+    if (storage_memcmp(storage_scratch,"hsqs",4)==0) {
+        *out_filesystem=RELIEFOS_DISK_FILESYSTEM_SQUASHFS;
+        return 0;
+    }
     if (sectors > 2u) {
         ret = install_read_sectors(disk, entry->first_lba + 2u, 1u, storage_scratch);
         if (ret < 0) {

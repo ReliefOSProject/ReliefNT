@@ -7,12 +7,20 @@
 #define SQFS_MAGIC 0x73717368u
 #define SQFS_SUPER_BYTES 96u
 #define SQFS_META_BYTES 8192u
-#define SQFS_IDS_PER_BLOCK (SQFS_META_BYTES / 4u)
-#define SQFS_ID_BLOCKS (UINT16_MAX / SQFS_IDS_PER_BLOCK + 1u)
+#define SQFS_INVALID_INDEX UINT32_MAX
+#define SQFS_GZIP 1u
 #define SQFS_DATA_RAW (1u << 24)
 #define SQFS_DIR_CURSORS 4u
 
-enum sqfs_table { SQFS_INODE, SQFS_DIRECTORY, SQFS_ID, SQFS_TABLES };
+enum sqfs_table {
+    SQFS_INODE, SQFS_DIRECTORY, SQFS_ID, SQFS_FRAGMENT, SQFS_XATTR_ID, SQFS_XATTR, SQFS_TABLES
+};
+
+struct sqfs_index {
+    uint64_t disk;
+    uint32_t entries;
+    uint32_t record_size;
+};
 
 struct sqfs_position {
     uint64_t block; /* Absolute image byte offset of the metadata header. */
@@ -47,8 +55,13 @@ struct sqfs_super {
     uint64_t bytes_used, data_start, root;
     uint64_t device_generation;
     uint64_t begin[SQFS_TABLES], end[SQFS_TABLES];
-    uint64_t id_blocks[SQFS_ID_BLOCKS];
-    uint32_t inodes, id_count, block_size;
+    struct sqfs_index index[SQFS_TABLES];
+    uint64_t index_cache_disk;
+    uint32_t index_cache_size;
+    uint8_t index_cache[SECTOR_SIZE];
+    uint32_t inodes, block_size;
+    uint16_t compression;
+    void *codec;
     struct sqfs_meta_cache meta[SQFS_TABLES];
     struct sqfs_dir_cursor dir[SQFS_DIR_CURSORS];
     unsigned next_dir;
@@ -67,7 +80,7 @@ static inline bool sqfs_image_changed(const struct storage_volume *volume)
 struct sqfs_inode {
     struct sqfs_position extra;
     uint64_t size, start, sparse;
-    uint32_t number, time, links, rdev;
+    uint32_t number, time, links, rdev, fragment, fragment_offset, xattr;
     uint16_t disk_type, mode, uid, gid, offset;
 };
 
@@ -100,17 +113,25 @@ static inline unsigned sqfs_basic_type(unsigned type)
  * caches and scratch memory belong to the mounted volume, not global state. */
 int sqfs_read_at(struct storage_volume *, uint64_t, void *, uint32_t, uint64_t);
 int sqfs_meta_read(struct storage_volume *, enum sqfs_table, struct sqfs_position *, void *, uint32_t);
+int sqfs_index_read(struct storage_volume *, enum sqfs_table, uint32_t, void *);
 int sqfs_id(struct storage_volume *, uint16_t, uint32_t *);
+int sqfs_decompress(struct sqfs_super *, const uint8_t *, uint32_t, uint8_t *, uint32_t, uint32_t *);
 int sqfs_inflate(const uint8_t *, size_t, uint8_t *, size_t, uint32_t *);
 int sqfs_inode_read(struct storage_volume *, uint64_t, struct sqfs_inode *);
 int sqfs_node(struct storage_volume *, uint64_t, const struct sqfs_inode *, struct storage_node *);
 uint32_t sqfs_node_type(unsigned);
 int sqfs_lookup(struct storage_volume *, const struct storage_node *, const char *, struct storage_node *);
 int sqfs_readdir(struct storage_volume *, const struct storage_node *, uint64_t *, struct reliefos_dir_entry *, uint64_t);
+int sqfs_readdir_name(struct storage_volume *, const struct storage_node *, uint64_t *, char *,
+                      size_t, uint64_t);
 int sqfs_file_read(struct storage_volume *, const struct storage_node *, uint64_t, void *, uint32_t,
                    uint32_t *, struct storage_read_cursor *, uint64_t);
 int sqfs_readlink(struct storage_volume *, const struct storage_node *, char *, uint32_t, uint32_t *);
 int sqfs_stat(struct storage_volume *, const struct storage_node *, struct linux_stat_abi *);
+int sqfs_getxattr(struct storage_volume *, const struct storage_node *, const char *, void *,
+                  uint32_t, uint32_t *);
+int sqfs_listxattr(struct storage_volume *, const struct storage_node *, void *, uint32_t,
+                   uint32_t *, bool);
 int sqfs_permissions(struct storage_volume *, const struct storage_node *, struct reliefos_permissions *, bool);
 extern const struct storage_filesystem_ops storage_squashfs_ops;
 #endif
