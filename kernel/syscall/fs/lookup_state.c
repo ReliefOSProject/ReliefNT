@@ -454,7 +454,17 @@ int task_lookup_user_bytes(struct task *task,uint64_t user_ptr,uint32_t length,s
     while(snapshot->done<length) {
         uint32_t done=snapshot->done,chunk=length-done;if(chunk>32768u)chunk=32768u;
         int prep=swap_prepare_user_range(task,user_ptr+done,chunk,false);
-        if(prep || !user_range_ok(user_ptr+done,chunk)) {
+        if(!prep) {
+#ifdef CONFIG_SWAP
+            int fault=user_range_readable(user_ptr+done,chunk);
+            /* X11 writev and other imports can read a file-backed operand
+             * even when no swap entry was present. Keep the copied prefix. */
+            prep=fault==-EAGAIN ? SWAP_STORAGE_CONTENDED : fault;
+#else
+            prep=user_range_ok(user_ptr+done,chunk) ? 0 : -RELIEFOS_EFAULT;
+#endif
+        }
+        if(prep) {
             if(prep!=SWAP_STORAGE_CONTENDED || !saved) {
                 if(saved)saved->name=NULL;
                 kernel_free(snapshot);
