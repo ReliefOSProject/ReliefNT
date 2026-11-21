@@ -23,6 +23,8 @@ static struct storage_inode_ref *storage_inode_for_node(const struct storage_nod
             } else if(!ref->unlinked && node->entry_id==ref->node.entry_id &&
                       node->type==ref->node.type &&
                       (!(node->flags & STORAGE_NODE_FLAG_ROOT) || node->first_cluster==ref->node.first_cluster))return ref;
+        } else if(node->flags&STORAGE_NODE_FLAG_SQUASHFS) {
+            if(ref->node.entry_id==node->entry_id)return ref;
         } else if(ref->node.first_cluster==node->first_cluster)return ref;
     }
     return NULL;
@@ -213,7 +215,8 @@ int storage_inode_get(const struct storage_node *node, struct storage_inode_ref 
         !(node->flags & ~STORAGE_NODE_FLAG_ROOT) &&
         (node->type == RELIEFOS_FS_TYPE_FILE || node->type == RELIEFOS_FS_TYPE_DIR);
     bool clustered=storage_inode_clustered(node);
-    if (!(node->flags & (STORAGE_NODE_FLAG_EXT2 | STORAGE_NODE_FLAG_TMPFS)) && !optical && !clustered) return 0;
+    bool squashfs=(node->flags&STORAGE_NODE_FLAG_SQUASHFS)!=0;
+    if (!(node->flags & (STORAGE_NODE_FLAG_EXT2 | STORAGE_NODE_FLAG_TMPFS)) && !optical && !clustered && !squashfs) return 0;
     if ((node->flags & STORAGE_NODE_FLAG_EXT_FAMILY) && node->mount_generation &&
         (node->volume_id >= STORAGE_MAX_VOLUMES ||
          node->mount_generation != g_volumes[node->volume_id].mount_generation)) return -116;
@@ -244,7 +247,7 @@ int storage_inode_get(const struct storage_node *node, struct storage_inode_ref 
         }
         storage_restore_volume(previous);
         if(ret){kernel_free(ref);kernel_execution_unlock_irqrestore(flags);return ret;}
-        *ref=(struct storage_inode_ref){.node=*node,.read_only=optical,.next=storage_inode_refs};
+        *ref=(struct storage_inode_ref){.node=*node,.read_only=optical||squashfs,.next=storage_inode_refs};
         storage_inode_refs=ref;
     }
     if(clustered) {

@@ -1,0 +1,2 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := type.o super.o io.o inode.o directory.o file.o inflate.o

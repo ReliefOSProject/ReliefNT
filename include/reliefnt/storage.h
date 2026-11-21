@@ -291,6 +291,7 @@ struct storage_read_cursor {
 #define STORAGE_NODE_FLAG_MEMFD 0x00080000u
 /* Native inode carrying st_rdev; first_cluster remains its inode identity. */
 #define STORAGE_NODE_FLAG_RDEV 0x00100000u
+#define STORAGE_NODE_FLAG_SQUASHFS 0x00200000u
 #define STORAGE_SYSFS_DEVICE 202u
 #define STORAGE_NODE_FLAG_DEV_LINK 0x00000200u
 /* Anonymous filesystem device numbers, also exported in proc mountinfo. */

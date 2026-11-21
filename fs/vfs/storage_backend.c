@@ -236,7 +236,8 @@ static int storage_vfs_describe(struct vfs_mount *mount,const struct storage_vol
     if(!filesystem)return -EOPNOTSUPP;
     char source[RELIEFOS_FS_PATH_LEN];
     if(volume->tmpfs)storage_copy_text(source,sizeof(source),volume->tmpfs_source[0] ? volume->tmpfs_source : "tmpfs");
-    else if(volume->transport==STORAGE_TRANSPORT_MEMORY)storage_copy_text(source,sizeof(source),"ramdisk");
+    else if(volume->transport==STORAGE_TRANSPORT_MEMORY && !volume->data_partition_mount)
+        storage_copy_text(source,sizeof(source),"ramdisk");
     else if(volume->filesystem==STORAGE_FILESYSTEM_ISO9660) {
         int rc=storage_disk_device_name(volume->source_disk_id,-1,source,sizeof(source));if(rc)return rc;
     } else if(volume->data_partition_mount) {

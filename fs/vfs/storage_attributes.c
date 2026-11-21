@@ -16,7 +16,8 @@ int storage_backend_getattr(void *context,const struct vfs_path *path,struct lin
 {
     struct storage_volume *volume=context;const struct storage_node *node=vfs_path_node(path);
     if(!volume || !node || node->volume_id!=volume->volume_id)return -EINVAL;
-    if(node->flags&(STORAGE_NODE_FLAG_TMPFS|STORAGE_NODE_FLAG_EXT2))return storage_inode_stat(node,out);
+    if(node->flags&(STORAGE_NODE_FLAG_TMPFS|STORAGE_NODE_FLAG_EXT2|STORAGE_NODE_FLAG_SQUASHFS))
+        return storage_inode_stat(node,out);
     struct storage_node current=*node;int rc=storage_inode_refresh(&current);
     if(!rc)rc=vfs_stat_basic(&current,out);
     struct reliefos_permissions mode;
