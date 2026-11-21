@@ -60,8 +60,7 @@ int framebuffer_set_mode(uint32_t width, uint32_t height)
         return device.available && device.width == width && device.height == height
                    ? 0 : -1;
     if (!device.available || !(device.capabilities & FRAMEBUFFER_CAP_MODE_SET) ||
-        (device.backend != FRAMEBUFFER_BACKEND_BOCHS_VBE &&
-         device.backend != FRAMEBUFFER_BACKEND_VMWARE_SVGA) ||
+        device.backend != FRAMEBUFFER_BACKEND_BOCHS_VBE ||
         !width || !height || width > device.max_width || height > device.max_height ||
         (uint64_t)width * height * 4u > device.max_bytes)
         return -1;
@@ -69,7 +68,6 @@ int framebuffer_set_mode(uint32_t width, uint32_t height)
         return 0;
 
     ++hardware_write_count;
-    if (device.backend == FRAMEBUFFER_BACKEND_VMWARE_SVGA)
         ++trace_change_count;
     device.width = width;
     device.height = height;
@@ -281,7 +279,7 @@ static void test_now_current_mode_is_a_noop(void)
     assert(framebuffer_fbdev_put_var(&var) == 0);
     assert_no_side_effects(&before, 0, 0, 0);
 
-    setup_fb(32, FRAMEBUFFER_BACKEND_VMWARE_SVGA);
+    setup_fb(32, FRAMEBUFFER_BACKEND_BOCHS_VBE);
     before = device;
     var = make_var(800, 600, 32);
     assert(framebuffer_fbdev_put_var(&var) == 0);
@@ -322,7 +320,7 @@ static void test_lease_noop_does_not_claim_a_format_change(void)
     struct fb_var_screeninfo var = make_var(800, 600, 32);
     struct fb_var_screeninfo requested = var;
 
-    setup_fb(24, FRAMEBUFFER_BACKEND_VMWARE_SVGA);
+    setup_fb(24, FRAMEBUFFER_BACKEND_BOCHS_VBE);
     before = device;
     drm_lease_active = true;
     assert(framebuffer_fbdev_put_var(&var) == -LINUX_EINVAL);
@@ -336,13 +334,12 @@ static void test_lease_rejects_different_size_without_scanout_side_effects(void)
     struct fb_var_screeninfo var = make_var(1024, 768, 32);
     struct fb_var_screeninfo requested = var;
 
-    setup_fb(24, FRAMEBUFFER_BACKEND_VMWARE_SVGA);
+    setup_fb(24, FRAMEBUFFER_BACKEND_BOCHS_VBE);
     before = device;
     drm_lease_active = true;
     assert(framebuffer_fbdev_put_var(&var) == -LINUX_EINVAL);
     assert(memcmp(&var, &requested, sizeof(var)) == 0);
-    /* One mode-set attempt reaches the lease guard; it performs no write or
-     * SVGA trace transition and leaves the complete device state untouched. */
+    /* The mode-set attempt reaches the lease guard before changing device state. */
     assert_no_side_effects(&before, 1, 0, 0);
 }
 
@@ -453,7 +450,7 @@ static void test_invalid_formats_ranges_and_activation_are_rejected(void)
 static void test_fixed_screeninfo_exports_physical_memory(void)
 {
     struct fb_fix_screeninfo info;
-    setup_fb(32, FRAMEBUFFER_BACKEND_VMWARE_SVGA);
+    setup_fb(32, FRAMEBUFFER_BACKEND_BOCHS_VBE);
     assert(framebuffer_fbdev_get_fix_info(&device, &info));
     assert(info.smem_start == framebuffer_physical);
     assert(info.smem_start != (uint64_t)framebuffer_alias);

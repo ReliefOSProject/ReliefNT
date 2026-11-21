@@ -1,10 +1,7 @@
 #include "drm_internal.h"
-#ifdef CONFIG_DRM_VIRTIO_GPU
-#include "virtio/internal.h"
-#endif
+#include <reliefnt/console.h>
 
 #include <drm/drm_mode.h>
-#include <drm/vmwgfx_drm.h>
 #include <linux/capability.h>
 #include <linux/errno.h>
 #include <reliefnt/heap.h>
@@ -55,8 +52,6 @@ int drm_user_import(struct task *task,void *destination,uint64_t address,uint32_
 #define DRM_IOCTL_REQUIRED_OUT (_IOC_READ << _IOC_DIRSHIFT)
 #define DRM_IOCTL_INTERFACE_MAJOR 1
 #define DRM_IOCTL_INTERFACE_MINOR 4
-#define DRM_IOCTL_DRIVER_MAJOR 2
-#define DRM_IOCTL_DRIVER_MINOR 1
 
 enum drm_ioctl_handler {
     DRM_HANDLER_UNSUPPORTED,
@@ -73,17 +68,7 @@ enum drm_ioctl_handler {
     DRM_HANDLER_BO,
     DRM_HANDLER_PRIME,
     DRM_HANDLER_KMS,
-    DRM_HANDLER_VMW_CAPS,
-    DRM_HANDLER_VMW_RESOURCE,
-    DRM_HANDLER_VMW_EXECBUF,
-    DRM_HANDLER_VIRTIO,
-};
-
-enum drm_ioctl_permission {
-    DRM_PERMISSION_AUTH = 1u << 0,
-    DRM_PERMISSION_MASTER = 1u << 1,
-    DRM_PERMISSION_ADMIN = 1u << 2,
-    DRM_PERMISSION_RENDER_ALLOW = 1u << 3,
+    DRM_HANDLER_DRIVER,
 };
 
 struct drm_ioctl_desc {
@@ -98,10 +83,7 @@ static const char *drm_ioctl_handler_name(enum drm_ioctl_handler handler)
     case DRM_HANDLER_BO: return "bo";
     case DRM_HANDLER_PRIME: return "prime";
     case DRM_HANDLER_KMS: return "kms";
-    case DRM_HANDLER_VMW_CAPS: return "vmw_caps";
-    case DRM_HANDLER_VMW_RESOURCE: return "vmw_resource";
-    case DRM_HANDLER_VMW_EXECBUF: return "execbuf";
-    case DRM_HANDLER_VIRTIO: return "virtio";
+    case DRM_HANDLER_DRIVER: return "driver";
     case DRM_HANDLER_VERSION: return "version";
     case DRM_HANDLER_GET_UNIQUE: return "get_unique";
     case DRM_HANDLER_GET_MAGIC: return "get_magic";
@@ -115,36 +97,6 @@ static const char *drm_ioctl_handler_name(enum drm_ioctl_handler handler)
     case DRM_HANDLER_UNSUPPORTED: return "unsupported";
     }
     return "unknown";
-}
-
-static const char *drm_ioctl_failure_stage(
-    const struct drm_ioctl_desc *desc, uint32_t command)
-{
-    if (!desc) return "ioctl.return";
-    if (desc->handler == DRM_HANDLER_VMW_RESOURCE) {
-        switch (_IOC_NR(command)) {
-        case DRM_COMMAND_BASE + DRM_VMW_CREATE_CONTEXT:
-            return "resource.context";
-        case DRM_COMMAND_BASE + DRM_VMW_CREATE_SURFACE:
-            return "resource.surface";
-        default:
-            return "resource.ioctl";
-        }
-    }
-    if (desc->handler == DRM_HANDLER_VMW_EXECBUF) {
-        switch (_IOC_NR(command)) {
-        case DRM_COMMAND_BASE + DRM_VMW_EXECBUF:
-            return "execbuf.return";
-        case DRM_COMMAND_BASE + DRM_VMW_FENCE_WAIT:
-            return "fence.wait";
-        case DRM_COMMAND_BASE + DRM_VMW_FENCE_SIGNALED:
-            return "fence.signaled";
-        default:
-            return "execbuf.ioctl";
-        }
-    }
-    if (desc->handler == DRM_HANDLER_BO) return "bo.ioctl";
-    return "ioctl.dispatch";
 }
 
 #define DRM_IOCTL_ENTRY(command_, handler_) \
@@ -255,88 +207,27 @@ static const struct drm_ioctl_desc drm_ioctl_table[] = {
     DRM_IOCTL_DENY_ENTRY(DRM_IOCTL_MODE_LIST_LESSEES, DRM_PERMISSION_MASTER),
     DRM_IOCTL_DENY_ENTRY(DRM_IOCTL_MODE_GET_LEASE, DRM_PERMISSION_MASTER),
     DRM_IOCTL_DENY_ENTRY(DRM_IOCTL_MODE_REVOKE_LEASE, DRM_PERMISSION_MASTER),
-    /* These vmwgfx operations carry Linux DRM_RENDER_ALLOW. The render
-     * permission is explicit; all object authority remains per-file. */
-    { .command = DRM_IOWR(DRM_COMMAND_BASE + DRM_VMW_ALLOC_BO,
-                          union drm_vmw_alloc_bo_arg),
-      .handler = DRM_HANDLER_BO, .permission = DRM_PERMISSION_RENDER_ALLOW },
-    { .command = DRM_IOW(DRM_COMMAND_BASE + DRM_VMW_UNREF_DMABUF,
-                         struct drm_vmw_handle_close_arg),
-      .handler = DRM_HANDLER_BO, .permission = DRM_PERMISSION_RENDER_ALLOW },
-    { .command = DRM_IOW(DRM_COMMAND_BASE + DRM_VMW_SYNCCPU,
-      struct drm_vmw_synccpu_arg),
-      .handler = DRM_HANDLER_VMW_EXECBUF,
-      .permission = DRM_PERMISSION_RENDER_ALLOW },
-    { .command = DRM_IOWR(DRM_COMMAND_BASE + DRM_VMW_GET_PARAM,
-                          struct drm_vmw_getparam_arg),
-      .handler = DRM_HANDLER_VMW_CAPS,
-      .permission = DRM_PERMISSION_RENDER_ALLOW },
-    { .command = DRM_IOR(DRM_COMMAND_BASE + DRM_VMW_CREATE_CONTEXT,
-                         struct drm_vmw_context_arg),
-      .handler = DRM_HANDLER_VMW_RESOURCE,
-      .permission = DRM_PERMISSION_RENDER_ALLOW },
-    { .command = DRM_IOW(DRM_COMMAND_BASE + DRM_VMW_UNREF_CONTEXT,
-                         struct drm_vmw_context_arg),
-      .handler = DRM_HANDLER_VMW_RESOURCE,
-      .permission = DRM_PERMISSION_RENDER_ALLOW },
-    { .command = DRM_IOWR(DRM_COMMAND_BASE + DRM_VMW_CREATE_SURFACE,
-                          union drm_vmw_surface_create_arg),
-      .handler = DRM_HANDLER_VMW_RESOURCE,
-      .permission = DRM_PERMISSION_RENDER_ALLOW },
-    { .command = DRM_IOW(DRM_COMMAND_BASE + DRM_VMW_UNREF_SURFACE,
-                         struct drm_vmw_surface_arg),
-      .handler = DRM_HANDLER_VMW_RESOURCE,
-      .permission = DRM_PERMISSION_RENDER_ALLOW },
-    { .command = DRM_IOWR(DRM_COMMAND_BASE + DRM_VMW_REF_SURFACE,
-                          union drm_vmw_surface_reference_arg),
-      .handler = DRM_HANDLER_VMW_RESOURCE,
-      .permission = DRM_PERMISSION_RENDER_ALLOW },
-    { .command = DRM_IOW(DRM_COMMAND_BASE + DRM_VMW_GET_3D_CAP,
-                         struct drm_vmw_get_3d_cap_arg),
-      .handler = DRM_HANDLER_VMW_CAPS,
-      .permission = DRM_PERMISSION_RENDER_ALLOW },
-    { .command = DRM_IOW(DRM_COMMAND_BASE + DRM_VMW_EXECBUF,
-                         struct drm_vmw_execbuf_arg),
-      .handler = DRM_HANDLER_VMW_EXECBUF,
-      .permission = DRM_PERMISSION_RENDER_ALLOW },
-    { .command = DRM_IOWR(DRM_COMMAND_BASE + DRM_VMW_FENCE_WAIT,
-                          struct drm_vmw_fence_wait_arg),
-      .handler = DRM_HANDLER_VMW_EXECBUF,
-      .permission = DRM_PERMISSION_RENDER_ALLOW },
-    { .command = DRM_IOWR(DRM_COMMAND_BASE + DRM_VMW_FENCE_SIGNALED,
-                          struct drm_vmw_fence_signaled_arg),
-      .handler = DRM_HANDLER_VMW_EXECBUF,
-      .permission = DRM_PERMISSION_RENDER_ALLOW },
-    { .command = DRM_IOW(DRM_COMMAND_BASE + DRM_VMW_FENCE_UNREF,
-                         struct drm_vmw_fence_arg),
-      .handler = DRM_HANDLER_VMW_EXECBUF,
-      .permission = DRM_PERMISSION_RENDER_ALLOW },
 };
 
-#ifdef CONFIG_DRM_VIRTIO_GPU
-#define VG_IOCTL_ENTRY(command_) { .command=(command_),.handler=DRM_HANDLER_VIRTIO,.permission=DRM_PERMISSION_RENDER_ALLOW }
-static const struct drm_ioctl_desc virtio_ioctl_table[]={
-    VG_IOCTL_ENTRY(DRM_IOCTL_VIRTGPU_MAP),VG_IOCTL_ENTRY(DRM_IOCTL_VIRTGPU_EXECBUFFER),
-    VG_IOCTL_ENTRY(DRM_IOCTL_VIRTGPU_GETPARAM),VG_IOCTL_ENTRY(DRM_IOCTL_VIRTGPU_RESOURCE_CREATE),
-    VG_IOCTL_ENTRY(DRM_IOCTL_VIRTGPU_RESOURCE_INFO),VG_IOCTL_ENTRY(DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST),
-    VG_IOCTL_ENTRY(DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST),VG_IOCTL_ENTRY(DRM_IOCTL_VIRTGPU_WAIT),
-    VG_IOCTL_ENTRY(DRM_IOCTL_VIRTGPU_GET_CAPS),VG_IOCTL_ENTRY(DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB),
-    VG_IOCTL_ENTRY(DRM_IOCTL_VIRTGPU_CONTEXT_INIT),
-};
-#endif
-
-static const struct drm_ioctl_desc *drm_ioctl_find(uint32_t command)
+static const struct drm_ioctl_desc *drm_ioctl_find(const struct drm_file *file,
+                                                   uint32_t command,
+                                                   struct drm_ioctl_desc *private)
 {
     uint32_t type = _IOC_TYPE(command);
     uint32_t number = _IOC_NR(command);
     if (type != DRM_IOCTL_BASE) return NULL;
-#ifdef CONFIG_DRM_VIRTIO_GPU
-    if(drm_is_virtio() && number>=DRM_COMMAND_BASE && number<DRM_COMMAND_END) {
-        for(unsigned i=0;i<sizeof(virtio_ioctl_table)/sizeof(virtio_ioctl_table[0]);++i)
-            if(_IOC_NR(virtio_ioctl_table[i].command)==number)return &virtio_ioctl_table[i];
+    if (number >= DRM_COMMAND_BASE && number < DRM_COMMAND_END) {
+        const struct drm_driver *driver = file->device->driver;
+        for (unsigned i = 0; i < driver->ioctl_count; ++i) {
+            const struct drm_driver_ioctl *entry = &driver->ioctls[i];
+            if (_IOC_NR(entry->command) == number) {
+                *private = (struct drm_ioctl_desc){entry->command, DRM_HANDLER_DRIVER,
+                                                   entry->permission};
+                return private;
+            }
+        }
         return NULL;
     }
-#endif
     for (uint32_t i = 0; i < sizeof(drm_ioctl_table) / sizeof(drm_ioctl_table[0]); ++i) {
         if (_IOC_TYPE(drm_ioctl_table[i].command) == type &&
             _IOC_NR(drm_ioctl_table[i].command) == number)
@@ -387,12 +278,10 @@ static int drm_copy_field(struct task *task, uint64_t address, size_t *length,
     return 0;
 }
 
-static int drm_ioctl_version(struct task *task, struct drm_version *version)
+static int drm_ioctl_version(struct task *task, const struct drm_driver *driver,
+                             struct drm_version *version)
 {
-    const char *name="vmwgfx",*description="Linux drm driver for VMware graphics devices";
-#ifdef CONFIG_DRM_VIRTIO_GPU
-    if(drm_is_virtio()){name="virtio_gpu";description="virtio GPU";}
-#endif
+    const char *name = driver->name, *description = driver->description;
 #ifdef CONFIG_SWAP
     /* Prepare every actually used output before the first field is copied. */
     const uint64_t addresses[]={(uint64_t)(uintptr_t)version->name,
@@ -416,12 +305,9 @@ static int drm_ioctl_version(struct task *task, struct drm_version *version)
         ret = drm_copy_field(task, (uint64_t)(uintptr_t)version->desc,
                              &version->desc_len,
                              description);
-    version->version_major = DRM_IOCTL_DRIVER_MAJOR;
-    version->version_minor = DRM_IOCTL_DRIVER_MINOR;
-    version->version_patchlevel = 0;
-#ifdef CONFIG_DRM_VIRTIO_GPU
-    if(drm_is_virtio()){version->version_major=0;version->version_minor=1;}
-#endif
+    version->version_major = driver->major;
+    version->version_minor = driver->minor;
+    version->version_patchlevel = driver->patchlevel;
     return ret;
 }
 
@@ -482,6 +368,7 @@ static int drm_ioctl_auth_magic(struct drm_file *file, const struct drm_auth *au
 static int drm_ioctl_set_version(struct drm_file *file,
                                  struct drm_set_version *version)
 {
+    const struct drm_driver *driver = file->device->driver;
     int ret = 0;
     if (version->drm_di_major != -1) {
         if (version->drm_di_major != DRM_IOCTL_INTERFACE_MAJOR ||
@@ -514,31 +401,26 @@ static int drm_ioctl_set_version(struct drm_file *file,
         }
     }
     if (version->drm_dd_major != -1 &&
-        (version->drm_dd_major != DRM_IOCTL_DRIVER_MAJOR ||
+        (version->drm_dd_major != driver->major ||
          version->drm_dd_minor < 0 ||
-         version->drm_dd_minor > DRM_IOCTL_DRIVER_MINOR))
+         version->drm_dd_minor > driver->minor))
         ret = -LINUX_EINVAL;
 out:
     version->drm_di_major = DRM_IOCTL_INTERFACE_MAJOR;
     version->drm_di_minor = DRM_IOCTL_INTERFACE_MINOR;
-    version->drm_dd_major = DRM_IOCTL_DRIVER_MAJOR;
-    version->drm_dd_minor = DRM_IOCTL_DRIVER_MINOR;
+    version->drm_dd_major = driver->major;
+    version->drm_dd_minor = driver->minor;
     return ret;
 }
 
-static int drm_ioctl_get_cap(struct drm_get_cap *cap)
+static int drm_ioctl_get_cap(const struct drm_driver *driver, struct drm_get_cap *cap)
 {
     cap->value = 0;
-#ifdef CONFIG_DRM_VIRTIO_GPU
-    if(drm_is_virtio()) {
-        switch(cap->capability) {
-        case DRM_CAP_CURSOR_WIDTH:case DRM_CAP_CURSOR_HEIGHT:cap->value=64;return 0;
-        case DRM_CAP_ADDFB2_MODIFIERS:case DRM_CAP_ASYNC_PAGE_FLIP:cap->value=0;return 0;
-        case DRM_CAP_CRTC_IN_VBLANK_EVENT:cap->value=1;return 0;
-        default:break;
-        }
+    if (driver->get_cap) {
+        int ret = driver->get_cap(cap);
+        if (ret != -EOPNOTSUPP)
+            return ret;
     }
-#endif
     if (cap->capability == DRM_CAP_TIMESTAMP_MONOTONIC) {
         cap->value = 1;
         return 0;
@@ -572,29 +454,42 @@ static int drm_ioctl_dispatch(struct task *task, struct drm_file *file,
                               uint32_t *created_handle_out,
                               uint32_t *created_fb_out,
                               int *created_fd_out,
-                              struct drm_vmwgfx_rollback_receipt *resource_receipt,
-                              struct drm_faildiag_context *diagnostics,
-                              uint64_t user_argument)
+                              uint32_t *created_object_out,
+                              struct drm_faildiag_context *diagnostics)
 {
+    const struct drm_driver *driver = file->device->driver;
     switch (desc->handler) {
     case DRM_HANDLER_VERSION:
-        return drm_ioctl_version(task, data);
+        return drm_ioctl_version(task, driver, data);
     case DRM_HANDLER_GET_UNIQUE:
         return drm_ioctl_get_unique(task, file, data);
     case DRM_HANDLER_GET_MAGIC:
         return drm_ioctl_get_magic(file, data);
     case DRM_HANDLER_GET_CAP:
-        return drm_ioctl_get_cap(data);
-    case DRM_HANDLER_SET_CLIENT_CAP:
-#ifdef CONFIG_DRM_VIRTIO_GPU
-        if(drm_is_virtio()) {
-            struct drm_set_client_cap *cap=data;
-            if(cap->capability==DRM_CLIENT_CAP_UNIVERSAL_PLANES && cap->value<=1) {
-                file->universal_planes=cap->value;return 0;
-            }
+        return drm_ioctl_get_cap(driver, data);
+    case DRM_HANDLER_SET_CLIENT_CAP: {
+        const struct drm_set_client_cap *cap = data;
+        if (driver->universal_planes && cap->capability == DRM_CLIENT_CAP_UNIVERSAL_PLANES &&
+            cap->value <= 1) {
+            file->universal_planes = cap->value;
+            return 0;
         }
-#endif
+        if (driver->atomic_modeset && cap->capability == DRM_CLIENT_CAP_ATOMIC) {
+            if (cap->value > 1)
+                return -LINUX_EINVAL;
+            file->atomic_modeset = file->universal_planes = cap->value;
+            if (!cap->value)
+                file->cursor_hotspot = false;
+            return 0;
+        }
+        if (driver->cursor_hotspot && cap->capability == DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT) {
+            if (!file->atomic_modeset || cap->value > 1)
+                return -LINUX_EINVAL;
+            file->cursor_hotspot = cap->value;
+            return 0;
+        }
         return -LINUX_EOPNOTSUPP;
+    }
     case DRM_HANDLER_SET_VERSION:
         return drm_ioctl_set_version(file, data);
     case DRM_HANDLER_SET_UNIQUE:
@@ -610,28 +505,14 @@ static int drm_ioctl_dispatch(struct task *task, struct drm_file *file,
                             diagnostics);
     case DRM_HANDLER_PRIME:
         return drm_prime_ioctl(task, file, command, data, created_fd_out,
-                               resource_receipt,created_handle_out);
+                               created_handle_out, created_object_out);
     case DRM_HANDLER_KMS:
-        return drm_kms_ioctl(task, file, command, data, created_fb_out,user_argument);
-    case DRM_HANDLER_VMW_CAPS:
-        return drm_vmwgfx_caps_ioctl(task, file, command, data);
-    case DRM_HANDLER_VMW_RESOURCE:
-        return drm_vmwgfx_resource_ioctl(task, file, command, data,
-                                         resource_receipt,user_argument);
-    case DRM_HANDLER_VMW_EXECBUF:
-        return (int)drm_vmwgfx_execbuf_ioctl(task, file, command, data,
-                                             user_argument, diagnostics);
+        return drm_kms_ioctl(task, file, command, data, created_fb_out);
     case DRM_HANDLER_UNSUPPORTED:
-#ifdef CONFIG_DRM_VIRTIO_GPU
-        if(drm_is_virtio())return vg_kms_ioctl(task,file,desc->command,data,created_fb_out);
-#endif
-        return -LINUX_EOPNOTSUPP;
-    case DRM_HANDLER_VIRTIO:
-#ifdef CONFIG_DRM_VIRTIO_GPU
-        return vg_ioctl(task,file,desc->command,data,created_handle_out,created_fd_out);
-#else
-        return -LINUX_EOPNOTSUPP;
-#endif
+        return drm_kms_ioctl(task, file, desc->command, data, created_fb_out);
+    case DRM_HANDLER_DRIVER:
+        return driver->ioctl(task, file, desc->command, data, created_handle_out,
+                             created_fd_out, created_object_out);
     }
     return -LINUX_EINVAL;
 }
@@ -641,30 +522,27 @@ int64_t drm_file_ioctl(struct task *task, struct task_file *task_file,
 {
     struct drm_file *file = task_file ? task_file->drm_file : NULL;
     const struct drm_ioctl_desc *desc;
+    struct drm_ioctl_desc private;
     uint32_t size, input_size, output_size, kernel_size;
     uint8_t local_data[128];
     uint8_t *data = local_data;
     bool allocated = false;
     uint32_t created_handle = 0;
     uint32_t created_fb = 0;
+    uint32_t created_object = 0;
     int created_fd = -1;
-    struct drm_vmwgfx_rollback_receipt resource_receipt = {0};
     struct drm_faildiag_context diagnostics = {
         .pid = task ? task->pid : 0,
         .command = command,
         .handler = DRM_HANDLER_UNSUPPORTED,
         .handler_name = "unknown",
     };
-    bool continuation_handled = false;
-    bool skip_input = false;
     int ret;
 
     if (!file) return -LINUX_EBADF;
     if (_IOC_TYPE(command) != DRM_IOCTL_BASE) return -LINUX_ENOTTY;
-    desc = drm_ioctl_find(command);
+    desc = drm_ioctl_find(file, command, &private);
     if (!desc) {
-        /* vmwgfx private ioctls and unknown core slots are not part of this
-         * primary-node compatibility slice. */
         drm_faildiag_record(&diagnostics, -LINUX_EINVAL, "ioctl.unknown",
                             NULL, 0);
         return -LINUX_EINVAL;
@@ -694,12 +572,7 @@ int64_t drm_file_ioctl(struct task *task, struct task_file *task_file,
     }
     if (kernel_size) __builtin_memset(data, 0, kernel_size);
     ret = 0;
-    if(!drm_is_virtio())ret = (int)drm_vmwgfx_prepare_ioctl_continuation(task, task_file, file,
-        command, argument, data, kernel_size, &continuation_handled,
-        &skip_input);
-    if (continuation_handled) goto out;
-    if (ret) goto out;
-    if (input_size && !skip_input) {
+    if (input_size) {
 #ifdef CONFIG_SWAP
         ret=drm_user_import(task,data,argument,input_size);
         if(ret)goto out;
@@ -720,25 +593,25 @@ int64_t drm_file_ioctl(struct task *task, struct task_file *task_file,
 #endif
     if (!ret) ret = drm_ioctl_dispatch(task, file, desc, command, data,
                                        &created_handle, &created_fb,
-                                       &created_fd,
-                                       &resource_receipt, &diagnostics,
-                                       argument);
+                                       &created_fd, &created_object, &diagnostics);
 #ifdef CONFIG_SWAP
-    if(ret==KERNEL_SYSCALL_SWAP_CONTENDED || ret==KERNEL_SYSCALL_DRM_ENUM_WAIT)goto out;
+    if (ret == KERNEL_SYSCALL_SWAP_CONTENDED) goto out;
 #endif
     if (output_size && user_copy_to_task(task, argument, data, output_size) < 0) {
+        const struct drm_driver *driver = file->device->driver;
+        if (!ret && (desc->handler == DRM_HANDLER_DRIVER || created_object ||
+                     desc->command == DRM_IOCTL_MODE_CREATEPROPBLOB) && driver->ioctl_rollback)
+            driver->ioctl_rollback(file, desc->command, data, created_object);
         ret = -LINUX_EFAULT;
         if (created_handle) (void)drm_bo_handle_delete(file, created_handle);
         if (created_fb) drm_kms_remove_fb(file, created_fb);
         if (created_fd >= 0) task_discard_file_fd(task, created_fd);
-        drm_vmwgfx_resource_rollback(file, &resource_receipt);
     }
 out:
     if (allocated) kernel_free(data);
-    if (ret < 0 && ret != KERNEL_SYSCALL_SWAP_CONTENDED &&
-        ret != KERNEL_SYSCALL_DRM_ENUM_WAIT && !diagnostics.attempted)
+    if (ret < 0 && ret != KERNEL_SYSCALL_SWAP_CONTENDED && !diagnostics.attempted)
         drm_faildiag_record(&diagnostics, ret,
-            drm_ioctl_failure_stage(desc, command), NULL, 0);
+            desc->handler == DRM_HANDLER_BO ? "bo.ioctl" : "ioctl.dispatch", NULL, 0);
     return ret;
 }
 

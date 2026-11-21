@@ -12,7 +12,6 @@
 #include <string.h>
 #include <drm/drm.h>
 #include <drm/drm_mode.h>
-#include <drm/vmwgfx_drm.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -34,7 +33,7 @@ static _Noreturn void fail(const char *operation)
  */
 static void require_busy(const char *operation)
 {errno=0;if(syscall(SYS_delete_module,"drm",O_NONBLOCK)!=-1 || errno!=EWOULDBLOCK)fail(operation);}
-/** @brief Resolve this actual SVGA PCI alias with the real staged target modprobe.
+/** @brief Resolve the VirtIO-GPU PCI alias with the staged target modprobe.
  * Guest-only task context; uses sysfs discovery and native modules.alias, with
  * no replacement dependency resolver or production policy embedded in the test.
  */
@@ -54,11 +53,11 @@ static void load_modalias(void)
             if(used==sizeof(alias)-1)fail("PCI alias bounds");
         }
         close(fd);alias[used]=0;
-        static const char expected[]="pci:v000015ADd00000405";
+        static const char expected[]="pci:v00001AF4d00001050";
         if(!strncmp(alias,expected,sizeof(expected)-1))break;
         alias[0]=0;
     }
-    closedir(directory);if(!alias[0])fail("find actual SVGA PCI alias");
+    closedir(directory);if(!alias[0])fail("find actual VirtIO-GPU PCI alias");
     alias[strcspn(alias,"\r\n")]=0;
     pid_t child=fork();if(child<0)fail("fork alias modprobe");
     if(!child){execl("/qa-busybox","busybox","modprobe","-b",alias,(char *)NULL);_exit(127);}
@@ -144,19 +143,11 @@ int main(void)
         if(!stat("/dev/dri/card0",&node) || errno!=ENOENT)fail("unloaded DRM has no primary node");
         load_modalias();
     }
-    fd=open("/dev/dri/card0",O_RDWR|O_CLOEXEC);if(fd<0)fail("open actual card");
-    struct drm_vmw_getparam_arg capability={.param=DRM_VMW_PARAM_3D};
-    unsigned long request=DRM_IOWR(DRM_COMMAND_BASE+DRM_VMW_GET_PARAM,struct drm_vmw_getparam_arg);
-    if(ioctl(fd,request,&capability) || capability.value>1)fail("native VGPU9 capability");
-    close(fd);
-    const char *modes[]={"expect-present","expect-bo","expect-kms","expect-prime","expect-resources",
+    const char *modes[]={"expect-present","expect-bo","expect-kms",
         "positional-pread64","positional-preadv","positional-preadv2","positional-preadv2-current",
         "positional-preadv2-hipri","positional-preadv2-current-hipri","positional-preadv-zero-negative",
         "positional-preadv2-zero-negative","positional-lseek","positional-interruptible"};
     for(size_t i=0;i<sizeof(modes)/sizeof(*modes);++i) {
-        if(!capability.value && (!strcmp(modes[i],"expect-prime") || !strcmp(modes[i],"expect-resources"))) {
-            printf("SKIP MODULE_DRM_3D %s: device reports VGPU9 unavailable\n",modes[i]);continue;
-        }
         printf("MODULE_DRM_BEGIN %s\n",modes[i]);
         pid_t child=fork();if(child<0)fail("fork contract child");
         if(!child){execl("/qa-drm-probe","drm-probe",modes[i],(char *)NULL);_exit(127);}

@@ -33,6 +33,14 @@ Third-party components in this repository
   their complete license texts. The independent implementation in
   drivers/virtio/ and drivers/video/drm/virtio/ is Apache-2.0; no Linux
   DRM driver implementation is imported or relicensed.
+* VMware SVGA II protocol and ioctl definitions from torvalds/linux commit
+  aebb7274476403040d582c61478df8f4a7bf9cd3. The files in
+  drivers/video/drm/svga/protocol/ come from
+  drivers/gpu/drm/vmwgfx/device_include/ under the MIT option of GPL-2.0 OR
+  MIT. vm_basic_types.h retains a subset of the upstream types and macros.
+  include/uapi/drm/vmwgfx_drm.h is unchanged and is used under its MIT option.
+  drivers/video/drm/svga/host.c and mksstat.c adapt vmwgfx_msg.c under MIT.
+  The corresponding sources retain VMware's copyright and license notices.
 * GNU Unifont 18.0.01 (unifont_all-18.0.01.hex.gz, the pinned build input
   fetched into cache/downloads by `make fetch` from the URL recorded in
   configs/dependencies.lock.json): the compiled fonts are covered by the SIL

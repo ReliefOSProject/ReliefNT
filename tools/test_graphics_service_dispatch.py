@@ -4,7 +4,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 ROOT=Path(__file__).resolve().parents[1]
-SOURCES=("drivers/tty/pty/vt.c", "drivers/video/framebuffer/vmware.c", "drivers/video/svga/device.c",
+SOURCES=("drivers/tty/pty/vt.c", "drivers/video/framebuffer/panic.c", "drivers/console/core.c",
          "fs/devfs/devfs.c", "fs/sysfs/sysfs.c", "kernel/exec/userland.c", "kernel/sched/exec.c",
          "kernel/signal/signal.c", "kernel/syscall/fd/descriptor.c", "kernel/syscall/entry.c")
 with tempfile.TemporaryDirectory(prefix="reliefnt-graphics-service-dispatch-") as directory:
@@ -17,4 +17,4 @@ with tempfile.TemporaryDirectory(prefix="reliefnt-graphics-service-dispatch-") a
         direct=[line for line in imports.splitlines() if line.split()[-1].startswith("drm_")]
         if direct:remaining[source]=direct
     if remaining:raise AssertionError("Permanent objects still import DRM implementation: "+repr(remaining))
-    print("PASS permanent console/VT/SVGA/devfs/sysfs/scheduler/signal/syscall ELF consumers have no direct DRM imports")
+    print("PASS permanent console/VT/framebuffer/devfs/sysfs/scheduler/signal/syscall ELF consumers have no direct DRM imports")

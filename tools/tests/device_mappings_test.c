@@ -15,6 +15,33 @@ static void release(void *context){assert(context==&references && references);--
 static void destroy(void *context){assert(context==&references && !references);++destroyed;}
 static uint64_t physical(void *context,uint64_t offset){assert(context==&references && references);return 0x24000000u+offset;}
 static const struct device_mapping_operations operations={.release=release,.destroy=destroy,.physical=physical};
+static int prepare_cpu(void *context, uint64_t offset, bool writable)
+{
+    assert(context == &references && offset == 0);
+    return writable && fail_heap ? -EIO : 0;
+}
+
+static void test_cpu_access(void)
+{
+    const struct device_mapping_operations coherent_ops = {
+        .release = release, .physical = physical, .prepare_cpu = prepare_cpu,
+    };
+    struct device_mapping_access access = {0};
+    const struct device_mapping_info info = {.length = 4096, .max_prot = 3, .access = &access};
+    struct device_mapping *mapping = NULL;
+    references = 1;
+    assert(!device_mapping_create(NULL, &coherent_ops, &references, &info, &mapping));
+    assert(!device_mapping_prepare_cpu(mapping, 0, false));
+    assert(access.exposed && !access.write_epoch);
+    fail_heap = true;
+    assert(device_mapping_prepare_cpu(mapping, 0, true) == -EIO && !access.write_epoch);
+    fail_heap = false;
+    assert(!device_mapping_prepare_cpu(mapping, 0, true) && access.write_epoch == 1);
+    assert(!device_mapping_prepare_cpu(mapping, 0, true) && access.write_epoch == 1);
+    assert(device_mapping_prepare_cpu(mapping, 4096, true) == -EINVAL);
+    device_mapping_put(mapping);
+}
+
 int main(void)
 {
     struct module owner={0};struct module_runtime *runtime=kernel_malloc(sizeof(*runtime));assert(runtime);
@@ -42,5 +69,6 @@ int main(void)
     info.max_prot=1;assert(!device_mapping_create(NULL,&operations,&references,&info,&mapping));
     device_mapping_put(mapping);assert(!references && destroyed==2 && !allocations);
     device_mapping_put(NULL);
+    test_cpu_access();
     puts("PASS generic device VMA: COMING admission, independent module pin, callback-free fork/split sharing, exact physical bounds, final backend release/destroy and OOM rollback");
 }

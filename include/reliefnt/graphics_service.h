@@ -22,9 +22,6 @@ struct graphics_service_operations {
     bool (*kms_scanout_active)(void);
     void (*kms_vt_release)(void);
     uint32_t (*process_retirements)(uint32_t budget);
-    void (*cancel_task_continuation)(struct task *task);
-    bool (*task_uninterruptible)(const struct task *task);
-    bool (*task_signal_busy)(const struct task *task);
     void (*panic_prepare)(void);
     void (*panic_damage)(uint32_t x,uint32_t y,uint32_t width,uint32_t height);
     void (*panic_present)(void);
@@ -83,26 +80,6 @@ uint32_t graphics_service_process_retirements(uint32_t budget);
  * IRQ/task-safe core registry snapshot, no optional callback or retained pin.
  */
 bool graphics_service_present(void);
-/** @brief Cancel optional graphics syscall continuation ownership for one task.
- * @param task Execution-owned task, nullable; core never dereferences optional state.
- * Execution-owned task context; no registry lock spans the callback or wait.
- * The core drops both pins only after optional code returns; nothing escapes.
- */
-void graphics_service_cancel_task_continuation(struct task *task);
-/** @brief Query optional graphics continuation signal-deferral policy.
- * @param task Execution-owned task, nullable.
- * @return Backend result or false when no method is available.
- * Execution-owned task context; no registry lock spans the callback or wait.
- * The core drops both pins only after optional code returns; nothing escapes.
- */
-bool graphics_service_task_uninterruptible(const struct task *task);
-/** @brief Query optional graphics CPU synchronization signal policy.
- * @param task Execution-owned task, nullable.
- * @return Backend result or false when no method is available.
- * Execution-owned task context; no registry lock spans the callback or wait.
- * The core drops both pins only after optional code returns; nothing escapes.
- */
-bool graphics_service_task_signal_busy(const struct task *task);
 /** @brief Copy one connector's connected state, modes and validated EDID.
  * @param index Zero-based output. @param out Required pointer-free destination.
  * @return Zero or -ENOENT/-ENODEV. Execution-owned task context; the provider

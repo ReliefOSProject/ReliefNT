@@ -68,7 +68,7 @@ drivers/ 按 console、tty、video、storage、net、input、usb、sound 等设�
      - 依赖 sound core，Kconfig 限制驱动的链接等级不高于 core。
    * - ``DRM``
      - ``drm``
-     - DRM/KMS、vmwgfx 与可选 VirtIO-GPU 服务、资源与映射；启动 framebuffer
+     - DRM/KMS 与可选 VirtIO-GPU 服务、资源与映射；启动 framebuffer
        和文本控制台内置。VirtIO 的能力与生命周期见 :doc:`virtio-gpu`。
    * - ``FAT_FS`` / ``EXFAT_FS`` / ``ISO9660_FS``
      - ``vfat`` / ``exfat`` / ``isofs``
@@ -110,7 +110,6 @@ sysfs 和 devfs 为启动与模块管理提供基础，也保持内置。这些�
 FAT 目录按需有界分配，长文件名按 UTF-16 wire 数据处理，不能使用未对齐主机读取。
 默认 root 的 PARTUUID 选择与磁盘编号分开。
 
-framebuffer 提供基本显示；DRM/vmwgfx 实现有界 SVGA-II/VGPU9 能力、资源、
-命令验证与 fence，不承诺通用跨设备 DMA-BUF、atomic modesetting 或硬件 vblank。
-VirtIO-GPU 使用独立的现代 PCI、2D/VirGL 协议及 Linux VirtGPU UAPI。
+framebuffer 提供基本显示。DRM 的 VirtIO-GPU 后端使用现代 VirtIO PCI、
+2D/VirGL 协议及 Linux VirtGPU UAPI。
 未得到设备能力时不能伪造 render 节点或成功状态。

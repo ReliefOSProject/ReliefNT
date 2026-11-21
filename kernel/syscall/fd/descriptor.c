@@ -4,7 +4,6 @@
 extern void memory_wait_cancel(struct task *) __attribute__((weak));
 #endif
 #include <reliefnt/export.h>
-#include <reliefnt/graphics_service.h>
 #include "../internal.h"
 #include <reliefnt/module.h>
 #include <reliefnt/proc_stats.h>
@@ -531,9 +530,6 @@ void task_release_syscall_file(struct task *task)
     task_transfer_cancel(task);
     task_lookup_scope_cancel(task);
     module_file_cancel(task);
-    /* Signal handoff and syscall mismatch invalidate DRM ioctl snapshots here;
-     * the vmwgfx hook only queues bounded task-context cleanup. */
-    graphics_service_cancel_task_continuation(task);
     task_sysv_msg_cancel(task);
     task_sysv_sem_cancel(task);
     task_fifo_cancel(task);

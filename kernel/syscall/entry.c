@@ -399,7 +399,6 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
     bool module_file_io_retry=number==LINUX_SYS_FINIT_MODULE && result==MODULE_FILE_IO_RETRY;
     bool mmap_file_io_retry=number==LINUX_SYS_MMAP && result==KERNEL_MMAP_FILE_IO_RETRY;
     bool prerequisite_retry=result==KERNEL_SYSCALL_SWAP_CONTENDED ||
-                            result==KERNEL_SYSCALL_DRM_ENUM_WAIT ||
                             result==KERNEL_SYSCALL_UNIX_CONNECT_IO_WAIT;
     bool exec_commit_retry=result==KERNEL_SYSCALL_EXEC_COMMIT_WAIT;
     if (result==KERNEL_SYSCALL_EXEC_FATAL) {

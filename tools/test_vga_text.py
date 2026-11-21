@@ -13,7 +13,7 @@ class VgaTextTests(unittest.TestCase):
             subprocess.run(["clang","-std=c11","-O1","-g","-Wall","-Wextra","-Werror",
                 "-fsanitize=address,undefined","-fno-sanitize-recover=all","-Iinclude","-Iinclude/uapi",
                 "tools/tests/vga_hardware_test.c","drivers/video/vga/text_mode.c","-o",str(binary)],cwd=ROOT,check=True)
-            for case in ("vbe","svga","unsupported","svga-busy"):
+            for case in ("vbe", "unsupported"):
                 subprocess.run([binary,case],check=True,timeout=20)
 
     def test_console_integration(self):

@@ -13,6 +13,7 @@ with tempfile.TemporaryDirectory(prefix="reliefnt-module-drm-core-owner-") as di
                     "-fno-sanitize-recover=all", "-Iinclude", "-Iinclude/uapi",
                     "tools/tests/drm_core_test.c", "kernel/device/mapping.c", "kernel/device/service.c",
                     "kernel/device/graphics_service.c", "drivers/video/drm/services.c", "drivers/video/drm/memory.c",
+                    "drivers/video/drm/sync.c",
                     "kernel/module/lifecycle.c", "kernel/module/layout.c", "kernel/module/symbols.c",
                     "kernel/params/value.c", "kernel/params/arguments.c", "-o", str(binary)], cwd=ROOT, check=True)
     subprocess.run([str(binary)], cwd=ROOT, check=True, timeout=30)

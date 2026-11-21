@@ -13,6 +13,7 @@ struct drm_mapping_context {
     struct drm_bo *bo;
     struct task_file *file;
     uint64_t offset;
+    int (*prepare_cpu)(struct drm_bo *bo);
 };
 /** @brief Release the sharing family's BO and original canonical OFD lease.
  * @param value Owned context with one BO and OFD reference.
@@ -40,6 +41,14 @@ static uint64_t drm_mapping_physical(void *value,uint64_t offset)
     const struct drm_mapping_context *context=value;
     return offset>UINT64_MAX-context->offset ? 0 : drm_bo_page_physical(context->bo,context->offset+offset);
 }
+static int drm_mapping_prepare_cpu(void *value, uint64_t offset, bool writable)
+{
+    struct drm_mapping_context *context = value;
+    (void)offset;
+    (void)writable;
+    return context->prepare_cpu(context->bo);
+}
+
 /** @brief Validate DRM mmap and transactionally adopt its BO/OFD lease.
  * @param task Current caller. @param file Admitted canonical card/PRIME OFD.
  * @param offset DRM BO selector. @param length Rounded nonzero page extent.
@@ -73,9 +82,19 @@ int drm_character_mmap(struct task *task,struct task_file *file,uint64_t offset,
     struct drm_mapping_context *context=kernel_malloc(sizeof(*context));
     if(!context){drm_bo_put(bo);task_file_put(pin);return -ENOMEM;}
     *context=(struct drm_mapping_context){.bo=bo,.file=pin,.offset=bo_offset};
-    static const struct device_mapping_operations operations={
-        .release=drm_mapping_release,.destroy=drm_mapping_destroy,.physical=drm_mapping_physical};
-    struct device_mapping_info info={.length=length,.max_prot=max_prot,.can_split=true,.can_move=true};
+    static const struct device_mapping_operations operations = {
+        .release = drm_mapping_release, .destroy = drm_mapping_destroy,
+        .physical = drm_mapping_physical, .prepare_cpu = drm_mapping_prepare_cpu,
+    };
+    struct device_mapping_info info = {
+        .length = length, .max_prot = max_prot, .can_split = true, .can_move = true,
+    };
+    const struct drm_driver *driver = file->drm_file ? file->drm_file->device->driver :
+        drm_prime_mmap_driver(file);
+    if (driver && driver->bo_cpu_access && !drm_bo_is_dumb(bo)) {
+        context->prepare_cpu = driver->bo_cpu_access;
+        info.access = drm_bo_mapping_access(bo);
+    }
     rc=device_mapping_create(THIS_MODULE,&operations,context,&info,out);
     if(rc){drm_mapping_release(context);kernel_free(context);}return rc;
 }

@@ -7,6 +7,7 @@
 #include <reliefnt/paging.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/syscall.h>
+#include <linux/errno.h>
 
 #define PAGE_SIZE 4096ULL
 
@@ -18,43 +19,37 @@ static uint64_t align_down_page(uint64_t value)
     return value & ~(PAGE_SIZE - 1ULL);
 }
 
-/** @brief Validate readable user pages, resolving lazy faults for the current task.
- * @param ptr Inclusive user virtual address. @param len Exact byte length.
- * @return True for an accessible range, false for aperture/overflow/fault errors;
- * zero length succeeds. Execution-owned task context; lazy faults may allocate
- * or synchronously read a retained file provider, so no graph/module lock may
- * span the call. Missing pages are resolved as user data reads, including
- * untouched stack gaps; ordinary stack/VMA permissions and resource limits
- * still apply. The caller owns all buffers/OFDs and performs the copy.
- */
+/* Keep the resident-page check shared by legacy and retryable copyin. */
+#ifndef CONFIG_SWAP
+static
+#endif
+int user_range_readable(uint64_t ptr, uint64_t len)
+{
+    if (!len) return 0;
+    if (ptr < RELIEFNT_USER_BASE || ptr >= RELIEFNT_USER_TOP ||
+        len > RELIEFNT_USER_TOP - ptr) return -EFAULT;
+
+    struct task *task = sched_current_task();
+    if (!task || task->kind != TASK_KIND_USER) return 0;
+
+    struct address_space *as = sched_task_as(task);
+    uint64_t end = ptr + len;
+    for (uint64_t page = align_down_page(ptr); page < end; page += PAGE_SIZE) {
+        if (address_space_user_page_readable(as, page)) continue;
+#ifdef CONFIG_SWAP
+        int fault = syscall_handle_user_page_fault_detailed(page, 4, false);
+        if (fault == -EAGAIN) return fault;
+#else
+        int fault = syscall_handle_user_page_fault(page, 4);
+#endif
+        if (fault <= 0 || !address_space_user_page_readable(as, page)) return -EFAULT;
+    }
+    return 0;
+}
+
 bool user_range_ok(uint64_t ptr, uint64_t len)
 {
-    struct task *task;
-    uint64_t end;
-    uint64_t page;
-    if (len == 0) {
-        return true;
-    }
-    if (ptr < RELIEFNT_USER_BASE || ptr > RELIEFNT_USER_TOP) {
-        return false;
-    }
-    if (len > RELIEFNT_USER_TOP - ptr) {
-        return false;
-    }
-    end = ptr + len;
-    task = sched_current_task();
-    if (!task || task->kind != TASK_KIND_USER) {
-        return true;
-    }
-    for (page = align_down_page(ptr); page < end; page += PAGE_SIZE) {
-        if (!address_space_user_page_readable(sched_task_as(task), page)) {
-            if (!syscall_handle_user_page_fault(page, 0x4ULL) ||
-                !address_space_user_page_readable(sched_task_as(task), page)) {
-                return false;
-            }
-        }
-    }
-    return true;
+    return user_range_readable(ptr, len) == 0;
 }
 
 /** @brief Prepare current user pages for output, resolving lazy/COW backing.

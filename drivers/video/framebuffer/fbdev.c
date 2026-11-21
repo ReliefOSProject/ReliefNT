@@ -119,8 +119,7 @@ static bool fbdev_mode_geometry_supported(const struct fb_var_screeninfo *var,
 static bool fbdev_mode_setting_supported(const struct framebuffer *fb)
 {
     return (fb->capabilities & FRAMEBUFFER_CAP_MODE_SET) != 0 &&
-           (fb->backend == FRAMEBUFFER_BACKEND_BOCHS_VBE ||
-            fb->backend == FRAMEBUFFER_BACKEND_VMWARE_SVGA);
+           fb->backend == FRAMEBUFFER_BACKEND_BOCHS_VBE;
 }
 
 static void fbdev_normalize_geometry(struct fb_var_screeninfo *var,

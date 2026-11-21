@@ -3,24 +3,20 @@
 #ifdef CONFIG_DRM_VIRTIO_GPU
 #include "virtio/internal.h"
 #include <reliefnt/futex.h>
-#include <reliefnt/time.h>
 #endif
 
 #include <drm/drm.h>
-#include <drm/vmwgfx_drm.h>
 #include <linux/errno.h>
 #include <linux/fcntl.h>
 #include <linux/mman.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/sched.h>
+#include <reliefnt/time.h>
 #include <reliefnt/syscall.h>
 #include <reliefnt/syscall_internal.h>
 #include <reliefnt/usercopy.h>
 
-#include "../svga/device.h"
-#include "../svga/svga_protocol.h"
 
-#define DRM_PRIME_PAGE_SIZE 4096ULL
 #define DRM_DMA_BUF_IOCTL_SYNC 0x40086200u
 #define DRM_DMA_BUF_SYNC_RW 0x3u
 #define DRM_DMA_BUF_SYNC_END (1u << 2)
@@ -28,9 +24,11 @@
 #define DRM_PRIME_FD_CLOEXEC LINUX_O_CLOEXEC
 
 struct drm_prime_file {
-    struct drm_vmwgfx_surface *surface;
     struct drm_device *device;
     struct drm_bo *bo;
+    void *object;
+    void (*put)(void *);
+    struct task_file **object_cache;
     bool cache_bound;
 };
 
@@ -41,98 +39,10 @@ struct drm_dma_buf_sync {
 static uint64_t drm_prime_next_ino;
 
 /**
- * @brief Compute the page-aligned opaque size of every face and mip level.
- * @param metadata Surface format, dimensions, cube flag and per-face mip count.
- * @param size_out Required writable output receiving the aligned byte size.
- * @return Zero on success, negative EINVAL for incomplete metadata, or
- *         negative EOVERFLOW when image-size arithmetic cannot be represented.
- */
-static int drm_prime_surface_size(
-    const struct drm_vmwgfx_surface_metadata *metadata, uint64_t *size_out)
-{
-    if (!metadata || !size_out) return -LINUX_EINVAL;
-    uint32_t block_width, block_height, bytes_per_block, capability;
-    int status = svga_format(metadata->desc.format, &block_width,
-                             &block_height, &bytes_per_block, &capability);
-    if (status || !block_width || !block_height || !bytes_per_block)
-        return -LINUX_EINVAL;
-
-    uint32_t face_count = (metadata->desc.flags & SVGA3D_SURFACE_CUBEMAP)
-                              ? DRM_VMW_MAX_SURFACE_FACES : 1u;
-    uint64_t total = 0;
-    for (uint32_t face = 0; face < face_count; ++face) {
-        uint32_t levels = metadata->mip_levels[face];
-        uint64_t width = metadata->desc.width;
-        uint64_t height = metadata->desc.height;
-        uint64_t depth = metadata->desc.depth ? metadata->desc.depth : 1u;
-        if (!levels) return -LINUX_EINVAL;
-        for (uint32_t mip = 0; mip < levels; ++mip) {
-            uint64_t blocks_wide = (width + block_width - 1u) / block_width;
-            uint64_t blocks_high = (height + block_height - 1u) / block_height;
-            if (blocks_wide && blocks_high > UINT64_MAX / blocks_wide)
-                return -LINUX_EOVERFLOW;
-            uint64_t image = blocks_wide * blocks_high;
-            if (image && depth > UINT64_MAX / image)
-                return -LINUX_EOVERFLOW;
-            image *= depth;
-            if (image && bytes_per_block > UINT64_MAX / image)
-                return -LINUX_EOVERFLOW;
-            image *= bytes_per_block;
-            if (total > UINT64_MAX - image) return -LINUX_EOVERFLOW;
-            total += image;
-            if (width > 1u) width >>= 1;
-            if (height > 1u) height >>= 1;
-            if (depth > 1u) depth >>= 1;
-        }
-    }
-    if (!total || total > UINT64_MAX - (DRM_PRIME_PAGE_SIZE - 1u))
-        return -LINUX_EINVAL;
-    *size_out = (total + DRM_PRIME_PAGE_SIZE - 1u) &
-                ~(DRM_PRIME_PAGE_SIZE - 1u);
-    return 0;
-}
-
-/**
- * @brief Resolve a descriptor only when it names this device's shareable
- *        surface PRIME OFD, and return one retained typed surface reference.
- * @param task Task whose fd table supplies the descriptor; required.
- * @param fd Descriptor number in task; an absent/negative descriptor returns
- *           EBADF, while an existing non-PRIME descriptor returns EINVAL.
- * @param device Exact target DRM device object; import provenance is pointer
- *               identity, not a matching surface name or PCI number.
- * @param surface_out Required output set to null on failure and to one owned
- *                    surface reference on success.
- * @return Zero on success, negative EBADF for an absent descriptor, or
- *         negative EINVAL for an existing wrong-object, foreign-device,
- *         stale, or non-shareable descriptor or an unavailable surface ref.
- */
-int drm_prime_surface_from_fd(struct task *task, int fd,
-                              struct drm_device *device,
-                              struct drm_vmwgfx_surface **surface_out)
-{
-    if (surface_out) *surface_out = NULL;
-    if (!task || !device || !surface_out) return -LINUX_EINVAL;
-    struct task_file *file = task_file_for_fd(task, fd);
-    if (!file) return -LINUX_EBADF;
-    struct drm_prime_file *prime = file->drm_prime_file;
-    if (!prime || prime->device != device || !prime->surface)
-        return -LINUX_EINVAL;
-    struct drm_vmwgfx_surface_metadata metadata;
-    if (drm_vmwgfx_surface_get_metadata(prime->surface, &metadata) < 0 ||
-        !metadata.shareable)
-        return -LINUX_EINVAL;
-    int ret = drm_vmwgfx_surface_get(prime->surface);
-    if (ret) return -LINUX_EINVAL;
-    *surface_out = prime->surface;
-    return 0;
-}
-
-/**
  * @brief Allocate a new descriptor slot referring to an existing cached PRIME
  *        open-file description.
  * @param task Caller receiving the descriptor.
- * @param description Existing shared PRIME OFD; its surface and cache binding
- *                     remain owned by the description.
+ * @param description Existing shared PRIME OFD retaining the buffer object.
  * @param flags DRM export flags; only descriptor-local CLOEXEC is applied here.
  * @param fd_out Required output receiving the new descriptor number.
  * @return Zero after the slot retains description, or a negative errno; no
@@ -156,162 +66,81 @@ static int drm_prime_dup_cached(struct task *task,
     return 0;
 }
 
-/**
- * @brief Export an authorized shareable surface through a cached opaque PRIME
- *        OFD and allocate its first descriptor transactionally.
- * @param task Caller whose fd namespace and current filesystem owner are used.
- * @param file DRM card OFD authorizing the surface handle lookup.
- * @param argument Kernel copy of PRIME_HANDLE_TO_FD input/output fields.
- * @param created_fd_out Optional output recording the fd for syscall-layer
- *                       rollback if copying the result to userspace fails.
- * @return Zero with argument->fd allocated but still rollback-capable, or a
- *         negative errno; all pre-publication failures release temporary refs.
- */
-static int drm_prime_export_surface(struct task *task, struct drm_file *file,
-                                    struct drm_prime_handle *argument,
-                                    int *created_fd_out)
+/* Owns prime and its backing reference on entry, including error paths. */
+static int drm_prime_new_fd(struct task *task, struct drm_prime_file *prime,
+                            uint32_t flags, uint64_t size)
 {
-    const uint32_t allowed = DRM_PRIME_FD_CLOEXEC | DRM_PRIME_FD_RDWR;
-    if (argument->flags & ~allowed) return -LINUX_EINVAL;
-    struct drm_vmwgfx_surface *surface =
-        drm_vmwgfx_surface_lookup_get(file, argument->handle);
-    if (!surface) return -LINUX_EINVAL;
-    struct drm_vmwgfx_surface_metadata metadata;
-    int ret = drm_vmwgfx_surface_get_metadata(surface, &metadata);
-    if (ret || !metadata.shareable) {
-        drm_vmwgfx_surface_put(surface);
-        return -LINUX_EINVAL;
-    }
-    uint64_t size;
-    ret = drm_prime_surface_size(&metadata, &size);
-    if (ret) {
-        drm_vmwgfx_surface_put(surface);
-        return ret;
-    }
-
-    struct task_file *cached =
-        drm_vmwgfx_surface_prime_description(surface);
-    if (cached) {
-        int fd;
-        ret = drm_prime_dup_cached(task, cached, argument->flags, &fd);
-        drm_vmwgfx_surface_put(surface);
-        if (ret) return ret;
-        argument->fd = fd;
-        if (created_fd_out) *created_fd_out = fd;
-        return 0;
-    }
-
-    struct drm_prime_file *prime = kernel_malloc(sizeof(*prime));
-    if (!prime) {
-        drm_vmwgfx_surface_put(surface);
-        return -LINUX_ENOMEM;
-    }
-    ret = drm_vmwgfx_surface_get(surface);
-    if (ret) {
-        drm_vmwgfx_surface_put(surface);
-        kernel_free(prime);
-        return ret;
-    }
-    *prime = (struct drm_prime_file){
-        .surface = surface,
-        .device = file->device,
-    };
-    struct task_file *slot = NULL;
+    struct task_file *slot;
     int fd = task_allocate_fd(task, 0, &slot);
     if (fd < 0) {
-        drm_vmwgfx_surface_put(surface);
-        drm_vmwgfx_surface_put(surface);
+        drm_bo_put(prime->bo);
+        if (prime->put)
+            prime->put(prime->object);
         kernel_free(prime);
         return fd;
     }
-    uint64_t ino = __atomic_add_fetch(&drm_prime_next_ino, 1u,
-                                      __ATOMIC_RELAXED);
-    if (!ino) ino = __atomic_add_fetch(&drm_prime_next_ino, 1u,
-                                       __ATOMIC_RELAXED);
+    uint64_t ino = __atomic_add_fetch(&drm_prime_next_ino, 1, __ATOMIC_RELAXED);
+    if (!ino)
+        ino = __atomic_add_fetch(&drm_prime_next_ino, 1, __ATOMIC_RELAXED);
     slot->kind = TASK_FILE_KIND_DRM_PRIME;
-    slot->flags = (argument->flags & DRM_PRIME_FD_RDWR) ? RELIEFOS_O_RDWR
-                                                        : RELIEFOS_O_RDONLY;
+    slot->flags = (flags & DRM_PRIME_FD_RDWR) ? RELIEFOS_O_RDWR : RELIEFOS_O_RDONLY;
     slot->node.type = RELIEFOS_FS_TYPE_FILE;
     slot->node.size = size;
     slot->drm_prime_file = prime;
-    slot->drm_prime_ino = ino;
     slot->drm_prime_size = size;
+    slot->drm_prime_ino = ino;
     slot->drm_prime_uid = task->fsuid;
     slot->drm_prime_gid = task->fsgid;
-    slot->fd_flags = (argument->flags & DRM_PRIME_FD_CLOEXEC)
-                         ? RELIEFOS_FD_CLOEXEC : 0;
-
-    ret=drm_character_attach_anonymous(task,slot);
-    if(ret) {
-        /* Admission can fail before open or after its partial-close callback.
-         * This idempotent cleanup covers both without dropping a surface twice. */
+    slot->fd_flags = (flags & DRM_PRIME_FD_CLOEXEC) ? RELIEFOS_FD_CLOEXEC : 0;
+    int ret = drm_character_attach_anonymous(task, slot);
+    if (ret) {
         drm_prime_file_close(slot);
-        task_discard_file_fd(task,fd);
-        drm_vmwgfx_surface_put(surface);
+        task_discard_file_fd(task, fd);
         return ret;
     }
-
-    struct task_file *description = task_file_get(slot);
-    if (!description) {
-        task_discard_file_fd(task, fd);
-        drm_vmwgfx_surface_put(surface);
-        return -LINUX_ENOMEM;
-    }
-    ret = drm_vmwgfx_surface_prime_bind(surface, description);
-    if (!ret) prime->cache_bound = true;
-    task_file_put(description);
-    if (ret == -LINUX_EEXIST) {
-        /* Another export won the cache race. Closing this unpublished OFD
-         * drops its surface reference; duplicate the canonical cached OFD. */
-        cached = drm_vmwgfx_surface_prime_description(surface);
-        task_discard_file_fd(task, fd);
-        if (!cached) {
-            drm_vmwgfx_surface_put(surface);
-            return -LINUX_EBUSY;
-        }
-        ret = drm_prime_dup_cached(task, cached, argument->flags, &fd);
-        drm_vmwgfx_surface_put(surface);
-        if (ret) return ret;
-    } else if (ret) {
-        task_discard_file_fd(task, fd);
-        drm_vmwgfx_surface_put(surface);
-        return ret;
-    } else {
-        drm_vmwgfx_surface_put(surface);
-    }
-    argument->fd = fd;
-    if (created_fd_out) *created_fd_out = fd;
-    return 0;
+    return fd;
 }
 
-/**
- * @brief Import a same-device PRIME surface and transactionally grant this DRM
- *        file a typed logical reference.
- * @param task Caller whose fd table owns argument->fd.
- * @param file Target DRM card OFD receiving the deliberate per-file reference.
- * @param argument Kernel copy of PRIME_FD_TO_HANDLE input/output fields.
- * @param receipt Required rollback receipt consumed by the syscall copyout
- *                 success/failure path.
- * @return Zero with the imported handle and active receipt, or a negative
- *         errno without a retained surface reference.
- */
-static int drm_prime_import_surface(struct task *task, struct drm_file *file,
-                                    struct drm_prime_handle *argument,
-                                    struct drm_vmwgfx_rollback_receipt *receipt)
+int drm_prime_export_object(struct task *task, struct drm_device *device, uint32_t flags,
+                            uint64_t size, void *object, void (*put)(void *), struct task_file **cache)
 {
-    if (argument->flags) return -LINUX_EINVAL;
-    struct drm_vmwgfx_surface *surface = NULL;
-    int ret = drm_prime_surface_from_fd(task, argument->fd, file->device,
-                                        &surface);
-    if (ret) return ret;
-    struct drm_vmwgfx_surface_metadata metadata;
-    ret = drm_vmwgfx_surface_get_metadata(surface, &metadata);
-    if (!ret)
-        ret = drm_vmwgfx_surface_add_file_reference(file, surface, receipt);
-    drm_vmwgfx_surface_put(surface);
-    if (ret) return ret;
-    argument->handle = metadata.handle;
-    return 0;
+    if (cache && *cache) {
+        int fd;
+        int ret = drm_prime_dup_cached(task, *cache, flags, &fd);
+        put(object);
+        return ret ? ret : fd;
+    }
+    struct drm_prime_file *prime = kernel_malloc(sizeof(*prime));
+    if (!prime) {
+        put(object);
+        return -ENOMEM;
+    }
+    *prime = (struct drm_prime_file){.device = device, .object = object, .put = put};
+    int fd = drm_prime_new_fd(task, prime, flags, size);
+    if (fd < 0 || !cache)
+        return fd;
+    struct task_file *description = task_file_get(task_file_for_fd(task, fd));
+    if (!description) {
+        task_discard_file_fd(task, fd);
+        return -ENOMEM;
+    }
+    *cache = description;
+    prime->object_cache = cache;
+    task_file_put(description);
+    return fd;
+}
+
+void *drm_prime_lookup_object(struct task_file *source, const struct drm_device *device)
+{
+    struct drm_prime_file *prime = source ? source->drm_prime_file : NULL;
+    return prime && prime->device == device ? prime->object : NULL;
+}
+
+/** @brief Borrow the BO of a matching PRIME OFD under execution ownership. */
+struct drm_bo *drm_prime_lookup_bo(struct task_file *source, const struct drm_device *device)
+{
+    struct drm_prime_file *prime = source ? source->drm_prime_file : NULL;
+    return prime && prime->device == device ? prime->bo : NULL;
 }
 
 /** @brief Export a file-authorized VirtGPU GEM object using a canonical DMA-BUF.
@@ -322,9 +151,11 @@ static int drm_prime_import_surface(struct task *task, struct drm_file *file,
 static int drm_prime_export_bo(struct task *task,struct drm_file *file,
                               struct drm_prime_handle *argument,int *created_fd_out)
 {
-    if(argument->flags&~(DRM_PRIME_FD_CLOEXEC|DRM_PRIME_FD_RDWR))return -LINUX_EINVAL;
     struct drm_bo *bo=drm_bo_lookup_handle_get(file,argument->handle);
-    if(!bo || !drm_bo_virtio(bo)){drm_bo_put(bo);return -LINUX_ENOENT;}
+    if (!bo || (!file->device->driver->prime_bo && !drm_bo_virtio(bo))) {
+        drm_bo_put(bo);
+        return -ENOENT;
+    }
     struct task_file *cached=drm_bo_prime_description(bo);
     int fd=-1,rc;
     if(cached) {
@@ -334,25 +165,22 @@ static int drm_prime_export_bo(struct task *task,struct drm_file *file,
         struct drm_prime_file *prime=kernel_malloc(sizeof(*prime));
         if(!prime){drm_bo_put(bo);return -LINUX_ENOMEM;}
         *prime=(struct drm_prime_file){.bo=bo,.device=file->device};
-        struct task_file *slot=NULL;fd=task_allocate_fd(task,0,&slot);
-        if(fd<0){kernel_free(prime);drm_bo_put(bo);return fd;}
-        uint64_t ino=__atomic_add_fetch(&drm_prime_next_ino,1,__ATOMIC_RELAXED);
-        if(!ino)ino=__atomic_add_fetch(&drm_prime_next_ino,1,__ATOMIC_RELAXED);
-        slot->kind=TASK_FILE_KIND_DRM_PRIME;
-        slot->flags=(argument->flags&DRM_PRIME_FD_RDWR) ? RELIEFOS_O_RDWR : RELIEFOS_O_RDONLY;
-        slot->node.type=RELIEFOS_FS_TYPE_FILE;slot->node.size=drm_bo_size(bo);
-        slot->drm_prime_file=prime;slot->drm_prime_size=drm_bo_size(bo);slot->drm_prime_ino=ino;
-        slot->drm_prime_uid=task->fsuid;slot->drm_prime_gid=task->fsgid;
-        slot->fd_flags=(argument->flags&DRM_PRIME_FD_CLOEXEC) ? RELIEFOS_FD_CLOEXEC : 0;
-        rc=drm_character_attach_anonymous(task,slot);
-        if(rc){drm_prime_file_close(slot);task_discard_file_fd(task,fd);return rc;}
-        struct task_file *description=task_file_get(slot);
+        fd = drm_prime_new_fd(task, prime, argument->flags, drm_bo_size(bo));
+        if (fd < 0)
+            return fd;
+        struct task_file *description=task_file_get(task_file_for_fd(task, fd));
         if(!description){task_discard_file_fd(task,fd);return -LINUX_ENOMEM;}
         rc=drm_bo_prime_bind(bo,description);if(!rc)prime->cache_bound=true;
         task_file_put(description);
         if(rc){task_discard_file_fd(task,fd);return rc;}
     }
     argument->fd=fd;if(created_fd_out)*created_fd_out=fd;return 0;
+}
+
+const struct drm_driver *drm_prime_mmap_driver(const struct task_file *file)
+{
+    const struct drm_prime_file *prime = file->drm_prime_file;
+    return prime && prime->device ? prime->device->driver : NULL;
 }
 
 /** @brief Resolve retained GEM pages for an admitted DMA-BUF mapping.
@@ -375,41 +203,54 @@ int drm_prime_mmap_bo(struct task_file *file,uint64_t offset,uint64_t length,str
  * @param command PRIME_HANDLE_TO_FD or PRIME_FD_TO_HANDLE.
  * @param data Copied kernel ioctl structure with fields in/out as specified.
  * @param created_fd_out Optional syscall rollback output for exported fd.
- * @param receipt Required import rollback receipt for failed output copy.
  * @param created_handle_out Optional output for newly granted GEM handles.
  * @return Zero on supported success, negative errno for invalid/unsupported
  *         requests; descriptor and handle outputs remain failure-atomic.
  */
 int drm_prime_ioctl(struct task *task, struct drm_file *file,
                     uint32_t command, void *data, int *created_fd_out,
-                    struct drm_vmwgfx_rollback_receipt *receipt,uint32_t *created_handle_out)
+                    uint32_t *created_handle_out, uint32_t *created_object_out)
 {
     if (created_fd_out) *created_fd_out = -1;
-    if (!task || !file || !data || !receipt) return -LINUX_EINVAL;
-    if(drm_is_virtio()) {
-        struct drm_prime_handle *argument=data;
-        if(command==DRM_IOCTL_PRIME_HANDLE_TO_FD)
-            return drm_prime_export_bo(task,file,argument,created_fd_out);
-        if(command!=DRM_IOCTL_PRIME_FD_TO_HANDLE)return -LINUX_EOPNOTSUPP;
-        if(argument->flags)return -LINUX_EINVAL;
-        struct task_file *source=task_file_for_fd(task,argument->fd);
-        if(!source)return -LINUX_EBADF;
-        struct drm_prime_file *prime=source->drm_prime_file;
-        if(!prime || prime->device!=file->device || !prime->bo)return -LINUX_EINVAL;
-        bool created=false;
-        int rc=drm_bo_handle_import(file,prime->bo,&argument->handle,&created);
-        if(!rc && created && created_handle_out)*created_handle_out=argument->handle;
-        return rc;
+    if (!task || !file || !data) return -LINUX_EINVAL;
+    struct drm_prime_handle *argument = data;
+    const struct drm_driver *driver = file->device->driver;
+    if (command == DRM_IOCTL_PRIME_HANDLE_TO_FD) {
+        if (argument->flags & ~(DRM_PRIME_FD_CLOEXEC | DRM_PRIME_FD_RDWR))
+            return -EINVAL;
+        if (driver->prime_export) {
+            int ret = driver->prime_export(task, file, argument);
+            if (ret != -ENOENT) {
+                if (!ret && created_fd_out)
+                    *created_fd_out = argument->fd;
+                return ret;
+            }
+        }
+        return drm_prime_export_bo(task, file, argument, created_fd_out);
     }
-    if (command == DRM_IOCTL_PRIME_HANDLE_TO_FD)
-        return drm_prime_export_surface(task, file, data, created_fd_out);
-    if (command == DRM_IOCTL_PRIME_FD_TO_HANDLE)
-        return drm_prime_import_surface(task, file, data, receipt);
-    return -LINUX_EOPNOTSUPP;
+    if (command != DRM_IOCTL_PRIME_FD_TO_HANDLE) return -LINUX_EOPNOTSUPP;
+    if (argument->flags) return -LINUX_EINVAL;
+    struct task_file *source = task_file_for_fd(task, argument->fd);
+    if (!source) return -LINUX_EBADF;
+    struct drm_prime_file *prime = source->drm_prime_file;
+    if (!prime || prime->device != file->device)
+        return -EINVAL;
+    if (prime->object && driver->prime_import) {
+        int ret = driver->prime_import(file, prime->object, &argument->handle);
+        if (!ret && created_object_out)
+            *created_object_out = argument->handle;
+        return ret;
+    }
+    if (!prime->bo)
+        return -EINVAL;
+    bool created = false;
+    int rc = drm_bo_handle_import(file, prime->bo, &argument->handle, &created);
+    if (!rc && created && created_handle_out) *created_handle_out = argument->handle;
+    return rc;
 }
 
 /**
- * @brief Drop cached-export association and the PRIME OFD's retained surface
+ * @brief Drop cached-export association and the PRIME OFD's retained BO
  *        when its final shared descriptor reference closes.
  * @param file Final PRIME open-file description being destroyed; null or a
  *             non-PRIME description is ignored.
@@ -421,21 +262,20 @@ void drm_prime_file_close(struct task_file *file)
     if (!file || !file->drm_prime_file) return;
     struct drm_prime_file *prime = file->drm_prime_file;
     file->drm_prime_file = NULL;
-    if (prime->surface) {
-        if (prime->cache_bound)
-            drm_vmwgfx_surface_prime_unbind(prime->surface, file);
-        drm_vmwgfx_surface_put(prime->surface);
-    }
     if(prime->bo) {
         if(prime->cache_bound)drm_bo_prime_unbind(prime->bo,file);
         drm_bo_put(prime->bo);
     }
+    if (prime->object_cache)
+        *prime->object_cache = NULL;
+    if (prime->put)
+        prime->put(prime->object);
     kernel_free(prime);
 }
 
 /**
  * @brief Report immediate ready bits for the opaque DMA-BUF's empty reservation.
- * @param file PRIME surface description queried by poll.
+ * @param file PRIME buffer description queried by poll.
  * @param events Requested poll events; unsupported bits are ignored.
  * @return Requested subset of POLLIN/POLLRDNORM/POLLOUT/POLLWRNORM, or zero
  *         when file is not a PRIME description.
@@ -451,7 +291,7 @@ uint32_t drm_prime_file_poll(const struct task_file *file, uint32_t events)
 
 /**
  * @brief Implement the opaque TTM object's zero-offset SET and END seeks.
- * @param file PRIME surface description holding the exported page-aligned size.
+ * @param file PRIME buffer description holding the exported page-aligned size.
  * @param offset Requested offset; nonzero offsets are unsupported.
  * @param whence ReliefNT SEEK_SET or SEEK_END selector.
  * @return Zero for SEEK_SET, size for SEEK_END, or a negative errno.
@@ -468,7 +308,7 @@ int64_t drm_prime_file_llseek(struct task_file *file, int64_t offset,
 
 /**
  * @brief Apply OFD mode checks before reporting unsupported opaque-object I/O.
- * @param file PRIME surface description to access.
+ * @param file PRIME buffer description to access.
  * @param writing True for write, false for read.
  * @return Negative EBADF when OFD access mode denies the operation; otherwise
  *         negative EINVAL because the opaque surface has no byte stream.
@@ -482,9 +322,9 @@ int64_t drm_prime_file_rw(const struct task_file *file, bool writing)
 }
 
 /**
- * @brief Validate Linux DMA_BUF_IOCTL_SYNC flags on the opaque surface OFD.
+ * @brief Validate Linux DMA_BUF_IOCTL_SYNC flags on the PRIME buffer OFD.
  * @param task Caller used to safely copy the sync structure from argument.
- * @param file PRIME surface description receiving the ioctl.
+ * @param file PRIME buffer description receiving the ioctl.
  * @param command 32-bit request; only DMA_BUF_IOCTL_SYNC is supported.
  * @param argument 64-bit caller address of the sync flags structure.
  * @return Zero for valid READ/WRITE START or END operations, or a negative
@@ -525,13 +365,12 @@ int64_t drm_prime_file_ioctl(struct task *task, struct task_file *file,
 }
 
 /**
- * @brief Enforce canonical OFD access precedence before rejecting unsupported
- *        opaque surface mappings.
+ * @brief Enforce canonical OFD access precedence for a PRIME buffer mapping.
  * @param file PRIME description being mapped.
  * @param flags Linux mmap flags, including MAP_SHARED when applicable.
  * @param protection Requested PROT_* access bits.
  * @return Negative EACCES when read/write access is forbidden by the OFD mode;
- *         otherwise negative EINVAL because the surface has no mmap operation.
+ *         otherwise zero for a GEM-backed export or negative EINVAL.
  */
 int drm_prime_file_mmap(struct task_file *file, uint64_t flags,
                         uint64_t protection)

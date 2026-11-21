@@ -538,9 +538,7 @@ int64_t syscall_legacy_ioctl(uint64_t number, uint64_t a0, uint64_t a1, uint64_t
             return 0;
 #endif
         }
-        /* Panning display is the Linux fbdev flush request: VMware SVGA
-         * scanout only refreshes from VRAM when the FIFO receives an
-         * update command, and mmap writers bypass every other path. */
+        /* Publish damage from fbdev clients that write through mmap. */
         if (a1 == FBIOPAN_DISPLAY) {
             framebuffer_present_region(0, 0, fb->width, fb->height);
             return 0;

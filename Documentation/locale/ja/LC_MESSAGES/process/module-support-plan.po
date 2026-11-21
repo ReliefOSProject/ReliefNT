@@ -84,8 +84,8 @@ msgstr "AHCI、IDE/ATAPI、NVMe、e1000、PS/2/USB デバイスドライバー�
 msgid "AC97、ES1371、HDA，以及完成通用设备分发与 owner 引用改造后的 sound core。"
 msgstr "AC97、ES1371、HDA、および汎用デバイス分配と owner 参照の改修が完了した sound core。"
 
-msgid "VMware SVGA/DRM 及 DRM core；基础 framebuffer/启动日志保持内置。"
-msgstr "VMware SVGA/DRM と DRM core。基本 framebuffer／起動ログは組み込みに保ちます。"
+msgid "DRM 核心与 VirtIO-GPU 后端。基础 framebuffer 和启动日志保持内置。"
+msgstr "DRM コアと VirtIO-GPU バックエンド。基本 framebuffer と起動ログは組み込みです。"
 
 msgid "ext2、ext4、FAT、exFAT、ISO9660；公共 ext 辅助代码作为显式依赖。"
 msgstr "ext2、ext4、FAT、exFAT、ISO9660。共通 ext 補助コードは明示的な依存関係とします。"

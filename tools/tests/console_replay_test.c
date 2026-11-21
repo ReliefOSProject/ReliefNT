@@ -6,7 +6,6 @@
 
 #include <reliefnt/lock.h>
 #include <reliefnt/port.h>
-#include <reliefnt/svga.h>
 
 #include "modules/framebuffer.h"
 #include "modules/console.h"
@@ -19,7 +18,6 @@
 #define FB_HEIGHT_32 59u
 #define FB_PITCH_32 (FB_WIDTH * 4u + 17u)
 
-struct svga_device svga;
 
 static uint8_t display_a[FB_GUARD_BYTES + FB_MAX_BYTES + FB_GUARD_BYTES];
 static uint8_t display_b[FB_GUARD_BYTES + FB_MAX_BYTES + FB_GUARD_BYTES];
@@ -32,24 +30,6 @@ void kernel_spin_lock_irqsave(struct kernel_spinlock *lock, uint64_t *flags)
 void kernel_spin_unlock_irqrestore(struct kernel_spinlock *lock, uint64_t flags)
 { assert(lock->state == 1 && !flags); lock->state = 0; }
 
-uint64_t svga_lock(void) { return 0; }
-bool svga_try_lock_irqsave(uint64_t *flags)
-{
-    if (flags) *flags = 0;
-    return true;
-}
-void svga_unlock(uint64_t flags) { (void)flags; }
-int svga_update_try_locked(uint32_t x, uint32_t y, uint32_t width, uint32_t height)
-{
-    (void)x; (void)y; (void)width; (void)height;
-    return 0;
-}
-int svga_update_locked(uint32_t x, uint32_t y, uint32_t width, uint32_t height)
-{
-    (void)x; (void)y; (void)width; (void)height;
-    return 0;
-}
-bool svga_restore_traces_locked(void) { return false; }
 void x86_64_outl(uint32_t value, uint16_t port) { (void)value; (void)port; }
 uint32_t x86_64_inl(uint16_t port) { (void)port; return 0; }
 void x86_64_outw(uint16_t value, uint16_t port) { (void)value; (void)port; }

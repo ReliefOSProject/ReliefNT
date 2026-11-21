@@ -27,8 +27,7 @@ void sched_request_reschedule_all_online(void) { ++reschedules; }
 /** @brief Model an exec with no outstanding graphics continuation.
  * @param task Borrowed execution-owned task whose commit is being tested.
  */
-void graphics_service_cancel_task_continuation(struct task *task)
-{ assert(task && !scheduler_lock.state);++exec_cancels; }
+
 /** @brief Supply a modeled kernel root for the actual exec commit.
  * @return Fixed nonzero kernel CR3.
  */

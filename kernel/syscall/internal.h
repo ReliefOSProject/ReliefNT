@@ -165,9 +165,7 @@ struct reliefos_flock_entry {
 
 
 
-/* fbdev's colour map and blank state are software state on the VMware
- * framebuffer.  Keeping them here gives standard fb clients a stable
- * GETCMAP/PUTCMAP round trip even though SVGA scanout is true-colour. */
+
 
 
 

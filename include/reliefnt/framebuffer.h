@@ -8,21 +8,6 @@
 #include <reliefnt/multiboot2.h>
 #include <reliefnt/types.h>
 
-struct pci_device;
-/** @brief Copy the immutable identity established by successful boot binding.
- * @param out Required writable PCI output; unchanged when unavailable.
- * @return Zero or -ENODEV. Called after boot framebuffer binding, with no
- * allocation, I/O, optional-provider dependency or ownership transfer.
- */
-int framebuffer_vmware_pci_identity(struct pci_device *out);
-/** @brief Enable WC for a verified, prefetchable SVGA pixel aperture at boot.
- * @return True after conversion; false retains the current conservative policy.
- * BSP only after sparse-map setup and before APs/users. Requires PAT, rejects
- * overlap with FIFO/register storage and never retypes ordinary RAM or live
- * aliases. Later modesets preserve this permanent policy.
- */
-bool framebuffer_enable_writecombine_boot(void);
-
 struct framebuffer {
     uint32_t *pixels;
     uint32_t width;
@@ -70,7 +55,6 @@ struct framebuffer_capabilities {
 
 #define FRAMEBUFFER_BACKEND_BOOT 0u
 #define FRAMEBUFFER_BACKEND_BOCHS_VBE 1u
-#define FRAMEBUFFER_BACKEND_VMWARE_SVGA 2u
 
 struct framebuffer_mode_cmd {
     uint32_t width;
@@ -223,47 +207,14 @@ static inline void framebuffer_damage_union(struct framebuffer_damage *bounds,
 bool framebuffer_take_damage(uint64_t *generation, struct framebuffer_damage *damage);
 /**
  * @brief Reclaim fatal scanout without locks after other CPUs have stopped.
- * Restores legacy GFB tracing where supported; never resets the video mode.
  */
 void framebuffer_panic_prepare(void);
-/** @brief Publish fatal pixels without locks, with a finite FIFO retry bound. */
+/** @brief Publish fatal pixels through the emergency graphics service. */
 void framebuffer_panic_present(void);
 /**
  * @brief Flush only the (x,y,width,height) sub-region of the back buffer.
  */
 void framebuffer_present_region(uint32_t x, uint32_t y, uint32_t width, uint32_t height);
-/**
- * @brief Retry queued SVGA damage, without waiting for the lock or the FIFO.
- * @param graphical Allow the periodic full update for mmap-backed graphics
- * on VMware SVGA hosts without VRAM write tracing or a DRM scanout owner.
- */
-void framebuffer_display_tick(bool graphical);
-/**
- * @brief Transfer a validated SVGA scanout from console tracing to DRM presentation.
- * @return Zero, including already-owned scanout, or legacy internal -1 for unsupported framebuffer state.
- * Execution-owned task context; takes the SVGA lock internally and disables traces only on success. No heap allocation or provider self-reference.
- */
-int framebuffer_drm_scanout_begin(void);
-/**
- * @brief Return the permanent SVGA scanout to ordinary framebuffer tracing.
- * Execution-owned task context after dependent jobs drain. Clears pending DRM damage and restores tracing under the SVGA lock; does not unbind the boot console or free provider-owned backing.
- */
-void framebuffer_drm_scanout_release(void);
-/**
- * @brief Copy validated XRGB8888 damage into the retained DRM-owned scanout.
- * @param pixels Readable kernel source covering every requested row.
- * @param pitch Source byte stride, at least the display width times four.
- * @param format Supported XRGB8888 format code.
- * @param x1 Inclusive left pixel.
- * @param y1 Inclusive top pixel.
- * @param x2 Exclusive right pixel, within display width.
- * @param y2 Exclusive bottom pixel, within display height.
- * @return Zero after copying/queuing damage, or legacy internal -1 for invalid or unavailable scanout.
- * Execution-owned task context; source remains borrowed only during the copy. Coalesces FIFO pressure into permanent damage state under the SVGA lock; no module/data pointer is queued.
- */
-int framebuffer_drm_present_region(const void *pixels, uint32_t pitch,
-                                   uint32_t format, uint32_t x1, uint32_t y1,
-                                   uint32_t x2, uint32_t y2);
 /**
  * @brief Read the color of the pixel at (x,y).
  */

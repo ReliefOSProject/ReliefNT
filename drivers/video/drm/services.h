@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #ifndef RELIEFNT_DRM_SERVICES_H
 #define RELIEFNT_DRM_SERVICES_H
-/** @brief Publish DRM after discovering the independently bound boot framebuffer.
+/** @brief Publish DRM after discovering supported graphics hardware.
  * @return Zero or discovery/registration errno, with no table left on failure.
  * Init task context after heap initialization; no provider self-reference.
  */

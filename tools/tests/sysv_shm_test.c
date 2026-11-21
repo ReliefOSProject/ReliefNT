@@ -102,7 +102,7 @@ struct task_file *task_file_get(struct task_file *description)
 }
 void task_file_put(struct task_file *description)
 {if(description){assert(description==&borrowed_mapping && description->references);--description->references;}}
-void graphics_service_cancel_task_continuation(struct task *task) { (void)task; }
+
 /* Only the focused successful clone below admits these resource-free
  * boundaries. All original rollback cases still abort if they reach them. */
 static bool empty_clone_boundary;

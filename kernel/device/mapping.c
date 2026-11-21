@@ -3,6 +3,7 @@
 #include <reliefnt/export.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/paging.h>
+#include <reliefnt/smp.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/storage.h>
 #include <linux/errno.h>
@@ -42,6 +43,12 @@ int device_user_page_get(struct task *task,uint64_t address,uint64_t physical,
         if(rc){device_mapping_put(mapping);return rc;}
     } else if(vma->file_node.first_cluster!=STORAGE_DEV_KIND_FB0) return -EFAULT;
 
+    struct device_mapping_access *access = mapping ? device_mapping_info(mapping)->access : NULL;
+    if (access && access->aliases == UINT32_MAX) {
+        device_mapping_release_range(mapping, offset, 4096, true);
+        device_mapping_put(mapping);
+        return -EOVERFLOW;
+    }
     const uint64_t mask=RELIEFNT_PAGE_PWT|RELIEFNT_PAGE_PCD|RELIEFNT_PAGE_PAT;
     uint64_t cache=0;
     void *alias;
@@ -56,6 +63,8 @@ int device_user_page_get(struct task *task,uint64_t address,uint64_t physical,
         alias=paging_ioremap_device_page(physical,flags&mask);temporary=true;
     }
     if(!alias){device_mapping_release_range(mapping,offset,4096,true);device_mapping_put(mapping);return -ENOMEM;}
+    if (access)
+        ++access->aliases;
     *out=(struct device_user_page){.mapping=mapping,.alias=alias,.offset=offset,.temporary=temporary};
     return 0;
 }
@@ -69,6 +78,8 @@ void device_user_page_put(struct device_user_page *page)
     if(!page)return;
     struct device_user_page old=*page;*page=(struct device_user_page){0};
     if(old.temporary && old.alias)(void)paging_iounmap(old.alias,4096);
+    if (old.mapping && device_mapping_info(old.mapping)->access)
+        --device_mapping_info(old.mapping)->access->aliases;
     device_mapping_release_range(old.mapping,old.offset,4096,true);
     device_mapping_put(old.mapping);
 }
@@ -245,7 +256,8 @@ int device_mapping_create(struct module *owner,const struct device_mapping_opera
 {
     if(!out)return -EINVAL;*out=NULL;
     if(!operations || !operations->release || !operations->physical ||
-       !info || !info->length || (info->length&4095u) || (info->max_prot&~7u))return -EINVAL;
+       !info || !info->length || (info->length&4095u) || (info->max_prot&~7u) ||
+       (info->access && !operations->prepare_cpu))return -EINVAL;
     if(!try_module_get(owner))return -ENODEV;
     struct device_mapping *mapping=kernel_malloc(sizeof(*mapping));
     if(!mapping){module_put(owner);return -ENOMEM;}
@@ -449,6 +461,60 @@ void device_mapping_release_range(struct device_mapping *mapping,uint64_t offset
     mapping->policy_cursor=p ? p : mapping->policy_tail;
     mapping->policy_high_end=mapping->policy_tail ? mapping->policy_tail->end : 0;
 }
+int device_mapping_prepare_cpu(struct device_mapping *mapping, uint64_t offset, bool writable)
+{
+    if (!mapping || !mapping->info.access || !mapping->operations->prepare_cpu ||
+        (offset & 4095u) || offset >= mapping->info.length)
+        return -EINVAL;
+    struct device_mapping_access *access = mapping->info.access;
+    if (!access->exposed || (writable && !access->writable)) {
+        int ret = mapping->operations->prepare_cpu(mapping->context, offset, writable);
+        if (ret)
+            return ret;
+    }
+    if (writable && !access->writable) {
+        if (!++access->write_epoch)
+            ++access->write_epoch;
+        access->writable = true;
+    }
+    access->exposed = true;
+    return 0;
+}
+
+int device_mapping_revoke_cpu(struct device_mapping_access *access)
+{
+    if (access->aliases)
+        return -EBUSY;
+    if (!access->exposed)
+        return 0;
+    bool flush = false;
+    struct task *task;
+    for (uint32_t i = 0; (task = sched_task_at(i)); ++i) {
+        if (task->kind != TASK_KIND_USER || task->state == TASK_EXITED)
+            continue;
+        struct address_space *as = sched_task_as(task);
+        uint32_t capacity = sched_task_vma_capacity(task);
+        for (uint32_t v = 0; v < capacity; ++v) {
+            const struct task_vma *vma = sched_task_vma_at(task, v);
+            if (!vma || !vma->used || !vma->device_mapping ||
+                device_mapping_info(vma->device_mapping)->access != access)
+                continue;
+            uint64_t cursor = vma->start, page, flags;
+            while (address_space_user_entry_next(as, cursor, vma->end, &page, NULL, &flags)) {
+                if ((flags & RELIEFNT_PAGE_DEVICE) && address_space_unmap_user_page(as, page))
+                    flush = true;
+                cursor = page + 4096;
+            }
+        }
+    }
+    if (flush)
+        smp_flush_user_tlb();
+    access->exposed = false;
+    access->writable = false;
+    return 0;
+}
+
+EXPORT_SYMBOL(device_mapping_revoke_cpu);
 EXPORT_SYMBOL(device_mapping_create);
 EXPORT_SYMBOL(device_mapping_get);
 EXPORT_SYMBOL(device_mapping_put);

@@ -23,7 +23,6 @@
 #include <linux/errno.h>
 #include <reliefnt/time.h>
 #include <reliefnt/power.h>
-#include <reliefnt/graphics_service.h>
 #include <reliefnt/storage.h>
 #ifdef CONFIG_SWAP
 /** @brief Cancel an interrupted fork's scalar-only private reclaim state. */
@@ -302,8 +301,6 @@ static int signal_setup_frame(struct task *task, int sig,
             nr != __NR_poll && nr != __NR_ppoll && nr != __NR_epoll_wait && nr != __NR_epoll_pwait &&
             nr != __NR_epoll_pwait2 && nr != __NR_select && nr != __NR_pselect6 && nr != __NR_rt_sigtimedwait && !sleeping &&
             !(nr == __NR_futex && frame->r10) && !task->socket_io_timed;
-        bool synccpu_busy = graphics_service_task_signal_busy(task);
-        if (synccpu_busy) restart = false;
         uint64_t received = task->socket_receive_done;
         bool batch = task->mmsg.active;
 #ifdef CONFIG_SWAP
@@ -323,8 +320,7 @@ static int signal_setup_frame(struct task *task, int sig,
         task_release_syscall_file(task);
         if (received || socket_output_error || transfer_result<0 || (batch && batch_result != -LINUX_EINTR) || (interruptible && !restart)) {
             frame->rip += 2;
-            frame->rax = synccpu_busy ? (uint64_t)-LINUX_EBUSY :
-                socket_output_error ? (uint64_t)socket_output_error : transfer_result<0 ? (uint64_t)transfer_result :
+            frame->rax = socket_output_error ? (uint64_t)socket_output_error : transfer_result<0 ? (uint64_t)transfer_result :
                 batch ? (uint64_t)batch_result : received ? received : (uint64_t)-4LL;
             task->poll_deadline_ticks = 0;
         }
@@ -470,7 +466,6 @@ static int signal_deliver_pending_locked(struct task *task, struct trap_frame *f
     /* A direct delivery or RMID result precedes signal_pending in ipc/msg.c. */
     if (task->restart_syscall && task->sysv_msg.completed) return 0;
     if (task->restart_syscall && task_sysv_sem_ready(task)) return 0;
-    if (graphics_service_task_uninterruptible(task)) return 0;
     int sig;
     for (;;) {
         uint64_t allowed = ~(task->blocked_signals | task->sigwait_mask);

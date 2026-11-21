@@ -9,8 +9,7 @@ struct task;
 struct task_file;
 struct drm_bo;
 
-/* Register only after the VMware SVGA PCI function has been bound. */
-int drm_device_register(const struct pci_device *device);
+/* Register a PCI device after its graphics backend has initialized it. */
 bool drm_device_is_registered(void);
 bool drm_device_render_node_ready(void);
 int drm_device_pci_identity(struct pci_device *out);
@@ -99,11 +98,6 @@ int64_t drm_prime_file_ioctl(struct task *task, struct task_file *file,
  */
 int drm_prime_file_mmap(struct task_file *file, uint64_t flags,
                         uint64_t protection);
-/* Run a bounded vmwgfx retirement pass; return the number of resources freed. */
-uint32_t drm_vmwgfx_process_retirements(uint32_t budget);
-void drm_vmwgfx_cancel_task_continuation(struct task *task);
-bool drm_vmwgfx_task_uninterruptible(const struct task *task);
-bool drm_vmwgfx_task_signal_busy(const struct task *task);
 
 /* DRM owns one BO/OFD lease per generic mapping family; core VM never owns
  * a raw BO. Slices/forks share that lease until their final generic put. */
@@ -113,5 +107,4 @@ void drm_bo_get(struct drm_bo *bo);
 void drm_bo_put(struct drm_bo *bo);
 uint64_t drm_bo_page_physical(const struct drm_bo *bo, uint64_t offset);
 uint64_t drm_bo_size(const struct drm_bo *bo);
-
 #endif

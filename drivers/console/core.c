@@ -135,12 +135,6 @@ void console_present(void)
     console_presenting = false;
 }
 
-/** @brief Retry scanout damage, including while a text VT is active. */
-void console_display_tick(void)
-{
-    framebuffer_display_tick(console_vt_graphical);
-}
-
 void console_init(void)
 {
     serial_init();

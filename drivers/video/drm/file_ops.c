@@ -8,9 +8,7 @@
 #include <reliefnt/syscall_internal.h>
 #include <linux/errno.h>
 #include <linux/uio.h>
-#ifdef CONFIG_DRM_VIRTIO_GPU
-#include "virtio/sync.h"
-#endif
+#include "sync.h"
 
 /** @brief Open the actual card/render inode or adopt already owned PRIME state.
  * @param task Current execution-owned caller. @param file Borrowed unpublished OFD.
@@ -26,9 +24,7 @@ static int drm_character_open(struct task *task,struct task_file *file)
  */
 static void drm_character_close(struct task_file *file)
 {
-#ifdef CONFIG_DRM_VIRTIO_GPU
-    vg_sync_close(file);
-#endif
+    drm_sync_close(file);
     drm_prime_file_close(file);drm_file_close(file);
 }
 /** @brief Read card events or apply the opaque PRIME object's stream policy.
@@ -61,9 +57,7 @@ static int64_t drm_character_write(struct task *task,struct task_file *file,cons
  */
 static int64_t drm_character_ioctl(struct task *task,struct task_file *file,uint64_t request,uint64_t argument)
 {
-#ifdef CONFIG_DRM_VIRTIO_GPU
-    if(file->kind==TASK_FILE_KIND_DRM_SYNC)return vg_sync_ioctl(task,file,(uint32_t)request,argument);
-#endif
+    if(file->kind==TASK_FILE_KIND_DRM_SYNC)return drm_sync_ioctl(task,file,(uint32_t)request,argument);
     return drm_fd_ioctl(task,file,(uint32_t)request,argument);
 }
 /** @brief Query the retained card/opaque PRIME readiness implementation.
@@ -72,9 +66,7 @@ static int64_t drm_character_ioctl(struct task *task,struct task_file *file,uint
  */
 static short drm_character_poll(struct task_file *file,short events)
 {
-#ifdef CONFIG_DRM_VIRTIO_GPU
-    if(file->kind==TASK_FILE_KIND_DRM_SYNC)return vg_sync_poll(file,events);
-#endif
+    if(file->kind==TASK_FILE_KIND_DRM_SYNC)return drm_sync_poll(file,events);
     return (short)(file->drm_prime_file ? drm_prime_file_poll(file,(uint16_t)events) : drm_file_poll(file,(uint16_t)events));
 }
 /** @brief Preserve Linux DRM noop_llseek and opaque DMA-BUF SET/END behavior.
@@ -140,8 +132,7 @@ static void drm_character_exit(void)
 module_init(drm_character_init);
 module_exit(drm_character_exit);
 MODULE_LICENSE("Apache-2.0");
-MODULE_DESCRIPTION("ReliefNT DRM/KMS, VMware SVGA and VirtIO-GPU provider");
-MODULE_ALIAS("pci:v000015ADd00000405sv*sd*bc*sc*i*");
+MODULE_DESCRIPTION("ReliefNT DRM/KMS provider");
 #ifdef CONFIG_DRM_VIRTIO_GPU
 MODULE_ALIAS("pci:v00001AF4d00001050sv*sd*bc*sc*i*");
 #endif

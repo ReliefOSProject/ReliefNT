@@ -28,10 +28,8 @@
 #include <reliefnt/smp.h>
 #include <reliefnt/userland.h>
 #include <reliefnt/vdso.h>
-#include <reliefnt/svga.h>
 #include <reliefos/layout.h>
 #include <reliefnt/permissions.h>
-#include <reliefnt/graphics_service.h>
 #include <reliefnt/net.h>
 #include <reliefnt/usb.h>
 #include <reliefnt/mount.h>
@@ -1142,7 +1140,6 @@ static void userland_discard_prepared(struct task *prepared)
  */
 static int userland_commit_prepared(struct task *task, struct task *prepared)
 {
-    svga_gpu_release_owner(task->pid);
     sched_exec_replace_mm(task, sched_task_as(prepared));
     task->address_space = prepared->address_space;
     task->credentials = prepared->credentials;

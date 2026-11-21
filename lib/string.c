@@ -135,6 +135,7 @@ int strncmp(const char *a, const char *b, size_t len)
 }
 
 EXPORT_SYMBOL(memcpy);
+EXPORT_SYMBOL(memmove);
 
 EXPORT_SYMBOL(memcmp);
 EXPORT_SYMBOL(strcmp);

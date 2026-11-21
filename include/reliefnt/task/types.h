@@ -149,7 +149,7 @@ struct task_file {
     struct audio_timer_file *audio_timer_file;
     /* DRM primary-node state owned by the open file description. */
     struct drm_file *drm_file;
-    /* Opaque same-device vmwgfx surface PRIME file; also OFD-owned. */
+    /* Same-device PRIME buffer metadata owned by the file description. */
     struct drm_prime_file *drm_prime_file;
     uint64_t drm_prime_ino;
     uint64_t drm_prime_size;
@@ -511,6 +511,8 @@ struct task_lookup_scope {
     struct task_lookup_path paths[2];
     struct task_lookup_extra *extra;
     uint64_t number,args[6];
+    uint64_t ioctl_deadline_us; /* Absolute deadline of a suspended driver wait. */
+    uint64_t ioctl_target_sequence;
     size_t cursor;
     bool armed;
 };
@@ -587,8 +589,6 @@ struct task {
     struct task_file *syscall_file;
     /* Owned inode/read-deny lease across finit_module snapshot I/O retries. */
     struct storage_inode_ref *module_file_inode;
-    /* Task-owned vmwgfx ioctl continuation; opaque to the scheduler. */
-    void *drm_vmwgfx_continuation;
     struct task_file *fifo_open_file; /* Unpublished endpoint held during FIFO rendezvous. */
     uint32_t tty_old_pgrp;
     struct task_pty_fd syscall_pty;

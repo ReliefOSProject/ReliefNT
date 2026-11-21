@@ -1,4 +1,3 @@
-#include <reliefnt/graphics_service.h>
 #include <reliefnt/swap.h>
 #include "internal.h"
 
@@ -232,9 +231,6 @@ void sched_exec_replace_mm(struct task *task, const struct address_space *replac
      * destroyed or recycled. Failed exec preparation keeps its old token. */
     if(memory_headroom_exec_cancel)memory_headroom_exec_cancel(task);
 #endif
-    /* A committed exec has replaced the user's address-space contract. Drop
-     * any saved ioctl user pointers before releasing the previous mm. */
-    graphics_service_cancel_task_continuation(task);
     struct task_address_space_state *old = task->shared_mm;
     /* exec_mmap() calls exec_mm_release() before the new mm is activated.
      * At this point userland_exec_current_path() cannot fail any more, so a

@@ -6,16 +6,6 @@
 #include <reliefnt/framebuffer.h>
 #include <reliefnt/pci.h>
 #include <reliefnt/port.h>
-#include "../svga/device.h"
-
-/** @brief Copy complete pixels into a UC/WC 32-bit scanout aperture.
- * @param destination Four-byte-aligned writable pixel extent, borrowed.
- * @param source Nonoverlapping readable source, possibly unaligned, borrowed.
- * @param pixels Exact count, zero allowed. Caller retains mappings and display
- * exclusion and orders WC writes before publication; no readback, padding
- * access, allocation, lock or SIMD use.
- */
-void framebuffer_copy_io32(void *destination, const void *source, size_t pixels);
 
 /** @brief Paint one opaque 8- or 16-pixel-wide, 16-row glyph.
  * @param target Destination framebuffer. @param x Left pixel. @param y Top.
@@ -57,43 +47,6 @@ void framebuffer_draw_glyph_to(const struct framebuffer *target, uint32_t x, uin
 #define VBE_DISPI_ID5 0xb0c5u
 #define VBE_DISPI_ENABLED 0x01u
 #define VBE_DISPI_LFB_ENABLED 0x40u
-
-#define VMWARE_VENDOR_ID 0x15adu
-#define VMWARE_SVGA_DEVICE_ID 0x0405u
-#define VMWARE_PCI_COMMAND_IO 0x0001u
-#define VMWARE_PCI_COMMAND_MEMORY 0x0002u
-#define VMWARE_SVGA_ID_2 0x90000002u
-#define VMWARE_SVGA_REG_ID 0u
-#define VMWARE_SVGA_REG_ENABLE 1u
-#define VMWARE_SVGA_REG_WIDTH 2u
-#define VMWARE_SVGA_REG_HEIGHT 3u
-#define VMWARE_SVGA_REG_MAX_WIDTH 4u
-#define VMWARE_SVGA_REG_MAX_HEIGHT 5u
-#define VMWARE_SVGA_REG_DEPTH 6u
-#define VMWARE_SVGA_REG_BITS_PER_PIXEL 7u
-#define VMWARE_SVGA_REG_PSEUDOCOLOR 8u
-#define VMWARE_SVGA_REG_BYTES_PER_LINE 12u
-#define VMWARE_SVGA_REG_FB_START 13u
-#define VMWARE_SVGA_REG_FB_OFFSET 14u
-#define VMWARE_SVGA_REG_FB_MAX_SIZE 15u
-#define VMWARE_SVGA_REG_FB_SIZE 16u
-#define VMWARE_SVGA_REG_CAPABILITIES 17u
-#define VMWARE_SVGA_REG_MEM_START 18u
-#define VMWARE_SVGA_REG_MEM_SIZE 19u
-#define VMWARE_SVGA_REG_CONFIG_DONE 20u
-#define VMWARE_SVGA_REG_SYNC 21u
-#define VMWARE_SVGA_REG_BUSY 22u
-#define VMWARE_SVGA_REG_TRACES 45u
-#define VMWARE_SVGA_CAP_TRACES 0x00200000u
-
-
-struct vmware_svga_state {
-    struct pci_device pci;
-    uint16_t io_port;
-    uint32_t max_width;
-    uint32_t max_height;
-    bool present;
-};
 
 struct bochs_vbe_state {
     uint32_t lfb_start;
@@ -288,22 +241,7 @@ struct efi_graphics_output_protocol {
 
 
 
-/* Kick the host to process queued FIFO commands without waiting for it to
- * drain.  Writing the SYNC register is the doorbell; reading BUSY in a loop is
- * the synchronous wait.  On the fast present path we only need the doorbell:
- * blocking here would pin a core spinning (and serialise every other core's
- * syscall) for the duration of a frame the host can process asynchronously. */
-
-
 extern struct framebuffer fb;
-extern struct vmware_svga_state vmware_svga;
-extern bool framebuffer_drm_scanout_owned;
-extern bool framebuffer_svga_damage_pending;
-
-static inline void framebuffer_svga_clear_damage(void)
-{
-    __atomic_store_n(&framebuffer_svga_damage_pending, false, __ATOMIC_RELAXED);
-}
 
 /** @brief Return the font's one- or two-column width for a Unicode scalar. */
 uint32_t framebuffer_codepoint_width(uint32_t cp);
@@ -331,8 +269,6 @@ void framebuffer_codepoint_to(const struct framebuffer *target,
                               uint32_t x, uint32_t y, uint32_t cp,
                               uint32_t fg, uint32_t bg);
 
-bool framebuffer_drm_owned(void);
-
 int framebuffer_color_format_valid(const struct framebuffer *target);
 
 /**
@@ -359,48 +295,12 @@ int framebuffer_range_valid(uint64_t start, uint64_t bytes);
 
 uint64_t framebuffer_current_bytes(void);
 
-uint32_t vmware_svga_read(uint32_t reg);
-
-void vmware_svga_write(uint32_t reg, uint32_t value);
-
-void vmware_svga_memory_fence(void);
-
-/**
- * @brief Enable VMware GFB write tracing for mmap-backed fbdev clients.
- * @return None.
- *
- * Xorg's fbdev shadow framebuffer writes the scan-out surface through its
- * mmap.  Once the SVGA FIFO is enabled those writes do not imply an UPDATE
- * unless SVGA_REG_TRACES is explicitly enabled.  Keep the capability check
- * here so mode/FIFO reinitialisation restores the same display semantics.
- */
-void framebuffer_vmware_enable_traces(void);
-
-/**
- * @brief Reclaim the legacy framebuffer after stopping other panic CPUs.
- * Bypasses the device lock, which the interrupted CPU may already own.
- */
-void framebuffer_panic_prepare(void);
-
-/**
- * @brief Publish panic pixels without logging, locks or unbounded FIFO waits.
- * The panic owner is the only remaining producer. A wedged GPU is best effort.
- */
-void framebuffer_panic_present(void);
-
-/** @brief Probe VMware, restoring reprogrammed scanout on selection failure.
- * @return 1 for a published device surface, or 0 for the unchanged boot surface.
- */
-int framebuffer_vmware_probe(void);
-
 /** @brief Probe VBE without discarding the active boot framebuffer reservation.
  * @return 1 when selected; 0 when the boot framebuffer remains the backend.
  */
 int framebuffer_vbe_probe(void);
 
 int framebuffer_vbe_set_mode(uint32_t width, uint32_t height);
-
-int framebuffer_vmware_set_mode(uint32_t width, uint32_t height);
 
 uint8_t *framebuffer_pixel_ptr(uint32_t x, uint32_t y);
 
@@ -441,14 +341,6 @@ void framebuffer_present_region(uint32_t x, uint32_t y, uint32_t width, uint32_t
 
 void framebuffer_present(void);
 
-
-int framebuffer_drm_scanout_begin(void);
-
-void framebuffer_drm_scanout_release(void);
-
-int framebuffer_drm_present_region(const void *pixels, uint32_t pitch,
-                                   uint32_t format, uint32_t x1, uint32_t y1,
-                                   uint32_t x2, uint32_t y2);
 
 void framebuffer_text(uint32_t x, uint32_t y, const char *text, uint32_t fg, uint32_t bg);
 

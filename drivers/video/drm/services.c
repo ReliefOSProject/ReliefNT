@@ -1,90 +1,118 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "services.h"
-#include <reliefnt/drm.h>
-#include <reliefnt/framebuffer.h>
+#include "drm_internal.h"
 #include <reliefnt/graphics_service.h>
 #include <reliefnt/moduleparam.h>
-#include <linux/errno.h>
+
 #ifdef CONFIG_DRM_VIRTIO_GPU
-#include "virtio/internal.h"
+extern const struct drm_driver vg_driver;
+#endif
+#ifdef CONFIG_DRM_VMWARE_SVGA
+extern const struct drm_driver svga_driver;
 #endif
 
-/** @brief Dispatch bounded retirement work to the registered hardware backend.
- * @param budget Work limit. @return Retired count; task/execution context.
- */
+static const struct drm_driver *const drivers[] = {
+#ifdef CONFIG_DRM_VIRTIO_GPU
+    &vg_driver,
+#endif
+#ifdef CONFIG_DRM_VMWARE_SVGA
+    &svga_driver,
+#endif
+    NULL,
+};
+
+static const struct drm_driver *primary_driver(void)
+{
+    struct drm_device *device = drm_device_get();
+    return device ? device->driver : NULL;
+}
+
 static uint32_t process_retirements(uint32_t budget)
 {
-#ifdef CONFIG_DRM_VIRTIO_GPU
-    if(drm_is_virtio())return vg_process_retirements(budget);
-#endif
-    return drm_vmwgfx_process_retirements(budget);
+    const struct drm_driver *driver = primary_driver();
+    return driver && driver->retire ? driver->retire(budget) : 0;
 }
-#ifdef CONFIG_DRM_VIRTIO_GPU
-/** @brief Copy connector metadata for VirtIO, retaining the generic SVGA contract.
- * @param index Output number. @param out Copied destination. @return Zero or errno.
- * Task/execution context, no borrowed pointer survives provider admission.
- */
-static int connector_info(uint32_t index,struct graphics_connector_info *out)
+
+static int connector_info(uint32_t index, struct graphics_connector_info *out)
 {
-    if(drm_is_virtio())return vg_connector_info(index,out);
-    if(index)return -ENOENT;
-    const struct framebuffer *fb=framebuffer_get();
-    *out=(struct graphics_connector_info){.connected=fb->available,
-        .enabled=drm_device_kms_scanout_active(),.mode_count=fb->available ? 1 : 0};
-    out->widths[0]=fb->width;out->heights[0]=fb->height;return 0;
+    const struct drm_driver *driver = primary_driver();
+    return driver && driver->connector_info ? driver->connector_info(index, out) : -ENODEV;
 }
-#endif
-/* A boot-only, readonly parameter uses the same descriptor in y and m builds.
- * modprobe forwards drm.faildiag from /proc/cmdline to an external drm.ko. */
+
+static void panic_prepare(void)
+{
+    const struct drm_driver *driver = primary_driver();
+    if (driver && driver->panic_prepare)
+        driver->panic_prepare();
+}
+
+static void panic_damage(uint32_t x, uint32_t y, uint32_t width, uint32_t height)
+{
+    const struct drm_driver *driver = primary_driver();
+    if (driver && driver->panic_damage)
+        driver->panic_damage(x, y, width, height);
+}
+
+static void panic_present(void)
+{
+    const struct drm_driver *driver = primary_driver();
+    if (driver && driver->panic_present)
+        driver->panic_present();
+}
+
+/* Readonly boot parameter, parsed identically in y and m builds. */
 static bool faildiag;
 module_param(faildiag, bool, 0400);
 MODULE_PARM_DESC(faildiag, "Enable bounded DRM failure diagnostics at initialization");
-static const struct graphics_service_operations drm_core_operations={
-    .is_registered=drm_device_is_registered,.render_node_ready=drm_device_render_node_ready,
-    .pci_identity=drm_device_pci_identity,.kms_scanout_active=drm_device_kms_scanout_active,
-    .kms_vt_release=drm_device_kms_vt_release,.process_retirements=process_retirements,
-    .cancel_task_continuation=drm_vmwgfx_cancel_task_continuation,
-    .task_uninterruptible=drm_vmwgfx_task_uninterruptible,.task_signal_busy=drm_vmwgfx_task_signal_busy,
-#ifdef CONFIG_DRM_VIRTIO_GPU
-    .panic_prepare=vg_panic_prepare,.panic_damage=vg_panic_damage,.panic_present=vg_panic_present,
-    .connector_info=connector_info,
-#endif
+
+static const struct graphics_service_operations drm_core_operations = {
+    .is_registered = drm_device_is_registered, .render_node_ready = drm_device_render_node_ready,
+    .pci_identity = drm_device_pci_identity, .kms_scanout_active = drm_device_kms_scanout_active,
+    .kms_vt_release = drm_device_kms_vt_release, .process_retirements = process_retirements,
+    .panic_prepare = panic_prepare, .panic_damage = panic_damage, .panic_present = panic_present,
+    .connector_info = connector_info,
 };
-static const struct kernel_service_descriptor drm_core_provider={
-    .operations=&drm_core_operations,.owner=THIS_MODULE};
-/** @brief Discover the bound SVGA function and publish fully initialized DRM hooks.
- * @return Zero, including no matching framebuffer, or discovery/registry errno.
- * Init task context after core heap setup; no early graphics registration is
- * required. The immutable framebuffer identity is copied, never borrowed.
- * The shared parameter framework has applied the boot/module arguments before
- * this call. The readonly faildiag value initializes bounded logging once.
- */
+static const struct kernel_service_descriptor drm_core_provider = {
+    .operations = &drm_core_operations, .owner = THIS_MODULE,
+};
+
+static void stop_primary(void)
+{
+    const struct drm_driver *driver = primary_driver();
+    if (driver) {
+        if (driver->kms_vt_release)
+            driver->kms_vt_release();
+        driver->stop();
+        drm_device_unregister();
+    }
+}
+
 int drm_core_services_start(void)
 {
-    struct pci_device device;
-    int rc=-ENODEV;
-#ifdef CONFIG_DRM_VIRTIO_GPU
-    rc=vg_device_start(&device);
-    if(rc && rc!=-ENODEV)return rc;
-#endif
-    if(rc==-ENODEV)rc=framebuffer_vmware_pci_identity(&device);
-    if(!rc){rc=drm_device_register(&device);if(rc)return rc;}
-    else if(rc!=-ENODEV)return rc;
+    for (unsigned i = 0; drivers[i]; ++i) {
+        struct pci_device device;
+        int ret = drivers[i]->start(&device);
+        if (ret == -ENODEV)
+            continue;
+        if (ret)
+            return ret;
+        ret = drm_device_register(&device, drivers[i]);
+        if (ret) {
+            drivers[i]->stop();
+            return ret;
+        }
+        break;
+    }
+
     drm_faildiag_configure(faildiag ? "drm.faildiag=1" : NULL);
-    rc=graphics_service_register(&drm_core_provider);
-#ifdef CONFIG_DRM_VIRTIO_GPU
-    if(rc)vg_device_stop();
-#endif
-    return rc;
+    int ret = graphics_service_register(&drm_core_provider);
+    if (ret)
+        stop_primary();
+    return ret;
 }
-/** @brief Remove optional DRM hooks only after all external code users have drained.
- * Exit task context; cleanup-ledger detach may already have completed. No
- * callback or hardware operation occurs under the permanent service locks.
- */
+
 void drm_core_services_stop(void)
 {
     (void)graphics_service_unregister(&drm_core_provider);
-#ifdef CONFIG_DRM_VIRTIO_GPU
-    vg_kms_vt_release();vg_device_stop();
-#endif
+    stop_primary();
 }

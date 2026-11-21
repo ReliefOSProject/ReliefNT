@@ -7,6 +7,7 @@
 
 #include <reliefnt/types.h>
 struct task;
+struct paging_writable_alias;
 /**
  * @brief Copy through the target's page tables rather than the current CR3.
  * @param task Pinned destination task under the kernel execution lock.
@@ -28,6 +29,21 @@ int user_copy_to_task(struct task *task, uint64_t address, const void *source, u
 int user_copy_from_task(struct task *task, void *destination, uint64_t address,
                         uint64_t size);
 
+/**
+ * @brief Retain the RAM frame of one readable, page-aligned user mapping.
+ * @param task Live user task under the kernel execution writer.
+ * @param address User page address, with swapped backing prepared by the caller.
+ * @param pin Zeroed owner-embedded node, kept until user_unpin_read_page().
+ * @return Zero, or -EFAULT for an inaccessible, device or unowned page.
+ * The frame survives unmap and swap. Break existing writable COW and use the
+ * fork alias registry to keep a subsequent fork from moving the parent's
+ * frame on write. Replacing a mapping does not retarget the pin. External
+ * readers must be detached before dropping the pin under the same writer.
+ */
+int user_pin_read_page(struct task *task, uint64_t address,
+                       struct paging_writable_alias *pin);
+void user_unpin_read_page(struct paging_writable_alias *pin);
+
 /** @brief Validate readable user pages, resolving lazy faults for the current task.
  * @param ptr Inclusive user virtual address. @param len Exact byte length.
  * @return True for an accessible range, false for aperture/overflow/fault errors;
@@ -38,6 +54,13 @@ int user_copy_from_task(struct task *task, void *destination, uint64_t address,
  * still apply. The caller owns all buffers/OFDs and performs the copy.
  */
 bool user_range_ok(uint64_t ptr, uint64_t len);
+#ifdef CONFIG_SWAP
+/** Like user_range_ok(), but retain -EAGAIN from a contended lazy file page.
+ * Returns zero or -EFAULT otherwise. The caller must prepare swapped pages
+ * first and, on -EAGAIN, defer the operation before publishing side effects.
+ */
+int user_range_readable(uint64_t ptr, uint64_t len);
+#endif
 /** @brief Prepare current user pages for output, resolving lazy/COW backing.
  * @param ptr User virtual destination. @param len Byte count, zero allowed.
  * @return True for writable pages, false without a user task or on bounds/fault/

@@ -6,7 +6,6 @@
 #include <reliefnt/lock.h>
 #include "modules/framebuffer.h"
 #include "modules/console.h"
-#include "../../drivers/video/svga/fifo.c"
 #include "../../lib/bugcheck.c"
 
 #define WIDTH 640u
@@ -14,11 +13,10 @@
 #define GUARD 32u
 static unsigned checks;
 static bool panic_phase;
-static unsigned allocations, locking, io_writes, vga_bytes;
+static unsigned allocations, locking, vbe_accesses, vga_bytes;
 static unsigned provider_prepares, provider_damages, provider_presents;
 static char serial_output[32768];
 static size_t serial_used;
-struct svga_device svga;
 #define CHECK(c) do {++checks; if (!(c)) {fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#c);exit(1);}} while(0)
 
 void kernel_spin_lock_irqsave(struct kernel_spinlock *lock, uint64_t *flags)
@@ -26,23 +24,8 @@ void kernel_spin_lock_irqsave(struct kernel_spinlock *lock, uint64_t *flags)
 void kernel_spin_unlock_irqrestore(struct kernel_spinlock *lock, uint64_t flags)
 { CHECK(!panic_phase && lock->state==1 && !flags); lock->state=0; }
 
-uint64_t svga_lock(void) { CHECK(!panic_phase); ++locking; return 0; }
-bool svga_try_lock_irqsave(uint64_t *flags) { if(flags)*flags=0; return false; }
-void svga_unlock(uint64_t flags) {(void)flags;}
-int svga_update_locked(uint32_t x,uint32_t y,uint32_t w,uint32_t h)
-{(void)x;(void)y;(void)w;(void)h;CHECK(!panic_phase);return 0;}
-int svga_update_try_locked(uint32_t x,uint32_t y,uint32_t w,uint32_t h)
-{(void)x;(void)y;(void)w;(void)h;return 0;}
-bool svga_restore_traces_locked(void) {CHECK(!panic_phase);return false;}
-void x86_64_outl(uint32_t value,uint16_t port) {(void)value;(void)port;++io_writes;}
-uint32_t x86_64_inl(uint16_t port) {(void)port;return 0;}
-void x86_64_outw(uint16_t value,uint16_t port) {(void)value;(void)port;}
-uint16_t x86_64_inw(uint16_t port) {(void)port;return 0;}
-void svga_barrier(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
-void svga_relax(void) {}
-static uint32_t panic_fifo_read(uint32_t reg) { (void)reg; return 0; }
-static void panic_fifo_write(uint32_t reg,uint32_t value)
-{(void)reg;(void)value;++io_writes;}
+void x86_64_outw(uint16_t value,uint16_t port) {(void)value;(void)port;++vbe_accesses;}
+uint16_t x86_64_inw(uint16_t port) {(void)port;++vbe_accesses;return 0;}
 void *kernel_malloc(size_t bytes) {CHECK(!panic_phase);++allocations;return malloc(bytes);}
 void kernel_free(void *pointer) {CHECK(!panic_phase);free(pointer);}
 void serial_write(const char *text) {(void)text;CHECK(!panic_phase);}
@@ -104,7 +87,6 @@ static void scenario(uint8_t bytes,bool graphical)
     if(graphical) {
         console_vt_activate(1,true);
         framebuffer_rect(0,0,WIDTH,HEIGHT,0x00336699);
-        framebuffer_drm_scanout_owned=true;
     }
     unsigned old_alloc=allocations,old_locks=locking;
     unsigned old_prepares=provider_prepares,old_damages=provider_damages;
@@ -139,7 +121,6 @@ static void scenario(uint8_t bytes,bool graphical)
     CHECK(strstr(serial_output,"0x0000000000001111")!=NULL);
     CHECK(strstr(serial_output,"P=0 W=1 U=0")!=NULL);
     CHECK(strstr(serial_output,"fixture-task")!=NULL);
-    CHECK(!framebuffer_drm_scanout_owned);
     const char *history=vt_text[graphical?0:1].bytes;
     CHECK(strstr(history,"KERNEL PANIC")!=NULL);
     if(graphical) CHECK(vt_text[1].length==tty2_before);
@@ -161,52 +142,18 @@ static void scenario(uint8_t bytes,bool graphical)
     fb=(struct framebuffer){0};
 }
 
-/** @brief Exercise real emergency FIFO success, backpressure, and corrupt indices. */
-static void fifo_scenario(void)
-{
-    uint32_t ring[256]={0};
-    fb=(struct framebuffer){.available=true,.width=800,.height=600,
-                           .backend=FRAMEBUFFER_BACKEND_VMWARE_SVGA};
-    vmware_svga=(struct vmware_svga_state){.present=true,.io_port=0x1000};
-    svga=(struct svga_device){.bound=true,.fifo_ready=true,.fifo=ring,
-        .min=64,.fifo_bytes=sizeof(ring),
-        .ops={.read=panic_fifo_read,.write=panic_fifo_write}};
-    ring[SVGA_FIFO_MIN]=64;ring[SVGA_FIFO_MAX]=sizeof(ring);
-    ring[SVGA_FIFO_NEXT_CMD]=ring[SVGA_FIFO_STOP]=64;
-    panic_phase=true;
-    framebuffer_panic_prepare();framebuffer_panic_present();
-    CHECK(ring[SVGA_FIFO_NEXT_CMD]==84);
-    CHECK(ring[16]==SVGA_CMD_UPDATE && ring[19]==800 && ring[20]==600);
-    __atomic_store_n(&svga.fifo_writer_active,true,__ATOMIC_RELEASE);
-    framebuffer_panic_present();
-    CHECK(ring[SVGA_FIFO_NEXT_CMD]==84);
-    __atomic_store_n(&svga.fifo_writer_active,false,__ATOMIC_RELEASE);
-    ring[SVGA_FIFO_NEXT_CMD]=64;ring[SVGA_FIFO_STOP]=68;
-    unsigned before=io_writes;
-    framebuffer_panic_present();
-    CHECK(io_writes>before && io_writes-before<30000); /* finite stuck-FIFO path */
-    CHECK(ring[SVGA_FIFO_NEXT_CMD]==64);
-    ring[SVGA_FIFO_NEXT_CMD]=sizeof(ring)+4;
-    before=io_writes;
-    framebuffer_panic_present();
-    CHECK(!svga.fifo_ready && io_writes==before);
-    panic_phase=false;
-    vmware_svga=(struct vmware_svga_state){0};svga=(struct svga_device){0};fb=(struct framebuffer){0};
-}
-
-/** @brief A GOP mapping rejected at boot must stay disabled during a panic. */
+/** @brief A boot framebuffer rejected at boot must stay disabled during a panic. */
 static void disabled_framebuffer_scenario(void)
 {
     fb=(struct framebuffer){.available=true,.pixels=(uint32_t *)(uintptr_t)0x1000000000ULL,
         .width=800,.height=600,.pitch=3200,.bytes_per_pixel=4,
-        .backend=FRAMEBUFFER_BACKEND_VMWARE_SVGA};
-    vmware_svga=(struct vmware_svga_state){.present=true};
+        .backend=FRAMEBUFFER_BACKEND_BOOT};
     fb_console_enabled=false;
     fb_console_tty_cursor_visible=true; /* no cursor restore through bad pixels */
     fb_console_tty_cursor_x=fb_console_tty_cursor_y=0;
     fb_console_tty_cursor_bpp=4;
     unsigned before=vga_bytes;
-    unsigned io_before=io_writes;
+    unsigned vbe_before=vbe_accesses;
     serial_used=0;serial_output[0]=0;
     panic_phase=true;
     (void)console_panic_begin();
@@ -214,9 +161,9 @@ static void disabled_framebuffer_scenario(void)
     console_panic_flush();
     CHECK(!fb_console_enabled);
     CHECK(vga_bytes>before);
-    CHECK(io_writes==io_before);
+    CHECK(vbe_accesses==vbe_before);
     CHECK(strstr(serial_output,"KERNEL PANIC")!=NULL);
-    panic_phase=false;fb=(struct framebuffer){0};vmware_svga=(struct vmware_svga_state){0};
+    panic_phase=false;fb=(struct framebuffer){0};
 }
 
 /** @brief Explicit panic and emergency frames must label unavailable data honestly. */
@@ -293,7 +240,6 @@ static void overlay_cells(uint8_t bytes,bool soft_wrap)
 int main(void)
 {
     scenario(4,false);scenario(4,true);scenario(3,false);scenario(3,true);
-    fifo_scenario();
     disabled_framebuffer_scenario();
     report_scenarios();
     overlay_cells(4,false);overlay_cells(3,false);

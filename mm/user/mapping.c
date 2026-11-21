@@ -488,7 +488,8 @@ static int64_t mm_mmap_internal(uint64_t addr, uint64_t len, uint64_t prot,
     if (vma_flags & TASK_VMA_FLAG_SHARED) page_flags |= RELIEFNT_PAGE_SHARED;
     if (device_mapping) {
         uint64_t phys = device_phys;
-        for (uint64_t page = start; page < end; page += PAGE_SIZE, phys += PAGE_SIZE) {
+        bool demand = device_backing && device_mapping_info(device_backing)->access;
+        for (uint64_t page = start; !demand && page < end; page += PAGE_SIZE, phys += PAGE_SIZE) {
             uint64_t actual=device_backing ? device_mapping_physical(device_backing,page-start) : phys;
             uint64_t cache=0;
             /* Typed backing owns the physical policy through all VMA/stage
@@ -815,7 +816,8 @@ int64_t syscall_mm_mremap(uint64_t old_addr, uint64_t old_len, uint64_t new_len,
         if (vma->prot & LINUX_PROT_WRITE) page_flags |= RELIEFNT_PAGE_WRITABLE;
         if (!(vma->prot & LINUX_PROT_EXEC)) page_flags |= RELIEFNT_PAGE_NOEXEC;
         if (vma->prot == LINUX_PROT_NONE) page_flags |= RELIEFNT_PAGE_PROTNONE;
-        for (uint64_t page = 0; page < new_mapped; page += PAGE_SIZE) {
+        bool demand = device_mapping_info(vma->device_mapping)->access != NULL;
+        for (uint64_t page = 0; !demand && page < new_mapped; page += PAGE_SIZE) {
             uint64_t actual=device_mapping_physical(vma->device_mapping,vma->device_map_offset+page);
             uint64_t cache=address_space_user_page_flags(sched_task_as(task),old_addr+page) &
                 (RELIEFNT_PAGE_PWT|RELIEFNT_PAGE_PCD|RELIEFNT_PAGE_PAT);

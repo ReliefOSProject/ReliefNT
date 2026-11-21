@@ -15,7 +15,7 @@
 
 void task_regular_io_stage_cancel(struct task *task) { assert(task==&target); }
 void task_socket_stage_cancel(struct task *task) { assert(task==&target); }
-void graphics_service_cancel_task_continuation(struct task *task) { assert(task==&target); }
+
 void task_sysv_msg_cancel(struct task *task) { assert(task==&target); }
 void task_sysv_sem_cancel(struct task *task) { assert(task==&target); }
 void task_pty_release_entry(struct task_pty_fd *entry) { assert(entry && !entry->used); }

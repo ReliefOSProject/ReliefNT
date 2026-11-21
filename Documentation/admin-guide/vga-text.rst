@@ -28,10 +28,9 @@ Linux VT 控制流程在提交所有权之前调用可失败的 VGA 硬件准备
 设备和降级
 ==========
 
-支持兼容 VGA 的 Bochs VBE、VMware SVGA II 图形恢复，以及无 framebuffer
-的 Legacy VGA 纯文本启动。纯 GOP 且无兼容平面的设备不进入该模式。
-SVGA 转换使用现有设备停机与恢复事务；活跃模式租约导致拒绝转换，不能强制
-释放其他 owner 的资源。panic 在停止其他 CPU 后通过静态屏幕和有界端口写入
+支持兼容 VGA 的 Bochs VBE 图形恢复，以及无 framebuffer 的 Legacy VGA
+纯文本启动。纯 GOP 且无兼容平面的设备不进入该模式。
+活跃模式租约会阻止转换。panic 在停止其他 CPU 后通过静态屏幕和有界端口写入
 强制取回文字扫描输出，不获取常规设备锁或分配内存。
 
 固定 PSF 字库提供拉丁字符及部分线框；其他 Unicode 字符降级为 ``?``。

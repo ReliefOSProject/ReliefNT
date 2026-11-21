@@ -106,10 +106,8 @@ void futex_cancel_wait(struct task *task)
     task->futex_deadline = 0;
     ++futex_cancellations;
 }
-bool graphics_service_task_uninterruptible(const struct task *task)
-{ (void)task; return synccpu_uninterruptible; }
-bool graphics_service_task_signal_busy(const struct task *task)
-{ (void)task; return false; }
+
+
 int syscall_handle_task_page_fault(struct task *task, uint64_t address,
                                    uint64_t error)
 { (void)task; (void)address; (void)error; return 0; }

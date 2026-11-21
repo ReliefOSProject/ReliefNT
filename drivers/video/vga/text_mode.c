@@ -8,20 +8,12 @@
 #include <reliefnt/port.h>
 #include <reliefos/psf_font.h>
 
-/* Core-owned mode transaction APIs, shared with the framebuffer mode setter.
- * Successful begin holds the device lock; end reconfigures FIFO and unlocks. */
-int svga_mode_begin(uint64_t *flags);
-void svga_mode_end(uint64_t flags);
-uint64_t svga_lock(void);
-void svga_unlock(uint64_t flags);
-int framebuffer_vmware_set_mode(uint32_t width, uint32_t height);
 int framebuffer_vbe_set_mode(uint32_t width, uint32_t height);
 
 static volatile uint16_t *text_memory;
 static volatile uint8_t *font_memory;
-static bool ready, text_active, svga_suspended, have_dispi, transitioning;
+static bool ready, text_active, have_dispi, transitioning;
 static uint32_t backend;
-static uint16_t svga_port;
 static uint8_t saved_misc, saved_seq[5], saved_crtc[25], saved_gr[9], saved_ac[21], saved_dac[768];
 
 /** @brief Read one indexed byte register while the caller owns device I/O. */
@@ -42,13 +34,6 @@ static uint16_t dispi_read(unsigned index)
 /** @brief Write a Bochs VBE register in the serialized transition path. */
 static void dispi_write(unsigned index, uint16_t value)
 { x86_64_outw((uint16_t)index,0x1ce); x86_64_outw(value,0x1cf); }
-/** @brief Access the bound SVGA device's indexed mode register. */
-static void svga_write(unsigned index, unsigned value)
-{ x86_64_outl(index,svga_port); x86_64_outl(value,svga_port+1); }
-/** @brief Read the current extended scanout enable state for a foreign mode set. */
-static unsigned svga_read(unsigned index)
-{ x86_64_outl(index,svga_port); return x86_64_inl(svga_port+1); }
-
 /** @brief Capture VGA registers/DAC before a destructive legacy mode switch. */
 static void save_vga(void)
 {
@@ -119,15 +104,8 @@ int vga_text_hw_enter(void)
 {
     if (!ready) return -19;
     if (text_active) return 0;
-    if (backend==FRAMEBUFFER_BACKEND_VMWARE_SVGA) {
-        uint64_t flags;
-        int ret=svga_mode_begin(&flags);
-        if (ret) return ret;
-        svga_suspended=true;
-        save_vga(); svga_write(1,0); svga_unlock(flags);
-    } else save_vga();
-    /* EFI may leave the underlying Bochs scanout enabled even when the
-     * selected provider is SVGA. Either extended enable overrides VGA mode 3. */
+    save_vga();
+    /* An extended scanout left enabled by firmware overrides VGA mode 3. */
     if (have_dispi) dispi_write(4,0);
     program_text(); text_active=true;
     return 0;
@@ -150,16 +128,6 @@ int vga_text_hw_leave(void)
         if (!framebuffer_vbe_set_mode(fb->width,fb->height)) {
             dispi_write(4,0); program_text(); transitioning=false; return -5;
         }
-    } else if (backend==FRAMEBUFFER_BACKEND_VMWARE_SVGA) {
-        /* Reuse the existing checked FIFO/mode transaction, including trace
-         * restoration. No framebuffer TTY renderer is enabled by this call. */
-        if (!framebuffer_vmware_set_mode(fb->width,fb->height)) {
-            svga_write(1,0);
-            if (have_dispi) dispi_write(4,0);
-            program_text(); transitioning=false; return -5;
-        }
-        if (svga_suspended) svga_mode_end(svga_lock());
-        svga_suspended=false;
     } else { program_text(); transitioning=false; return -19; }
     text_active=false;
     transitioning=false;
@@ -173,15 +141,9 @@ int vga_text_hw_init(bool legacy_boot)
     struct pci_device dev;
     backend=fb->backend;
     if (fb->available) {
-        uint16_t vendor=backend==FRAMEBUFFER_BACKEND_BOCHS_VBE?0x1234:0x15ad;
-        uint16_t device=backend==FRAMEBUFFER_BACKEND_BOCHS_VBE?0x1111:0x0405;
-        if ((backend!=FRAMEBUFFER_BACKEND_BOCHS_VBE && backend!=FRAMEBUFFER_BACKEND_VMWARE_SVGA) ||
-            pci_find_device(vendor,device,&dev)<0 || dev.class_code!=3 || dev.subclass!=0) return -19;
-        if (backend==FRAMEBUFFER_BACKEND_VMWARE_SVGA) {
-            uint32_t bar=pci_config_read32(dev.bus,dev.slot,dev.function,0x10);
-            if (!(bar&1) || !(bar&0xfffc) || (bar&0xfffc)>0xfffe) return -19;
-            svga_port=(uint16_t)(bar&0xfffc);
-        }
+        if (backend != FRAMEBUFFER_BACKEND_BOCHS_VBE ||
+            pci_find_device(0x1234, 0x1111, &dev) < 0 ||
+            dev.class_code != 3 || dev.subclass != 0) return -19;
     } else if (!legacy_boot) return -19;
     uint16_t dispi_id=dispi_read(0);
     have_dispi=dispi_id>=0xb0c0 && dispi_id<=0xb0c5;
@@ -200,8 +162,7 @@ void vga_text_hw_present(const uint16_t *cells, unsigned x, unsigned y,
     if (!ready || !text_active || transitioning || !cells) return;
     /* Mode-setting is independent of text rendering. Reclaim text scanout
      * after a pre-KD_GRAPHICS fbdev mode set without changing fbdev policy. */
-    if ((have_dispi && (dispi_read(4)&1)) ||
-        (backend==FRAMEBUFFER_BACKEND_VMWARE_SVGA && (svga_read(1)&1))) {
+    if (have_dispi && (dispi_read(4)&1)) {
         text_active=false;
         if (vga_text_hw_enter()) return;
     }
@@ -222,6 +183,5 @@ void vga_text_hw_panic(void)
 {
     if (!ready) return;
     if (have_dispi) dispi_write(4,0);
-    if (backend==FRAMEBUFFER_BACKEND_VMWARE_SVGA) svga_write(1,0);
     program_text(); transitioning=false; text_active=true;
 }

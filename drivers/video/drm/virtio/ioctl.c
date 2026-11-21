@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "internal.h"
-#include "sync.h"
+#include "../sync.h"
 #include <reliefnt/heap.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/time.h>
@@ -9,7 +9,7 @@
 #include <reliefnt/syscall_internal.h>
 #include <reliefnt/console.h>
 
-struct vg_submission { uint32_t count; struct vg_fence *fence; struct drm_bo *objects[]; };
+struct vg_submission { uint32_t count; struct drm_sync_fence *fence; struct drm_bo *objects[]; };
 
 /** @brief Import a nested input before any externally visible submission.
  * @param task Caller. @param to Owned kernel bytes. @param from User address.
@@ -43,8 +43,8 @@ static int output(struct task *task,uint64_t address,uint32_t length)
 static void submission_complete(struct vg_request *request)
 {
     struct vg_submission *submission=request->private;
-    vg_fence_signal(submission->fence,request->result);
-    vg_fence_put(submission->fence);
+    drm_sync_fence_signal(submission->fence,request->result);
+    drm_sync_fence_put(submission->fence);
     for(unsigned i=0;i<submission->count;++i) {
         if(request->result)drm_bo_virtio(submission->objects[i])->error=request->result;
         drm_bo_gpu_release(submission->objects[i]);drm_bo_put(submission->objects[i]);
@@ -64,7 +64,7 @@ static int execbuffer(struct task *task,struct drm_file *file,struct drm_virtgpu
     if(!arg->size || (arg->size&3) || arg->size>VG_MAX_COMMAND-sizeof(struct virtio_gpu_cmd_submit) ||
         arg->num_bo_handles>VG_MAX_RESOURCES)return -EINVAL;
     if(arg->flags&VIRTGPU_EXECBUF_FENCE_FD_IN) {
-        int rc=vg_sync_wait_fd(task,arg->fence_fd);if(rc)return rc;
+        int rc=drm_sync_wait_fd(task,arg->fence_fd);if(rc)return rc;
     }
     uint32_t *handles=kernel_malloc((size_t)arg->num_bo_handles*4+1);
     if(!handles)return -ENOMEM;
@@ -89,8 +89,8 @@ static int execbuffer(struct task *task,struct drm_file *file,struct drm_virtgpu
     }
     if(!rc)rc=vg_context_create(file);
     if(!rc && (arg->flags&VIRTGPU_EXECBUF_FENCE_FD_OUT)) {
-        submission->fence=vg_fence_create();
-        rc=submission->fence ? vg_sync_export(task,submission->fence,&fence_fd) : -ENOMEM;
+        submission->fence=drm_sync_fence_create("virtio_gpu", "virtio_gpu");
+        rc=submission->fence ? drm_sync_export(task,submission->fence,&fence_fd) : -ENOMEM;
     }
     if(!rc) {
         command->hdr=(struct virtio_gpu_ctrl_hdr){.type=VIRTIO_GPU_CMD_SUBMIT_3D,.ctx_id=file->virtio->context};
@@ -104,7 +104,7 @@ static int execbuffer(struct task *task,struct drm_file *file,struct drm_virtgpu
         }
     }
     if(fence_fd>=0)task_discard_file_fd(task,fence_fd);
-    vg_fence_put(submission->fence);
+    drm_sync_fence_put(submission->fence);
     for(unsigned i=0;i<submission->count;++i) {
         drm_bo_gpu_release(submission->objects[i]);drm_bo_put(submission->objects[i]);
     }
@@ -212,8 +212,10 @@ static int getcaps(struct task *task,struct drm_virtgpu_get_caps *arg)
  * selector. @param data Kernel argument. @param created_handle Rollback output.
  * @return Zero, errno or scheduler/prerequisite retry; no user pointer is queued.
  */
-int vg_ioctl(struct task *task,struct drm_file *file,uint32_t command,void *data,uint32_t *created_handle,int *created_fd)
+int vg_ioctl(struct task *task, struct drm_file *file, uint32_t command, void *data,
+             uint32_t *created_handle, int *created_fd, uint32_t *created_object)
 {
+    (void)created_object;
     vg_process_retirements(128);
     if(!vg.ready || vg.fault)return -EIO;
     switch(command) {

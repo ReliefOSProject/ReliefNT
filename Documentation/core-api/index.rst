@@ -25,5 +25,4 @@
    vmxnet3
    ext3
    usb
-   svga
    virtio-gpu

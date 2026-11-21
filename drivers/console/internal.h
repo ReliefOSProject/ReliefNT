@@ -303,17 +303,6 @@ void console_emit_raw(char ch);
 /** @brief Draw the cursor and publish an active text grid when not staging. */
 void console_present(void);
 
-/**
- * @brief Refresh the active graphical VT's framebuffer scanout.
- *
- * The VMware legacy FIFO does not observe direct mmap writes from Xorg, so a
- * periodic full-screen UPDATE is required while a graphical VT is active.
- * This path is independent of the text-console renderer: Xorg owns the
- * framebuffer while the active VT is graphical, even if text rendering has
- * been disabled for that hand-off.
- */
-void console_display_tick(void);
-
 void console_emit_timestamp(void);
 
 void console_init(void);

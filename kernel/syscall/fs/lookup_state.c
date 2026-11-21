@@ -151,6 +151,8 @@ void task_lookup_scope_begin(struct task *task,const struct trap_frame *frame)
 {
     if(!task || !frame || frame->rax==LINUX_SYS_RT_SIGRETURN)return;
     bool scoped=lookup_path_call(frame->rax);
+    if(frame->rax==LINUX_SYS_IOCTL && task->syscall_file &&
+       task->syscall_file->character_file && task->syscall_file->drm_file)scoped=true;
 #ifdef CONFIG_SWAP
     /* Special-device vectors retain the admitted metadata across a
      * prerequisite page-in wait, just as ordinary files and sockets do. */
@@ -169,7 +171,7 @@ void task_lookup_scope_begin(struct task *task,const struct trap_frame *frame)
        (uint32_t)frame->rsi==BLKGETSIZE || (uint32_t)frame->rsi==BLKGETSIZE64))scoped=true;
     if(frame->rax==LINUX_SYS_IOCTL && task->syscall_file &&
        task->syscall_file->character_file &&
-       (task->syscall_file->drm_file || task->syscall_file->drm_prime_file ||
+       (task->syscall_file->drm_prime_file ||
         task->syscall_file->kind==TASK_FILE_KIND_DRM_SYNC))scoped=true;
     if(frame->rax==LINUX_SYS_IOCTL && task->syscall_file &&
        task->syscall_file->character_file &&
@@ -456,7 +458,17 @@ int task_lookup_user_bytes(struct task *task,uint64_t user_ptr,uint32_t length,s
     while(snapshot->done<length) {
         uint32_t done=snapshot->done,chunk=length-done;if(chunk>32768u)chunk=32768u;
         int prep=swap_prepare_user_range(task,user_ptr+done,chunk,false);
-        if(prep || !user_range_ok(user_ptr+done,chunk)) {
+        if(!prep) {
+#ifdef CONFIG_SWAP
+            int fault=user_range_readable(user_ptr+done,chunk);
+            /* X11 writev and other imports can read a file-backed operand
+             * even when no swap entry was present. Keep the copied prefix. */
+            prep=fault==-EAGAIN ? SWAP_STORAGE_CONTENDED : fault;
+#else
+            prep=user_range_ok(user_ptr+done,chunk) ? 0 : -RELIEFOS_EFAULT;
+#endif
+        }
+        if(prep) {
             if(prep!=SWAP_STORAGE_CONTENDED || !saved) {
                 if(saved)saved->name=NULL;
                 kernel_free(snapshot);

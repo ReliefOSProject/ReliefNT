@@ -93,8 +93,10 @@ msgid "AC97、ES1371、HDA，以及完成通用设备分发与 owner 引用改�
 msgstr ""
 "AC97, ES1371, HDA, and sound core after generic device dispatch and owner references are reworked."
 
-msgid "VMware SVGA/DRM 及 DRM core；基础 framebuffer/启动日志保持内置。"
-msgstr "VMware SVGA/DRM and DRM core; basic framebuffer/boot logging remains built in."
+msgid "DRM 核心与 VirtIO-GPU 后端。基础 framebuffer 和启动日志保持内置。"
+msgstr ""
+"DRM core and the VirtIO-GPU backend. The basic framebuffer and boot "
+"logging are built in."
 
 msgid "ext2、ext4、FAT、exFAT、ISO9660；公共 ext 辅助代码作为显式依赖。"
 msgstr "ext2, ext4, FAT, exFAT, and ISO9660, with common ext helpers as explicit dependencies."

@@ -211,10 +211,8 @@ void sched_wake_interruptible(struct task *task)
         task->state = TASK_READY;
     }
 }
-bool graphics_service_task_uninterruptible(const struct task *task)
-{ (void)task; return false; }
-bool graphics_service_task_signal_busy(const struct task *task)
-{ (void)task; return false; }
+
+
 void sched_signal_discard(struct task *task, int sig)
 { task->pending_signals &= ~(1ULL << (sig - 1)); *sched_task_process_pending(task) &= ~(1ULL << (sig - 1)); }
 
