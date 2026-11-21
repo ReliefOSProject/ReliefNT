@@ -85,6 +85,27 @@ int vfs_path_readdir(const struct vfs_path *path,uint64_t *cursor,struct reliefo
     return path->mount->ops->readdir(path->mount->context,&path->dentry->node,cursor,entry,vfs_path_mount_flags(path));
 }
 
+/* Linux needs only the name here. The caller obtains the inode and type
+ * through the retained directory with vfs_path_dirent_stat. */
+int vfs_path_readdir_name(const struct vfs_path *path,uint64_t *cursor,char name[VFS_NAME_MAX+1])
+{
+    if (!vfs_path_valid(path) || !cursor || !name) return -EINVAL;
+    if (path->dentry->node.type!=RELIEFOS_FS_TYPE_DIR) return -ENOTDIR;
+    const struct vfs_mount *mount=path->mount;
+    if (mount->ops->readdir_name)
+        return mount->ops->readdir_name(mount->context,&path->dentry->node,cursor,name,
+                                        VFS_NAME_MAX+1,vfs_path_mount_flags(path));
+    struct reliefos_dir_entry legacy={0};
+    int rc=vfs_path_readdir(path,cursor,&legacy);
+    if (rc>0) {
+        size_t length=0;
+        while (length<sizeof(legacy.name) && legacy.name[length]) ++length;
+        if (length==sizeof(legacy.name)) return -EIO;
+        __builtin_memcpy(name,legacy.name,length+1);
+    }
+    return rc;
+}
+
 int vfs_path_permissions(const struct vfs_path *path,struct reliefos_permissions *value,bool write)
 {
     if(!vfs_path_valid(path) || !value)return -EINVAL;

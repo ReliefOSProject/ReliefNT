@@ -24,23 +24,40 @@ static int data_block(struct storage_volume *volume, uint64_t disk, uint32_t des
                       uint32_t expected)
 {
     struct sqfs_super *fs = volume->squashfs;
-    if (fs->data_descriptor == descriptor && fs->data_block == disk && fs->data_size == expected)
-        return 0;
+    if (fs->data_descriptor == descriptor && fs->data_block == disk)
+        return !expected || fs->data_size == expected ? 0 : -EIO;
     fs->data_descriptor = 0;
     bool raw = (descriptor & SQFS_DATA_RAW) != 0;
     uint32_t stored = descriptor & (SQFS_DATA_RAW - 1u);
-    if (raw && stored != expected) return -EIO;
+    if (descriptor >= 2u * SQFS_DATA_RAW || !stored || stored > fs->block_size ||
+        disk < fs->data_start || (raw && expected && stored != expected)) return -EIO;
     int rc = sqfs_read_at(volume, disk, raw ? fs->data : fs->input, stored, fs->begin[SQFS_INODE]);
     if (rc) return rc;
+    uint32_t size = stored;
     if (!raw) {
-        uint32_t size;
-        rc = sqfs_inflate(fs->input, stored, fs->data, expected, &size);
+        rc = sqfs_decompress(fs, fs->input, stored, fs->data, expected ? expected : fs->block_size,
+                             &size);
         if (rc) return rc;
-        if (size != expected) return -EIO;
+        if (!size || (expected && size != expected)) return -EIO;
     }
     fs->data_block = disk;
     fs->data_descriptor = descriptor;
-    fs->data_size = expected;
+    fs->data_size = size;
+    return 0;
+}
+
+static int read_fragment(struct storage_volume *volume, const struct sqfs_inode *inode,
+                         uint32_t skip, void *bytes, uint32_t length)
+{
+    struct sqfs_super *fs = volume->squashfs;
+    uint8_t field[16];
+    int rc = sqfs_index_read(volume, SQFS_FRAGMENT, inode->fragment, field);
+    if (rc) return rc;
+    rc = data_block(volume, sqfs_u64(field), sqfs_u32(field + 8), 0);
+    if (rc) return rc;
+    uint32_t offset = inode->fragment_offset + skip;
+    if (!sqfs_range(offset, length, fs->data_size)) return -EIO;
+    __builtin_memcpy(bytes, fs->data + offset, length);
     return 0;
 }
 
@@ -60,6 +77,14 @@ int sqfs_file_read(struct storage_volume *volume, const struct storage_node *nod
 
     struct sqfs_super *fs = volume->squashfs;
     uint64_t block = offset / fs->block_size;
+    uint64_t fragment_block = inode.fragment == SQFS_INVALID_INDEX ? UINT64_MAX :
+        inode.size / fs->block_size;
+    uint32_t skip = offset % fs->block_size;
+    if (block == fragment_block) {
+        rc = read_fragment(volume, &inode, skip, bytes, capacity);
+        if (!rc && length) *length = capacity;
+        return rc;
+    }
     struct sqfs_file_cursor pos = fs->file;
     if (!pos.valid || pos.inode != node->entry_id || pos.index > block)
         pos = (struct sqfs_file_cursor){.valid = true, .inode = node->entry_id,
@@ -71,8 +96,7 @@ int sqfs_file_read(struct storage_volume *volume, const struct storage_node *nod
     }
     uint8_t *out = bytes;
     uint32_t done = 0;
-    unsigned skip = offset % fs->block_size;
-    while (done < capacity) {
+    while (done < capacity && pos.index < fragment_block) {
         uint64_t disk = pos.disk, available = inode.size - pos.index * fs->block_size;
         uint32_t expected = available < fs->block_size ? (uint32_t)available : fs->block_size;
         fs->file = pos;
@@ -90,6 +114,10 @@ int sqfs_file_read(struct storage_volume *volume, const struct storage_node *nod
         if (take == expected - skip) fs->file = pos;
         skip = 0;
     }
-    if (length) *length = done;
+    if (done < capacity) {
+        rc = read_fragment(volume, &inode, 0, out + done, capacity - done);
+        if (rc) return rc;
+    }
+    if (length) *length = capacity;
     return 0;
 }

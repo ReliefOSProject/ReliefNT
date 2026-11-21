@@ -5,7 +5,7 @@ struct sqfs_dirent {
     uint64_t ref;
     uint32_t number;
     uint16_t type, length;
-    char name[257];
+    char name[VFS_NAME_MAX + 1];
 };
 
 static int dir_begin(struct storage_volume *volume, const struct storage_node *node,
@@ -85,10 +85,9 @@ int sqfs_lookup(struct storage_volume *volume, const struct storage_node *parent
     return rc ? rc : -ENOENT;
 }
 
-int sqfs_readdir(struct storage_volume *volume, const struct storage_node *node,
-                 uint64_t *cookie, struct reliefos_dir_entry *out, uint64_t flags)
+static int readdir_entry(struct storage_volume *volume, const struct storage_node *node,
+                         uint64_t *cookie, char *name, size_t capacity, uint32_t *type)
 {
-    (void)flags;
     struct sqfs_super *fs = volume->squashfs;
     if (sqfs_image_changed(volume)) return -EIO;
     struct sqfs_dir_iter iter;
@@ -115,9 +114,38 @@ int sqfs_readdir(struct storage_volume *volume, const struct storage_node *node,
     }
     int rc = dir_next(volume, &iter, &entry);
     if (rc <= 0) return rc;
-    if (entry.length >= sizeof(out->name)) return -ENAMETOOLONG;
-    out->type = sqfs_node_type(entry.type);
-    __builtin_memcpy(out->name, entry.name, entry.length + 1u);
+    if (entry.length >= capacity) return -ENAMETOOLONG;
+    if (type) *type = sqfs_node_type(entry.type);
+    __builtin_memcpy(name, entry.name, entry.length + 1u);
     *cached = (struct sqfs_dir_cursor){true, node->entry_id, ++*cookie, iter};
     return 1;
+}
+
+int sqfs_readdir(struct storage_volume *volume, const struct storage_node *node,
+                 uint64_t *cookie, struct reliefos_dir_entry *out, uint64_t flags)
+{
+    (void)flags;
+    return readdir_entry(volume, node, cookie, out->name, sizeof(out->name), &out->type);
+}
+
+int sqfs_readdir_name(struct storage_volume *volume, const struct storage_node *node,
+                      uint64_t *cookie, char *name, size_t capacity, uint64_t flags)
+{
+    (void)flags;
+    /* SquashFS leaves the two dot entries implicit on disk. Keep their
+     * positions in the native stream separate from the stored-entry cursor. */
+    if (node->type != RELIEFOS_FS_TYPE_DIR) return -ENOTDIR;
+    if (*cookie < 2) {
+        if (sqfs_image_changed(volume)) return -EIO;
+        const char *dot = *cookie == 0 ? "." : "..";
+        size_t length = (size_t)*cookie + 2;
+        if (length > capacity) return -ENAMETOOLONG;
+        __builtin_memcpy(name, dot, length);
+        ++*cookie;
+        return 1;
+    }
+    uint64_t stored_cookie = *cookie - 2;
+    int rc = readdir_entry(volume, node, &stored_cookie, name, capacity, NULL);
+    if (rc > 0) *cookie = stored_cookie + 2;
+    return rc;
 }

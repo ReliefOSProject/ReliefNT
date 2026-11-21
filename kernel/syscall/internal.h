@@ -1261,6 +1261,19 @@ int64_t syscall_directory(struct vfs_namespace *ns,struct task *task,uint64_t nu
  */
 int linux_stat_from_path(struct linux_stat_abi *out,const struct vfs_path *path);
 
+/** @brief Dispatch Linux extended-attribute syscalls against retained filesystem objects.
+ * @param ns Borrowed shared namespace under execution ownership.
+ * @param task Borrowed calling task with held credentials and filesystem references.
+ * @param number Linux extended-attribute syscall number.
+ * @param a0 User pathname address or descriptor depending on the syscall.
+ * @param a1 User attribute name address, or output list address for list operations.
+ * @param a2 User value address, or output list capacity in bytes for list operations.
+ * @param a3 Value buffer size in bytes for operations with a value argument.
+ * @param a4 Flags for set operations.
+ * @return Byte count for reads and size queries, or negative errno or internal retry.
+ */
+int64_t syscall_xattr(struct vfs_namespace *ns,struct task *task,uint64_t number,
+                      uint64_t a0,uint64_t a1,uint64_t a2,uint64_t a3,uint64_t a4);
 /** @brief Dispatch stat/statfs families against retained inode/OFD objects.
  * @param ns Borrowed shared namespace under execution ownership.
  * @param task Borrowed current task with stable filesystem references.
