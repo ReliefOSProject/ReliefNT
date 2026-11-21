@@ -11,7 +11,7 @@
 int storage_inode_permissions(const struct storage_node *node,struct reliefos_permissions *value,bool write)
 {
     if(!node || !value)return -EINVAL;
-    if(!(node->flags&(STORAGE_NODE_FLAG_EXT2|STORAGE_NODE_FLAG_TMPFS)))return -EOPNOTSUPP;
+    if(!(node->flags&(STORAGE_NODE_FLAG_EXT2|STORAGE_NODE_FLAG_TMPFS|STORAGE_NODE_FLAG_SQUASHFS)))return -EOPNOTSUPP;
     uint64_t flags;kernel_execution_lock_irqsave(&flags);
     struct storage_volume *previous=NULL;int rc=storage_select_node_volume(node,&previous);
     if(!rc) {
@@ -30,7 +30,7 @@ int storage_inode_permissions(const struct storage_node *node,struct reliefos_pe
 int storage_inode_stat(const struct storage_node *node,struct linux_stat_abi *value)
 {
     if(!node || !value)return -EINVAL;
-    if(!(node->flags&(STORAGE_NODE_FLAG_EXT2|STORAGE_NODE_FLAG_TMPFS)))return -EOPNOTSUPP;
+    if(!(node->flags&(STORAGE_NODE_FLAG_EXT2|STORAGE_NODE_FLAG_TMPFS|STORAGE_NODE_FLAG_SQUASHFS)))return -EOPNOTSUPP;
     uint64_t flags;kernel_execution_lock_irqsave(&flags);
     struct storage_volume *previous=NULL;int rc=storage_select_node_volume(node,&previous);
     if(!rc) {

@@ -72,7 +72,7 @@ int storage_backend_permissions(void *context,const struct vfs_path *path,
     struct storage_volume *volume=context;
     if(!vfs_path_valid(path) || !value || !volume || path->dentry->node.volume_id!=volume->volume_id)return -EINVAL;
     const struct storage_node *node=&path->dentry->node;
-    if(node->flags&(STORAGE_NODE_FLAG_TMPFS|STORAGE_NODE_FLAG_EXT2))
+    if(node->flags&(STORAGE_NODE_FLAG_TMPFS|STORAGE_NODE_FLAG_EXT2|STORAGE_NODE_FLAG_SQUASHFS))
         return storage_inode_permissions(node,value,write);
     if(volume->filesystem==STORAGE_FILESYSTEM_ISO9660) {
         if(write)return -EROFS;

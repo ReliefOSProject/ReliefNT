@@ -49,6 +49,7 @@ jobs:
             pkg-config \
             libncurses-dev \
             gzip \
+            squashfs-tools \
             curl \
             python3
 

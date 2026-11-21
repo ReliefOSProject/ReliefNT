@@ -12,4 +12,5 @@
    vga-text
    panic
    swap
+   squashfs
    limitations
