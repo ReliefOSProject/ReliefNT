@@ -5,6 +5,7 @@ from pathlib import Path
 import random
 import shlex
 import subprocess
+import sys
 import tempfile
 
 
@@ -18,15 +19,15 @@ SOURCES += [f"fs/squashfs/codecs/xz/{name}.c" for name in (
     "xz_crc32", "xz_crc64", "xz_sha256", "xz_dec_bcj", "xz_dec_lzma2", "xz_dec_stream")]
 
 
-def run(*args, **kwargs):
-    return subprocess.run(args, cwd=ROOT, check=True, timeout=60, **kwargs)
+def run(*args, check=True, **kwargs):
+    return subprocess.run(args, cwd=ROOT, check=check, timeout=60, **kwargs)
 
 
-def make_image(tree, image, *options):
-    run("mksquashfs", tree, image, "-noappend", "-quiet", "-no-progress",
-        "-processors", "1", "-b", "4096",
-        "-all-time", "1700000000", "-mkfs-time", "1700000000",
-        "-force-uid", "1234", "-force-gid", "4321", *options)
+def make_image(tree, image, *options, **kwargs):
+    return run("mksquashfs", tree, image, "-noappend", "-quiet", "-no-progress",
+               "-processors", "1", "-b", "4096",
+               "-all-time", "1700000000", "-mkfs-time", "1700000000",
+               "-force-uid", "1234", "-force-gid", "4321", *options, **kwargs)
 
 
 with tempfile.TemporaryDirectory(prefix="reliefnt-squashfs-") as temporary:
@@ -70,11 +71,14 @@ with tempfile.TemporaryDirectory(prefix="reliefnt-squashfs-") as temporary:
         make_image(tree, fixture, "-comp", codec, "-always-use-fragments")
         images.append(fixture)
     # Some distro builds of squashfs-tools omit the deprecated LZMA encoder.
-    help_comp = run("mksquashfs", "-help-comp", "ALL", stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT).stdout
-    if b"\n\tlzma\n" in help_comp:
-        fixture = work / "lzma.squashfs"
-        make_image(tree, fixture, "-comp", "lzma", "-always-use-fragments")
+    fixture = work / "lzma.squashfs"
+    lzma = make_image(tree, fixture, "-comp", "lzma", "-always-use-fragments",
+                      check=False, stderr=subprocess.PIPE)
+    if lzma.returncode == 1 and b'Compressor "lzma" is not supported!' in lzma.stderr:
+        print("SKIP LZMA fixture: mksquashfs lacks the LZMA encoder")
+    else:
+        sys.stderr.buffer.write(lzma.stderr)
+        lzma.check_returncode()
         images.append(fixture)
     empty_tree = work / "empty"
     empty_tree.mkdir()
