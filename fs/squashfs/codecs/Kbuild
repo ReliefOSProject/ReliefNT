@@ -1,2 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 obj-y := codec.o lzo.o xz/ zstd/ lz4/ lzma/
+
+# Use the kernel string interface in the vendored freestanding decoders.
+ccflags-y := -I$(src)/freestanding
