@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := LzmaDec.o
+ccflags-y := -I$(src)/../freestanding

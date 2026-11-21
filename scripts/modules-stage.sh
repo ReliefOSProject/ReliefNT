@@ -27,6 +27,16 @@ if [ -z "$extmod" ]; then
        "$src/LICENSES/realtek/OpenBSD-BSD-4-Clause.txt" \
        "$src/LICENSES/realtek/Realtek-firmware.txt" \
        "$work/lib/modules/$release/LICENSES/realtek/"
+    if grep -qx 'CONFIG_SQUASHFS=y' "$out/.config"; then
+        codecs=$src/fs/squashfs/codecs
+        squashfs_licenses=$work/lib/modules/$release/LICENSES/squashfs
+        mkdir -p "$squashfs_licenses"
+        cp "$src/third_party/zlib/LICENSE" "$squashfs_licenses/zlib.txt"
+        cp "$codecs/xz/COPYING" "$squashfs_licenses/xz-embedded.txt"
+        cp "$codecs/zstd/LICENSE" "$squashfs_licenses/zstandard.txt"
+        cp "$codecs/lz4/LICENSE" "$squashfs_licenses/lz4.txt"
+        cp "$codecs/lzokay.LICENSE" "$squashfs_licenses/lzokay.txt"
+    fi
     # Original modinst omits this file when MODULES=n. The all-builtin bundle
     # still needs an explicit empty module set; no imported rule is changed.
     if [ ! -f "$work/lib/modules/$release/modules.order" ]; then

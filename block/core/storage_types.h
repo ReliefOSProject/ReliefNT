@@ -68,10 +68,12 @@ enum storage_filesystem_kind {
     STORAGE_FILESYSTEM_TMPFS = 5,
     STORAGE_FILESYSTEM_EXT4 = 6,
     STORAGE_FILESYSTEM_EXT3 = 7,
+    STORAGE_FILESYSTEM_SQUASHFS = 8,
 };
 
 
 struct storage_filesystem_ops;
+struct sqfs_super;
 
 /**
  * @brief Shared volume state used by block routing and filesystem backends.
@@ -88,6 +90,7 @@ struct storage_volume {
     struct fs_type_ref fs_type;
     struct block_device_ref device_ref; /* Owned until final native/cache retirement. */
     struct tmpfs_super *tmpfs;
+    struct sqfs_super *squashfs;
     char tmpfs_source[RELIEFOS_FS_PATH_LEN];
     uint64_t mount_flags;
     struct fat_mount_options fat_options;

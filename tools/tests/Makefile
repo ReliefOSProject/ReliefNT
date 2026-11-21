@@ -14,6 +14,7 @@ test-host-smoke:
 	 --suite loadavg --suite input --suite input_routing --suite uapi \
 	 --suite acpi_pm_timer --suite apic_timer --suite cpu_accounting \
 	 --suite fat_async_read --suite fat_read_split \
+	 --suite squashfs --suite squashfs_boot \
 	 --suite vdso_mapping --suite vdso_time
 
 test-smp-time:

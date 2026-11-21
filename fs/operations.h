@@ -86,6 +86,12 @@ struct storage_filesystem_ops {
     void (*invalidate)(void);
     void (*invalidate_write)(const struct storage_volume *writer,const struct block_device *device,
                              uint64_t lba,uint32_t sectors);
+    int (*getxattr)(struct storage_volume *volume,const struct storage_node *node,
+                    const char *name,void *value,uint32_t capacity,uint32_t *length);
+    int (*listxattr)(struct storage_volume *volume,const struct storage_node *node,
+                     void *names,uint32_t capacity,uint32_t *length,bool include_trusted);
+    int (*readdir_name)(struct storage_volume *volume,const struct storage_node *node,
+                        uint64_t *cursor,char *name,size_t capacity,uint64_t mount_flags);
 };
 
 /* Only the owning filesystem's parser/constructor installs its table. The

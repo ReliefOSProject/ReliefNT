@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := lz4.o
+CFLAGS_lz4.o := -include $(src)/port.h

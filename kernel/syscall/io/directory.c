@@ -7,8 +7,8 @@ struct dirent_receipt {
     uint64_t next;
     uint16_t length, name_length, name_offset;
     bool named, ready;
-    struct reliefos_dir_entry entry;
-    uint8_t bytes[256];
+    char name[VFS_NAME_MAX+1];
+    uint8_t bytes[(offsetof(struct linux_dirent64,d_name)+VFS_NAME_MAX+1+7)&~7u];
 };
 
 /** @brief Return records through bounded completed-provider receipts.
@@ -53,13 +53,13 @@ static int64_t syscall_getdents_staged(struct task *task,uint64_t number,int32_t
         if(!stage->ready) {
             if(!stage->named) {
                 uint64_t next=file->offset;
-                rc=vfs_path_readdir(&file->path_ref,&next,&stage->entry);
+                rc=vfs_path_readdir_name(&file->path_ref,&next,stage->name);
                 if(rc==-RELIEFOS_EAGAIN || rc==KERNEL_SYSCALL_BLOCKED)return rc;
                 if(rc<0){error=rc;break;}
                 if(!rc)break;
                 uint32_t length=0;
-                while(length<sizeof(stage->entry.name) && stage->entry.name[length])++length;
-                if(!length || length==sizeof(stage->entry.name)){error=-LINUX_EIO;break;}
+                while(length<sizeof(stage->name) && stage->name[length])++length;
+                if(!length || length==sizeof(stage->name)){error=-LINUX_EIO;break;}
                 bool wide=number==LINUX_SYS_GETDENTS64;
                 uint32_t name_offset=wide ? (uint32_t)offsetof(struct linux_dirent64,d_name) : 18u;
                 uint16_t record=(uint16_t)((name_offset+length+1+(wide ? 0 : 1)+7)&~7u);
@@ -68,7 +68,7 @@ static int64_t syscall_getdents_staged(struct task *task,uint64_t number,int32_t
                 stage->name_offset=(uint16_t)name_offset;stage->named=true;
             }
             struct linux_stat_abi status;
-            rc=vfs_path_dirent_stat(&file->path_ref,stage->entry.name,&status);
+            rc=vfs_path_dirent_stat(&file->path_ref,stage->name,&status);
             if(rc==-RELIEFOS_EAGAIN || rc==KERNEL_SYSCALL_BLOCKED)return rc;
             if(rc==-RELIEFOS_ENOENT) {
                 file->offset=stage->next;stage->named=false;
@@ -83,7 +83,7 @@ static int64_t syscall_getdents_staged(struct task *task,uint64_t number,int32_t
             __builtin_memcpy(stage->bytes,&status.st_ino,sizeof(status.st_ino));
             __builtin_memcpy(stage->bytes+8,&stage->next,sizeof(stage->next));
             __builtin_memcpy(stage->bytes+16,&stage->length,sizeof(stage->length));
-            __builtin_memcpy(stage->bytes+stage->name_offset,stage->entry.name,stage->name_length+1);
+            __builtin_memcpy(stage->bytes+stage->name_offset,stage->name,stage->name_length+1);
             stage->bytes[number==LINUX_SYS_GETDENTS64 ? 18 : stage->length-1]=
                 (uint8_t)((status.st_mode&LINUX_S_IFMT)>>12);
             stage->named=false;stage->ready=true;
@@ -142,19 +142,19 @@ int64_t syscall_getdents_object(struct task *task,uint64_t number,int32_t fd,uin
     if(!user_range_writable(buffer,capacity))error=-RELIEFOS_EFAULT;
     storage_set_io_async_context(false);uint64_t started=time_work_counter_us();
     while(!error) {
-        struct reliefos_dir_entry entry;uint64_t next=file->offset;
-        int rc=vfs_path_readdir(&file->path_ref,&next,&entry);
+        char name[VFS_NAME_MAX+1];uint64_t next=file->offset;
+        int rc=vfs_path_readdir_name(&file->path_ref,&next,name);
         if(rc==-RELIEFOS_EAGAIN || rc==KERNEL_SYSCALL_BLOCKED)return rc;
         if(rc<0){error=rc;break;}
         if(!rc)break;
-        uint32_t length=0;while(length<sizeof(entry.name) && entry.name[length])++length;
-        if(!length || length==sizeof(entry.name)){error=-LINUX_EIO;break;}
+        uint32_t length=0;while(length<sizeof(name) && name[length])++length;
+        if(!length || length==sizeof(name)){error=-LINUX_EIO;break;}
         bool wide=number==LINUX_SYS_GETDENTS64;
         uint32_t name_offset=wide ? (uint32_t)offsetof(struct linux_dirent64,d_name) : 18u;
         uint16_t record=(uint16_t)((name_offset+length+1+(wide ? 0 : 1)+7)&~7u);
         if(record>capacity-written){error=-RELIEFOS_EINVAL;break;}
         struct linux_stat_abi status;
-        rc=vfs_path_dirent_stat(&file->path_ref,entry.name,&status);
+        rc=vfs_path_dirent_stat(&file->path_ref,name,&status);
         if(rc==-RELIEFOS_EAGAIN || rc==KERNEL_SYSCALL_BLOCKED)return rc;
         if(rc==-RELIEFOS_ENOENT) {
             file->offset=next;
@@ -169,7 +169,7 @@ int64_t syscall_getdents_object(struct task *task,uint64_t number,int32_t fd,uin
         __builtin_memcpy(destination,&status.st_ino,sizeof(status.st_ino));
         __builtin_memcpy(destination+8,&next,sizeof(next));
         __builtin_memcpy(destination+16,&record,sizeof(record));
-        __builtin_memcpy(destination+name_offset,entry.name,length+1);
+        __builtin_memcpy(destination+name_offset,name,length+1);
         destination[wide ? 18 : record-1]=(uint8_t)((status.st_mode&LINUX_S_IFMT)>>12);
         file->offset=next;written+=record;task->regular_io.done=written;
         if(time_work_counter_us()-started>=2000) {

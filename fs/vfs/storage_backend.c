@@ -138,6 +138,31 @@ static int storage_vfs_readdir(void *context,const struct storage_node *node,uin
     if(rc>=0)storage_backend_access(context,node,mount_flags);
     return rc;
 }
+static int storage_vfs_readdir_name(void *context,const struct storage_node *node,uint64_t *cursor,
+                                      char *name,size_t capacity,uint64_t mount_flags)
+{
+    struct storage_volume *volume=context;
+    if (node->volume_id!=volume->volume_id) return -EINVAL;
+    const struct storage_filesystem_ops *ops=volume->fs_ops;
+    if (!ops || !ops->readdir_name) {
+        struct reliefos_dir_entry legacy={0};
+        int rc=storage_vfs_readdir(context,node,cursor,&legacy,mount_flags);
+        if (rc<=0) return rc;
+        size_t length=0;
+        while (length<sizeof(legacy.name) && legacy.name[length]) ++length;
+        if (length==sizeof(legacy.name)) return -EIO;
+        if (length>=capacity) return -ENAMETOOLONG;
+        __builtin_memcpy(name,legacy.name,length+1);
+        return rc;
+    }
+    struct storage_volume *previous=NULL;
+    int rc=storage_select_node_volume(node,&previous);
+    if (rc) return rc;
+    rc=ops->readdir_name(volume,node,cursor,name,capacity,mount_flags);
+    storage_restore_volume(previous);
+    if (rc>=0) storage_backend_access(context,node,mount_flags);
+    return rc;
+}
 static uint64_t storage_vfs_flags(void *context)
 {
     const struct storage_volume *volume=context;
@@ -210,6 +235,32 @@ static uint64_t storage_vfs_lookup_generation(void *context)
     }
     return volume->lookup_generation;
 }
+static int storage_vfs_getxattr(void *context,const struct storage_node *node,const char *name,
+                               void *value,uint32_t capacity,uint32_t *length)
+{
+    struct storage_volume *volume=context,*previous=NULL;
+    if(node->volume_id!=volume->volume_id)return -EINVAL;
+    int rc=storage_select_node_volume(node,&previous);
+    if(rc)return rc;
+    const struct storage_filesystem_ops *ops=volume->fs_ops;
+    rc=ops && ops->getxattr ? ops->getxattr(volume,node,name,value,capacity,length) : -EOPNOTSUPP;
+    storage_restore_volume(previous);
+    return rc;
+}
+
+static int storage_vfs_listxattr(void *context,const struct storage_node *node,void *names,
+                                uint32_t capacity,uint32_t *length,bool include_trusted)
+{
+    struct storage_volume *volume=context,*previous=NULL;
+    if(node->volume_id!=volume->volume_id)return -EINVAL;
+    int rc=storage_select_node_volume(node,&previous);
+    if(rc)return rc;
+    const struct storage_filesystem_ops *ops=volume->fs_ops;
+    rc=ops && ops->listxattr ? ops->listxattr(volume,node,names,capacity,length,include_trusted) : -EOPNOTSUPP;
+    storage_restore_volume(previous);
+    return rc;
+}
+
 static const struct vfs_backend_ops storage_vfs_ops={
     .lookup_generation=storage_vfs_lookup_generation,
     .lookup=storage_backend_lookup_vfs,.retain=storage_vfs_retain,.release=storage_vfs_release,
@@ -218,6 +269,8 @@ static const struct vfs_backend_ops storage_vfs_ops={
     .read=storage_vfs_read,.read_cursor=storage_vfs_read_cursor,.readdir=storage_vfs_readdir,.permissions=storage_backend_permissions,
     .mount_flags=storage_vfs_flags,.create_node=storage_backend_create_node,
     .getattr=storage_backend_getattr,.statfs=storage_backend_statfs,
+    .getxattr=storage_vfs_getxattr,.listxattr=storage_vfs_listxattr,
+    .readdir_name=storage_vfs_readdir_name,
     .write=storage_backend_write,.truncate=storage_backend_truncate,.utimens=storage_backend_utimens,
     .fallocate=storage_backend_fallocate,.sync=storage_backend_sync,
     .remove_node=storage_backend_remove_node,.rename_node=storage_backend_rename_node,.link_node=storage_backend_link_node
@@ -236,7 +289,8 @@ static int storage_vfs_describe(struct vfs_mount *mount,const struct storage_vol
     if(!filesystem)return -EOPNOTSUPP;
     char source[RELIEFOS_FS_PATH_LEN];
     if(volume->tmpfs)storage_copy_text(source,sizeof(source),volume->tmpfs_source[0] ? volume->tmpfs_source : "tmpfs");
-    else if(volume->transport==STORAGE_TRANSPORT_MEMORY)storage_copy_text(source,sizeof(source),"ramdisk");
+    else if(volume->transport==STORAGE_TRANSPORT_MEMORY && !volume->data_partition_mount)
+        storage_copy_text(source,sizeof(source),"ramdisk");
     else if(volume->filesystem==STORAGE_FILESYSTEM_ISO9660) {
         int rc=storage_disk_device_name(volume->source_disk_id,-1,source,sizeof(source));if(rc)return rc;
     } else if(volume->data_partition_mount) {

@@ -42,5 +42,13 @@ config ISO9660_FS
     tristate "ISO9660 read-only filesystem"
     default y
 
+config SQUASHFS
+    bool "SquashFS 4.0 read-only filesystem"
+    default y
+    help
+      Mount SquashFS 4.0 images with gzip, XZ, Zstandard, LZ4, LZO or
+      legacy LZMA compression. Read file fragments and extended attributes.
+      ReliefOS installer media require this filesystem built into the kernel.
+
 comment "Initial memory root, tmpfs, VFS and proc/sys/dev filesystems stay built-in"
 endmenu

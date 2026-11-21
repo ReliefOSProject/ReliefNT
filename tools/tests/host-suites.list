@@ -178,6 +178,8 @@ initramfs tools/test_initramfs.py
 initramfs_boot tools/test_initramfs_boot.py
 devfs_rdev tools/test_devfs_rdev.py
 boot_block tools/test_boot_block.py
+squashfs tools/test_squashfs.py
+squashfs_boot tools/test_squashfs_boot.py
 install_bundle tools/test_install_bundle.py
 parameter_values tools/test_parameter_values.py
 builtin_parameters tools/test_builtin_parameters.py

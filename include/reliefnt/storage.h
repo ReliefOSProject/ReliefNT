@@ -56,6 +56,7 @@ int storage_namespace_bootstrap(void);
 #define RELIEFOS_DISK_FILESYSTEM_EXFAT 4U
 #define RELIEFOS_DISK_FILESYSTEM_EXT4 5U
 #define RELIEFOS_DISK_FILESYSTEM_EXT3 6U
+#define RELIEFOS_DISK_FILESYSTEM_SQUASHFS 7U
 #define RELIEFOS_DISK_PARTITION_FLAG_ESP 0x00000001U
 #define RELIEFOS_DISK_PARTITION_FLAG_BOOT_ROOT 0x00000002U
 #define RELIEFOS_DISK_PARTITION_FLAG_TARGET_MOUNTED 0x00000004U
@@ -291,6 +292,7 @@ struct storage_read_cursor {
 #define STORAGE_NODE_FLAG_MEMFD 0x00080000u
 /* Native inode carrying st_rdev; first_cluster remains its inode identity. */
 #define STORAGE_NODE_FLAG_RDEV 0x00100000u
+#define STORAGE_NODE_FLAG_SQUASHFS 0x00200000u
 #define STORAGE_SYSFS_DEVICE 202u
 #define STORAGE_NODE_FLAG_DEV_LINK 0x00000200u
 /* Anonymous filesystem device numbers, also exported in proc mountinfo. */

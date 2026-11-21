@@ -68,6 +68,9 @@ POSIX I/O 检查。宿主 Linux 参考运行与 ReliefNT 来宾执行分别记�
 ``make test-ext4-reference LINUX_REFERENCE=<目录>`` 检查 ext4 schema，
 需要已有 Linux 参考树；
 它不会下载参考源码。互操作检查需要宿主 ``e2fsprogs``。
+``squashfs`` 宿主套件需要 ``squashfs-tools``，用 ``mksquashfs`` 生成真实镜像，
+并用 ``unsquashfs`` 交叉检查文件内容；``squashfs_boot`` 检查 Multiboot2 载荷
+对应的只读 RAM 设备。两项均不替代来宾挂载与安装测试。
 音频探针 ``--build-guest`` 需要显式传入由操作系统提供的 ``--sdk``。
 
 兼容性基线

@@ -73,6 +73,8 @@ const char *storage_root_filesystem_name(void)
         return "fat32";
     case STORAGE_FILESYSTEM_ISO9660:
         return "iso9660";
+    case STORAGE_FILESYSTEM_SQUASHFS:
+        return "squashfs";
     default:
         return "none";
     }
