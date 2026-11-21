@@ -18,3 +18,11 @@ config DRM_VIRTIO_GPU
       hardware cursor and VirGL rendering with an unmodified Mesa driver.
       Included in drm.ko when DRM is modular. Venus and host-visible blob
       resources are not advertised by this configuration.
+
+config DRM_VMWARE_SVGA
+    bool "VMware SVGA II DRM/KMS (experimental)"
+    depends on DRM
+    help
+      Support the VMware SVGA II PCI graphics adapter. The driver is included
+      in drm.ko when DRM is modular. A supported VirtIO-GPU takes priority
+      when both backends are configured and their devices are present.

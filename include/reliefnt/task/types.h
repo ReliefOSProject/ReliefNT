@@ -511,6 +511,8 @@ struct task_lookup_scope {
     struct task_lookup_path paths[2];
     struct task_lookup_extra *extra;
     uint64_t number,args[6];
+    uint64_t ioctl_deadline_us; /* Absolute deadline of a suspended driver wait. */
+    uint64_t ioctl_target_sequence;
     size_t cursor;
     bool armed;
 };

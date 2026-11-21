@@ -3263,4 +3263,5 @@ uint64_t paging_module_unmap_page(uint64_t address,uint64_t original_alias)
 EXPORT_SYMBOL(paging_kernel_direct_map);
 
 EXPORT_SYMBOL(paging_kernel_direct_map_range);
+EXPORT_SYMBOL(paging_kernel_direct_map_next);
 EXPORT_SYMBOL(paging_mmio_writecombined);

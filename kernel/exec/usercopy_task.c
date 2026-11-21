@@ -78,5 +78,47 @@ int user_copy_from_task(struct task *task, void *destination, uint64_t address,
     return 0;
 }
 
+int user_pin_read_page(struct task *task, uint64_t address,
+                       struct paging_writable_alias *pin)
+{
+    if (!task || !pin || pin->physical || (address & 4095u) ||
+        address < RELIEFNT_USER_BASE || address >= RELIEFNT_USER_TOP)
+        return -LINUX_EFAULT;
+
+    struct address_space *as = sched_task_as(task);
+    if (!address_space_user_page_phys(as, address) &&
+        !syscall_handle_task_page_fault(task, address, 4))
+        return -LINUX_EFAULT;
+    if (!address_space_user_page_readable(as, address) ||
+        address_space_user_page_is_device(as, address))
+        return -LINUX_EFAULT;
+    if ((address_space_user_page_flags(as, address) & RELIEFNT_PAGE_COW) &&
+        !syscall_handle_task_page_fault(task, address, 6))
+        return -LINUX_EFAULT;
+
+    uint64_t physical = address_space_user_page_phys(as, address);
+    if (!physical || !mm_phys_to_virt(physical) || !mm_page_refcount(physical))
+        return -LINUX_EFAULT;
+
+    /* Retain the frame even if its file/cache owner subsequently evicts it. */
+    mm_retain_page(physical);
+    if (!(address_space_user_page_flags(as, address) & RELIEFNT_PAGE_SHARED))
+        paging_writable_alias_add(pin, physical);
+    else
+        pin->physical = physical;
+    return 0;
+}
+
+void user_unpin_read_page(struct paging_writable_alias *pin)
+{
+    if (!pin->physical)
+        return;
+    uint64_t physical = pin->physical;
+    paging_writable_alias_remove(pin);
+    mm_free_page(physical);
+}
+
 EXPORT_SYMBOL(user_copy_from_task);
 EXPORT_SYMBOL(user_copy_to_task);
+EXPORT_SYMBOL(user_pin_read_page);
+EXPORT_SYMBOL(user_unpin_read_page);

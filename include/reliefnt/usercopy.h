@@ -7,6 +7,7 @@
 
 #include <reliefnt/types.h>
 struct task;
+struct paging_writable_alias;
 /**
  * @brief Copy through the target's page tables rather than the current CR3.
  * @param task Pinned destination task under the kernel execution lock.
@@ -27,6 +28,21 @@ int user_copy_to_task(struct task *task, uint64_t address, const void *source, u
  */
 int user_copy_from_task(struct task *task, void *destination, uint64_t address,
                         uint64_t size);
+
+/**
+ * @brief Retain the RAM frame of one readable, page-aligned user mapping.
+ * @param task Live user task under the kernel execution writer.
+ * @param address User page address, with swapped backing prepared by the caller.
+ * @param pin Zeroed owner-embedded node, kept until user_unpin_read_page().
+ * @return Zero, or -EFAULT for an inaccessible, device or unowned page.
+ * The frame survives unmap and swap. Break existing writable COW and use the
+ * fork alias registry to keep a subsequent fork from moving the parent's
+ * frame on write. Replacing a mapping does not retarget the pin. External
+ * readers must be detached before dropping the pin under the same writer.
+ */
+int user_pin_read_page(struct task *task, uint64_t address,
+                       struct paging_writable_alias *pin);
+void user_unpin_read_page(struct paging_writable_alias *pin);
 
 /** @brief Validate readable user pages, resolving lazy faults for the current task.
  * @param ptr Inclusive user virtual address. @param len Exact byte length.

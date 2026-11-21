@@ -9,10 +9,14 @@
 #include <linux/mman.h>
 #include "exec_source_fixture_stubs.h"
 #include "../../drivers/video/drm/file_ops.h"
+#include "../../drivers/video/drm/drm_internal.h"
 
 /* The BO allocator and canonical OFD are the hardware/file boundary. The
  * production DRM adapter, generic reference family and VM clear run unchanged. */
 static struct drm_bo *const expected_bo=(struct drm_bo *)(uintptr_t)0x1000;
+static struct drm_driver driver;
+static struct drm_device device = {.driver = &driver};
+static struct drm_file drm_file = {.device = &device};
 static struct task_file expected_file;
 static unsigned bo_refs,file_refs,allocations;
 static int fail_after=-1,fail_pin;
@@ -24,6 +28,11 @@ void *kernel_malloc(size_t bytes)
     void *memory=malloc(bytes);if(memory)++allocations;return memory;
 }
 void kernel_free(void *memory){if(memory){assert(allocations);--allocations;free(memory);}}
+bool drm_bo_is_dumb(const struct drm_bo *bo) { assert(bo == expected_bo); return false; }
+struct device_mapping_access *drm_bo_mapping_access(struct drm_bo *bo)
+{ (void)bo; assert(!"unexpected demand mapping"); return NULL; }
+const struct drm_driver *drm_prime_mmap_driver(const struct task_file *file)
+{ (void)file; assert(!"unexpected PRIME mapping"); return NULL; }
 void drm_bo_put(struct drm_bo *bo){assert(bo==expected_bo && bo_refs);--bo_refs;}
 int drm_file_mmap_bo(struct task_file *file,uint64_t offset,uint64_t length,
                      struct drm_bo **out,uint64_t *bo_offset)
@@ -51,7 +60,7 @@ int storage_inode_put(struct storage_inode_ref *reference){assert(!reference);re
 
 int main(void)
 {
-    expected_file=(struct task_file){.used=1,.flags=LINUX_O_RDWR,.drm_file=(struct drm_file *)(uintptr_t)1};
+    expected_file=(struct task_file){.used=1,.flags=LINUX_O_RDWR,.drm_file=&drm_file};
     struct device_mapping *mapping=NULL;
     fail_pin=1;
     assert(drm_character_mmap(NULL,&expected_file,0x8000,8192,3,LINUX_MAP_SHARED,&mapping)==-ENOMEM);

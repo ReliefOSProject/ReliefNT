@@ -5,21 +5,6 @@
 #include <reliefnt/text_stream.h>
 #include <reliefnt/graphics_service.h>
 
-/** @brief Fill a sufficiently sized query array using the ordinary usercopy boundary.
- * @param task Caller. @param address User destination. @param capacity Slots.
- * @param data Kernel elements. @param count Actual count. @param size Element bytes.
- * @return Zero or errno/retry; short capacities return counts without copying.
- */
-int vg_kms_array(struct task *task,uint64_t address,uint32_t capacity,const void *data,uint32_t count,uint32_t size)
-{
-    if(capacity<count || !count)return 0;
-    uint64_t bytes=(uint64_t)count*size;
-#ifdef CONFIG_SWAP
-    int rc=drm_user_prepare(task,address,bytes,true);if(rc)return rc;
-#endif
-    return user_copy_to_task(task,address,data,bytes)<0 ? -EFAULT : 0;
-}
-
 /** @brief Build a progressive 60 Hz virtual monitor mode with valid blanking.
  * @param mode Output. @param width Pixels. @param height Pixels. @param preferred
  * Set only for the host-advertised preferred dimensions.
@@ -84,10 +69,10 @@ static int resources(struct task *task,struct drm_file *file,struct drm_mode_car
     uint32_t *fbs=count ? kernel_malloc((size_t)count*4) : NULL;
     if(count && !fbs)return -ENOMEM;
     unsigned n=0;for(struct vg_kms_fb *fb=file->virtio_fbs;fb;fb=fb->next)fbs[n++]=fb->id;
-    int rc=vg_kms_array(task,arg->fb_id_ptr,arg->count_fbs,fbs,count,4);
-    if(!rc)rc=vg_kms_array(task,arg->crtc_id_ptr,arg->count_crtcs,crtcs,vg.scanout_count,4);
-    if(!rc)rc=vg_kms_array(task,arg->encoder_id_ptr,arg->count_encoders,encoders,vg.scanout_count,4);
-    if(!rc)rc=vg_kms_array(task,arg->connector_id_ptr,arg->count_connectors,connectors,vg.scanout_count,4);
+    int rc=drm_kms_copy_array(task,arg->fb_id_ptr,arg->count_fbs,fbs,count,4);
+    if(!rc)rc=drm_kms_copy_array(task,arg->crtc_id_ptr,arg->count_crtcs,crtcs,vg.scanout_count,4);
+    if(!rc)rc=drm_kms_copy_array(task,arg->encoder_id_ptr,arg->count_encoders,encoders,vg.scanout_count,4);
+    if(!rc)rc=drm_kms_copy_array(task,arg->connector_id_ptr,arg->count_connectors,connectors,vg.scanout_count,4);
     kernel_free(fbs);
     arg->count_fbs=count;arg->count_crtcs=arg->count_encoders=arg->count_connectors=vg.scanout_count;
     arg->min_width=arg->min_height=1;arg->max_width=VG_MAX_WIDTH;arg->max_height=VG_MAX_HEIGHT;
@@ -103,10 +88,10 @@ static int connector(struct task *task,struct drm_mode_get_connector *arg)
     struct drm_mode_modeinfo modes[10];unsigned count=modes_get(i,modes);
     uint32_t encoder=VG_ENCODER+i,props[]={VG_PROP_EDID,VG_PROP_DPMS};
     uint64_t values[]={vg.edid[i].size ? VG_EDID_BLOB+i : 0,vg_outputs[i].enabled ? DRM_MODE_DPMS_ON : DRM_MODE_DPMS_OFF};
-    int rc=vg_kms_array(task,arg->modes_ptr,arg->count_modes,modes,count,sizeof(*modes));
-    if(!rc)rc=vg_kms_array(task,arg->encoders_ptr,arg->count_encoders,&encoder,1,4);
-    if(!rc)rc=vg_kms_array(task,arg->props_ptr,arg->count_props,props,2,4);
-    if(!rc)rc=vg_kms_array(task,arg->prop_values_ptr,arg->count_props,values,2,8);
+    int rc=drm_kms_copy_array(task,arg->modes_ptr,arg->count_modes,modes,count,sizeof(*modes));
+    if(!rc)rc=drm_kms_copy_array(task,arg->encoders_ptr,arg->count_encoders,&encoder,1,4);
+    if(!rc)rc=drm_kms_copy_array(task,arg->props_ptr,arg->count_props,props,2,4);
+    if(!rc)rc=drm_kms_copy_array(task,arg->prop_values_ptr,arg->count_props,values,2,8);
     arg->count_modes=count;arg->count_encoders=1;arg->count_props=2;
     arg->encoder_id=encoder;arg->connector_type=DRM_MODE_CONNECTOR_VIRTUAL;
     arg->connector_type_id=i+1;arg->connection=vg.display.pmodes[i].enabled ? 1 : 2;
@@ -135,8 +120,8 @@ static int property(struct task *task,struct drm_mode_get_property *arg)
     default:return -ENOENT;
     }
     for(unsigned i=0;i<enum_count;++i)enums[i].value=values[i];
-    int rc=vg_kms_array(task,arg->values_ptr,arg->count_values,values,count,8);
-    if(!rc)rc=vg_kms_array(task,arg->enum_blob_ptr,arg->count_enum_blobs,enums,enum_count,sizeof(*enums));
+    int rc=drm_kms_copy_array(task,arg->values_ptr,arg->count_values,values,count,8);
+    if(!rc)rc=drm_kms_copy_array(task,arg->enum_blob_ptr,arg->count_enum_blobs,enums,enum_count,sizeof(*enums));
     __builtin_memset(arg->name,0,sizeof(arg->name));__builtin_memcpy(arg->name,name,__builtin_strlen(name));
     arg->count_values=count;arg->count_enum_blobs=enum_count;return rc;
 }
@@ -154,8 +139,8 @@ static int object_properties(struct task *task,struct drm_mode_obj_get_propertie
     } else if(arg->obj_type==DRM_MODE_OBJECT_PLANE && arg->obj_id-VG_PLANE<vg.scanout_count) {
         count=1;properties[0]=VG_PROP_PLANE_TYPE;values[0]=1;
     } else if(!(arg->obj_type==DRM_MODE_OBJECT_CRTC && arg->obj_id-VG_CRTC<vg.scanout_count))return -ENOENT;
-    int rc=vg_kms_array(task,arg->props_ptr,arg->count_props,properties,count,4);
-    if(!rc)rc=vg_kms_array(task,arg->prop_values_ptr,arg->count_props,values,count,8);
+    int rc=drm_kms_copy_array(task,arg->props_ptr,arg->count_props,properties,count,4);
+    if(!rc)rc=drm_kms_copy_array(task,arg->prop_values_ptr,arg->count_props,values,count,8);
     arg->count_props=count;return rc;
 }
 
@@ -173,7 +158,7 @@ int vg_kms_query(struct task *task,struct drm_file *file,uint32_t command,void *
     case DRM_IOCTL_MODE_GETPROPBLOB: {
         struct drm_mode_get_blob *arg=data;unsigned i=arg->blob_id-VG_EDID_BLOB;
         if(i>=vg.scanout_count || !vg.edid[i].size)return -ENOENT;
-        int rc=vg_kms_array(task,arg->data,arg->length,vg.edid[i].edid,vg.edid[i].size,1);
+        int rc=drm_kms_copy_array(task,arg->data,arg->length,vg.edid[i].edid,vg.edid[i].size,1);
         arg->length=vg.edid[i].size;return rc;
     }
     case DRM_IOCTL_MODE_GETCRTC: {
@@ -193,14 +178,14 @@ int vg_kms_query(struct task *task,struct drm_file *file,uint32_t command,void *
         struct drm_mode_get_plane_res *arg=data;uint32_t planes[16];
         unsigned count=file->universal_planes ? vg.scanout_count : 0;
         for(unsigned i=0;i<count;++i)planes[i]=VG_PLANE+i;
-        int rc=vg_kms_array(task,arg->plane_id_ptr,arg->count_planes,planes,count,4);
+        int rc=drm_kms_copy_array(task,arg->plane_id_ptr,arg->count_planes,planes,count,4);
         arg->count_planes=count;return rc;
     }
     case DRM_IOCTL_MODE_GETPLANE: {
         struct drm_mode_get_plane *arg=data;unsigned i=arg->plane_id-VG_PLANE;
         if(i>=vg.scanout_count)return -ENOENT;
         uint32_t formats[]={VG_XRGB8888,VG_ARGB8888};
-        int rc=vg_kms_array(task,arg->format_type_ptr,arg->count_format_types,formats,2,4);
+        int rc=drm_kms_copy_array(task,arg->format_type_ptr,arg->count_format_types,formats,2,4);
         arg->count_format_types=2;arg->possible_crtcs=1u<<i;arg->gamma_size=0;
         arg->crtc_id=vg_outputs[i].enabled ? VG_CRTC+i : 0;
         arg->fb_id=vg_outputs[i].fb ? vg_outputs[i].fb->id : 0;return rc;

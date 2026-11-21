@@ -12,15 +12,43 @@ struct device_mapping_operations {
     void (*release)(void *context);
     void (*destroy)(void *context);
     uint64_t (*physical)(void *context,uint64_t offset);
+    /* Prepare the backing for a demand fault. Optional with info.access. */
+    int (*prepare_cpu)(void *context, uint64_t offset, bool writable);
+};
+
+/* Shared by every demand-mapped view of one backing, including PRIME.
+ * The provider owns storage for as long as any view can retain it. All
+ * members are serialized by the execution writer. A writable admission
+ * advances write_epoch once between revocations, including kernel aliases. */
+struct device_mapping_access {
+    uint64_t write_epoch;
+    uint32_t aliases;
+    bool exposed, writable;
 };
 struct device_mapping_info {
     uint64_t length;
     uint32_t max_prot;
     /* Splits share the backing; moves preserve offsets and never expand it. */
     bool can_split,can_move;
+    struct device_mapping_access *access;
 };
 struct device_mapping;
 struct task;
+
+/** @brief Admit CPU access before installing pages for a demand-backed VMA.
+ * @param mapping Retained view with a demand-access provider.
+ * @param offset Page-aligned byte position in the view.
+ * @param writable True if the VMA can later be made writable by mprotect.
+ * @return Zero on admission, or negative errno with the epoch unchanged.
+ * Requires the execution writer. The callback must not drop this ownership.
+ */
+int device_mapping_prepare_cpu(struct device_mapping *mapping, uint64_t offset, bool writable);
+/** @brief Revoke every demand-mapped PTE for this backing and flush the TLB.
+ * @param access Live backing access state. VMAs and cache claims remain owned.
+ * @return Zero, or EBUSY while I/O retains a supervisor alias.
+ * Requires the execution writer. The epoch persists across revocation.
+ */
+int device_mapping_revoke_cpu(struct device_mapping_access *access);
 /** A retained DEVICE page and cache-compatible supervisor alias. */
 struct device_user_page {
     struct device_mapping *mapping;

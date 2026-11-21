@@ -3,7 +3,6 @@
 #ifdef CONFIG_DRM_VIRTIO_GPU
 #include "virtio/internal.h"
 #include <reliefnt/futex.h>
-#include <reliefnt/time.h>
 #endif
 
 #include <drm/drm.h>
@@ -12,6 +11,7 @@
 #include <linux/mman.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/sched.h>
+#include <reliefnt/time.h>
 #include <reliefnt/syscall.h>
 #include <reliefnt/syscall_internal.h>
 #include <reliefnt/usercopy.h>
@@ -26,6 +26,9 @@
 struct drm_prime_file {
     struct drm_device *device;
     struct drm_bo *bo;
+    void *object;
+    void (*put)(void *);
+    struct task_file **object_cache;
     bool cache_bound;
 };
 
@@ -63,6 +66,83 @@ static int drm_prime_dup_cached(struct task *task,
     return 0;
 }
 
+/* Owns prime and its backing reference on entry, including error paths. */
+static int drm_prime_new_fd(struct task *task, struct drm_prime_file *prime,
+                            uint32_t flags, uint64_t size)
+{
+    struct task_file *slot;
+    int fd = task_allocate_fd(task, 0, &slot);
+    if (fd < 0) {
+        drm_bo_put(prime->bo);
+        if (prime->put)
+            prime->put(prime->object);
+        kernel_free(prime);
+        return fd;
+    }
+    uint64_t ino = __atomic_add_fetch(&drm_prime_next_ino, 1, __ATOMIC_RELAXED);
+    if (!ino)
+        ino = __atomic_add_fetch(&drm_prime_next_ino, 1, __ATOMIC_RELAXED);
+    slot->kind = TASK_FILE_KIND_DRM_PRIME;
+    slot->flags = (flags & DRM_PRIME_FD_RDWR) ? RELIEFOS_O_RDWR : RELIEFOS_O_RDONLY;
+    slot->node.type = RELIEFOS_FS_TYPE_FILE;
+    slot->node.size = size;
+    slot->drm_prime_file = prime;
+    slot->drm_prime_size = size;
+    slot->drm_prime_ino = ino;
+    slot->drm_prime_uid = task->fsuid;
+    slot->drm_prime_gid = task->fsgid;
+    slot->fd_flags = (flags & DRM_PRIME_FD_CLOEXEC) ? RELIEFOS_FD_CLOEXEC : 0;
+    int ret = drm_character_attach_anonymous(task, slot);
+    if (ret) {
+        drm_prime_file_close(slot);
+        task_discard_file_fd(task, fd);
+        return ret;
+    }
+    return fd;
+}
+
+int drm_prime_export_object(struct task *task, struct drm_device *device, uint32_t flags,
+                            uint64_t size, void *object, void (*put)(void *), struct task_file **cache)
+{
+    if (cache && *cache) {
+        int fd;
+        int ret = drm_prime_dup_cached(task, *cache, flags, &fd);
+        put(object);
+        return ret ? ret : fd;
+    }
+    struct drm_prime_file *prime = kernel_malloc(sizeof(*prime));
+    if (!prime) {
+        put(object);
+        return -ENOMEM;
+    }
+    *prime = (struct drm_prime_file){.device = device, .object = object, .put = put};
+    int fd = drm_prime_new_fd(task, prime, flags, size);
+    if (fd < 0 || !cache)
+        return fd;
+    struct task_file *description = task_file_get(task_file_for_fd(task, fd));
+    if (!description) {
+        task_discard_file_fd(task, fd);
+        return -ENOMEM;
+    }
+    *cache = description;
+    prime->object_cache = cache;
+    task_file_put(description);
+    return fd;
+}
+
+void *drm_prime_lookup_object(struct task_file *source, const struct drm_device *device)
+{
+    struct drm_prime_file *prime = source ? source->drm_prime_file : NULL;
+    return prime && prime->device == device ? prime->object : NULL;
+}
+
+/** @brief Borrow the BO of a matching PRIME OFD under execution ownership. */
+struct drm_bo *drm_prime_lookup_bo(struct task_file *source, const struct drm_device *device)
+{
+    struct drm_prime_file *prime = source ? source->drm_prime_file : NULL;
+    return prime && prime->device == device ? prime->bo : NULL;
+}
+
 /** @brief Export a file-authorized VirtGPU GEM object using a canonical DMA-BUF.
  * @param task Execution-owned caller. @param file GEM namespace. @param argument
  * Copied Linux export. @param created_fd_out Rollback output.
@@ -71,9 +151,11 @@ static int drm_prime_dup_cached(struct task *task,
 static int drm_prime_export_bo(struct task *task,struct drm_file *file,
                               struct drm_prime_handle *argument,int *created_fd_out)
 {
-    if(argument->flags&~(DRM_PRIME_FD_CLOEXEC|DRM_PRIME_FD_RDWR))return -LINUX_EINVAL;
     struct drm_bo *bo=drm_bo_lookup_handle_get(file,argument->handle);
-    if(!bo || !drm_bo_virtio(bo)){drm_bo_put(bo);return -LINUX_ENOENT;}
+    if (!bo || (!file->device->driver->prime_bo && !drm_bo_virtio(bo))) {
+        drm_bo_put(bo);
+        return -ENOENT;
+    }
     struct task_file *cached=drm_bo_prime_description(bo);
     int fd=-1,rc;
     if(cached) {
@@ -83,25 +165,22 @@ static int drm_prime_export_bo(struct task *task,struct drm_file *file,
         struct drm_prime_file *prime=kernel_malloc(sizeof(*prime));
         if(!prime){drm_bo_put(bo);return -LINUX_ENOMEM;}
         *prime=(struct drm_prime_file){.bo=bo,.device=file->device};
-        struct task_file *slot=NULL;fd=task_allocate_fd(task,0,&slot);
-        if(fd<0){kernel_free(prime);drm_bo_put(bo);return fd;}
-        uint64_t ino=__atomic_add_fetch(&drm_prime_next_ino,1,__ATOMIC_RELAXED);
-        if(!ino)ino=__atomic_add_fetch(&drm_prime_next_ino,1,__ATOMIC_RELAXED);
-        slot->kind=TASK_FILE_KIND_DRM_PRIME;
-        slot->flags=(argument->flags&DRM_PRIME_FD_RDWR) ? RELIEFOS_O_RDWR : RELIEFOS_O_RDONLY;
-        slot->node.type=RELIEFOS_FS_TYPE_FILE;slot->node.size=drm_bo_size(bo);
-        slot->drm_prime_file=prime;slot->drm_prime_size=drm_bo_size(bo);slot->drm_prime_ino=ino;
-        slot->drm_prime_uid=task->fsuid;slot->drm_prime_gid=task->fsgid;
-        slot->fd_flags=(argument->flags&DRM_PRIME_FD_CLOEXEC) ? RELIEFOS_FD_CLOEXEC : 0;
-        rc=drm_character_attach_anonymous(task,slot);
-        if(rc){drm_prime_file_close(slot);task_discard_file_fd(task,fd);return rc;}
-        struct task_file *description=task_file_get(slot);
+        fd = drm_prime_new_fd(task, prime, argument->flags, drm_bo_size(bo));
+        if (fd < 0)
+            return fd;
+        struct task_file *description=task_file_get(task_file_for_fd(task, fd));
         if(!description){task_discard_file_fd(task,fd);return -LINUX_ENOMEM;}
         rc=drm_bo_prime_bind(bo,description);if(!rc)prime->cache_bound=true;
         task_file_put(description);
         if(rc){task_discard_file_fd(task,fd);return rc;}
     }
     argument->fd=fd;if(created_fd_out)*created_fd_out=fd;return 0;
+}
+
+const struct drm_driver *drm_prime_mmap_driver(const struct task_file *file)
+{
+    const struct drm_prime_file *prime = file->drm_prime_file;
+    return prime && prime->device ? prime->device->driver : NULL;
 }
 
 /** @brief Resolve retained GEM pages for an admitted DMA-BUF mapping.
@@ -130,19 +209,40 @@ int drm_prime_mmap_bo(struct task_file *file,uint64_t offset,uint64_t length,str
  */
 int drm_prime_ioctl(struct task *task, struct drm_file *file,
                     uint32_t command, void *data, int *created_fd_out,
-                    uint32_t *created_handle_out)
+                    uint32_t *created_handle_out, uint32_t *created_object_out)
 {
     if (created_fd_out) *created_fd_out = -1;
     if (!task || !file || !data) return -LINUX_EINVAL;
     struct drm_prime_handle *argument = data;
-    if (command == DRM_IOCTL_PRIME_HANDLE_TO_FD)
+    const struct drm_driver *driver = file->device->driver;
+    if (command == DRM_IOCTL_PRIME_HANDLE_TO_FD) {
+        if (argument->flags & ~(DRM_PRIME_FD_CLOEXEC | DRM_PRIME_FD_RDWR))
+            return -EINVAL;
+        if (driver->prime_export) {
+            int ret = driver->prime_export(task, file, argument);
+            if (ret != -ENOENT) {
+                if (!ret && created_fd_out)
+                    *created_fd_out = argument->fd;
+                return ret;
+            }
+        }
         return drm_prime_export_bo(task, file, argument, created_fd_out);
+    }
     if (command != DRM_IOCTL_PRIME_FD_TO_HANDLE) return -LINUX_EOPNOTSUPP;
     if (argument->flags) return -LINUX_EINVAL;
     struct task_file *source = task_file_for_fd(task, argument->fd);
     if (!source) return -LINUX_EBADF;
     struct drm_prime_file *prime = source->drm_prime_file;
-    if (!prime || prime->device != file->device || !prime->bo) return -LINUX_EINVAL;
+    if (!prime || prime->device != file->device)
+        return -EINVAL;
+    if (prime->object && driver->prime_import) {
+        int ret = driver->prime_import(file, prime->object, &argument->handle);
+        if (!ret && created_object_out)
+            *created_object_out = argument->handle;
+        return ret;
+    }
+    if (!prime->bo)
+        return -EINVAL;
     bool created = false;
     int rc = drm_bo_handle_import(file, prime->bo, &argument->handle, &created);
     if (!rc && created && created_handle_out) *created_handle_out = argument->handle;
@@ -166,6 +266,10 @@ void drm_prime_file_close(struct task_file *file)
         if(prime->cache_bound)drm_bo_prime_unbind(prime->bo,file);
         drm_bo_put(prime->bo);
     }
+    if (prime->object_cache)
+        *prime->object_cache = NULL;
+    if (prime->put)
+        prime->put(prime->object);
     kernel_free(prime);
 }
 

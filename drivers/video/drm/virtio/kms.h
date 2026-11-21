@@ -29,12 +29,7 @@ struct vg_output {
 struct vg_event { struct vg_event *next; struct drm_event_vblank payload; };
 extern struct vg_output vg_outputs[VIRTIO_GPU_MAX_SCANOUTS];
 
-/** @brief Copy one query array only when the caller has enough slots.
- * @param task Caller. @param address Nested user destination. @param capacity
- * Declared elements. @param data Kernel array. @param count Actual elements.
- * @param size Element bytes. @return Zero, errno or prerequisite retry.
- */
-int vg_kms_array(struct task *task,uint64_t address,uint32_t capacity,const void *data,uint32_t count,uint32_t size);
+
 /** @brief Dispatch KMS metadata queries without hardware state mutations.
  * @param task Caller. @param file OFD. @param command Canonical ioctl.
  * @param data Copied argument. @return Zero/errno/retry or -VG_IOCTL_UNOWNED if unowned.

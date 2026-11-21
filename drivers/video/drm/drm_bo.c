@@ -1,4 +1,5 @@
 #include "drm_internal.h"
+#include <reliefnt/device_mapping.h>
 #ifdef CONFIG_DRM_VIRTIO_GPU
 #include "virtio/internal.h"
 #endif
@@ -25,6 +26,8 @@ struct drm_bo {
     uint64_t physical;
     uint64_t map_offset;
     struct vg_resource *virtio;
+    struct device_mapping_access cpu_access;
+    bool is_dumb;
     struct task_file *prime_description; /* weak; execution owner serializes close */
 };
 
@@ -125,6 +128,16 @@ int drm_bo_prime_bind(struct drm_bo *bo,struct task_file *description)
  */
 void drm_bo_prime_unbind(struct drm_bo *bo,struct task_file *description)
 { if(bo && bo->prime_description==description)bo->prime_description=NULL; }
+
+bool drm_bo_is_dumb(const struct drm_bo *bo)
+{
+    return bo && bo->is_dumb;
+}
+
+struct device_mapping_access *drm_bo_mapping_access(struct drm_bo *bo)
+{
+    return &bo->cpu_access;
+}
 
 int drm_bo_gpu_reserve(struct drm_bo *bo)
 {
@@ -230,31 +243,55 @@ static uint32_t drm_bo_allocate_handle_locked(struct drm_file *file)
     return 0;
 }
 
-/** @brief Create or find the per-OFD handle for an existing same-device GEM BO.
- * @param file Target OFD. @param bo Retained source. @param handle Output ID.
- * @param created True only for a newly allocated logical handle.
- * @return Zero or -EINVAL/-ENOMEM/-ENOSPC; task context, no allocation under lock.
- */
-int drm_bo_handle_import(struct drm_file *file, struct drm_bo *bo, uint32_t *handle, bool *created)
+/* A non-NULL created output requests PRIME's existing-handle semantics. */
+static int drm_bo_add_handle(struct drm_file *file, struct drm_bo *bo,
+                             uint32_t *handle, bool *created)
 {
-    if(!file || !bo || !handle || !created)return -LINUX_EINVAL;
-    struct drm_bo_handle *entry=kernel_malloc(sizeof(*entry));
-    if(!entry)return -LINUX_ENOMEM;
-    uint64_t flags;kernel_spin_lock_irqsave(&drm_bo_lock,&flags);
-    for(struct drm_bo_handle *old=file->bo_handles;old;old=old->next) {
-        if(old->bo==bo) {
-            *handle=old->handle;*created=false;
-            kernel_spin_unlock_irqrestore(&drm_bo_lock,flags);kernel_free(entry);return 0;
+    if (!file || !bo || !handle)
+        return -LINUX_EINVAL;
+    struct drm_bo_handle *entry = kernel_malloc(sizeof(*entry));
+    if (!entry)
+        return -LINUX_ENOMEM;
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&drm_bo_lock, &flags);
+    if (created) {
+        for (struct drm_bo_handle *old = file->bo_handles; old; old = old->next) {
+            if (old->bo == bo) {
+                *handle = old->handle;
+                *created = false;
+                kernel_spin_unlock_irqrestore(&drm_bo_lock, flags);
+                kernel_free(entry);
+                return 0;
+            }
         }
     }
-    uint32_t id=drm_bo_allocate_handle_locked(file);
-    if(id) {
-        drm_bo_get(bo);*entry=(struct drm_bo_handle){.next=file->bo_handles,.bo=bo,.handle=id};
-        file->bo_handles=entry;*handle=id;*created=true;
+    uint32_t id = drm_bo_allocate_handle_locked(file);
+    if (id) {
+        drm_bo_get(bo);
+        *entry = (struct drm_bo_handle){.next = file->bo_handles, .bo = bo, .handle = id};
+        file->bo_handles = entry;
+        *handle = id;
+        if (created)
+            *created = true;
     }
-    kernel_spin_unlock_irqrestore(&drm_bo_lock,flags);
-    if(!id)kernel_free(entry);
+    kernel_spin_unlock_irqrestore(&drm_bo_lock, flags);
+    if (!id)
+        kernel_free(entry);
     return id ? 0 : -LINUX_ENOSPC;
+}
+
+/** @brief Add a separately closeable GEM handle to a retained BO. */
+int drm_bo_handle_create(struct drm_file *file, struct drm_bo *bo, uint32_t *handle)
+{
+    return drm_bo_add_handle(file, bo, handle, NULL);
+}
+
+/** @brief Deduplicate a same-device GEM PRIME import within the target OFD. */
+int drm_bo_handle_import(struct drm_file *file, struct drm_bo *bo, uint32_t *handle, bool *created)
+{
+    if (!created)
+        return -LINUX_EINVAL;
+    return drm_bo_add_handle(file, bo, handle, created);
 }
 
 /** @brief Allocate a per-file BO, respecting the owning device's address mask.
@@ -263,14 +300,12 @@ int drm_bo_handle_import(struct drm_file *file, struct drm_bo *bo, uint32_t *han
  * @param map_offset_out Required mapping-offset output.
  * @return Zero with an owned handle, or negative errno with no published BO.
  */
-int drm_bo_create(struct drm_file *file,
-                  struct drm_faildiag_context *diagnostics,
-                  uint64_t requested_size,
-                  uint32_t *handle_out, uint64_t *map_offset_out)
+static int drm_bo_allocate(uint64_t requested_size, struct drm_faildiag_context *diagnostics,
+                           struct drm_bo **out)
 {
     uint64_t size = drm_bo_align_size(requested_size);
-    if (!file || !handle_out || !map_offset_out || !size ||
-        size > DRM_BO_MAX_BYTES) return -LINUX_EINVAL;
+    if (!size || size > DRM_BO_MAX_BYTES)
+        return -LINUX_EINVAL;
     uint32_t page_count = (uint32_t)(size / DRM_BO_PAGE_SIZE);
     uint64_t retained = 0;
     int ret = drm_bo_reserve_bytes(size, &retained);
@@ -281,19 +316,14 @@ int drm_bo_create(struct drm_file *file,
     }
 
     struct drm_bo *bo = kernel_malloc(sizeof(*bo));
-    struct drm_bo_handle *entry = kernel_malloc(sizeof(*entry));
-    if (!bo || !entry) {
-        const char *stage = bo ? "bo.metadata_handle" : "bo.metadata_object";
-        kernel_free(entry);
-        kernel_free(bo);
+    if (!bo) {
         retained = drm_bo_release_reserved_bytes(size);
-        drm_bo_record_failure(diagnostics, -LINUX_ENOMEM, stage,
+        drm_bo_record_failure(diagnostics, -LINUX_ENOMEM, "bo.metadata_object",
                               requested_size, size, retained, page_count);
         return -LINUX_ENOMEM;
     }
     uint64_t physical = mm_alloc_pages(page_count);
     if (!physical) {
-        kernel_free(entry);
         kernel_free(bo);
         retained = drm_bo_release_reserved_bytes(size);
         drm_bo_record_failure(diagnostics, -LINUX_ENOMEM,
@@ -310,30 +340,51 @@ int drm_bo_create(struct drm_file *file,
 
     uint64_t flags;
     kernel_spin_lock_irqsave(&drm_bo_lock, &flags);
-    uint32_t handle = drm_bo_allocate_handle_locked(file);
-    if (!handle || drm_bo_next_map_offset > (uint64_t)INT64_MAX - size) {
-        if (handle) {
-            /* The unused handle was only reserved in next_bo_handle. It has
-             * not been linked, so leaving a harmless gap is safe. */
-        }
+    if (drm_bo_next_map_offset > (uint64_t)INT64_MAX - size) {
         kernel_spin_unlock_irqrestore(&drm_bo_lock, flags);
-        mm_free_pages(physical, page_count);
-        kernel_free(entry);
-        kernel_free(bo);
-        kernel_spin_lock_irqsave(&drm_bo_lock, &flags);
-        drm_bo_bytes -= size;
-        kernel_spin_unlock_irqrestore(&drm_bo_lock, flags);
+        drm_bo_put(bo);
         return -LINUX_ENOSPC;
     }
     bo->map_offset = drm_bo_next_map_offset;
     drm_bo_next_map_offset += size;
-    *entry = (struct drm_bo_handle){
-        .next = file->bo_handles,
-        .bo = bo,
-        .handle = handle,
-    };
-    file->bo_handles = entry;
     kernel_spin_unlock_irqrestore(&drm_bo_lock, flags);
+    *out = bo;
+    return 0;
+}
+
+int drm_bo_alloc(uint64_t size, struct drm_bo **out)
+{
+    return drm_bo_allocate(size, NULL, out);
+}
+
+int drm_bo_create(struct drm_file *file, struct drm_faildiag_context *diagnostics,
+                  uint64_t requested_size, uint32_t *handle_out, uint64_t *map_offset_out)
+{
+    if (!file || !handle_out || !map_offset_out)
+        return -LINUX_EINVAL;
+    struct drm_bo *bo;
+    int ret = drm_bo_allocate(requested_size, diagnostics, &bo);
+    if (ret)
+        return ret;
+    struct drm_bo_handle *entry = kernel_malloc(sizeof(*entry));
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&drm_bo_lock, &flags);
+    uint32_t handle = entry ? drm_bo_allocate_handle_locked(file) : 0;
+    uint64_t retained = drm_bo_bytes - bo->size;
+    if (handle) {
+        *entry = (struct drm_bo_handle){.next = file->bo_handles, .bo = bo, .handle = handle};
+        file->bo_handles = entry;
+    }
+    kernel_spin_unlock_irqrestore(&drm_bo_lock, flags);
+    if (!handle) {
+        ret = entry ? -LINUX_ENOSPC : -LINUX_ENOMEM;
+        if (!entry)
+            drm_bo_record_failure(diagnostics, ret, "bo.metadata_handle", requested_size,
+                                  bo->size, retained, bo->page_count);
+        kernel_free(entry);
+        drm_bo_put(bo);
+        return ret;
+    }
 
     *handle_out = handle;
     *map_offset_out = bo->map_offset;
@@ -444,16 +495,15 @@ static int drm_bo_create_dumb(struct drm_file *file,
     uint64_t map_offset;
     int ret = drm_bo_create(file, diagnostics, size, &handle, &map_offset);
     if (ret < 0) return ret;
-#ifdef CONFIG_DRM_VIRTIO_GPU
-    if(drm_is_virtio()) {
-        if(bpp!=32 && bpp!=24){(void)drm_bo_handle_delete(file,handle);return -LINUX_EINVAL;}
-        struct drm_bo *bo=drm_bo_lookup_handle_get(file,handle);
-        struct drm_virtgpu_resource_create parameters={.width=width,.height=height,.depth=1,
-            .array_size=1,.format=VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM,.target=2,.stride=pitch};
-        ret=vg_resource_create(bo,&parameters,false);drm_bo_put(bo);
-        if(ret){(void)drm_bo_handle_delete(file,handle);return ret;}
+    struct drm_bo *bo = drm_bo_lookup_handle_get(file, handle);
+    bo->is_dumb = true;
+    if (file->device->driver->dumb_init)
+        ret = file->device->driver->dumb_init(bo, width, height, bpp, pitch);
+    drm_bo_put(bo);
+    if (ret) {
+        (void)drm_bo_handle_delete(file, handle);
+        return ret;
     }
-#endif
     arg->handle = handle;
     arg->pitch = pitch;
     arg->size = size;
@@ -477,7 +527,7 @@ int drm_bo_ioctl(struct drm_file *file, uint32_t command, void *data,
         if (!arg) return -LINUX_EFAULT;
         arg->offset = 0;
         int rc=drm_bo_map_offset(file, arg->handle, &arg->offset);
-        return drm_is_virtio() && rc==-LINUX_EINVAL ? -LINUX_ENOENT : rc;
+        return file->device->driver->dumb_init && rc==-LINUX_EINVAL ? -LINUX_ENOENT : rc;
     }
     case DRM_IOCTL_MODE_DESTROY_DUMB: {
         struct drm_mode_destroy_dumb *arg = data;

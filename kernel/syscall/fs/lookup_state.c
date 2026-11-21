@@ -147,6 +147,8 @@ void task_lookup_scope_begin(struct task *task,const struct trap_frame *frame)
 {
     if(!task || !frame || frame->rax==LINUX_SYS_RT_SIGRETURN)return;
     bool scoped=lookup_path_call(frame->rax);
+    if(frame->rax==LINUX_SYS_IOCTL && task->syscall_file &&
+       task->syscall_file->character_file && task->syscall_file->drm_file)scoped=true;
 #ifdef CONFIG_SWAP
     /* Special-device vectors retain the admitted metadata across a
      * prerequisite page-in wait, just as ordinary files and sockets do. */
@@ -165,7 +167,7 @@ void task_lookup_scope_begin(struct task *task,const struct trap_frame *frame)
        (uint32_t)frame->rsi==BLKGETSIZE || (uint32_t)frame->rsi==BLKGETSIZE64))scoped=true;
     if(frame->rax==LINUX_SYS_IOCTL && task->syscall_file &&
        task->syscall_file->character_file &&
-       (task->syscall_file->drm_file || task->syscall_file->drm_prime_file ||
+       (task->syscall_file->drm_prime_file ||
         task->syscall_file->kind==TASK_FILE_KIND_DRM_SYNC))scoped=true;
     if(frame->rax==LINUX_SYS_IOCTL && task->syscall_file &&
        task->syscall_file->character_file &&

@@ -333,6 +333,13 @@ static int ioctl_call(struct task *task, struct task_file *file,
                                (uint64_t)(uintptr_t)argument);
 }
 
+static void fixture_stop(void) {}
+
+static const struct drm_driver fixture_driver = {
+    .name = "reliefnt", .description = "ReliefNT DRM core", .minor = 1,
+    .stop = fixture_stop,
+};
+
 static void test_registration_and_open_lifetime(void)
 {
     struct task unprivileged = make_task(100, false);
@@ -340,17 +347,17 @@ static void test_registration_and_open_lifetime(void)
     struct task admin = make_task(200, true);
     struct task_file first = {0}, second = {0}, third = {0};
     struct pci_device identity;
-    assert(drm_device_register(NULL) == -LINUX_EINVAL);
+    assert(drm_device_register(NULL, &fixture_driver) == -LINUX_EINVAL);
     assert(!drm_device_is_registered());
     assert(drm_file_open(&unprivileged, &first) == -LINUX_ENODEV);
     assert(!first.drm_file && allocations == drm_test_permanent_allocations);
 
     struct pci_device pci = fixture_device();
-    assert(drm_device_register(&pci) == 0);
-    assert(drm_device_register(&pci) == 0);
+    assert(drm_device_register(&pci, &fixture_driver) == 0);
+    assert(drm_device_register(&pci, &fixture_driver) == 0);
     struct pci_device other = pci;
     ++other.slot;
-    assert(drm_device_register(&other) == -LINUX_EBUSY);
+    assert(drm_device_register(&other, &fixture_driver) == -LINUX_EBUSY);
     assert(!drm_device_render_node_ready());
     assert(drm_device_pci_identity(&identity) == 0);
     assert(identity.bus == 0 && identity.slot == 15 && identity.function == 0);
@@ -633,6 +640,16 @@ static void test_prime_bo_lifetime(void)
     struct drm_bo *bo = NULL;
     assert(!drm_prime_mmap_bo(description, 4096, 4096, &bo));
     assert(bo == importer.drm_file->bo_handles->bo && drm_bo_size(bo) == 8192);
+    /* vmwgfx surface references return independent handles to the same BO. */
+    uint32_t first, second;
+    assert(!drm_bo_handle_create(importer.drm_file, bo, &first));
+    assert(!drm_bo_handle_create(importer.drm_file, bo, &second));
+    assert(first != handle && second != handle && first != second);
+    assert(!drm_bo_handle_delete(importer.drm_file, first));
+    struct drm_bo *retained = drm_bo_lookup_handle_get(importer.drm_file, second);
+    assert(retained == bo);
+    drm_bo_put(retained);
+    assert(!drm_bo_handle_delete(importer.drm_file, second));
 
     drm_file_close(&card);
     task_discard_file_fd(&producer, export.fd);
@@ -653,7 +670,8 @@ static int drm_test_fail_alloc_bo(struct task *task, struct task_file *task_file
 static void test_faildiag_real_bo_failures(void)
 {
     struct task task = make_task(314, false);
-    struct drm_file drm_file = {0};
+    struct drm_device device = {.driver = &fixture_driver};
+    struct drm_file drm_file = {.device = &device};
     struct task_file task_file = {.drm_file = &drm_file};
     const uint64_t original_bo_bytes = drm_bo_bytes;
     const unsigned original_allocations = allocations;

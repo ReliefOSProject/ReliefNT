@@ -89,6 +89,14 @@ int pci_find_device(uint16_t vendor_id, uint16_t device_id,
 bool pci_device_bar_contains(const struct pci_device *device, uint8_t bar,
                              uint64_t phys, uint64_t bytes);
 
+/** @brief Resolve an assigned 16-bit I/O BAR0 and validate the used extent.
+ * Caller exclusively owns a quiesced function and supplies the byte count.
+ * Temporarily disables decode under the PCI config lock to determine size.
+ * On failure the output is untouched and the old config is restored.
+ */
+int pci_device_io_bar0(const struct pci_device *device, uint16_t bytes,
+                       uint16_t *port);
+
 /** @brief Enumerate every present PCI function by stable bus/slot/function index.
  * @param index Zero-based ordinal among present functions.
  * @param out Receives complete module-facing identity; borrowed output.

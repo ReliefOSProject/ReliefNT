@@ -2396,6 +2396,7 @@ static int64_t inet_message(struct task_file *file, uint64_t user_header,
 {
     bool packet = file->kind == TASK_FILE_KIND_PACKET;
     bool netlink = file->kind == TASK_FILE_KIND_NETLINK;
+    bool netlink_passcred = receiving && netlink && task_netlink_passcred(file);
     bool udp = file->kind == TASK_FILE_KIND_UDP;
     bool datagram = udp || packet || netlink;
     if (flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL | MSG_PEEK | MSG_TRUNC | MSG_WAITALL | MSG_CMSG_CLOEXEC))
@@ -2417,15 +2418,17 @@ static int64_t inet_message(struct task_file *file, uint64_t user_header,
 #ifndef CONFIG_SWAP
     if (receiving && user_header && !user_range_writable(user_header, sizeof(message))) return -LINUX_EFAULT;
 #endif
-    if (receiving && (udp || packet) && message.msg_name) {
-        uint32_t native_size = udp ? task_udp_address_size(file) : task_packet_address_size(file);
+    if (receiving && datagram && message.msg_name) {
+        uint32_t native_size = netlink ? sizeof(struct sockaddr_nl) :
+            udp ? task_udp_address_size(file) : task_packet_address_size(file);
         uint32_t copied = message.msg_namelen < native_size ? message.msg_namelen : native_size;
         int prep = socket_user_prepare(sched_current_task(), (uintptr_t)message.msg_name, copied, true);
         if (prep) return prep;
         if (copied && !user_range_writable((uintptr_t)message.msg_name, copied)) return -LINUX_EFAULT;
     }
-    if (receiving && (udp || packet) && message.msg_controllen && message.msg_control) {
-        uint64_t copied = message.msg_controllen < 88 ? message.msg_controllen : 88;
+    if (receiving && (udp || packet || netlink_passcred) && message.msg_controllen && message.msg_control) {
+        uint64_t limit = netlink_passcred ? CMSG_SPACE(sizeof(struct ucred)) : 88;
+        uint64_t copied = message.msg_controllen < limit ? message.msg_controllen : limit;
         int prep = socket_user_prepare(sched_current_task(), (uintptr_t)message.msg_control, copied, true);
         if (prep) return prep;
         if (!user_range_writable((uintptr_t)message.msg_control, copied)) return -LINUX_EFAULT;
@@ -2499,8 +2502,8 @@ static int64_t inet_message(struct task_file *file, uint64_t user_header,
                                          message.msg_name ? &source : NULL,&source_length,&udp_info);
         else ret=task_inet_recv(file,payload,output_size,flags);
 #else
-        if (netlink) ret = task_netlink_recv(file, payload, size, (flags & ~MSG_CMSG_CLOEXEC) | MSG_TRUNC,
-            (uintptr_t)message.msg_name, (uintptr_t)&destination->msg_namelen);
+        if (netlink) ret = task_netlink_recv_staged(file, payload, size, (flags & ~MSG_CMSG_CLOEXEC) | MSG_TRUNC,
+                                                   message.msg_name ? &source : NULL, &source_length);
         else if (packet) ret = task_packet_recv_ex(file, payload, size, (flags & ~MSG_CMSG_CLOEXEC) | MSG_TRUNC,
                                                   message.msg_name ? &source : NULL,&source_length,&udp_info);
         else if (udp) ret = task_udp_recv_ex(file, payload, size, (flags & ~MSG_CMSG_CLOEXEC) | MSG_TRUNC,
@@ -2508,11 +2511,7 @@ static int64_t inet_message(struct task_file *file, uint64_t user_header,
         else ret = task_inet_recv(file, payload, size, flags);
 #endif
         if (ret < 0) goto done;
-        if((udp || packet
-#ifdef CONFIG_SWAP
-            || netlink
-#endif
-            ) && message.msg_name) {
+        if (datagram && message.msg_name) {
             uint32_t copied_name=message.msg_namelen<source_length ? message.msg_namelen : source_length;
             if(copied_name)__builtin_memcpy(message.msg_name,&source,copied_name);
             destination->msg_namelen=source_length;
@@ -2526,6 +2525,23 @@ static int64_t inet_message(struct task_file *file, uint64_t user_header,
         }
         output->flags = datagram && (uint64_t)ret > size ? MSG_TRUNC : 0;
         uint64_t used = 0;
+        if (netlink_passcred) {
+            const struct ucred credentials = {0};
+            const uint64_t available = message.msg_control ? message.msg_controllen : 0;
+            if (available < CMSG_LEN(sizeof(credentials)))
+                output->flags |= MSG_CTRUNC;
+            if (available >= CMSG_LEN(0)) {
+                uint64_t copy = available - CMSG_LEN(0);
+                if (copy > sizeof(credentials))
+                    copy = sizeof(credentials);
+                const struct cmsghdr header = {
+                    .cmsg_len = CMSG_LEN(copy), .cmsg_level = SOL_SOCKET, .cmsg_type = SCM_CREDENTIALS,
+                };
+                __builtin_memcpy(message.msg_control, &header, sizeof(header));
+                __builtin_memcpy((uint8_t *)message.msg_control + CMSG_LEN(0), &credentials, copy);
+                used = CMSG_SPACE(copy) < available ? CMSG_SPACE(copy) : available;
+            }
+        }
         if ((udp || packet) && (udp_info.pktinfo || udp_info.hoplimit || udp_info.old_hoplimit)) {
             struct in6_pktinfo pktinfo = {.ipi6_addr = udp_info.destination, .ipi6_ifindex = udp_info.ifindex};
             for (unsigned which = 0; which < 3; ++which) {

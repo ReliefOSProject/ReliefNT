@@ -196,7 +196,8 @@ int vg_context_detach_resource(struct vg_resource *resource);
  * @param created_fd Sync_file rollback output, populated only after submission.
  * @return Zero, errno or internal blocked status; no borrowed user pointer escapes.
  */
-int vg_ioctl(struct task *task, struct drm_file *file, uint32_t command, void *data, uint32_t *created_handle,int *created_fd);
+int vg_ioctl(struct task *task, struct drm_file *file, uint32_t command, void *data,
+             uint32_t *created_handle, int *created_fd, uint32_t *created_object);
 /** @brief Dispatch copied KMS arguments with all nested user ranges prepared.
  * @param task Caller. @param file Authorized OFD. @param command Canonical ioctl.
  * @param data Copied argument. @param created_fb Rollback output.

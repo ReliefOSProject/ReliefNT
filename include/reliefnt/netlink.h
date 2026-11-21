@@ -30,6 +30,12 @@ int task_netlink_recv(struct task_file *file,void *data,uint32_t length,uint32_t
  * @param source_length Output source length. @return Bytes, errno or blocked marker. */
 int task_netlink_recv_staged(struct task_file *file,void *data,uint32_t length,uint32_t flags,
                              void *source,uint32_t *source_length);
+/* Kernel-originated datagrams carry pid, uid and gid zero with SO_PASSCRED. */
+bool task_netlink_passcred(const struct task_file *file);
+/* Publish KOBJ_CHANGE to group 1. All input is kernel-owned and is copied
+ * before return. properties contains NUL-terminated environment entries. */
+void netlink_uevent_change(const char *devpath, const char *subsystem,
+                         const char *properties, uint32_t length);
 /** @brief Query queued datagrams and send readiness.
  * @param file Retained OFD. @param events Requested poll flags. @return Ready flags. */
 short task_netlink_poll(const struct task_file *file,short events);

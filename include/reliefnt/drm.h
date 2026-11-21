@@ -10,7 +10,6 @@ struct task_file;
 struct drm_bo;
 
 /* Register a PCI device after its graphics backend has initialized it. */
-int drm_device_register(const struct pci_device *device);
 bool drm_device_is_registered(void);
 bool drm_device_render_node_ready(void);
 int drm_device_pci_identity(struct pci_device *out);

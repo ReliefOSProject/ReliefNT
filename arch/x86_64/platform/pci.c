@@ -7,6 +7,7 @@
 #include <reliefnt/console.h>
 #include <reliefnt/lock.h>
 #include <reliefnt/paging.h>
+#include <linux/errno.h>
 
 #include "../port.h"
 
@@ -517,6 +518,46 @@ bool pci_device_bar_contains(const struct pci_device *device, uint8_t bar,
     return true;
 }
 
+int pci_device_io_bar0(const struct pci_device *device, uint16_t bytes,
+                       uint16_t *port)
+{
+    if (!device || !bytes || !port)
+        return -EINVAL;
+
+    uint64_t flags;
+    uint8_t bus = device->bus, slot = device->slot, fn = device->function;
+    int ret = -ENODEV;
+
+    kernel_spin_lock_irqsave(&pci_config_lock, &flags);
+    uint32_t id = pci_raw_read32(bus, slot, fn, 0);
+    uint32_t header = pci_raw_read32(bus, slot, fn, 0x0c);
+    if ((uint16_t)id != device->vendor_id || id >> 16 != device->device_id ||
+        (header & 0x007f0000u))
+        goto out;
+    uint32_t bar = pci_raw_read32(bus, slot, fn, 0x10);
+    uint32_t base = bar & ~3u;
+    if ((bar & 3) != 1 || !base || base > UINT16_MAX)
+        goto out;
+
+    uint16_t command = pci_raw_read32(bus, slot, fn, 4);
+    pci_raw_write16(bus, slot, fn, 4, command & (uint16_t)~3u);
+    pci_raw_write32(bus, slot, fn, 0x10, UINT32_MAX);
+    uint32_t mask = pci_raw_read32(bus, slot, fn, 0x10);
+    pci_raw_write32(bus, slot, fn, 0x10, bar);
+    pci_raw_write16(bus, slot, fn, 4, command);
+
+    uint32_t size = 0x10000u - (mask & 0xfffcu);
+    if ((mask & 3) != 1 || !size || (size & (size - 1)) ||
+        (base & (size - 1)) || bytes > size || size > 0x10000u - base)
+        goto out;
+    *port = base;
+    ret = 0;
+
+out:
+    kernel_spin_unlock_irqrestore(&pci_config_lock, flags);
+    return ret;
+}
+
 #define PCI_MMIO_MAX 64U
 struct pci_mmio_mapping { uint64_t phys, bytes, aligned, length; void *ptr; uint32_t refs; bool high; };
 static struct pci_mmio_mapping pci_mappings[PCI_MMIO_MAX];
@@ -661,8 +702,10 @@ EXPORT_SYMBOL(pci_config_write16);
 EXPORT_SYMBOL(pci_config_write32);
 
 EXPORT_SYMBOL(pci_device_bar_contains);
+EXPORT_SYMBOL(pci_device_io_bar0);
 
 EXPORT_SYMBOL(pci_map_mmio);
+EXPORT_SYMBOL(pci_map_device_bar);
 EXPORT_SYMBOL(pci_map_firmware_bar0);
 EXPORT_SYMBOL(pci_map_xhci_firmware_cap_page);
 

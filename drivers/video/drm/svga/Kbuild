@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: Apache-2.0
+drm-svga-y := device.o fifo.o submit.o caps.o resource.o surface.o exec.o buffer.o context.o binding.o fence.o query.o legacy.o dx.o dma.o screen.o layout.o cursor.o overlay.o kms.o kms_query.o atomic.o property.o vblank.o ioctl.o
+drm-svga-y += console.o host.o mksstat.o

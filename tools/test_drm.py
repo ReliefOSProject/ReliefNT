@@ -14,6 +14,14 @@ INCLUDES = [
 ]
 FIXTURES = [
     ("tools/tests/drm_abi_test.c", "drm-abi"),
+    ("tests/host/svga_fifo.c", "svga-fifo"),
+    ("tests/host/svga_stream.c", "svga-stream"),
+    ("tests/host/svga_submit.c", "svga-submit"),
+    ("tests/host/svga_dma.c", "svga-dma"),
+    ("tests/host/svga_sync.c", "svga-sync"),
+    ("tests/host/svga_exec.c", "svga-exec"),
+    ("tests/host/svga_mksstat.c", "svga-mksstat"),
+    ("tests/host/svga_screen.c", "svga-screen"),
     ("tools/tests/drm_core_test.c", "drm-core"),
     ("tools/tests/drm_vma_clear_test.c", "drm-vma-clear"),
     ("tools/tests/drm_runtime_sysfs_test.c", "drm-runtime-sysfs"),
@@ -45,10 +53,27 @@ def main() -> int:
                 "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
                 *INCLUDES, source, "-Wl,--gc-sections", "-o", str(binary),
             ]
+            if name in ("svga-fifo", "svga-submit"):
+                command[1:1] = ["-Idrivers/video/drm/svga", "drivers/video/drm/svga/fifo.c"]
+            if name == "svga-submit":
+                command[1:1] = ["drivers/video/drm/svga/submit.c"]
+            if name == "svga-dma":
+                command[1:1] = [f"drivers/video/drm/svga/{part}.c" for part in ("dma", "surface", "context", "binding")]
+            if name == "svga-sync":
+                command[1:1] = [f"drivers/video/drm/svga/{part}.c"
+                                for part in ("fence", "query", "buffer")]
+            if name == "svga-exec":
+                command[1:1] = [f"drivers/video/drm/svga/{part}.c"
+                                for part in ("exec", "buffer")]
+            if name == "svga-mksstat":
+                command[1:1] = ["drivers/video/drm/svga/mksstat.c"]
+            if name == "svga-screen":
+                command[1:1] = ["drivers/video/drm/svga/screen.c"]
             if name == "drm-core":
                 command[1:1] = ['-DKBUILD_MODNAME="drm"', "kernel/params/value.c", "kernel/params/arguments.c",
                                 "kernel/device/service.c", "kernel/device/graphics_service.c",
-                                "drivers/video/drm/services.c", "drivers/video/drm/memory.c"]
+                                "drivers/video/drm/services.c", "drivers/video/drm/memory.c",
+                                "drivers/video/drm/sync.c"]
             if name in ("drm-core", "drm-vma-clear"):
                 command[1:1] = ["kernel/device/mapping.c"]
             if name == "drm-vma-clear":

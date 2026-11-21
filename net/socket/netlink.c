@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-/* Route-netlink state is owned by the ordinary kernel execution context. */
+/* Netlink state is owned by the ordinary kernel execution context. */
 #include <reliefnt/netlink.h>
 #include <reliefnt/net_ipv6.h>
 #include <reliefnt/net.h>
@@ -7,10 +7,12 @@
 #include <reliefnt/net_interface.h>
 #include <reliefnt/futex.h>
 #include <reliefnt/heap.h>
+#include <reliefnt/export.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/socket_usercopy.h>
 #include <reliefnt/syscall.h>
 #include <reliefnt/syscall_internal.h>
+#include <reliefnt/text_stream.h>
 #include <reliefnt/time.h>
 #include <reliefnt/usercopy.h>
 #include <reliefnt/wait.h>
@@ -30,8 +32,8 @@ struct netlink_socket {
     struct netlink_socket *next;
     struct netlink_message *head, *tail;
     uint32_t port, queued_bytes, groups;
-    int type;
-    bool bound, connected, overrun;
+    int type, protocol;
+    bool bound, connected, overrun, passcred;
 };
 struct nl_builder {
     struct netlink_message *message, *completion;
@@ -40,6 +42,7 @@ struct nl_builder {
 static struct netlink_socket *netlink_sockets;
 static uint32_t netlink_auto_port = 0x80000000u;
 static uint64_t netlink_ino;
+static uint64_t uevent_seqnum;
 static struct net_ipv6_address *nl_previous_addresses;
 static struct net_ipv6_route *nl_previous_routes;
 static uint32_t nl_previous_address_count, nl_previous_route_count;
@@ -65,7 +68,8 @@ static struct netlink_socket *nl_socket(const struct task_file *file)
 static bool nl_port_used(uint32_t port, const struct netlink_socket *except)
 {
     for (struct netlink_socket *s = netlink_sockets; s; s = s->next)
-        if (s != except && s->bound && s->port == port) return true;
+        if (s != except && s->protocol == except->protocol && s->bound && s->port == port)
+            return true;
     return false;
 }
 
@@ -387,12 +391,18 @@ static int nl_initial_snapshot(void)
  * @param s Subscriber. @param groups New Linux group mask. @return Zero or errno. */
 static int nl_set_groups(struct netlink_socket *s, uint32_t groups)
 {
+    if (s->protocol == NETLINK_KOBJECT_UEVENT) {
+        if (groups & ~1u)
+            return -LINUX_EOPNOTSUPP;
+        s->groups = groups;
+        return 0;
+    }
     if (groups & ~NL_SUPPORTED_GROUPS) return -LINUX_EOPNOTSUPP;
     if (groups) { int rc=nl_initial_snapshot(); if (rc) return rc; }
     s->groups=groups;
     if (!groups) {
         for (struct netlink_socket *it=netlink_sockets;it;it=it->next)
-            if (it->groups) return 0;
+            if (it->protocol == NETLINK_ROUTE && it->groups) return 0;
         nl_forget_snapshot();
     }
     return 0;
@@ -403,9 +413,59 @@ static int nl_set_groups(struct netlink_socket *s, uint32_t groups)
 static void nl_overrun(uint32_t group)
 {
     for (struct netlink_socket *s=netlink_sockets;s;s=s->next)
-        if (s->groups & group) s->overrun=true;
+        if (s->protocol == NETLINK_ROUTE && (s->groups & group)) s->overrun=true;
     kernel_poll_readiness_notify();
 }
+
+static void nl_multicast(int protocol, uint32_t group, const void *data, uint32_t length)
+{
+    bool notified = false;
+    for (struct netlink_socket *s = netlink_sockets; s; s = s->next) {
+        if (s->protocol != protocol || !(s->groups & group))
+            continue;
+        notified = true;
+        struct netlink_message *message = NULL;
+        if (s->queued_bytes <= NL_QUEUE_BUDGET - NL_MESSAGE_MAX)
+            message = kernel_malloc(sizeof(*message) + length);
+        if (!message) {
+            s->overrun = true;
+            continue;
+        }
+        *message = (struct netlink_message){.length = length, .groups = group};
+        __builtin_memcpy(message->data, data, length);
+        if (s->tail)
+            s->tail->next = message;
+        else
+            s->head = message;
+        s->tail = message;
+        s->queued_bytes += NL_MESSAGE_MAX;
+    }
+    if (notified)
+        kernel_poll_readiness_notify();
+}
+
+void netlink_uevent_change(const char *devpath, const char *subsystem,
+                         const char *properties, uint32_t length)
+{
+    char payload[512];
+    struct text_stream stream = {.buffer = payload, .capacity = sizeof(payload)};
+    static const char action[] = "\0ACTION=change\0DEVPATH=";
+    static const char system[] = "\0SUBSYSTEM=";
+    text_string(&stream, "change@");
+    text_string(&stream, devpath);
+    text_bytes(&stream, action, sizeof(action) - 1);
+    text_string(&stream, devpath);
+    text_bytes(&stream, system, sizeof(system) - 1);
+    text_string(&stream, subsystem);
+    text_bytes(&stream, "", 1);
+    text_bytes(&stream, properties, length);
+    text_string(&stream, "SEQNUM=");
+    text_unsigned(&stream, ++uevent_seqnum);
+    text_bytes(&stream, "", 1);
+    if (stream.position <= sizeof(payload))
+        nl_multicast(NETLINK_KOBJECT_UEVENT, 1, payload, stream.written);
+}
+EXPORT_SYMBOL(netlink_uevent_change);
 
 /** @brief Compare address identity independently of its mutable flags/lifetime.
  * @param a First snapshot. @param b Second snapshot. @return True for the same address. */
@@ -441,7 +501,8 @@ static void nl_publish(uint32_t group,uint16_t type,const void *value,bool up)
 {
     (void)up;
     bool interested=false;
-    for (struct netlink_socket *s=netlink_sockets;s;s=s->next) if (s->groups & group) { interested=true; break; }
+    for (struct netlink_socket *s=netlink_sockets;s;s=s->next)
+        if (s->protocol == NETLINK_ROUTE && (s->groups & group)) { interested=true; break; }
     if (!interested) return;
     struct netlink_message *message=kernel_malloc(sizeof(*message)+NL_MESSAGE_MAX);
     if (!message) { nl_overrun(group); return; }
@@ -450,17 +511,8 @@ static void nl_publish(uint32_t group,uint16_t type,const void *value,bool up)
            group==RTMGRP_IPV6_ROUTE ? nl_route6(&b,0,value,type,false) :
            nl_link_snapshot(&b,0,false,type,value);
     if (rc) { kernel_free(message); nl_overrun(group); return; }
-    for (struct netlink_socket *s=netlink_sockets;s;s=s->next) {
-        if (!(s->groups & group)) continue;
-        if (s->queued_bytes>NL_QUEUE_BUDGET-NL_MESSAGE_MAX) { s->overrun=true; continue; }
-        struct netlink_message *copy=kernel_malloc(sizeof(*copy)+NL_MESSAGE_MAX);
-        if (!copy) { s->overrun=true; continue; }
-        copy->next=NULL; copy->length=b.used; copy->groups=group;
-        __builtin_memcpy(copy->data,message->data,b.used);
-        if (s->tail) s->tail->next=copy; else s->head=copy;
-        s->tail=copy; s->queued_bytes+=NL_MESSAGE_MAX;
-    }
-    kernel_free(message); kernel_poll_readiness_notify();
+    nl_multicast(NETLINK_ROUTE, group, message->data, b.used);
+    kernel_free(message);
 }
 
 /** @brief Diff owned address, route and link snapshots into multicast events.
@@ -918,6 +970,8 @@ int task_netlink_send(struct task_file *file,const void *data,uint32_t length,ui
 {
     struct netlink_socket *s=nl_socket(file);
     if (!s) return -LINUX_EBADF;
+    if (s->protocol == NETLINK_KOBJECT_UEVENT)
+        return -LINUX_EPERM;
     if (flags & ~(MSG_DONTWAIT|MSG_NOSIGNAL)) return -LINUX_EOPNOTSUPP;
     if (!length || length > NL_MESSAGE_MAX) return -LINUX_EMSGSIZE;
     if (address) {
@@ -1044,6 +1098,12 @@ int task_netlink_recv_staged(struct task_file *file,void *data,uint32_t length,u
                              void *source,uint32_t *source_length)
 { return nl_receive(file,data,length,flags,0,0,source,source_length); }
 
+bool task_netlink_passcred(const struct task_file *file)
+{
+    const struct netlink_socket *s = nl_socket(file);
+    return s && s->passcred;
+}
+
 /** @brief Return current socket readiness under execution ownership.
  * @param file Retained OFD. @param events Requested bits. @return Ready bits or POLLNVAL. */
 short task_netlink_poll(const struct task_file *file,short events)
@@ -1071,10 +1131,10 @@ void task_netlink_release(struct task_file *file)
     struct netlink_socket **link=&netlink_sockets;
     while (*link && *link!=s) link=&(*link)->next;
     if (*link) *link=s->next;
-    if (s->groups) {
+    if (s->protocol == NETLINK_ROUTE && s->groups) {
         bool subscribers=false;
         for (struct netlink_socket *it=netlink_sockets;it;it=it->next)
-            if (it->groups) { subscribers=true; break; }
+            if (it->protocol == NETLINK_ROUTE && it->groups) { subscribers=true; break; }
         if (!subscribers) nl_forget_snapshot();
     }
     while (s->head) { struct netlink_message *m=s->head; s->head=m->next; kernel_free(m); }
@@ -1116,11 +1176,12 @@ int64_t syscall_netlink(uint64_t number,uint64_t a0,uint64_t a1,uint64_t a2,
         if (a0!=AF_NETLINK) return -LINUX_EAFNOSUPPORT;
         if (a1 & ~(uint64_t)(15|SOCK_NONBLOCK|SOCK_CLOEXEC)) return -LINUX_EINVAL;
         if (type!=SOCK_RAW && type!=SOCK_DGRAM) return -LINUX_ESOCKTNOSUPPORT;
-        if (a2!=NETLINK_ROUTE) return -LINUX_EPROTONOSUPPORT;
+        if (a2 != NETLINK_ROUTE && a2 != NETLINK_KOBJECT_UEVENT)
+            return -LINUX_EPROTONOSUPPORT;
         struct netlink_socket *s=kernel_malloc(sizeof(*s)); if (!s) return -LINUX_ENOMEM;
         struct task_file *file; int fd=task_allocate_fd(task,0,&file);
         if (fd<0) { kernel_free(s); return fd; }
-        *s=(struct netlink_socket){.next=netlink_sockets,.type=type}; netlink_sockets=s;
+        *s=(struct netlink_socket){.next=netlink_sockets,.type=type,.protocol=(int)a2}; netlink_sockets=s;
         file->flags=TASK_FILE_FLAG_SOCKET|TASK_FILE_FLAG_SOCKET_INET|RELIEFOS_O_RDWR|
                     ((a1&SOCK_NONBLOCK) ? RELIEFOS_O_NONBLOCK : 0);
         file->fd_flags=(a1&SOCK_CLOEXEC) ? RELIEFOS_FD_CLOEXEC : 0;
@@ -1166,15 +1227,27 @@ int64_t syscall_netlink(uint64_t number,uint64_t a0,uint64_t a1,uint64_t a2,
             uint32_t group; int rc=socket_user_import(task,a3,&group,sizeof(group)); if (rc) return rc;
             if (!group || group>32) return -LINUX_EINVAL;
             uint32_t mask=1u<<(group-1);
-            if (!(mask & NL_SUPPORTED_GROUPS)) return -LINUX_EOPNOTSUPP;
+            if (!(mask & (s->protocol == NETLINK_ROUTE ? NL_SUPPORTED_GROUPS : 1u)))
+                return -LINUX_EOPNOTSUPP;
             return nl_set_groups(s,a2==NETLINK_ADD_MEMBERSHIP ? s->groups|mask : s->groups&~mask);
         }
         if (a1!=SOL_SOCKET) return -LINUX_ENOPROTOOPT;
-        if (number==__NR_setsockopt) return -LINUX_ENOPROTOOPT;
+        if (number == __NR_setsockopt) {
+            if (a2 != SO_PASSCRED || s->protocol != NETLINK_KOBJECT_UEVENT)
+                return -LINUX_ENOPROTOOPT;
+            if (a4 < sizeof(int))
+                return -LINUX_EINVAL;
+            int enable;
+            int ret = socket_user_import(task, a3, &enable, sizeof(enable));
+            if (!ret)
+                s->passcred = enable != 0;
+            return ret;
+        }
         int value;
         if (a2==SO_TYPE) value=s->type;
         else if (a2==SO_DOMAIN) value=AF_NETLINK;
-        else if (a2==SO_PROTOCOL) value=0;
+        else if (a2==SO_PROTOCOL) value=s->protocol;
+        else if (a2==SO_PASSCRED && s->protocol == NETLINK_KOBJECT_UEVENT) value=s->passcred;
         else if (a2==SO_ERROR) value=s->overrun ? LINUX_ENOBUFS : 0;
         else return -LINUX_ENOPROTOOPT;
         uint32_t cap; int rc=socket_user_length(task,a4,&cap); if (rc) return rc;

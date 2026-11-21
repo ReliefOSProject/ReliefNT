@@ -1,2 +1,2 @@
 # SPDX-License-Identifier: Apache-2.0
-drm-virtio-y := device.o command.o resource.o context.o sync.o ioctl.o kms.o kms_query.o kms_fb.o cursor.o events.o console.o panic.o
+drm-virtio-y := driver.o device.o command.o resource.o context.o ioctl.o kms.o kms_query.o kms_fb.o cursor.o events.o console.o panic.o

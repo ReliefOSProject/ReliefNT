@@ -690,6 +690,47 @@ static int task_page_fault_detailed(struct task *task, uint64_t fault_addr, uint
     }
 
     {
+        struct task_vma *vma = task_vma_containing(task, page, page + PAGE_SIZE);
+        struct device_mapping *mapping = vma ? vma->device_mapping : NULL;
+        if (mapping && device_mapping_info(mapping)->access) {
+            if (vma->prot == LINUX_PROT_NONE || (error & 16) ||
+                ((error & 2) && !(vma->prot & LINUX_PROT_WRITE)))
+                return 0;
+            uint64_t offset = vma->device_map_offset + page - vma->start;
+            /* A later mprotect must not grant an untracked writable alias. */
+            bool writable = vma->max_prot & LINUX_PROT_WRITE;
+            int ret = device_mapping_prepare_cpu(mapping, offset, writable);
+            if (ret) {
+                task->page_fault_signal = LINUX_SIGBUS;
+                return 0;
+            }
+            uint64_t page_flags = RELIEFNT_PAGE_DEVICE | RELIEFNT_PAGE_SHARED | RELIEFNT_PAGE_NOEXEC;
+            if (vma->prot & LINUX_PROT_WRITE)
+                page_flags |= RELIEFNT_PAGE_WRITABLE;
+            /* Prefault a short run from the same backing after one prepare. */
+            uint64_t end = page + 16 * PAGE_SIZE;
+            if (end > vma->end)
+                end = vma->end;
+            struct address_space *as = sched_task_as(task);
+            for (uint64_t va = page; va < end; va += PAGE_SIZE, offset += PAGE_SIZE) {
+                if (address_space_user_page_phys(as, va))
+                    break;
+                uint64_t phys = device_mapping_physical(mapping, offset), cache;
+                ret = phys ? device_mapping_cache_page(mapping, offset, phys, &cache) : -RELIEFOS_EFAULT;
+                if (ret || !address_space_map_user_page(as, va, phys, page_flags | cache)) {
+                    if (va != page)
+                        break;
+                    if (!ret || ret == -RELIEFOS_ENOMEM)
+                        return -RELIEFOS_ENOMEM;
+                    task->page_fault_signal = LINUX_SIGBUS;
+                    return 0;
+                }
+            }
+            return 1;
+        }
+    }
+
+    {
         struct task_vma *shared = task_vma_containing(task, page, page + PAGE_SIZE);
         if (shared && (shared->flags & TASK_VMA_FLAG_SYSV_SHM)) {
             if (shared->prot == LINUX_PROT_NONE ||
