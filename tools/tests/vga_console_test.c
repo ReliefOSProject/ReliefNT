@@ -80,5 +80,16 @@ int main(void)
     assert(!memcmp(unchanged,pixels,sizeof(pixels)));
     vga_console_panic_begin(); vga_console_panic_write("PANIC\n",6,12);
     assert(panic_enters==1 && aperture[0]==0x0c50);
+    /* A legacy machine without a framebuffer needs the same full terminal,
+     * not the early-boot character sink that discards cursor/edit commands. */
+    console_vga_text_mode = false;
+    display.available = false;
+    vga_console_configure(NULL, false);
+    assert(!console_vga_text_mode && inits == 2);
+    vga_console_configure(NULL, true);
+    assert(console_vga_text_mode && inits == 3);
+    console_vt_activate(1, false);
+    console_vt_write(1, "\033cABCDE\033[3D\033[@X", 15);
+    assert((aperture[2] & 255) == 'X' && (aperture[3] & 255) == 'C');
     puts("PASS VGA dispatch: explicit parameter, boot output, six independent VTs, hidden output, query routing, graphics restore/failure isolation and panic");
 }

@@ -126,16 +126,16 @@ static int64_t syscall_poll_impl_core(struct task *task, struct pollfd *fds,
                        task_device_is(file, STORAGE_DEV_KIND_CONSOLE)) {
                 uint32_t terminal = task_device_is(file, STORAGE_DEV_KIND_CONSOLE)
                     ? (uint32_t)file->aux : task->pty_id;
-                if ((events & POLLIN) && pty_input_available(terminal)) revents |= POLLIN;
-                if (pty_is_hungup(terminal)) {
-                    revents |= POLLHUP;
-                }
+                revents |= pty_poll_endpoint(terminal, false) &
+                    (events | POLLHUP | POLLERR);
             } else if (events & POLLIN) {
                 revents |= POLLIN;
             }
             if ((events & POLLOUT) && file_can_write(file) &&
                 !task_device_is(file, STORAGE_DEV_KIND_KEYBOARD) &&
                 !task_device_is(file, STORAGE_DEV_KIND_MOUSE) &&
+                !task_device_is(file, STORAGE_DEV_KIND_TTY) &&
+                !task_device_is(file, STORAGE_DEV_KIND_CONSOLE) &&
                 !task_device_is(file, STORAGE_DEV_KIND_AUDIO) &&
                 !(file->node.flags & (STORAGE_NODE_FLAG_AUDIO_CONTROL |
                                       STORAGE_NODE_FLAG_AUDIO_MIXER))) {
@@ -153,12 +153,12 @@ static int64_t syscall_poll_impl_core(struct task *task, struct pollfd *fds,
             }
         } else if (fd >= 0 && fd <= 2 && task_pty_stream_for_fd(task, fd) >= 0) {
             if (fd == 0) {
-                if (pty_input_available(task->pty_id)) revents |= POLLIN;
+                if (pty_input_ready(task->pty_id)) revents |= POLLIN;
                 if (pty_is_hungup(task->pty_id)) revents |= POLLHUP;
             } else if (pty_is_hungup(task->pty_id)) {
                 revents |= POLLHUP;
             } else if (events & POLLOUT) {
-                revents |= POLLOUT;
+                revents |= pty_poll_endpoint(task->pty_id, false) & POLLOUT;
             }
         } else if (!task_pty_fd_for_fd(task, fd)) {
             revents |= POLLNVAL;

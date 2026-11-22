@@ -108,12 +108,51 @@ static int open6(void)
     return request.socket;
 }
 
+/* Old Netty leaves sin6_scope_id unset for unscoped addresses. Linux ignores
+ * that field rather than interpreting the leftover bytes as an interface. */
+static void test_bind_scope(void)
+{
+    static const struct in6_addr addresses[] = {
+        {0},
+        {.s6_addr={0,0,0,0,0,0,0,0,0,0,255,255,0,0,0,0}},
+        {.s6_addr={0,0,0,0,0,0,0,0,0,0,255,255,127,0,0,1}},
+        {.s6_addr={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1}},
+    };
+    for (unsigned i = 0; i < sizeof(addresses) / sizeof(addresses[0]); ++i) {
+        int listener = open6();
+        uint32_t device = 1;
+        assert(!net_socket_bound_device(listener,true,&device));
+        struct sockaddr_in6 address = {.sin6_family=AF_INET6,
+            .sin6_addr=addresses[i],.sin6_scope_id=0xa5a5a5a5u};
+        int result = net_socket_bind6_fd(listener,&address);
+        printf("TCP unscoped bind case %u: %d\n",i,result);
+        fflush(stdout);
+        assert(!result);
+        struct sockaddr_in6 bound;
+        assert(!net_socket_address6(listener,false,&bound) && !bound.sin6_scope_id);
+        assert(!net_socket_bound_device(listener,false,&device) && device == 1);
+        assert(!net_socket_listen_fd(listener,1));
+    }
+    int listener = open6();
+    struct sockaddr_in6 address = {.sin6_family=AF_INET6,
+        .sin6_addr={.s6_addr={0xfe,0x80,0,0,0,0,0,0,0,0,0,0,0,0,0,1}},
+        .sin6_scope_id=0xa5a5a5a5u};
+    assert(net_socket_bind6_fd(listener,&address) == -LINUX_ENODEV);
+    address.sin6_scope_id=0;
+    assert(net_socket_bind6_fd(listener,&address) == -LINUX_EINVAL);
+    address.sin6_addr=loop6;
+    assert(!net_socket_bind6_fd(listener,&address));
+}
+
 int main(void)
 {
     current.cap_effective = 1ULL << CAP_NET_BIND_SERVICE;
+    test_bind_scope();
     int listener = open6(), client = open6();
     struct sockaddr_in6 addr = {.sin6_family=AF_INET6,.sin6_port=__builtin_bswap16(55010),.sin6_addr=loop6};
-    assert(!net_socket_bind6_fd(listener,&addr));
+    struct sockaddr_in6 bind_address = addr;
+    bind_address.sin6_scope_id = 0xa5a5a5a5u;
+    assert(!net_socket_bind6_fd(listener,&bind_address));
     assert(!net_socket_listen_fd(listener,4));
     assert(net_socket_connect6_fd(client,&addr,true) == -LINUX_EINPROGRESS);
     net_poll_packets();
@@ -132,7 +171,8 @@ int main(void)
     assert(!net_socket_recv(&io,0) && io.transferred == 5 && !memcmp(bytes,"hello",5));
     assert(net_socket_poll_fd(child,0,POLLIN) & POLLIN);
     int dual = open6(), mapped_client = open6();
-    struct sockaddr_in6 any = {.sin6_family=AF_INET6,.sin6_port=__builtin_bswap16(55011)};
+    struct sockaddr_in6 any = {.sin6_family=AF_INET6,.sin6_port=__builtin_bswap16(55011),
+        .sin6_scope_id=0xa5a5a5a5u};
     assert(!net_socket_bind6_fd(dual,&any) && !net_socket_listen_fd(dual,4));
     struct sockaddr_in6 mapped = {.sin6_family=AF_INET6,.sin6_port=any.sin6_port,
         .sin6_addr={.s6_addr={0,0,0,0,0,0,0,0,0,0,255,255,127,0,0,1}}};

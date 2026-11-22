@@ -112,6 +112,7 @@ int file_can_read(const struct task_file *file) { (void)file; return 1; }
 int file_can_write(const struct task_file *file) { (void)file; return 1; }
 int pty_is_hungup(uint32_t pty_id) { (void)pty_id; return 0; }
 uint32_t pty_input_available(uint32_t pty_id) { (void)pty_id; return 0; }
+bool pty_input_ready(uint32_t pty_id) { (void)pty_id; return false; }
 short pty_poll_endpoint(uint32_t pty_id, bool master)
 { (void)pty_id; (void)master; return POLLOUT | POLLWRNORM; }
 

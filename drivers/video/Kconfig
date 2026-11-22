@@ -22,6 +22,7 @@ config DRM_VIRTIO_GPU
 config DRM_VMWARE_SVGA
     bool "VMware SVGA II DRM/KMS (experimental)"
     depends on DRM
+    default y
     help
       Support the VMware SVGA II PCI graphics adapter. The driver is included
       in drm.ko when DRM is modular. A supported VirtIO-GPU takes priority

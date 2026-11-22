@@ -57,7 +57,7 @@ int task_device_read(struct task *task, struct task_file *file,
         if (!terminal || !pty_is_active(terminal)) return -RELIEFOS_ENODEV;
         int64_t change = pty_check_change(terminal, task->pid, 21);
         if (change) return (int)change;
-        if ((file->flags & RELIEFOS_O_NONBLOCK) && !pty_input_available(terminal) &&
+        if ((file->flags & RELIEFOS_O_NONBLOCK) && !pty_input_ready(terminal) &&
             !pty_is_hungup(terminal)) return -RELIEFOS_EAGAIN;
         return (int)pty_read_input(terminal, (char *)buffer, length);
     }

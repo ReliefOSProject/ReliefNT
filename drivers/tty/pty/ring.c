@@ -3,7 +3,7 @@
 
 
 /**
- * @brief Append length bytes into the ring, overwriting the oldest when full; returns bytes written.
+ * @brief Append a prefix that fits, retaining unread bytes when the ring is full.
  */
 uint32_t ring_push(uint8_t *ring, uint32_t cap, uint32_t *head, uint32_t *tail,
                           const char *buffer, uint32_t length)
@@ -12,7 +12,7 @@ uint32_t ring_push(uint8_t *ring, uint32_t cap, uint32_t *head, uint32_t *tail,
     for (uint32_t i = 0; i < length; ++i) {
         uint32_t next = (*head + 1) % cap;
         if (next == *tail) {
-            *tail = (*tail + 1) % cap;
+            break;
         }
         ring[*head] = (uint8_t)buffer[i];
         *head = next;

@@ -181,6 +181,7 @@ struct task_file *task_descriptor_for_fd(struct task *task, int fd)
 uint32_t pty_vt_number(uint32_t pty_id) { (void)pty_id; return 1; }
 int pty_is_hungup(uint32_t pty_id) { (void)pty_id; return 0; }
 uint32_t pty_input_available(uint32_t pty_id) { (void)pty_id; return 0; }
+bool pty_input_ready(uint32_t pty_id) { (void)pty_id; return false; }
 short pty_poll_endpoint(uint32_t pty_id, bool master)
 { (void)pty_id; (void)master; return POLLOUT | POLLWRNORM; }
 short task_signalfd_poll(struct task *task, const struct task_file *file)

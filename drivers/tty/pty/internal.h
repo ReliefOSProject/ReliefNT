@@ -40,11 +40,16 @@ struct pty_session {
     uint32_t transfer_refs;
     uint32_t transfer_masters;
     uint8_t input[PTY_INPUT_CAP];
+    /* Per-slot canonical line ends; EOF is a delimiter, never a returned byte. */
+    uint8_t input_end[PTY_INPUT_CAP];
     uint32_t input_head;
     uint32_t input_tail;
     /* ICANON input is kept separate until a line delimiter arrives. */
     uint8_t canonical_input[PTY_INPUT_CAP];
+    /* Echo cell widths; bit 7 identifies a tab erased by cursor motion. */
+    uint8_t canonical_width[PTY_INPUT_CAP];
     uint32_t canonical_length;
+    bool literal_next;
     uint8_t output[PTY_OUTPUT_CAP];
     uint32_t output_head;
     uint32_t output_tail;
@@ -131,7 +136,7 @@ int pty_inode_permissions(const struct storage_node *node,
                            struct reliefos_permissions *value, bool write);
 
 /**
- * @brief Append length bytes into the ring, overwriting the oldest when full; returns bytes written.
+ * @brief Append the prefix that fits without overwriting unread bytes.
  */
 uint32_t ring_push(uint8_t *ring, uint32_t cap, uint32_t *head, uint32_t *tail,
                           const char *buffer, uint32_t length);

@@ -67,3 +67,28 @@ void framebuffer_codepoint_to(const struct framebuffer *target,
     framebuffer_draw_glyph_to(target, x, y, cjk_glyphs[index].bits,
                               cjk_glyphs[index].width, fg, bg);
 }
+
+/** @brief Thicken the bitmap without drawing a shifted opaque background or
+ * crossing into an adjacent cell. Both fonts have at most two 8-pixel columns.
+ */
+void framebuffer_codepoint_bold_to(const struct framebuffer *target, uint32_t x,
+                                    uint32_t y, uint32_t cp, uint32_t fg, uint32_t bg)
+{
+    uint32_t columns = 1;
+    const uint8_t *bits;
+    if (cp < 128) bits = reliefos_psf_glyph((char)cp);
+    else {
+        unsigned index = framebuffer_glyph_index(cp);
+        bits = cjk_glyphs[index].bits;
+        columns = cjk_glyphs[index].width;
+    }
+    if (!columns || columns > 2) return;
+    uint8_t bold[RELIEFOS_FONT_H * 2];
+    for (uint32_t row = 0; row < RELIEFOS_FONT_H; ++row)
+        for (uint32_t col = 0; col < columns; ++col) {
+            uint32_t at = row * columns + col;
+            bold[at] = bits[at] | (bits[at] >> 1) |
+                       (col ? bits[at - 1] << 7 : 0);
+        }
+    framebuffer_draw_glyph_to(target, x, y, bold, columns, fg, bg);
+}

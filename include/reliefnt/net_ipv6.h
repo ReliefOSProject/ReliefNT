@@ -12,6 +12,17 @@ struct text_stream;
 #define NET_IPV6_ADDR_PERMANENT 0x80u
 #define NET_IPV6_ADDR_NODAD 0x02u
 
+/** @brief Test whether Linux bind uses an address's interface scope ID.
+ * @param address Borrowed network-order IPv6 address.
+ * @return True for link-local unicast and interface/link-local multicast.
+ * Pure classification; no mutable state or ownership transfer. */
+static inline bool net_ipv6_needs_scope_id(const struct in6_addr *address)
+{
+    const uint8_t *bytes = address->s6_addr;
+    return (bytes[0] == 0xfe && (bytes[1] & 0xc0) == 0x80) ||
+           (bytes[0] == 0xff && ((bytes[1] & 0x0f) == 1 || (bytes[1] & 0x0f) == 2));
+}
+
 /* Network byte-order addresses; deadlines are uptime milliseconds, UINT64_MAX is infinite.
  * All APIs below require existing kernel execution ownership, never raw IRQ context.
  * Snapshots are copies and do not transfer references or expose internal pointers. */

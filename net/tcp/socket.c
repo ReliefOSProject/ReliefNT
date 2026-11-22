@@ -1359,8 +1359,9 @@ int net_socket_bind6_fd(int32_t handle, const struct sockaddr_in6 *address)
     struct net_socket *s = net_socket_find(handle, 0, 1);
     if (!s) return -LINUX_EBADF;
     if (!address || s->bound || s->state != RELIEFOS_NET_TCP_CLOSED) return -LINUX_EINVAL;
-    if (address->sin6_scope_id && !net_interface_exists(address->sin6_scope_id)) return -LINUX_ENODEV;
-    if (address->sin6_scope_id && s->bound_ifindex && address->sin6_scope_id != s->bound_ifindex)
+    uint32_t scope = net_ipv6_needs_scope_id(&address->sin6_addr) ? address->sin6_scope_id : 0;
+    if (scope && !net_interface_exists(scope)) return -LINUX_ENODEV;
+    if (scope && s->bound_ifindex && scope != s->bound_ifindex)
         return -LINUX_EINVAL;
     bool mapped = tcp6_mapped(&address->sin6_addr);
     if (mapped && s->ipv6 && s->v6only) return -LINUX_EINVAL;
@@ -1371,16 +1372,16 @@ int net_socket_bind6_fd(int32_t handle, const struct sockaddr_in6 *address)
         if (ip && !net_interface_for_ipv4(ip)) return -LINUX_EADDRNOTAVAIL;
     } else if (!tcp6_any(&address->sin6_addr)) {
         if (!s->ipv6) return -LINUX_EAFNOSUPPORT;
-        if (address->sin6_addr.s6_addr[0] == 0xfe && (address->sin6_addr.s6_addr[1] & 0xc0) == 0x80 && !address->sin6_scope_id)
+        if (address->sin6_addr.s6_addr[0] == 0xfe && (address->sin6_addr.s6_addr[1] & 0xc0) == 0x80 && !scope)
             return -LINUX_EINVAL;
         struct net_ipv6_address entries[32]; uint32_t count = net_ipv6_addresses(entries, 32); bool found = false;
         for (uint32_t i = 0; i < count && i < 32; ++i)
             if (!__builtin_memcmp(&entries[i].address, &address->sin6_addr, sizeof(address->sin6_addr)) &&
                 !(entries[i].flags & (NET_IPV6_ADDR_TENTATIVE | NET_IPV6_ADDR_DADFAILED)) &&
-                (!address->sin6_scope_id || entries[i].ifindex == address->sin6_scope_id)) found = true;
+                (!scope || entries[i].ifindex == scope)) found = true;
         if (!found) return -LINUX_EADDRNOTAVAIL;
     }
-    s->local6 = address->sin6_addr; s->scope6 = address->sin6_scope_id;
+    s->local6 = address->sin6_addr; s->scope6 = scope;
     int ret = tcp_bind_port(s, ip, __builtin_bswap16(address->sin6_port));
     if (ret < 0) { s->local6 = (struct in6_addr){0}; s->scope6 = 0; }
     return ret;

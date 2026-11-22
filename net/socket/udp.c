@@ -294,11 +294,12 @@ static int udp6_bind(struct udp_socket *s, const struct sockaddr_in6 *address)
 {
     if (s->bound) return -LINUX_EINVAL;
     const struct in6_addr *ip = &address->sin6_addr;
+    uint32_t scope = net_ipv6_needs_scope_id(ip) ? address->sin6_scope_id : 0;
     if (udp6_mapped(ip) && s->v6only) return -LINUX_EINVAL;
-    if (address->sin6_scope_id && !net_interface_exists(address->sin6_scope_id)) return -LINUX_ENODEV;
-    if (address->sin6_scope_id && s->ifindex && address->sin6_scope_id != (uint32_t)s->ifindex)
+    if (scope && !net_interface_exists(scope)) return -LINUX_ENODEV;
+    if (scope && s->ifindex && scope != (uint32_t)s->ifindex)
         return -LINUX_EINVAL;
-    if (ip->s6_addr[0] == 0xfe && (ip->s6_addr[1] & 0xc0) == 0x80 && !address->sin6_scope_id)
+    if (ip->s6_addr[0] == 0xfe && (ip->s6_addr[1] & 0xc0) == 0x80 && !scope)
         return -LINUX_EINVAL;
     if (!udp6_any(ip) && !udp6_mapped(ip) && ip->s6_addr[0] != 0xff) {
         struct net_ipv6_address entries[32];
@@ -307,11 +308,11 @@ static int udp6_bind(struct udp_socket *s, const struct sockaddr_in6 *address)
         for (uint32_t i = 0; i < count && i < 32; ++i)
             if (!__builtin_memcmp(&entries[i].address, ip, sizeof(*ip)) &&
                 !(entries[i].flags & (NET_IPV6_ADDR_TENTATIVE | NET_IPV6_ADDR_DADFAILED)) &&
-                (!address->sin6_scope_id || entries[i].ifindex == address->sin6_scope_id)) found = true;
+                (!scope || entries[i].ifindex == scope)) found = true;
         if (!found) return -LINUX_EADDRNOTAVAIL;
     }
     s->local6 = *ip;
-    s->scope6 = address->sin6_scope_id;
+    s->scope6 = scope;
     int ret = bind_port(s, udp6_mapped(ip) ? udp6_unmap(ip) : 0, swap16(address->sin6_port));
     if (ret < 0) { s->local6 = (struct in6_addr){0}; s->scope6 = 0; }
     return ret;

@@ -99,6 +99,51 @@ static int bind6(int fd, bool wildcard, struct sockaddr_in6 *address)
     return 0;
 }
 
+/** @brief Check Linux's treatment of scope IDs left in unscoped bind addresses.
+ * @return Zero or minus one. Uses only standard socket calls on either kernel. */
+static int check_bind_scope(void)
+{
+    static const char *addresses[] = {"::", "::ffff:0.0.0.0", "::ffff:127.0.0.1", "::1"};
+    static const int types[] = {SOCK_STREAM, SOCK_DGRAM};
+    for (unsigned type = 0; type < sizeof(types) / sizeof(types[0]); ++type) {
+        for (unsigned i = 0; i < sizeof(addresses) / sizeof(addresses[0]); ++i) {
+            int fd = socket(AF_INET6, types[type], 0);
+            if (fd < 0) return fail("bind-scope socket");
+            struct sockaddr_in6 address = {.sin6_family=AF_INET6,.sin6_scope_id=0xa5a5a5a5u};
+            if (inet_pton(AF_INET6,addresses[i],&address.sin6_addr) != 1 ||
+                bind(fd,(struct sockaddr *)&address,sizeof(address)) < 0) {
+                fail("unscoped bind ignores invalid interface"); close(fd); return -1;
+            }
+            socklen_t length = sizeof(address);
+            if (getsockname(fd,(struct sockaddr *)&address,&length) < 0 ||
+                length != sizeof(address) || address.sin6_scope_id || !address.sin6_port ||
+                (types[type] == SOCK_STREAM && listen(fd,1) < 0)) {
+                if (!errno) errno=EPROTO;
+                fail("unscoped bind address/listen"); close(fd); return -1;
+            }
+            close(fd);
+        }
+        int fd = socket(AF_INET6,types[type],0);
+        if (fd < 0) return fail("scoped bind socket");
+        struct sockaddr_in6 address = {.sin6_family=AF_INET6,.sin6_scope_id=0xa5a5a5a5u};
+        if (inet_pton(AF_INET6,"fe80::1",&address.sin6_addr) != 1 ||
+            bind(fd,(struct sockaddr *)&address,sizeof(address)) != -1 || errno != ENODEV) {
+            errno=EPROTO; fail("link-local bind rejects invalid interface"); close(fd); return -1;
+        }
+        /* Linux may retain a device selection after a failed scoped bind. */
+        close(fd);
+        fd = socket(AF_INET6,types[type],0);
+        if (fd < 0) return fail("missing-scope socket");
+        address.sin6_scope_id=0;
+        if (bind(fd,(struct sockaddr *)&address,sizeof(address)) != -1 || errno != EINVAL) {
+            errno=EPROTO; fail("link-local bind requires scope"); close(fd); return -1;
+        }
+        close(fd);
+    }
+    puts("PASS TCP/UDP bind ignores unscoped IDs and validates link-local interfaces");
+    return 0;
+}
+
 /** @brief Confirm getifaddrs exposes the actual IPv6 loopback address.
  * @return Zero or minus one. */
 static int check_interfaces(void)
@@ -374,7 +419,8 @@ static void timeout_exit(int signum)
 {
     static const char text[]="FAIL probe timeout\n";
     (void)signum;
-    (void)write(STDERR_FILENO,text,sizeof(text)-1);
+    ssize_t ignored=write(STDERR_FILENO,text,sizeof(text)-1);
+    (void)ignored;
     _exit(124);
 }
 
@@ -384,14 +430,18 @@ int main(int argc,char **argv)
 {
     signal(SIGPIPE,SIG_IGN);
     signal(SIGALRM,timeout_exit);
+    if (argc==2 && !strcmp(argv[1],"--bind-scope")) {
+        alarm(30);
+        return check_bind_scope() ? 1 : 0;
+    }
     if (argc==2 && !strcmp(argv[1],"--loopback")) {
         alarm(30);
-        return check_interfaces() || check_udp() || check_tcp() || check_mapped() || check_raw() ? 1 : 0;
+        return check_bind_scope() || check_interfaces() || check_udp() || check_tcp() || check_mapped() || check_raw() ? 1 : 0;
     }
     if (argc==4 && !strcmp(argv[1],"--network")) {
         alarm(25);
         return check_network(argv[2],argv[3]) ? 1 : 0;
     }
-    fprintf(stderr,"usage: %s --loopback | --network NUMERIC_IPV6 PORT\n",argv[0]);
+    fprintf(stderr,"usage: %s --bind-scope | --loopback | --network NUMERIC_IPV6 PORT\n",argv[0]);
     return 2;
 }

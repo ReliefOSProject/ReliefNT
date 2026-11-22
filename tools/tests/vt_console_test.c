@@ -15,7 +15,7 @@ static uint32_t presented[4];
 static uint32_t last_codepoint;
 static char serial_output[16384];
 static size_t serial_length;
-static const struct framebuffer display = {
+static struct framebuffer display = {
     .pixels = pixels, .width = 80, .height = 48, .pitch = 80 * 4,
     .bpp = 32, .bytes_per_pixel = 4, .available = true,
 };
@@ -53,6 +53,9 @@ void framebuffer_codepoint(uint32_t x, uint32_t y, uint32_t c, uint32_t fg, uint
 void framebuffer_codepoint_to(const struct framebuffer *target, uint32_t x, uint32_t y,
                               uint32_t c, uint32_t fg, uint32_t bg)
 { last_codepoint = c; framebuffer_rect_to(target, x, y, 8 * framebuffer_codepoint_width(c), 16, c == ' ' ? bg : fg); }
+void framebuffer_codepoint_bold_to(const struct framebuffer *target, uint32_t x, uint32_t y,
+                                   uint32_t c, uint32_t fg, uint32_t bg)
+{ framebuffer_codepoint_to(target, x, y, c, fg, bg); }
 void serial_write(const char *text)
 {
     size_t length = strlen(text);
@@ -148,7 +151,7 @@ static void test_text_damage(void)
     console_vt_write(2, "\xe4\xb8\xad", 3);
     expect_damage(0, 0, 16, 16);
     console_vt_write(2, "\033[1mB", sizeof("\033[1mB") - 1);
-    expect_damage(16, 0, 9, 16);
+    expect_damage(16, 0, 8, 16);
     console_vt_write(2, "\033[3;10HC", sizeof("\033[3;10HC") - 1);
     expect_damage(72, 32, 8, 16);
     uint32_t top[80 * 16];
@@ -160,6 +163,14 @@ static void test_text_damage(void)
     for (unsigned i = 80 * 16; i < 80 * 48; ++i)
         assert(pixels[i] == 0x006fc77au);
     console_vt_write(2, "\033[1;3r\033[0m", sizeof("\033[1;3r\033[0m") - 1);
+    console_vt_write(2, "\033[Habcdefg\033[3G", sizeof("\033[Habcdefg\033[3G") - 1);
+    text_present_count = 0;
+    console_vt_write(2, "\033[2@", sizeof("\033[2@") - 1);
+    expect_damage(16, 0, 64, 16);
+    console_vt_write(2, "\033[P", sizeof("\033[P") - 1);
+    expect_damage(16, 0, 64, 16);
+    console_vt_write(2, "\033[2X", sizeof("\033[2X") - 1);
+    expect_damage(16, 0, 16, 16);
 }
 
 int main(void)
@@ -180,7 +191,7 @@ int main(void)
     assert(full_clear_count == boot_clear_count);
     assert(vt_text[0].length == boot_history_length + 5u);
     assert(memcmp(vt_text[0].bytes + boot_history_length, "init\n", 5) == 0);
-    static const char openrc_output[] = "\033[1;32mOpenRC\033[0m starting\n";
+    static const char openrc_output[] = "\033[1;32mOpenRC\033[0m starting\r\n";
     size_t before_openrc = vt_text[0].length;
     uint32_t before_openrc_present = text_present_count;
     console_vt_write(1, openrc_output, sizeof(openrc_output) - 1u);

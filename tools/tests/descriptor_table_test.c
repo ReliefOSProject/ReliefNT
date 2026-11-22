@@ -491,6 +491,7 @@ int pty_is_hungup(uint32_t pty_id) { (void)pty_id; return 0; }
 static uint32_t descriptor_pty_input_available;
 uint32_t pty_input_available(uint32_t pty_id)
 { return pty_id == 7 ? descriptor_pty_input_available : 0; }
+bool pty_input_ready(uint32_t pty_id) { return pty_input_available(pty_id) != 0; }
 short pty_poll_endpoint(uint32_t pty_id, bool master)
 {
     short ready = POLLOUT | POLLWRNORM;

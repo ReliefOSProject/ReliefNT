@@ -5,7 +5,7 @@
 /** @brief Parse exact console= tokens; an absent option leaves VGA disabled.
  * @param cmdline Nullable boot command line. @return True for last console=vga. */
 bool vga_console_requested(const char *cmdline);
-/** @brief Configure the opt-in hardware backend and replay retained boot output.
+/** @brief Configure a requested VGA terminal or the legacy no-framebuffer fallback.
  * @param cmdline Nullable command line. @param legacy_boot Non-EFI handoff.
  * BSP initialization only; unsupported devices retain the original backend. */
 void vga_console_configure(const char *cmdline, bool legacy_boot);
