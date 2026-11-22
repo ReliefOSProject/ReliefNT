@@ -308,7 +308,7 @@ int64_t syscall_io_read_iter(uint64_t a0, uint64_t a1, uint64_t a2, enum pty_rea
                                        (char *)(uintptr_t)a1, request, phase);
             }
             if ((task_pty_status(endpoint) & RELIEFOS_O_NONBLOCK) &&
-                !pty_input_available(endpoint->pty_id) &&
+                !pty_input_ready(endpoint->pty_id) &&
                 !pty_is_hungup(endpoint->pty_id)) {
                 int64_t change = pty_check_change(endpoint->pty_id, task->pid, 21);
                 return change ? change : -RELIEFOS_EAGAIN;

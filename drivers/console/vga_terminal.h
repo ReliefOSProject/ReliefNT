@@ -63,4 +63,5 @@ void vga_terminal_csi(struct vga_terminal *t, uint8_t command);
 /** @brief Set one active screen to initial state.
  * @param p Page to clear and reset. */
 void vga_terminal_page_reset(struct vga_page *p);
+void vga_terminal_restore_cursor(struct vga_page *p);
 #endif

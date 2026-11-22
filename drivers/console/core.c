@@ -63,6 +63,9 @@ bool fb_console_underline;
 
 bool fb_console_reverse;
 
+bool fb_console_insert_mode;
+struct fb_terminal_modes fb_modes;
+
 uint32_t fb_console_underline_color;
 
 bool fb_console_underline_color_set;
@@ -115,7 +118,8 @@ void console_emit_raw(char ch)
         vga_putc(ch);
     }
     if (!console_service_logs_only) {
-        fb_console_putc(ch);
+        if (ch == '\n') fb_console_newline();
+        else fb_console_putc(ch);
     }
     console_line_start = ch == '\n';
 }
@@ -203,7 +207,9 @@ void console_enable_framebuffer(void)
     fb_console_initialize_fullscreen();
     fb_console_clear_log();
     for (size_t i = console_log_replay_start(); i < log_len; ++i) {
-        fb_console_ansi_feed(log_buffer[(log_start + i) % CONSOLE_LOG_CAP]);
+        char ch = log_buffer[(log_start + i) % CONSOLE_LOG_CAP];
+        if (ch == '\n') fb_console_ansi_feed('\r');
+        fb_console_ansi_feed(ch);
     }
     console_present();
 }

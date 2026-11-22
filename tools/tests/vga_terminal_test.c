@@ -8,8 +8,31 @@ static void feed(const char *s) { while (*s) vga_terminal_feed(&t, (unsigned cha
 static unsigned ch(unsigned x, unsigned y) { return t.page[t.alternate].cells[y * 80 + x] & 255; }
 static unsigned attr(unsigned x, unsigned y) { return t.page[t.alternate].cells[y * 80 + x] >> 8; }
 
+static void test_boundary_regressions(void)
+{
+    vga_terminal_reset(&t);
+    feed("\033[1;80HX\033[?6hY");
+    assert(ch(0,0) == 'Y' && ch(0,1) == ' ' && !t.page[0].pending_wrap);
+    feed("\033[5;5H\033[?1048h\033[1;80HX\033[?1048lY");
+    assert(ch(4,4) == 'Y' && ch(0,5) == ' ');
+    feed("\033c\033[?6h\0337\033[10;20r\0338\033[6n");
+    assert(t.page[0].cursor.y == 9 && t.reply_length == 6 && !memcmp(t.reply, "\033[1;1R", 6));
+    t.reply_length = 0;
+    feed("\033c\033[38:2:1:255:0:0mR");
+    assert(ch(0,0) == 'R' && attr(0,0) == 4);
+    feed("\033c\033%GA\033[6 nB\033[3 !qC");
+    assert(ch(0,0) == 'A' && ch(1,0) == 'B' && ch(2,0) == 'C');
+    assert(t.reply_length == 0 && t.cursor_style == 0);
+    feed("\033[3J");
+    for (unsigned i = 0; i < VGA_TEXT_CELLS; ++i) assert((t.page[0].cells[i] & 255) == ' ');
+    feed("\033[HABCDEFG\033[5D\033[4hXY\033[4l\033[2P");
+    assert(ch(0,0)=='A' && ch(2,0)=='X' && ch(3,0)=='Y' && ch(4,0)=='E' && ch(6,0)=='G');
+    puts("PASS VGA origin/restore at pending wrap, colon RGB colors, reset suffixes and malformed CSI");
+}
+
 int main(void)
 {
+    test_boundary_regressions();
     vga_terminal_reset(&t);
     assert(t.page[0].cursor.fg == 7 && t.page[0].bottom == 24 && t.visible);
     feed("abc\rX\tZ\bQ");

@@ -10,7 +10,9 @@ int vga_text_hw_leave(void) { return 0; }
 void vga_text_hw_present(const uint16_t *c,unsigned x,unsigned y,bool v,unsigned s,bool r)
 { (void)c;(void)x;(void)y;(void)v;(void)s;(void)r; }
 void vga_text_hw_panic(void) {}
+#ifndef CONSOLE_TEST_REPLY
 void pty_vt_reply(uint32_t n,const char *b,size_t l) {(void)n;(void)b;(void)l;}
+#endif
 #endif
 #include "../../../drivers/console/vga_terminal.c"
 #include "../../../drivers/console/vga_ansi.c"

@@ -94,9 +94,11 @@ static void scenario(uint8_t bytes,bool graphical)
     fb_console_render_vt=3;
     vt_text[console_active_vt-1].charset[0]=1;
     vt_text[console_active_vt-1].charset_bank=0;
+    fb_console_insert_mode=true;
     panic_phase=true;
     struct console_panic_context context=console_panic_begin();
     CHECK(fb_console_render_vt==0);
+    CHECK(!fb_console_insert_mode);
     CHECK(vt_text[context.vt-1].charset[0]==0);
     CHECK(context.vt==(graphical?1u:2u));
     CHECK(context.graphical==graphical);

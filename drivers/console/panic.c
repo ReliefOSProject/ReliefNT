@@ -83,6 +83,8 @@ struct console_panic_context console_panic_begin(void)
     if (fb_cols > CONSOLE_MAX_COLS) fb_cols = CONSOLE_MAX_COLS;
     if (fb_rows > CONSOLE_MAX_ROWS) fb_rows = CONSOLE_MAX_ROWS;
     fb_console_bold = fb_console_underline = fb_console_reverse = false;
+    fb_console_insert_mode = false;
+    fb_modes = (struct fb_terminal_modes){.wrap = true, .newline = true};
     fb_console_underline_color_set = false;
     fb_console_fg_color = 0x00ffffffu;
     fb_console_bg_color = 0;

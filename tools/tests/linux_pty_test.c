@@ -5,10 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include "modules/pty.h"
+#include "../../drivers/console/vga_console.c"
 bool console_vga_text_mode;
+struct console_vt_text vt_text[CONSOLE_VT_COUNT];
 int console_prepare_vt(bool graphics) { (void)graphics; return 0; }
-unsigned vga_console_key(uint32_t v,uint8_t k,unsigned m,char *b)
-{ (void)v;(void)k;(void)m;(void)b;return 0; }
 
 static struct task owner;
 static unsigned signals;
@@ -27,9 +27,9 @@ void kernel_wait_queue_block_current(struct kernel_wait_queue *q) { (void)q; ++b
 uint32_t kernel_wait_queue_wake_all(struct kernel_wait_queue *q) { (void)q; ++awakened; return 1; }
 void kernel_poll_readiness_notify(void) { }
 static unsigned descriptor_refs = 1;
-static uint8_t keyboard_caps;
+static uint8_t keyboard_caps, keyboard_num;
 uint8_t input_caps_lock_active(void) { return keyboard_caps; }
-uint8_t input_num_lock_active(void) { return 0; }
+uint8_t input_num_lock_active(void) { return keyboard_num; }
 void input_set_graphical_vt(uint32_t number) { (void)number; }
 static uint32_t shown_vt;
 static uint32_t shown_graphical;
@@ -76,6 +76,149 @@ void console_log(enum console_log_level level, const char *format, ...)
     (void)level; (void)format;
 }
 void console_write_len(const char *text, size_t count) { (void)text; (void)count; }
+
+static void test_queue_boundaries(void)
+{
+    char input[PTY_OUTPUT_CAP + 32], output[sizeof(input)];
+    for (unsigned i = 0; i < sizeof(input); ++i) input[i] = 'a' + i % 26;
+    pty_init();
+    int id = pty_create(owner.pid);
+    struct reliefos_pty_termios mode;
+    assert(pty_get_termios(id, &mode) == 0);
+    mode.c_iflag = mode.c_oflag = mode.c_lflag = 0;
+    assert(pty_set_termios(id, &mode) == 0);
+    assert(pty_write_input(owner.pid, id, input, sizeof(input)) == PTY_INPUT_CAP - 1);
+    assert(!(pty_poll_endpoint(id, true) & POLLOUT));
+    assert(pty_write_input(owner.pid, id, "!", 1) == -LINUX_EAGAIN);
+    assert(pty_read_input(id, output, sizeof(output)) == PTY_INPUT_CAP - 1);
+    assert(!memcmp(input, output, PTY_INPUT_CAP - 1));
+    assert(pty_poll_endpoint(id, true) & POLLOUT);
+    assert(pty_write_output(id, input, sizeof(input)) == PTY_OUTPUT_CAP - 1);
+    assert(!(pty_poll_endpoint(id, false) & POLLOUT));
+    assert(pty_write_output(id, "!", 1) == -LINUX_EAGAIN);
+    assert(pty_read_output(owner.pid, id, output, sizeof(output), NULL) == PTY_OUTPUT_CAP - 1);
+    assert(!memcmp(input, output, PTY_OUTPUT_CAP - 1));
+    assert(pty_poll_endpoint(id, false) & POLLOUT);
+    mode.c_oflag = LINUX_OPOST | LINUX_ONLCR;
+    assert(pty_set_termios(id, &mode) == 0);
+    assert(pty_write_output(id, input, PTY_OUTPUT_CAP - 2) == PTY_OUTPUT_CAP - 2);
+    unsigned column = find_session(id)->output_column;
+    assert(pty_write_output(id, "\n", 1) == -LINUX_EAGAIN);
+    assert(find_session(id)->output_column == column);
+    assert(pty_read_output(owner.pid, id, output, sizeof(output), NULL) == PTY_OUTPUT_CAP - 2);
+    assert(!memcmp(input, output, PTY_OUTPUT_CAP - 2));
+    assert(pty_write_output(id, "\n", 1) == 1);
+    assert(pty_read_output(owner.pid, id, output, sizeof(output), NULL) == 2);
+    assert(!memcmp(output, "\r\n", 2));
+
+    mode.c_lflag = LINUX_ICANON | LINUX_IEXTEN;
+    assert(pty_set_termios(id, &mode) == 0);
+    assert(pty_write_input(owner.pid, id, "one\ntwo\n", 8) == 8);
+    assert(pty_read_input(id, output, sizeof(output)) == 4 && !memcmp(output, "one\n", 4));
+    assert(pty_read_input(id, output, sizeof(output)) == 4 && !memcmp(output, "two\n", 4));
+    assert(pty_write_input(owner.pid, id, "\004", 1) == 1);
+    assert(pty_input_available(id) == 0 && pty_input_ready(id));
+    assert(pty_poll_endpoint(id, false) & POLLIN);
+    assert(pty_read_input(id, output, sizeof(output)) == 0);
+    assert(!pty_input_ready(id) && pty_read_input(id, output, 1) == -LINUX_EAGAIN);
+    assert(pty_write_input(owner.pid, id, "end\004after\n", 10) == 10);
+    assert(pty_read_input(id, output, sizeof(output)) == 3 && !memcmp(output, "end", 3));
+    assert(pty_read_input(id, output, sizeof(output)) == 6 && !memcmp(output, "after\n", 6));
+    assert(pty_write_input(owner.pid, id, input, PTY_INPUT_CAP * 2) == PTY_INPUT_CAP * 2);
+    assert(pty_write_input(owner.pid, id, "\n", 1) == 1);
+    assert(pty_write_input(owner.pid, id, "tail", 4) == 4);
+    mode.c_lflag = 0;
+    assert(pty_set_termios(id, &mode) == 0);
+    assert(pty_write_input(owner.pid, id, "z", 1) == -LINUX_EAGAIN);
+    assert(pty_read_input(id, output, sizeof(output)) == PTY_INPUT_CAP - 1);
+    assert(!memcmp(input, output, PTY_INPUT_CAP - 2) && output[PTY_INPUT_CAP - 2] == '\n');
+    assert(pty_write_input(owner.pid, id, "z", 1) == 1);
+    assert(pty_read_input(id, output, sizeof(output)) == 5 && !memcmp(output, "tailz", 5));
+    puts("PASS PTY backpressure, OPOST atomicity, canonical boundaries/EOF and overlong-line recovery");
+}
+
+static void test_cooked_echo(void)
+{
+    char bytes[128];
+    pty_init();
+    int id = pty_create(owner.pid);
+    struct reliefos_pty_termios mode;
+    assert(pty_get_termios(id, &mode) == 0);
+    assert(pty_write_input(owner.pid, id, "ab\177C\n", 5) == 5);
+    assert(pty_read_output(owner.pid, id, bytes, sizeof(bytes), NULL) == 8);
+    assert(!memcmp(bytes, "ab\b \bC\r\n", 8));
+    assert(pty_read_input(id, bytes, sizeof(bytes)) == 3 && !memcmp(bytes, "aC\n", 3));
+    assert(pty_write_input(owner.pid, id, "\177\025", 2) == 2);
+    assert(pty_read_output(owner.pid, id, bytes, sizeof(bytes), NULL) == -LINUX_EAGAIN);
+    assert(pty_write_input(owner.pid, id, "ab\025", 3) == 3);
+    assert(pty_read_output(owner.pid, id, bytes, sizeof(bytes), NULL) == 8);
+    assert(!memcmp(bytes, "ab\b \b\b \b", 8));
+    assert(pty_write_input(owner.pid, id, "alpha beta \027\n", 13) == 13);
+    assert(pty_read_input(id, bytes, sizeof(bytes)) == 7 && !memcmp(bytes, "alpha \n", 7));
+    (void)pty_read_output(owner.pid, id, bytes, sizeof(bytes), NULL);
+    mode.c_iflag |= LINUX_IUTF8;
+    assert(pty_set_termios(id, &mode) == 0);
+    assert(pty_write_input(owner.pid, id, "A\303\251\177\n", 5) == 5);
+    assert(pty_read_input(id, bytes, sizeof(bytes)) == 2 && !memcmp(bytes, "A\n", 2));
+    assert(pty_read_output(owner.pid, id, bytes, sizeof(bytes), NULL) == 8);
+    assert(!memcmp(bytes, "A\303\251\b \b\r\n", 8));
+    assert(pty_write_input(owner.pid, id, "\026\004\n", 3) == 3);
+    assert(pty_read_input(id, bytes, sizeof(bytes)) == 2 && !memcmp(bytes, "\004\n", 2));
+    (void)pty_read_output(owner.pid, id, bytes, sizeof(bytes), NULL);
+    assert(pty_write_input(owner.pid, id, "\023x", 2) == 2);
+    assert(pty_read_output(owner.pid, id, bytes, sizeof(bytes), NULL) == -LINUX_EAGAIN);
+    assert(pty_write_input(owner.pid, id, "\021", 1) == 1);
+    assert(pty_read_output(owner.pid, id, bytes, sizeof(bytes), NULL) == 1 && bytes[0] == 'x');
+    pty_flush_input(id);
+    mode.c_lflag = LINUX_ICANON;
+    mode.c_iflag = LINUX_ICRNL;
+    mode.c_cc[LINUX_VEOF] = 0;
+    assert(pty_set_termios(id, &mode) == 0);
+    assert(pty_write_input(owner.pid, id, "\0x\r", 3) == 3);
+    assert(pty_read_input(id, bytes, sizeof(bytes)) == 3 && !memcmp(bytes, "\0x\n", 3));
+    mode.c_lflag = 0;
+    mode.c_iflag = LINUX_ISTRIP | LINUX_INLCR | LINUX_IGNCR;
+    assert(pty_set_termios(id, &mode) == 0);
+    assert(pty_write_input(owner.pid, id, "\301\r\n", 3) == 3);
+    assert(pty_read_input(id, bytes, sizeof(bytes)) == 2 && !memcmp(bytes, "A\r", 2));
+
+    pty_init();
+    assert(pty_vt_init() == 0);
+    vt_written_len = 0;
+    pty_console_key_event(14, 1);
+    assert(vt_written_len == 0); /* The empty-line prompt survives Backspace. */
+    pty_console_key_event(30, 1);
+    pty_console_key_event(14, 1);
+    assert(vt_written_len == 4 && !memcmp(vt_written, "a\b \b", 4));
+    /* ECHONL applies to cooked input even with ECHO off, never Bash raw input. */
+    assert(pty_get_termios(1, &mode) == 0);
+    mode.c_lflag &= ~LINUX_ECHO;
+    assert(pty_set_termios(1, &mode) == 0);
+    vt_written_len = 0;
+    pty_console_key_event(28, 1);
+    assert(vt_written_len == 2 && !memcmp(vt_written, "\r\n", 2));
+    mode.c_lflag &= ~LINUX_ICANON;
+    assert(pty_set_termios(1, &mode) == 0);
+    vt_written_len = 0;
+    pty_console_key_event(28, 1);
+    assert(vt_written_len == 0);
+    pty_flush_input(1);
+    char fill[PTY_INPUT_CAP];
+    memset(fill, 'a', sizeof(fill));
+    assert(pty_write_input(0, 1, fill, PTY_INPUT_CAP - 3) == PTY_INPUT_CAP - 3);
+    pty_console_key_event(75, 1); /* Only two slots remain; Left needs three. */
+    assert(pty_input_available(1) == PTY_INPUT_CAP - 3);
+    assert(pty_read_input(1, fill, sizeof(fill)) == PTY_INPUT_CAP - 3);
+    for (unsigned i = 0; i < PTY_INPUT_CAP - 3; ++i) assert(fill[i] == 'a');
+    pty_console_key_event(75, 1);
+    assert(pty_read_input(1, bytes, sizeof(bytes)) == 3 && !memcmp(bytes, "\033[D", 3));
+    assert(pty_write_input(0, 1, fill, PTY_INPUT_CAP - 1) == PTY_INPUT_CAP - 1);
+    pty_console_key_event(29, 1);
+    pty_console_key_event(46, 1); /* Ctrl-C must still flush a full raw queue. */
+    pty_console_key_event(29, 0);
+    assert(pty_input_available(1) == 0);
+    puts("PASS shared console/PTY echo, empty Backspace, Ctrl-U/W/V, UTF-8 erase and CR/control-byte mappings");
+}
 
 int main(void)
 {
@@ -202,6 +345,35 @@ int main(void)
     keyboard_caps = 0;
     pty_console_key_event(30, 1);
     assert(pty_read_input(id, &ch, 1) == 1 && ch == 'a');
+    mode.c_lflag = 0;
+    assert(pty_set_termios(id, &mode) == 0);
+    char encoded[16];
+    pty_console_key_event(56, 1); /* Alt+B is Readline backward-word. */
+    pty_console_key_event(48, 1);
+    pty_console_key_event(56, 0);
+    assert(pty_read_input(id, encoded, sizeof(encoded)) == 2 && !memcmp(encoded, "\033b", 2));
+    pty_console_key_event(29, 1);
+    const uint8_t controls[] = {26,43,27,7,12,57};
+    const uint8_t expected_controls[] = {27,28,29,30,31,0};
+    for (unsigned i = 0; i < sizeof(controls); ++i) {
+        pty_console_key_event(controls[i], 1);
+        assert(pty_read_input(id, &ch, 1) == 1 && (uint8_t)ch == expected_controls[i]);
+    }
+    pty_console_key_event(75, 1);
+    assert(pty_read_input(id, encoded, sizeof(encoded)) == 6 && !memcmp(encoded, "\033[1;5D", 6));
+    pty_console_key_event(29, 0);
+    vt_text[0].application_cursor = true;
+    pty_console_key_event(INPUT_KEY_KP4, 1);
+    assert(pty_read_input(id, encoded, sizeof(encoded)) == 3 && !memcmp(encoded, "\033OD", 3));
+    keyboard_num = 1;
+    pty_console_key_event(INPUT_KEY_KP4, 1);
+    assert(pty_read_input(id, &ch, 1) == 1 && ch == '4');
+    pty_console_key_event(42, 1); /* Shift temporarily reverses Num Lock. */
+    pty_console_key_event(INPUT_KEY_KP4, 1);
+    pty_console_key_event(42, 0);
+    assert(pty_read_input(id, encoded, sizeof(encoded)) == 6 && !memcmp(encoded, "\033[1;2D", 6));
+    keyboard_num = 0;
+    vt_text[0].application_cursor = false;
     pty_init();
     id = pty_create(owner.pid);
     assert(pty_transfer_get(id, TASK_PTY_ENDPOINT_SLAVE) == 0);
@@ -384,6 +556,8 @@ int main(void)
         assert(pty_write_output(1, "h\ni", 3) == 3);
         assert(vt_written_len == 4 && !memcmp(vt_written, "h\r\ni", 4));
     }
+    test_queue_boundaries();
+    test_cooked_echo();
     puts("PASS native PTY modes, OPOST output post-processing, controlling-session isolation and queued-rights lifetime");
     return 0;
 }
