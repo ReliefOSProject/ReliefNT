@@ -606,6 +606,8 @@ int64_t syscall_packet(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2,
             struct sockaddr_in6 address;
             int ret = packet6_import(a1, (uint32_t)a2, &address);
             if (ret < 0) return ret;
+            if (number == __NR_bind && !net_ipv6_needs_scope_id(&address.sin6_addr))
+                address.sin6_scope_id = 0;
             if (address.sin6_scope_id && !net_interface_exists(address.sin6_scope_id)) return -LINUX_ENODEV;
             if (address.sin6_scope_id && s->ifindex && address.sin6_scope_id != (uint32_t)s->ifindex)
                 return -LINUX_EINVAL;

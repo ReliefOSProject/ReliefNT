@@ -11,6 +11,12 @@ x86-64 socket ABI 和 POSIX socket 调用，不需要 ReliefNT 私有 IPv6 调�
 ``sin6_scope_id`` 是接口索引。当前 ``lo`` 为 1，``eth0`` 为 2。
 链路本地地址需要正确的区域标识。
 
+TCP、UDP 和 raw socket 的 ``bind`` 与 Linux 一样，只对需要区域标识的地址
+使用 ``sin6_scope_id``。绑定 ``::``、``::1``、IPv4 映射地址或其他无此需求的
+地址时忽略该字段，避免将旧版 Netty 留下的未初始化值误判为不存在的网卡。
+链路本地地址及接口／链路本地多播地址仍校验接口；``SO_BINDTODEVICE``
+指定的设备绑定继续生效。
+
 实现包含 UDP、TCP、ICMPv6 raw socket、回环、以太网 IPv6、邻居发现、重复地址
 检测、路由器发现和 SLAAC。地址与默认路由按通告有效期维护；SLAAC 地址遵守
 RFC 4862 的两小时有效期保护。处理 IPv6 校验和、扩展首部、源端分片、乱序重组、

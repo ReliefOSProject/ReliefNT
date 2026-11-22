@@ -3,6 +3,7 @@ __attribute__((noreturn)) void task_netlink_recv(void) { __builtin_trap(); }
 __attribute__((noreturn)) void task_netlink_recv_staged(void) { __builtin_trap(); }
 __attribute__((noreturn)) void task_netlink_send(void) { __builtin_trap(); }
 __attribute__((noreturn)) void task_netlink_cancel_wait(void) { __builtin_trap(); }
+__attribute__((noreturn)) void task_netlink_passcred(void) { __builtin_trap(); }
 __attribute__((noreturn)) void task_packet_recv(void) { __builtin_trap(); }
 __attribute__((noreturn)) void task_packet_recv_ex(void) { __builtin_trap(); }
 __attribute__((noreturn)) void task_packet_recv_staged(void) { __builtin_trap(); }

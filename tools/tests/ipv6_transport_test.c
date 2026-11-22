@@ -62,9 +62,63 @@ int net_ipv4_send_raw(uint32_t destination, uint32_t source, uint8_t protocol,
                       bool hdrincl, const void *data, uint32_t length)
 { (void)destination; (void)source; (void)protocol; (void)hdrincl; (void)data; return (int)length; }
 
+static void test_bind_scope(void)
+{
+    static const struct in6_addr addresses[] = {
+        {0},
+        {.s6_addr={0,0,0,0,0,0,0,0,0,0,255,255,0,0,0,0}},
+        {.s6_addr={0,0,0,0,0,0,0,0,0,0,255,255,127,0,0,1}},
+        {.s6_addr={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1}},
+    };
+    for (unsigned i = 0; i < sizeof(addresses) / sizeof(addresses[0]); ++i) {
+        int fd = (int)call(__NR_socket, AF_INET6, SOCK_DGRAM, 0, 0, 0);
+        assert(fd >= 0);
+        const char device[] = "lo";
+        assert(!call(__NR_setsockopt, fd, SOL_SOCKET, SO_BINDTODEVICE,
+                     (uintptr_t)device, sizeof(device)));
+        struct sockaddr_in6 address = {.sin6_family=AF_INET6,
+            .sin6_addr=addresses[i],.sin6_scope_id=0xa5a5a5a5u};
+        long result = call(__NR_bind, fd, (uintptr_t)&address, sizeof(address), 0, 0);
+        printf("UDP unscoped bind case %u: %ld\n",i,result);
+        fflush(stdout);
+        assert(!result);
+        struct sockaddr_in6 bound;
+        uint32_t length = sizeof(bound);
+        assert(!call(__NR_getsockname,fd,(uintptr_t)&bound,(uintptr_t)&length,0,0));
+        assert(!bound.sin6_scope_id && udp_from_file(&files[fd])->ifindex == 1);
+        task_udp_release(&files[fd]); files[fd].used=0;
+    }
+    current.cap_effective |= 1ULL << CAP_NET_RAW;
+    for (unsigned i = 0; i < 2; ++i) {
+        int raw = (int)syscall_packet(__NR_socket,AF_INET6,SOCK_RAW,IPPROTO_ICMPV6,0,0,0);
+        assert(raw >= 0);
+        struct sockaddr_in6 address = {.sin6_family=AF_INET6,
+            .sin6_addr=i ? loop6 : (struct in6_addr){0},.sin6_scope_id=0xa5a5a5a5u};
+        assert(!syscall_packet(__NR_bind,raw,(uintptr_t)&address,sizeof(address),0,0,0));
+        struct sockaddr_in6 bound;
+        uint32_t length = sizeof(bound);
+        assert(!syscall_packet(__NR_getsockname,raw,(uintptr_t)&bound,(uintptr_t)&length,0,0,0));
+        assert(!bound.sin6_scope_id);
+        task_packet_release(&files[raw]); files[raw].used=0;
+    }
+    current.cap_effective &= ~(1ULL << CAP_NET_RAW);
+    int fd = (int)call(__NR_socket, AF_INET6, SOCK_DGRAM, 0, 0, 0);
+    assert(fd >= 0);
+    struct sockaddr_in6 address = {.sin6_family=AF_INET6,
+        .sin6_addr={.s6_addr={0xfe,0x80,0,0,0,0,0,0,0,0,0,0,0,0,0,1}},
+        .sin6_scope_id=0xa5a5a5a5u};
+    assert(call(__NR_bind,fd,(uintptr_t)&address,sizeof(address),0,0) == -LINUX_ENODEV);
+    address.sin6_scope_id=0;
+    assert(call(__NR_bind,fd,(uintptr_t)&address,sizeof(address),0,0) == -LINUX_EINVAL);
+    address.sin6_addr=loop6;
+    assert(!call(__NR_bind,fd,(uintptr_t)&address,sizeof(address),0,0));
+    task_udp_release(&files[fd]); files[fd].used=0;
+}
+
 int main(void)
 {
     current.cap_effective = 1ULL << CAP_NET_BIND_SERVICE;
+    test_bind_scope();
     int fd = (int)call(__NR_socket, AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK, 0, 0, 0);
     assert(fd >= 0);
     int domain = -1;
@@ -108,7 +162,8 @@ int main(void)
     files[fd].used = 0;
     int v6 = (int)call(__NR_socket, AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK, 0, 0, 0);
     int v4 = open_socket();
-    struct sockaddr_in6 any6 = {.sin6_family = AF_INET6, .sin6_port = swap16(55002)};
+    struct sockaddr_in6 any6 = {.sin6_family = AF_INET6, .sin6_port = swap16(55002),
+        .sin6_scope_id = 0xa5a5a5a5u};
     struct sockaddr_in any4 = {.sin_family = AF_INET, .sin_port = swap16(55002)};
     assert(call(__NR_bind, v6, (uintptr_t)&any6, sizeof(any6), 0, 0) == 0);
     assert(call(__NR_bind, v4, (uintptr_t)&any4, sizeof(any4), 0, 0) == -LINUX_EADDRINUSE);
