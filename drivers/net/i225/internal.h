@@ -5,6 +5,9 @@
 #include <reliefos/driver.h>
 #include <reliefnt/lock.h>
 
+#define I225_V_DEVICE_ID   0x15f3u
+#define I226_V_DEVICE_ID   0x125cu
+
 #define I225_CTRL          0x00000u
 #define I225_STATUS        0x00008u
 #define I225_ICR           0x01500u

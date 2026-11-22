@@ -97,8 +97,8 @@ msgstr "``I225_V``"
 msgid "``i225``"
 msgstr "``i225``"
 
-msgid "Intel I225-V PCIe 2.5GbE 网卡（8086:15f3）；单队列收发，优先 MSI 通知， 无 MSI 时退回轮询。 仅支持 I225-V，实体卡验证状态见 :doc:`i225`。"
-msgstr "Intel I225-V PCIe 2.5GbE adapter (8086:15f3) with one queue. It prefers MSI notifications and falls back to polling when MSI is unavailable. Only I225-V is supported; see :doc:`i225` for physical-hardware validation status."
+msgid "Intel I225-V（8086:15f3）和 I226-V（8086:125c）PCIe 2.5GbE 网卡。 单队列收发，优先 MSI 通知，无 MSI 时退回轮询。验证范围见 :doc:`i225`。"
+msgstr "Intel I225-V (8086:15f3) and I226-V (8086:125c) PCIe 2.5GbE adapters. They use one RX/TX queue, prefer MSI notifications, and fall back to polling when MSI is unavailable. See :doc:`i225` for validation coverage."
 
 msgid "``R8169``"
 msgstr "``R8169``"

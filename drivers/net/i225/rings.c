@@ -1,6 +1,17 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "internal.h"
 
+#define I226_RETX_CTL            0x0041cu
+#define I226_RETX_WATERMARK_MASK 0x0fu
+#define I226_GTXOFFSET           0x03310u
+#define I226_TXQCTL0             0x03344u
+#define I226_DTXMXPKTSZ          0x0355cu
+#define I226_DTXMXPKTSZ_DEFAULT  0x98u
+#define I226_TQAVCTRL            0x03570u
+#define I226_TQAVCTRL_TSN        (1u << 0)
+#define I226_TQAVCTRL_ENH_QAV    (1u << 3)
+#define I226_TQAVCTRL_FUTSCDDIS  (1u << 7)
+
 int i225_allocate_rings(struct i225_device *d)
 {
     d->rx_physical = d->api->alloc_dma(1, UINT64_MAX);
@@ -39,6 +50,20 @@ static int wait_queue(struct i225_device *d, unsigned reg, uint32_t enable)
     }
 }
 
+/* Select ordinary Ethernet transmission after firmware may have configured TSN. */
+static void i226_restore_legacy_tx(struct i225_device *d)
+{
+    i225_write(d, I226_GTXOFFSET, 0);
+    i225_write(d, I226_DTXMXPKTSZ, I226_DTXMXPKTSZ_DEFAULT);
+    /* Keep the normal retry buffer watermark and clear the scheduled threshold. */
+    uint32_t retry = i225_read(d, I226_RETX_CTL) & I226_RETX_WATERMARK_MASK;
+    i225_write(d, I226_RETX_CTL, retry);
+    uint32_t scheduling = i225_read(d, I226_TQAVCTRL);
+    scheduling &= ~(I226_TQAVCTRL_TSN | I226_TQAVCTRL_ENH_QAV | I226_TQAVCTRL_FUTSCDDIS);
+    i225_write(d, I226_TQAVCTRL, scheduling);
+    i225_write(d, I226_TXQCTL0, 0);
+}
+
 /** @brief Configure a single standard-MTU queue pair from owned DMA storage.
  * @param d Device with bus mastering disabled and initialized DMA descriptors.
  * @return Zero or -ETIMEDOUT; no interface may be published after failure.
@@ -49,9 +74,11 @@ int i225_configure_rings(struct i225_device *d)
     i225_write(d, I225_TCTL, 0);
     i225_write(d, I225_RXDCTL0, 0);
     i225_write(d, I225_TXDCTL0, 0);
-    /* Restore normal I225 packet-buffer partitioning, including after TSN firmware. */
+    /* Restore normal packet-buffer partitioning, including after TSN firmware. */
     i225_write(d, I225_RXPBS, 0x000000a2u);
     i225_write(d, I225_TXPBS, 0x04000014u);
+    if (d->pci.device_id == I226_V_DEVICE_ID)
+        i226_restore_legacy_tx(d);
     i225_write(d, I225_RXCSUM, 0); /* The network stack verifies IP and transport checksums. */
     i225_write(d, I225_MRQC, 0); /* All accepted frames belong to queue zero. */
     /* Disable IPv6 extension-header parsing as required by the hardware erratum. */
