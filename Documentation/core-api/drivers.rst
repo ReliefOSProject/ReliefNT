@@ -35,9 +35,8 @@ drivers/ 按 console、tty、video、storage、net、input、usb、sound 等设�
        网络接口。设备范围和验证边界见 :doc:`e1000e`。
    * - ``I225_V``
      - ``i225``
-     - Intel I225-V PCIe 2.5GbE 网卡（8086:15f3）；单队列收发，优先 MSI 通知，
-       无 MSI 时退回轮询。
-       仅支持 I225-V，实体卡验证状态见 :doc:`i225`。
+     - Intel I225-V（8086:15f3）和 I226-V（8086:125c）PCIe 2.5GbE 网卡。
+       单队列收发，优先 MSI 通知，无 MSI 时退回轮询。验证范围见 :doc:`i225`。
    * - ``R8169``
      - ``r8169``
      - Realtek RTL8111/8168 千兆与 RTL8125 2.5GbE PCIe 网卡；每个 PCI 功能

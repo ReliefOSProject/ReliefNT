@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the native I225-V driver against a PCI/MMIO/DMA boundary model."""
+"""Exercise the native I225-V and I226-V driver against a PCI/MMIO/DMA model."""
 from pathlib import Path
 import os
 import subprocess

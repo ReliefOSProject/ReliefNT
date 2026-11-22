@@ -9,5 +9,6 @@ static void i225_exit(void) { }
 module_init(i225_register);
 module_exit(i225_exit);
 MODULE_LICENSE("Apache-2.0");
-MODULE_DESCRIPTION("ReliefNT Intel I225-V 2.5GbE network driver");
+MODULE_DESCRIPTION("ReliefNT Intel I225-V and I226-V 2.5GbE network driver");
 MODULE_ALIAS("pci:v00008086d000015F3sv*sd*bc*sc*i*");
+MODULE_ALIAS("pci:v00008086d0000125Csv*sd*bc02sc00i*");

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-/* Hardware-boundary model for the native Intel I225-V driver. */
+/* Hardware-boundary model for the native Intel I225-V and I226-V driver. */
 #define _POSIX_C_SOURCE 200809L
 #include <assert.h>
 #include <stdio.h>
@@ -43,6 +43,11 @@ extern const struct reliefos_driver_module i225_driver_module __attribute__((wea
 #define TDLEN 0x0e008u
 #define TDT 0x0e018u
 #define TXDCTL 0x0e028u
+#define RETX_CTL 0x0041cu
+#define GTXOFFSET 0x03310u
+#define TXQCTL 0x03344u
+#define DTXMXPKTSZ 0x0355cu
+#define TQAVCTRL 0x03570u
 #define RXCSUM 0x05000u
 #define RFCTL 0x05008u
 #define RLPML 0x05004u
@@ -74,7 +79,7 @@ struct dma_allocation { uint64_t address; unsigned pages; uint8_t *bytes; };
 
 static uint32_t registers[0x13000 / 4];
 #define REG(offset) registers[(offset) / 4]
-static uint16_t device_id = 0x15f3, command = 7;
+static uint16_t tested_device_id, device_id, command;
 static uint16_t config[128];
 static uint8_t pm_capability;
 static bool refuse_d0;
@@ -159,6 +164,8 @@ static void *alias(uint64_t address)
 uint32_t i225_io_read(const volatile uint8_t *base, unsigned offset)
 {
     assert(base == (const volatile uint8_t *)registers && offset < sizeof(registers));
+    if (offset == RETX_CTL)
+        assert(device_id == 0x125c);
     uint32_t value = REG(offset);
     if (offset == ICR)
         REG(ICR) = 0;
@@ -170,6 +177,8 @@ uint32_t i225_io_read(const volatile uint8_t *base, unsigned offset)
 void i225_io_write(volatile uint8_t *base, unsigned offset, uint32_t value)
 {
     assert(base == (volatile uint8_t *)registers && offset < sizeof(registers));
+    if (offset == RETX_CTL)
+        assert(device_id == 0x125c && !(command & 4u));
     if (offset == CTRL && (value & (1u << 31)) && !(REG(CTRL) & (1u << 31))) {
         assert(REG(SW_FW_SYNC) & 2u);
         assert(!(REG(MANC) & (1u << 18)));
@@ -193,6 +202,11 @@ void i225_io_write(volatile uint8_t *base, unsigned offset, uint32_t value)
         ++mdio_commands;
     }
     if ((offset == RXDCTL || offset == TXDCTL) && (value & (1u << 25))) {
+        if (offset == TXDCTL && device_id == 0x125c) {
+            /* Exercise firmware leaving scheduled TX active across MAC reset. */
+            assert(REG(RETX_CTL) == 0xbu && REG(TQAVCTRL) == 0x10u);
+            assert(!REG(GTXOFFSET) && !REG(TXQCTL) && REG(DTXMXPKTSZ) == 0x98u);
+        }
         if ((offset == RXDCTL && reject_rx_enable) || (offset == TXDCTL && reject_tx_enable))
             value &= ~(1u << 25);
         else if (queue_delay) {
@@ -378,7 +392,7 @@ static void console_log(enum console_log_level level, const char *format, ...)
 static int request_pci_irq(const struct reliefos_driver_pci_device *device,
                            void (*handler)(void *), void *context, uint32_t *handle)
 {
-    assert(device->vendor_id == 0x8086 && device->device_id == 0x15f3);
+    assert(device->vendor_id == 0x8086 && device->device_id == tested_device_id);
     ++irq_requests;
     if (irq_request_error)
         return irq_request_error;
@@ -445,6 +459,13 @@ static void reset_fixture(void)
     REG(EEER) = (7u << 16) | 0x125;
     REG(IPCNFG) = 0x11c;
     REG(RXPBS) = REG(TXPBS) = REG(RFCTL) = UINT32_MAX;
+    if (tested_device_id == 0x125c) {
+        REG(RETX_CTL) = 0x1b0bu;
+        REG(GTXOFFSET) = 0x578u;
+        REG(TXQCTL) = 0xc7u;
+        REG(DTXMXPKTSZ) = 0x19u;
+        REG(TQAVCTRL) = 0x99u;
+    }
     for (unsigned i = 1; i < 16; ++i) {
         REG(0x5400 + i * 8) = 0xa5a5a5a5;
         REG(0x5404 + i * 8) = 0x80001234;
@@ -458,7 +479,7 @@ static void reset_fixture(void)
     phy[0] = (1u << 14) | (1u << 11) | (1u << 10);
     mmd_address = mmd_aneg = 0;
     mmd_data_mode = 0;
-    device_id = 0x15f3;
+    device_id = tested_device_id;
     command = 7;
     allocation_limit = 4;
     mapping_failure = registration_error = teardown_error = 0;
@@ -716,28 +737,13 @@ static void test_frame_boundaries(void)
     finish();
 }
 
-int main(void)
+static void test_device(uint16_t id)
 {
-    if (!&i225_driver_module) {
-        fputs("FAIL i225: native I225-V driver is missing\n", stderr);
-        return 1;
-    }
-    assert(i225_driver_module.init && i225_driver_module.fini);
-    assert(!strcmp(i225_driver_module.name, "i225"));
-    assert(i225_driver_module.init(NULL) == -22);
-    struct reliefos_driver_kernel_api truncated_api = api;
-    truncated_api.struct_size = RELIEFOS_DRIVER_PHYS_MAP_API_SIZE - 1;
-    assert(i225_driver_module.init(&truncated_api) == -22);
-
+    tested_device_id = id;
     test_power_management();
     test_phy_and_semaphores();
     test_queue_startup();
     test_frame_boundaries();
-
-    reset_fixture();
-    device_id = 0x125c; /* I226-V is deliberately outside the first device table. */
-    assert(i225_driver_module.init(&api) == -19);
-    finish();
 
     for (unsigned failure = 0; failure < 4; ++failure) {
         reset_fixture();
@@ -817,7 +823,7 @@ int main(void)
 
     struct e1000_info info = {0};
     network->get_info(network_context, &info);
-    assert(info.present && info.active && info.device_id == 0x15f3 && info.bus == 2);
+    assert(info.present && info.active && info.device_id == id && info.bus == 2);
     assert(!memcmp(network->mac(network_context), "\x52\x54\x00\x12\x34\x56", 6));
 
     struct rx_desc *rx = rx_ring();
@@ -997,6 +1003,34 @@ int main(void)
     assert(network && network->is_ready(network_context));
     finish();
 
-    puts("PASS i225: PCI D0, PHY reset/semaphores, queue startup, frame padding/limits, MSI races, DMA STOP");
+    printf("PASS i225 8086:%04x: PCI D0, PHY, TX mode, RX/TX, MSI and DMA STOP\n", id);
+}
+
+int main(void)
+{
+    if (!&i225_driver_module) {
+        fputs("FAIL i225: native Intel 2.5GbE driver is missing\n", stderr);
+        return 1;
+    }
+    assert(i225_driver_module.init && i225_driver_module.fini);
+    assert(!strcmp(i225_driver_module.name, "i225"));
+    assert(i225_driver_module.init(NULL) == -22);
+    struct reliefos_driver_kernel_api truncated_api = api;
+    truncated_api.struct_size = RELIEFOS_DRIVER_PHYS_MAP_API_SIZE - 1;
+    assert(i225_driver_module.init(&truncated_api) == -22);
+
+    test_device(0x15f3);
+    test_device(0x125c);
+
+    /* Other SKUs and blank-NVM devices must never be probed. */
+    const uint16_t unsupported[] = {0x15f2, 0x125b, 0x125d, 0x125f};
+    for (unsigned i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); ++i) {
+        reset_fixture();
+        device_id = unsupported[i];
+        unsigned previous_maps = maps;
+        assert(i225_driver_module.init(&api) == -19);
+        assert(maps == previous_maps && !irq_requests && !network);
+        finish();
+    }
     return 0;
 }

@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 config I225_V
-    tristate "Intel I225-V 2.5GbE Ethernet"
+    tristate "Intel I225-V / I226-V 2.5GbE Ethernet"
     default y
     help
-      Native PCIe Ethernet for Intel I225-V (8086:15f3). The driver uses
-      one RX/TX queue and the existing network device interface. MSI notifies
-      the network service when available; otherwise the driver uses polling.
+      Native PCIe Ethernet for Intel I225-V (8086:15f3) and I226-V
+      (8086:125c). The driver uses one RX/TX queue and the existing network
+      device interface. MSI notifies the network service when available;
+      otherwise the driver uses polling.
       Frame processing always runs in task context.
-      Other I225 variants and I226 controllers are not matched.
+      Other I225 and I226 variants are not matched. Builds i225.ko when modular.

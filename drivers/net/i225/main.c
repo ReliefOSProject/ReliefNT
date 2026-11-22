@@ -5,6 +5,22 @@
 
 static struct i225_device *devices;
 
+static const char *device_model(const struct reliefos_driver_pci_device *pci)
+{
+    if (pci->vendor_id != 0x8086 || pci->class_code != 2 || pci->subclass != 0 ||
+        (pci->header_type & 0x7f) != 0)
+        return NULL;
+
+    switch (pci->device_id) {
+    case I225_V_DEVICE_ID:
+        return "Intel I225-V";
+    case I226_V_DEVICE_ID:
+        return "Intel I226-V";
+    default:
+        return NULL;
+    }
+}
+
 static int ready(void *context)
 {
     struct i225_device *d = context;
@@ -74,8 +90,8 @@ static int start(const struct reliefos_driver_kernel_api *api)
                 first_error = rc;
             break;
         }
-        if (pci.vendor_id != 0x8086 || pci.device_id != 0x15f3 ||
-            pci.class_code != 2 || pci.subclass != 0 || (pci.header_type & 0x7f) != 0)
+        const char *model = device_model(&pci);
+        if (!model)
             continue;
 
         struct i225_device *d = kernel_malloc(sizeof(*d));
@@ -105,8 +121,8 @@ static int start(const struct reliefos_driver_kernel_api *api)
         }
         if (rc) {
             api->console_log(CONSOLE_LOG_WARN,
-                "[i225] %02x:%02x.%u initialization failed: %d\n",
-                pci.bus, pci.slot, pci.function, rc);
+                "[i225] %02x:%02x.%u %s initialization failed: %d\n",
+                pci.bus, pci.slot, pci.function, model, rc);
             if (!first_error)
                 first_error = rc;
             if (stop_device(d))
@@ -116,8 +132,8 @@ static int start(const struct reliefos_driver_kernel_api *api)
             continue;
         }
         api->console_log(CONSOLE_LOG_INFO,
-            "[i225] %02x:%02x.%u Intel I225-V MAC=%02x:%02x:%02x:%02x:%02x:%02x; link=%s irq=%s\n",
-            pci.bus, pci.slot, pci.function, d->mac[0], d->mac[1], d->mac[2],
+            "[i225] %02x:%02x.%u %s MAC=%02x:%02x:%02x:%02x:%02x:%02x; link=%s irq=%s\n",
+            pci.bus, pci.slot, pci.function, model, d->mac[0], d->mac[1], d->mac[2],
             d->mac[3], d->mac[4], d->mac[5], ready(d) ? "up" : "down",
             d->irq_handle ? "msi" : "poll");
         ++registered;
