@@ -606,6 +606,7 @@ EXPORT_SYMBOL(min_u64);
 EXPORT_SYMBOL(storage_begin_mutation);
 EXPORT_SYMBOL(storage_cache_invalidate);
 EXPORT_SYMBOL(storage_copy_text);
+EXPORT_SYMBOL(storage_metadata_generation);
 EXPORT_SYMBOL(storage_dir_index_lookup);
 EXPORT_SYMBOL(storage_dir_index_store);
 EXPORT_SYMBOL(storage_is_acl_metadata_name);
