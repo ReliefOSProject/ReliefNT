@@ -644,10 +644,6 @@ static int userland_load_task_image_locked(struct task *task, const struct task 
     }
     task->flags |= TASK_FLAG_STARTED;
 
-    console_debug("[reliefnt] %s prepared lazy Ring-3 image entry=0x%llx cr3=0x%llx\n",
-                   task->name,
-                   (unsigned long long)task->entry,
-                   (unsigned long long)(*sched_task_as(task)).cr3);
     return 0;
 }
 

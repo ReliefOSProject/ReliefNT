@@ -23,6 +23,19 @@
 #define CONSOLE_VT_COUNT 6u
 #define CONSOLE_VT_TEXT_CAP 65536u
 
+struct fb_saved_rendition {
+    uint32_t foreground, background, underline_color;
+    bool bold, underline, reverse, conceal, underline_color_set, origin, wrap;
+    uint8_t charset[2], charset_bank;
+};
+
+struct fb_terminal_modes {
+    bool wrap, pending_wrap, origin, newline, conceal;
+    bool tabs[CONSOLE_MAX_COLS];
+    uint32_t last;
+    struct fb_saved_rendition saved;
+};
+
 /* Pixel checkpoints retain the complete streaming parser across VT changes. */
 struct fb_console_state {
     struct reliefos_utf8_stream utf8;
@@ -39,6 +52,9 @@ struct fb_console_state {
     bool bold;
     bool underline;
     bool reverse;
+    bool insert_mode;
+    struct fb_terminal_modes modes;
+    uint8_t charset[2], charset_bank;
     uint32_t underline_color;
     bool underline_color_set;
     uint32_t scroll_top;
@@ -49,6 +65,8 @@ struct fb_console_state {
     bool param_active;
     bool private_mode;
     bool dec_private;
+    bool overflow, string_osc;
+    uint8_t prefix, intermediate;
     uint8_t charset_target;
     uint32_t params[FB_ANSI_MAX_PARAMS];
     bool param_colon[FB_ANSI_MAX_PARAMS];
@@ -58,6 +76,7 @@ struct console_vt_text {
     char bytes[CONSOLE_VT_TEXT_CAP];
     size_t length;
     bool application_cursor, cursor_hidden;
+    bool alternate;
     uint8_t charset[2], charset_bank;
 };
 
@@ -133,6 +152,7 @@ enum fb_ansi_state {
     FB_ANSI_OSC,
     FB_ANSI_OSC_ESC,
     FB_ANSI_CHARSET,
+    FB_ANSI_IGNORE_ONE,
 };
 
 
@@ -192,6 +212,7 @@ extern uint32_t console_active_vt;
 extern bool console_vt_graphical;
 extern const struct framebuffer *fb_console_render_target;
 extern uint32_t fb_console_render_vt;
+extern bool fb_console_replaying;
 extern char log_buffer[CONSOLE_LOG_CAP];
 extern size_t log_len;
 extern size_t log_start;
@@ -207,7 +228,6 @@ extern uint32_t fb_rows;
 extern uint32_t fb_col;
 extern uint32_t fb_row;
 extern uint32_t console_ui_theme;
-extern bool console_line_start;
 extern bool console_service_logs_only;
 extern uint32_t fb_saved_col;
 extern uint32_t fb_saved_row;
@@ -216,6 +236,8 @@ extern uint32_t fb_console_bg_color;
 extern bool fb_console_bold;
 extern bool fb_console_underline;
 extern bool fb_console_reverse;
+extern bool fb_console_insert_mode;
+extern struct fb_terminal_modes fb_modes;
 extern uint32_t fb_console_underline_color;
 extern bool fb_console_underline_color_set;
 extern uint32_t fb_scroll_top;
@@ -263,6 +285,21 @@ void fb_console_show_tty_cursor(void);
  * SIMD state or mapping changes, even for unaligned 24-bit row layouts.
  */
 void fb_console_scroll(uint32_t lines);
+/** @brief Scroll an inclusive row region in either direction without moving the cursor. */
+void fb_console_scroll_region(uint32_t top, uint32_t bottom, uint32_t lines, bool reverse);
+/** @brief Apply IND/RI, scrolling only when the cursor is on its corresponding margin. */
+void fb_console_index(bool reverse, bool carriage);
+/** @brief Move to a configured tab stop without changing existing cells. */
+void fb_console_tab(uint32_t count, bool reverse);
+/** @brief Repeat the last printable scalar with the normal wrap/insertion rules. */
+void fb_console_repeat(uint32_t count);
+/** @brief Save/restore the cursor, rendition, character set and DEC modes. */
+void fb_console_save_cursor(void);
+void fb_console_restore_cursor(void);
+/** @brief Select a retained primary/alternate framebuffer page for one VT. */
+void fb_console_alternate(bool on, bool clear, bool save_cursor);
+/** @brief Discard retained alternate page contents during a terminal reset. */
+void fb_console_reset_alternate(void);
 void fb_console_mark_damage(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 void fb_console_publish_damage(void);
 
@@ -280,6 +317,14 @@ void fb_console_putc(char ch);
  */
 void fb_console_clear_row_range(uint32_t row, uint32_t first, uint32_t last);
 
+/** @brief Insert or delete cells at the cursor, shifting only the current row.
+ * @param count Number of cells, clipped to the remaining columns.
+ * @param insert True to shift right and blank the inserted cells; false to
+ * shift left and blank the vacated right margin. The cursor does not move.
+ * Caller serializes console access and hides the software cursor first.
+ */
+void fb_console_shift_characters(uint32_t count, bool insert);
+
 void fb_console_ansi_feed(char ch);
 
 /**
@@ -293,17 +338,20 @@ void fb_console_state_save(struct fb_console_state *state);
  * @param state Required checkpoint saved for the matching surface layout.
  */
 void fb_console_state_restore(const struct fb_console_state *state);
+/** @brief Restore page rendering state while leaving the active byte parser intact. */
+void fb_console_page_restore(const struct fb_console_state *state);
+/** @brief Restore only the shared byte parser after switching terminal pages. */
+void fb_console_stream_restore(const struct fb_console_state *state);
 
 
 /** @brief Reset text state and clear the full active rendering surface. */
 void fb_console_initialize_fullscreen(void);
 
-void console_emit_raw(char ch);
+void console_emit_display(const char *text, size_t length);
 
 /** @brief Draw the cursor and publish an active text grid when not staging. */
 void console_present(void);
 
-void console_emit_timestamp(void);
 
 void console_init(void);
 
@@ -311,12 +359,10 @@ void console_log_configure(const char *cmdline);
 
 void console_set_ui_theme(uint32_t theme);
 
-void console_putc(char ch);
 
-void console_write(const char *s);
 
 /**
- * @brief Append raw diagnostic output to the kernel log and serial sink.
+ * @brief Append length-delimited input as INFO records in the kernel log.
  * @param s Bytes to write; need not be NUL-terminated.
  * @param len Number of bytes to write.
  */

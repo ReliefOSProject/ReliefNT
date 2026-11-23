@@ -153,6 +153,9 @@ void framebuffer_text(uint32_t x, uint32_t y, const char *text, uint32_t fg, uin
 uint32_t framebuffer_codepoint_width(uint32_t cp);
 /** @brief Draw scalar cp at x/y with foreground fg and background bg. */
 void framebuffer_codepoint(uint32_t x, uint32_t y, uint32_t cp, uint32_t fg, uint32_t bg);
+/** @brief Draw a bold scalar within its own cell span, preserving its neighbors. */
+void framebuffer_codepoint_bold_to(const struct framebuffer *target, uint32_t x,
+                                    uint32_t y, uint32_t cp, uint32_t fg, uint32_t bg);
 /**
  * @brief Draw a scalar into an explicit framebuffer without changing the
  *        active framebuffer descriptor.

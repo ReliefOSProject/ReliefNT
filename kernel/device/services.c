@@ -1,3 +1,4 @@
+#include <reliefnt/serial.h>
 #include <reliefnt/proc_stats.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/export.h>
@@ -357,51 +358,21 @@ uint8_t mouse_last_ack(void)
 }
 
 /**
- * @brief Program the COM1 UART (baud, frame format, FIFO, IRQ) and enable the early serial path.
- */
-void serial_init(void)
-{
-    x86_64_outb(0x00u, (uint16_t)(EARLY_SERIAL_COM1 + 1u));
-    x86_64_outb(0x80u, (uint16_t)(EARLY_SERIAL_COM1 + 3u));
-    x86_64_outb(0x03u, (uint16_t)(EARLY_SERIAL_COM1 + 0u));
-    x86_64_outb(0x00u, (uint16_t)(EARLY_SERIAL_COM1 + 1u));
-    x86_64_outb(0x03u, (uint16_t)(EARLY_SERIAL_COM1 + 3u));
-    x86_64_outb(0xc7u, (uint16_t)(EARLY_SERIAL_COM1 + 2u));
-    x86_64_outb(0x0bu, (uint16_t)(EARLY_SERIAL_COM1 + 4u));
-    early_serial_ready = 1;
-}
-
-/**
- * @brief Return 1 when a serial driver is registered and reports ready.
- * @return Driver result or 0 while absent/closing; one consistent ops/owner pin
- * spans is_ready, with no manager lock held during the callback.
- */
-int serial_is_ready(void)
-{
-    uint32_t owner;
-    const struct reliefos_driver_serial_ops *ops = driver_serial_service_pin(&owner);
-    if (!ops) return 0;
-    int ready = ops->is_ready ? ops->is_ready() : 0;
-    driver_manager_service_unpin(owner);
-    return ready;
-}
-
-/**
  * @brief Write text through the serial driver, or the built-in COM1 path before one loads.
  * @param text Kernel-owned NUL-terminated text borrowed through callback return.
- * @return None. The matching local ops/owner snapshot stays pinned across write.
+ * The matching local ops/owner snapshot stays pinned across write.
  */
 void serial_write(const char *text)
 {
     uint32_t owner;
     const struct reliefos_driver_serial_ops *ops = driver_serial_service_pin(&owner);
-    if (ops && ops->write) {
+    if (ops && ops->write && (!ops->is_ready || ops->is_ready())) {
         ops->write(text);
         driver_manager_service_unpin(owner);
         return;
     }
     if (ops) driver_manager_service_unpin(owner);
-    early_serial_write(text);
+    if (text) serial_tx_record(text, __builtin_strlen(text), true);
 }
 
 /** @brief Register a provider context without exposing it before init succeeds.

@@ -22,10 +22,11 @@ bool vga_console_requested(const char *s)
     return enabled;
 }
 
-/** @brief Reset and enable only a hardware-probed, explicitly requested backend. */
+/** @brief Enable a requested VGA backend or a probed legacy no-framebuffer fallback. */
 void vga_console_configure(const char *cmdline, bool legacy_boot)
 {
-    if (!vga_console_requested(cmdline)) return;
+    if (!vga_console_requested(cmdline) &&
+        (framebuffer_get()->available || !legacy_boot)) return;
     int ret=vga_text_hw_init(legacy_boot);
     if (ret) {
         console_warn("[console] console=vga unavailable ret=%d; keeping original backend\n",ret);
@@ -43,7 +44,6 @@ void vga_console_boot_byte(char ch)
 {
     if (ch=='\n') vga_terminal_feed(&vga_screens[0],'\r');
     vga_terminal_feed(&vga_screens[0],(uint8_t)ch);
-    if (ch=='\n') vga_console_present();
 }
 
 /** @brief Send query replies directly to the addressed VT's input, without echo. */

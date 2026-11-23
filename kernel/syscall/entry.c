@@ -103,6 +103,7 @@ static int syscall_eagain_is_nonblocking_device(struct task *task,
             (task_device_is(file, STORAGE_DEV_KIND_KEYBOARD) ||
              task_device_is(file, STORAGE_DEV_KIND_MOUSE) ||
              task_device_is(file, STORAGE_DEV_KIND_CONSOLE) ||
+             task_device_is(file, STORAGE_DEV_KIND_SERIAL) ||
              task_device_is(file, STORAGE_DEV_KIND_AUDIO) ||
              (file->node.flags & (STORAGE_NODE_FLAG_AUDIO_CONTROL |
                                   STORAGE_NODE_FLAG_AUDIO_TIMER)))) {
@@ -319,7 +320,7 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
     number = frame->rax;
     struct task *calling_task = sched_current_task();
     bool trace = syscall_trace_task(calling_task);
-    if (trace) console_debug("[syscall-trace] pid=%u nr=%llu args=%llx,%llx,%llx,%llx,%llx,%llx\n",
+    if (trace) console_info("[syscall-trace] pid=%u nr=%llu args=%llx,%llx,%llx,%llx,%llx,%llx\n",
         calling_task->pid, (unsigned long long)number,
         (unsigned long long)frame->rdi, (unsigned long long)frame->rsi,
         (unsigned long long)frame->rdx, (unsigned long long)frame->r10,
@@ -417,7 +418,7 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
         frame->error = 0;
         restored_signal_frame = 1;
     }
-    if (trace) console_debug("[syscall-trace] pid=%u nr=%llu result=%lld\n",
+    if (trace) console_info("[syscall-trace] pid=%u nr=%llu result=%lld\n",
         calling_task->pid, (unsigned long long)number, (long long)result);
     eagain_from_nonblocking =
         result == -RELIEFOS_EAGAIN &&

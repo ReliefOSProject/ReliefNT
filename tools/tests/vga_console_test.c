@@ -37,7 +37,7 @@ int main(void)
     vga_console_configure("console=vga",true); assert(console_vga_text_mode && inits==2);
     uint32_t unchanged[80*48]; memcpy(unchanged,pixels,sizeof(pixels));
     console_enable_framebuffer(); assert(!fb_console_enabled);
-    console_write("BOOT\n");
+    console_info("BOOT\n");
     assert((aperture[0]&255)=='[' || (aperture[0]&255)=='B');
     console_vt_activate(1,false);
     console_vt_write(1,"\033[2J\033[Hone",11);
@@ -66,7 +66,7 @@ int main(void)
     assert(!console_prepare_vt(true)); console_vt_activate(1,true);
     assert(presents==previous);
     pixels[100]=0x123456; memcpy(unchanged,pixels,sizeof(pixels));
-    console_vt_write(1,"hidden",6); console_write("kernel diagnostic\n");
+    console_vt_write(1,"hidden",6); console_info("kernel diagnostic\n");
     assert(presents==previous && !memcmp(unchanged,pixels,sizeof(pixels)));
     enter_error=-16;
     assert(console_prepare_vt(false)==-16 && console_vt_graphical);
@@ -80,5 +80,16 @@ int main(void)
     assert(!memcmp(unchanged,pixels,sizeof(pixels)));
     vga_console_panic_begin(); vga_console_panic_write("PANIC\n",6,12);
     assert(panic_enters==1 && aperture[0]==0x0c50);
+    /* A legacy machine without a framebuffer needs the same full terminal,
+     * not the early-boot character sink that discards cursor/edit commands. */
+    console_vga_text_mode = false;
+    display.available = false;
+    vga_console_configure(NULL, false);
+    assert(!console_vga_text_mode && inits == 2);
+    vga_console_configure(NULL, true);
+    assert(console_vga_text_mode && inits == 3);
+    console_vt_activate(1, false);
+    console_vt_write(1, "\033cABCDE\033[3D\033[@X", 15);
+    assert((aperture[2] & 255) == 'X' && (aperture[3] & 255) == 'C');
     puts("PASS VGA dispatch: explicit parameter, boot output, six independent VTs, hidden output, query routing, graphics restore/failure isolation and panic");
 }

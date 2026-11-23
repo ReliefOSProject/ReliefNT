@@ -204,7 +204,8 @@ static void pty_initialize_session(struct pty_session *session, uint32_t owner_p
                                RELIEFOS_PTY_LFLAG_ECHONL |
                                RELIEFOS_PTY_LFLAG_ICANON |
                                RELIEFOS_PTY_LFLAG_IEXTEN |
-                               RELIEFOS_PTY_LFLAG_ISIG;
+                               RELIEFOS_PTY_LFLAG_ISIG |
+                               LINUX_ECHOE | LINUX_ECHOK | LINUX_ECHOCTL | LINUX_ECHOKE;
     session->termios.c_cc[RELIEFOS_PTY_CC_VEOF] = 4;
     session->termios.c_cc[RELIEFOS_PTY_CC_VEOL] = 0;
     session->termios.c_cc[RELIEFOS_PTY_CC_VERASE] = 127;
@@ -216,6 +217,8 @@ static void pty_initialize_session(struct pty_session *session, uint32_t owner_p
     session->termios.c_cc[RELIEFOS_PTY_CC_VSTOP] = 19;
     session->termios.c_cc[RELIEFOS_PTY_CC_VSUSP] = 26;
     session->termios.c_cc[RELIEFOS_PTY_CC_VTIME] = 0;
+    session->termios.c_cc[LINUX_VWERASE] = 23;
+    session->termios.c_cc[LINUX_VLNEXT] = 22;
     session->termios.c_ispeed = 115200U;
     session->termios.c_ospeed = 115200U;
     session->winsize = *winsize;

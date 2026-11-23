@@ -40,6 +40,8 @@ int net_ipv6_multicast_change(const struct in6_addr *address,uint32_t ifindex,in
 
 int file_can_read(const struct task_file *file) { return file != NULL; }
 int file_can_write(const struct task_file *file) { return file != NULL; }
+int user_range_readable(uint64_t address, uint64_t length)
+{ return user_range_ok(address,length) ? 0 : -LINUX_EFAULT; }
 
 /* The scalar fallback is only reached by the old, incorrect vector path. */
 int64_t syscall_io_write(uint64_t fd, uint64_t address, uint64_t length)

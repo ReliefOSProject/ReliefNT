@@ -5,6 +5,7 @@
 #include <string.h>
 #include <reliefnt/lock.h>
 #include "modules/framebuffer.h"
+#define CONSOLE_TEST_PANIC_SERIAL
 #include "modules/console.h"
 #include "../../lib/bugcheck.c"
 
@@ -28,6 +29,7 @@ void x86_64_outw(uint16_t value,uint16_t port) {(void)value;(void)port;++vbe_acc
 uint16_t x86_64_inw(uint16_t port) {(void)port;++vbe_accesses;return 0;}
 void *kernel_malloc(size_t bytes) {CHECK(!panic_phase);++allocations;return malloc(bytes);}
 void kernel_free(void *pointer) {CHECK(!panic_phase);free(pointer);}
+void serial_panic_quiesce(void) {CHECK(panic_phase);}
 void serial_write(const char *text) {(void)text;CHECK(!panic_phase);}
 void serial_write_emergency(const char *text,size_t length)
 {CHECK(length<sizeof(serial_output)-serial_used);memcpy(serial_output+serial_used,text,length);serial_used+=length;serial_output[serial_used]=0;}
@@ -94,9 +96,11 @@ static void scenario(uint8_t bytes,bool graphical)
     fb_console_render_vt=3;
     vt_text[console_active_vt-1].charset[0]=1;
     vt_text[console_active_vt-1].charset_bank=0;
+    fb_console_insert_mode=true;
     panic_phase=true;
     struct console_panic_context context=console_panic_begin();
     CHECK(fb_console_render_vt==0);
+    CHECK(!fb_console_insert_mode);
     CHECK(vt_text[context.vt-1].charset[0]==0);
     CHECK(context.vt==(graphical?1u:2u));
     CHECK(context.graphical==graphical);

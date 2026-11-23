@@ -1,3 +1,4 @@
+#include <reliefnt/serial.h>
 #include "../internal.h"
 #include <reliefnt/swap.h>
 
@@ -114,8 +115,17 @@ static int64_t syscall_poll_impl_core(struct task *task, struct pollfd *fds,
         } else if (file && file->character_file) {
             revents=character_file_poll(file->character_file,file,events);
         } else if (file && (file->flags & TASK_FILE_FLAG_DEV_NODE)) {
-            if (task_device_is(file, STORAGE_DEV_KIND_KEYBOARD) ||
-                task_device_is(file, STORAGE_DEV_KIND_MOUSE)) {
+            if (task_device_is(file, STORAGE_DEV_KIND_SERIAL)) {
+                if (!serial_com1_available()) revents |= POLLERR;
+                else {
+                    /* This diagnostic device has no receive path. A read
+                     * still completes immediately with EOF. */
+                    revents |= events & (POLLIN | POLLRDNORM);
+                    if (file_can_write(file) && serial_tx_writable())
+                        revents |= events & (POLLOUT | POLLWRNORM);
+                }
+            } else if (task_device_is(file, STORAGE_DEV_KIND_KEYBOARD) ||
+                       task_device_is(file, STORAGE_DEV_KIND_MOUSE)) {
                 task_evdev_bind_vt(task, file);
                 if ((events & POLLIN) &&
                     input_evdev_available_vt(file->node.first_cluster, file->aux,
@@ -126,17 +136,18 @@ static int64_t syscall_poll_impl_core(struct task *task, struct pollfd *fds,
                        task_device_is(file, STORAGE_DEV_KIND_CONSOLE)) {
                 uint32_t terminal = task_device_is(file, STORAGE_DEV_KIND_CONSOLE)
                     ? (uint32_t)file->aux : task->pty_id;
-                if ((events & POLLIN) && pty_input_available(terminal)) revents |= POLLIN;
-                if (pty_is_hungup(terminal)) {
-                    revents |= POLLHUP;
-                }
+                revents |= pty_poll_endpoint(terminal, false) &
+                    (events | POLLHUP | POLLERR);
             } else if (events & POLLIN) {
                 revents |= POLLIN;
             }
             if ((events & POLLOUT) && file_can_write(file) &&
                 !task_device_is(file, STORAGE_DEV_KIND_KEYBOARD) &&
                 !task_device_is(file, STORAGE_DEV_KIND_MOUSE) &&
+                !task_device_is(file, STORAGE_DEV_KIND_TTY) &&
+                !task_device_is(file, STORAGE_DEV_KIND_CONSOLE) &&
                 !task_device_is(file, STORAGE_DEV_KIND_AUDIO) &&
+                !task_device_is(file, STORAGE_DEV_KIND_SERIAL) &&
                 !(file->node.flags & (STORAGE_NODE_FLAG_AUDIO_CONTROL |
                                       STORAGE_NODE_FLAG_AUDIO_MIXER))) {
                 revents |= POLLOUT;
@@ -153,12 +164,12 @@ static int64_t syscall_poll_impl_core(struct task *task, struct pollfd *fds,
             }
         } else if (fd >= 0 && fd <= 2 && task_pty_stream_for_fd(task, fd) >= 0) {
             if (fd == 0) {
-                if (pty_input_available(task->pty_id)) revents |= POLLIN;
+                if (pty_input_ready(task->pty_id)) revents |= POLLIN;
                 if (pty_is_hungup(task->pty_id)) revents |= POLLHUP;
             } else if (pty_is_hungup(task->pty_id)) {
                 revents |= POLLHUP;
             } else if (events & POLLOUT) {
-                revents |= POLLOUT;
+                revents |= pty_poll_endpoint(task->pty_id, false) & POLLOUT;
             }
         } else if (!task_pty_fd_for_fd(task, fd)) {
             revents |= POLLNVAL;

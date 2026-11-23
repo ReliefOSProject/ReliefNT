@@ -43,7 +43,7 @@ static unsigned extended(struct vga_terminal *t, unsigned at, uint8_t *out)
     if (kind == 2) {
         unsigned first = at + 2;
         /* ISO colon form may include an empty colorspace slot. */
-        if (t->colon[at] && first + 3 < t->count && t->colon[first+2] && !t->params[first]) ++first;
+        if (t->colon[at] && first + 3 < t->count && t->colon[first+2]) ++first;
         if (first + 2 < t->count) {
             *out = nearest(t->params[first],t->params[first+1],t->params[first+2]);
             return first+2;
@@ -91,11 +91,12 @@ static void mode(struct vga_terminal *t, unsigned n, bool on)
     else if (n == 5) t->reverse_screen = on;
     else if (n == 6) {
         p->cursor.origin = on; p->cursor.x = 0; p->cursor.y = on ? p->top : 0;
+        p->pending_wrap = false;
     } else if (n == 7) { p->cursor.wrap = on; p->pending_wrap = false; }
     else if (n == 25) t->visible = on;
     else if (n == 1048) {
         if (on) p->saved = p->cursor;
-        else p->cursor = p->saved;
+        else vga_terminal_restore_cursor(p);
     } else if (n == 47 || n == 1047 || n == 1049) {
         if (on && !t->alternate) {
             if (n == 1049) t->page[0].saved = t->page[0].cursor;
@@ -103,7 +104,7 @@ static void mode(struct vga_terminal *t, unsigned n, bool on)
             t->alternate = 1;
         } else if (!on && t->alternate) {
             t->alternate = 0;
-            if (n == 1049) t->page[0].cursor = t->page[0].saved;
+            if (n == 1049) vga_terminal_restore_cursor(&t->page[0]);
         }
     }
 }
@@ -133,6 +134,11 @@ void vga_terminal_csi(struct vga_terminal *t, uint8_t cmd)
     unsigned zero = t->params[0], n = zero ? zero : 1;
     unsigned second = t->count > 1 && t->params[1] ? t->params[1] : 1;
     unsigned low = c->origin ? p->top : 0, high = c->origin ? p->bottom : 24;
+    if (t->intermediate) {
+        if (!t->prefix && t->intermediate == ' ' && cmd == 'q' && zero <= 6)
+            t->cursor_style = zero;
+        return;
+    }
     if (cmd == 'h' || cmd == 'l') {
         for (unsigned i = 0; i < t->count; ++i) mode(t,t->params[i],cmd == 'h');
         return;
@@ -151,10 +157,6 @@ void vga_terminal_csi(struct vga_terminal *t, uint8_t cmd)
         return;
     }
     if (t->prefix) return;
-    if (t->intermediate) {
-        if (t->intermediate == ' ' && cmd == 'q' && zero <= 6) t->cursor_style = zero;
-        return;
-    }
     if (cmd != 'm' && cmd != 's' && cmd != 'u' && cmd != 'b') p->pending_wrap = false;
     switch (cmd) {
     case 'A': c->y = c->y > low + n ? c->y-n : low; break;
@@ -169,7 +171,7 @@ void vga_terminal_csi(struct vga_terminal *t, uint8_t cmd)
     case 'J':
         if (zero == 0) vga_terminal_erase(p,c->y*80+c->x,2000);
         if (zero == 1) vga_terminal_erase(p,0,c->y*80+c->x+1);
-        if (zero == 2) vga_terminal_erase(p,0,2000);
+        if (zero == 2 || zero == 3) vga_terminal_erase(p,0,2000);
         break;
     case 'K':
         if (zero == 0) vga_terminal_erase(p,c->y*80+c->x,(c->y+1)*80);
@@ -201,7 +203,7 @@ void vga_terminal_csi(struct vga_terminal *t, uint8_t cmd)
         break;
     }
     case 's': p->saved = *c; break;
-    case 'u': *c = p->saved; p->pending_wrap = false; break;
+    case 'u': vga_terminal_restore_cursor(p); break;
     case 'm': sgr(t); break;
     case 'g':
         if (!zero) t->tabs[c->x] = false;

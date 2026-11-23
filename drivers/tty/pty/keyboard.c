@@ -14,6 +14,17 @@ static int console_key_to_bytes(uint8_t keycode, char *buffer, uint32_t *length)
  */
 static void console_update_modifier(uint32_t held, uint8_t pressed);
 
+/* Physical keys cannot retry a partial queue write. Drop a whole encoded key
+ * when raw input is full, rather than delivering half an escape sequence. */
+static void console_queue_key(struct pty_session *session, uint32_t id,
+                                const char *bytes, uint32_t length)
+{
+    if (length > 1 && !(session->termios.c_lflag & LINUX_ICANON)) {
+        uint32_t used = (session->input_head + PTY_INPUT_CAP - session->input_tail) % PTY_INPUT_CAP;
+        if (PTY_INPUT_CAP - 1 - used < session->canonical_length + length) return;
+    }
+    (void)pty_write_input(session->owner_pid, id, bytes, length);
+}
 
 static int console_key_to_bytes(uint8_t keycode, char *buffer, uint32_t *length)
 {
@@ -24,7 +35,7 @@ static int console_key_to_bytes(uint8_t keycode, char *buffer, uint32_t *length)
     *length = 0;
     if (keycode >= INPUT_KEY_KP1 && keycode <= INPUT_KEY_KPDOT) {
         static const char digits[] = "1234567890.";
-        if (input_num_lock_active()) {
+        if ((input_num_lock_active() != 0) != (console_shift_down != 0)) {
             buffer[0]=digits[keycode-INPUT_KEY_KP1];*length=1;return 1;
         }
         switch(keycode) {
@@ -98,8 +109,18 @@ static int console_key_to_bytes(uint8_t keycode, char *buffer, uint32_t *length)
         default: break;
         }
     }
-    if (console_ctrl_down && ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z'))) {
-        ch = (char)(((ch | 0x20) - 'a') + 1);
+    if (console_ctrl_down) {
+        if ((ch >= '@' && ch <= '_') || (ch >= 'a' && ch <= 'z')) ch &= 0x1f;
+        else switch (ch) {
+        case ' ': case '2': ch = 0; break;
+        case '3': ch = 27; break;
+        case '4': ch = 28; break;
+        case '5': ch = 29; break;
+        case '6': ch = 30; break;
+        case '7': case '-': case '/': ch = 31; break;
+        case '8': case '?': ch = 127; break;
+        default: break;
+        }
     }
     buffer[0] = ch;
     *length = 1;
@@ -220,7 +241,7 @@ void pty_console_key_event(uint8_t keycode, uint8_t pressed)
             bytes[length++] = (char)((code >> 7) | 0x80);
             bytes[length++] = (char)(code | 0x80);
         } else bytes[length++] = (char)(code | (pressed ? 0 : 0x80));
-        (void)pty_write_input(session->owner_pid, pty_id, bytes, length);
+        console_queue_key(session, pty_id, bytes, length);
         return;
     }
     if (modifier) return;
@@ -231,20 +252,18 @@ void pty_console_key_event(uint8_t keycode, uint8_t pressed)
         return;
     }
     if (!pressed) return;
-    length=vga_console_key(pty_id,keycode,
+    uint8_t navigation = keycode;
+    if (keycode >= INPUT_KEY_KP1 && keycode <= INPUT_KEY_KPDOT &&
+        (input_num_lock_active() != 0) == (console_shift_down != 0)) {
+        static const uint8_t keypad_navigation[] = {79,80,81,75,0,77,71,72,73,82,83};
+        navigation = keypad_navigation[keycode - INPUT_KEY_KP1];
+    }
+    length=vga_console_key(pty_id,navigation,
         1u+(console_shift_down?1u:0u)+(console_alt_down?2u:0u)+(console_ctrl_down?4u:0u),bytes);
     if (!length && !console_key_to_bytes(keycode,bytes,&length)) return;
-    /* Feed through the same canonical/ISIG handling used by PTY hosts. */
-    (void)pty_write_input(session->owner_pid, pty_id, bytes, length);
-    if (session->termios.c_lflag & RELIEFOS_PTY_LFLAG_ECHO) {
-        if (keycode == 14) {
-            static const char erase[] = "\b \b";
-            console_vt_write(active_vt, erase, sizeof(erase) - 1U);
-        } else if (keycode == 28 || keycode == INPUT_KEY_KPENTER) {
-            static const char newline[] = "\r\n";
-            console_vt_write(active_vt, newline, sizeof(newline) - 1U);
-        } else if (length == 1 && (uint8_t)bytes[0] >= 32U) {
-            console_vt_write(active_vt, bytes, 1);
-        }
+    if (length == 1 && console_alt_down) {
+        bytes[1] = bytes[0]; bytes[0] = 27; length = 2;
     }
+    /* Feed through the same canonical/ISIG handling used by PTY hosts. */
+    console_queue_key(session, pty_id, bytes, length);
 }

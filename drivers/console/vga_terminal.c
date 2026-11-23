@@ -45,6 +45,17 @@ void vga_terminal_page_reset(struct vga_page *p)
     vga_terminal_erase(p, 0, VGA_TEXT_CELLS);
 }
 
+/** @brief Restore saved attributes and clamp against the current margins. */
+void vga_terminal_restore_cursor(struct vga_page *p)
+{
+    p->cursor = p->saved;
+    unsigned low = p->cursor.origin ? p->top : 0;
+    unsigned high = p->cursor.origin ? p->bottom : VGA_TEXT_ROWS - 1;
+    if (p->cursor.y < low) p->cursor.y = low;
+    if (p->cursor.y > high) p->cursor.y = high;
+    p->pending_wrap = false;
+}
+
 /** @brief Reset primary/alternate screens and independent stream-parser state. */
 void vga_terminal_reset(struct vga_terminal *t)
 {
@@ -104,7 +115,7 @@ void vga_terminal_scalar(struct vga_terminal *t, uint32_t cp)
     else { ++p->cursor.x; p->pending_wrap = false; }
 }
 
-enum { NORMAL, ESCAPE, CSI, STRING, STRING_ESC, CHARSET, HASH };
+enum { NORMAL, ESCAPE, CSI, STRING, STRING_ESC, CHARSET, HASH, IGNORE_ONE };
 
 /** @brief Incrementally consume a bounded escape stream and UTF-8 scalars. */
 void vga_terminal_feed(struct vga_terminal *t, uint8_t b)
@@ -137,8 +148,10 @@ void vga_terminal_feed(struct vga_terminal *t, uint8_t b)
         } else if (b == '(' || b == ')') {
             t->parser = CHARSET; t->charset_target = b == ')';
         } else if (b == '#') t->parser = HASH;
+        else if (b == '%' || b == '*' || b == '+' || b == '-' || b == '.' || b == '/')
+            t->parser = IGNORE_ONE;
         else if (b == '7') p->saved = p->cursor;
-        else if (b == '8') { p->cursor = p->saved; p->pending_wrap = false; }
+        else if (b == '8') vga_terminal_restore_cursor(p);
         else if (b == 'c') vga_terminal_reset(t);
         else if (b == 'D' || b == 'E' || b == 'M') vga_terminal_index(p, b == 'M', b == 'E');
         else if (b == 'H') t->tabs[p->cursor.x] = true;
@@ -152,17 +165,24 @@ void vga_terminal_feed(struct vga_terminal *t, uint8_t b)
         if (b == '8') for (unsigned i = 0; i < VGA_TEXT_CELLS; ++i) p->cells[i] = 0x0745;
         t->parser = NORMAL; return;
     }
+    if (t->parser == IGNORE_ONE) { t->parser = NORMAL; return; }
     if (t->parser == CSI) {
         if (b >= '0' && b <= '9') {
+            if (t->intermediate) t->overflow = true;
             unsigned next = t->value * 10 + b - '0';
             t->value = next > 65535 ? 65535 : next; t->digit = true;
         } else if (b == ';' || b == ':') {
+            if (t->intermediate) t->overflow = true;
             if (t->count < VGA_TEXT_PARAMS) {
                 t->params[t->count] = t->value; t->colon[t->count++] = b == ':';
             } else t->overflow = true;
             t->value = 0; t->digit = false;
-        } else if (b >= 0x3c && b <= 0x3f && !t->count && !t->digit && !t->intermediate) t->prefix = b;
-        else if (b >= 0x20 && b <= 0x2f) t->intermediate = b;
+        } else if (b >= 0x3c && b <= 0x3f && !t->count && !t->digit && !t->prefix && !t->intermediate)
+            t->prefix = b;
+        else if (b >= 0x20 && b <= 0x2f) {
+            if (t->intermediate) t->overflow = true;
+            t->intermediate = b;
+        }
         else if (b >= 0x40 && b <= 0x7e) {
             if (t->count < VGA_TEXT_PARAMS) {
                 t->params[t->count] = t->value; t->colon[t->count++] = false;

@@ -106,3 +106,6 @@ msgstr ""
 "``rtnetlink(7)``. POSIX specifies application interfaces; the corresponding IETF standards specify"
 " IPv6 wire protocol details. Targeted host tests and full-system VM tests provide different "
 "evidence; QEMU results cannot replace VMware or physical hardware results."
+
+msgid "TCP、UDP 和 raw socket 的 ``bind`` 与 Linux 一样，只对需要区域标识的地址 使用 ``sin6_scope_id``。绑定 ``::``、``::1``、IPv4 映射地址或其他无此需求的 地址时忽略该字段，避免将旧版 Netty 留下的未初始化值误判为不存在的网卡。 链路本地地址及接口／链路本地多播地址仍校验接口；``SO_BINDTODEVICE`` 指定的设备绑定继续生效。"
+msgstr "As on Linux, bind on TCP, UDP, and raw sockets uses sin6_scope_id only for addresses that require a scope identifier. For ::, ::1, IPv4-mapped addresses, and other addresses without that requirement, the field is ignored so that an uninitialized value left by older Netty versions is not mistaken for a nonexistent interface. Link-local addresses and interface-local or link-local multicast addresses still require a valid interface. Device binding selected with SO_BINDTODEVICE remains effective."

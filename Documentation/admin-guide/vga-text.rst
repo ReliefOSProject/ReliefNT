@@ -2,8 +2,10 @@
 VGA Text Mode 后端
 ===================
 
-``console=vga`` 显式请求字符平面控制台，默认不启用。
+``console=vga`` 显式请求字符平面控制台；有 framebuffer 时默认使用 framebuffer。
 ``console=framebuffer`` 可覆盖之前的 VGA 请求；匹配完整命令行 token。
+Legacy 启动没有可用 framebuffer 时，会自动尝试同一个完整 VGA 终端后端，
+使交互式 TTY 也具备光标移动和插入/删除能力。
 只有硬件探测和模式切换均成功才发布 ``console_vga_text_mode``。
 不支持的设备维持原后端，打印可诊断错误。
 
