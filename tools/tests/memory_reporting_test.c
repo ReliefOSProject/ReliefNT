@@ -647,6 +647,62 @@ static void stale_negative(void)
     puts("PASS committed mprotect denial, reserved/fetch errors, ineligible first-write leaves and upper-level protection");
 }
 
+/** @brief A timed syscall wake may retain its old queue before a file fault.
+ * Exercise both data reads and instruction fetches behind another disk owner;
+ * only the faulting task's obsolete wait link may move to the fault queue.
+ */
+static void file_fault_after_timed_wait(void)
+{
+    const uint64_t address = 0x20000000;
+    for (unsigned mode = 0; mode < 2; ++mode) {
+        struct storage_node node = {.type = RELIEFOS_FS_TYPE_FILE,
+            .flags = STORAGE_NODE_FLAG_FAT32, .first_cluster = 950 + mode,
+            .volume_id = 3, .size = 4096};
+        memset(file_bytes, 0x5a, 4096);
+        struct vfs_exec_source *source = exec_fixture_open(&node);
+        struct task *task = file_task(source, node, address, 0, node.size,
+            TASK_VMA_FLAG_PRIVATE | TASK_VMA_FLAG_FILE | TASK_VMA_FLAG_LAZY |
+            TASK_VMA_FLAG_SHARED_FILE, LINUX_PROT_READ | LINUX_PROT_EXEC);
+        prepare_task(task);
+        struct kernel_wait_queue syscall_waiters = {.lock = KERNEL_SPINLOCK_INIT};
+        struct task peer = {.pid = 999, .kind = TASK_KIND_USER, .state = TASK_BLOCKED};
+        assert(!kernel_wait_queue_add(&syscall_waiters, &peer));
+        assert(!kernel_wait_queue_sleep_current_until(&syscall_waiters, time_ticks() + 1));
+        assert(task->state == TASK_BLOCKED && syscall_waiters.count == 2);
+        uint64_t lock;
+        kernel_execution_lock_irqsave(&lock);
+        assert(memory_fault_storage_wait(task, address) == -ESRCH);
+        assert(memory_fault_storage_wait(&peer, address) == -ESRCH);
+        assert(syscall_waiters.count == 2 && task->waiting_queue == &syscall_waiters &&
+               peer.waiting_queue == &syscall_waiters);
+        kernel_execution_unlock_irqrestore(lock);
+        /* Timer expiry makes the task runnable without detaching the link;
+         * the retried syscall normally does that on its next entry. */
+        prepare_task(task);
+        provider_read_error = -EAGAIN;
+        unsigned before = live_pages;
+        struct fault_work work = {task, address, mode ? 0x14 : 4, 0x23, 0, NULL, 0};
+        run_fault(&work);
+        assert(!atomic_load(&signals) && task->state == TASK_BLOCKED);
+        assert(task->waiting_queue && task->waiting_queue != &syscall_waiters);
+        assert(syscall_waiters.count == 1 && syscall_waiters.head == &peer &&
+               syscall_waiters.tail == &peer && peer.waiting_queue == &syscall_waiters);
+        assert(live_pages == before && !address_space_user_page_phys(sched_task_as(task), address));
+        provider_read_error = 0;
+        run_fault(&work);
+        uint64_t physical = address_space_user_page_phys(sched_task_as(task), address);
+        assert(physical && !atomic_load(&signals) && !task->waiting_queue);
+        for (unsigned i = 0; i < 4096; ++i)
+            assert(((uint8_t *)mm_phys_to_virt(physical))[i] == 0x5a);
+        kernel_wait_queue_remove(&syscall_waiters, &peer);
+        destroy_task(task);
+        page_cache_forget_node(&node);
+        vfs_exec_source_put(source);
+        assert(!live_pages && !syscall_waiters.count);
+    }
+    puts("PASS data/fetch file faults replace expired syscall waits without SIGBUS or disturbing peer waiters");
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 3); nx_enabled = true; page_cache_init();
@@ -668,6 +724,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "stale-shared")) stale_shared();
     else if (!strcmp(argv[1], "stale-supervisor")) stale_supervisor();
     else if (!strcmp(argv[1], "stale-negative")) stale_negative();
+    else if (!strcmp(argv[1], "file-timed-wait")) file_fault_after_timed_wait();
     else abort();
     return 0;
 }

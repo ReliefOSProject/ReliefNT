@@ -312,6 +312,11 @@ const struct device_mapping_info *device_mapping_info(const struct device_mappin
 { (void)mapping; abort(); }
 uint64_t device_mapping_physical(struct device_mapping *mapping, uint64_t offset)
 { (void)mapping; (void)offset; abort(); }
+int device_mapping_prepare_cpu(struct device_mapping *mapping, uint64_t offset, bool writable)
+{ (void)mapping; (void)offset; (void)writable; abort(); }
+int device_mapping_cache_page(struct device_mapping *mapping, uint64_t offset,
+                               uint64_t physical, uint64_t *flags)
+{ (void)mapping; (void)offset; (void)physical; (void)flags; abort(); }
 #ifndef PRESSURE_OPEN_FIXTURE
 int storage_errno(int status) { return status; }
 #endif

@@ -42,13 +42,18 @@ void memory_wait_cancel(struct task *task)
 
 /** @brief Validate and prepare a current task's allocation-free pressure wait.
  * @param task Candidate current user task. @return Zero or terminal errno.
+ * A timer wake leaves the previous syscall's link for its retry entry to
+ * remove. A user fault can precede that entry, so retire only this running
+ * task's old registration before publishing the fault's own wait. The saved
+ * syscall continuation and any accepted provider request remain owned.
  */
 static int memory_fault_wait_admit(struct task *task)
 {
     if (!kernel_execution_is_outermost()) return -EDEADLK;
     if (!task || task != sched_current_task() || !task->pid ||
         task->kind != TASK_KIND_USER || task->state != TASK_RUNNING) return -ESRCH;
-    if (task->waiting_queue && task->waiting_queue != &pressure_waiters) return -EBUSY;
+    if (task->waiting_queue && task->waiting_queue != &pressure_waiters)
+        kernel_wait_queue_remove(task->waiting_queue, task);
     if (!release_notify_installed) {
         sched_set_memory_release_notify(memory_pressure_notify);
         release_notify_installed = true;
