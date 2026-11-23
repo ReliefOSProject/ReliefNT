@@ -35,6 +35,17 @@ class ConsoleTests(unittest.TestCase):
             subprocess.run(command, cwd=ROOT, check=True)
             subprocess.run([binary], check=True, timeout=30)
 
+    def test_serial_transmit_queue(self):
+        with tempfile.TemporaryDirectory(prefix="reliefnt-serial-") as tmp:
+            binary = str(Path(tmp) / "serial")
+            subprocess.run([
+                "clang", "-std=c11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
+                "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
+                "-Iinclude", "-Iinclude/uapi", "-no-pie",
+                "tools/tests/serial_tx_test.c", "kernel/device/serial_tx.c", "-o", binary,
+            ], cwd=ROOT, check=True)
+            subprocess.run([binary], check=True, timeout=10)
+
     def test_console_cursor_and_background_output(self):
         with tempfile.TemporaryDirectory(prefix="reliefos-vt-console-") as tmp:
             binary = str(Path(tmp) / "console")

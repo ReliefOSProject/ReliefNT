@@ -13,15 +13,7 @@
  */
 void console_init(void);
 /**
- * @brief Write a single character to the active console backend.
- */
-void console_putc(char ch);
-/**
- * @brief Write a NUL-terminated string to the console.
- */
-void console_write(const char *s);
-/**
- * @brief Append raw diagnostics to the kernel log and serial sink.
+ * @brief Append length-delimited input as INFO records in the kernel log.
  * @param s Bytes to write; need not be NUL-terminated.
  * @param len Number of bytes to write.
  */
@@ -72,12 +64,6 @@ struct console_panic_context console_panic_begin(void);
 void console_panic_write(const char *text, size_t length, uint32_t foreground);
 /** @brief Publish panic pixels with bounded hardware polling and no locks. */
 void console_panic_flush(void);
-/**
- * @brief Write directly to COM1 without registered drivers or console locks.
- * @param text Bytes to send; newline is expanded to CR/LF.
- * @param length Number of bytes; polling per character is bounded.
- */
-void serial_write_emergency(const char *text, size_t length);
 /** @brief Select black VGA text attributes, preserving a valid text cursor. */
 void vga_panic_begin(void);
 /**
@@ -87,12 +73,27 @@ void vga_panic_begin(void);
  */
 void vga_panic_putc(char ch, uint8_t foreground);
 /**
- * @brief Format INFO-level kernel diagnostics; raw output uses console_write.
+ * @brief Format INFO-level kernel diagnostics.
  */
 void console_printf(const char *fmt, ...);
 
+/** @brief Set the logging policy on the BSP before concurrent output begins.
+ * @param cmdline NUL-terminated boot arguments, or NULL for defaults.
+ */
 void console_log_configure(const char *cmdline);
+/** @brief Check the immutable boot logging policy without taking a lock.
+ * @param level Severity of the proposed record.
+ * @return True when the record should be formatted.
+ */
+bool console_log_enabled(enum console_log_level level);
+/** @brief Format and publish bounded kernel records to enabled sinks.
+ * @param level Severity of the record.
+ * @param fmt NUL-terminated kernel format string, with matching arguments.
+ */
 void console_log(enum console_log_level level, const char *fmt, ...);
+/** @brief Submit a literal driver message using its optional legacy level prefix.
+ * @param text NUL-terminated message or NULL.
+ */
 void console_log_write(const char *text);
 
 #define console_debug(...) console_log(CONSOLE_LOG_DEBUG, __VA_ARGS__)
@@ -121,14 +122,6 @@ void console_enable_vga_fallback(void);
  * @brief Select the UI color theme used by the framebuffer console.
  */
 void console_set_ui_theme(uint32_t theme);
-/**
- * @brief Initialize the COM1 serial port for early diagnostic output.
- */
-void serial_init(void);
-/**
- * @brief Return non-zero when the serial backend is available for output.
- */
-int serial_is_ready(void);
 /**
  * @brief Write a string to the serial backend (or the early COM1 fallback).
  */

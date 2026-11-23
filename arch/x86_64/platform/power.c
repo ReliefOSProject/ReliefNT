@@ -3,6 +3,7 @@
  * Provides shutdown, reboot, and platform-specific fallback mechanisms.
  */
 #include <reliefnt/console.h>
+#include <reliefnt/serial.h>
 #include <reliefnt/multiboot2.h>
 #include <reliefnt/power.h>
 #include <reliefnt/paging.h>
@@ -835,6 +836,7 @@ static int acpi_enable_power_management(void)
 void power_reboot(void)
 {
     console_info("[reliefnt] reboot requested\n");
+    serial_tx_flush();
     for (;;) {
         while (x86_64_inb(0x64) & 0x02) {
         }
@@ -849,6 +851,7 @@ void power_reboot(void)
 void power_shutdown(void)
 {
     console_info("[reliefnt] shutdown requested\n");
+    serial_tx_flush();
     if (acpi_enable_power_management()) {
         uint16_t sleep_enable = 1U << 13;
         uint16_t pm1a = x86_64_inw(acpi_power.pm1a_control);

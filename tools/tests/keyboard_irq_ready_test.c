@@ -30,6 +30,9 @@ void input_handle_scancode(uint8_t key, uint8_t pressed)
 void pci_irq_dispatch(uint32_t vector) { (void)vector; }
 void apic_eoi(void) { ++apic_eois; }
 void time_on_tick(void) { ++global_ticks; }
+/* No COM1 is present in this fixture. */
+void serial_tx_tick(void) {}
+void serial_tx_irq(void) { assert(0 && "unexpected COM1 interrupt"); }
 uint64_t time_uptime_us(void) { return 0; }
 uint8_t input_caps_lock_active(void) { return 0; }
 struct task *userland_schedule_from_frame(struct trap_frame *frame)

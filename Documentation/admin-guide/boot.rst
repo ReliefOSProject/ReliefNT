@@ -21,6 +21,17 @@ BIOS 入口检查 CPU 能力、建立页表与栈后进入共享 64 位内核。
 日志
 ====
 
-启动日志可镜像到 COM1。``logcolor=0`` 关闭内核颜色，``bootlog-pause=1``
-在启动检查点等待输入；普通启动继续进入用户态。文字控制台采用现有
-framebuffer 字形、pitch 和原生 RGB 转换，不假设紧密排列的 32 位像素。
+内核日志使用 ``[启动后秒数] [等级] [组件] 消息`` 格式。默认保留 INFO、WARN、ERROR 和
+FATAL。常见的进程启动、退出、回收及硬件缺席记录仅在 DEBUG 下输出。``debug`` 或 ``loglevel=8`` 开启
+DEBUG，``quiet`` 等效于 ``loglevel=4``。``loglevel=N`` 接受 0–8，输出优先级数值小于 N 的记录。FATAL 和
+panic 始终保留紧急输出。
+
+``log=screen,serial`` 是默认值。可用 ``log=screen`` 或 ``log=serial`` 只选一个日志目标，也可用
+``log=none`` 关闭常规内核日志。``logcolor=0`` 关闭普通日志颜色。``bootlog-pause=1``
+在启动检查点等待输入。``syscall-trace=/path/prefix`` 为匹配的程序启用系统调用诊断。
+
+COM1 使用 115200 波特、8N1。早期启动和 panic 使用有界轮询。进入用户态后，内核日志和控制台镜像进入 32 KiB 发送队列，由 IRQ4
+批量填充 UART FIFO，定时器负责兜底。队列为 WARN 和 ERROR 预留空间。积压清空后，串口报告丢弃的日志和控制台镜像数量。直接写入
+``/dev/ttyS0`` 时，阻塞写等待可用空间，非阻塞写在无法接收任何字节时返回 ``EAGAIN``。关闭或重启系统前会尝试发送队列中的数据。
+
+文字控制台使用现有 framebuffer 字形、pitch 和原生 RGB 转换，可处理带行间填充的帧缓冲。

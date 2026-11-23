@@ -185,7 +185,7 @@ int64_t syscall_io_write(uint64_t a0, uint64_t a1, uint64_t a2)
         request_len = a2 > RELIEFOS_FS_IO_SLICE_BYTES
                           ? RELIEFOS_FS_IO_SLICE_BYTES
                           : (uint32_t)a2;
-        console_write_len((const char *)(uintptr_t)a1, (size_t)request_len);
+        console_serial_write_len((const char *)(uintptr_t)a1, (size_t)request_len);
         return (int64_t)request_len;
     }
     struct task_file *file = task_file_for_io(task, (int)a0);

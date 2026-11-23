@@ -368,7 +368,10 @@ void console_serial_write_len(const char *text, size_t length)
 { (void)text; (void)length; abort(); }
 void console_write_len(const char *text, size_t length)
 { (void)text; (void)length; abort(); }
-void serial_write(const char *text) { (void)text; abort(); }
+bool serial_com1_available(void) { return false; }
+bool serial_tx_writable(void) { abort(); }
+int serial_tx_user(const void *bytes, size_t length)
+{ (void)bytes; (void)length; abort(); }
 int task_pipe_write(struct task_file *file, const void *buffer, uint32_t length)
 {
     assert(file && file->aux==0xf001 && transfer_pipe_mode);

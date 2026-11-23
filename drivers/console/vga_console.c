@@ -44,7 +44,6 @@ void vga_console_boot_byte(char ch)
 {
     if (ch=='\n') vga_terminal_feed(&vga_screens[0],'\r');
     vga_terminal_feed(&vga_screens[0],(uint8_t)ch);
-    if (ch=='\n') vga_console_present();
 }
 
 /** @brief Send query replies directly to the addressed VT's input, without echo. */

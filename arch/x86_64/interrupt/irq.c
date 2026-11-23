@@ -12,6 +12,7 @@
 #include <reliefnt/lock.h>
 #include <reliefnt/sched.h>
 #include <reliefnt/smp.h>
+#include <reliefnt/serial.h>
 #include <reliefnt/time.h>
 #include <reliefnt/trap.h>
 #include <reliefnt/userland.h>
@@ -83,6 +84,7 @@ static void pic_remap(void)
     io_wait();
 
     uint8_t mask1 = (uint8_t)~((1u << 0) | (1u << 1) | (1u << 2));
+    if (serial_com1_available()) mask1 &= (uint8_t)~(1u << 4);
     uint8_t mask2 = (uint8_t)~(1u << 4);
     x86_64_outb(mask1, PIC1_DATA);
     x86_64_outb(mask2, PIC2_DATA);
@@ -159,6 +161,7 @@ void irq_init(void)
         if (routed) {
             pic_mask_all();
             irq_uses_ioapic = true;
+            serial_tx_set_irq(serial_com1_available() && ioapic_route_irq(4u, 0x24u, apic_bsp_id()));
             console_info("[reliefnt] IOAPIC owns PIT/keyboard/mouse, PIT=%uHz BSP=%u\n",
                            (unsigned)RELIEFNT_TICK_HZ, (unsigned)apic_bsp_id());
             return;
@@ -166,11 +169,13 @@ void irq_init(void)
         /* Fall back to the LAPIC virtual-wire bridge.  This keeps legacy PIC
          * delivery alive after SMP enables the BSP local APIC. */
         apic_enable_legacy_pic();
+        serial_tx_set_irq(serial_com1_available());
         irq_uses_local_apic = apic_enabled();
         console_info("[reliefnt] PIC virtual-wire owns IRQ0/1/12, PIT=%uHz\n",
                        (unsigned)RELIEFNT_TICK_HZ);
         return;
     }
+    serial_tx_set_irq(serial_com1_available());
     console_info("[reliefnt] PIC remapped, PIT=%uHz, IRQ0/1/12 enabled\n",
                    (unsigned)RELIEFNT_TICK_HZ);
 }
@@ -195,6 +200,7 @@ struct task *irq_dispatch(struct trap_frame *frame)
     }
     if (vector == 0x20) {
         time_on_tick();
+        serial_tx_tick();
         if (from_user) {
             uint8_t byte;
             if (keyboard_led_next(&keyboard_led, input_caps_lock_active() ? 4U : 0U,
@@ -264,6 +270,9 @@ struct task *irq_dispatch(struct trap_frame *frame)
             }
         }
         irq_send_eoi(1);
+    } else if (vector == 0x24) {
+        serial_tx_irq();
+        irq_send_eoi(4);
     } else if (vector == 0x2c) {
         driver_manager_mouse_poll();
         irq_send_eoi(12);

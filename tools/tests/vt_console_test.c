@@ -173,9 +173,48 @@ static void test_text_damage(void)
     expect_damage(16, 0, 16, 16);
 }
 
+static void test_log_configuration(void)
+{
+    /* The default must avoid even timestamp work for suppressed DEBUG. */
+    console_log_configure("logcolor=0");
+    console_debug("default-filtered-debug\n");
+    assert(serial_length == 0 && log_len == 0);
+
+    console_log_configure("logcolor=0 debug log=serial");
+    console_debug("[test] first\nsecond\n");
+    assert(strstr(serial_output, "[DEBUG] [test] first\n"));
+    assert(strstr(serial_output, "[DEBUG] [reliefnt] second\n"));
+    assert(console_log_replay_start() == log_len);
+
+    console_log_configure("logcolor=0 debug quiet log=screen");
+    size_t output_before = serial_length;
+    size_t history_before = log_len;
+    console_info("quiet-filtered-info\n");
+    assert(log_len == history_before);
+    console_error("[test] retained error\n");
+    assert(log_len > history_before && console_log_replay_start() == 0);
+    assert(serial_length == output_before);
+
+    console_log_configure("logcolor=0 loglevel=5");
+    console_info("threshold-filtered-info\n");
+    console_warn("[test] kept warning\n");
+    assert(!strstr(serial_output, "threshold-filtered-info"));
+    assert(strstr(serial_output, "[WARN] [test] kept warning\n"));
+
+    console_log_configure("log=none");
+    output_before = serial_length;
+    console_error("sinks-disabled\n");
+    assert(serial_length == output_before);
+    console_fatal("[test] fatal bypass\n");
+    assert(strstr(serial_output, "[test] fatal bypass\n"));
+    console_log_configure("logcolor=0");
+}
+
 int main(void)
 {
-    console_log_configure("logcolor=0");
+    test_log_configuration();
+    log_start = log_len = serial_length = 0;
+    serial_output[0] = 0;
     console_enable_framebuffer();
     console_info("boot ready\n");
     uint32_t boot_col = fb_col;
@@ -186,7 +225,7 @@ int main(void)
     assert(full_clear_count == boot_clear_count);
     assert(fb_col == boot_col && fb_row == boot_row);
     assert(vt_text[0].length == boot_history_length);
-    assert(strstr(vt_text[0].bytes, "[INFO] boot ready\n") != NULL);
+    assert(strstr(vt_text[0].bytes, "[INFO] [reliefnt] boot ready\n") != NULL);
     console_vt_write(1, "init\n", 5);
     assert(full_clear_count == boot_clear_count);
     assert(vt_text[0].length == boot_history_length + 5u);
@@ -214,7 +253,7 @@ int main(void)
     console_vt_activate(2, false);
     console_vt_activate(1, false);
     assert(vt_text[0].length == startup_history_length);
-    assert(strstr(vt_text[0].bytes, "[INFO] boot ready\ninit\n") != NULL);
+    assert(strstr(vt_text[0].bytes, "[INFO] [reliefnt] boot ready\ninit\n") != NULL);
     assert(strstr(vt_text[0].bytes, openrc_output) != NULL);
     console_vt_activate(2, false);
     assert(fb_console_tty_cursor_visible && fb_console_tty_cursor_x == 0);
@@ -224,7 +263,7 @@ int main(void)
     assert(fb_console_tty_cursor_x == 16);
     uint32_t before[80 * 48];
     memcpy(before, pixels, sizeof(pixels));
-    console_write("background kernel log\n");
+    console_info("background kernel log\n");
     console_write_len("kmsg diagnostic\n", sizeof("kmsg diagnostic\n") - 1u);
     assert(memcmp(before, pixels, sizeof(pixels)) == 0);
     assert(vt_text[0].length == startup_history_length);
