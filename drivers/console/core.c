@@ -1,4 +1,5 @@
 #include "internal.h"
+#include <reliefnt/serial.h>
 
 static void vga_console_ansi_feed(char character);
 
@@ -42,8 +43,6 @@ uint32_t fb_col;
 uint32_t fb_row;
 
 uint32_t console_ui_theme = 1u;
-
-bool console_line_start = true;
 
 bool console_service_logs_only;
 
@@ -101,27 +100,21 @@ static void vga_console_ansi_feed(char character)
     }
 }
 
-void console_emit_raw(char ch)
+/** @brief Render one encoded record while the boot console owns the display. */
+void console_emit_display(const char *text, size_t length)
 {
-    char s[2] = {ch, 0};
-    if (console_vga_text_mode) {
-        log_store(ch);
-        serial_write(s);
-        if (!console_service_logs_only) vga_console_boot_byte(ch);
-        console_line_start = ch == '\n';
-        return;
+    if (console_service_logs_only) return;
+    if (!console_vga_text_mode) fb_console_hide_tty_cursor();
+    for (size_t i = 0; i < length; ++i) {
+        char ch = text[i];
+        if (console_vga_text_mode) vga_console_boot_byte(ch);
+        else {
+            if (vga_console_enabled) vga_console_ansi_feed(ch);
+            if (ch == '\n') fb_console_ansi_feed('\r');
+            fb_console_ansi_feed(ch);
+        }
     }
-    if (!console_service_logs_only) fb_console_hide_tty_cursor();
-    log_store(ch);
-    serial_write(s);
-    if (vga_console_enabled && !console_service_logs_only) {
-        vga_putc(ch);
-    }
-    if (!console_service_logs_only) {
-        if (ch == '\n') fb_console_newline();
-        else fb_console_putc(ch);
-    }
-    console_line_start = ch == '\n';
+    console_present();
 }
 
 /** @brief Draw the cursor and publish an active text grid when not staging. */
@@ -149,52 +142,18 @@ void console_set_ui_theme(uint32_t theme)
     console_ui_theme = theme == 0u ? 0u : 1u;
 }
 
-void console_putc(char ch)
+void console_serial_write_len(const char *text, size_t length)
 {
-    if (console_line_start) {
-        console_emit_timestamp();
+    if (!text) return;
+    char data[512];
+    /* Do not retain user pointers or run their faults in the TX lock. */
+    while (length) {
+        size_t chunk = length < sizeof(data) ? length : sizeof(data);
+        __builtin_memcpy(data, text, chunk);
+        serial_tx_record(data, chunk, false);
+        length -= chunk;
+        text += chunk;
     }
-    console_emit_raw(ch);
-}
-
-void console_write(const char *s)
-{
-    while (s && *s) {
-        console_putc(*s++);
-    }
-}
-
-/**
- * @brief Append raw diagnostic output to the kernel log and serial sink.
- * @param s Bytes to write; need not be NUL-terminated.
- * @param len Number of bytes to write.
- */
-void console_write_len(const char *s, size_t len)
-{
-    for (size_t i = 0; i < len; ++i) {
-        console_putc(s[i]);
-    }
-}
-
-/**
- * @brief Mirror system-console bytes to serial without creating kernel log records.
- * @param s Bytes already accepted by the console terminal.
- * @param len Number of bytes to mirror; s need not be NUL-terminated.
- */
-void console_serial_write_len(const char *s, size_t len)
-{
-    for (size_t i = 0; i < len; ++i) {
-        char byte[2] = {s[i], 0};
-        serial_write(byte);
-    }
-}
-
-void console_printf(const char *fmt, ...)
-{
-    va_list arguments;
-    va_start(arguments, fmt);
-    console_vlog(CONSOLE_LOG_INFO, fmt, arguments);
-    va_end(arguments);
 }
 
 void console_enable_framebuffer(void)

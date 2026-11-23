@@ -1,3 +1,4 @@
+#include <reliefnt/serial.h>
 #include "../internal.h"
 
 
@@ -157,19 +158,21 @@ int task_device_write(struct task *task, struct task_file *file,
         return (int)length;
     }
     if (task_device_is(file, STORAGE_DEV_KIND_SERIAL)) {
-        const char *src = (const char *)buffer;
-        uint32_t done = 0;
+        if (!length) return 0;
         if (!buffer) return -RELIEFOS_EFAULT;
-        /* The serial driver exposes a string-oriented backend.  Keep each
-         * temporary chunk bounded and preserve the write length. */
+        /* Stage a bounded chunk before taking the TX lock. A user mapping
+         * must not fault while the interrupt handler's queue lock is held. */
+        char bytes[512];
+        const char *source = buffer;
+        size_t done = 0;
         while (done < length) {
-            char chunk[128];
-            uint32_t take = length - done;
-            if (take >= sizeof(chunk)) take = sizeof(chunk) - 1u;
-            for (uint32_t i = 0; i < take; ++i) chunk[i] = src[done + i];
-            chunk[take] = 0;
-            serial_write(chunk);
-            done += take;
+            size_t take = length - done;
+            if (take > sizeof(bytes)) take = sizeof(bytes);
+            __builtin_memcpy(bytes, source + done, take);
+            int result = serial_tx_user(bytes, take);
+            if (result < 0) return done ? (int)done : result;
+            done += (size_t)result;
+            if ((size_t)result < take) break;
         }
         return (int)done;
     }

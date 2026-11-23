@@ -102,10 +102,9 @@ static void initialize_console_state(void)
     vga_console_enabled = false;
     fb_x = fb_y = fb_cols = fb_rows = fb_col = fb_row = 0;
     console_ui_theme = 1u;
-    console_line_start = true;
     console_service_logs_only = false;
     console_presenting = false;
-    console_log_color_enabled = false;
+    console_log_configure("logcolor=0");
     vga_ansi_state = 0;
     console_log_owner = UINT32_MAX;
     fb_saved_col = fb_saved_row = 0;

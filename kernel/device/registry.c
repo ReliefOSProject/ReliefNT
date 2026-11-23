@@ -1,3 +1,4 @@
+#include <linux/errno.h>
 #include <reliefnt/sound_service.h>
 #include "manager_internal.h"
 #include <reliefnt/driver_module.h>
@@ -65,7 +66,6 @@ static int driver_load_registered(struct driver_slot *slot,
 
 
 
-int early_serial_ready;
 
 
 struct driver_slot driver_slots[RELIEFOS_DRIVER_MAX];
@@ -136,9 +136,11 @@ static void driver_set_error(struct driver_slot *slot, int status, const char *e
     slot->info.state = RELIEFOS_DRIVER_STATE_FAILED;
     driver_copy_text(slot->info.error, sizeof(slot->info.error), error);
     if (status < 0) {
-        console_log(status == -19 ? CONSOLE_LOG_INFO : CONSOLE_LOG_ERROR,
-                    "[driver] %s failed status=%d: %s\n", slot->info.file,
-                       status, slot->info.error);
+        if (status == -ENODEV)
+            console_debug("[driver] %s hardware not present\n", slot->info.file);
+        else
+            console_error("[driver] %s failed status=%d: %s\n", slot->info.file,
+                          status, slot->info.error);
     }
 }
 
@@ -421,7 +423,7 @@ int driver_module_register(const struct reliefos_driver_module *descriptor,struc
         if(ret) { driver_memzero(slot,sizeof(*slot)); goto done; }
     }
     ret=driver_load_registered(slot,descriptor);
-    if(ret==-19) ret=0;
+    if(ret==-ENODEV) ret=0;
 done:
     driver_manager_phase_leave();
     return ret;

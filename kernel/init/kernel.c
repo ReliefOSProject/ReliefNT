@@ -6,6 +6,7 @@
 #include <reliefnt/arch.h>
 #include <reliefnt/apic.h>
 #include <reliefnt/console.h>
+#include <reliefnt/serial.h>
 #include <reliefnt/driver_manager.h>
 #include <reliefnt/graphics_service.h>
 #include <reliefnt/efi_fs.h>
@@ -287,7 +288,7 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
     /**
  * @brief Parse ACPI before the physical allocator can reclaim ACPI memory.
  */
-    console_info("[boot] discovering ACPI power controls and SMBIOS identity\n");
+    console_debug("[boot] discovering ACPI power controls and SMBIOS identity\n");
     power_init(&boot);
     if (power_acpi_capture_resources() < 0)
         panic("Unable to preserve ACPI boot resources");
@@ -298,7 +299,7 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
                      dmi->values[0], dmi->values[1], dmi->values[3], dmi->values[4]);
     }
 
-    console_info("[boot] discovering interrupt controllers and CPU topology limit=%u\n", SMP_MAX_CPUS);
+    console_debug("[boot] discovering interrupt controllers and CPU topology limit=%u\n", SMP_MAX_CPUS);
     arch_init();
     apic_init();
     ioapic_init();
@@ -308,11 +309,11 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
         console_info("[cpu] vendor=%s model=%s family=%u model_id=%u stepping=%u apic=%u\n",
                      cpu_info->vendor, cpu_info->model_name, cpu_info->family,
                      cpu_info->model, cpu_info->stepping, cpu_info->apic_id);
-        console_info("[cpu] cpuid_features ecx=0x%08x edx=0x%08x base_mhz=%u max_mhz=%u\n",
+        console_debug("[cpu] cpuid_features ecx=0x%08x edx=0x%08x base_mhz=%u max_mhz=%u\n",
                      cpu_info->leaf1_ecx, cpu_info->leaf1_edx,
                      cpu_info->base_mhz, cpu_info->max_mhz);
     }
-    console_info("[boot] initializing display and physical page allocator\n");
+    console_debug("[boot] initializing display and physical page allocator\n");
     /* Install the shared supervisor direct map before mm_init reads or writes
      * any physical page through its alias.  Initialize it before framebuffer
      * setup as that path also converts the firmware-provided physical surface. */
@@ -365,7 +366,7 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
     console_info("[boot] kernel_console=%s theme=%s serial=%s\n",
                  console_vga_text_mode ? "VGA-text" : framebuffer_get()->available ? "framebuffer" : "VGA",
                  boot_theme == 0u ? "win95" : "metro",
-                 serial_is_ready() ? "driver" : "early-COM1");
+                 serial_com1_available() ? "COM1" : "unavailable");
     sched_init();
     sched_create_idle_task();
     syscall_init();
@@ -376,7 +377,7 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
      * the CPU still holds the firmware IDT, whose gates select firmware GDT
      * segments and triple fault on delivery after the GDT switch. */
     idt_init();
-    console_info("[boot] GDT/TSS/IDT installed\n");
+    console_debug("[boot] GDT/TSS/IDT installed\n");
     irq_init();
     driver_manager_init();
     {
@@ -430,16 +431,16 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
             kernel_idle_loop();
         }
     }
-    console_info("[boot] loading built-in mouse, serial, network and audio drivers\n");
+    console_debug("[boot] loading built-in mouse, serial, network and audio drivers\n");
     driver_manager_load_builtin();
-    console_info("[boot] input providers initialized; initializing IPv4 networking\n");
+    console_debug("[boot] input providers initialized; initializing IPv4 networking\n");
     net_init();
     if (boot_log_pause) boot_log_wait_for_enter();
     if (pty_vt_init() < 0) {
         console_fatal("[reliefnt] unable to initialize six virtual terminals\n");
         kernel_idle_loop();
     }
-    console_info("[boot] virtual terminals tty1-tty6 ready; preparing PID 1\n");
+    console_debug("[boot] virtual terminals tty1-tty6 ready; preparing PID 1\n");
     userland_init(&boot);
     /* The PM clock and task table are ready, with no shared locks held.
      * Give the BSP the same local preemption checks as the APs while the PIT
@@ -463,6 +464,7 @@ static void kernel_start(uint32_t magic, uintptr_t multiboot_info)
 
     console_boot_complete();
     console_vt_activate(1, false);
+    serial_tx_start();
     userland_enter_first();
     kernel_idle_loop();
 }

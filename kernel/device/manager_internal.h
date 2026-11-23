@@ -25,20 +25,6 @@
 
 #include "../../arch/x86_64/port.h"
 
-#define EARLY_SERIAL_COM1 0x3f8u
-#define EARLY_SERIAL_LSR  (EARLY_SERIAL_COM1 + 5u)
-
-/* Kernel diagnostics must be available before the serial driver registers.
- * Keep a tiny COM1 backend here; the driver later replaces it through
- * register_serial(), without changing the public console API. */
-
-
-
-
-
-
-
-
 struct driver_slot {
     struct reliefos_driver_info info;
     const struct reliefos_driver_module *module;
@@ -49,7 +35,6 @@ struct driver_slot {
 };
 
 
-extern int early_serial_ready;
 extern struct driver_slot driver_slots[RELIEFOS_DRIVER_MAX];
 extern int32_t loading_slot;
 extern int32_t cleanup_slot;
@@ -65,19 +50,9 @@ extern uint32_t audio_generation, audio_lease_generation;
 extern struct mouse_state mouse_cache;
 extern struct kernel_spinlock manager_service_lock;
 
-/** @brief Borrow the immutable driver services used by builtin and native modules.
- * @return Permanent kernel-owned service table; no locks or callbacks.
- */
+
+/** @brief Borrow the immutable driver services used by builtin and native modules. */
 const struct reliefos_driver_kernel_api *driver_kernel_services(void);
-
-void early_serial_write(const char *text);
-
-/**
- * @brief Bypass driver registration and locks when reporting a fatal failure.
- * @param text Bytes to send through the already initialized COM1 UART.
- * @param length Number of bytes, independent of NUL termination.
- */
-void serial_write_emergency(const char *text, size_t length);
 
 /**
  * @brief Zero size bytes starting at address.
@@ -308,25 +283,6 @@ uint8_t driver_manager_mouse_last_ack(void);
  * @brief Forward mouse_poll to callers outside this file.
  */
 void driver_manager_mouse_poll(void);
-
-/**
- * @brief Program the COM1 UART (baud, frame format, FIFO, IRQ) and enable the early serial path.
- */
-void serial_init(void);
-
-/**
- * @brief Return 1 when a serial driver is registered and reports ready.
- * @return Driver result or 0 while absent/closing; one consistent ops/owner pin
- * spans is_ready, with no manager lock held during the callback.
- */
-int serial_is_ready(void);
-
-/**
- * @brief Write text through the serial driver, or the built-in COM1 path before one loads.
- * @param text Kernel-owned NUL-terminated text borrowed through callback return.
- * @return None. The matching local ops/owner snapshot stays pinned across write.
- */
-void serial_write(const char *text);
 
 /**
  * @brief Reserved startup hook; the NIC is brought up by its driver's init().

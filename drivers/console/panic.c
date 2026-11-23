@@ -1,4 +1,5 @@
 #include "internal.h"
+#include <reliefnt/serial.h>
 #include <reliefnt/graphics_service.h>
 
 /**
@@ -40,6 +41,7 @@ static void console_panic_store(const char *text, size_t length)
  */
 struct console_panic_context console_panic_begin(void)
 {
+    serial_panic_quiesce();
     const struct framebuffer *active = framebuffer_get();
     /* arch_userland_init may have disabled a GOP buffer that cannot survive
      * the active identity map. Never undo that decision in a fatal path. */

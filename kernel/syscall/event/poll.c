@@ -1,3 +1,4 @@
+#include <reliefnt/serial.h>
 #include "../internal.h"
 #include <reliefnt/swap.h>
 
@@ -114,8 +115,17 @@ static int64_t syscall_poll_impl_core(struct task *task, struct pollfd *fds,
         } else if (file && file->character_file) {
             revents=character_file_poll(file->character_file,file,events);
         } else if (file && (file->flags & TASK_FILE_FLAG_DEV_NODE)) {
-            if (task_device_is(file, STORAGE_DEV_KIND_KEYBOARD) ||
-                task_device_is(file, STORAGE_DEV_KIND_MOUSE)) {
+            if (task_device_is(file, STORAGE_DEV_KIND_SERIAL)) {
+                if (!serial_com1_available()) revents |= POLLERR;
+                else {
+                    /* This diagnostic device has no receive path. A read
+                     * still completes immediately with EOF. */
+                    revents |= events & (POLLIN | POLLRDNORM);
+                    if (file_can_write(file) && serial_tx_writable())
+                        revents |= events & (POLLOUT | POLLWRNORM);
+                }
+            } else if (task_device_is(file, STORAGE_DEV_KIND_KEYBOARD) ||
+                       task_device_is(file, STORAGE_DEV_KIND_MOUSE)) {
                 task_evdev_bind_vt(task, file);
                 if ((events & POLLIN) &&
                     input_evdev_available_vt(file->node.first_cluster, file->aux,
@@ -137,6 +147,7 @@ static int64_t syscall_poll_impl_core(struct task *task, struct pollfd *fds,
                 !task_device_is(file, STORAGE_DEV_KIND_TTY) &&
                 !task_device_is(file, STORAGE_DEV_KIND_CONSOLE) &&
                 !task_device_is(file, STORAGE_DEV_KIND_AUDIO) &&
+                !task_device_is(file, STORAGE_DEV_KIND_SERIAL) &&
                 !(file->node.flags & (STORAGE_NODE_FLAG_AUDIO_CONTROL |
                                       STORAGE_NODE_FLAG_AUDIO_MIXER))) {
                 revents |= POLLOUT;

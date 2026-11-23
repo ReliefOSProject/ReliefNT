@@ -228,7 +228,6 @@ extern uint32_t fb_rows;
 extern uint32_t fb_col;
 extern uint32_t fb_row;
 extern uint32_t console_ui_theme;
-extern bool console_line_start;
 extern bool console_service_logs_only;
 extern uint32_t fb_saved_col;
 extern uint32_t fb_saved_row;
@@ -348,12 +347,11 @@ void fb_console_stream_restore(const struct fb_console_state *state);
 /** @brief Reset text state and clear the full active rendering surface. */
 void fb_console_initialize_fullscreen(void);
 
-void console_emit_raw(char ch);
+void console_emit_display(const char *text, size_t length);
 
 /** @brief Draw the cursor and publish an active text grid when not staging. */
 void console_present(void);
 
-void console_emit_timestamp(void);
 
 void console_init(void);
 
@@ -361,12 +359,10 @@ void console_log_configure(const char *cmdline);
 
 void console_set_ui_theme(uint32_t theme);
 
-void console_putc(char ch);
 
-void console_write(const char *s);
 
 /**
- * @brief Append raw diagnostic output to the kernel log and serial sink.
+ * @brief Append length-delimited input as INFO records in the kernel log.
  * @param s Bytes to write; need not be NUL-terminated.
  * @param len Number of bytes to write.
  */

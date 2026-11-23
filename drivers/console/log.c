@@ -1,197 +1,79 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #include "internal.h"
 #include <reliefnt/export.h>
+#include <reliefnt/serial.h>
 
-static void print_unsigned_raw(uint64_t value, unsigned base, bool upper);
+#define CONSOLE_LOG_MESSAGE_BYTES 768u
+#define CONSOLE_LOG_RECORD_BYTES (CONSOLE_LOG_MESSAGE_BYTES + 96u)
 
-static void console_log_control(const char *sequence);
-
-static void console_log_putc(enum console_log_level level, char character);
-
-static void console_log_string(enum console_log_level level, const char *text);
-
-static void console_log_number(enum console_log_level level, uint64_t value,
-                               unsigned base, bool upper, unsigned width,
-                               bool zero_pad, bool negative);
-
-static bool console_log_color_enabled;
+static bool console_log_color_enabled = true;
+static bool log_screen = true;
+static bool log_serial = true;
+/* Kernel priorities are Linux loglevel values. Only priorities below the
+ * console threshold are emitted. FATAL always reaches the emergency sink. */
+static unsigned loglevel = 7;
 static uint32_t console_log_owner = UINT32_MAX;
-static const char *const console_log_prefixes[] = {
+static uint64_t last_timestamp;
+static bool log_head_fragment;
+static const unsigned priorities[] = {7, 6, 4, 3, 0};
+static const char *const prefixes[] = {
     "[DEBUG] ", "[INFO] ", "[WARN] ", "[ERROR] ", "[FATAL] ",
 };
-static const char *const console_log_colors[] = {
-    "\033[38;2;128;144;160m",
-    "\033[38;2;144;168;160m",
-    "\033[38;2;192;168;112m",
-    "\033[38;2;192;128;128m",
-    "\033[38;2;176;128;160m",
+static const char *const colors[] = {
+    "\033[38;2;128;144;160m", "\033[38;2;144;168;160m", "\033[38;2;192;168;112m",
+    "\033[38;2;192;128;128m", "\033[38;2;176;128;160m",
 };
-void log_store(char ch)
+
+struct log_format {
+    char *data;
+    size_t length;
+    size_t capacity;
+    bool truncated;
+};
+
+static void format_char(struct log_format *output, char ch)
 {
-    if (log_len < CONSOLE_LOG_CAP) {
-        log_buffer[(log_start + log_len++) % CONSOLE_LOG_CAP] = ch;
-    } else {
-        log_buffer[log_start] = ch;
-        log_start = (log_start + 1u) % CONSOLE_LOG_CAP;
-    }
+    if (output->length == output->capacity) output->truncated = true;
+    else output->data[output->length++] = ch ? ch : '?';
 }
 
-size_t console_log_replay_start(void)
+static void format_string(struct log_format *output, const char *text)
 {
-    size_t first = 0;
-    if (log_len == CONSOLE_LOG_CAP) {
-        while (first < log_len && log_buffer[(log_start + first) % CONSOLE_LOG_CAP] != '\n') ++first;
-        if (first < log_len) ++first;
-    }
-    return first;
+    for (; text && *text && !output->truncated; ++text) format_char(output, *text);
 }
 
-static void print_unsigned_raw(uint64_t value, unsigned base, bool upper)
+static void format_number(struct log_format *output, uint64_t value,
+                          unsigned base, bool upper, unsigned width,
+                          bool zero_pad, bool negative)
 {
-    char buf[32];
-    const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
-    size_t i = 0;
-
-    if (value == 0) {
-        console_emit_raw('0');
-        return;
-    }
-
-    while (value && i < sizeof(buf)) {
-        buf[i++] = digits[value % base];
-        value /= base;
-    }
-    while (i) {
-        console_emit_raw(buf[--i]);
-    }
-}
-
-void console_emit_timestamp(void)
-{
-    uint64_t uptime_us = time_uptime_us();
-    uint64_t seconds = uptime_us / 1000000ULL;
-    uint64_t micros = uptime_us % 1000000ULL;
-    uint64_t divisor = 1ULL;
-    uint32_t digits = 1U;
-
-    while (seconds >= divisor * 10ULL && digits < 20U) {
-        divisor *= 10ULL;
-        ++digits;
-    }
-    console_emit_raw('[');
-    for (uint32_t i = digits; i < 5U; ++i) {
-        console_emit_raw(' ');
-    }
-    print_unsigned_raw(seconds, 10, false);
-    console_emit_raw('.');
-    console_emit_raw((char)('0' + (micros / 100000ULL) % 10ULL));
-    console_emit_raw((char)('0' + (micros / 10000ULL) % 10ULL));
-    console_emit_raw((char)('0' + (micros / 1000ULL) % 10ULL));
-    console_emit_raw((char)('0' + (micros / 100ULL) % 10ULL));
-    console_emit_raw((char)('0' + (micros / 10ULL) % 10ULL));
-    console_emit_raw((char)('0' + micros % 10ULL));
-    console_emit_raw(']');
-    console_emit_raw(' ');
-}
-
-void console_log_configure(const char *cmdline)
-{
-    console_log_color_enabled = true;
-    const char *cursor = cmdline;
-    while (cursor && *cursor) {
-        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' || *cursor == '\n') ++cursor;
-        const char *end = cursor;
-        while (*end && *end != ' ' && *end != '\t' && *end != '\r' && *end != '\n') ++end;
-        size_t length = (size_t)(end - cursor);
-        if (length == sizeof("logcolor=0") - 1u) {
-            if (__builtin_memcmp(cursor, "logcolor=0", length) == 0)
-                console_log_color_enabled = false;
-            else if (__builtin_memcmp(cursor, "logcolor=1", length) == 0)
-                console_log_color_enabled = true;
-        }
-        cursor = end;
-    }
-}
-
-static void console_log_control(const char *sequence)
-{
-    serial_write(sequence);
-    for (const char *cursor = sequence; *cursor; ++cursor) {
-        log_store(*cursor);
-        if (!console_service_logs_only) {
-            if (console_vga_text_mode) vga_console_boot_byte(*cursor);
-            else fb_console_ansi_feed(*cursor);
-        }
-    }
-}
-
-static void console_log_putc(enum console_log_level level, char character)
-{
-    if (console_line_start && character != '\n' && character != '\r') {
-        console_emit_timestamp();
-        if (console_log_color_enabled) console_log_control(console_log_colors[level]);
-        const char *prefix = console_log_prefixes[level];
-        while (*prefix) console_emit_raw(*prefix++);
-        if (console_log_color_enabled) console_log_control("\033[0m");
-    }
-    bool line_start = console_line_start;
-    console_emit_raw(character);
-    if (character == '\r' && line_start) console_line_start = true;
-}
-
-static void console_log_string(enum console_log_level level, const char *text)
-{
-    while (text && *text) console_log_putc(level, *text++);
-}
-
-static void console_log_number(enum console_log_level level, uint64_t value,
-                               unsigned base, bool upper, unsigned width,
-                               bool zero_pad, bool negative)
-{
-    char digits_buffer[32];
+    char buffer[32];
     const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
     unsigned count = 0;
     do {
-        digits_buffer[count++] = digits[value % base];
+        buffer[count++] = digits[value % base];
         value /= base;
-    } while (value && count < sizeof(digits_buffer));
+    } while (value);
     unsigned length = count + (negative ? 1u : 0u);
-    if (negative && zero_pad) console_log_putc(level, '-');
+    if (negative && zero_pad) format_char(output, '-');
     while (width > length) {
-        console_log_putc(level, zero_pad ? '0' : ' ');
+        format_char(output, zero_pad ? '0' : ' ');
         --width;
     }
-    if (negative && !zero_pad) console_log_putc(level, '-');
-    while (count) console_log_putc(level, digits_buffer[--count]);
+    if (negative && !zero_pad) format_char(output, '-');
+    while (count) format_char(output, buffer[--count]);
 }
 
-void console_vlog(enum console_log_level level, const char *fmt, va_list arguments)
+static void format_message(struct log_format *output, const char *fmt, va_list arguments)
 {
-    if (!fmt || !*fmt) return;
-    if ((unsigned)level > CONSOLE_LOG_FATAL) level = CONSOLE_LOG_INFO;
-    uint64_t flags = kernel_irq_save();
-    uint32_t cpu = smp_current_cpu();
-    bool acquired = false;
-    if (__atomic_load_n(&console_log_owner, __ATOMIC_RELAXED) != cpu) {
-        do {
-            uint32_t expected = UINT32_MAX;
-            acquired = __atomic_compare_exchange_n(&console_log_owner, &expected,
-                cpu, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
-            if (acquired || level == CONSOLE_LOG_FATAL) break;
-            smp_membarrier_poll();
-            __asm__ volatile("pause" ::: "memory");
-        } while (!acquired);
-    }
-
-    if (!console_line_start) console_emit_raw('\n');
-    for (const char *p = fmt; *p; ++p) {
+    for (const char *p = fmt; *p && !output->truncated; ++p) {
         if (*p != '%') {
-            console_log_putc(level, *p);
+            format_char(output, *p);
             continue;
         }
 
         ++p;
         if (!*p) {
-            console_log_putc(level, '%');
+            format_char(output, '%');
             break;
         }
         bool zero_pad = *p == '0';
@@ -220,11 +102,11 @@ void console_vlog(enum console_log_level level, const char *fmt, va_list argumen
         switch (*p) {
         case 's': {
             const char *text = va_arg(arguments, const char *);
-            console_log_string(level, text ? text : "(null)");
+            format_string(output, text ? text : "(null)");
             break;
         }
         case 'c':
-            console_log_putc(level, (char)va_arg(arguments, int));
+            format_char(output, (char)va_arg(arguments, int));
             break;
         case 'd':
         case 'i': {
@@ -233,7 +115,7 @@ void console_vlog(enum console_log_level level, const char *fmt, va_list argumen
                          : size_flag ? va_arg(arguments, ptrdiff_t)
                                      : va_arg(arguments, int);
             uint64_t magnitude = value < 0 ? 0ULL - (uint64_t)value : (uint64_t)value;
-            console_log_number(level, magnitude, 10, false, width, zero_pad, value < 0);
+            format_number(output, magnitude, 10, false, width, zero_pad, value < 0);
             break;
         }
         case 'u': {
@@ -241,7 +123,7 @@ void console_vlog(enum console_log_level level, const char *fmt, va_list argumen
                           : long_flag ? va_arg(arguments, unsigned long)
                           : size_flag ? va_arg(arguments, size_t)
                                       : va_arg(arguments, unsigned int);
-            console_log_number(level, value, 10, false, width, zero_pad, false);
+            format_number(output, value, 10, false, width, zero_pad, false);
             break;
         }
         case 'x':
@@ -250,39 +132,197 @@ void console_vlog(enum console_log_level level, const char *fmt, va_list argumen
                           : long_flag ? va_arg(arguments, unsigned long)
                           : size_flag ? va_arg(arguments, size_t)
                                       : va_arg(arguments, unsigned int);
-            console_log_number(level, value, 16, *p == 'X', width, zero_pad, false);
+            format_number(output, value, 16, *p == 'X', width, zero_pad, false);
             break;
         }
         case 'p': {
             uintptr_t value = (uintptr_t)va_arg(arguments, void *);
-            console_log_string(level, "0x");
-            console_log_number(level, value, 16, false, width, zero_pad, false);
+            format_string(output, "0x");
+            format_number(output, value, 16, false, width, zero_pad, false);
             break;
         }
         case '%':
-            console_log_putc(level, '%');
+            format_char(output, '%');
             break;
         default:
-            console_log_putc(level, '%');
-            console_log_putc(level, *p);
+            format_char(output, '%');
+            format_char(output, *p);
             break;
         }
     }
 
-    if (!console_line_start) console_emit_raw('\n');
-    console_present();
+    if (output->truncated) {
+        static const char marker[] = " ... [truncated]";
+        size_t length = sizeof(marker) - 1u;
+        __builtin_memcpy(output->data + output->length - length, marker, length);
+    }
+}
+
+/* Text history is shared with boot-screen replay and the lock-free panic owner.
+ * Regular producers append complete encoded records while owning the logger. */
+static void log_store_bytes(const char *text, size_t length)
+{
+    size_t added = log_len + length;
+    if (added > CONSOLE_LOG_CAP) {
+        size_t keep = (log_start + added - CONSOLE_LOG_CAP) % CONSOLE_LOG_CAP;
+        log_head_fragment = log_buffer[(keep + CONSOLE_LOG_CAP - 1u) % CONSOLE_LOG_CAP] != '\n';
+    }
+    size_t end = (log_start + log_len) % CONSOLE_LOG_CAP;
+    size_t first = CONSOLE_LOG_CAP - end;
+    if (first > length) first = length;
+    __builtin_memcpy(log_buffer + end, text, first);
+    __builtin_memcpy(log_buffer, text + first, length - first);
+    if (added > CONSOLE_LOG_CAP) {
+        log_start = (log_start + added - CONSOLE_LOG_CAP) % CONSOLE_LOG_CAP;
+        added = CONSOLE_LOG_CAP;
+    }
+    log_len = added;
+}
+
+void log_store(char ch)
+{
+    log_store_bytes(&ch, 1);
+}
+
+size_t console_log_replay_start(void)
+{
+    size_t first = 0;
+    if (!log_screen) return log_len;
+    if (log_len == CONSOLE_LOG_CAP && log_head_fragment) {
+        while (first < log_len && log_buffer[(log_start + first) % CONSOLE_LOG_CAP] != '\n') ++first;
+        if (first < log_len) ++first;
+    }
+    return first;
+}
+
+static bool token_is(const char *token, size_t length, const char *value)
+{
+    return length == __builtin_strlen(value) && !__builtin_memcmp(token, value, length);
+}
+
+void console_log_configure(const char *cmdline)
+{
+    loglevel = 7;
+    console_log_color_enabled = true;
+    log_screen = log_serial = true;
+    while (cmdline && *cmdline) {
+        while (*cmdline && (unsigned char)*cmdline <= ' ') ++cmdline;
+        const char *start = cmdline;
+        while ((unsigned char)*cmdline > ' ') ++cmdline;
+        size_t length = (size_t)(cmdline - start);
+        if (token_is(start, length, "debug")) loglevel = 8;
+        else if (token_is(start, length, "quiet")) loglevel = 4;
+        else if (length == 10 && !__builtin_memcmp(start, "loglevel=", 9) &&
+                 start[9] >= '0' && start[9] <= '8') loglevel = (unsigned)(start[9] - '0');
+        else if (token_is(start, length, "logcolor=0")) console_log_color_enabled = false;
+        else if (token_is(start, length, "logcolor=1")) console_log_color_enabled = true;
+        else if (token_is(start, length, "log=screen")) { log_screen = true; log_serial = false; }
+        else if (token_is(start, length, "log=serial")) { log_screen = false; log_serial = true; }
+        else if (token_is(start, length, "log=none")) { log_screen = false; log_serial = false; }
+        else if (token_is(start, length, "log=serial,screen") || token_is(start, length, "log=screen,serial"))
+            log_screen = log_serial = true;
+    }
+}
+
+static enum console_log_level normalize_level(enum console_log_level level)
+{
+    return (unsigned)level <= CONSOLE_LOG_FATAL ? level : CONSOLE_LOG_INFO;
+}
+
+bool console_log_enabled(enum console_log_level level)
+{
+    level = normalize_level(level);
+    return level == CONSOLE_LOG_FATAL || (priorities[level] < loglevel && (log_screen || log_serial));
+}
+
+static bool has_component(const char *text, size_t length)
+{
+    if (length < 4 || text[0] != '[') return false;
+    for (size_t i = 1; i < length && i <= 32; ++i) {
+        unsigned char ch = (unsigned char)text[i];
+        if (ch == ']') return i > 1 && i + 1 < length && text[i + 1] == ' ';
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+              (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.')) return false;
+    }
+    return false;
+}
+
+static void publish_line(enum console_log_level level, uint64_t uptime,
+                         const char *text, size_t length, bool owned)
+{
+    char record[CONSOLE_LOG_RECORD_BYTES];
+    struct log_format line = {.data = record, .capacity = sizeof(record) - 1u};
+    if (owned) {
+        if (uptime < last_timestamp) uptime = last_timestamp;
+        last_timestamp = uptime;
+    }
+    format_char(&line, '[');
+    format_number(&line, uptime / 1000000u, 10, false, 5, false, false);
+    format_char(&line, '.');
+    format_number(&line, uptime % 1000000u, 10, false, 6, true, false);
+    format_string(&line, "] ");
+    if (console_log_color_enabled) format_string(&line, colors[level]);
+    format_string(&line, prefixes[level]);
+    if (console_log_color_enabled) format_string(&line, "\033[0m");
+    if (!has_component(text, length)) format_string(&line, "[reliefnt] ");
+    for (size_t i = 0; i < length; ++i) format_char(&line, text[i]);
+    format_char(&line, '\n');
+    record[line.length] = 0;
+    if (owned) {
+        log_store_bytes(record, line.length);
+        if (log_screen || level == CONSOLE_LOG_FATAL) console_emit_display(record, line.length);
+    }
+    if (level == CONSOLE_LOG_FATAL) serial_write_emergency(record, line.length);
+    else if (log_serial) {
+        if (console_service_logs_only) serial_tx_record(record, line.length, level >= CONSOLE_LOG_WARN);
+        else serial_write(record);
+    }
+}
+
+static void console_publish(enum console_log_level level, const char *text, size_t length)
+{
+    uint64_t uptime = time_uptime_us();
+    uint64_t flags = kernel_irq_save();
+    uint32_t cpu = smp_current_cpu();
+    bool acquired = false;
+    bool owned = __atomic_load_n(&console_log_owner, __ATOMIC_RELAXED) == cpu;
+    if (!owned) {
+        do {
+            if (__atomic_load_n(&console_log_owner, __ATOMIC_RELAXED) == UINT32_MAX) {
+                uint32_t expected = UINT32_MAX;
+                acquired = __atomic_compare_exchange_n(&console_log_owner, &expected, cpu,
+                    false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+            }
+            if (acquired || level == CONSOLE_LOG_FATAL) break;
+            smp_membarrier_poll();
+            __asm__ volatile("pause" ::: "memory");
+        } while (!acquired);
+        owned = acquired;
+    }
+    for (size_t from = 0; from < length;) {
+        size_t end = from;
+        while (end < length && text[end] != '\n') ++end;
+        size_t line_length = end - from;
+        if (line_length && text[end - 1u] == '\r') --line_length;
+        publish_line(level, uptime, text + from, line_length, owned);
+        from = end + 1u;
+    }
     if (acquired) __atomic_store_n(&console_log_owner, UINT32_MAX, __ATOMIC_RELEASE);
     kernel_irq_restore(flags);
 }
 
-/** @brief Append one formatted diagnostic through the permanent console/log core.
- * @param level Severity selecting the configured log policy.
- * @param fmt Borrowed terminated format string. @param ... Values matching fmt.
- * IRQ-safe and bounded by the underlying console policy. No caller storage is
- * retained; the core restores incoming IRQ state and serial callback pins.
- */
+void console_vlog(enum console_log_level level, const char *fmt, va_list arguments)
+{
+    if (!console_log_enabled(level) || !fmt || !*fmt) return;
+    char message[CONSOLE_LOG_MESSAGE_BYTES];
+    struct log_format output = {.data = message, .capacity = sizeof(message)};
+    format_message(&output, fmt, arguments);
+    console_publish(normalize_level(level), message, output.length);
+}
+
 void console_log(enum console_log_level level, const char *fmt, ...)
 {
+    if (!console_log_enabled(level)) return;
     va_list arguments;
     va_start(arguments, fmt);
     console_vlog(level, fmt, arguments);
@@ -290,12 +330,20 @@ void console_log(enum console_log_level level, const char *fmt, ...)
 }
 EXPORT_SYMBOL(console_log);
 
+void console_printf(const char *fmt, ...)
+{
+    va_list arguments;
+    va_start(arguments, fmt);
+    console_vlog(CONSOLE_LOG_INFO, fmt, arguments);
+    va_end(arguments);
+}
+
 void console_log_write(const char *text)
 {
     if (!text) return;
     enum console_log_level level = CONSOLE_LOG_INFO;
     for (unsigned candidate = CONSOLE_LOG_DEBUG; candidate <= CONSOLE_LOG_FATAL; ++candidate) {
-        const char *prefix = console_log_prefixes[candidate];
+        const char *prefix = prefixes[candidate];
         size_t matched = 0;
         while (prefix[matched] && text[matched] == prefix[matched]) ++matched;
         if (!prefix[matched]) {
@@ -305,4 +353,18 @@ void console_log_write(const char *text)
         }
     }
     console_log(level, "%s", text);
+}
+
+void console_write_len(const char *text, size_t length)
+{
+    if (!text || !console_log_enabled(CONSOLE_LOG_INFO)) return;
+    /* User buffers may fault. Stage them before acquiring logger ownership. */
+    char data[CONSOLE_LOG_MESSAGE_BYTES];
+    while (length) {
+        size_t chunk = length < sizeof(data) ? length : sizeof(data);
+        __builtin_memcpy(data, text, chunk);
+        console_publish(CONSOLE_LOG_INFO, data, chunk);
+        text += chunk;
+        length -= chunk;
+    }
 }
