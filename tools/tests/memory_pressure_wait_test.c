@@ -14,6 +14,7 @@ static bool outer = true;
 static int reclaim_result = -EAGAIN;
 static unsigned reclaim_calls;
 static enum pressure_stall_cause stall_cause;
+static uint64_t storage_progress;
 
 void kernel_spin_init(struct kernel_spinlock *lock) { lock->state = 0; }
 void kernel_spin_lock_irqsave(struct kernel_spinlock *lock, uint64_t *flags)
@@ -37,6 +38,7 @@ int memory_try_reclaim_fault(uint32_t pages)
 int memory_try_reclaim_no_oom(uint64_t pages)
 { assert(pages > 5 && outer && !scheduler_lock_depth && !queue_depth); ++reclaim_calls; return reclaim_result; }
 enum pressure_stall_cause memory_reclaim_stall_cause(void) { return stall_cause; }
+uint64_t storage_completion_generation(void) { return storage_progress; }
 
 static void run_as(struct task *task)
 {
@@ -60,6 +62,18 @@ int main(void)
     assert(!memory_fault_oom(a, 0x5000) && !a->waiting_queue);
 
     reclaim_result = -EAGAIN; stall_cause = PRESSURE_STALL_STORAGE;
+    /* A different owner can hold the global storage transaction while making
+     * repeated bounded I/O progress. That must restart this waiter's stall
+     * budget instead of converting a valid fault into SIGBUS. */
+    for (unsigned round = 0; round < 3; ++round) {
+        for (unsigned i = 0; i < 499; ++i) {
+            ++ticks; run_as(a);
+            assert(memory_fault_storage_wait(a, 0x6100) == -EAGAIN && a->waiting_queue);
+        }
+        ++storage_progress; ++ticks; run_as(a);
+        assert(memory_fault_storage_wait(a, 0x6100) == -EAGAIN && a->waiting_queue);
+    }
+    memory_wait_cancel(a);
     for (unsigned i = 0; i < 12; ++i) {
         run_as(a); assert(memory_fault_oom(a, 0x6000) == -EAGAIN && a->waiting_queue);
     }

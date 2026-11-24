@@ -230,12 +230,15 @@ bool sched_oom_victim_marked(const struct task *task, uint64_t epoch);
 /** @brief Count repeated pressure stalls for one current task and fault.
  * @param task Published task. @param address Fault address.
  * @param free_pages Allocatable page snapshot. @param cause Nonzero stall kind.
+ * @param progress_generation Monotonic relevant progress identity; zero when
+ * no progress source applies. A changed generation starts a new stall window.
  * @param tick Current scheduler tick; count at most once per distinct tick.
- * @return Consecutive stall observations with unchanged address, count and cause.
+ * @return Consecutive stall observations with unchanged identity/progress.
  * Execution-writer ownership keeps the private task allocation stable.
  */
 uint32_t sched_pressure_stall(struct task *task, uint64_t address,
-                              uint64_t free_pages, uint32_t cause, uint64_t tick);
+                              uint64_t free_pages, uint32_t cause,
+                              uint64_t progress_generation, uint64_t tick);
 /** @brief Clear a published task's private pressure progress state.
  * @param task Execution-owned task, nullable. No allocation or scheduling.
  */

@@ -32,6 +32,7 @@ void storage_wait_hint(uint64_t deadline)
 }
 
 /** @brief Advance the condition epoch and wake all registered storage waiters.
+ * Hardware completion or retired global storage ownership counts as progress.
  * IRQ/task safe; no driver lock, allocation, I/O or execution writer required.
  */
 void storage_completion_notify(void)
@@ -40,6 +41,14 @@ void storage_completion_notify(void)
     __atomic_add_fetch(&generation,1,__ATOMIC_RELEASE);
     kernel_wait_queue_wake_all(&waiters);
     kernel_spin_unlock_irqrestore(&event_lock,flags);
+}
+
+/** @brief Snapshot storage progress without acquiring the completion lock.
+ * @return Monotonic completion/ownership-retirement generation.
+ */
+uint64_t storage_completion_generation(void)
+{
+    return __atomic_load_n(&generation,__ATOMIC_ACQUIRE);
 }
 
 /** @brief Atomically check the completion epoch and publish a syscall wait.

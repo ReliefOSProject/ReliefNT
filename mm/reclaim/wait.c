@@ -4,6 +4,7 @@
 #include <reliefnt/memory_pressure.h>
 #include <reliefnt/mm.h>
 #include <reliefnt/sched.h>
+#include <reliefnt/storage_wait.h>
 #include <reliefnt/time.h>
 #include <reliefnt/wait.h>
 #include <linux/errno.h>
@@ -77,7 +78,10 @@ static int memory_fault_wait_defer(struct task *task, uint64_t address,
 #endif
     uint64_t now = time_ticks();
     if (cause != PRESSURE_STALL_NONE) {
-        uint32_t stalls = sched_pressure_stall(task, address, mm_free_memory_kib() / 4, cause, now);
+        uint64_t progress = cause == PRESSURE_STALL_STORAGE
+            ? storage_completion_generation() : 0;
+        uint32_t stalls = sched_pressure_stall(task, address, mm_free_memory_kib() / 4,
+                                               cause, progress, now);
         if ((cause == PRESSURE_STALL_STORAGE && stalls > PRESSURE_STORAGE_STALL_LIMIT) ||
             (cause == PRESSURE_STALL_VICTIM && stalls > PRESSURE_VICTIM_STALL_LIMIT)) {
             memory_wait_cancel(task);

@@ -182,6 +182,7 @@ struct task *alloc_task_slot(void)
             object->pressure_address = object->pressure_free = 0;
             object->pressure_stall_tick = 0;
             object->pressure_cause = object->pressure_stalls = 0;
+            object->pressure_storage_generation = 0;
             object->pressure_fault_cr3 = object->pressure_fault_rip = 0;
             object->pressure_fault_pages[0] = object->pressure_fault_pages[1] = 0;
             object->pressure_fault_pages[2] = object->pressure_fault_pages[3] = 0;
@@ -234,6 +235,7 @@ struct task *alloc_task_slot(void)
     object->pressure_address = object->pressure_free = 0;
     object->pressure_stall_tick = 0;
     object->pressure_cause = object->pressure_stalls = 0;
+    object->pressure_storage_generation = 0;
     object->pressure_fault_cr3 = object->pressure_fault_rip = 0;
     object->pressure_fault_pages[0] = object->pressure_fault_pages[1] = 0;
     object->pressure_fault_pages[2] = object->pressure_fault_pages[3] = 0;

@@ -507,7 +507,9 @@ int main(void)
     struct task storage_task;task_init(&storage_task,777,TASK_RUNNING);
     current_task=&storage_task;
     uint64_t observed=storage_wait_begin();
+    uint64_t progress=storage_completion_generation();
     storage_completion_notify();storage_wait_sleep(observed);
+    if(storage_completion_generation()!=progress+1)return EXIT_FAILURE;
     if(storage_task.state!=TASK_RUNNING || storage_task.waiting_queue)return EXIT_FAILURE;
     observed=storage_wait_begin();storage_wait_hint(510);storage_wait_sleep(observed);
     if(storage_task.state!=TASK_BLOCKED || last_sleep_tick!=510)return EXIT_FAILURE;

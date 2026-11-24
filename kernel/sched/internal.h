@@ -191,6 +191,7 @@ struct sched_task_object {
     int32_t oom_adjustment, oom_minimum;
     uint64_t oom_victim_epoch;
     uint64_t pressure_address, pressure_free, pressure_stall_tick;
+    uint64_t pressure_storage_generation;
     uint32_t pressure_cause, pressure_stalls;
     uint64_t pressure_fault_cr3, pressure_fault_rip, pressure_fault_pages[4];
     struct pressure_cursor pressure_fault_cursor[2];

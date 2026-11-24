@@ -17,6 +17,8 @@ uint64_t time_uptime_ms(void)
     return 0;
 }
 #include "../../block/core/storage_internal.h"
+/* Storage completion wakeups are outside this host fixture. */
+void storage_completion_notify(void) {}
 #include "../../block/core/storage_state.c"
 #include "../../block/core/device_number.c"
 #include "../../block/core/storage_state_data.c"

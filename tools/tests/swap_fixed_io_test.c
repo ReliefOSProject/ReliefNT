@@ -9,6 +9,8 @@
 #include "../../mm/swap/internal.h"
 /* Keep the real admission function while retaining this fixture's cache hook. */
 #define storage_filesystem_cache_event_device unused_fixture_cache_event_device
+/* Storage completion wakeups are outside this host fixture. */
+void storage_completion_notify(void) {}
 #include "../../block/core/storage_state.c"
 #undef storage_filesystem_cache_event_device
 
