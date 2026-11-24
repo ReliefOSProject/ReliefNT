@@ -36,6 +36,7 @@ int memory_oom_advance(uint32_t budget) { return pressure_fixture_no_victim(budg
 int memory_oom_advance(uint32_t budget) { (void)budget; abort(); }
 #endif
 void sched_set_memory_release_notify(void (*notify)(void)) { retirement_notify=notify; }
+uint64_t storage_completion_generation(void) { return 0; }
 
 #ifndef PRESSURE_INTEGRATION_FIXTURE_ENTRY
 #define PRESSURE_INTEGRATION_FIXTURE_ENTRY main

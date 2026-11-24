@@ -68,17 +68,21 @@ bool sched_oom_victim_marked(const struct task *task, uint64_t epoch)
  * @param task Execution-owned task, nullable. @param address Faulting byte.
  * @param free_pages Free-page snapshot. @param cause Current nonzero stall kind.
  * @param tick Scheduler tick; at most one observation counts per distinct tick.
- * @return Consecutive observations, reset when address, count or cause changes.
+ * @return Consecutive observations, reset when the fault identity or supplied
+ * progress generation changes. Storage progress resets only storage stalls.
  */
 uint32_t sched_pressure_stall(struct task *task, uint64_t address,
-                              uint64_t free_pages, uint32_t cause, uint64_t tick)
+                              uint64_t free_pages, uint32_t cause,
+                              uint64_t progress_generation, uint64_t tick)
 {
     struct sched_task_object *object = (struct sched_task_object *)task;
     if (!object) return 0;
     if (object->pressure_address != address || object->pressure_free != free_pages ||
-        object->pressure_cause != cause) {
+        object->pressure_cause != cause ||
+        object->pressure_storage_generation != progress_generation) {
         object->pressure_address = address; object->pressure_free = free_pages;
         object->pressure_cause = cause; object->pressure_stalls = 0;
+        object->pressure_storage_generation = progress_generation;
     }
     if (cause && (!object->pressure_stalls || object->pressure_stall_tick != tick)) {
         object->pressure_stall_tick = tick;
@@ -97,6 +101,7 @@ void sched_pressure_reset(struct task *task)
     object->pressure_address = object->pressure_free = 0;
     object->pressure_stall_tick = 0;
     object->pressure_cause = object->pressure_stalls = 0;
+    object->pressure_storage_generation = 0;
     object->pressure_fault_cursor[0].cache_attempt = false;
     object->pressure_fault_cursor[1].cache_attempt = false;
 }

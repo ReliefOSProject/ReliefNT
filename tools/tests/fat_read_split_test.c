@@ -22,6 +22,8 @@ static uint64_t deferred_start;
 static uint64_t fail_lba = UINT64_MAX;
 static struct { bool active; uint64_t lba; uint32_t count; void *buffer; } pending;
 
+/* Storage completion wakeups are outside this host fixture. */
+void storage_completion_notify(void) {}
 struct task *sched_current_task(void) { return NULL; }
 uint32_t sched_current_pid(void) { return 7; }
 uint32_t smp_cpu_count(void) { return 1; }

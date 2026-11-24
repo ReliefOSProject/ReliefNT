@@ -18,6 +18,10 @@ void storage_wait_hint(uint64_t deadline);
  * IRQ/task safe; wakes registered tasks without allocation or driver callbacks.
  */
 void storage_completion_notify(void);
+/** @brief Read the monotonic generation of completed storage operations.
+ * @return Current completion/owner-release generation; safe from IRQ/task context.
+ */
+uint64_t storage_completion_generation(void);
 /** @brief Park a retrying syscall only if no completion raced its condition check.
  * @param generation Snapshot returned by storage_wait_begin before the operation.
  * Execution-owned syscall epilogue only, after all transport locks unwind.

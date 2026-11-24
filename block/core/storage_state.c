@@ -1,6 +1,7 @@
 #include "storage_internal.h"
 #include <reliefnt/export.h>
 #include <reliefnt/storage_context.h>
+#include <reliefnt/storage_wait.h>
 #ifdef CONFIG_SWAP
 #include <reliefnt/swap_internal.h>
 #endif
@@ -83,6 +84,7 @@ void storage_release_task_io(uint32_t pid)
 {
     if (pid && storage_task_io_owner == pid) {
         storage_task_io_owner = 0;
+        storage_completion_notify();
     }
 }
 
