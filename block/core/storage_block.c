@@ -4,41 +4,89 @@
 #include "storage_internal.h"
 #include <linux/errno.h>
 
-/** @brief Transfer logical blocks through a held exact native device reference.
- * @param volume Borrowed instance retaining device_ref for the entire call.
- * @param lba First native logical block. @param count Nonzero native blocks.
- * @param buffer Stable current kernel buffer of count*block_size bytes.
- * @param write Whether buffer is readable write input instead of read output.
- * @return Zero or negative transport errno. Single-command reads preserve
- * resumable -EAGAIN; split reads temporarily use synchronous context because
- * this API cannot retain a completed prefix across caller replay. All exits
- * restore the caller's exact retry/commit flags and retain its I/O owner.
- * Execution ownership required; transport lock spans commands but never a
- * registry lock. The complete extent is validated before its first callback.
- */
-static int storage_transfer_blocks(const struct storage_volume *volume,uint64_t lba,
-                                      uint32_t count,void *buffer,bool write)
+/* One physical logical block used only by the 512-byte filesystem adapter,
+ * serialized with native I/O. Never retain this buffer across a syscall yield. */
+static uint8_t logical_scratch[STORAGE_MAX_LOGICAL_BLOCK] __attribute__((aligned(4096)));
+
+/* Caller owns transport exclusion and has validated the entire native extent. */
+static int transfer_locked(const struct block_device_ref *ref, const struct block_device_info *info,
+                           uint64_t lba, uint32_t count, void *buffer, bool write)
+{
+    while (count) {
+        uint32_t chunk = count < info->max_blocks ? count : info->max_blocks;
+        int rc = write ? block_device_write(ref, lba, chunk, buffer) :
+                         block_device_read(ref, lba, chunk, buffer);
+        if (rc) return rc;
+        count -= chunk;
+        lba += chunk;
+        buffer = (uint8_t *)buffer + (size_t)chunk * info->block_size;
+    }
+    return 0;
+}
+
+/* Single-command reads may unwind for replay; larger reads cannot retain a
+ * completed prefix. Keep each mutation or multi-command read synchronous. */
+static int storage_transfer_blocks(const struct block_device_ref *ref, const struct block_device_info *info,
+                                   uint64_t lba, uint32_t count, void *buffer, bool write)
+{
+    if (!buffer || !count || lba >= info->blocks || count > info->blocks - lba) return -EINVAL;
+    bool synchronous = write || count > info->max_blocks;
+    struct storage_io_context saved;
+    if (synchronous) storage_kernel_context_enter(&saved);
+    kernel_spin_lock(&storage_transport_lock);
+    int rc = transfer_locked(ref, info, lba, count, buffer, write);
+    kernel_spin_unlock(&storage_transport_lock);
+    if (synchronous) storage_kernel_context_leave(&saved);
+    return rc;
+}
+
+/* Map filesystem sectors to native transport blocks without advertising an
+ * emulated disk geometry. Edge writes preserve adjacent sectors, and the
+ * transport lock spans the whole read-modify-write, including cache eviction. */
+static int storage_transfer_sectors(const struct block_device_ref *ref, uint64_t lba,
+                                    uint32_t count, void *buffer, bool write)
 {
     struct block_device_info info;
-    int rc=block_device_info(&volume->device_ref,&info);if(rc)return rc;
-    if(!count || lba>=info.blocks || count>info.blocks-lba)return -EINVAL;
-    /* A replay starts at lba again. If a later native command yields, the
-     * first command on retry would discard that pending command's identity.
-     * Complete this bounded extent without unwinding instead; single-command
-     * reads still use the provider's owned asynchronous continuation. */
-    bool synchronous=!write && count>info.max_blocks;
+    int rc = block_device_info(ref, &info);
+    if (rc) return rc;
+    if (info.block_size < SECTOR_SIZE || info.block_size > STORAGE_MAX_LOGICAL_BLOCK)
+        return -EOPNOTSUPP;
+    uint32_t factor = info.block_size / SECTOR_SIZE;
+    if (info.blocks > UINT64_MAX / factor) return -EOVERFLOW;
+    uint64_t total = info.blocks * factor;
+    if (lba >= total || count > total - lba) return -EINVAL;
+    if (write && (info.flags & BLOCK_DEVICE_READ_ONLY)) return -EROFS;
+    if (!(lba % factor) && !(count % factor))
+        return storage_transfer_blocks(ref, &info, lba / factor, count / factor, buffer, write);
+
     struct storage_io_context saved;
-    if(synchronous)storage_kernel_context_enter(&saved);
+    storage_kernel_context_enter(&saved);
     kernel_spin_lock(&storage_transport_lock);
-    while(count) {
-        uint32_t chunk=count<info.max_blocks ? count : info.max_blocks;
-        rc=write ? block_device_write(&volume->device_ref,lba,chunk,buffer) :
-            block_device_read(&volume->device_ref,lba,chunk,buffer);
-        if(rc)break;
-        count-=chunk;lba+=chunk;buffer=(uint8_t *)buffer+(size_t)chunk*info.block_size;
+    uint8_t *data = buffer;
+    while (count) {
+        uint32_t offset = lba % factor;
+        uint32_t sectors;
+        if (!offset && count >= factor) {
+            uint32_t blocks = count / factor;
+            rc = transfer_locked(ref, &info, lba / factor, blocks, data, write);
+            sectors = blocks * factor;
+        } else {
+            sectors = count < factor - offset ? count : factor - offset;
+            rc = block_device_read(ref, lba / factor, 1, logical_scratch);
+            if (rc) break;
+            uint8_t *edge = logical_scratch + offset * SECTOR_SIZE;
+            if (write) {
+                __builtin_memcpy(edge, data, sectors * SECTOR_SIZE);
+                rc = block_device_write(ref, lba / factor, 1, logical_scratch);
+            } else __builtin_memcpy(data, edge, sectors * SECTOR_SIZE);
+        }
+        if (rc) break;
+        lba += sectors;
+        count -= sectors;
+        data += (size_t)sectors * SECTOR_SIZE;
     }
     kernel_spin_unlock(&storage_transport_lock);
-    if(synchronous)storage_kernel_context_leave(&saved);
+    storage_kernel_context_leave(&saved);
     return rc;
 }
 
@@ -53,9 +101,7 @@ static int storage_transfer_blocks(const struct storage_volume *volume,uint64_t 
 int storage_read_device(const struct storage_volume *volume,uint64_t lba,uint32_t sector_count,void *buffer)
 {
     if(!volume || !buffer || !sector_count)return -EINVAL;
-    struct block_device_info info;int rc=block_device_info(&volume->device_ref,&info);
-    if(rc)return rc;if(info.block_size!=512)return -EOPNOTSUPP;
-    rc=storage_transfer_blocks(volume,lba,sector_count,buffer,false);
+    int rc = storage_transfer_sectors(&volume->device_ref, lba, sector_count, buffer, false);
     if(rc<0 && rc!=-RELIEFOS_EAGAIN)
         console_error("[storage] device read failed volume=%u kind=%u transport=%u lba=%llu sectors=%u ret=%d\n",
             volume->volume_id,volume->kind,volume->transport,(unsigned long long)lba,sector_count,rc);
@@ -74,35 +120,33 @@ int storage_write_device(const struct storage_volume *volume,uint64_t lba,uint32
 {
     if(!volume || !buffer || !sector_count)return -EINVAL;
     storage_filesystem_cache_event(volume,lba,sector_count);
-    struct block_device_info info;int rc=block_device_info(&volume->device_ref,&info);
-    if(rc)return rc;if(info.block_size!=512)return -EOPNOTSUPP;
-    return storage_transfer_blocks(volume,lba,sector_count,(void *)buffer,true);
+    return storage_transfer_sectors(&volume->device_ref, lba, sector_count, (void *)buffer, true);
 }
 
-/** @brief Read a bounded raw extent with temporary exact device/code ownership.
- * @param disk Borrowed inventory record, required. @param lba First sector.
- * @param sector_count Nonzero sectors. @param buffer Current writable bytes.
- * @return Zero or native errno; all exits drop the temporary token. Caller holds
- * execution ownership and any outer multi-I/O transaction/OFD lifetime pin.
- */
-int storage_read_install_disk(const struct install_disk_state *disk,uint64_t lba,uint32_t sector_count,void *buffer)
+/* Partition tables and raw byte access use native LBAs, unlike filesystems. */
+static int transfer_install_disk(const struct install_disk_state *disk, uint64_t lba,
+                                 uint32_t count, void *buffer, bool write)
 {
-    struct storage_volume volume={0};int rc=storage_volume_from_install_disk(&volume,disk);
-    if(!rc)rc=storage_read_device(&volume,lba,sector_count,buffer);
-    storage_volume_put_device(&volume);return rc;
+    if (!disk || !disk->present) return -EINVAL;
+    struct block_device_ref ref = {0};
+    struct block_device_info info;
+    int rc = block_device_get(disk->device, &ref);
+    if (!rc) rc = block_device_info(&ref, &info);
+    if (!rc) rc = storage_transfer_blocks(&ref, &info, lba, count, buffer, write);
+    block_device_put(&ref);
+    return rc;
 }
 
-/** @brief Write a bounded raw extent while retaining exact device/code ownership.
- * @param disk Borrowed inventory record, required. @param lba First sector.
- * @param sector_count Nonzero sectors. @param buffer Current readable bytes.
- * @return Zero or native errno; all exits drop the temporary token. Caller holds
- * execution ownership and the outer multi-I/O transaction/OFD lifetime pin.
- */
-int storage_write_install_disk(const struct install_disk_state *disk,uint64_t lba,uint32_t sector_count,const void *buffer)
+int storage_read_install_disk(const struct install_disk_state *disk, uint64_t lba,
+                              uint32_t blocks, void *buffer)
 {
-    struct storage_volume volume={0};int rc=storage_volume_from_install_disk(&volume,disk);
-    if(!rc)rc=storage_write_device(&volume,lba,sector_count,buffer);
-    storage_volume_put_device(&volume);return rc;
+    return transfer_install_disk(disk, lba, blocks, buffer, false);
+}
+
+int storage_write_install_disk(const struct install_disk_state *disk, uint64_t lba,
+                               uint32_t blocks, const void *buffer)
+{
+    return transfer_install_disk(disk, lba, blocks, (void *)buffer, true);
 }
 
 /**
@@ -146,7 +190,8 @@ static int storage_gpt_guid_empty(const uint8_t guid[16])
  * implementation supports up to ReliefOS's fixed 128-entry in-memory limit,
  * but does not require the table itself to start at LBA 2: valid GPT tools
  * may choose another table position. */
-static int storage_gpt_header_valid_for_root(const struct gpt_header *header)
+static int storage_gpt_header_valid_for_root(const struct gpt_header *header,
+                                            const struct block_device_info *info)
 {
     struct gpt_header copy;
     uint64_t table_bytes;
@@ -156,7 +201,7 @@ static int storage_gpt_header_valid_for_root(const struct gpt_header *header)
         header->revision < 0x00010000u ||
         header->header_size != sizeof(struct gpt_header) ||
         header->reserved != 0 || header->current_lba != 1u ||
-        header->backup_lba <= header->current_lba ||
+        header->backup_lba <= header->current_lba || header->backup_lba >= info->blocks ||
         header->first_usable_lba < 2u ||
         header->first_usable_lba > header->last_usable_lba ||
         header->last_usable_lba >= header->backup_lba ||
@@ -168,8 +213,9 @@ static int storage_gpt_header_valid_for_root(const struct gpt_header *header)
     }
     table_bytes = (uint64_t)header->partition_entry_count *
                   header->partition_entry_size;
-    table_sectors = (table_bytes + SECTOR_SIZE - 1u) / SECTOR_SIZE;
+    table_sectors = (table_bytes + info->block_size - 1u) / info->block_size;
     if (!table_sectors || table_bytes > sizeof(storage_cluster_buf) ||
+        header->partition_entries_lba >= header->first_usable_lba ||
         table_sectors > header->first_usable_lba - header->partition_entries_lba) {
         return -22;
     }
@@ -277,7 +323,7 @@ int storage_read_iso_blocks(uint64_t lba,uint32_t block_count,void *buffer)
     if(g_storage.iso_sector_count && (lba>=g_storage.iso_sector_count || block_count>g_storage.iso_sector_count-lba))return -EIO;
     struct block_device_info info;int rc=block_device_info(&g_storage.device_ref,&info);
     if(rc)return rc;if(info.block_size!=2048)return -EOPNOTSUPP;
-    return storage_transfer_blocks(&g_storage,lba,block_count,buffer,false);
+    return storage_transfer_blocks(&g_storage.device_ref,&info,lba,block_count,buffer,false);
 }
 
 /** @brief Write selected-volume sectors using the registered native batch limit.
@@ -298,11 +344,11 @@ int storage_write_sectors(uint64_t lba, uint32_t sector_count, const void *buffe
     storage_sector_cache_invalidate();
     struct block_device_info info;int rc=block_device_info(&g_storage.device_ref,&info);
     if(rc)return rc;
-    uint32_t limit=info.max_blocks;
+    uint32_t limit = info.block_size == SECTOR_SIZE ? info.max_blocks : STORAGE_WRITE_MAX_SECTORS;
     while (sector_count) {
         uint32_t chunk = min_u32(sector_count,limit);
         int ret = storage_write_device(&g_storage, lba, chunk, src);
-        if (ret < 0 && chunk > 1u) {
+        if (ret < 0 && chunk > 1u && g_storage.transport != STORAGE_TRANSPORT_VIRTIO) {
             /* A few virtual AHCI implementations occasionally fail a
              * multi-sector DMA command even though the media is healthy.
              * Retry the same idempotent payload one sector at a time so a
@@ -339,7 +385,13 @@ int gpt_find_esp(void)
     uint64_t basic_data_candidate_lba = 0;
     uint8_t fat32_candidate_found = 0;
     uint64_t fat32_candidate_lba = 0;
-    int ret = storage_read_sectors(1, 1, storage_scratch);
+    struct block_device_info info;
+    int ret = block_device_info(&g_storage.device_ref, &info);
+    if (ret) return ret;
+    if (info.block_size < SECTOR_SIZE || info.block_size > sizeof(storage_scratch)) return -EOPNOTSUPP;
+    if (info.blocks > UINT64_MAX / info.block_size) return -EOVERFLOW;
+    uint32_t factor = info.block_size / SECTOR_SIZE;
+    ret = storage_read_sectors(factor, factor, storage_scratch);
     if (ret < 0) {
         return storage_read_failure(ret);
     }
@@ -351,7 +403,7 @@ int gpt_find_esp(void)
     uint32_t total_bytes;
     uint32_t total_sectors;
     uint32_t table_crc;
-    if (storage_gpt_header_valid_for_root(hdr) < 0) {
+    if (storage_gpt_header_valid_for_root(hdr, &info) < 0) {
         console_error("[reliefnt] GPT primary header invalid\n");
         return -22;
     }
@@ -359,7 +411,7 @@ int gpt_find_esp(void)
     size = hdr->partition_entry_size;
     console_info("[reliefnt] GPT found entries=%u entry_size=%u\n", count, size);
     total_bytes = count * size;
-    total_sectors = (total_bytes + SECTOR_SIZE - 1u) / SECTOR_SIZE;
+    total_sectors = ((total_bytes + info.block_size - 1u) / info.block_size) * factor;
     uint64_t phys = mm_alloc_pages((total_sectors + 7u) / 8u);
     if (!phys) {
         return -12;
@@ -369,7 +421,7 @@ int gpt_find_esp(void)
         mm_free_pages(phys, (total_sectors + 7u) / 8u);
         return -12;
     }
-    ret = storage_read_sectors(hdr->partition_entries_lba, total_sectors, table);
+    ret = storage_read_sectors(hdr->partition_entries_lba * factor, total_sectors, table);
     if (ret < 0) {
         mm_free_pages(phys, (total_sectors + 7u) / 8u);
         return ret;
@@ -380,6 +432,17 @@ int gpt_find_esp(void)
         mm_free_pages(phys, (total_sectors + 7u) / 8u);
         console_error("[reliefnt] GPT partition table invalid\n");
         return -5;
+    }
+    /* The CRC and every bound above were checked in native GPT units. All
+     * filesystem probes below, including legacy root selection, use 512 bytes. */
+    for (uint32_t i = 0; i < count; ++i) {
+        struct gpt_entry *entry = (struct gpt_entry *)(void *)(table + (uint64_t)i * size);
+        if (storage_gpt_guid_empty(entry->type_guid)) {
+            entry->first_lba = entry->last_lba = 0;
+        } else {
+            entry->first_lba *= factor;
+            entry->last_lba = (entry->last_lba + 1u) * factor - 1u;
+        }
     }
     for (uint32_t i = 0; i < count; ++i) {
         struct gpt_entry *entry = (struct gpt_entry *)(void *)(table + (uint64_t)i * size);

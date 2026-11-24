@@ -17,6 +17,7 @@
    resource-limits
    drivers
    storage-completion
+   virtio-blk
    network-devices
    e1000e
    i225

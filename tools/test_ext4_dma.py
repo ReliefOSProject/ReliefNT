@@ -10,5 +10,5 @@ with tempfile.TemporaryDirectory(prefix="ext4-dma-") as temporary:
         "-fno-sanitize-recover=all", "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
         "-DRELIEFOS_STORAGE_STANDALONE_TU", "-Iinclude", "-Iinclude/uapi",
         "tools/tests/ext4_dma_read_test.c", "-o", str(binary)], cwd=ROOT, check=True)
-    for args in ([], ["uncached"], ["no-memory"], ["high-memory"]):
+    for args in ([], ["uncached"], ["no-memory"], ["high-memory"], ["4kn"]):
         subprocess.run([str(binary), *args], check=True, timeout=30)

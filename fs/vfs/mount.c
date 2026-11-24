@@ -46,17 +46,17 @@ static int storage_path_append_text(char *path, uint32_t capacity, uint32_t *pos
     return 0;
 }
 
-static int storage_append_sd_suffix(char *out, uint32_t capacity, uint32_t *position,
+static int storage_append_disk_suffix(char *out, uint32_t capacity, uint32_t *position,
                                     uint32_t index)
 {
     char letters[8];
     uint32_t count = 0;
-    do {
+    for (;;) {
         if (count >= sizeof(letters)) return -22;
         letters[count++] = (char)('a' + (index % 26u));
-        index = index / 26u;
-        if (index) --index;
-    } while (index || count == 0);
+        if (index < 26u) break;
+        index = index / 26u - 1u;
+    }
     while (count) {
         if (*position + 1u >= capacity) return -22;
         out[(*position)++] = letters[--count];
@@ -102,8 +102,9 @@ int storage_disk_device_name(uint32_t disk_id, int32_t partition_index,
             storage_path_append_u32(out, capacity, &position, disk->nvme_nsid) < 0)
             return -22;
     } else {
-        if (storage_path_append_text(out, capacity, &position, "/dev/sd") < 0 ||
-            storage_append_sd_suffix(out, capacity, &position,
+        const char *prefix = disk->transport == STORAGE_TRANSPORT_VIRTIO ? "/dev/vd" : "/dev/sd";
+        if (storage_path_append_text(out, capacity, &position, prefix) < 0 ||
+            storage_append_disk_suffix(out, capacity, &position,
                                      disk->name_index) < 0)
             return -22;
     }
@@ -172,6 +173,7 @@ static int storage_mount_runtime_boot(void)
     if(ret)return ret;
     boot->esp_start_lba=root->esp_start_lba;boot->esp_sector_count=root->esp_sector_count;
     boot->esp_device=root->esp_device;
+    boot->mount_flags = root->mount_flags & MS_RDONLY;
     __builtin_memcpy(boot->esp_unique_guid,root->esp_unique_guid,sizeof(boot->esp_unique_guid));
     /* Copy transport geometry, never ownership of the root journal. */
     storage_memzero(&boot->ext4, sizeof(boot->ext4));
@@ -238,6 +240,7 @@ static int storage_try_mount_root_disk(struct install_disk_state *disk)
     root->volume_id = STORAGE_VOLUME_ROOT;
     ret=storage_volume_from_install_disk(root,disk);
     if(ret)return ret;
+    if (disk->flags & BLOCK_DEVICE_READ_ONLY) root->mount_flags |= MS_RDONLY;
     g_active_volume = root;
     ret = gpt_find_esp();
     if (ret == 0) {

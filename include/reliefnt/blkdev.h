@@ -20,6 +20,7 @@ struct block_device_ref;
 #define BLOCK_TRANSPORT_NVME 3u
 #define BLOCK_TRANSPORT_MEMORY 4u
 #define BLOCK_TRANSPORT_USB 5u
+#define BLOCK_TRANSPORT_VIRTIO 6u
 
 struct block_io_stats {
     uint64_t reads, writes, read_sectors, write_sectors;

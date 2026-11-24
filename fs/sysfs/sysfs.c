@@ -235,12 +235,15 @@ static int sys_block_pci_parent(uint32_t disk)
     block_device_put(&ref);
     if (rc || (info.transport!=BLOCK_TRANSPORT_AHCI &&
                info.transport!=BLOCK_TRANSPORT_IDE_PIO &&
-               info.transport!=BLOCK_TRANSPORT_NVME)) return -1;
+               info.transport!=BLOCK_TRANSPORT_NVME &&
+               info.transport!=BLOCK_TRANSPORT_VIRTIO)) return -1;
     for (uint32_t i=0;i<pci_count;++i) {
         const struct pci_device *pci=&pci_devices[i];
         if (pci->bus!=info.bus || pci->slot!=info.slot || pci->function!=info.function) continue;
         /* Refuse an inconsistent registry/controller identity rather than
          * placing the disk under an unrelated PCI device. */
+        if (info.transport==BLOCK_TRANSPORT_VIRTIO)
+            return pci->vendor_id==0x1af4 && pci->device_id==0x1042 ? (int)i : -1;
         if (pci->class_code!=1) return -1;
         if (info.transport==BLOCK_TRANSPORT_AHCI && pci->subclass==6 && pci->prog_if==1) return (int)i;
         if (info.transport==BLOCK_TRANSPORT_IDE_PIO && pci->subclass==1) return (int)i;
@@ -289,7 +292,7 @@ static int sys_blocks(sys_visit visit, void *ctx)
             sys_path(diskpath,directory,-1,diskname+5);
         } else sys_path(diskpath, "/sys/devices/platform/leonos-block/", -1, diskname + 5);
         for (int32_t part = -1; part < (int32_t)RELIEFOS_DISK_MAX_PARTITIONS; ++part) {
-            uint64_t start = 0, sectors = disks[i].sector_count;
+            uint64_t start = 0, sectors = info.blocks * (info.block_size / 512u);
             if (part >= 0) {
                 ret = storage_disk_block_info(disks[i].id, part, &start, &sectors);
                 if (ret == -2 || ret == -22) continue; /* No GPT entry/table. */
@@ -334,9 +337,8 @@ static int sys_blocks(sys_visit visit, void *ctx)
                                         j == 12 ? fs_uuid : fs_label;
                 struct sys_node n = {.path=path,.attr=kind[j],
                     .target=j >= 10 ? fs_target : j == 3 ? number : event,
-                    .value=j == 4 ? sectors * (disks[i].sector_size / 512u) :
-                           j == 6 ? start * (disks[i].sector_size / 512u) :
-                           j == 7 ? (uint32_t)part + 1 : disks[i].sector_size};
+                    .value=j == 4 ? sectors : j == 6 ? start :
+                           j == 7 ? (uint32_t)part + 1 : info.block_size};
                 if ((ret = visit(&n, ctx))) return ret;
             }
             sys_path(target, "../../", -1, base + 5);

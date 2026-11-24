@@ -221,7 +221,7 @@ int disk_partition_filesystem(struct install_disk_state *disk,
     }
     *out_filesystem = RELIEFOS_DISK_FILESYSTEM_UNKNOWN;
     sectors = entry->last_lba - entry->first_lba + 1u;
-    ret = install_read_sectors(disk, entry->first_lba, 1u, storage_scratch);
+    ret = disk_read_partition_blocks(disk, entry->first_lba, 1u, storage_scratch);
     if (ret < 0) {
         return ret;
     }
@@ -240,13 +240,15 @@ int disk_partition_filesystem(struct install_disk_state *disk,
         *out_filesystem=RELIEFOS_DISK_FILESYSTEM_SQUASHFS;
         return 0;
     }
-    if (sectors > 2u) {
-        ret = install_read_sectors(disk, entry->first_lba + 2u, 1u, storage_scratch);
-        if (ret < 0) {
-            return ret;
+    uint32_t logical = disk_logical_block_size(disk);
+    uint32_t block = 1024u / logical, offset = 1024u % logical;
+    if (sectors > block) {
+        if (block) {
+            ret = disk_read_partition_blocks(disk, entry->first_lba + block, 1u, storage_scratch);
+            if (ret < 0) return ret;
         }
         const struct ext2_superblock *super =
-            (const struct ext2_superblock *)(const void *)storage_scratch;
+            (const struct ext2_superblock *)(const void *)(storage_scratch + offset);
         if (super->magic == EXT2_SUPER_MAGIC) {
             enum storage_ext_format format = storage_ext_detect_format(super->feature_compat,
                 super->feature_incompat, super->feature_ro_compat);
@@ -325,9 +327,11 @@ static int disk_partition_export(uint32_t disk_id, struct install_disk_state *di
  */
 int disk_partition_mutable(const struct install_disk_state *disk)
 {
-    if (!disk) {
-        return -22;
-    }
+    if (!disk) return -22;
+    if (disk->flags & BLOCK_DEVICE_READ_ONLY) return -EROFS;
+    /* The legacy GPT/format editor writes fixed-size sector images. A native
+     * 4Kn disk is usable through block nodes, not this custom writer. */
+    if (disk_logical_block_size(disk) != SECTOR_SIZE) return -EOPNOTSUPP;
     /* When booted from the installer ISO, / is the writable RAM root and the
      * physical disks are installation targets, even if probing them first
      * found an existing ReliefOS root. Keep the boot-disk guard for normal disk

@@ -283,3 +283,14 @@ msgid "Realtek RTL8139 10/100 PCI 网卡，使用经典模式、DMA32 和任务�
 msgstr ""
 "Realtek RTL8139 10/100 PCI ネットワークカード。従来モード、DMA32、タスクコンテキストのポーリングを使用し、PCI "
 "機能ごとに独立したインターフェースを登録します。対応範囲と復旧の意味は :doc:`rtl8139` を参照してください。"
+
+msgid "``VIRTIO_BLK``"
+msgstr "``VIRTIO_BLK``"
+
+msgid "``virtio_blk``"
+msgstr "``virtio_blk``"
+
+msgid "现代 VirtIO PCI 块设备，提供 ``/dev/vd*``。传输、4Kn 与根设备支持范围见 :doc:`virtio-blk`。"
+msgstr ""
+"モダン VirtIO PCI ブロックデバイスを ``/dev/vd*`` として公開します。トランスポート、4Kn、ルートデバイスの対応範囲は "
+":doc:`virtio-blk` を参照してください。"

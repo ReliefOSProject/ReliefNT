@@ -4,18 +4,16 @@
 #include <reliefnt/heap.h>
 #include <linux/errno.h>
 
-static uint32_t next_sd_name;
+static uint32_t next_sd_name, next_vd_name;
 
-/** @brief Check whether an earlier live sd-style disk owns a candidate name.
- * @param name Candidate sd name index. @param before Exclusive inventory limit.
- * @return True if a live disk owns the name, otherwise false. Execution-owned.
- */
-static bool storage_sd_name_used(uint32_t name,uint32_t before)
+/* sd and vd have distinct name namespaces; RAM and NVMe do not use either. */
+static bool storage_disk_name_used(uint32_t name,uint32_t before,bool virtio)
 {
     for(uint32_t i=0;i<before;++i) {
         const struct install_disk_state *disk=&g_install_disks[i];
         if(disk->present && disk->transport!=STORAGE_TRANSPORT_MEMORY &&
-           disk->transport!=STORAGE_TRANSPORT_NVME && disk->name_index==name)return true;
+           disk->transport!=STORAGE_TRANSPORT_NVME && disk->name_index==name &&
+           (disk->transport==STORAGE_TRANSPORT_VIRTIO)==virtio)return true;
     }
     return false;
 }
@@ -75,22 +73,23 @@ int storage_refresh_disks(void)
                 *disk=(struct install_disk_state){.present=true,.device=info.device,
                     .transport=info.transport,.bus=info.bus,.slot=info.slot,.function=info.function,
                     .port=info.port,.nvme_controller_index=info.controller,.nvme_nsid=info.namespace_id,
-                    .sector_count=info.blocks};
+                    .sector_count=info.blocks,.logical_block_size=info.block_size,.flags=info.flags};
                 if(info.transport==STORAGE_TRANSPORT_MEMORY)disk->name_index=info.controller;
                 else if(info.transport!=STORAGE_TRANSPORT_NVME) {
+                    bool virtio=info.transport==STORAGE_TRANSPORT_VIRTIO;
                     bool known=false;
                     for(uint32_t old=0;info.transport!=STORAGE_TRANSPORT_USB && old<i;++old) {
                         const struct install_disk_state *previous=&g_install_disks[old];
                         if(!previous->present && previous->transport==info.transport && previous->bus==info.bus &&
                            previous->slot==info.slot && previous->function==info.function && previous->port==info.port &&
                            previous->nvme_controller_index==info.controller && previous->nvme_nsid==info.namespace_id &&
-                           previous->sector_count==info.blocks &&
+                           previous->sector_count==info.blocks && previous->logical_block_size==info.block_size &&
                            !__builtin_strncmp(previous->device_model,info.model,sizeof(previous->device_model)) &&
-                           !storage_sd_name_used(previous->name_index,i)) {
+                           !storage_disk_name_used(previous->name_index,i,virtio)) {
                             disk->name_index=previous->name_index;known=true;break;
                         }
                     }
-                    if(!known)disk->name_index=next_sd_name++;
+                    if(!known)disk->name_index=virtio ? next_vd_name++ : next_sd_name++;
                 }
                 storage_copy_text(disk->device_model,sizeof(disk->device_model),info.model);
             }
@@ -136,12 +135,14 @@ int storage_inventory_snapshot(struct reliefos_install_disk *disks,uint32_t capa
         if(count<capacity) {
             struct reliefos_install_disk *out=&disks[count];
             *out=(struct reliefos_install_disk){.id=i,.port=disk->transport==STORAGE_TRANSPORT_NVME ?
-                disk->nvme_nsid : disk->port,.sector_size=512,.sector_count=disk->sector_count,
+                disk->nvme_nsid : disk->port,.sector_size=disk_logical_block_size(disk),
+                .sector_count=disk->sector_count,
                 .flags=disk->boot_root ? RELIEFOS_INSTALL_DISK_FLAG_BOOT_ROOT : 0};
             storage_copy_text(out->name,sizeof(out->name),disk->transport==STORAGE_TRANSPORT_MEMORY ? "Memory Disk" :
                 disk->transport==STORAGE_TRANSPORT_IDE_PIO ? "IDE/PATA Disk" :
                 disk->transport==STORAGE_TRANSPORT_NVME ? "NVMe Namespace" :
                 disk->transport==STORAGE_TRANSPORT_USB ? "USB Mass Storage" :
+                disk->transport==STORAGE_TRANSPORT_VIRTIO ? "VirtIO Block Device" :
                 disk->transport==STORAGE_TRANSPORT_AHCI ? "SATA/AHCI Disk" : "Block Disk");
         }
         ++count;
@@ -149,7 +150,7 @@ int storage_inventory_snapshot(struct reliefos_install_disk *disks,uint32_t capa
     *out_count=count;return 0;
 }
 
-/** @brief Copy all present 512-byte disk identities, including reserved RAM media.
+/** @brief Copy all present disk identities and their native geometry, including reserved RAM media.
  * @param disks Caller array, nullable at zero capacity. @param capacity Entry capacity.
  * @param out_count Required full present count, including omitted entries.
  * @return Zero or snapshot errno. Execution-owned observation; no transport I/O

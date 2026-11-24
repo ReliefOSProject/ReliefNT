@@ -1,5 +1,6 @@
 #include "internal.h"
 #include <reliefnt/heap.h>
+#include <reliefnt/storage_context.h>
 #ifdef CONFIG_SWAP
 #include <reliefnt/swap_internal.h>
 #endif
@@ -9,8 +10,8 @@
  * stable CPU staging area, including read continuations. Never expose a user
  * mapping to a transport or retain a temporary allocation across EAGAIN.
  * Providers retain their own DMA backing and their advertised request limit. */
-#define DISK_RAW_STAGE_SECTORS 128u
-static uint8_t disk_raw_stage[DISK_RAW_STAGE_SECTORS * SECTOR_SIZE]
+#define DISK_RAW_STAGE_BYTES (64u * 1024u)
+static uint8_t disk_raw_stage[DISK_RAW_STAGE_BYTES]
     __attribute__((aligned(4096)));
 
 /** @brief Bound raw staging to one native request and the core's fixed budget.
@@ -23,16 +24,33 @@ static int disk_raw_stage_size(const struct block_device_ref *reference,uint32_t
     struct block_device_info info;
     int ret=block_device_info(reference,&info);
     if(ret)return ret;
-    if(info.block_size!=SECTOR_SIZE)return -95;
-    uint32_t sectors=min_u32(info.max_blocks,DISK_RAW_STAGE_SECTORS);
-    if(!sectors)return -22;
-    *out_bytes=sectors*SECTOR_SIZE;
+    if(info.block_size<SECTOR_SIZE || info.block_size>STORAGE_MAX_LOGICAL_BLOCK)return -95;
+    uint32_t blocks=min_u32(info.max_blocks,DISK_RAW_STAGE_BYTES/info.block_size);
+    if(!blocks)return -22;
+    *out_bytes=blocks*info.block_size;
     return 0;
 }
 
-/** @brief Read one512-byte DOS metadata sector through the held block transport. */
+/* A table walk restarts at its first header if it yields. Do not let a
+ * one-request VirtIO queue replace its in-flight metadata command on replay. */
+int disk_read_partition_blocks(struct install_disk_state *disk,uint64_t lba,
+                               uint32_t blocks,void *buffer)
+{
+    struct storage_io_context saved;
+    bool synchronous = disk->transport == STORAGE_TRANSPORT_VIRTIO;
+    if (synchronous) storage_kernel_context_enter(&saved);
+    int rc = install_read_sectors(disk,lba,blocks,buffer);
+    if (synchronous) storage_kernel_context_leave(&saved);
+    return rc;
+}
+
+/* DOS entries use disk LBAs, but only the first 512 bytes at each are parsed. */
 static int disk_mbr_read(void *context,uint64_t sector,uint8_t bytes[512])
-{ return install_read_sectors(context,sector,1,bytes); }
+{
+    int rc = disk_read_partition_blocks(context,sector,1,storage_scratch);
+    if (!rc) storage_memcpy(bytes,storage_scratch,SECTOR_SIZE);
+    return rc;
+}
 
 /** @brief Fill an unpublished partition cache from a bounded MBR/EBR snapshot. */
 static int disk_mbr_cache_load(struct install_disk_state *disk,uint64_t sectors,
@@ -65,7 +83,8 @@ static int disk_block_range(uint32_t disk_id, struct install_disk_state *disk,
  * @param sector_count Total number of addressable disk sectors.
  * @return Zero on success or a negative errno-style storage error.
  */
-static int disk_gpt_header_valid(const struct gpt_header *header, uint64_t sector_count);
+static int disk_gpt_header_valid(const struct gpt_header *header, uint64_t sector_count,
+                                 uint32_t logical);
 
 /** @brief Retire cached GPT validity for one stable core disk identity.
  * @param disk_id Reserved inventory slot; unknown/no-cache entries are ignored.
@@ -246,7 +265,8 @@ int disk_gpt_entry_used(const struct gpt_entry *entry)
  * @param sector_count Total number of addressable disk sectors.
  * @return Zero on success or a negative errno-style storage error.
  */
-static int disk_gpt_header_valid(const struct gpt_header *header, uint64_t sector_count)
+static int disk_gpt_header_valid(const struct gpt_header *header, uint64_t sector_count,
+                                 uint32_t logical)
 {
     struct gpt_header check;
     uint64_t table_bytes;
@@ -267,7 +287,7 @@ static int disk_gpt_header_valid(const struct gpt_header *header, uint64_t secto
         return -22;
     }
     table_bytes = (uint64_t)header->partition_entry_count * header->partition_entry_size;
-    table_sectors = (table_bytes + SECTOR_SIZE - 1u) / SECTOR_SIZE;
+    table_sectors = (table_bytes + logical - 1u) / logical;
     if (table_bytes > sizeof(storage_cluster_buf) ||
         header->partition_entries_lba < 2u ||
         header->partition_entries_lba >= sector_count ||
@@ -343,7 +363,8 @@ int disk_gpt_load(struct install_disk_state *disk, uint64_t sector_count,
     if (!disk || !out_table) {
         return -22;
     }
-    ret = install_read_sectors(disk, 1u, 1u, storage_scratch);
+    uint32_t logical = disk_logical_block_size(disk);
+    ret = disk_read_partition_blocks(disk, 1u, 1u, storage_scratch);
     if (ret < 0) {
         return ret;
     }
@@ -351,13 +372,13 @@ int disk_gpt_load(struct install_disk_state *disk, uint64_t sector_count,
     if (primary.signature != 0x5452415020494645ULL) {
         return -2;
     }
-    ret = disk_gpt_header_valid(&primary, sector_count);
+    ret = disk_gpt_header_valid(&primary, sector_count, logical);
     if (ret < 0 || primary.current_lba != 1u) {
         return ret < 0 ? ret : -22;
     }
     table_bytes = primary.partition_entry_count * primary.partition_entry_size;
-    table_sectors = (table_bytes + SECTOR_SIZE - 1u) / SECTOR_SIZE;
-    ret = install_read_sectors(disk, primary.backup_lba, 1u, storage_scratch);
+    table_sectors = (table_bytes + logical - 1u) / logical;
+    ret = disk_read_partition_blocks(disk, primary.backup_lba, 1u, storage_scratch);
     if (ret == -RELIEFOS_EAGAIN) {
         /* The AHCI async path still owns the pending command.  Do not treat
          * an incomplete backup-header read as a missing header and submit a
@@ -373,7 +394,7 @@ int disk_gpt_load(struct install_disk_state *disk, uint64_t sector_count,
     } else {
         storage_memcpy(&backup, storage_scratch, sizeof(backup));
     }
-    ret = disk_gpt_header_valid(&backup, sector_count);
+    ret = disk_gpt_header_valid(&backup, sector_count, logical);
     if (ret < 0 || backup.current_lba != primary.backup_lba ||
         backup.backup_lba != primary.current_lba ||
         backup.partition_entry_count != primary.partition_entry_count ||
@@ -389,7 +410,7 @@ int disk_gpt_load(struct install_disk_state *disk, uint64_t sector_count,
         backup.partition_entries_lba = sector_count - table_sectors - 1u;
         backup.header_crc32 = 0;
     }
-    ret = install_read_sectors(disk, primary.partition_entries_lba, table_sectors,
+    ret = disk_read_partition_blocks(disk, primary.partition_entries_lba, table_sectors,
                                storage_cluster_buf);
     if (ret < 0) {
         return ret;
@@ -417,8 +438,14 @@ static int storage_disk_block_info_owned(uint32_t disk_id, int32_t partition_ind
     if (ret < 0) return ret;
     ret = disk_manage_prepare(disk_id, &disk, &sector_count);
     if (ret < 0) return ret;
-    return disk_block_range(disk_id, disk, sector_count, partition_index,
-                            out_first_lba, out_sector_count);
+    ret = disk_block_range(disk_id, disk, sector_count, partition_index,
+                           out_first_lba, out_sector_count);
+    if (!ret) {
+        uint32_t factor = disk_logical_block_size(disk) / SECTOR_SIZE;
+        *out_first_lba *= factor;
+        *out_sector_count *= factor;
+    }
+    return ret;
 }
 
 /** @brief Flush one raw disk/optical transaction with exact block/code ownership.
@@ -476,8 +503,8 @@ static int storage_disk_block_read_owned(uint32_t disk_id, int32_t partition_ind
     if (ret < 0) return ret;
     ret = disk_block_range(disk_id, disk, sectors, partition_index, &first_lba, &sectors);
     if (ret < 0) return ret;
-    if (sectors > UINT64_MAX / 512u) return -75;
-    uint64_t bytes = sectors * 512u;
+    uint32_t logical = disk_logical_block_size(disk);
+    uint64_t bytes = sectors * logical;
     if (offset >= bytes) return 0;
     if (length > bytes - offset) length = bytes - offset;
     uint32_t stage_bytes;
@@ -489,10 +516,10 @@ static int storage_disk_block_read_owned(uint32_t disk_id, int32_t partition_ind
      * stable, page-aligned staging buffer in bounded chunks instead. */
     while (done < length) {
         uint64_t position = offset + done;
-        uint32_t skip = position % 512u;
+        uint32_t skip = position % logical;
         uint32_t take = min_u32(stage_bytes - skip, length - done);
-        ret = storage_read_install_disk(disk, first_lba + position / 512u,
-                                   (skip + take + 511u) / 512u, disk_raw_stage);
+        ret = storage_read_install_disk(disk, first_lba + position / logical,
+                                   (skip + take + logical - 1u) / logical, disk_raw_stage);
         if (ret < 0) { if (out_read) *out_read = done; return ret; }
         storage_memcpy(destination + done, disk_raw_stage + skip, take);
         done += take;
@@ -519,16 +546,18 @@ static int storage_disk_block_write_owned(uint32_t disk_id, int32_t partition_in
     if (ret < 0) return ret;
     ret = disk_block_range(disk_id, disk, sectors, partition_index, &first_lba, &sectors);
     if (ret < 0) return ret;
-    if (sectors > UINT64_MAX / 512u) return -75;
-    uint64_t bytes = sectors * 512u;
+    uint32_t logical = disk_logical_block_size(disk);
+    uint64_t bytes = sectors * logical;
+    if (disk->flags & BLOCK_DEVICE_READ_ONLY) return -EROFS;
     if (offset >= bytes) return -28;
     if (length > bytes - offset) length = bytes - offset;
     uint32_t stage_bytes;
     ret=disk_raw_stage_size(reference,&stage_bytes);
     if(ret<0)return ret;
 #ifdef CONFIG_SWAP
-    uint64_t raw_first=first_lba+offset/512u;
-    uint64_t raw_count=((offset%512u)+(uint64_t)length+511u)/512u;
+    uint32_t factor = logical / SECTOR_SIZE;
+    uint64_t raw_first = (first_lba + offset / logical) * factor;
+    uint64_t raw_count = ((offset % logical + (uint64_t)length + logical - 1u) / logical) * factor;
     int busy=swap_storage_raw_busy(reference,raw_first,raw_count,partition_index<0);
     if (busy) return busy<0 ? busy : -EBUSY;
 #else
@@ -551,22 +580,22 @@ static int storage_disk_block_write_owned(uint32_t disk_id, int32_t partition_in
      * to the controller. */
     while (done < length) {
         uint64_t position = offset + done;
-        uint32_t skip = position % 512u;
+        uint32_t skip = position % logical;
         uint32_t take = min_u32(stage_bytes - skip, length - done);
-        uint32_t chunk = (skip + take + 511u) / 512u;
+        uint32_t chunk = (skip + take + logical - 1u) / logical;
         /* Preserve only sectors containing bytes outside this write. Interior
          * sectors are overwritten completely and need no read-before-write. */
         if (skip) {
-            ret = storage_read_install_disk(disk, first_lba + position / 512u, 1, disk_raw_stage);
+            ret = storage_read_install_disk(disk, first_lba + position / logical, 1, disk_raw_stage);
             if (ret < 0) { if (out_written) *out_written = done; return ret; }
         }
-        if (((skip + take) & 511u) && (!skip || chunk > 1u)) {
-            ret = storage_read_install_disk(disk, first_lba + position / 512u + chunk - 1u,
-                                       1, disk_raw_stage + (chunk - 1u) * 512u);
+        if (((skip + take) % logical) && (!skip || chunk > 1u)) {
+            ret = storage_read_install_disk(disk, first_lba + position / logical + chunk - 1u,
+                                       1, disk_raw_stage + (chunk - 1u) * logical);
             if (ret < 0) { if (out_written) *out_written = done; return ret; }
         }
         storage_memcpy(disk_raw_stage + skip, source + done, take);
-        ret = storage_write_install_disk(disk, first_lba + position / 512u, chunk, disk_raw_stage);
+        ret = storage_write_install_disk(disk, first_lba + position / logical, chunk, disk_raw_stage);
         if (ret < 0) { if (out_written) *out_written = done; return ret; }
         done += take;
     }

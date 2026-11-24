@@ -125,7 +125,9 @@ int virtio_pci_reset(struct virtio_pci *d)
     if (!d || !d->common) return -EINVAL;
     d->common[20] = 0;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    uint64_t deadline = time_uptime_us() + 1000000;
+    /* STOP can run with the execution writer masking local IRQs. The boot
+     * clock is tick-capped in that context, unlike the local work clock. */
+    uint64_t start = time_work_counter_us();
     for (unsigned count = 0; count < 10000000; ++count) {
         if (!d->common[20]) {
             pci_config_write16(d->pci.bus, d->pci.slot, d->pci.function, 4,
@@ -135,7 +137,10 @@ int virtio_pci_reset(struct virtio_pci *d)
             d->irq_handle = 0; d->irq_mode = 0;
             return 0;
         }
-        if (time_uptime_us() >= deadline) break;
+        if ((count & 255u) == 0) {
+            uint64_t now = time_work_counter_us();
+            if (now >= start && now - start >= 1000000) break;
+        }
         __asm__ volatile("pause");
     }
     d->live = true;

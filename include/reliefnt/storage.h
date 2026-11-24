@@ -499,13 +499,13 @@ int storage_list_block_disks(struct reliefos_install_disk *disks,uint32_t capaci
 int storage_disk_list_partitions(uint32_t disk_id,
                                  struct reliefos_disk_partition *partitions,
                                  uint32_t capacity, uint32_t *out_count);
-/** Returns the LBA range represented by a whole-disk or partition node. */
+/** Returns the range of a whole-disk or partition node in 512-byte sectors. */
 int storage_disk_block_info(uint32_t disk_id, int32_t partition_index,
                             uint64_t *out_first_lba, uint64_t *out_sector_count);
 /** Format the canonical Linux block-device path for a discovered disk. */
 int storage_disk_device_name(uint32_t disk_id, int32_t partition_index,
                              char *out, uint32_t capacity);
-/** Reads/writes a block node at a byte offset; offsets and lengths are sector aligned. */
+/** Reads/writes a block node at a byte offset; partial native blocks are staged. */
 /** @brief Check current mount conflicts for an exclusive whole-disk/partition open. */
 int storage_disk_block_busy(uint32_t disk_id, int32_t partition_index);
 int storage_disk_block_read(uint32_t disk_id, int32_t partition_index,

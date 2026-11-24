@@ -68,12 +68,14 @@ int storage_mount_whole_filesystem(struct storage_volume *volume,uint32_t disk,c
     int rc=storage_volume_from_install_disk(volume,&g_install_disks[disk]);
     struct block_device_info info;
     if(!rc)rc=block_device_info(&volume->device_ref,&info);
-    if(!rc && info.block_size!=512)rc=-EOPNOTSUPP;
+    if(!rc && (info.block_size<SECTOR_SIZE || info.block_size>STORAGE_MAX_LOGICAL_BLOCK))rc=-EOPNOTSUPP;
+    if(!rc && info.blocks>UINT64_MAX/info.block_size)rc=-EOVERFLOW;
     if(!rc && (info.flags&BLOCK_DEVICE_READ_ONLY) && !(volume->mount_flags&MS_RDONLY))rc=-EROFS;
     if(!rc) {
         volume->source_disk_id=disk;volume->source_partition_index=UINT32_MAX;
         volume->data_partition_mount=true;
-        volume->esp_sector_count=volume->exfat_sector_count=volume->ext_sector_count=info.blocks;
+        volume->esp_sector_count=volume->exfat_sector_count=volume->ext_sector_count=
+            info.blocks*(info.block_size/SECTOR_SIZE);
         volume->esp_device=volume->exfat_device=volume->ext_device=info.device;
         rc=storage_mount_filesystem(volume,name);
     }

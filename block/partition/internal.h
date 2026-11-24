@@ -89,6 +89,10 @@ int disk_manage_prepare(uint32_t disk_id, struct install_disk_state **out_disk,
 int disk_gpt_load(struct install_disk_state *disk, uint64_t sector_count,
                          struct disk_gpt_table *out_table);
 
+/* Read a prepared disk's native blocks while preserving multi-header replay. */
+int disk_read_partition_blocks(struct install_disk_state *disk,uint64_t lba,
+                               uint32_t blocks,void *buffer);
+
 int storage_disk_block_info(uint32_t disk_id, int32_t partition_index,
                             uint64_t *out_first_lba, uint64_t *out_sector_count);
 

@@ -712,4 +712,6 @@ EXPORT_SYMBOL(pci_map_xhci_firmware_cap_page);
 EXPORT_SYMBOL(pci_read_device);
 EXPORT_SYMBOL(pci_find_device);
 
+EXPORT_SYMBOL(pci_enumerate);
+
 EXPORT_SYMBOL(pci_unmap_mmio);

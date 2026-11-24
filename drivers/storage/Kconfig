@@ -15,4 +15,12 @@ config BLK_DEV_NVME
 	default y
 	help
 	  Native NVMe PCI transport with owned queues/PRPs. Module name: nvme.
+config VIRTIO_BLK
+	tristate "VirtIO block devices"
+	depends on VIRTIO_PCI
+	default y
+	help
+	  VirtIO 1.x block disks on non-transitional and transitional PCI
+	  functions with modern capabilities. Supports single-queue reads,
+	  writes, read-only media and cache flushes. Module: virtio_blk.
 endmenu

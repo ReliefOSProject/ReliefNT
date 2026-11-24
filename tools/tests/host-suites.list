@@ -10,6 +10,7 @@ vga_text tools/test_vga_text.py
 cpu_accounting tools/test_cpu_accounting.py
 drm tools/test_drm.py
 virtio tools/test_virtio.py
+virtio_blk tools/test_virtio_blk.py
 e1000 tools/test_e1000.py
 e1000e tools/test_e1000e.py
 i225 tools/test_i225.py
