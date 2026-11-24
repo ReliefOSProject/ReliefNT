@@ -26,6 +26,10 @@ drivers/ 按 console、tty、video、storage、net、input、usb、sound 等设�
      - ``ahci`` / ``ide`` / ``nvme``
      - 原生控制器、IRQ 和 DMA；根设备引用阻止卸载。
        NVMe/AHCI 的中断、读取接续及验证边界见 :doc:`storage-completion`。
+   * - ``VIRTIO_BLK``
+     - ``virtio_blk``
+     - 现代 VirtIO PCI 块设备，提供 ``/dev/vd*``。传输、4Kn 与根设备支持范围见
+       :doc:`virtio-blk`。
    * - ``E1000``
      - ``e1000``
      - PRO/1000 设备；网络协议栈和回调入口保留内置。

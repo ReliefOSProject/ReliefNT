@@ -326,7 +326,8 @@ int storage_ext4_cache_read_blocks(struct storage_volume *v, uint64_t first,
     struct block_device_info info;
     ret = block_device_info(&v->device_ref, &info);
     if (ret < 0) return ret;
-    if (info.block_size != SECTOR_SIZE || !info.max_blocks) return -RELIEFOS_EOPNOTSUPP;
+    if (info.block_size < SECTOR_SIZE || info.block_size > STORAGE_MAX_LOGICAL_BLOCK ||
+        !info.max_blocks) return -RELIEFOS_EOPNOTSUPP;
     struct ext4_cache_table *table = &ext4_cache_tables[EXT4_CACHE_TABLE_BLOCK];
     bool caching = ext4_cache_ensure(table);
     uint32_t hits = 0;
@@ -339,7 +340,10 @@ int storage_ext4_cache_read_blocks(struct storage_volume *v, uint64_t first,
     /* A replay restarts at first, potentially after inode/extent lookups evict
      * earlier data. Cache capacity alone cannot guarantee prefix residency.
      * Only an entirely uncached single command has a stable retry identity. */
-    bool synchronous = count > info.max_blocks / sectors ||
+    uint32_t factor = info.block_size / SECTOR_SIZE;
+    uint64_t first_lba = lba - (uint64_t)(count - 1) * sectors;
+    uint64_t total = (uint64_t)count * sectors;
+    bool synchronous = first_lba % factor || total % factor || total / factor > info.max_blocks ||
         count > EXT4_READAHEAD_BLOCKS || (hits && hits < count);
     struct storage_io_context saved;
     if (synchronous) storage_kernel_context_enter(&saved);

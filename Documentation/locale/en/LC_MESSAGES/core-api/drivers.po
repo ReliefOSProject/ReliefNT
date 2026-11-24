@@ -317,3 +317,14 @@ msgstr ""
 "Realtek RTL8139 10/100 PCI Ethernet, using classic mode, DMA32 and task-context polling. Each"
 " PCI function registers an independent interface. See :doc:`rtl8139` for scope and recovery "
 "semantics."
+
+msgid "``VIRTIO_BLK``"
+msgstr "``VIRTIO_BLK``"
+
+msgid "``virtio_blk``"
+msgstr "``virtio_blk``"
+
+msgid "现代 VirtIO PCI 块设备，提供 ``/dev/vd*``。传输、4Kn 与根设备支持范围见 :doc:`virtio-blk`。"
+msgstr ""
+"Modern VirtIO PCI block devices, exposed as ``/dev/vd*``. See :doc"
+":`virtio-blk` for the transport, 4Kn, and root-device support boundaries."

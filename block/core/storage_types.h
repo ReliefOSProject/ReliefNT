@@ -14,8 +14,9 @@
 
 #include "../../fs/ext_common/storage_ext4_types.h"
 
-/** @brief Common sector size for all supported block transports. */
+/** @brief Unit of filesystem I/O and Linux block accounting. */
 #define SECTOR_SIZE 512u
+#define STORAGE_MAX_LOGICAL_BLOCK 4096u
 /* Bounded generic writeback batch, independent of any optional transport. */
 #define STORAGE_WRITE_MAX_SECTORS 64u
 #define STORAGE_SCRATCH_SECTORS 8u
@@ -57,6 +58,7 @@ enum storage_transport {
     STORAGE_TRANSPORT_NVME = BLOCK_TRANSPORT_NVME,
     STORAGE_TRANSPORT_MEMORY = BLOCK_TRANSPORT_MEMORY,
     STORAGE_TRANSPORT_USB = BLOCK_TRANSPORT_USB,
+    STORAGE_TRANSPORT_VIRTIO = BLOCK_TRANSPORT_VIRTIO,
 };
 
 enum storage_filesystem_kind {
@@ -208,9 +210,14 @@ struct install_disk_state {
     uint8_t boot_root;
     uint16_t nvme_controller_index;
     uint32_t nvme_nsid;
-    uint64_t sector_count;
+    uint64_t sector_count; /* Native logical blocks, not necessarily 512 bytes. */
+    uint32_t logical_block_size, flags;
 };
 
+static inline uint32_t disk_logical_block_size(const struct install_disk_state *disk)
+{
+    return disk->logical_block_size ? disk->logical_block_size : SECTOR_SIZE;
+}
 
 /* State definitions are owned by block/core/storage_state_data.c. */
 extern struct storage_volume g_volumes[STORAGE_MAX_VOLUMES];

@@ -17,9 +17,9 @@ uint32_t storage_crc32(const void *data, uint32_t len)
 /**
  * @brief Write a raw installer extent in bounded native transport batches.
  * @param disk Required present inventory record, stable for the complete transaction.
- * @param lba First physical 512-byte sector.
+ * @param lba First native logical block.
  * @param sector_count Complete sector count; zero performs no device write.
- * @param buffer Required readable kernel extent of sector_count times 512 bytes.
+ * @param buffer Required readable kernel extent of sector_count native blocks.
  * @return Zero after every batch succeeds, otherwise the first validation or transport errno; earlier batches may already be written.
  * @par Context
  * Caller holds storage execution ownership; shared volume/cache state must remain selected and live throughout the call. Invalidates shared caches and latches mutation before I/O. The provider token is held for each batch; caller owns outer disk/format exclusion.
@@ -43,7 +43,7 @@ int install_write_sectors(struct install_disk_state *disk, uint64_t lba,
         }
         lba += chunk;
         sector_count -= chunk;
-        src += chunk * SECTOR_SIZE;
+        src += (size_t)chunk * disk_logical_block_size(disk);
     }
     return 0;
 }
@@ -59,27 +59,14 @@ int install_write_sectors(struct install_disk_state *disk, uint64_t lba,
 int install_read_sectors(struct install_disk_state *disk, uint64_t lba,
                                 uint32_t sector_count, void *buffer)
 {
-    uint8_t *dst = (uint8_t *)buffer;
-    if (!disk || !disk->present || !buffer) {
-        return -22;
-    }
-    while (sector_count) {
-        uint32_t chunk = min_u32(sector_count, STORAGE_WRITE_MAX_SECTORS);
-        int ret = storage_read_install_disk(disk, lba, chunk, dst);
-        if (ret < 0) {
-            return ret;
-        }
-        lba += chunk;
-        sector_count -= chunk;
-        dst += chunk * SECTOR_SIZE;
-    }
-    return 0;
+    if (!disk || !disk->present || !buffer) return -22;
+    return sector_count ? storage_read_install_disk(disk, lba, sector_count, buffer) : 0;
 }
 
 /**
  * @brief Zero a raw installer extent through the common write path.
  * @param disk Borrowed present disk inventory record, stable for the transaction.
- * @param lba First physical 512-byte sector.
+ * @param lba First native logical block.
  * @param sector_count Number of sectors; zero is a no-op.
  * @return Zero after all batches are cleared or the first write errno; partial completion is possible.
  * @par Context
@@ -88,9 +75,11 @@ int install_read_sectors(struct install_disk_state *disk, uint64_t lba,
 int install_clear_sectors(struct install_disk_state *disk, uint64_t lba,
                                  uint64_t sector_count)
 {
+    if (!disk || disk_logical_block_size(disk) > sizeof(storage_scratch)) return -22;
+    size_t stage = sizeof(storage_scratch) / disk_logical_block_size(disk);
     storage_memzero(storage_scratch, sizeof(storage_scratch));
     while (sector_count) {
-        uint32_t chunk = (uint32_t)min_u64(sector_count, STORAGE_SCRATCH_SECTORS);
+        uint32_t chunk = (uint32_t)min_u64(sector_count, stage);
         int ret = install_write_sectors(disk, lba, chunk, storage_scratch);
         if (ret < 0) {
             return ret;
@@ -133,6 +122,8 @@ int install_write_gpt(struct install_disk_state *disk, uint64_t sector_count,
         sector_count < 655360ULL) {
         return -28;
     }
+    if (disk_logical_block_size(disk) != SECTOR_SIZE) return -95;
+    if (disk->flags & BLOCK_DEVICE_READ_ONLY) return -30;
     storage_make_guid(disk_guid, 0x4c3447494449534bULL, disk, sector_count);
     storage_make_guid(esp_part_guid, 0x4c34474944504152ULL, disk, sector_count);
     storage_make_guid(root_part_guid, 0x4c34474944525431ULL, disk, sector_count);

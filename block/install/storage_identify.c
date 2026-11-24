@@ -14,7 +14,9 @@ int storage_install_identify(struct install_disk_state *disk,uint64_t *out_secto
     struct block_device_ref ref={0};int rc=block_device_get(disk->device,&ref);
     if(rc)return rc;
     struct block_device_info info;rc=block_device_info(&ref,&info);
-    if(!rc && info.block_size!=512)rc=-95;
-    if(!rc){disk->sector_count=info.blocks;*out_sectors=info.blocks;}
+    if(!rc && (info.block_size<SECTOR_SIZE || info.block_size>STORAGE_MAX_LOGICAL_BLOCK))rc=-95;
+    if(!rc && info.blocks>UINT64_MAX/info.block_size)rc=-75;
+    if(!rc){disk->sector_count=info.blocks;disk->logical_block_size=info.block_size;
+        disk->flags=info.flags;*out_sectors=info.blocks;}
     block_device_put(&ref);return rc;
 }

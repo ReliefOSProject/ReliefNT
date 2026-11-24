@@ -12,13 +12,14 @@
 static uint8_t disk[64 * 4096];
 static uint8_t output[8 * 4096];
 static unsigned commands, fail_cache, pending, high_dma;
+static uint32_t logical_size = 512;
 static void *pending_buffer;
 static int device_error;
 int block_device_info(const struct block_device_ref *ref, struct block_device_info *out)
 {
     assert(ref && out);
-    *out = (struct block_device_info){.blocks = sizeof(disk) / 512,
-        .block_size = 512, .max_blocks = 256};
+    *out = (struct block_device_info){.blocks = sizeof(disk) / logical_size,
+        .block_size = logical_size, .max_blocks = 131072 / logical_size};
     return 0;
 }
 
@@ -43,6 +44,7 @@ int storage_read_device(const struct storage_volume *v, uint64_t lba,
     assert(address != UINT64_C(0x100000000)); /* AHCI has a 32-bit DMA address. */
     ++commands;
     if (pending == 1) {
+        assert(codec_io_context.asynchronous);
         pending_buffer = buffer;
         pending = 2;
         return -RELIEFOS_EAGAIN;
@@ -77,6 +79,8 @@ int main(int argc, char **argv)
     fail_cache = argc > 1 && !strcmp(argv[1], "uncached");
     if (argc > 1 && !strcmp(argv[1], "no-memory")) fail_cache = 2;
     high_dma = argc > 1 && !strcmp(argv[1], "high-memory");
+    if (argc > 1 && !strcmp(argv[1], "4kn")) logical_size = 4096;
+    codec_io_context.asynchronous = true;
     assert(storage_ext4_cache_read_blocks(&v, 4, 8, output) == 0);
     assert(commands == 1);
     assert(!memcmp(output, disk + 4 * 4096, sizeof(output)));

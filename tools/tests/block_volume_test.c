@@ -23,6 +23,7 @@ uint64_t time_uptime_ms(void)
 void console_log(enum console_log_level level,const char *format,...) {(void)level;(void)format;}
 static unsigned allocations,reads,writes,cancels,cache_notifications;
 static int pending;
+static uint32_t fixture_block_size = 512;
 static unsigned char media[8192];
 struct storage_volume g_volumes[STORAGE_MAX_VOLUMES];
 struct storage_volume *g_active_volume=&g_volumes[0];
@@ -50,11 +51,12 @@ void storage_filesystem_cache_event(const struct storage_volume *v,uint64_t l,ui
 /* Direct block callers invalidate aliases before each native write as well as
  * the outer volume notification. No filesystem is mounted in this fixture. */
 void storage_filesystem_cache_event_device(const struct block_device *device,uint64_t lba,uint32_t count)
-{assert(device && storage_transport_lock.state && lba>=2 && count==2);++cache_notifications;}
+{assert(device && storage_transport_lock.state);
+    assert(fixture_block_size == 512 ? lba >= 2 && count == 2 : lba % 8 == 0 && count == 8);++cache_notifications;}
 static int rd(void *c,uint64_t l,uint32_t n,void *p)
-{assert(c==media && storage_transport_lock.state);++reads;if(pending){pending=0;return -11;}memcpy(p,media+l*512,n*512);return 0;}
+{assert(c==media && storage_transport_lock.state);++reads;if(pending){pending=0;return -11;}memcpy(p,media+l*fixture_block_size,n*fixture_block_size);return 0;}
 static int wr(void *c,uint64_t l,uint32_t n,const void *p)
-{assert(c==media && storage_transport_lock.state);++writes;memcpy(media+l*512,p,n*512);return 0;}
+{assert(c==media && storage_transport_lock.state);++writes;memcpy(media+l*fixture_block_size,p,n*fixture_block_size);return 0;}
 static int flush(void *c){assert(c==media);return 0;}
 static void cancel(void *c,uint32_t pid){assert(c==media && pid==7);++cancels;}
 static const struct block_device_operations operations={.read=rd,.write=wr,.flush=flush,.cancel=cancel};
@@ -80,5 +82,17 @@ int main(void)
     storage_volume_put_device(&v);assert(!v.device_ref.device && unregister_block_device(&r)==-16);
     storage_volume_put_device(&second);assert(!unregister_block_device(&r));assert(!allocations);
     assert(storage_volume_from_install_disk(&v,d)==-19 && !v.device_ref.device);
+    fixture_block_size=4096;
+    r.info.device=block_device_allocate_number(false);
+    r.info.blocks=2; r.info.block_size=fixture_block_size; r.info.max_blocks=1;
+    d->device=r.info.device;
+    assert(!register_block_device(&r) && !storage_volume_from_install_disk(&v,d));
+    memset(media,0x33,sizeof(media));
+    assert(!storage_read_device(&v,1,1,output) && output[0]==0x33);
+    assert(!storage_write_device(&v,7,3,input)); /* partial blocks on two sides */
+    assert(media[7*512-1]==0x33 && !memcmp(media+7*512,input,3*512) && media[10*512]==0x33);
+    assert(!storage_read_device(&v,7,3,output) && !memcmp(input,output,3*512));
+    assert(storage_read_device(&v,15,2,output)==-22);
+    storage_volume_put_device(&v);assert(!unregister_block_device(&r) && !allocations);
     puts("PASS real volume binding: independent noncopyable refs, chunked I/O, EAGAIN, bounds, cancellation and exact cleanup");
 }

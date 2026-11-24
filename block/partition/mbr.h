@@ -5,8 +5,8 @@
 #define MBR_PARTITION_CAPACITY 128u
 struct mbr_partition { uint64_t first, count; uint8_t type; };
 /** @brief Read MBR primary and DOS EBR logical extents without trusting CHS fields.
- * @param read Reads one512-byte sector; negative errno preserved.
- * @param context Borrowed reader context. @param sectors Actual512-byte sectors.
+ * @param read Reads the first 512 bytes of a native logical block; negative errno preserved.
+ * @param context Borrowed reader context. @param sectors Native logical blocks.
  * @param entries Required128-slot output: primary0..3, logical4 onward.
  * @return Zero, ENOENT for absent signature, EOPNOTSUPP for protective GPT,
  * EINVAL for overlaps/bounds/cycles, ENOSPC on slot exhaustion, or I/O errno.

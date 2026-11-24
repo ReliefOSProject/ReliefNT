@@ -301,15 +301,18 @@ static int storage_open_block_partition_owned(uint32_t disk_id, uint32_t partiti
     volume->mount_flags = flags;
     volume->source_disk_id = disk_id;
     volume->source_partition_index = partition_index;
+    uint32_t factor = info.block_size / SECTOR_SIZE;
+    uint64_t fs_start = entry.first_lba * factor;
+    uint64_t fs_sectors = (entry.last_lba - entry.first_lba + 1u) * factor;
     if (filesystem == RELIEFOS_DISK_FILESYSTEM_FAT32) {
-        volume->esp_start_lba = entry.first_lba;
-        volume->esp_sector_count = entry.last_lba - entry.first_lba + 1u;
+        volume->esp_start_lba = fs_start;
+        volume->esp_sector_count = fs_sectors;
     } else if (filesystem == RELIEFOS_DISK_FILESYSTEM_EXFAT) {
-        volume->exfat_start_lba = entry.first_lba;
-        volume->exfat_sector_count = entry.last_lba - entry.first_lba + 1u;
+        volume->exfat_start_lba = fs_start;
+        volume->exfat_sector_count = fs_sectors;
     } else {
-        volume->ext2_start_lba = entry.first_lba;
-        volume->ext2_sector_count = entry.last_lba - entry.first_lba + 1u;
+        volume->ext2_start_lba = fs_start;
+        volume->ext2_sector_count = fs_sectors;
     }
     g_active_volume = volume;
     ret = storage_mount_filesystem(volume,filesystem == RELIEFOS_DISK_FILESYSTEM_FAT32 ? "vfat" :
