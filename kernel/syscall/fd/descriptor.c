@@ -104,6 +104,8 @@ int clear_task_file_result(struct task_file *file)
     }
     if (file->kind == TASK_FILE_KIND_INOTIFY && file->aux && fsnotify_put)
         fsnotify_put((struct fsnotify_instance *)(uintptr_t)file->aux);
+    if (file->kind == TASK_FILE_KIND_PIDFD)
+        sched_task_pidfd_put((struct task_identity *)(uintptr_t)file->aux);
     if ((file->flags & TASK_FILE_FLAG_DEV_NODE) &&
         (file->node.first_cluster == STORAGE_DEV_KIND_KEYBOARD ||
          file->node.first_cluster == STORAGE_DEV_KIND_MOUSE) &&

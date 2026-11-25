@@ -16,9 +16,14 @@ void sched_account_mode(bool kernel);
  * @param user User ticks. @param system Kernel ticks. @param idle Idle ticks.
  * @param capacity Array length, clamped to CPU maximum; IRQ-safe, no allocation. */
 void sched_cpu_times(uint64_t *user, uint64_t *system, uint64_t *idle, uint32_t capacity);
-/** @brief Read one thread or group's user/system CPU ticks under scheduler lock.
- * @param task Borrowed target. @param process Sum group. @param user User output.
- * @param system Kernel output. No allocation or ownership transfer. */
+/** @brief Read one thread's CPU ticks or its group's retained CPU time.
+ * @param task Borrowed published target, or NULL for zero counters.
+ * @param process Include group members and recycled-thread CPU time when true.
+ * @param user Required kernel output for user-mode ticks.
+ * @param system Required kernel output for kernel-mode ticks.
+ * Takes scheduler_lock internally; caller must not hold it. No allocation,
+ * I/O or ownership transfer.
+ */
 void sched_task_cpu_times(const struct task *task, bool process, uint64_t *user, uint64_t *system);
 /** @brief Count live OFDs independently of descriptor aliases or task tables.
  * @return Allocated canonical/inline descriptions, execution-owned snapshot. */

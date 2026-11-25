@@ -249,45 +249,77 @@ static bool signal_known_layout(int sig, int code)
     return code <= limit;
 }
 
-/**
- * @brief Validate and send a native rt_sigqueueinfo/rt_tgsigqueueinfo request.
- * @param tgid Group constraint for thread sends; target PID/TID for process sends.
- * @param tid Target TID for a thread-directed request.
- * @param sig Linux signal number, including zero for a permission probe.
- * @param pointer User siginfo address, copied as 48 bytes plus checked unknown expansion.
- * @param thread Select rt_tgsigqueueinfo semantics.
- * @return Zero on success or the Linux copy, permission, identity or queue errno.
+/** @brief Import native user siginfo while preserving its reported signo.
+ * @param caller Borrowed calling task for prefaulting, or NULL to skip prefault.
+ * @param pointer User address of the native siginfo; checked before access.
+ * @param sig Requested signal selecting the meaningful siginfo layout.
+ * @param info Required kernel output; zeroed first, not retained.
+ * @return Zero, -EFAULT/-E2BIG, or KERNEL_SYSCALL_SWAP_CONTENDED before enqueue.
+ * Execution ownership required; caller holds no spinlock across prefaulting.
  */
-int64_t kernel_signal_queueinfo(int32_t tgid, int32_t tid, int sig,
-                                uint64_t pointer, bool thread)
+int kernel_signal_import_info(struct task *caller, uint64_t pointer, int sig,
+                              struct linux_siginfo *info)
 {
-    struct linux_siginfo info = {0};
-    struct task *caller = sched_current_task();
-    /* Only the outer rt_sigqueueinfo syscall calls this user-import path.
-     * Prepare the prefix before enqueue; inspect the expansion only when this
-     * signal layout actually requires it. */
+    *info = (struct linux_siginfo){0};
+    /* Prefault before enqueue; known layouts never inspect the unused tail. */
     if (caller) {
         int prep=swap_prepare_user_range(caller,pointer,KERNEL_SIGINFO_SIZE,false);
         if(prep==SWAP_STORAGE_CONTENDED)return KERNEL_SYSCALL_SWAP_CONTENDED;
         if(prep<0)return -LINUX_EFAULT;
     }
     if (!user_range_ok(pointer, KERNEL_SIGINFO_SIZE)) return -LINUX_EFAULT;
-    __builtin_memcpy(&info, (const void *)(uintptr_t)pointer, KERNEL_SIGINFO_SIZE);
-    info.signo = sig;
-    if (!signal_known_layout(sig, info.code)) {
-        if (pointer > UINT64_MAX - sizeof(info)) return -LINUX_EFAULT;
+    __builtin_memcpy(info, (const void *)(uintptr_t)pointer, KERNEL_SIGINFO_SIZE);
+    if (!signal_known_layout(sig, info->code)) {
+        if (pointer > UINT64_MAX - sizeof(*info)) return -LINUX_EFAULT;
         if (caller) {
             int prep=swap_prepare_user_range(caller,pointer+KERNEL_SIGINFO_SIZE,
-                                             sizeof(info)-KERNEL_SIGINFO_SIZE,false);
+                                             sizeof(*info)-KERNEL_SIGINFO_SIZE,false);
             if(prep==SWAP_STORAGE_CONTENDED)return KERNEL_SYSCALL_SWAP_CONTENDED;
             if(prep<0)return -LINUX_EFAULT;
         }
-        if (!user_range_ok(pointer + KERNEL_SIGINFO_SIZE, sizeof(info) - KERNEL_SIGINFO_SIZE))
+        if (!user_range_ok(pointer + KERNEL_SIGINFO_SIZE, sizeof(*info) - KERNEL_SIGINFO_SIZE))
             return -LINUX_EFAULT;
         const unsigned char *extra = (const void *)(uintptr_t)(pointer + KERNEL_SIGINFO_SIZE);
-        for (unsigned i = 0; i < sizeof(info) - KERNEL_SIGINFO_SIZE; ++i)
+        for (unsigned i = 0; i < sizeof(*info) - KERNEL_SIGINFO_SIZE; ++i)
             if (extra[i]) return -LINUX_E2BIG;
     }
+    return 0;
+}
+
+/** @brief Apply native Linux same-group, credential and CAP_KILL signal rules.
+ * @param caller Borrowed sender under execution ownership, nullable.
+ * @param target Borrowed identity-checked receiver, nullable.
+ * @param sig Requested signal; SIGCONT also admits the same-session exception.
+ * @return True when the sender is authorized, false for NULL tasks or denial.
+ * Takes no locks or references and does not queue a signal.
+ */
+bool kernel_signal_may_send(const struct task *caller, const struct task *target, int sig)
+{
+    return caller && target && (sched_task_tgid(caller) == sched_task_tgid(target) ||
+        (caller->cap_effective & (1ULL << CAP_KILL)) ||
+        caller->uid == target->uid || caller->uid == target->suid ||
+        caller->euid == target->uid || caller->euid == target->suid ||
+        (sig == 18 && caller->process_session == target->process_session));
+}
+
+/** @brief Import and send a user-queued signal through numeric PID/TID lookup.
+ * @param tgid Target PID, or required thread-group ID when thread is true.
+ * @param tid Target TID for thread-directed sends; ignored otherwise.
+ * @param sig Native signal number, or zero to check permission and existence.
+ * @param pointer Checked user address of the native siginfo to import.
+ * @param thread Select rt_tgsigqueueinfo rather than rt_sigqueueinfo semantics.
+ * @return Zero on acceptance, negative Linux errno, or a pre-enqueue swap retry.
+ * Current task execution ownership required; no spinlock held across import,
+ * queueing or wakeup. Does not retain user memory or target references.
+ */
+int64_t kernel_signal_queueinfo(int32_t tgid, int32_t tid, int sig,
+                                uint64_t pointer, bool thread)
+{
+    struct linux_siginfo info;
+    struct task *caller = sched_current_task();
+    int rc = kernel_signal_import_info(caller, pointer, sig, &info);
+    if (rc) return rc;
+    info.signo = sig;
     if (thread && (tgid <= 0 || tid <= 0)) return -LINUX_EINVAL;
     if (!caller) return -LINUX_ESRCH;
     int32_t pid = thread ? tid : tgid;
@@ -297,11 +329,7 @@ int64_t kernel_signal_queueinfo(int32_t tgid, int32_t tid, int sig,
     if (!target || target->kind != TASK_KIND_USER ||
         (thread && sched_task_tgid(target) != (uint32_t)tgid)) return -LINUX_ESRCH;
     if (sig < 0 || sig >= LINUX_NSIG) return -LINUX_EINVAL;
-    if (info.code <= 0 && sched_task_tgid(caller) != sched_task_tgid(target) &&
-        caller->euid != target->uid && caller->euid != target->suid &&
-        caller->uid != target->uid && caller->uid != target->suid &&
-        !(caller->cap_effective & (1ULL << CAP_KILL)) &&
-        !(sig == 18 && caller->process_session == target->process_session)) return -LINUX_EPERM;
+    if (info.code <= 0 && !kernel_signal_may_send(caller, target, sig)) return -LINUX_EPERM;
     if (!sig) return 0;
     if (thread)
         return target->state == TASK_EXITED ? 0 : kernel_signal_queue_task_info(target, sig, &info);

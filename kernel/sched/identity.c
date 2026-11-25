@@ -10,7 +10,14 @@ extern void sched_oom_membership_changed(void) __attribute__((weak));
 /* Invalidate the target before its task record can be recycled. Keeping this
  * allocation alive, rather than comparing timestamps or a wrapping PID, lets
  * an old proc inode distinguish a dead process from a reused task slot. */
-struct task_identity {struct task *task;uint64_t references;};
+struct task_identity {
+    struct task *task;
+    uint64_t references;
+    uint64_t pidfd_inode;
+    uint64_t pidfd_files;
+};
+
+static uint64_t last_pidfd_inode;
 
 /** @brief Allocate one unbound PID object before scheduler locking.
  * @return One caller-owned identity, or NULL on allocation failure.
@@ -46,6 +53,52 @@ int sched_task_identity_get_existing(struct task *task, struct task_identity **o
     struct task_identity *identity=task->identity_token;
     if (identity->references==UINT64_MAX) return -EOVERFLOW;
     ++identity->references;*out=identity;return 0;
+}
+
+/** @brief Retain one OFD-owned PID identity and assign its stable inode number.
+ * @param task Borrowed published target under execution ownership.
+ * @param out Required output receiving one reference, NULL on failure.
+ * @param ino Required kernel output receiving the identity's inode number.
+ * @return Zero, or -EINVAL/-ESRCH/-EOVERFLOW without an acquired reference.
+ * Does not allocate or take locks; the caller serializes identity access.
+ */
+int sched_task_pidfd_get(struct task *task, struct task_identity **out, uint64_t *ino)
+{
+    int rc = sched_task_identity_get_existing(task, out);
+    if (rc) return rc;
+    struct task_identity *identity = *out;
+    if (!identity->pidfd_inode) {
+        if (last_pidfd_inode == UINT64_MAX) {
+            sched_task_identity_put(identity);
+            *out = NULL;
+            return -EOVERFLOW;
+        }
+        identity->pidfd_inode = ++last_pidfd_inode;
+    }
+    ++identity->pidfd_files;
+    *ino = identity->pidfd_inode;
+    return 0;
+}
+
+/** @brief Drop one OFD's watch and owned PID reference after its final close.
+ * @param identity Owned pidfd reference, or NULL, under execution ownership.
+ * Frees the identity only after its last reference; no I/O or lock acquisition.
+ */
+void sched_task_pidfd_put(struct task_identity *identity)
+{
+    if (!identity) return;
+    --identity->pidfd_files;
+    sched_task_identity_put(identity);
+}
+
+/** @brief Test whether an OFD watches this task's current PID identity.
+ * @param task Borrowed task, or NULL, under execution ownership or scheduler_lock.
+ * @return True when at least one pidfd OFD retains its identity.
+ * Does not acquire locks or references; descriptor aliases share one watch.
+ */
+bool sched_task_pidfd_watched(const struct task *task)
+{
+    return task && task->identity_token && task->identity_token->pidfd_files;
 }
 
 /** @brief Acquire an independent stable PID-object reference for proc lookup.

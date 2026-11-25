@@ -372,6 +372,15 @@ int sched_signal_user_task(uint32_t pid, int signal_number);
 int sched_signal_user_process(uint32_t tgid, int signal_number);
 /** @brief Send to a thread group's shared queue, preserving the supplied siginfo. */
 int sched_signal_user_process_info(uint32_t tgid, int sig, const struct linux_siginfo *info);
+/** @brief Signal an identity-checked member's group without numeric PID lookup.
+ * @param target Borrowed addressed member, which need not be the leader.
+ * @param sig Native signal number, or zero for an existence check.
+ * @param info Optional kernel siginfo copied into the pending queue.
+ * @return Zero on acceptance or for a waitable zombie, or negative target/queue
+ * error. Caller holds execution ownership, has checked permission and holds no
+ * scheduler_lock across queueing/wakeup. Does not retain the target.
+ */
+int sched_signal_user_process_target(struct task *target, int sig, const struct linux_siginfo *info);
 /** @brief Publish interruptible sleep before rechecking pending notifications.
  * @param deadline Absolute tick deadline, or zero for no timeout.
  * Execution-owned current task context; changes scheduler state under its IRQ
@@ -522,6 +531,17 @@ int sched_kill_user_tasks_for_logout(uint32_t uid, uint32_t session_id,
  */
 int64_t sched_wait_reap(uint32_t waiter_pid, int32_t wanted_pid,
                         uint32_t options, int *status, struct linux_siginfo *info);
+struct linux_rusage;
+/** @brief Observe or reap only the child named by a retained PID object.
+ * @param waiter_pid Calling task ID. @param identity Borrowed PID object.
+ * @param options Linux wait-event flags. @param info Optional kernel siginfo output.
+ * @param usage Optional kernel resource usage output, written only for an event.
+ * @return Child PID on an event, zero without an eligible child, or negative errno.
+ * Call under execution ownership without scheduler_lock.
+ */
+int64_t sched_wait_identity(uint32_t waiter_pid, const struct task_identity *identity,
+                            uint32_t options, struct linux_siginfo *info,
+                            struct linux_rusage *usage);
 /** @brief Advance at most budget deferred exited-task slots at an outer gate.
  * @param budget Maximum slots examined, not a count of released tasks.
  */

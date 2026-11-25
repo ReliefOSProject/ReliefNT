@@ -1,6 +1,8 @@
 #include "../internal.h"
 #include <reliefnt/swap.h>
 #include <reliefnt/lock.h>
+#include <reliefnt/pidfd.h>
+#include <linux/wait.h>
 
 #ifdef CONFIG_SWAP
 /** @brief Prepare an output only after a wait result is known to need it.
@@ -141,7 +143,9 @@ int64_t syscall_legacy_process(uint64_t number, uint64_t a0, uint64_t a1, uint64
         int32_t requested_pid = (int32_t)a0;
         int status = 0;
         int64_t pid;
-        if ((uint32_t)a2 & ~(1u | 2u | 8u | 0xc0000000u)) return -RELIEFOS_EINVAL;
+        if ((uint32_t)a2 & ~(LINUX_WNOHANG | LINUX_WSTOPPED | LINUX_WCONTINUED |
+                             LINUX_WNOTHREAD | LINUX_WALL | LINUX_WCLONE))
+            return -RELIEFOS_EINVAL;
 #ifdef CONFIG_SWAP
         if(a1) {
             /* Observe without consuming so a prerequisite wait leaves the
@@ -175,11 +179,10 @@ int64_t syscall_legacy_process(uint64_t number, uint64_t a0, uint64_t a1, uint64
     if (number == LINUX_SYS_WAITID) {
         /* waitid(2) reports the same child state as wait4, but writes a
          * fixed 128-byte siginfo_t and always returns zero on success. */
-        enum { LINUX_P_ALL = 0, LINUX_P_PID = 1, LINUX_P_PGID = 2 };
-        enum { LINUX_WNOHANG = 1, LINUX_WSTOPPED = 2, LINUX_WEXITED = 4,
-               LINUX_WCONTINUED = 8, LINUX_WNOWAIT = 0x01000000 };
         uint32_t idtype = (uint32_t)a0;
         uint32_t options = (uint32_t)a3;
+        if (idtype == LINUX_P_PIDFD)
+            return syscall_pidfd_waitid(sched_current_task(), (int32_t)a1, a2, a4, options);
         int32_t wanted = -1;
         int status = 0;
         int64_t pid;
@@ -192,8 +195,8 @@ int64_t syscall_legacy_process(uint64_t number, uint64_t a0, uint64_t a1, uint64
             wanted = (int32_t)a1 ? -(int32_t)a1 : 0;
         } else if (idtype != LINUX_P_ALL) return -RELIEFOS_EINVAL;
         if (!(options & (LINUX_WEXITED | LINUX_WSTOPPED | LINUX_WCONTINUED)) ||
-            options & ~(uint32_t)(LINUX_WNOHANG | LINUX_WSTOPPED |
-                                  LINUX_WEXITED | LINUX_WCONTINUED | LINUX_WNOWAIT | 0xc0000000u)) {
+            options & ~(LINUX_WNOHANG | LINUX_WSTOPPED | LINUX_WEXITED | LINUX_WCONTINUED |
+                        LINUX_WNOWAIT | LINUX_WNOTHREAD | LINUX_WALL | LINUX_WCLONE)) {
             return -RELIEFOS_EINVAL;
         }
         struct linux_siginfo info = {0};

@@ -1,4 +1,5 @@
 #include "internal.h"
+#include <reliefnt/pidfd.h>
 #include <reliefnt/swap.h>
 
 /**
@@ -139,6 +140,11 @@ static int64_t syscall_dispatch_normalized_inner(const struct syscall_frame *fra
     }
 
     switch (frame->number) {
+    case __NR_pidfd_open:
+    case __NR_pidfd_send_signal:
+        return syscall_dispatch_regs(sched_current_task(), frame->number,
+                                     frame->args[0], frame->args[1], frame->args[2],
+                                     frame->args[3], 0, 0);
     case LINUX_SYS_SWAPON:
         return syscall_mm_swapon(frame->args[0],frame->args[1]);
     case LINUX_SYS_SWAPOFF:
@@ -771,6 +777,9 @@ int64_t syscall_dispatch_regs(struct task *task, uint64_t number, uint64_t a0, u
                                      uint64_t a2, uint64_t a3, uint64_t a4,
                                      uint64_t a5)
 {
+    if (number == __NR_pidfd_open) return syscall_pidfd_open(task, (int32_t)a0, (uint32_t)a1);
+    if (number == __NR_pidfd_send_signal)
+        return syscall_pidfd_send_signal(task, (int32_t)a0, (int32_t)a1, a2, (uint32_t)a3);
     if(number==LINUX_SYS_SWAPON)return syscall_mm_swapon(a0,a1);
     if(number==LINUX_SYS_SWAPOFF)return syscall_mm_swapoff(a0);
     if(number==LINUX_SYS_INIT_MODULE || number==LINUX_SYS_DELETE_MODULE || number==LINUX_SYS_FINIT_MODULE)

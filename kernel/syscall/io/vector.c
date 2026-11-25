@@ -172,6 +172,7 @@ int64_t syscall_vector_io(struct task *task,uint64_t number,uint64_t a0,uint64_t
     uint64_t saved_offset = 0;
     bool restore_position = false;
     int64_t total;
+    if (file && file->kind == TASK_FILE_KIND_PIDFD) return -LINUX_EINVAL;
     if (file && file->kind == TASK_FILE_KIND_SIGNALFD) {
         if (positional && !current_position) return (int64_t)position < 0 ? -LINUX_EINVAL : -LINUX_ESPIPE;
         if (writing) return -LINUX_EINVAL;

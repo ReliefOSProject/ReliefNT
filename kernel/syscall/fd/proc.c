@@ -22,6 +22,16 @@ static void proc_timer_duration(struct text_stream *s, uint64_t ticks)
  */
 int proc_fd_details(struct task_file *file, struct text_stream *s)
 {
+    if (file->kind == TASK_FILE_KIND_PIDFD) {
+        const struct task *target = sched_task_identity_task((void *)(uintptr_t)file->aux);
+        long pid = target && !(target->pid != sched_task_tgid(target) &&
+            target->state == TASK_EXITED && (target->flags & TASK_FLAG_RESOURCES_RELEASED))
+            ? (long)target->pid : -1;
+        text_string(s, "Pid:\t");
+        text_signed(s, pid);
+        text_string(s, "\n");
+        return 0;
+    }
     if (file->flags & TASK_FILE_FLAG_EVENTFD) {
         text_string(s, "eventfd-count: ");
         text_hex(s, file->aux, 16);

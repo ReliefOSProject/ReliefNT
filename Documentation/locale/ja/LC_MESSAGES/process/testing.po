@@ -30,6 +30,16 @@ msgstr ""
 "include、上流エンジンのダイジェストを検査します。ホストツール／ASan/UBSan、ヘッダー公開、自己完結した C/C++、ELF、実際の実行は異なる層です。ABI "
 "変更は明示的に審査し、差異を消すために過去の golden データを再生成してはなりません。"
 
+msgid ""
+"``tools/tests/pidfd_probe.c`` 是原生 Linux ABI 对照探针。可用宿主 C 编译器 以 "
+"``-pthread`` 编译运行，或静态链接并在 ReliefNT 来宾中运行。探针检查 描述符生命周期、退出与回收事件、信号权限以及 "
+"``waitid(P_PIDFD)``； 跨 UID 权限用例只在有 root 权限的测试环境中执行。"
+msgstr ""
+"``tools/tests/pidfd_probe.c`` は、ネイティブの Linux ABI と動作を比較するためのプローブです。ホストの C"
+" コンパイラーで ``-pthread`` を指定して実行するか、静的リンクして ReliefNT "
+"ゲストで実行します。ディスクリプターのライフサイクル、終了と回収のイベント、シグナル送信の権限、および ``waitid(P_PIDFD)`` "
+"を確認します。異なる UID 間の権限テストは、root 権限のあるテスト環境でのみ実行します。"
+
 msgid "测试归属"
 msgstr "テストの所属"
 

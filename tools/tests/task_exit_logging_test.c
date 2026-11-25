@@ -154,6 +154,11 @@ void syscall_record_lock_cancel(struct task *task) { (void)task; }
 void kernel_wait_queue_remove(struct kernel_wait_queue *queue, struct task *task)
 { (void)queue; (void)task; }
 #endif
+#ifndef TASK_EXIT_REAL_POLL_QUEUE
+/* The lifecycle fixtures have no poll waiters, but notification must still
+ * happen outside scheduler_lock because the production queue wakes tasks. */
+void kernel_poll_readiness_notify(void) { assert(!scheduler_lock_depth); }
+#endif
 uint64_t task_socket_cancel_receive(struct task *task) { (void)task; return 0; }
 void task_release_syscall_file(struct task *task) { (void)task; }
 void task_sysv_sem_exit(struct task *task) { (void)task; }
@@ -271,6 +276,73 @@ static void mutate_after_unlock(void)
 static void repeat_after_unlock(void)
 {
     sched_exit(snapshot_task->pid, 24);
+}
+
+/* Wait CPU usage must survive reuse of nonleader slots before the parent
+ * consumes the group leader. Exercise the real allocator and pidfd wait path. */
+static void check_retired_thread_usage(void)
+{
+    struct task *parent = fixture_task(60, "usage-parent");
+    struct task *leader = fixture_task(61, "usage-leader");
+    struct task *first = fixture_task(62, "usage-thread-1");
+    struct task *second = fixture_task(63, "usage-thread-2");
+    struct task *table[] = {parent, leader, first, second};
+    install_tasks(table, 4);
+    current_task[0] = NULL;
+    leader->parent_pid = parent->pid;
+    leader->state = first->state = second->state = TASK_EXITED;
+    leader->flags |= TASK_FLAG_RESOURCES_RELEASED;
+    first->flags = second->flags = TASK_FLAG_RESOURCES_RELEASED;
+    first->tgid = second->tgid = leader->pid;
+    leader->cpu_user_ticks = RELIEFNT_TICK_HZ;
+    leader->cpu_system_ticks = 2 * RELIEFNT_TICK_HZ;
+    first->cpu_user_ticks = 3 * RELIEFNT_TICK_HZ;
+    first->cpu_system_ticks = 4 * RELIEFNT_TICK_HZ;
+    second->cpu_user_ticks = 5 * RELIEFNT_TICK_HZ;
+    second->cpu_system_ticks = 6 * RELIEFNT_TICK_HZ;
+    struct task_identity *identity;
+    uint64_t ino;
+    sched_task_identity_bind(leader, sched_task_identity_prepare());
+    assert(sched_task_pidfd_get(leader, &identity, &ino) == 0);
+    struct linux_rusage before, after;
+    assert(sched_wait_identity(parent->pid, identity, LINUX_WEXITED | LINUX_WNOWAIT,
+                               NULL, &before) == leader->pid);
+    check(before.ru_utime.tv_sec == 9 && before.ru_utime.tv_usec == 0 &&
+          before.ru_stime.tv_sec == 12 && before.ru_stime.tv_usec == 0,
+          "wait usage initially includes every thread");
+
+    for (unsigned i = 0; i < 2; ++i) {
+        uint64_t flags;
+        kernel_spin_lock_irqsave(&scheduler_lock, &flags);
+        struct task *recycled = alloc_task_slot();
+        kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
+        assert(recycled == (i == 0 ? first : second));
+        recycled->pid = recycled->tgid = 70 + i;
+        recycled->state = TASK_READY;
+        recycled->running_cpu = SCHED_CPU_NONE;
+        assert(sched_wait_identity(parent->pid, identity, LINUX_WEXITED | LINUX_WNOWAIT,
+                                   NULL, &after) == leader->pid);
+        check(memcmp(&before, &after, sizeof(before)) == 0,
+              "wait usage survives retired thread slot reuse");
+    }
+    uint64_t user, system;
+    sched_task_cpu_times(leader, true, &user, &system);
+    check(user == 9 * RELIEFNT_TICK_HZ && system == 12 * RELIEFNT_TICK_HZ,
+          "process clock retains retired thread usage");
+    sched_task_cpu_times(leader, false, &user, &system);
+    check(user == RELIEFNT_TICK_HZ && system == 2 * RELIEFNT_TICK_HZ,
+          "thread clock excludes retired sibling usage");
+    assert(sched_wait_identity(parent->pid, identity, LINUX_WEXITED,
+                               NULL, &after) == 61);
+    check(memcmp(&before, &after, sizeof(before)) == 0,
+          "consuming wait reports each retired thread exactly once");
+    sched_task_pidfd_put(identity);
+    free(parent);
+    free(leader);
+    free(first);
+    free(second);
+    tasks = NULL;
+    task_count = task_capacity = 0;
 }
 
 int main(void)
@@ -421,6 +493,8 @@ int main(void)
     interrupts_enabled = true;
     printf("IRQ-disabled caller preserved: calls=%u held=%u irq_disabled=%u\n",
            console_calls, console_calls_while_locked, console_calls_with_irqs_disabled);
+
+    check_retired_thread_usage();
 
     free(exiting);
     free(remote);

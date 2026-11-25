@@ -1,4 +1,5 @@
 #include "../internal.h"
+#include <linux/pidfd.h>
 
 
 
@@ -139,7 +140,8 @@ int64_t syscall_legacy_descriptors(uint64_t number, uint64_t a0, uint64_t a1, ui
             if (a1 == RELIEFOS_F_GETFL) {
                 if (file_fd) {
                     return (int64_t)(file_fd->flags &
-                        (RELIEFOS_O_ACCMODE | RELIEFOS_O_APPEND | RELIEFOS_O_NONBLOCK));
+                        (RELIEFOS_O_ACCMODE | RELIEFOS_O_APPEND | RELIEFOS_O_NONBLOCK |
+                         (file_fd->kind == TASK_FILE_KIND_PIDFD ? PIDFD_THREAD : 0)));
                 }
                 if (pty_fd) {
                     return (int64_t)task_pty_status(pty_fd);

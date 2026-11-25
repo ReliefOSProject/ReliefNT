@@ -15,8 +15,6 @@ __attribute__((noreturn)) void task_fifo_cancel(void) { __builtin_trap(); }
 /** @brief Trap an unrelated branch. */
 __attribute__((noreturn)) void task_file_for_fd(void) { __builtin_trap(); }
 /** @brief Trap an unrelated branch. */
-__attribute__((noreturn)) void task_file_for_io(void) { __builtin_trap(); }
-/** @brief Trap an unrelated branch. */
 __attribute__((noreturn)) void task_file_get(void) { __builtin_trap(); }
 /** @brief Trap an unrelated branch. */
 __attribute__((noreturn)) void task_pty_ensure_fd(void) { __builtin_trap(); }
@@ -39,3 +37,9 @@ __attribute__((noreturn)) void syscall_mm_mincore_reclaim(void) { __builtin_trap
 __attribute__((noreturn)) void syscall_open_path_reclaim(void) { __builtin_trap(); }
 /** @brief Trap ordinary read reclaim in this unrelated entry fixture. */
 __attribute__((noreturn)) void syscall_regular_read_reclaim(void) { __builtin_trap(); }
+
+/* Wait4 never enters the pipe reader fast path. */
+__attribute__((noreturn)) void kernel_execution_try_read_lock_irqsave(void) { __builtin_trap(); }
+__attribute__((noreturn)) void kernel_execution_read_unlock_irqrestore(void) { __builtin_trap(); }
+__attribute__((noreturn)) void address_space_user_page_copyable(void) { __builtin_trap(); }
+__attribute__((noreturn)) void task_pipe_try_io(void) { __builtin_trap(); }

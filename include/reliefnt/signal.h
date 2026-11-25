@@ -53,8 +53,36 @@ int kernel_signal_peek(struct task *task, uint64_t allowed);
 void kernel_signal_flush(struct task *task, bool process, uint64_t mask);
 /** @brief Move shared pending state into the sole surviving exec thread. */
 void kernel_signal_detach_process(struct task *task);
-/** @brief Implement native rt_sigqueueinfo and rt_tgsigqueueinfo user-copy and permission checks. */
+/** @brief Implement native queued signals with user-copy and permission checks.
+ * @param tgid Target PID, or group ID when thread is true.
+ * @param tid Target TID for a thread-directed signal; ignored otherwise.
+ * @param sig Native signal number, or zero for a permission/existence check.
+ * @param info User siginfo address, validated and imported before enqueue.
+ * @param thread Select rt_tgsigqueueinfo rather than rt_sigqueueinfo semantics.
+ * @return Zero, negative Linux errno, or a pre-enqueue swap retry result.
+ * Requires current-task execution ownership without caller-held spinlocks.
+ * Neither user memory nor target references are retained.
+ */
 int64_t kernel_signal_queueinfo(int32_t tgid, int32_t tid, int sig, uint64_t info, bool thread);
+/** @brief Import native siginfo without changing its reported signal number.
+ * @param caller Borrowed caller for prefaulting, or NULL to skip prefault.
+ * @param pointer User siginfo address, validated before access.
+ * @param sig Requested signal selecting the meaningful siginfo layout.
+ * @param info Required kernel output, zeroed first and not retained.
+ * @return Zero, -EFAULT/-E2BIG, or KERNEL_SYSCALL_SWAP_CONTENDED before enqueue.
+ * Requires execution ownership without spinlocks across prefaulting.
+ */
+int kernel_signal_import_info(struct task *caller, uint64_t pointer, int sig,
+                              struct linux_siginfo *info);
+
+/** @brief Check native Linux signal permissions for numeric and pidfd sends.
+ * @param caller Borrowed sender under execution ownership, nullable.
+ * @param target Borrowed identity-checked receiver, nullable.
+ * @param sig Requested signal; SIGCONT permits the same-session exception.
+ * @return True for an authorized sender, false for NULL tasks or denial.
+ * Does not acquire locks, retain references or enqueue a signal.
+ */
+bool kernel_signal_may_send(const struct task *caller, const struct task *target, int sig);
 /** @brief Test Linux's default-ignore signal set. */
 bool kernel_signal_default_ignored(int sig);
 /** @brief Pending signal that can interrupt a Linux TASK_KILLABLE wait, or zero. */

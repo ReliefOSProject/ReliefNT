@@ -311,23 +311,63 @@ void sched_cpu_times(uint64_t *user, uint64_t *system, uint64_t *idle, uint32_t 
     }
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
 }
-/** @brief Snapshot one thread's CPU times or the published thread group's sum.
- * @param task Borrowed target. @param process Sum the group when true.
- * @param user Required user ticks. @param system Required kernel ticks.
- * IRQ-safe scheduler lock; no references escape.
+/** @brief Preserve a retired nonleader's CPU time before its slot is recycled.
+ * @param task Fully retired task whose counters will be cleared, borrowed.
+ * Caller holds scheduler_lock and has checked that its group is quiescent.
+ * Transfers and clears CPU counters only while the original leader is still
+ * published; no allocation, I/O, locking or ownership transfer occurs.
+ */
+void cpu_accounting_retire_thread(struct task *task)
+{
+    if (!task || !task->pid || task->pid == sched_task_tgid(task)) return;
+    struct task *leader = sched_find(sched_task_tgid(task));
+    if (!leader) return;
+    leader->retired_user_ticks =
+        cpu_accounting_add(leader->retired_user_ticks, task->cpu_user_ticks);
+    leader->retired_system_ticks =
+        cpu_accounting_add(leader->retired_system_ticks, task->cpu_system_ticks);
+    task->cpu_user_ticks = task->cpu_system_ticks = 0;
+}
+
+/** @brief Snapshot thread or group CPU time, including recycled group members.
+ * @param task Borrowed published target, or NULL for a zero result.
+ * @param process Include all group members and retained CPU time when true.
+ * @param user Required kernel output receiving user-mode ticks.
+ * @param system Required kernel output receiving kernel-mode ticks.
+ * Caller holds scheduler_lock. Settles per-CPU accounting without allocation,
+ * additional locking or retaining task references.
+ */
+void cpu_accounting_task_times_locked(const struct task *task, bool process,
+                                      uint64_t *user, uint64_t *system)
+{
+    cpu_accounting_sync();
+    *user = *system = 0;
+    for (uint32_t i = 0; task && task->pid && i < task_count; ++i) {
+        const struct task *t = tasks[i];
+        if (t->pid && ((!process && t == task) ||
+            (process && sched_task_tgid(t) == sched_task_tgid(task)))) {
+            *user = cpu_accounting_add(*user, t->cpu_user_ticks);
+            *system = cpu_accounting_add(*system, t->cpu_system_ticks);
+            if (process) {
+                *user = cpu_accounting_add(*user, t->retired_user_ticks);
+                *system = cpu_accounting_add(*system, t->retired_system_ticks);
+            }
+        }
+    }
+}
+
+/** @brief Snapshot a thread's CPU time or its group's full retained CPU time.
+ * @param task Borrowed published target, or NULL for a zero result.
+ * @param process Include group members and recycled-thread CPU time when true.
+ * @param user Required kernel output receiving user-mode ticks.
+ * @param system Required kernel output receiving kernel-mode ticks.
+ * Takes the IRQ-safe scheduler lock; callers must not already hold it.
+ * No allocation, I/O or ownership transfer occurs.
  */
 void sched_task_cpu_times(const struct task *task, bool process, uint64_t *user, uint64_t *system)
 {
     uint64_t flags;
     kernel_spin_lock_irqsave(&scheduler_lock, &flags);
-    cpu_accounting_sync();
-    *user = *system = 0;
-    for (uint32_t i = 0; task && i < task_count; ++i) {
-        const struct task *t = tasks[i];
-        if ((!process && t == task) || (process && sched_task_tgid(t) == sched_task_tgid(task))) {
-            *user = cpu_accounting_add(*user, t->cpu_user_ticks);
-            *system = cpu_accounting_add(*system, t->cpu_system_ticks);
-        }
-    }
+    cpu_accounting_task_times_locked(task, process, user, system);
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
 }

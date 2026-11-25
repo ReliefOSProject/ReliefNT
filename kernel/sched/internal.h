@@ -609,6 +609,24 @@ void cpu_accounting_settle(uint32_t cpu);
 
 void cpu_accounting_sync(void);
 
+/** @brief Transfer a recycled nonleader's CPU time to its published leader.
+ * @param task Borrowed fully retired task, or NULL. Its counters are consumed.
+ * Caller holds scheduler_lock and has established group quiescence; performs
+ * no allocation, I/O or additional locking.
+ */
+void cpu_accounting_retire_thread(struct task *task);
+
+/** @brief Read thread or group CPU time without recursively taking its lock.
+ * @param task Borrowed published task, or NULL for zero counters.
+ * @param process Include group members and retained retired-thread CPU time.
+ * @param user Required kernel output for user ticks.
+ * @param system Required kernel output for kernel ticks.
+ * Caller holds scheduler_lock; settles per-CPU counters, with no allocation,
+ * I/O or reference transfer.
+ */
+void cpu_accounting_task_times_locked(const struct task *task, bool process,
+                                      uint64_t *user, uint64_t *system);
+
 /** @brief Drop the resource-limit reference only when a task is reaped/recycled. */
 void task_release_limits(struct task *task);
 

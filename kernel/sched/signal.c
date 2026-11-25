@@ -206,7 +206,21 @@ int sched_signal_user_process(uint32_t tgid, int signal_number)
 int sched_signal_user_process_info(uint32_t pid, int signal_number,
                                    const struct linux_siginfo *info)
 {
-    struct task *leader = sched_find(pid), *live = NULL, *eligible = NULL;
+    return sched_signal_user_process_target(sched_find(pid), signal_number, info);
+}
+
+/** @brief Signal the group of a stable task without a second numeric lookup.
+ * @param leader Borrowed addressed member, which need not be the group leader.
+ * @param signal_number Native signal number, or zero for an existence check.
+ * @param info Optional kernel siginfo copied into the group's pending queue.
+ * @return Zero on acceptance or for a waitable zombie, or a negative target/
+ * queue error. Caller holds execution ownership and has checked permissions;
+ * no scheduler_lock may be held across queueing and wakeup. No refs escape.
+ */
+int sched_signal_user_process_target(struct task *leader, int signal_number,
+                                     const struct linux_siginfo *info)
+{
+    struct task *live = NULL, *eligible = NULL;
     if (!leader || leader->kind != TASK_KIND_USER ||
         signal_number < 0 || (unsigned)signal_number >= KERNEL_SIGNAL_ACTION_MAX) return -1;
     uint32_t tgid = sched_task_tgid(leader);

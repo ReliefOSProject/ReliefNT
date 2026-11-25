@@ -9,11 +9,24 @@
 #undef main
 #include <reliefnt/swap.h>
 #include <reliefnt/syscall_internal.h>
+#include <linux/resource.h>
+#include <linux/wait.h>
 
 static int cleanup_result=1;
 static uintptr_t swapped,invalid;
 static bool contended;
 static unsigned prepares;
+static struct task_file waited_pidfd;
+
+/* Only the wait front door for this fixture's one pidfd is modeled. A
+ * blocking poll queue registration is outside these usercopy controls. */
+struct task_file *task_file_for_io(struct task *task, int fd)
+{ assert(task && fd == 7); return &waited_pidfd; }
+uint64_t kernel_poll_readiness_generation(void) { return 0; }
+int kernel_poll_wait_current(uint64_t generation, uint64_t deadline)
+{ (void)generation; (void)deadline; abort(); }
+uint64_t time_ticks(void) { return 100; }
+
 bool kernel_execution_is_outermost(void) { return execution_lock_depth==1; }
 int futex_task_exit_step(struct task *task)
 { assert(task && !scheduler_lock_depth);return cleanup_result; }
@@ -23,7 +36,8 @@ bool user_range_writable(uint64_t address,uint64_t size)
 { return address>=4096 && size<=UINT64_MAX-address && address!=swapped && address!=invalid; }
 int swap_prepare_user_range(struct task *task,uint64_t address,uint64_t size,bool write)
 {
-    assert(task && write && !scheduler_lock_depth && execution_lock_depth==1 && size<=128);
+    assert(task && write && !scheduler_lock_depth && execution_lock_depth==1 &&
+           size<=sizeof(struct linux_rusage));
     ++prepares;
     if(address==invalid)return -LINUX_EFAULT;
     if(address==swapped) {
@@ -39,6 +53,42 @@ static struct task *wait_fixture_task(uint32_t pid)
     struct task *old=fixture_task(pid,"wait-fixture");
     struct sched_task_object *object=calloc(1,sizeof(*object));assert(object);
     object->task=*old;free(old);return &object->task;
+}
+
+/** @brief Exercise the real pidfd wait front door across both output buffers. */
+static void check_pidfd_wait_swap(struct task *child)
+{
+    child->pid = 51;
+    child->parent_pid = 50;
+    child->state = TASK_EXITED;
+    child->flags = TASK_FLAG_WAITABLE_CHILD | TASK_FLAG_RESOURCES_RELEASED;
+    struct task_identity *identity;
+    uint64_t ino;
+    sched_task_identity_bind(child, sched_task_identity_prepare());
+    assert(!sched_task_pidfd_get(child, &identity, &ino));
+    waited_pidfd = (struct task_file){.kind = TASK_FILE_KIND_PIDFD,
+                                    .aux = (uintptr_t)identity, .aux2 = ino};
+    struct linux_siginfo info = {0};
+    struct linux_rusage usage = {.ru_utime = {-1, -1}};
+    const uintptr_t siginfo = (uintptr_t)&info, rusage = (uintptr_t)&usage;
+    contended = true;
+    swapped = rusage;
+    assert(syscall_legacy_process(LINUX_SYS_WAITID, LINUX_P_PIDFD, 7, siginfo,
+                                  LINUX_WEXITED, rusage, 0) == KERNEL_SYSCALL_SWAP_CONTENDED);
+    assert(child->pid == 51 && !info.signo && usage.ru_utime.tv_sec == -1);
+    swapped = siginfo;
+    assert(syscall_legacy_process(LINUX_SYS_WAITID, LINUX_P_PIDFD, 7, siginfo,
+                                  LINUX_WEXITED, rusage, 0) == KERNEL_SYSCALL_SWAP_CONTENDED);
+    assert(child->pid == 51 && !info.signo && usage.ru_utime.tv_sec == -1);
+    swapped = 0;
+    contended = false;
+    invalid = rusage;
+    assert(syscall_legacy_process(LINUX_SYS_WAITID, LINUX_P_PIDFD, 7, siginfo,
+                                  LINUX_WEXITED, rusage, 0) == -LINUX_EFAULT);
+    assert(child->pid == 0 && !sched_task_identity_task(identity) && !info.signo);
+    invalid = 0;
+    waited_pidfd = (struct task_file){0};
+    sched_task_pidfd_put(identity);
 }
 
 #ifdef TASK8_WAIT_FRAME_TEST
@@ -141,6 +191,7 @@ int main(void)
     invalid=0;
     assert(syscall_legacy_process(LINUX_SYS_WAITID,1,51,(uintptr_t)&info,4,0,0)==-RELIEFOS_ECHILD);
     assert(!info.signo && !info.fields.child.pid);
+    check_pidfd_wait_swap(child);
     execution_lock_depth=0;interrupts_enabled=true;free(parent);free(child);free(peer);
-    puts("PASS wait4/waitid readiness, swap retry, cleanup gate and late errors");return 0;
+    puts("PASS wait4/waitid readiness, pidfd and numeric swap retry, cleanup gate and late errors");return 0;
 }

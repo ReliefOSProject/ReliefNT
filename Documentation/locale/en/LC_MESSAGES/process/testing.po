@@ -33,6 +33,18 @@ msgstr ""
 "contained C/C++, ELF, and actual execution are distinct layers. ABI changes require explicit "
 "review, not regeneration of historical golden data to eliminate differences."
 
+msgid ""
+"``tools/tests/pidfd_probe.c`` 是原生 Linux ABI 对照探针。可用宿主 C 编译器 以 "
+"``-pthread`` 编译运行，或静态链接并在 ReliefNT 来宾中运行。探针检查 描述符生命周期、退出与回收事件、信号权限以及 "
+"``waitid(P_PIDFD)``； 跨 UID 权限用例只在有 root 权限的测试环境中执行。"
+msgstr ""
+"``tools/tests/pidfd_probe.c`` compares the native Linux ABI. Compile and "
+"run it on the host with a C compiler and ``-pthread``, or statically link"
+" it and run it in a ReliefNT guest. The probe checks descriptor "
+"lifetimes, exit and reap events, signal permissions, and "
+"``waitid(P_PIDFD)``. The cross-UID permission test runs only in a test "
+"environment with root privileges."
+
 msgid "测试归属"
 msgstr "Test Ownership"
 

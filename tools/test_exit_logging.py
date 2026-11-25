@@ -26,7 +26,7 @@ def main() -> int:
              "-ffunction-sections", "-fdata-sections",
              "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
              *INCLUDES, "-Wl,--gc-sections",
-             "tools/tests/task_exit_logging_test.c", "-o", str(binary)],
+             "tools/tests/task_exit_logging_test.c", "fs/vfs/lookup_cache.c", "-o", str(binary)],
             cwd=ROOT, check=True)
         result = subprocess.run([str(binary)], cwd=ROOT, timeout=30)
         print("task-exit-logging: " + ("PASS" if result.returncode == 0 else "FAIL"))

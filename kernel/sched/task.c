@@ -53,6 +53,32 @@ bool thread_group_pending(uint32_t tgid, const struct task *except)
     return false;
 }
 
+/** @brief Observe a retained PID's exit state without following reused PIDs.
+ * @param identity Borrowed retained identity, or NULL for a reaped result.
+ * @param thread Observe a leader's own retirement rather than its whole group.
+ * @return LIVE, EXITED for a quiescent waitable leader, or REAPED after identity
+ * invalidation or nonleader retirement, regardless of the requested scope.
+ * Takes scheduler_lock internally; caller must not hold it. Retains no refs.
+ */
+enum sched_pidfd_state sched_task_pidfd_state(const struct task_identity *identity, bool thread)
+{
+    uint64_t flags;
+    enum sched_pidfd_state state = SCHED_PIDFD_LIVE;
+    kernel_spin_lock_irqsave(&scheduler_lock, &flags);
+    const struct task *task = sched_task_identity_task(identity);
+    if (!task) {
+        state = SCHED_PIDFD_REAPED;
+    } else if (task->state == TASK_EXITED && task->running_cpu == SCHED_CPU_NONE &&
+               (task->flags & TASK_FLAG_RESOURCES_RELEASED)) {
+        if (task->pid != sched_task_tgid(task))
+            state = SCHED_PIDFD_REAPED; /* Native threads have no waitable zombie. */
+        else if (thread || !thread_group_pending(task->pid, task))
+            state = SCHED_PIDFD_EXITED;
+    }
+    kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
+    return state;
+}
+
 static uint64_t user_task_count_locked(uint32_t uid)
 {
     uint64_t count = 0;
@@ -160,7 +186,8 @@ uint32_t task_allocate_pid(void)
  * @brief Recycle a fully retired task or allocate a stable zeroed task record.
  * @return Borrowed unpublished task slot, or NULL on allocation/size failure.
  * Caller holds scheduler_lock. Retires old PID identities before reuse so held
- * proc inodes cannot retarget; releases no filesystem or device resources here.
+ * proc inodes cannot retarget. Preserves recycled thread CPU time on its still
+ * published group leader; releases no filesystem or device resources here.
  */
 struct task *alloc_task_slot(void)
 {
@@ -170,6 +197,7 @@ struct task *alloc_task_slot(void)
             (tasks[i]->flags & TASK_FLAG_RESOURCES_RELEASED) &&
             !thread_group_pending(sched_task_tgid(tasks[i]), tasks[i]) &&
             (!(tasks[i]->flags & TASK_FLAG_WAITABLE_CHILD) || tasks[i]->parent_pid == 0)) {
+            cpu_accounting_retire_thread(tasks[i]);
             task_release_limits(tasks[i]);
             fair_forget(tasks[i]);
             sched_task_identity_detach(tasks[i]);
@@ -422,7 +450,8 @@ uint32_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack
     task_zero(task);
     task->pid = pid;
     task->start_uptime_ms = time_uptime_ms();
-    task->parent_pid = parent_pid;
+    struct task *real_parent = parent_pid ? sched_find(parent_pid) : NULL;
+    task->parent_pid = real_parent ? sched_task_tgid(real_parent) : parent_pid;
     task->pdeath_parent_pid = parent_pid;
     task->parent_exit_signal = 17;
     task->process_group = task->pid;
@@ -580,12 +609,25 @@ void sched_exit(uint32_t pid, uint64_t code)
         }
     }
     if (exiting && exit_event) {
-        /* Linux forget_original_parent reparents each real-parent child after
-         * arming its parent-death signal, so a later prctl() can never pair a
-         * signal with a parent that has already terminated. */
-        struct task *reaper = sched_find(1);
-        uint32_t reaper_pid = (reaper && reaper != exiting &&
-                               reaper->state != TASK_EXITED) ? 1 : 0;
+        /* Reparent the real-parent link within the surviving thread group
+         * first. Only a dying group hands children to init. This link also
+         * determines which thread can wait with __WNOTHREAD. */
+        uint32_t reaper_pid = 0;
+        if (exiting->kind == TASK_KIND_USER) {
+            uint32_t group = sched_task_tgid(exiting);
+            for (uint32_t i = 0; i < task_count; ++i) {
+                const struct task *candidate = tasks[i];
+                if (candidate->pid && candidate->state != TASK_EXITED &&
+                    sched_task_tgid(candidate) == group) {
+                    reaper_pid = candidate->pid;
+                    break;
+                }
+            }
+        }
+        if (!reaper_pid) {
+            const struct task *init = sched_find(1);
+            if (init && init->state != TASK_EXITED) reaper_pid = 1;
+        }
         for (uint32_t i = 0; i < task_count; ++i) {
             if (tasks[i]->pdeath_parent_pid != exit_pid) continue;
             if (tasks[i]->pdeath_signal) tasks[i]->flags |= TASK_FLAG_PDEATH_NOTIFY;
@@ -724,6 +766,14 @@ void sched_release_task_resources(struct task *task)
      * hangup can recursively terminate other members of the foreground group. */
     if (last_files) pty_process_exit(task->pid);
     sched_notify_parent_exit(task);
+    /* A process pidfd is also released by the last sibling's exit, even if
+     * the leader exited earlier. Notify outside scheduler_lock: waking the
+     * shared poll queue takes that lock to make the waiters runnable. */
+    struct task *leader = sched_find(sched_task_tgid(task));
+    if (sched_task_pidfd_watched(task) ||
+        (leader && leader != task && leader->state == TASK_EXITED &&
+         sched_task_pidfd_watched(leader) && !thread_group_pending(leader->pid, leader)))
+        kernel_poll_readiness_notify();
 }
 
 /** @brief Advance a bounded number of quiescent deferred task cleanups.

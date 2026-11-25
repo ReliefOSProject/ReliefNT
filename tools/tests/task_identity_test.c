@@ -44,5 +44,25 @@ int main(void)
     assert(sched_task_identity_get(&a,&alias)==-ESRCH && !alias);
     sched_task_identity_detach(&a);assert(!sched_task_identity_task(old));
     sched_task_identity_put(old);assert(!live_allocations);
-    puts("PASS PID identity: allocation rollback, stable aliases, recycled slots, exec PID swap and final release");
+
+    /* Reuse the exact PID and backing task record while an OFD still retains
+     * the old identity; two open descriptions of one generation agree. */
+    a=(struct task){.pid=17};
+    sched_task_identity_bind(&a, sched_task_identity_prepare());
+    uint64_t first, same, replacement;
+    assert(sched_task_pidfd_get(&a, &old, &first) == 0 && sched_task_pidfd_watched(&a));
+    assert(sched_task_pidfd_get(&a, &alias, &same) == 0 && alias == old && same == first);
+    sched_task_pidfd_put(alias);
+    assert(sched_task_pidfd_watched(&a));
+    sched_task_identity_detach(&a);
+    sched_task_identity_bind(&a, sched_task_identity_prepare());
+    assert(!sched_task_pidfd_watched(&a) && !sched_task_identity_task(old));
+    assert(sched_task_pidfd_get(&a, &next, &replacement) == 0 && replacement != first);
+    assert(sched_task_identity_task(next) == &a && sched_task_identity_task(old) == NULL);
+    sched_task_pidfd_put(next);
+    assert(!sched_task_pidfd_watched(&a));
+    sched_task_identity_detach(&a);
+    sched_task_pidfd_put(old);
+    assert(!live_allocations);
+    puts("PASS PID identity: allocation rollback, aliases, PID reuse, exec PID swap and final release");
 }

@@ -1,4 +1,5 @@
 #include <reliefnt/serial.h>
+#include <reliefnt/pidfd.h>
 #include "../internal.h"
 #include <reliefnt/swap.h>
 
@@ -93,6 +94,8 @@ static int64_t syscall_poll_impl_core(struct task *task, struct pollfd *fds,
             revents = events & task_signalfd_poll(task, file);
         } else if (file && file->kind == TASK_FILE_KIND_INOTIFY) {
             revents = task_inotify_poll ? events & task_inotify_poll(file) : 0;
+        } else if (file && file->kind == TASK_FILE_KIND_PIDFD) {
+            revents = (events | POLLHUP) & task_pidfd_poll(file);
         } else if (file && (file->flags & TASK_FILE_FLAG_EPOLL)) {
             if ((events & (POLLIN | POLLRDNORM)) &&
                 task_epoll_poll_ready(task, file))

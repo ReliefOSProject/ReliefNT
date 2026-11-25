@@ -16,6 +16,35 @@ int sched_task_identity_get(struct task *task,struct task_identity **out);
  * @return Zero or -EINVAL/-ESRCH/-EOVERFLOW; success transfers one reference.
  */
 int sched_task_identity_get_existing(struct task *task, struct task_identity **out);
+/** @brief Retain one OFD-owned PID reference and its stable anonymous inode.
+ * @param task Borrowed published target under execution ownership.
+ * @param out Required output receiving one reference, NULL on failure.
+ * @param ino Required kernel output receiving the stable inode number.
+ * @return Zero, or -EINVAL/-ESRCH/-EOVERFLOW without retaining a reference.
+ * Caller serializes identity access; no allocation or lock acquisition.
+ */
+int sched_task_pidfd_get(struct task *task, struct task_identity **out, uint64_t *ino);
+/** @brief Release one OFD's watch and retained PID reference on final close.
+ * @param identity Owned pidfd reference, or NULL, under execution ownership.
+ * Frees only the final reference; no I/O or additional locking.
+ */
+void sched_task_pidfd_put(struct task_identity *identity);
+/** @brief Check whether any OFD watches this task's current identity.
+ * @param task Borrowed task, or NULL, under execution ownership or scheduler_lock.
+ * @return True for at least one pidfd OFD; aliases share their OFD's watch.
+ * Does not acquire a lock or retain a reference.
+ */
+bool sched_task_pidfd_watched(const struct task *task);
+
+enum sched_pidfd_state { SCHED_PIDFD_LIVE, SCHED_PIDFD_EXITED, SCHED_PIDFD_REAPED };
+/** @brief Snapshot exit and reap independently of PID or task-slot reuse.
+ * @param identity Borrowed retained identity, or NULL for a reaped result.
+ * @param thread Observe the leader alone rather than waiting for its group.
+ * @return LIVE, EXITED for a quiescent waitable leader, or REAPED for a detached
+ * identity or retired nonleader, independently of the requested scope.
+ * Takes scheduler_lock internally; caller must not hold it. No refs escape.
+ */
+enum sched_pidfd_state sched_task_pidfd_state(const struct task_identity *identity, bool thread);
 /** @brief Allocate an unbound PID identity before taking scheduler_lock.
  * @return One caller-owned identity, or NULL on allocation failure.
  */

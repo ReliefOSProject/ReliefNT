@@ -10,6 +10,7 @@
 #include <reliefnt/page_cache.h>
 #include <linux/errno.h>
 #include <linux/fcntl.h>
+#include <linux/pidfd.h>
 #include <linux/time.h>
 
 static const char *net_leaves[] = {"dev", "route", "arp", "tcp", "udp", "unix",
@@ -764,6 +765,8 @@ int proc_extra_emit(const char *path, struct text_stream *s)
         uint32_t public_flags =
             flags & (LINUX_O_ACCMODE | LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_SYNC |
                      LINUX_O_DIRECT | LINUX_O_NOATIME | LINUX_O_DSYNC);
+        if (f && f->kind == TASK_FILE_KIND_PIDFD)
+            public_flags |= flags & PIDFD_THREAD;
         if (flags & TASK_FILE_FLAG_PATH)
             public_flags |= LINUX_O_PATH;
         if (fdflags)
@@ -776,7 +779,9 @@ int proc_extra_emit(const char *path, struct text_stream *s)
                                    : pty && pty->description ? &pty->description->path_ref
                                                              : NULL;
         field(s, "mnt_id:\t", vfs_path_mount_id(p), "\n");
-        if (f && f->socket_ino)
+        if (f && f->kind == TASK_FILE_KIND_PIDFD)
+            field(s, "ino:\t", f->aux2, "\n");
+        else if (f && f->socket_ino)
             field(s, "ino:\t", f->socket_ino, "\n");
         else if (p && p->mount) {
             struct linux_stat_abi st;

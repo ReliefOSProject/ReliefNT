@@ -12,4 +12,5 @@
    descriptors
    inotify
    ipv6
+   pidfd
    procfs

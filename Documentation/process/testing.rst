@@ -15,6 +15,11 @@ module-layout 检查本地 Kbuild、重复/遗漏对象、生产实现包含和�
 宿主工具/ASan/UBSan、头导出、自包含 C/C++、ELF 和真实运行是不同层次。
 ABI 变化必须明确审查，不通过重生成历史 golden 消除差异。
 
+``tools/tests/pidfd_probe.c`` 是原生 Linux ABI 对照探针。可用宿主 C 编译器
+以 ``-pthread`` 编译运行，或静态链接并在 ReliefNT 来宾中运行。探针检查
+描述符生命周期、退出与回收事件、信号权限以及 ``waitid(P_PIDFD)``；
+跨 UID 权限用例只在有 root 权限的测试环境中执行。
+
 测试归属
 ========
 

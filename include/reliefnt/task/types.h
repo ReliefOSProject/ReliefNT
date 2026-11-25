@@ -165,6 +165,7 @@ struct task_file {
 #define TASK_FILE_KIND_DRM_PRIME 4u
 #define TASK_FILE_KIND_INOTIFY 5u
 #define TASK_FILE_KIND_DRM_SYNC 6u /* aux: OFD-owned Linux sync_file. */
+#define TASK_FILE_KIND_PIDFD 7u   /* aux: owned task_identity, aux2: identity inode. */
 
 static inline struct task_file *task_file_description(struct task_file *file)
 {
@@ -522,6 +523,9 @@ struct task {
     struct task_identity *identity_token;
     uint64_t proc_read_chars, proc_write_chars, proc_read_calls, proc_write_calls;
     uint64_t proc_read_bytes, proc_write_bytes;
+    /* Group-leader CPU time retained when retired thread slots are reused.
+     * Protected by scheduler_lock; excluded from per-thread CPU clocks. */
+    uint64_t retired_user_ticks, retired_system_ticks;
     struct eevdf_entity fair;
     uint64_t start_uptime_ms;
     bool no_new_privs;

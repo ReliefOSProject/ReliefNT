@@ -85,6 +85,11 @@ int linux_stat_from_node(struct linux_stat_abi *out,const struct reliefos_stat *
 
 void linux_stat_fd_type(struct linux_stat_abi *out, const struct task_file *file)
 {
+    if (file && file->kind == TASK_FILE_KIND_PIDFD) {
+        *out = (struct linux_stat_abi){.st_mode = 0700u, .st_ino = file->aux2,
+            .st_nlink = 1, .st_blksize = 4096};
+        return;
+    }
     if (file && file->socket_ino) {
         out->st_mode = LINUX_S_IFSOCK | 0600u;
         out->st_ino = file->socket_ino;

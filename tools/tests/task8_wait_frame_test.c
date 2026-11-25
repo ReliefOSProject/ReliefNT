@@ -3,8 +3,7 @@
 #define TASK8_WAIT_FRAME_TEST 1
 #include "task8_wait_swap_test.c"
 
-static unsigned release_calls,net_calls;
-void net_tcp_maintenance(void) { assert(execution_lock_depth);++net_calls; }
+static unsigned release_calls;
 uint32_t graphics_service_process_retirements(uint32_t n) { assert(execution_lock_depth && n==2);return 0; }
 void driver_manager_process_audio_faults(void) { assert(execution_lock_depth); }
 void usb_process_work(void) { assert(execution_lock_depth); }
@@ -13,9 +12,13 @@ void task_socket_stage_enter(struct task *task,const struct trap_frame *frame) {
 void task_transfer_enter(struct task *task,const struct trap_frame *frame) { assert(task && frame); }
 void task_vector_enter(struct task *task,const struct trap_frame *frame) { assert(task && frame); }
 void task_lookup_scope_begin(struct task *task,const struct trap_frame *frame) { assert(task && frame); }
+/* There is no storage completion source in this fixture. Model the real
+ * storage wait's one-tick fallback with the production scheduler. */
+uint64_t storage_wait_begin(void) { assert(execution_lock_depth); return 0; }
+void storage_wait_sleep(uint64_t generation)
+{ assert(execution_lock_depth && !generation); sched_sleep_current_until(time_ticks() + 1); }
 void storage_set_io_async_context(bool enabled) { assert(execution_lock_depth);(void)enabled; }
 void storage_release_task_io(uint32_t pid) { assert(execution_lock_depth && pid==50);++release_calls; }
-uint64_t time_ticks(void) { return 100; }
 void arch_set_user_fs(uint64_t fs) { (void)fs;assert(execution_lock_depth); }
 int64_t syscall_dispatch_regs(struct task *task,uint64_t nr,uint64_t a0,uint64_t a1,uint64_t a2,
                               uint64_t a3,uint64_t a4,uint64_t a5)
@@ -41,7 +44,7 @@ int main(void)
     parent->state=TASK_RUNNING;sched_resched_pending[0]=0;frame.rip+=2;
     assert(syscall_dispatch_frame(&frame)==parent);
     assert(!execution_lock_depth && frame.rax==51 && frame.rip==0x400002);
-    assert(!child->pid && status==(7<<8) && release_calls==1 && net_calls==2);
+    assert(!child->pid && status==(7<<8) && release_calls==1);
     free(parent);free(child);
     puts("PASS wait frame parks on prerequisite, wakes and consumes original event once");return 0;
 }

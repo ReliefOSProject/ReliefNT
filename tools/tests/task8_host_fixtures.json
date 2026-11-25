@@ -3513,6 +3513,8 @@
         "-Iinclude/uapi",
         "tools/tests/task8_wait_swap_test.c",
         "kernel/syscall/process/legacy_process.c",
+        "kernel/syscall/process/pidfd.c",
+        "fs/vfs/lookup_cache.c",
         "tools/tests/task8_host_stubs/wait-unreached.c",
         "-o",
         "{tmp}/fix1-wait-swap"
@@ -4956,6 +4958,8 @@
         "tools/tests/task8_wait_frame_test.c",
         "kernel/syscall/entry.c",
         "kernel/syscall/process/legacy_process.c",
+        "kernel/syscall/process/pidfd.c",
+        "fs/vfs/lookup_cache.c",
         "tools/tests/task8_host_stubs/wait-unreached.c",
         "tools/tests/task8_host_stubs/fix1-wait-frame-unreached.c",
         "-o",

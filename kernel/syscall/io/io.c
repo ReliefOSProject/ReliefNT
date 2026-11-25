@@ -119,7 +119,8 @@ int64_t syscall_io_write(uint64_t a0, uint64_t a1, uint64_t a2)
     int pty_stream;
     struct task_file *signal_file = task_file_for_io(task, (int32_t)a0);
     if (signal_file && (signal_file->flags & TASK_FILE_FLAG_PATH)) return -RELIEFOS_EBADF;
-    if (signal_file && signal_file->kind == TASK_FILE_KIND_SIGNALFD) return -LINUX_EINVAL;
+    if (signal_file && (signal_file->kind == TASK_FILE_KIND_SIGNALFD ||
+                        signal_file->kind == TASK_FILE_KIND_PIDFD)) return -LINUX_EINVAL;
     if (signal_file && signal_file->kind == TASK_FILE_KIND_INOTIFY) return -LINUX_EBADF;
 #ifdef CONFIG_SWAP
     if(signal_file && (signal_file->flags & TASK_FILE_FLAG_SOCKET_UNIX)) {
@@ -274,6 +275,7 @@ int64_t syscall_io_read_iter(uint64_t a0, uint64_t a1, uint64_t a2, enum pty_rea
     int pty_stream;
     file = task_file_for_io(task, (int32_t)a0);
     if (file && (file->flags & TASK_FILE_FLAG_PATH)) return -RELIEFOS_EBADF;
+    if (file && file->kind == TASK_FILE_KIND_PIDFD) return -LINUX_EINVAL;
     if (file && file->kind == TASK_FILE_KIND_SIGNALFD) return task_signalfd_read(task, file, a1, a2);
     if (file && file->kind == TASK_FILE_KIND_INOTIFY)
         return task_inotify_read ? task_inotify_read(task, file, a1, a2) : -RELIEFOS_ENOSYS;

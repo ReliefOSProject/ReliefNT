@@ -36,6 +36,7 @@
 #include <reliefnt/futex.h>
 #include <reliefnt/fsnotify_vfs.h>
 #include <linux/inotify.h>
+#include <linux/wait.h>
 #define RELIEFOS_FLOCK_NB 4u
 
 /* Real execution admission, including queued-writer exclusion. Privileged

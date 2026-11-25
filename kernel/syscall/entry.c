@@ -7,6 +7,7 @@
 #include <reliefnt/fsnotify_vfs.h>
 #include <reliefnt/storage_wait.h>
 #include <linux/inotify.h>
+#include <linux/wait.h>
 
 /** @brief Distinguish a nonblocking stream result from an internal I/O wait.
  * @param task Current task under execution ownership, nullable.
@@ -153,6 +154,7 @@ static int task_begin_syscall_io(struct task *task, uint64_t number, int32_t fd,
                                   uint64_t arg2)
 {
     bool file_io = (number==LINUX_SYS_MMAP && !((uint32_t)arg2&LINUX_MAP_ANONYMOUS)) ||
+        number == __NR_pidfd_send_signal || number == LINUX_SYS_WAITID ||
         number == LINUX_SYS_READ || number == LINUX_SYS_WRITE ||
         number == LINUX_SYS_FINIT_MODULE ||
         number == LINUX_SYS_FSTAT || number == LINUX_SYS_FSTATFS ||
@@ -341,8 +343,10 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
 #endif
     task_transfer_enter(calling_task,frame);
     task_vector_enter(calling_task,frame);
+    bool wait_pidfd = number == LINUX_SYS_WAITID && (uint32_t)frame->rdi == LINUX_P_PIDFD;
     int pin_error=task_begin_syscall_io(calling_task,number,
-        (int32_t)(number==LINUX_SYS_MMAP ? frame->r8 : frame->rdi),
+        (int32_t)(number==LINUX_SYS_MMAP ? frame->r8 : wait_pidfd ? frame->rsi :
+                  number==LINUX_SYS_WAITID ? (uint64_t)-1 : frame->rdi),
         number==LINUX_SYS_MMAP ? frame->r10 : frame->rdx);
     task_lookup_scope_begin(calling_task,frame);
     uint64_t storage_generation=storage_wait_begin();
@@ -441,6 +445,7 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
          number == LINUX_SYS_MSGSND ||
          number == LINUX_SYS_SEMOP || number == LINUX_SYS_SEMTIMEDOP ||
          number == LINUX_SYS_TKILL || number == LINUX_SYS_TGKILL ||
+         number == __NR_pidfd_send_signal || wait_pidfd ||
          number == LINUX_SYS_SENDMMSG || number == LINUX_SYS_RECVMMSG ||
          number == LINUX_SYS_FUTEX_REQUEUE || number == LINUX_SYS_CLONE ||
          number == LINUX_SYS_CLONE3 || number == LINUX_SYS_FORK ||

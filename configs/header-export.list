@@ -47,6 +47,7 @@ include/uapi/linux/mount.h
 include/uapi/linux/msg.h
 include/uapi/linux/openat2.h
 include/uapi/linux/patchkey.h
+include/uapi/linux/pidfd.h
 include/uapi/linux/poll.h
 include/uapi/linux/prctl.h
 include/uapi/linux/reboot.h
@@ -81,6 +82,7 @@ include/uapi/sound/asound.h
 include/uapi/sound/tlv.h
 include/uapi/linux/shm.h
 include/uapi/linux/posix_types.h
+include/uapi/linux/wait.h
 include/uapi/linux/stddef.h
 include/uapi/asm/shmbuf.h
 include/uapi/asm/ipcbuf.h

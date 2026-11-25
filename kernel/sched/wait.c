@@ -1,5 +1,7 @@
 #include <reliefnt/export.h>
 #include "internal.h"
+#include <linux/resource.h>
+#include <linux/wait.h>
 
 static void sched_wait_info(struct linux_siginfo *info, const struct task *task, int status);
 
@@ -108,6 +110,12 @@ void sched_sleep_current_until(uint64_t wake_tick)
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
 }
 
+/** @brief Format a child event as native SIGCHLD siginfo without user access.
+ * @param info Optional kernel output; NULL leaves the event unformatted.
+ * @param task Borrowed child whose PID and UID identify the event.
+ * @param status Encoded native wait status, including stop/continue events.
+ * Caller holds scheduler_lock; performs no allocation or reference transfer.
+ */
 static void sched_wait_info(struct linux_siginfo *info, const struct task *task, int status)
 {
     if (!info) return;
@@ -129,21 +137,42 @@ static void sched_wait_info(struct linux_siginfo *info, const struct task *task,
     }
 }
 
+/** @brief Snapshot the CPU counters available for a waitable child's group.
+ * @param out Optional kernel rusage destination; untracked counters remain zero.
+ * @param task Waitable child under scheduler_lock; no user memory is accessed.
+ */
+static void sched_wait_usage(struct linux_rusage *out, const struct task *task)
+{
+    if (!out) return;
+    uint64_t user, system;
+    cpu_accounting_task_times_locked(task, true, &user, &system);
+    *out = (struct linux_rusage){
+        .ru_utime = {(int64_t)(user / RELIEFNT_TICK_HZ),
+                     (int64_t)((user % RELIEFNT_TICK_HZ) * (1000000ULL / RELIEFNT_TICK_HZ))},
+        .ru_stime = {(int64_t)(system / RELIEFNT_TICK_HZ),
+                     (int64_t)((system % RELIEFNT_TICK_HZ) * (1000000ULL / RELIEFNT_TICK_HZ))},
+    };
+}
+
 /**
  * @brief Observe child events or consume a quiescent zombie, logging a successful reap after unlock.
  * @param waiter_pid Waiting task identifier.
  * @param wanted_pid Child or process-group selector using waitpid semantics.
+ * @param identity Optional retained PID object that overrides the numeric selector.
  * @param options Wait-event selection and WNOWAIT flags.
  * @param status Optional output wait status.
  * @param info Optional output child siginfo.
+ * @param usage Optional output resource usage, written only for a child event.
  * @return Child PID on an observed event, zero without a matching child,
  * -2 for an absent waiter, or -RELIEFOS_EAGAIN while a matching child is pending.
  * The caller must not hold scheduler_lock; resource teardown and diagnostics
  * execute outside it. WNOWAIT observes without consuming or logging a reap.
  * Consuming a zombie invalidates its retained PID identity before PID unpublish.
  */
-int64_t sched_wait_reap(uint32_t waiter_pid, int32_t wanted_pid,
-                        uint32_t options, int *status, struct linux_siginfo *info)
+static int64_t sched_wait_child(uint32_t waiter_pid, int32_t wanted_pid,
+                                const struct task_identity *identity,
+                                uint32_t options, int *status, struct linux_siginfo *info,
+                                struct linux_rusage *usage)
 {
     uint64_t lock_flags;
     struct task *waiter;
@@ -152,6 +181,7 @@ int64_t sched_wait_reap(uint32_t waiter_pid, int32_t wanted_pid,
     int reap_status = 0;
     int found_child = 0;
     bool reap_event = false;
+    bool notify_pidfd = false;
     uint32_t wanted_group = 0;
     kernel_spin_lock_irqsave(&scheduler_lock, &lock_flags);
     waiter = sched_find(waiter_pid);
@@ -159,13 +189,19 @@ int64_t sched_wait_reap(uint32_t waiter_pid, int32_t wanted_pid,
         kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
         return -2;
     }
-    if (wanted_pid < -1) {
+    const struct task *exact = sched_task_identity_task(identity);
+    if (identity && !exact) {
+        kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
+        return 0;
+    }
+    if (!identity && wanted_pid < -1) {
         wanted_group = (uint32_t)(-(int64_t)wanted_pid);
-    } else if (wanted_pid == 0) {
+    } else if (!identity && wanted_pid == 0) {
         wanted_group = waiter->process_group;
     }
     for (uint32_t i = 0; i < task_count; ++i) {
         struct task *task = tasks[i];
+        if (exact && task != exact) continue;
         if (task->pid == 0 || task->kind != TASK_KIND_USER) {
             continue;
         }
@@ -173,14 +209,15 @@ int64_t sched_wait_reap(uint32_t waiter_pid, int32_t wanted_pid,
         if (task->parent_pid != sched_task_tgid(waiter) && waiter_pid != 0) {
             continue;
         }
+        if ((options & LINUX_WNOTHREAD) && task->pdeath_parent_pid != waiter_pid) continue;
         if (wanted_pid > 0 && task->pid != (uint32_t)wanted_pid) {
             continue;
         }
         if (wanted_group && task->process_group != wanted_group) {
             continue;
         }
-        if (!(options & 0x40000000u) &&
-            ((task->parent_exit_signal != 17) != ((options & 0x80000000u) != 0))) continue;
+        if (!(options & LINUX_WALL) &&
+            ((task->parent_exit_signal != 17) != ((options & LINUX_WCLONE) != 0))) continue;
         if (task->state == TASK_EXITED && !(options & 4u) &&
             !thread_group_pending(sched_task_tgid(task), task)) continue;
         found_child = 1;
@@ -192,11 +229,12 @@ int64_t sched_wait_reap(uint32_t waiter_pid, int32_t wanted_pid,
             reap_status = task->exit_signal ? (int)(task->exit_signal & 0x7fU) :
                 (int)((task->exit_code & 0xffU) << 8);
             sched_wait_info(info, task, reap_status);
-            if ((options & 0x01000000u)
+            if ((options & LINUX_WNOWAIT)
 #ifdef CONFIG_SWAP
                 && (task->flags & TASK_FLAG_RESOURCES_RELEASED)
 #endif
                ) {
+                sched_wait_usage(usage, task);
                 if (status) *status = reap_status;
                 kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
                 return reap_pid;
@@ -207,19 +245,21 @@ int64_t sched_wait_reap(uint32_t waiter_pid, int32_t wanted_pid,
         if (task->child_event == TASK_CHILD_EVENT_STOPPED && (options & 2U)) {
             int stopped_status = (int)(((task->stop_signal & 0xffU) << 8) | 0x7fU);
             sched_wait_info(info, task, stopped_status);
+            sched_wait_usage(usage, task);
             if (status) {
                 *status = stopped_status;
             }
-            if (!(options & 0x01000000u)) task->child_event = TASK_CHILD_EVENT_NONE;
+            if (!(options & LINUX_WNOWAIT)) task->child_event = TASK_CHILD_EVENT_NONE;
             kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
             return task->pid;
         }
         if (task->child_event == TASK_CHILD_EVENT_CONTINUED && (options & 8U)) {
             sched_wait_info(info, task, 0xffff);
+            sched_wait_usage(usage, task);
             if (status) {
                 *status = 0xffff;
             }
-            if (!(options & 0x01000000u)) task->child_event = TASK_CHILD_EVENT_NONE;
+            if (!(options & LINUX_WNOWAIT)) task->child_event = TASK_CHILD_EVENT_NONE;
             kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
             return task->pid;
         }
@@ -239,13 +279,15 @@ int64_t sched_wait_reap(uint32_t waiter_pid, int32_t wanted_pid,
                 kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
                 return -RELIEFOS_EAGAIN;
             }
-            if (options & 0x01000000u) {
+            sched_wait_usage(usage, reap_task);
+            if (options & LINUX_WNOWAIT) {
                 reap_task->flags &= ~TASK_FLAG_REAP_IN_PROGRESS;
                 if (status) *status = reap_status;
                 kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
                 return reap_pid;
             }
             reap_task->parent_pid = 0;
+            notify_pidfd = sched_task_pidfd_watched(reap_task);
             sched_task_identity_detach(reap_task);
             task_release_limits(reap_task);
             reap_task->flags &= ~(TASK_FLAG_WAITABLE_CHILD | TASK_FLAG_REAP_IN_PROGRESS);
@@ -267,6 +309,7 @@ int64_t sched_wait_reap(uint32_t waiter_pid, int32_t wanted_pid,
             reap_event = true;
         }
         kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
+        if (notify_pidfd) kernel_poll_readiness_notify();
         if (reap_event) {
             console_debug("[reliefnt] scheduler wait reaped pid=%u by pid=%u\n",
                            reap_pid, waiter_pid);
@@ -280,6 +323,36 @@ int64_t sched_wait_reap(uint32_t waiter_pid, int32_t wanted_pid,
      * distinct from ECHILD, which means no matching child exists at all. */
     kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
     return found_child ? -RELIEFOS_EAGAIN : 0;
+}
+
+/** @brief Observe or reap a child selected by native waitpid numeric rules.
+ * @param waiter_pid Calling task ID.
+ * @param wanted_pid Child PID or waitpid process-group selector.
+ * @param options Wait-event flags; WNOWAIT observes without consuming.
+ * @param status Optional kernel output for encoded wait status.
+ * @param info Optional kernel output for child-event siginfo.
+ * @return Child PID, zero without an eligible child, -2 for an absent waiter,
+ * or -RELIEFOS_EAGAIN while a matching child has no selected event.
+ * Caller holds execution ownership without scheduler_lock. Teardown and reap
+ * diagnostics occur outside that lock; no task references escape.
+ */
+int64_t sched_wait_reap(uint32_t waiter_pid, int32_t wanted_pid,
+                        uint32_t options, int *status, struct linux_siginfo *info)
+{
+    return sched_wait_child(waiter_pid, wanted_pid, NULL, options, status, info, NULL);
+}
+
+/** @brief Observe or consume a child event without resolving a numeric PID.
+ * @param waiter_pid Calling task ID. @param identity Borrowed PID object.
+ * @param options Linux wait-event flags. @param info Optional kernel siginfo output.
+ * @param usage Optional kernel resource usage output, written only for an event.
+ * @return Child PID, zero when no eligible child exists, or negative errno.
+ */
+int64_t sched_wait_identity(uint32_t waiter_pid, const struct task_identity *identity,
+                            uint32_t options, struct linux_siginfo *info,
+                            struct linux_rusage *usage)
+{
+    return identity ? sched_wait_child(waiter_pid, -1, identity, options, NULL, info, usage) : 0;
 }
 
 EXPORT_SYMBOL(sched_wake_interruptible);

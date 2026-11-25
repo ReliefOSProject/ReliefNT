@@ -1,6 +1,7 @@
 /* Real pressure wait, intrusive queue, scheduler block/wake and exit cleanup.
  * Reclaim outcomes and CPU/clock/spin boundaries are explicit host models. */
 #define PRESSURE_WAIT_FIXTURE 1
+#define TASK_EXIT_REAL_POLL_QUEUE 1
 #define main old_exit_logging_main
 #include "task_exit_logging_test.c"
 #undef main
