@@ -890,6 +890,9 @@ retry:
 #ifdef CONFIG_SWAP
                 !sched_exec_staged(current) &&
 #endif
+#ifdef CONFIG_SECCOMP_FILTER
+                !current->restart_syscall &&
+#endif
                 sched_try_resume_current_user_frame(frame)) {
                 arch_set_user_fs(current->fs_base);
                 kernel_execution_unlock_irqrestore(execution_flags);
@@ -970,6 +973,24 @@ retry:
             goto retry;
         }
         task_release_syscall_file(next);
+    }
+#endif
+#ifdef CONFIG_SECCOMP_FILTER
+    if (next->restart_syscall) {
+        /* Complete an admitted syscall from this kernel-owned frame. No
+         * user instruction can run between the park and the continuation. */
+        paging_load_cr3_if_changed(sched_task_cr3(next));
+        arch_fpu_restore(next->fpu_state);
+        bool complete = syscall_resume_parked(next);
+        if (complete && next->state == TASK_RUNNING &&
+            kernel_signal_deliver_pending_outer(next, &next->frame) == SWAP_STORAGE_CONTENDED)
+            sched_sleep_current_until(time_ticks() + 1);
+        if (!complete || next->state != TASK_RUNNING) {
+            if (next->state != TASK_EXITED)
+                (void)sched_capture_current_user_frame(&next->frame);
+            frame = NULL;
+            goto retry;
+        }
     }
 #endif
     if (!userland_load_task_image(next)) {
@@ -1138,6 +1159,7 @@ static int userland_commit_prepared(struct task *task, struct task *prepared)
 {
     sched_exec_replace_mm(task, sched_task_as(prepared));
     task->address_space = prepared->address_space;
+    /* no_new_privs and seccomp belong to the surviving thread, not its image. */
     task->credentials = prepared->credentials;
     task->entry = prepared->entry;
     task->stack_top = prepared->stack_top;

@@ -14,3 +14,4 @@
    ipv6
    pidfd
    procfs
+   seccomp

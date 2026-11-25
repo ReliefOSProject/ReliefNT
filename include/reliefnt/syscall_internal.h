@@ -30,6 +30,14 @@ struct storage_inode_ref;
 #define VFS_NATIVE_LOOKUP_RECLAIM (-4107)
 /* AF_UNIX connect is waiting for pathname I/O before checking the listener. */
 #define KERNEL_SYSCALL_UNIX_CONNECT_IO_WAIT (-4108LL)
+#ifdef CONFIG_SECCOMP_FILTER
+/** @brief Complete or repark an already admitted syscall inside the scheduler.
+ * @param task Current CPU's selected task with a kernel rewind marker, active
+ * CR3 and restored FPU. Requires the outer execution writer, no other locks.
+ * @return True when the saved frame is ready, false for a new wait or exit.
+ */
+bool syscall_resume_parked(struct task *task);
+#endif
 #ifdef CONFIG_SWAP
 /** @brief Reclaim before an open's import, walk or unsubmitted native lookup.
  * @param task Current task under sole outer execution ownership.

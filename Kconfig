@@ -5,6 +5,7 @@ config 64BIT
     default y
 
 source "kernel/module/Kconfig"
+source "kernel/seccomp/Kconfig"
 source "kernel/sync/Kconfig"
 source "mm/Kconfig"
 source "sound/Kconfig"

@@ -3,6 +3,7 @@
  * priorities, and resource limits.
  */
 #include <reliefnt/sched.h>
+#include <reliefnt/seccomp.h>
 #include <reliefnt/signal.h>
 #include <reliefnt/console.h>
 #include <reliefnt/power.h>
@@ -392,6 +393,13 @@ int64_t syscall_process_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
     case LINUX_PR_GET_NO_NEW_PRIVS:
         if (arg2 || arg3 || arg4 || arg5) return -RELIEFOS_EINVAL;
         return task->no_new_privs;
+#ifdef CONFIG_SECCOMP_FILTER
+    case LINUX_PR_GET_SECCOMP:
+        return seccomp_active(task) ? SECCOMP_MODE_FILTER : SECCOMP_MODE_DISABLED;
+    case LINUX_PR_SET_SECCOMP:
+        if (arg2 != SECCOMP_MODE_FILTER) return -LINUX_EINVAL;
+        return seccomp_syscall(task, SECCOMP_SET_MODE_FILTER, 0, arg3);
+#endif
     case LINUX_PR_CAPBSET_READ:
         if (arg2 > CAP_LAST_CAP) return -LINUX_EINVAL;
         return !!(task->cap_bset & (1ULL << arg2));

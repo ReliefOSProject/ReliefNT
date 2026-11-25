@@ -2,6 +2,7 @@
 #include "internal.h"
 #include <reliefnt/proc_stats.h>
 #include <reliefnt/sched.h>
+#include <reliefnt/seccomp.h>
 #include <reliefnt/smp.h>
 #include <reliefnt/syscall_internal.h>
 #include <reliefnt/time.h>
@@ -77,6 +78,12 @@ int proc_extra_kind(const char *path)
         return sched_current_task() ? 3 : 0;
     if (!__builtin_strcmp(path, "/proc/net") || !__builtin_strcmp(path, "/proc/sys/fs"))
         return 2;
+#ifdef CONFIG_SECCOMP_FILTER
+    if (!__builtin_strcmp(path, "/proc/sys/kernel/seccomp"))
+        return 2;
+    if (!__builtin_strcmp(path, "/proc/sys/kernel/seccomp/actions_avail"))
+        return 1;
+#endif
     if (!__builtin_strncmp(path, "/proc/net/", 10))
         return member(path + 10, net_leaves, sizeof(net_leaves) / sizeof(*net_leaves));
     if (!__builtin_strncmp(path, "/proc/sys/fs/", 13))
@@ -258,6 +265,11 @@ static void status(struct task *t, struct text_stream *s)
         text_string(s, "\n");
     }
     field(s, "NoNewPrivs:\t", t->no_new_privs, "\n");
+#ifdef CONFIG_SECCOMP_FILTER
+    uint32_t filters = seccomp_filter_count(t);
+    field(s, "Seccomp:\t", filters ? SECCOMP_MODE_FILTER : SECCOMP_MODE_DISABLED, "\n");
+    field(s, "Seccomp_filters:\t", filters, "\n");
+#endif
     uint32_t cpus = smp_cpu_count();
     if (cpus > 64)
         cpus = 64;
@@ -615,6 +627,12 @@ int proc_extra_emit(const char *path, struct text_stream *s)
         field(s, "", UINT32_MAX, "\n");
         return 0;
     }
+#ifdef CONFIG_SECCOMP_FILTER
+    if (!__builtin_strcmp(path, "/proc/sys/kernel/seccomp/actions_avail")) {
+        text_string(s, RELIEFNT_SECCOMP_ACTIONS "\n");
+        return 0;
+    }
+#endif
     if (!__builtin_strcmp(path, "/proc/stat")) {
         uint64_t user[SMP_MAX_CPUS] = {0}, system[SMP_MAX_CPUS] = {0}, idle[SMP_MAX_CPUS] = {0};
         uint64_t u = 0, k = 0, d = 0;
@@ -825,6 +843,12 @@ int proc_extra_readdir(const char *path, uint64_t *offset, struct reliefos_dir_e
     }
     if (!__builtin_strcmp(path, "/proc/sys/fs/inotify") && proc_inotify_readdir)
         return proc_inotify_readdir(offset, entry);
+#ifdef CONFIG_SECCOMP_FILTER
+    if (!__builtin_strcmp(path, "/proc/sys/kernel/seccomp")) {
+        static const char *const names[] = {"actions_avail"};
+        return entries(names, sizeof(names) / sizeof(*names), offset, entry);
+    }
+#endif
     const char *leaf = NULL;
     struct task *t = proc_view_task(path, &leaf);
     if (!t || !leaf)

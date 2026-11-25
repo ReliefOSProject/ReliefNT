@@ -2,5 +2,6 @@
 # Objects are owned by this directory; child modules own their own lists.
 obj-y := device/ dma/ exec/ init/ ipc/ kthread/ params/ random/ sched/ signal/ sync/ syscall/ time/ workqueue/
 obj-$(CONFIG_MODULES) += module/
+obj-$(CONFIG_SECCOMP_FILTER) += seccomp/
 
 include $(srctree)/scripts/Makefile.module

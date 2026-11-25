@@ -28,6 +28,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     directory = args.output.resolve()
     (directory / "mincore_syscall_entry.inc").write_text(
+        function(ROOT / "kernel/syscall/entry.c", "syscall_execute_locked") +
         function(ROOT / "kernel/syscall/entry.c", "syscall_dispatch_frame"))
     (directory / "regular_release.inc").write_text(
         function(ROOT / "kernel/syscall/fd/descriptor.c", "task_release_syscall_file"))

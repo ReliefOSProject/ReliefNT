@@ -36,6 +36,7 @@ def main():
     else:
         directory = Path(tempfile.mkdtemp(prefix="memory-mincore-", dir=os.environ.get("TMPDIR")))
     (directory / "mincore_syscall_entry.inc").write_text(
+        function(ROOT / "kernel/syscall/entry.c", "syscall_execute_locked") +
         function(ROOT / "kernel/syscall/entry.c", "syscall_dispatch_frame"))
     binary = str(directory / "memory_mincore")
     common = [compiler, "-std=c11", "-O1", "-g", "-pthread", "-Wall", "-Wextra", "-Werror",

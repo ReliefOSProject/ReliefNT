@@ -11,7 +11,7 @@ test-host:
 
 test-host-smoke:
 	$(Q)$(RELIEFNT_HOST_TEST_RUN) --suite boot_policy --suite brand_identity --suite gpu_usercopy --suite drm \
-	 --suite loadavg --suite input --suite input_routing --suite uapi \
+	 --suite loadavg --suite input --suite input_routing --suite uapi --suite seccomp_bpf \
 	 --suite acpi_pm_timer --suite apic_timer --suite cpu_accounting \
 	 --suite fat_async_read --suite fat_read_split \
 	 --suite squashfs --suite squashfs_boot \

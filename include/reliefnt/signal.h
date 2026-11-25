@@ -42,6 +42,15 @@ int kernel_signal_queue_task(struct task *task, int signal_number);
 int kernel_signal_queue_task_info(struct task *task, int sig, const struct linux_siginfo *info);
 /** @brief Append one pending signal, enforcing the receiver's per-UID queue limit. */
 int kernel_signal_enqueue(struct task *task, bool process, int sig, const struct linux_siginfo *info);
+#ifdef CONFIG_SECCOMP_FILTER
+/** @brief Publish a synchronous, thread-directed SIGSYS without allocating.
+ * @param task Current thread with an unblocked SIGSYS handler, writer-owned.
+ * @param ip Saved post-syscall user instruction pointer.
+ * @param nr Original Linux syscall number. @param data Filter's 16-bit payload.
+ * The private pending bit makes task return pass through signal delivery.
+ */
+void kernel_signal_enqueue_seccomp(struct task *task, uint64_t ip, int32_t nr, uint16_t data);
+#endif
 /** @brief Consume one allowed signal, private queue before the shared queue. */
 int kernel_signal_dequeue(struct task *task, uint64_t allowed, struct linux_siginfo *info);
 /** @brief Inspect the next eligible signal using dequeue's selection order.

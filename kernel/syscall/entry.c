@@ -5,6 +5,7 @@
 #include <reliefnt/module.h>
 #include <reliefnt/usb.h>
 #include <reliefnt/fsnotify_vfs.h>
+#include <reliefnt/seccomp.h>
 #include <reliefnt/storage_wait.h>
 #include <linux/inotify.h>
 #include <linux/wait.h>
@@ -251,6 +252,11 @@ static bool syscall_try_pipe_io(struct trap_frame *frame, struct task **resume)
         task->running_cpu != smp_current_cpu() || task->shared_mm ||
         (task->flags & TASK_FLAG_PENDING_LOAD) || task->syscall_file || task->syscall_pty.used ||
         task->restart_syscall || task->fifo_open_file || task->waiting_queue || syscall_trace_task(task)) goto out;
+#ifdef CONFIG_SECCOMP_FILTER
+    /* This reader cannot queue signals or retire tasks. In particular, inspect
+     * seccomp state under the gate shared with TSYNC and fork publication. */
+    if (seccomp_active(task)) goto out;
+#endif
     struct task_file *file = task_file_for_fd(task, (int32_t)frame->rdi);
     if (!file || !(file->flags & TASK_FILE_FLAG_PIPE) || (file->flags & TASK_FILE_FLAG_PATH) ||
         file->character_file || file->path_ref.mount) goto out;
@@ -280,47 +286,18 @@ out:
     return completed;
 }
 
-/**
- * @brief Dispatch one int 0x80 request while serializing kernel execution.
- * @param frame Validated syscall frame, updated with the result or restart state.
- * @return A task for direct user return, or NULL when scheduler handling is required.
- * @note Device/protocol maintenance is deferred to scheduler service stacks;
- *       input publication retains its immediate user-return checks.
- * Path operands retain their checked copy and exact directory references over
- * pre-I/O retries; final return, signal handoff or replacement cancels ownership.
+/** @brief Execute one syscall already admitted while the writer is held.
+ * @param calling_task Current task pinned by execution ownership, nullable.
+ * @param frame Active or scheduler-owned frame at the post-syscall IP.
+ * @return True when its result/context is ready, false when it must park or
+ * retire. Preserves OFDs and operand snapshots only for kernel-owned waits.
  */
-struct task *syscall_dispatch_frame(struct trap_frame *frame)
+static bool syscall_execute_locked(struct task *calling_task, struct trap_frame *frame)
 {
-    uint64_t number;
-    uint64_t lock_flags;
+    uint64_t number = frame->rax;
     int64_t result;
     int restored_signal_frame = 0;
     int eagain_from_nonblocking = 0;
-    if (!frame) {
-        return NULL;
-    }
-    sched_account_mode(true);
-    struct task *pipe_resume = NULL;
-    if (syscall_try_pipe_io(frame, &pipe_resume)) return pipe_resume;
-    /* Several storage and GUI services still own global scratch buffers. */
-    kernel_execution_lock_scoped_irqsave(&lock_flags, lock_profile_syscall_scope(frame->rax));
-#ifdef CONFIG_SWAP
-    /* A committed exec is owned by the scheduler; reaching any old syscall
-     * frame here means that old user code unexpectedly ran.  Do not import
-     * its operands or advance its prepared image from this entry point. */
-    struct task *committed_task = sched_current_task();
-    if (committed_task && sched_exec_staged(committed_task)) {
-        userland_exec_cancel(committed_task);
-        sched_exit(committed_task->pid, 127);
-        kernel_execution_unlock_irqrestore(lock_flags);
-        return NULL;
-    }
-#endif
-    /* Device/protocol maintenance is queued onto scheduler service stacks;
-     * syscall admission only processes latency-sensitive pending input. */
-    input_process_pending();
-    number = frame->rax;
-    struct task *calling_task = sched_current_task();
     bool trace = syscall_trace_task(calling_task);
     if (trace) console_info("[syscall-trace] pid=%u nr=%llu args=%llx,%llx,%llx,%llx,%llx,%llx\n",
         calling_task->pid, (unsigned long long)number,
@@ -408,8 +385,7 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
     bool exec_commit_retry=result==KERNEL_SYSCALL_EXEC_COMMIT_WAIT;
     if (result==KERNEL_SYSCALL_EXEC_FATAL) {
         storage_set_io_async_context(false);
-        kernel_execution_unlock_irqrestore(lock_flags);
-        return NULL;
+        return false;
     }
     if(module_file_io_retry) result=-RELIEFOS_EAGAIN;
     if(mmap_file_io_retry) result=-RELIEFOS_EAGAIN;
@@ -499,8 +475,7 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
             calling_task->restart_syscall = number + 1;
             sched_sleep_current_until(time_ticks() + 1u);
         }
-        kernel_execution_unlock_irqrestore(lock_flags);
-        return NULL;
+        return false;
     }
 
     if (calling_task && result != KERNEL_SYSCALL_BLOCKED &&
@@ -536,32 +511,90 @@ struct task *syscall_dispatch_frame(struct trap_frame *frame)
         /* sigreturn and successful exec already supplied the user context. */
     } else if (result == KERNEL_SYSCALL_BLOCKED ||
                (result == -RELIEFOS_EAGAIN && !eagain_from_nonblocking)) {
-        /* Retry the original instruction after a completion notification or
-         * bounded fallback. Registration happens only after driver locks
-         * unwind; the generation closes IRQ-before-sleep on another CPU. */
+        /* Preserve the rewind position for the signal ABI. The scheduler can
+         * resume the admitted invocation after a wake or bounded fallback.
+         * Register only after driver locks unwind; the generation closes
+         * IRQ-before-sleep on another CPU. */
         frame->rax = number;
         frame->rip -= 2u;
         if (calling_task) calling_task->restart_syscall = number + 1;
         if (result != KERNEL_SYSCALL_BLOCKED)
             storage_wait_sleep(storage_generation);
-        kernel_execution_unlock_irqrestore(lock_flags);
-        return NULL;
+        return false;
     }
     if (!restored_signal_frame) {
         frame->rax = (uint64_t)result;
     }
     task_release_syscall_file(calling_task);
+    return true;
+}
+
+#ifdef CONFIG_SECCOMP_FILTER
+/** @brief Continue a parked invocation using only its kernel-owned frame.
+ * @param task Scheduler-selected caller; its live MM and FPU are loaded and
+ * the outer execution writer is held. A nonzero restart marker identifies the
+ * continuation, not a fresh user frame or an interrupted call in a handler.
+ * @return True for a completed frame, false for another wait or terminal exit.
+ */
+bool syscall_resume_parked(struct task *task)
+{
+    /* The marker and rewound frame were published together by the dispatcher.
+     * A caught signal clears the marker before user-mode restart is possible.
+     * TSYNC applies to the next real entry, not this admitted invocation. */
+    task->frame.rax = task->restart_syscall - 1;
+    task->restart_syscall = 0;
+    task->frame.rip += 2u;
+    return syscall_execute_locked(task, &task->frame);
+}
+#endif
+
+/**
+ * @brief Admit a native syscall or legacy interrupt under the execution gate.
+ * @param frame Validated user entry frame, updated with the result or wait state.
+ * @return A task for direct user return, or NULL for scheduling or signal delivery.
+ * @note Device/protocol maintenance remains deferred to scheduler service stacks.
+ */
+struct task *syscall_dispatch_frame(struct trap_frame *frame)
+{
+    uint64_t lock_flags;
+    if (!frame) return NULL;
+    sched_account_mode(true);
+    struct task *resume = NULL;
+    if (syscall_try_pipe_io(frame, &resume)) return resume;
+    /* Several storage and GUI services still own global scratch buffers. */
+    kernel_execution_lock_scoped_irqsave(&lock_flags, lock_profile_syscall_scope(frame->rax));
+#ifdef CONFIG_SWAP
+    /* A committed exec belongs to the scheduler; an old image cannot resume. */
+    struct task *committed_task = sched_current_task();
+    if (committed_task && sched_exec_staged(committed_task)) {
+        userland_exec_cancel(committed_task);
+        sched_exit(committed_task->pid, 127);
+        goto unlock;
+    }
+#endif
+    input_process_pending();
+    struct task *calling_task = sched_current_task();
+    if (calling_task && calling_task->state == TASK_EXITED) goto unlock;
+#ifdef CONFIG_SECCOMP_FILTER
+    if (seccomp_active(calling_task) && !seccomp_admit_syscall(calling_task, frame)) {
+        if (calling_task->state == TASK_EXITED) goto unlock;
+        /* A synthesized result is final; it cannot request a backend retry
+         * or turn ERRNO(0) on execve into an image replacement. */
+        task_release_syscall_file(calling_task);
+    } else
+#endif
+    if (!syscall_execute_locked(calling_task, frame)) goto unlock;
     /* Complete an unchanged task's return inside the transaction that already
      * pins its lifetime. The scheduler still checks signals, preemption, CPU
      * ownership, affinity and the frame under scheduler_lock. Drain input
      * arriving during the syscall before that check. Rejected returns keep
      * the full signal/retirement/selection path in the architecture entry. */
     input_process_pending();
-    struct task *resume = NULL;
     if (sched_try_resume_current_user_frame(frame)) {
         resume = sched_current_task();
         arch_set_user_fs(resume->fs_base);
     }
+unlock:
     kernel_execution_unlock_irqrestore(lock_flags);
     if (resume)
         sched_account_mode(false);
