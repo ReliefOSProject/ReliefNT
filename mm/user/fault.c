@@ -1,6 +1,7 @@
 #include "memory_internal.h"
 #include <reliefnt/exec_file.h>
 #include <reliefnt/memory_stats.h>
+#include <reliefnt/storage_context.h>
 
 extern void memory_event_add(enum memory_event, uint64_t) __attribute__((weak));
 extern bool sched_fault_event_major(struct task *) __attribute__((weak));
@@ -12,16 +13,25 @@ extern bool sched_fault_event_major(struct task *) __attribute__((weak));
  * @param capacity Requested bytes, bounded to one allocator page by callers.
  * @param read Required output for completed bytes.
  * @return Zero or backing errno; absent source fails EBADF. Caller owns the
- * execution/loader transaction and forces synchronous fault I/O. No displayed
+ * execution/loader transaction. Reads use synchronous fault I/O while preserving
+ * the surrounding syscall's continuation and irreversible-write state, even
+ * when backing contention requires retry. No displayed
  * name, unpinned filesystem callback or graph/module spinlock participates.
  */
 static int file_vma_read(const struct task_vma *vma,uint64_t offset,void *buffer,
                             uint32_t capacity,uint32_t *read)
 {
-    if(vma->exec_source)return vfs_exec_source_read(vma->exec_source,offset,buffer,capacity,read);
-    const struct task_file *file=task_file_description(vma->mapping_file);
-    if(file && vfs_path_node(&file->path_ref))return vfs_path_read(&file->path_ref,offset,buffer,capacity,read);
-    *read=0;return -RELIEFOS_EBADF;
+    struct storage_io_context saved;
+    storage_kernel_context_enter(&saved);
+    int result;
+    if(vma->exec_source)result=vfs_exec_source_read(vma->exec_source,offset,buffer,capacity,read);
+    else {
+        const struct task_file *file=task_file_description(vma->mapping_file);
+        if(file && vfs_path_node(&file->path_ref))result=vfs_path_read(&file->path_ref,offset,buffer,capacity,read);
+        else {*read=0;result=-RELIEFOS_EBADF;}
+    }
+    storage_kernel_context_leave(&saved);
+    return result;
 }
 
 /**
@@ -170,7 +180,6 @@ static int load_file_cache_page(uint64_t phys, void *opaque)
     /* usercopy can fault here inside an async filesystem syscall. A page
      * fault cannot replay that syscall, and its cache page must stay alive
      * until DMA completes. Match the uncached fault path's synchronous I/O. */
-    storage_set_io_async_context(false);
     void *page = mm_phys_to_virt(phys);
     if (!page) return -RELIEFOS_ENOMEM;
     int ret = file_vma_read(context->vma, offset, page, want, &got);
@@ -243,10 +252,6 @@ static int task_map_file_vma_page_observed(struct task *task, const struct task_
         uint32_t want = available < PAGE_SIZE ? (uint32_t)available : (uint32_t)PAGE_SIZE;
         uint32_t got = 0;
         int ret;
-        /**
- * @brief A user page fault is not a restartable filesystem syscall. Force this backing-page read through the synchronous AHCI path so an in-flight async storage operation cannot surface as EAGAIN and turn a valid lazy mapping into a process-killing fault.
- */
-        storage_set_io_async_context(false);
         void *frame = mm_phys_to_virt(phys);
         if (!frame) {
             if (cached) page_cache_release(phys);
@@ -255,7 +260,6 @@ static int task_map_file_vma_page_observed(struct task *task, const struct task_
         }
         ret = file_vma_read(vma, file_offset,
                                 frame, want, &got);
-        storage_set_io_async_context(false);
         if (ret < 0 || got != want) {
             if (cached) page_cache_release(phys);
             else mm_free_page(phys);
@@ -632,7 +636,8 @@ enum syscall_private_fault_result syscall_handle_private_page_fault(
  * @param task User task pinned by execution ownership, nullable.
  * @param fault_addr Faulting user byte address. @param error x86 fault flags.
  * @param defer_oom_diagnostic True when the caller reports a terminal fault
- * after allocation/storage retries; other backing failures remain immediately logged.
+ * after allocation retries. Temporary backing contention is never an error
+ * diagnostic; terminal backing failures remain immediately logged.
  * @param record_major True only for an admitted user hardware fault.
  * @return One on resolution, -ENOMEM on a valid allocation failure, -EAGAIN
  * when file backing is temporarily unavailable, or zero
@@ -814,7 +819,7 @@ static int task_page_fault_detailed(struct task *task, uint64_t fault_addr, uint
                 (vma->flags & TASK_VMA_FLAG_MMAP) &&
                 (ret == -RELIEFOS_EINVAL || ret == -RELIEFOS_ENOSPC))
                 task->page_fault_signal = LINUX_SIGBUS;
-            if (!defer_oom_diagnostic || (ret != -RELIEFOS_ENOMEM && ret != -RELIEFOS_EAGAIN))
+            if (ret != -RELIEFOS_EAGAIN && (!defer_oom_diagnostic || ret != -RELIEFOS_ENOMEM))
                 console_error("[reliefnt] lazy file map failed pid=%u page=0x%llx "
                            "fault=0x%llx error=0x%llx vma=0x%llx-0x%llx "
                            "flags=0x%x file_off=0x%llx file_limit=0x%llx ret=%d\n",

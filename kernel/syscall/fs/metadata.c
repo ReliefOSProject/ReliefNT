@@ -10,13 +10,9 @@
 static int metadata_result_slot(struct task *task, uint32_t kind,
                                 struct task_lookup_path **slot)
 {
-#ifdef CONFIG_SWAP
     int rc = task_lookup_scope_next(task, slot);
     if (rc) return rc;
     if (*slot && (*slot)->name && (*slot)->flags != kind) return -RELIEFOS_EINVAL;
-#else
-    (void)task; (void)kind; *slot=NULL;
-#endif
     return 0;
 }
 
@@ -37,6 +33,8 @@ static int metadata_prepare_result(struct task *task, uint64_t address, size_t o
                                    const void *data, size_t data_size, char **owned)
 {
     int rc = swap_prepare_user_range(task, address, output_size, true);
+    if (!rc && user_range_readable(address, output_size) == -RELIEFOS_EAGAIN)
+        rc = SWAP_STORAGE_CONTENDED;
     if (rc != SWAP_STORAGE_CONTENDED) return 0;
     if (slot && !slot->name) {
         char *saved = owned && *owned == data ? *owned : kernel_malloc(data_size ? data_size : 1);

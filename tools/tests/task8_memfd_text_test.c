@@ -8,6 +8,12 @@
 #include "task8_timerfd_user_test.c"
 #undef main
 #include <stdlib.h>
+int user_range_readable(uint64_t address,uint64_t length)
+{ return user_range_ok(address,length) ? 0 : -RELIEFOS_EFAULT; }
+const struct storage_node *vfs_path_node(const struct vfs_path *path)
+{ (void)path;abort(); }
+void vfs_path_get(const struct vfs_path *path,struct vfs_path *out)
+{ (void)path;(void)out;abort(); }
 static unsigned heap_allocs,heap_frees;
 void *kernel_malloc(size_t size){void *p=malloc(size);if(p)++heap_allocs;return p;}
 void kernel_free(void *p){if(p){++heap_frees;free(p);}}

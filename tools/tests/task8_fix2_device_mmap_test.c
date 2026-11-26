@@ -26,6 +26,8 @@ static uint64_t fix3_page_stride=4096;
  */
 bool user_range_ok(uint64_t address,uint64_t length)
 { return user_range_writable(address,length); }
+int user_range_readable(uint64_t address,uint64_t length)
+{ return user_range_ok(address,length) ? 0 : -LINUX_EFAULT; }
 /** @brief Trap a RAM refcount query in this DEVICE-only stage.
  * @param physical Unused page. @return Never returns.
  */

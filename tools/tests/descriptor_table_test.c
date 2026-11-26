@@ -535,6 +535,8 @@ void pty_transfer_put(uint32_t id, uint32_t endpoint)
 }
 bool user_range_ok(uint64_t address, uint64_t length)
 { return address >= 4096 && length <= UINT64_MAX - address; }
+int user_range_readable(uint64_t address, uint64_t length)
+{ return user_range_ok(address, length) ? 0 : -LINUX_EFAULT; }
 bool user_range_writable(uint64_t address, uint64_t length)
 { return user_range_ok(address, length); }
 

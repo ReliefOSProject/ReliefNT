@@ -74,6 +74,9 @@ class MemoryReclaimTests(unittest.TestCase):
         self.run_case("fault", "private-cow")
         self.run_case("fault", "clean-reload")
 
+    def test_file_fault_preserves_syscall_io_context(self):
+        self.run_case("fault", "io-context")
+
     def test_shared_write_protection(self):
         self.run_case("protect", "shared-mprotect", retained=True)
         self.run_case("protect", "shared-growth", retained=True)

@@ -19,6 +19,10 @@ int swap_prepare_user_range(struct task *owner,uint64_t address,uint64_t length,
 }
 bool user_range_ok(uint64_t address,uint64_t length)
 { return address>=4096 && length<=UINT64_MAX-address && address!=unmapped; }
+int user_range_readable(uint64_t address,uint64_t length)
+{ return user_range_ok(address,length) ? 0 : -RELIEFOS_EFAULT; }
+void vfs_path_get(const struct vfs_path *path,struct vfs_path *out)
+{ (void)path;(void)out;abort(); }
 void storage_drain_task_io(uint32_t pid){assert(pid==task.pid && !active_token);}
 void task_process_vm_scope_release(void *state){(void)state;abort();}
 void kernel_wait_queue_remove(struct kernel_wait_queue *q,struct task *t){(void)q;(void)t;abort();}

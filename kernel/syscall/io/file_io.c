@@ -82,7 +82,7 @@ void task_regular_io_stage_cancel(struct task *task)
 /** @brief Snapshot one write slice or retain one read slice's physical aliases.
  * @param task Live user task under execution ownership. @param address User VA.
  * @param length Bounded nonzero byte count. @param writing Direction.
- * @return Zero or negative EFAULT/ENOMEM. No provider request exists on entry.
+ * @return Zero, contention, or negative EFAULT/ENOMEM. No provider request exists on entry.
  * User pages must already be prepared for this outer-writer boundary.
  */
 static int regular_stage_begin(struct task *task, uint64_t address,
@@ -91,7 +91,9 @@ static int regular_stage_begin(struct task *task, uint64_t address,
     if (!length || length > REGULAR_IO_CHUNK || regular_stage_find(task)) return -LINUX_EFAULT;
     int ret = swap_prepare_user_range(task, address, length, !writing);
     if (ret < 0) return ret;
-    if (!(writing ? user_range_ok(address, length) : user_range_writable(address, length))) {
+    int readable = user_range_readable(address, length);
+    if (readable == -LINUX_EAGAIN) return SWAP_STORAGE_CONTENDED;
+    if (!(writing ? !readable : user_range_writable(address, length))) {
 #ifdef CONFIG_SWAP
         /* A valid lazy/COW output may have failed only because an ordinary
          * frame was unavailable. Retry the detailed faults before submitting
@@ -106,6 +108,7 @@ static int regular_stage_begin(struct task *task, uint64_t address,
                 fault_flags |= 1u;
             int fault = syscall_handle_user_page_fault_detailed(page, fault_flags, false);
             if (fault == -ENOMEM) return -ENOMEM;
+            if (fault == -EAGAIN) return SWAP_STORAGE_CONTENDED;
             if (fault <= 0) return -LINUX_EFAULT;
         }
         if (!user_range_writable(address, length)) return -LINUX_EFAULT;

@@ -14,6 +14,8 @@ static uint64_t mapped;
 static uint64_t mapped_flags;
 static unsigned allocations;
 static bool io_async;
+static bool io_write_started;
+static unsigned io_scope_depth;
 static int read_error;
 static bool short_read;
 static unsigned reads;
@@ -46,6 +48,7 @@ static int exec_fixture_read(void *context,const struct storage_node *node,uint6
     assert(node->size == sizeof(file_bytes) && offset + size <= node->size);
     ++reads;
     *got = 0;
+    assert(io_scope_depth && io_write_started);
     if (io_async) return -RELIEFOS_EAGAIN;
     if (read_error) return read_error;
     if (short_read) --size;
@@ -53,7 +56,18 @@ static int exec_fixture_read(void *context,const struct storage_node *node,uint6
     *got = size;
     return 0;
 }
-void storage_set_io_async_context(bool enabled) { io_async = enabled; }
+void storage_set_io_async_context(bool enabled)
+{ io_async = enabled; io_write_started = false; }
+void storage_kernel_context_enter(struct storage_io_context *saved)
+{
+    *saved = (struct storage_io_context){io_async, io_write_started};
+    io_async = false; io_write_started = true; ++io_scope_depth;
+}
+void storage_kernel_context_leave(const struct storage_io_context *saved)
+{
+    assert(io_scope_depth); --io_scope_depth;
+    io_async = saved->asynchronous; io_write_started = saved->write_started;
+}
 int storage_tmpfs_get_page(const struct storage_node *node, uint64_t offset, uint64_t *phys)
 { (void)node; (void)offset; (void)phys; abort(); }
 int storage_errno(int status) { return status; }
@@ -161,8 +175,58 @@ static void test_clean_reload(void)
     assert(!allocations); vfs_exec_source_put(source);
 }
 
+/** @brief A nested file page-in cannot reset its caller's replay/commit flags.
+ * @return None; real cached/uncached paths include success and provider failures.
+ */
+static void test_fault_io_context(void)
+{
+    struct task task = {0};
+    struct task_vma vma = {
+        .used = 1, .prot = LINUX_PROT_READ,
+        .flags = TASK_VMA_FLAG_FILE | TASK_VMA_FLAG_PRIVATE | TASK_VMA_FLAG_LAZY,
+        .start = 0x5000000, .end = 0x5001000, .file_limit = sizeof(file_bytes),
+        .file_node = {.type = RELIEFOS_FS_TYPE_FILE, .flags = STORAGE_NODE_FLAG_FAT32,
+                      .size = sizeof(file_bytes)}
+    };
+    struct vfs_exec_source *source = exec_fixture_open(&vma.file_node);
+    vma.exec_source = source;
+    for (unsigned cached = 0; cached < 2; ++cached) {
+        if (cached) vma.flags |= TASK_VMA_FLAG_SHARED_FILE;
+        for (unsigned asynchronous = 0; asynchronous < 2; ++asynchronous) {
+            for (unsigned committed = 0; committed < 2; ++committed) {
+                for (unsigned failure = 0; failure < 4; ++failure) {
+                    page_cache_init(); mapped = 0;
+                    io_async = asynchronous; io_write_started = committed;
+                    read_error = failure == 1 ? -RELIEFOS_EAGAIN :
+                                 failure == 2 ? -RELIEFOS_EIO : 0;
+                    short_read = failure == 3;
+                    int result = task_map_file_vma_page(&task, &vma, vma.start);
+                    assert(result == (failure == 1 ? -RELIEFOS_EAGAIN :
+                        failure ? (cached ? -RELIEFOS_EIO :
+                            failure == 3 ? -RELIEFOS_EINVAL : -RELIEFOS_EIO) : 0));
+                    assert(io_async == asynchronous && io_write_started == committed);
+                    assert(!io_scope_depth);
+                    if (mapped) {
+                        if (cached) page_cache_release(mapped);
+                        else mm_free_page(mapped);
+                    }
+                    page_cache_invalidate_node(&vma.file_node);
+                    assert(!allocations);
+                }
+            }
+        }
+    }
+    read_error = 0; short_read = false;
+    vfs_exec_source_put(source);
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "io-context")) {
+        test_fault_io_context();
+        puts("PASS file faults preserve outer I/O context on success, EAGAIN and read failure");
+        return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "shared-writable")) {
         test_shared_writable_invalidation();
         puts("PASS shared writable fault preserves modified cache data");

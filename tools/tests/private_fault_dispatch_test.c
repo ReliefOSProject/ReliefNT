@@ -281,6 +281,10 @@ void userland_loader_lock(uint64_t *flags) { assert(writer_owned() && !reader_ow
 void userland_loader_unlock(uint64_t flags) { (void)flags; assert(writer_owned()); }
 void storage_set_io_async_context(bool enabled)
 { (void)enabled; assert(writer_owned() && !reader_owned()); }
+void storage_kernel_context_enter(struct storage_io_context *saved)
+{ assert(writer_owned() && !reader_owned()); *saved = (struct storage_io_context){0}; }
+void storage_kernel_context_leave(const struct storage_io_context *saved)
+{ (void)saved; assert(writer_owned() && !reader_owned()); }
 struct task_file *task_file_get(struct task_file *file) { (void)file; abort(); }
 /** @brief Assert the fault fixture has no file OFD. @param file Expected NULL. */
 #ifdef PRESSURE_REGULAR_IO_FIXTURE

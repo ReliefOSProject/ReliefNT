@@ -24,6 +24,7 @@
 #include <reliefnt/storage.h>
 #include <reliefnt/syscall_internal.h>
 #include "sysv_shm_fixture_stubs.h"
+#include "storage_codec_context_fixture.h"
 #include "execution_suspend_fixture.h"
 
 int64_t syscall_mm_brk(uint64_t requested);

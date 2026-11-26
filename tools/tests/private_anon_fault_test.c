@@ -22,6 +22,17 @@ void kernel_spin_unlock_irqrestore(struct kernel_spinlock *lock, uint64_t flags)
 { (void)flags; assert(lock->state); lock->state = 0; }
 /** @brief Assert no device owner is present. @param mapping Expected NULL. */
 void device_mapping_put(struct device_mapping *mapping) { assert(!mapping); }
+/* Generic detailed usercopy links the file/device fault dispatcher. This
+ * fixture admits anonymous VMAs only; any device callback is a test failure. */
+const struct device_mapping_info *device_mapping_info(const struct device_mapping *mapping)
+{ (void)mapping; abort(); }
+uint64_t device_mapping_physical(struct device_mapping *mapping, uint64_t offset)
+{ (void)mapping; (void)offset; abort(); }
+int device_mapping_prepare_cpu(struct device_mapping *mapping, uint64_t offset, bool writable)
+{ (void)mapping; (void)offset; (void)writable; abort(); }
+int device_mapping_cache_page(struct device_mapping *mapping, uint64_t offset,
+                               uint64_t physical, uint64_t *flags)
+{ (void)mapping; (void)offset; (void)physical; (void)flags; abort(); }
 /** @brief Verify anonymous fixtures never retire a device reference.
  * @param mapping Optional view; the fixture must supply NULL.
  */

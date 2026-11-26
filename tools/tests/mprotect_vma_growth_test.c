@@ -343,6 +343,10 @@ int file_can_write(const struct task_file *file)
     (void)file;abort();
 }
 void storage_set_io_async_context(bool enabled){if(fail_exec_read){assert(!enabled);return;}abort();}
+void storage_kernel_context_enter(struct storage_io_context *saved)
+{ if(!fail_exec_read)abort(); *saved=(struct storage_io_context){0}; }
+void storage_kernel_context_leave(const struct storage_io_context *saved)
+{ (void)saved; if(!fail_exec_read)abort(); }
 /** @brief Preserve the fixture provider's real negative error. @param error Status.
  * @return Original negative error.
  */
