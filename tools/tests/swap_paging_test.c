@@ -28,16 +28,7 @@ int sched_task_vma_retain_file(struct task_vma *dst, const struct task_vma *src)
  * @param mapping Device mapping. @return Never returns.
  */
 int device_mapping_get(struct device_mapping *mapping) { (void)mapping; abort(); }
-/** @brief Reject device metadata in the anonymous-only lock fixture.
- * @param mapping Device mapping. @return Never returns.
- */
-const struct device_mapping_info *device_mapping_info(const struct device_mapping *mapping)
-{ (void)mapping; abort(); }
-/** @brief Reject device addressing in the anonymous-only lock fixture.
- * @param mapping Device mapping. @param offset Device byte offset. @return Never returns.
- */
-uint64_t device_mapping_physical(struct device_mapping *mapping, uint64_t offset)
-{ (void)mapping; (void)offset; abort(); }
+/* The inherited anonymous fixture rejects device metadata and addressing. */
 /** @brief Reject a backing inode in the anonymous-only lock fixture. @param inode Inode. */
 void storage_inode_retain(struct storage_inode_ref *inode) { (void)inode; abort(); }
 

@@ -67,6 +67,8 @@ bool user_range_ok(uint64_t p, uint64_t size) {
     return !size || (p >= 4096 && size <= UINT64_MAX - p);
 #endif
 }
+int user_range_readable(uint64_t p, uint64_t size)
+{ return user_range_ok(p, size) ? 0 : -LINUX_EFAULT; }
 bool user_range_writable(uint64_t p, uint64_t size) { return user_range_ok(p, size) && p != readonly; }
 int user_copy_to_task(struct task *task, uint64_t p, const void *source, uint64_t size)
 { assert(task == &current); if (!user_range_writable(p, size)) return -LINUX_EFAULT; memcpy((void *)p, source, size); return 0; }

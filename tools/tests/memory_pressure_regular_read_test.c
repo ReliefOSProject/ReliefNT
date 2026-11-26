@@ -2,6 +2,11 @@
 #define _POSIX_C_SOURCE 200809L
 #include <reliefnt/fsnotify_vfs.h>
 #include <linux/inotify.h>
+#include <linux/wait.h>
+#include <reliefnt/storage_wait.h>
+struct trap_frame;
+struct task;
+static bool syscall_try_pipe_io(struct trap_frame *frame,struct task **resume);
 /* Real scalar-read staging, syscall entry, PTE/swap and pressure recovery.
  * The fixture models finite physical-page/heap availability and swap transport. */
 #define PRESSURE_REGULAR_IO_FIXTURE 1
@@ -32,8 +37,14 @@ static bool pressure_fixture_heap_admitted(size_t size)
 
 uint64_t time_uptime_us(void) { return 0; }
 uint64_t time_work_counter_us(void) { return time_uptime_us(); }
-/* This fixture has one simulated CPU and no APIC transport. */
-void smp_send_reschedule(uint32_t cpu) { (void)cpu; }
+/* Pipe admission and storage-provider waits are outside this scalar-reclaim
+ * fixture; its provider completes immediately and pressure owns every wait. */
+static bool syscall_try_pipe_io(struct trap_frame *frame,struct task **resume)
+{ assert(frame && resume);return false; }
+uint64_t storage_wait_begin(void) { return 0; }
+void storage_wait_sleep(uint64_t generation) { (void)generation;abort(); }
+int kernel_signal_queue_task(struct task *task,int signal_number)
+{ (void)task;(void)signal_number;abort(); }
 int storage_disk_block_read(uint32_t d,int32_t p,uint64_t o,void *b,uint32_t n,uint32_t *r)
 { (void)d;(void)p;(void)o;(void)b;(void)n;(void)r;abort(); }
 int storage_disk_block_write(uint32_t d,int32_t p,uint64_t o,const void *b,uint32_t n,uint32_t *r)

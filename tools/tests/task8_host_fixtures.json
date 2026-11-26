@@ -1132,6 +1132,33 @@
     ]
   },
   {
+    "name": "metadata-user-noswap",
+    "commands": [
+      [
+        "clang",
+        "-std=c11",
+        "-O1",
+        "-g",
+        "-UCONFIG_SWAP",
+        "-fsanitize=address,undefined",
+        "-fno-sanitize-recover=all",
+        "-fno-pie",
+        "-no-pie",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-Wl,--gc-sections",
+        "-Iinclude",
+        "-Iinclude/uapi",
+        "tools/tests/task8_metadata_user_test.c",
+        "-o",
+        "{tmp}/metadata-user-noswap"
+      ]
+    ],
+    "run": [
+      "{tmp}/metadata-user-noswap"
+    ]
+  },
+  {
     "name": "mincore-user-process-vm-integration",
     "commands": [
       [
@@ -3213,6 +3240,36 @@
     ]
   },
   {
+    "name": "fix1-lookup-path-noswap",
+    "commands": [
+      [
+        "clang",
+        "-std=c11",
+        "-O1",
+        "-g",
+        "-fsanitize=address,undefined",
+        "-fno-sanitize-recover=all",
+        "-fno-pie",
+        "-no-pie",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-Wl,--gc-sections",
+        "-Iinclude",
+        "-Iinclude/uapi",
+        "tools/tests/task8_lookup_text_test.c",
+        "kernel/syscall/fs/path.c",
+        "kernel/syscall/fs/lookup_state.c",
+        "tools/tests/task8_host_stubs/no_prlimit_identity.c",
+        "-o",
+        "{tmp}/fix1-lookup-path-noswap"
+      ]
+    ],
+    "run": [
+      "{tmp}/fix1-lookup-path-noswap",
+      "path"
+    ]
+  },
+  {
     "name": "fix1-lookup-text",
     "commands": [
       [
@@ -3241,6 +3298,97 @@
     "run": [
       "{tmp}/fix1-lookup-text",
       "text"
+    ]
+  },
+  {
+    "name": "fix1-lookup-bytes",
+    "commands": [
+      [
+        "clang",
+        "-std=c11",
+        "-O1",
+        "-g",
+        "-DCONFIG_SWAP=1",
+        "-fsanitize=address,undefined",
+        "-fno-sanitize-recover=all",
+        "-fno-pie",
+        "-no-pie",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-Wl,--gc-sections",
+        "-Iinclude",
+        "-Iinclude/uapi",
+        "tools/tests/task8_lookup_text_test.c",
+        "kernel/syscall/fs/path.c",
+        "kernel/syscall/fs/lookup_state.c",
+        "tools/tests/task8_host_stubs/no_prlimit_identity.c",
+        "-o",
+        "{tmp}/fix1-lookup-bytes"
+      ]
+    ],
+    "run": [
+      "{tmp}/fix1-lookup-bytes",
+      "bytes"
+    ]
+  },
+  {
+    "name": "fix1-lookup-text-noswap",
+    "commands": [
+      [
+        "clang",
+        "-std=c11",
+        "-O1",
+        "-g",
+        "-fsanitize=address,undefined",
+        "-fno-sanitize-recover=all",
+        "-fno-pie",
+        "-no-pie",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-Wl,--gc-sections",
+        "-Iinclude",
+        "-Iinclude/uapi",
+        "tools/tests/task8_lookup_text_test.c",
+        "kernel/syscall/fs/path.c",
+        "kernel/syscall/fs/lookup_state.c",
+        "tools/tests/task8_host_stubs/no_prlimit_identity.c",
+        "-o",
+        "{tmp}/fix1-lookup-text-noswap"
+      ]
+    ],
+    "run": [
+      "{tmp}/fix1-lookup-text-noswap",
+      "text"
+    ]
+  },
+  {
+    "name": "fix1-lookup-bytes-noswap",
+    "commands": [
+      [
+        "clang",
+        "-std=c11",
+        "-O1",
+        "-g",
+        "-fsanitize=address,undefined",
+        "-fno-sanitize-recover=all",
+        "-fno-pie",
+        "-no-pie",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-Wl,--gc-sections",
+        "-Iinclude",
+        "-Iinclude/uapi",
+        "tools/tests/task8_lookup_text_test.c",
+        "kernel/syscall/fs/path.c",
+        "kernel/syscall/fs/lookup_state.c",
+        "tools/tests/task8_host_stubs/no_prlimit_identity.c",
+        "-o",
+        "{tmp}/fix1-lookup-bytes-noswap"
+      ]
+    ],
+    "run": [
+      "{tmp}/fix1-lookup-bytes-noswap",
+      "bytes"
     ]
   },
   {

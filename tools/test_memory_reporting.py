@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-FAULT_CASES = ("cache-prefix", "cache-interleaved", "budget-cold", "budget-refresh", "budget-full", "retry-log", "backing-log", "actual-events", "dirty-cache", "dirty-policy", "prefault-shortage", "usercopy-shortage", "ring0-log", "prefault-terminal", "stale-shared", "stale-supervisor", "stale-negative", "file-timed-wait")
+FAULT_CASES = ("cache-prefix", "cache-interleaved", "budget-cold", "budget-refresh", "budget-full", "retry-log", "backing-log", "actual-events", "dirty-cache", "dirty-policy", "prefault-shortage", "usercopy-shortage", "ring0-log", "prefault-terminal", "prefault-contention", "stale-shared", "stale-supervisor", "stale-negative", "file-timed-wait")
 PROC_CASES = ("proc-empty-swaps", "proc-meminfo", "proc-vmstat", "proc-oom")
 RESOURCE_CASES = ("sysinfo", "swap-stream", "oom-events")
 CASES = FAULT_CASES + PROC_CASES + RESOURCE_CASES

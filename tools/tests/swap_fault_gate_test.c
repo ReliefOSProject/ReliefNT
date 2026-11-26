@@ -180,6 +180,16 @@ int SWAP_FAULT_GATE_FIXTURE_ENTRY(void)
         work = (struct fault_work){task, va, 4, 0x23, 0, NULL, 0};
         unsigned baseline = live_pages, sleeps = gate_sleeps, reads = atomic_load(&provider_reads);
         provider_read_error = -EAGAIN;
+        /* Syscall usercopy prefaults use the same backing before the outer
+         * ring-3 fault dispatcher owns a wait. They must preserve contention
+         * and release every failed frame/cache reservation before returning. */
+        cpu=0;current=task;current_task[0]=task;current_pid[0]=task->pid;
+        kernel_execution_lock_irqsave(&irq);
+        for(unsigned retry=0;retry<3;++retry) {
+            assert(syscall_handle_user_page_fault_detailed(va,4,false)==-EAGAIN);
+            assert(live_pages==baseline && !address_space_user_page_phys(sched_task_as(task),va));
+        }
+        kernel_execution_unlock_irqrestore(irq);
         run_fault(&work);
         assert(!atomic_load(&signals) && gate_sleeps == sleeps + 1 && task->state == TASK_BLOCKED);
         assert(live_pages == baseline && atomic_load(&provider_reads) == reads &&
@@ -220,6 +230,6 @@ int SWAP_FAULT_GATE_FIXTURE_ENTRY(void)
     vfs_exec_source_put(denied_source);
     assert(!live_pages);
     puts("PASS real user trap: contention schedules, then page-in preserves bytes and gate boundaries");
-    puts("PASS file faults: cold/cache/refresh EAGAIN rollback, full retry, changed permissions and terminal I/O");
+    puts("PASS file faults: cold/cache/refresh prefault EAGAIN rollback, full retry, changed permissions and terminal I/O");
     return 0;
 }

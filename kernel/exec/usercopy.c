@@ -19,10 +19,13 @@ static uint64_t align_down_page(uint64_t value)
     return value & ~(PAGE_SIZE - 1ULL);
 }
 
-/* Keep the resident-page check shared by legacy and retryable copyin. */
-#ifndef CONFIG_SWAP
-static
-#endif
+/** @brief Populate current user read pages without losing backing contention.
+ * @param ptr First user byte. @param len Exact extent, zero allowed.
+ * @return Zero when readable, -EAGAIN for temporary file I/O contention, or
+ * -EFAULT for invalid bounds, permissions or a terminal fault. Caller owns
+ * execution and prepares swapped pages first; no graph/module lock may span
+ * lazy provider I/O. No bytes are copied and no user reference is retained.
+ */
 int user_range_readable(uint64_t ptr, uint64_t len)
 {
     if (!len) return 0;
@@ -36,12 +39,8 @@ int user_range_readable(uint64_t ptr, uint64_t len)
     uint64_t end = ptr + len;
     for (uint64_t page = align_down_page(ptr); page < end; page += PAGE_SIZE) {
         if (address_space_user_page_readable(as, page)) continue;
-#ifdef CONFIG_SWAP
         int fault = syscall_handle_user_page_fault_detailed(page, 4, false);
         if (fault == -EAGAIN) return fault;
-#else
-        int fault = syscall_handle_user_page_fault(page, 4);
-#endif
         if (fault <= 0 || !address_space_user_page_readable(as, page)) return -EFAULT;
     }
     return 0;

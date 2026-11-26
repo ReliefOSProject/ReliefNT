@@ -346,7 +346,8 @@ int64_t syscall_open_path_reclaim(struct task *task,const struct trap_frame *fra
  * an unscoped call. Caller kernel_free(out->allocation) on every outcome.
  * @return Zero or negative errno, with empty output on failure. Scoped copies
  * belong to the task until common cancellation and matching retries do not
- * reread user memory. No inode I/O, reference transfer or spinlock occurs.
+ * reread user memory. May populate lazy file pages through retained providers;
+ * no namespace lookup, reference transfer or spinlock spans that I/O.
  */
 int task_lookup_text_resume(struct task *task,struct task_lookup_path *saved,
                             uint64_t user_ptr,uint32_t maximum,bool allow_null,
@@ -386,7 +387,14 @@ int task_lookup_text_resume(struct task *task,struct task_lookup_path *saved,
         uint32_t chunk=4096u-(uint32_t)(address&4095u);
         if(chunk>maximum-done)chunk=maximum-done;
         int prep=swap_prepare_user_range(task,address,chunk,false);
-        if(prep || !user_range_ok(address,chunk)) {
+        if(!prep) {
+            /* A file-backed ELF VMA can still need disk I/O even when no swap
+             * entry exists. Retain its accepted string prefix while the
+             * unrelated storage owner runs, just as binary imports do. */
+            int fault=user_range_readable(address,chunk);
+            prep=fault==-EAGAIN ? SWAP_STORAGE_CONTENDED : fault;
+        }
+        if(prep) {
             rc=prep==SWAP_STORAGE_CONTENDED ? KERNEL_SYSCALL_SWAP_CONTENDED : -RELIEFOS_EFAULT;
             break;
         }
@@ -432,7 +440,8 @@ int task_lookup_user_text(struct task *task,uint64_t user_ptr,uint32_t maximum,
  * @return Zero or negative errno with empty output on failure. Matching
  * retries resume after the copied prefix and never reread it, even when the
  * caller changes or unmaps those pages. Common cancellation owns scoped
- * storage; no namespace lookup, inode I/O or spinlock participates.
+ * storage. May populate lazy file pages through retained providers; no
+ * namespace lookup or spinlock spans that I/O.
  */
 int task_lookup_user_bytes(struct task *task,uint64_t user_ptr,uint32_t length,struct task_user_text *out)
 {
@@ -459,14 +468,10 @@ int task_lookup_user_bytes(struct task *task,uint64_t user_ptr,uint32_t length,s
         uint32_t done=snapshot->done,chunk=length-done;if(chunk>32768u)chunk=32768u;
         int prep=swap_prepare_user_range(task,user_ptr+done,chunk,false);
         if(!prep) {
-#ifdef CONFIG_SWAP
             int fault=user_range_readable(user_ptr+done,chunk);
             /* X11 writev and other imports can read a file-backed operand
              * even when no swap entry was present. Keep the copied prefix. */
             prep=fault==-EAGAIN ? SWAP_STORAGE_CONTENDED : fault;
-#else
-            prep=user_range_ok(user_ptr+done,chunk) ? 0 : -RELIEFOS_EFAULT;
-#endif
         }
         if(prep) {
             if(prep!=SWAP_STORAGE_CONTENDED || !saved) {

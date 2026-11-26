@@ -54,13 +54,15 @@ void user_unpin_read_page(struct paging_writable_alias *pin);
  * still apply. The caller owns all buffers/OFDs and performs the copy.
  */
 bool user_range_ok(uint64_t ptr, uint64_t len);
-#ifdef CONFIG_SWAP
-/** Like user_range_ok(), but retain -EAGAIN from a contended lazy file page.
- * Returns zero or -EFAULT otherwise. The caller must prepare swapped pages
- * first and, on -EAGAIN, defer the operation before publishing side effects.
+/** @brief Validate read pages while retaining temporary file-backing contention.
+ * @param ptr First user virtual byte. @param len Exact length, zero allowed.
+ * @return Zero when readable, -EAGAIN for temporary file I/O contention, or
+ * -EFAULT for bounds, permissions or a terminal fault. Execution ownership
+ * and prior swap preparation are required. May populate lazy pages through
+ * retained providers without graph/module locks; no bytes or references are
+ * retained. On -EAGAIN, defer before publishing operation side effects.
  */
 int user_range_readable(uint64_t ptr, uint64_t len);
-#endif
 /** @brief Prepare current user pages for output, resolving lazy/COW backing.
  * @param ptr User virtual destination. @param len Byte count, zero allowed.
  * @return True for writable pages, false without a user task or on bounds/fault/

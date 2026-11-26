@@ -355,6 +355,42 @@ static void prefault_terminal(void)
     assert(!live_pages); puts("PASS nonretry terminal ENOMEM and EIO remain visible");
 }
 
+/** @brief A usercopy file prefault retries contention quietly but reports EIO. */
+static void prefault_contention(void)
+{
+    const uint64_t address=0x20000000;
+    for(unsigned cached=0;cached<2;++cached) {
+        struct storage_node node={.type=RELIEFOS_FS_TYPE_FILE,.flags=STORAGE_NODE_FLAG_FAT32,
+            .first_cluster=940+cached,.volume_id=3,.size=4096};
+        memset(file_bytes,0x5a,4096);
+        struct vfs_exec_source *source=exec_fixture_open(&node);
+        struct task *task=file_task(source,node,address,0,node.size,
+            TASK_VMA_FLAG_PRIVATE|TASK_VMA_FLAG_FILE|TASK_VMA_FLAG_LAZY|
+            (cached ? TASK_VMA_FLAG_SHARED_FILE : 0),LINUX_PROT_READ);
+        assert(address_space_prepare_user_range(sched_task_as(task),address,address+4096));
+        prepare_task(task);uint64_t irq;kernel_execution_lock_irqsave(&irq);
+        unsigned baseline=live_pages,errors=file_errors;
+        provider_read_error=-EAGAIN;
+        for(unsigned retry=0;retry<3;++retry) {
+            assert(user_range_readable(address,16)==-EAGAIN);
+            assert(live_pages==baseline && file_errors==errors &&
+                   !address_space_user_page_phys(sched_task_as(task),address));
+        }
+        provider_read_error=-EIO;
+        assert(user_range_readable(address,16)==-EFAULT);
+        assert(live_pages==baseline && file_errors==errors+1 &&
+               !address_space_user_page_phys(sched_task_as(task),address));
+        provider_read_error=0;
+        assert(!user_range_readable(address,16) && file_errors==errors+1);
+        uint64_t physical=address_space_user_page_phys(sched_task_as(task),address);assert(physical);
+        for(unsigned i=0;i<4096;++i)assert(((uint8_t *)mm_phys_to_virt(physical))[i]==0x5a);
+        kernel_execution_unlock_irqrestore(irq);
+        destroy_task(task);page_cache_forget_node(&node);vfs_exec_source_put(source);
+        assert(!live_pages);
+    }
+    puts("PASS cached/uncached usercopy file contention stays quiet without leaked pages; EIO remains reported");
+}
+
 /** @brief Real fault, cache walk and completed swap I/O update event counters. */
 static void actual_events(void)
 {
@@ -721,6 +757,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "usercopy-shortage")) prefault_shortage(true);
     else if (!strcmp(argv[1], "ring0-log")) ring0_log();
     else if (!strcmp(argv[1], "prefault-terminal")) prefault_terminal();
+    else if (!strcmp(argv[1], "prefault-contention")) prefault_contention();
     else if (!strcmp(argv[1], "stale-shared")) stale_shared();
     else if (!strcmp(argv[1], "stale-supervisor")) stale_supervisor();
     else if (!strcmp(argv[1], "stale-negative")) stale_negative();

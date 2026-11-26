@@ -24,6 +24,8 @@ static unsigned fixture_refs;
 static bool fixture_device,fixture_readonly;
 static uint64_t fixture_device_cache_flags;
 static bool fixture_expect_drain, fixture_drained;
+static bool fixture_cold_file, fixture_foreign_owner;
+static unsigned fixture_file_prepares;
 
 /** @brief Translate the simulated current user page to its retained alias.
  * @param as Unused fixture address space. @param va User virtual address.
@@ -59,7 +61,16 @@ void page_cache_release(uint64_t phys) { (void)phys; abort(); }
  * @return True when the complete interval lies within the fixture page.
  */
 bool user_range_ok(uint64_t address, uint64_t len)
-{ return address >= (uintptr_t)fixture_user && len <= 4096 && address - (uintptr_t)fixture_user <= 4096 - len; }
+{ return !fixture_cold_file && address >= (uintptr_t)fixture_user && len <= 4096 && address - (uintptr_t)fixture_user <= 4096 - len; }
+int user_range_readable(uint64_t address,uint64_t length)
+{
+    if(fixture_cold_file) {
+        ++fixture_file_prepares;
+        if(fixture_foreign_owner)return -LINUX_EAGAIN;
+        fixture_cold_file=false;
+    }
+    return user_range_ok(address,length) ? 0 : -LINUX_EFAULT;
+}
 /** @brief Validate the modeled writable range. @param address Start. @param len Length.
  * @return True for the fixture page.
  */
@@ -304,6 +315,27 @@ int main(void)
     fixture_alias = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, shared, 0);
     assert(fixture_user != MAP_FAILED && fixture_alias != MAP_FAILED);
     fixture_refs = 1; task->kind = TASK_KIND_USER;
+    /* A cold ELF/mmap page needs storage admission even without a swap entry.
+     * No stage, frame pin, file offset advance or provider request may precede
+     * its foreign-owner wait; after admission one transfer runs normally. */
+    file.flags=RELIEFOS_O_RDWR;
+    for(unsigned writing=0;writing<2;++writing) {
+        file.offset=0;task->syscall_file_number=writing ? LINUX_SYS_WRITE : LINUX_SYS_READ;
+        unsigned before_calls=provider_reads+provider_writes;
+        fixture_cold_file=fixture_foreign_owner=true;
+        memset(fixture_alias,0x4b,64);memset(disk,0x7d,64);
+        assert(syscall_regular_io(task,&file,(uintptr_t)fixture_user,64,0,writing,false)==KERNEL_SYSCALL_SWAP_CONTENDED);
+        assert(file.offset==0 && fixture_refs==1 && !regular_stage_find(task));
+        assert(task->regular_io.active && provider_reads+provider_writes==before_calls);
+        assert(syscall_regular_io(task,&file,(uintptr_t)fixture_user,64,0,writing,false)==KERNEL_SYSCALL_SWAP_CONTENDED);
+        assert(provider_reads+provider_writes==before_calls && !regular_stage_find(task));
+        fixture_foreign_owner=false;
+        assert(syscall_regular_io(task,&file,(uintptr_t)fixture_user,64,0,writing,false)==64);
+        assert(provider_reads+provider_writes==before_calls+1 && file.offset==64 && fixture_refs==1);
+        assert(!task->regular_io.active && !regular_stage_find(task));
+        for(unsigned i=0;i<64;++i)assert(disk[i]==(writing ? 0x4b : 0x7d) && fixture_alias[i]==(writing ? 0x4b : 0x7d));
+    }
+    assert(fixture_file_prepares==6);
     file.offset = 0; task->syscall_file_number = LINUX_SYS_READ;
     memset(disk, 0x71, 64); error_offset = 0; injected_error = -LINUX_EAGAIN;
     assert(syscall_regular_io(task, &file, (uintptr_t)fixture_user, 64, 0, false, false) == -LINUX_EAGAIN);

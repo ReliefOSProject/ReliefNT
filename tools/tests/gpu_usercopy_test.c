@@ -3,6 +3,7 @@
 #include <reliefnt/usercopy.h>
 #include <reliefnt/paging.h>
 #include <reliefnt/sched.h>
+#include <linux/errno.h>
 
 static struct task current;
 static uint64_t flags[3];
@@ -50,9 +51,9 @@ bool address_space_handle_cow_fault(struct address_space *as, uint64_t address)
     ++cow_copies;
     return true;
 }
-int syscall_handle_user_page_fault(uint64_t address, uint64_t error)
+int syscall_handle_user_page_fault_detailed(uint64_t address, uint64_t error, bool user_fault)
 {
-    (void)error;
+    (void)error;assert(!user_fault);
     unsigned index = index_for(address);
     if (lazy_maps && index < 3) {
         flags[index] = RELIEFNT_PAGE_PRESENT | RELIEFNT_PAGE_USER | RELIEFNT_PAGE_WRITABLE;
@@ -102,6 +103,9 @@ int main(void)
     assert(!user_range_writable(RELIEFNT_USER_BASE + 8192, 4));
     /* Fault handlers must actually establish access, not just report success. */
     flags[2] = 0;
+    lazy_result = -EAGAIN;
+    assert(user_range_readable(RELIEFNT_USER_BASE + 8192, 4) == -EAGAIN);
+    assert(!user_range_ok(RELIEFNT_USER_BASE + 8192, 4));
     lazy_result = 1;
     assert(!user_range_ok(RELIEFNT_USER_BASE + 8192, 4));
     assert(!user_range_writable(RELIEFNT_USER_BASE + 8192, 4));
