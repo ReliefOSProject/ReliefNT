@@ -1,4 +1,5 @@
 #include "internal.h"
+#include <reliefnt/seccomp.h>
 
 /** @brief Invalidate OOM snapshots when a vfork relation ends.
  * Production links the allocation-free scheduler notifier; standalone clone
@@ -217,6 +218,13 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
     }
     task_zero(child);
     *child = *parent;
+#ifdef CONFIG_SECCOMP_FILTER
+    /* The shallow copy hasn't taken a reference, nor does a new thread
+     * inherit a pending synchronous signal. */
+    child->seccomp_filter = NULL;
+    child->seccomp_count = 0;
+    child->seccomp_sigsys = (struct task_seccomp_sigsys){0};
+#endif
     sched_oom_policy_inherit(child, parent);
     child->identity_token=NULL;
     /* Pending syscall operands belong to the caller, never its new child. */
@@ -522,6 +530,9 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
         parent->state = TASK_BLOCKED;
     }
     sched_task_identity_bind(child, identity);
+#ifdef CONFIG_SECCOMP_FILTER
+    seccomp_inherit(child, parent);
+#endif
     child->proc_read_chars = child->proc_write_chars = 0;
     child->proc_read_calls = child->proc_write_calls = 0;
     child->proc_read_bytes = child->proc_write_bytes = 0;

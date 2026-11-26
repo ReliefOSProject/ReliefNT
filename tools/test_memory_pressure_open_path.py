@@ -28,6 +28,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     directory = args.output.resolve()
     (directory / "mincore_syscall_entry.inc").write_text(
+        function(ROOT / "kernel/syscall/entry.c", "syscall_execute_locked") +
         function(ROOT / "kernel/syscall/entry.c", "syscall_dispatch_frame"))
     (directory / "ext_lookup.inc").write_text(
         function(ROOT / "fs/ext_common/native.c", "ext_native_open_walk") +

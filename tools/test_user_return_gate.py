@@ -68,6 +68,8 @@ def main():
         work = Path(directory)
         for target, source, name in BODIES:
             body = host_function(kernel / source, name)
+            if name == "syscall_dispatch_frame":
+                body = function(kernel / source, "syscall_execute_locked") + body
             (work / target).write_text(body)
         source = module_text("syscall_dispatch")
         start = source.index("    if (number == LINUX_SYS_PSELECT6) {")

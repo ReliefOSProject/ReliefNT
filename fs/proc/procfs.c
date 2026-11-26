@@ -1181,13 +1181,18 @@ int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *
 #endif
     if (proc_text_eq(path, "/proc/sys") || proc_text_eq(path, "/proc/sys/kernel")) {
         static const char *values[] = {"hostname", "domainname",  "ostype",      "osrelease",
-                                       "version",  "overflowuid", "overflowgid", "pid_max"};
+                                       "version",  "overflowuid", "overflowgid", "pid_max"
+#ifdef CONFIG_SECCOMP_FILTER
+                                      , "seccomp"
+#endif
+        };
         int parent = proc_text_eq(path, "/proc/sys");
         if (*offset >= (parent ? 2 : sizeof(values) / sizeof(values[0])))
             return 0;
-        entry->type = parent ? RELIEFOS_FS_TYPE_DIR : RELIEFOS_FS_TYPE_FILE;
-        proc_copy(entry->name, sizeof(entry->name),
-                  parent ? (*offset ? "fs" : "kernel") : values[*offset]);
+        const char *name = parent ? (*offset ? "fs" : "kernel") : values[*offset];
+        entry->type = parent || proc_text_eq(name, "seccomp")
+            ? RELIEFOS_FS_TYPE_DIR : RELIEFOS_FS_TYPE_FILE;
+        proc_copy(entry->name, sizeof(entry->name), name);
         ++*offset;
         return 1;
     }

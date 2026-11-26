@@ -20,6 +20,8 @@ include/uapi/reliefos/startup_abi.h
 include/uapi/reliefos/syscall_abi.h
 include/uapi/reliefos/system_abi.h
 include/uapi/linux/arch_prctl.h
+include/uapi/linux/audit.h
+include/uapi/linux/bpf_common.h
 include/uapi/linux/capability.h
 include/uapi/linux/dirent.h
 include/uapi/linux/epoll.h
@@ -27,6 +29,7 @@ include/uapi/linux/errno.h
 include/uapi/linux/eventfd.h
 include/uapi/linux/fb.h
 include/uapi/linux/fcntl.h
+include/uapi/linux/filter.h
 include/uapi/linux/fs.h
 include/uapi/linux/futex.h
 include/uapi/linux/if.h
@@ -54,6 +57,7 @@ include/uapi/linux/reboot.h
 include/uapi/linux/resource.h
 include/uapi/linux/rseq.h
 include/uapi/linux/sched.h
+include/uapi/linux/seccomp.h
 include/uapi/linux/securebits.h
 include/uapi/linux/sem.h
 include/uapi/linux/signal.h

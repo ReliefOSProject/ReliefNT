@@ -67,7 +67,14 @@ int64_t syscall_legacy_process(uint64_t number, uint64_t a0, uint64_t a1, uint64
     if (number == LINUX_SYS_EXIT || number == LINUX_SYS_EXIT_GROUP) {
         struct task *task = sched_current_task();
         uint32_t pid = sched_current_pid();
-        if (number == LINUX_SYS_EXIT_GROUP && task) sched_exit_group(sched_task_tgid(task), a0 & 255);
+        if (number == LINUX_SYS_EXIT_GROUP && task) {
+            uint32_t tgid = sched_task_tgid(task);
+            struct task *leader = sched_find(tgid);
+            /* A normal group exit overrides a previously retired leader's
+             * private status, for example after a seccomp KILL_THREAD. */
+            if (leader) leader->exit_signal = 0;
+            sched_exit_group(tgid, a0 & 255);
+        }
         if (!task || !task->shared_files || task->shared_files->references == 1) pty_process_exit(pid);
         userland_process_exit(a0 & 255);
         return 0;

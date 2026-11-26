@@ -9,6 +9,10 @@
 #include <reliefnt/syscall_internal.h>
 #include <linux/capability.h>
 #include <linux/errno.h>
+#ifdef CONFIG_SECCOMP_FILTER
+#include <linux/audit.h>
+#define SECCOMP_SIGSYS_BIT (UINT64_C(1) << (LINUX_SIGSYS - 1))
+#endif
 
 #define KERNEL_SIGINFO_SIZE 48u
 
@@ -106,6 +110,24 @@ int kernel_signal_enqueue(struct task *task, bool process, int sig,
     return 0;
 }
 
+#ifdef CONFIG_SECCOMP_FILTER
+/** @brief Queue the caller's synchronous seccomp trap and its exact payload.
+ * @param task Current execution-owned thread; SIGSYS is caught and unblocked.
+ * @param ip Saved user IP after the syscall instruction.
+ * @param nr Native syscall number. @param data Filter's 16-bit payload.
+ * The embedded record survives pressure and is selected before an ordinary
+ * private SIGSYS with the same number. No allocation or shared signal.
+ */
+void kernel_signal_enqueue_seccomp(struct task *task, uint64_t ip, int32_t nr, uint16_t data)
+{
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&signal_queue_lock, &flags);
+    task->seccomp_sigsys = (struct task_seccomp_sigsys){ip, nr, data, true};
+    __atomic_fetch_or(&task->pending_signals, SECCOMP_SIGSYS_BIT, __ATOMIC_SEQ_CST);
+    kernel_spin_unlock_irqrestore(&signal_queue_lock, flags);
+}
+#endif
+
 /**
  * @brief Remove selected queued signals, their bits and their original UID charges.
  * @param task Receiver whose lifetime is pinned by the caller.
@@ -118,6 +140,9 @@ void kernel_signal_flush(struct task *task, bool process, uint64_t mask)
     uint64_t *pending = process ? sched_task_process_pending(task) : &task->pending_signals;
     struct kernel_sigqueue *queue = process ? sched_task_process_signal_queue(task) : &task->signal_queue;
     kernel_spin_lock_irqsave(&signal_queue_lock, &flags);
+#ifdef CONFIG_SECCOMP_FILTER
+    if (!process && (mask & SECCOMP_SIGSYS_BIT)) task->seccomp_sigsys.pending = false;
+#endif
     struct kernel_sigqueue_entry **link = &queue->head, *previous = NULL;
     while (*link) {
         struct kernel_sigqueue_entry *entry = *link;
@@ -184,6 +209,21 @@ int kernel_signal_dequeue(struct task *task, uint64_t allowed, struct linux_sigi
             previous = *link;
             link = &(*link)->next;
         }
+#ifdef CONFIG_SECCOMP_FILTER
+        if (!process && sig == LINUX_SIGSYS && task->seccomp_sigsys.pending) {
+            struct task_seccomp_sigsys payload = task->seccomp_sigsys;
+            task->seccomp_sigsys.pending = false;
+            *info = (struct linux_siginfo){
+                .signo = LINUX_SIGSYS,
+                .error = payload.data,
+                .code = LINUX_SYS_SECCOMP_CODE,
+                .fields.sys = {payload.ip, payload.nr, AUDIT_ARCH_X86_64},
+            };
+            if (!*link) __atomic_fetch_and(pending, ~bit, __ATOMIC_SEQ_CST);
+            kernel_spin_unlock_irqrestore(&signal_queue_lock, flags);
+            return sig;
+        }
+#endif
         *info = (struct linux_siginfo){.signo = sig, .code = LINUX_SI_USER};
         if (*link) {
             struct kernel_sigqueue_entry *entry = *link;

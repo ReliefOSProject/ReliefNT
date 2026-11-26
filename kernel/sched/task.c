@@ -8,6 +8,7 @@
 extern void memory_headroom_cancel(struct task *) __attribute__((weak));
 #endif
 #include <reliefnt/lock_profile.h>
+#include <reliefnt/seccomp.h>
 #include <reliefnt/userland.h>
 
 /** @brief Invalidate OOM holder snapshots after final task resource release.
@@ -510,6 +511,9 @@ uint32_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack
             sched_oom_policy_inherit(task, parent);
             task_copy_cwd(task, sched_task_cwd(parent));
             task_copy_identity_from_parent(task, parent);
+#ifdef CONFIG_SECCOMP_FILTER
+            seccomp_inherit(task, parent);
+#endif
             task->priority = parent->priority;
             task->limits = *sched_task_limits(parent);
             task->limits.references = 1;
@@ -732,6 +736,9 @@ void sched_release_task_resources(struct task *task)
         kernel_spin_unlock_irqrestore(&scheduler_lock, vfork_flags);
     }
     sched_release_task_signals(task);
+#ifdef CONFIG_SECCOMP_FILTER
+    seccomp_release(task);
+#endif
     if (!thread_group_pending(sched_task_tgid(task), task))
         pty_process_session_exit(sched_task_tgid(task));
     bool last_files = !task->shared_files ||

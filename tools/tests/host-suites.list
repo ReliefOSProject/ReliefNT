@@ -115,6 +115,7 @@ disk_raw_batch tools/test_disk_raw_batch.py
 syscall_io tools/test_syscall_io.py
 workqueue tools/test_workqueue.py
 uapi tools/test_uapi.py
+seccomp_bpf tools/test_seccomp_bpf.py
 user_return_gate tools/test_user_return_gate.py
 vdso_mapping tools/test_vdso_mapping.py
 vdso_time tools/test_vdso_time.py

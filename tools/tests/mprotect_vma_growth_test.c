@@ -397,6 +397,23 @@ static void teardown(void)
     current = NULL;
 }
 
+static void test_linux_map_denywrite_ignored(void)
+{
+    setup(1);
+    clear_setup_vmas();
+    sched_task_limits(current)->as.rlim_cur = LINUX_RLIM_INFINITY;
+    const uint64_t address = 0x0000010000000000ULL;
+    const uint64_t flags = LINUX_MAP_PRIVATE | LINUX_MAP_FIXED |
+                           LINUX_MAP_ANONYMOUS | LINUX_MAP_DENYWRITE;
+    assert(syscall_mm_mmap(address, 4096, LINUX_PROT_READ | LINUX_PROT_WRITE,
+                           flags, UINT64_MAX, 0) == (int64_t)address);
+    assert(task_vma_containing(current, address, address + 4096));
+    assert(syscall_handle_task_page_fault(current, address, 6));
+    assert(!syscall_mm_munmap(address, 4096));
+    teardown();
+    puts("PASS Linux MAP_DENYWRITE is accepted and ignored");
+}
+
 static void test_population_guard_operation_count(void)
 {
     setup(1);
@@ -2959,6 +2976,7 @@ int main(int argc, char **argv)
         test_checked_provider_failure_preserves_locks(); return 0;
     }
     test_reclaim_context_emergency_page();
+    test_linux_map_denywrite_ignored();
     test_population_many_guard_search_budget();
     test_population_local_eio_then_healthy();
     test_population_unvisited_split_reentry();

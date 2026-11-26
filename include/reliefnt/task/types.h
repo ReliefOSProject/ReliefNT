@@ -29,6 +29,7 @@ struct task_epoll_watch;
 struct task_identity;
 struct vfs_exec_source;
 struct task_transfer_state;
+struct seccomp_filter;
 
 #define SCHED_TASK_NAME_LEN 32u
 /* Initial task-table capacity; the scheduler grows beyond this value. */
@@ -532,6 +533,16 @@ struct task {
     bool nproc_exceeded;
     /* Copied by fork/clone and retained by exec; only uname.sysname changes. */
     bool uname_linux;
+#ifdef CONFIG_SECCOMP_FILTER
+    struct seccomp_filter *seccomp_filter;
+    uint32_t seccomp_count; /* Last published count, also visible for zombies. */
+    struct task_seccomp_sigsys {
+        uint64_t ip;
+        int32_t nr;
+        uint16_t data;
+        bool pending;
+    } seccomp_sigsys;
+#endif
     struct task_rlimit_state limits;
     struct task_rlimit_state *shared_limits;
     uint32_t tgid;
@@ -561,6 +572,7 @@ struct task {
     uint64_t signal_stack_base;
     uint64_t signal_stack_size;
     uint32_t signal_stack_flags;
+    /* Number plus one while the kernel owns a suspended invocation. */
     uint64_t restart_syscall;
     uint64_t nanosleep_deadline;
     uint64_t nanosleep_remaining;

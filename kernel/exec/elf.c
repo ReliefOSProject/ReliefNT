@@ -28,10 +28,15 @@
 #define PF_W 2
 #define PAGE_SIZE 4096ULL
 #define ELF_HEADER_READ_BYTES 4096U
-#define ELF_DYN_MAIN_MIN 0x01000000ULL
-#define ELF_DYN_MAIN_MAX 0x04000000ULL
-#define ELF_DYN_INTERP_MIN 0x04000000ULL
-#define ELF_DYN_INTERP_MAX 0x06000000ULL
+/* Keep PIEs in Linux-style high user ranges. The low address gap includes
+ * ReliefNT's supervisor-only kernel hole and is not a valid ELF placement
+ * window. The split also leaves a large unmapped gap between the main image
+ * and the interpreter for ordinary shared-library mmap placement. */
+#define ELF_DYN_MAIN_MIN 0x0000550000000000ULL
+#define ELF_DYN_MAIN_MAX 0x0000700000000000ULL
+#define ELF_DYN_INTERP_MIN 0x0000700000000000ULL
+#define ELF_DYN_INTERP_MAX 0x00007f0000000000ULL
+#define ELF_DYN_ALIGN 0x200000ULL
 
 struct elf64_ehdr {
     unsigned char e_ident[EI_NIDENT];
@@ -605,26 +610,49 @@ static struct task_vma *elf64_legacy_shared_page_vma(struct task *task,
 }
 
 /**
- * @brief Pick a random 2 MiB-aligned load bias inside the main/interpreter ASLR window that fits the image; returns 0 when the layout cannot fit.
+ * @brief Pick a random aligned load bias inside the Linux-style user ASLR
+ * window. The complete page-rounded image span must fit below the window end;
+ * returning zero leaves malformed or unplaceable images rejected.
  */
 static uint64_t elf64_choose_bias(const struct elf_image_info *info, bool interpreter)
 {
     uint64_t min = interpreter ? ELF_DYN_INTERP_MIN : ELF_DYN_MAIN_MIN;
     uint64_t max = interpreter ? ELF_DYN_INTERP_MAX : ELF_DYN_MAIN_MAX;
-    uint64_t span;
+    uint64_t low;
+    uint64_t high;
+    uint64_t image_span;
+    uint64_t first_base;
+    uint64_t latest_base;
+    uint64_t base_count;
     uint64_t base;
+    uint64_t bias;
     uint64_t random;
-    if (!info || info->high_vaddr <= info->low_vaddr ||
-        info->high_vaddr - info->low_vaddr > max - min) {
+
+    if (!info || info->high_vaddr <= info->low_vaddr || max <= min ||
+        info->high_vaddr > UINT64_MAX - (PAGE_SIZE - 1ULL)) {
         return 0;
     }
-    span = (max - min - (info->high_vaddr - info->low_vaddr)) & ~0x1fffffULL;
+    low = align_down(info->low_vaddr);
+    high = (info->high_vaddr + PAGE_SIZE - 1ULL) & ~(PAGE_SIZE - 1ULL);
+    if (high <= low) return 0;
+    image_span = high - low;
+    if (image_span > max - min) return 0;
+    latest_base = max - image_span;
+    first_base = min;
+    if (first_base <= low) {
+        if (low > UINT64_MAX - ELF_DYN_ALIGN) return 0;
+        first_base = (low + ELF_DYN_ALIGN) & ~(ELF_DYN_ALIGN - 1ULL);
+    }
+    if (latest_base < first_base) return 0;
+    base_count = (latest_base - first_base) / ELF_DYN_ALIGN + 1ULL;
     if (kernel_random_fill(&random, sizeof(random)) < 0) return 0;
-    base = min + (random % (span / 0x200000ULL + 1ULL)) * 0x200000ULL;
-    if (base < align_down(info->low_vaddr)) {
+    base = first_base + (random % base_count) * ELF_DYN_ALIGN;
+    bias = base - low;
+    if (bias > UINT64_MAX - info->high_vaddr ||
+        bias + info->high_vaddr > max || bias + info->high_vaddr > RELIEFNT_USER_TOP) {
         return 0;
     }
-    return base - align_down(info->low_vaddr);
+    return bias;
 }
 
 /**

@@ -1,0 +1,7 @@
+config SECCOMP_FILTER
+    bool "Seccomp classic BPF syscall filters"
+    default y
+    help
+      Allow native x86-64 userspace to restrict the system calls of a thread
+      or its thread group with classic BPF. Filters persist across fork and
+      exec. See Documentation/userspace-api/seccomp.rst for the ABI scope.

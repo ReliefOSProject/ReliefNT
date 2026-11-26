@@ -24,12 +24,14 @@ def macro(text: str, name: str) -> int:
 def test_linux_numbers_and_flags() -> None:
     syscall = read("include/uapi/linux/syscall.h")
     fcntl = read("include/uapi/linux/fcntl.h")
+    mman = read("include/uapi/linux/mman.h")
     assert macro(syscall, "__NR_pause") == 34
     assert macro(syscall, "__NR_arch_prctl") == 158
     assert macro(syscall, "__NR_set_tid_address") == 218
     assert macro(syscall, "__NR_exit_group") == 231
     assert macro(syscall, "__NR_gettid") == 186
     assert macro(fcntl, "LINUX_O_NONBLOCK") == 0x800
+    assert macro(mman, "LINUX_MAP_DENYWRITE") == 0x800
     assert macro(fcntl, "LINUX_F_DUPFD_CLOEXEC") == 1030
 
 

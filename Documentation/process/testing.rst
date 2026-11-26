@@ -59,6 +59,12 @@ PID 1 将结果写入串口并等待。编译示例::
 来宾验收分别记录单核和多核启动的完整串口日志、内核与探针摘要；
 出现 PASS 后仍需检查没有 FAIL 或 panic，不能只以启动完成代替 syscall 验证。
 
+``seccomp_bpf`` 套件以 ASan/UBSan 直接运行生产用经典 BPF 验证器和解释器。
+``tools/tests/seccomp_probe.c`` 可用静态 x86-64 musl 工具链编译，在测试系统
+中以普通进程运行（不可直接作为 PID 1），退出成功时打印 ``SECCOMP_ABI_PASS``。
+在 Linux 上不带参数运行，在 ReliefNT 上添加 ``--reliefnt`` 测试原生旧入口和
+未支持扩展。来宾串口证据应包含实际在线 CPU 数、探针结果及 guest 退出状态。
+
 ``service_roles`` 套件检查旧内核桌面实现未恢复、旧窗口服务权限标志未恢复，
 以及 exec 只保留允许的任务标志；这些内核源码检查由本仓持有，父仓不再重复。
 

@@ -3,8 +3,58 @@
 #include <string.h>
 #include "../../kernel/exec/elf.c"
 
+static int elf_test_random_status;
+
+int kernel_random_fill(void *buffer, size_t length)
+{
+    if (elf_test_random_status) return elf_test_random_status;
+    memset(buffer, 0, length);
+    return 0;
+}
+
+static void test_large_pie_bias(void)
+{
+    struct elf_image_info main_image = {
+        .dynamic = true, .low_vaddr = 0, .high_vaddr = 0x0d700000ULL,
+    };
+    uint64_t bias = elf64_choose_bias(&main_image, false);
+    uint64_t start = bias + main_image.low_vaddr;
+    uint64_t end = bias + main_image.high_vaddr;
+    assert(bias >= ELF_DYN_MAIN_MIN);
+    assert(end <= ELF_DYN_MAIN_MAX);
+    assert((bias & 0x1fffffULL) == 0);
+    assert(!(start < RELIEFNT_KERNEL_HOLE_END && end > RELIEFNT_KERNEL_HOLE_START));
+    assert(end < RELIEFNT_USER_TOP);
+
+    struct elf_image_info high_low_image = {
+        .dynamic = true, .low_vaddr = ELF_DYN_MAIN_MIN + 0x400000ULL,
+        .high_vaddr = ELF_DYN_MAIN_MIN + 0x800000ULL,
+    };
+    uint64_t high_low_bias = elf64_choose_bias(&high_low_image, false);
+    assert(high_low_bias != 0);
+    assert(high_low_bias + high_low_image.low_vaddr >= ELF_DYN_MAIN_MIN);
+    assert(high_low_bias + high_low_image.high_vaddr <= ELF_DYN_MAIN_MAX);
+
+    struct elf_image_info interpreter = {
+        .dynamic = true, .low_vaddr = 0, .high_vaddr = 0x00300000ULL,
+    };
+    uint64_t interpreter_bias = elf64_choose_bias(&interpreter, true);
+    assert(interpreter_bias >= ELF_DYN_INTERP_MIN);
+    assert(interpreter_bias + interpreter.high_vaddr <= ELF_DYN_INTERP_MAX);
+
+    struct elf_image_info oversized = {
+        .dynamic = true, .low_vaddr = 0,
+        .high_vaddr = ELF_DYN_MAIN_MAX - ELF_DYN_MAIN_MIN + PAGE_SIZE,
+    };
+    assert(elf64_choose_bias(&oversized, false) == 0);
+    elf_test_random_status = -1;
+    assert(elf64_choose_bias(&interpreter, true) == 0);
+    elf_test_random_status = 0;
+}
+
 int main(void)
 {
+    test_large_pie_bias();
     unsigned char image[4096] = {0};
     struct elf64_ehdr *eh = (void *)image;
     memcpy(eh->e_ident, "\177ELF\2\1\1", 7);
