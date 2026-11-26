@@ -11,6 +11,8 @@
 #define LINUX_MAP_SHARED_VALIDATE 0x03u
 #define LINUX_MAP_FIXED 0x10u
 #define LINUX_MAP_ANONYMOUS 0x20u
+/* Linux accepts this legacy flag but has ignored its effect since Linux 2.0. */
+#define LINUX_MAP_DENYWRITE 0x800u
 #define LINUX_MAP_NORESERVE 0x4000u
 #define LINUX_MAP_STACK 0x20000u
 #define LINUX_MAP_FIXED_NOREPLACE 0x100000u
