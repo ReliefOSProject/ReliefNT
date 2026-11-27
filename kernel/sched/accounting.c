@@ -371,3 +371,41 @@ void sched_task_cpu_times(const struct task *task, bool process, uint64_t *user,
     cpu_accounting_task_times_locked(task, process, user, system);
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
 }
+
+/** @brief Query scheduler-owned CPU time without nesting the timekeeper lock.
+ * @param clock Supported current process/thread CPU clock selector.
+ * @param resolution Return the real tick granularity when true.
+ * @param value Writable kernel result, optional for resolution queries.
+ * @return Zero or negative EINVAL, leaving output unchanged on failure.
+ * Task context for CPU-time reads. Acquires scheduler_lock and retains no
+ * references, performs no allocation and accesses no userspace memory.
+ */
+int sched_cpu_clock_get(int32_t clock, bool resolution, struct linux_timespec *value)
+{
+    if (clock != LINUX_CLOCK_PROCESS_CPUTIME_ID &&
+        clock != LINUX_CLOCK_THREAD_CPUTIME_ID)
+        return -LINUX_EINVAL;
+    if (resolution) {
+        if (value) {
+            value->tv_sec = 0;
+            value->tv_nsec = 1000000000ULL / RELIEFNT_TICK_HZ;
+        }
+        return 0;
+    }
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&scheduler_lock, &flags);
+    const struct task *task = sched_current_task();
+    if (!task || !task->pid) {
+        kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
+        return -LINUX_EINVAL;
+    }
+    uint64_t user, system;
+    cpu_accounting_task_times_locked(task, clock == LINUX_CLOCK_PROCESS_CPUTIME_ID,
+                                     &user, &system);
+    uint64_t total = cpu_accounting_add(user, system);
+    value->tv_sec = (int64_t)(total / RELIEFNT_TICK_HZ);
+    value->tv_nsec = (int64_t)((total % RELIEFNT_TICK_HZ) *
+                              (1000000000ULL / RELIEFNT_TICK_HZ));
+    kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
+    return 0;
+}

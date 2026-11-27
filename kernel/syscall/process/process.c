@@ -115,6 +115,7 @@ static int64_t process_resource_limit(uint64_t number, uint64_t a0, uint64_t a1,
     struct linux_rlimit64 *stored;
     if (resource == LINUX_RLIMIT_NOFILE) stored = &limits->nofile;
     else if (resource == LINUX_RLIMIT_AS) stored = &limits->as;
+    else if (resource == LINUX_RLIMIT_DATA) stored = &limits->data;
     else if (resource == LINUX_RLIMIT_SIGPENDING) stored = &limits->sigpending;
     else if (resource == LINUX_RLIMIT_STACK) stored = &limits->stack;
     else if (resource == LINUX_RLIMIT_NPROC) stored = &limits->nproc;

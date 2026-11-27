@@ -29,6 +29,8 @@ struct vfs_pseudo_provider {
     void (*put_identity)(void *pin);
     /* Authorize and transfer an exact target for a marked magic link. */
     int (*follow)(const char *name,struct vfs_path *out);
+    /* Authorized pathless target metadata; EOPNOTSUPP requests path following. */
+    int (*stat_link)(const char *name,struct linux_stat_abi *out);
     int (*permissions)(const char *intrinsic,const struct storage_node *node,
                         struct reliefos_permissions *value,bool write);
     /* Optional nonblocking per-open capture. An owned state is consumed by
@@ -37,6 +39,9 @@ struct vfs_pseudo_provider {
     int (*open)(const char *intrinsic,uint32_t flags,void **state);
     int (*read_open)(void *state,uint64_t offset,void *buffer,uint32_t capacity,uint32_t *read);
     void (*close)(void *state);
+    /* Optional provider-specific attributes after generic metadata is filled.
+     * The intrinsic key and its identity remain valid during the call. */
+    void (*getattr)(const char *name,struct linux_stat_abi *out);
 };
 
 /** @brief Create a referenced generated-file filesystem with owned inode keys.

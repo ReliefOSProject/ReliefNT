@@ -262,7 +262,12 @@ static void clone_pending_operands(struct task *parent,struct task *child,struct
             kernel_free(child->exec_argv);kernel_free(child->exec_envp);kernel_free(child->exec_data);
             sched_task_identity_detach(child);
             task_zero(child);child->state=TASK_EXITED;child->running_cpu=SCHED_CPU_NONE;child->flags=TASK_FLAG_RESOURCES_RELEASED;
-            sched_task_fs_unshare(parent);assert(ns->root->references==6);
+            if (parent->shared_fs) {
+                sched_task_fs_release(parent);
+                vfs_path_get(&operand->root, &parent->fs_paths.root);
+                vfs_path_get(&operand->start, &parent->fs_paths.cwd);
+            }
+            assert(ns->root->references == 6);
         }
         empty_clone_boundary=false;assert(live_pages()==pages_before && shm_heap_live==heap_before);
     }
@@ -391,14 +396,16 @@ int main(void)
     assert(!parent->fs_paths.root.mount && !parent->fs_paths.cwd.mount);
     struct task fs_sibling={.shared_fs=parent->shared_fs};++fs_sibling.shared_fs->references;
     assert(!sched_prepare_exec_current(parent));
-    assert(!parent->shared_fs && parent->fs_paths.root.mount==namespace.root && parent->fs_paths.cwd.mount==namespace.root);
-    assert(fs_sibling.shared_fs->references==1 && namespace.root->references==5);
+    assert(parent->shared_fs == fs_sibling.shared_fs);
+    assert(sched_task_paths(parent)->root.mount == namespace.root &&
+           sched_task_paths(parent)->cwd.mount == namespace.root);
+    assert(fs_sibling.shared_fs->references == 2 && namespace.root->references == 3);
     sched_task_fs_release(parent);
     assert(fs_sibling.shared_fs->references==1 && namespace.root->references==3);
     assert(sched_task_paths(&fs_sibling)->root.mount==namespace.root);
     sched_task_fs_release(&fs_sibling);
     assert(namespace.root->references==1);
-    /* Exec by the last CLONE_FS holder must release the old state's two pins. */
+    /* Exec by the last CLONE_FS holder preserves root/cwd and umask. */
     assert(!vfs_namespace_root(&namespace,&parent->fs_paths.root));
     vfs_path_get(&parent->fs_paths.root,&parent->fs_paths.cwd);
     task_copy_cwd(parent,"/kept");
@@ -406,8 +413,9 @@ int main(void)
     parent->umask=0027;
     assert(!task_promote_shared(parent,CLONE_FS));
     assert(!sched_prepare_exec_current(parent));
-    assert(!parent->shared_fs && namespace.root->references==3);
-    assert(!strcmp(parent->cwd,"/kept") && !strcmp(parent->root_dir,"/private") && parent->umask==0027);
+    assert(namespace.root->references == 3);
+    assert(!strcmp(sched_task_cwd(parent), "/kept") &&
+           !strcmp(sched_task_root(parent), "/private") && *sched_task_umask(parent) == 0027);
     sched_task_fs_release(parent);
     assert(namespace.root->references==1 && !vfs_namespace_destroy(&namespace) && !fs_backend_pins);
     task_file_put(&borrowed_mapping);parent->vmas[SCHED_TASK_VMA_MAX-1]=(struct task_vma){0};

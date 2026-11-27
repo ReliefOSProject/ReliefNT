@@ -4,6 +4,7 @@
 
 #define LINUX_NSIG 65
 #define LINUX_SIGRTMIN 32
+#define LINUX_SIGTRAP 5
 #define LINUX_SIGBUS 7
 #define LINUX_SIGSEGV 11
 #define LINUX_SIGXFSZ 25

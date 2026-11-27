@@ -97,7 +97,8 @@ static int syscall_eagain_is_nonblocking_device(struct task *task,
         if (file->flags & (TASK_FILE_FLAG_PIPE |
                            TASK_FILE_FLAG_SOCKET_UNIX |
                            TASK_FILE_FLAG_SOCKET_INET |
-                           TASK_FILE_FLAG_EVENTFD)) {
+                           TASK_FILE_FLAG_EVENTFD |
+                           TASK_FILE_FLAG_TIMERFD)) {
             return 1;
         }
         if (file->kind == TASK_FILE_KIND_SIGNALFD || file->kind == TASK_FILE_KIND_INOTIFY) return 1;

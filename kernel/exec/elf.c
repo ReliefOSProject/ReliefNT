@@ -675,6 +675,8 @@ static int elf64_map_one(struct task *task, struct vfs_exec_source *source,
     uint32_t loads = 0;
     uint32_t free_vmas = 0;
     uint64_t program_break = 0;
+    uint64_t data_start = 0;
+    uint64_t data_end = 0;
     if (!elf64_segments_nonoverlapping(eh, image, node->size, bias, info->dynamic)) {
         console_error("[reliefnt] ELF %s segment layout rejected bias=0x%llx\n",
                        image_name, (unsigned long long)bias);
@@ -751,6 +753,12 @@ static int elf64_map_one(struct task *task, struct vfs_exec_source *source,
         if ((ph->p_flags & PF_W) && end > program_break) {
             program_break = end;
         }
+        /* Linux uses the highest LOAD start and highest file-backed end for
+         * the byte-granular brk limit, independently of VMA page rounding. */
+        uint64_t segment_start = bias + ph->p_vaddr;
+        uint64_t file_end = segment_start + ph->p_filesz;
+        if (segment_start > data_start) data_start = segment_start;
+        if (file_end > data_end) data_end = file_end;
         if (legacy_vma) {
             if ((legacy_vma->prot | prot) & TASK_VMA_PROT_WRITE &&
                 (legacy_vma->prot | prot) & TASK_VMA_PROT_EXEC) {
@@ -790,6 +798,7 @@ static int elf64_map_one(struct task *task, struct vfs_exec_source *source,
         };
     }
     info->program_break = program_break;
+    info->program_data_size = data_end - data_start;
     return 0;
 }
 

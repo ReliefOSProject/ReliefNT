@@ -34,28 +34,23 @@ void sched_task_fs_inherit(struct task *task,const struct task *parent)
     vfs_path_put(&old.root);vfs_path_put(&old.cwd);
 }
 
-/** @brief Make shared FS state private without losing owned directory objects.
- * @param task Task under exclusive execution ownership, or NULL.
- * Acquires replacement pins before retiring shared ownership; no allocation.
- * Cached display names and umask retain the pre-existing native exec behavior.
- * Final shared-path release may call a backend, so no scheduler lock is held.
+/** @brief Check whether a separate process can change a task's CLONE_FS state.
+ * @param task Current task under exclusive execution ownership; required.
+ * @return True if any filesystem-state reference is held outside the task's
+ * thread group. Borrows the scheduler task entries under execution ownership.
  */
-void sched_task_fs_unshare(struct task *task)
+bool sched_task_fs_shared_outside_group(const struct task *task)
 {
-    if(!task || !task->shared_fs)return;
-    struct task_fs_state *shared=task->shared_fs;
-    struct task_fs_paths next={0},old=task->fs_paths;
-    vfs_path_get(&shared->paths.root,&next.root);
-    vfs_path_get(&shared->paths.cwd,&next.cwd);
-    __builtin_memcpy(task->cwd,shared->cwd,sizeof(task->cwd));
-    __builtin_memcpy(task->root_dir,shared->root_dir,sizeof(task->root_dir));
-    task->umask=shared->umask;
-    task->fs_paths=next;task->shared_fs=NULL;
-    vfs_path_put(&old.root);vfs_path_put(&old.cwd);
-    if(!__atomic_sub_fetch(&shared->references,1,__ATOMIC_SEQ_CST)) {
-        vfs_path_put(&shared->paths.root);vfs_path_put(&shared->paths.cwd);
-        kernel_free(shared);
+    const struct task_fs_state *shared = task->shared_fs;
+    if (!shared || shared->references == 1) return false;
+
+    uint32_t group = sched_task_tgid(task);
+    for (uint32_t i = 0; i < task_count; ++i) {
+        const struct task *peer = tasks[i];
+        if (peer->shared_fs == shared && sched_task_tgid(peer) != group)
+            return true;
     }
+    return false;
 }
 
 /** @brief Release the task's root/cwd ownership exactly once, honoring CLONE_FS.

@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 #include <errno.h>
+#include <linux/capability.h>
 #include <linux/sched.h>
 #include <signal.h>
 #include <stdint.h>
@@ -35,9 +36,41 @@ static long clone3_child_stack(struct clone_args *args, uint64_t *observed)
     return result;
 }
 
+/* ReliefNT has no user, PID, or network namespaces. Check both clone entry
+ * points because legacy clone passes the low-byte exit signal in flags. */
+static int clone_unavailable_namespaces(void)
+{
+    struct __user_cap_header_struct header = {.version = _LINUX_CAPABILITY_VERSION_3};
+    struct __user_cap_data_struct caps[_LINUX_CAPABILITY_U32S_3];
+    CHECK(syscall(SYS_capget, &header, caps) == 0);
+    uint64_t effective = caps[0].effective | ((uint64_t)caps[1].effective << 32);
+    int privileged_error = effective & (1ULL << CAP_SYS_ADMIN) ? EINVAL : EPERM;
+    const struct { uint64_t flags; int error; } cases[] = {
+        {CLONE_NEWUSER, EINVAL},
+        {CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET, EINVAL},
+        {CLONE_NEWPID, privileged_error},
+        {CLONE_NEWPID | CLONE_NEWNET, privileged_error},
+        {CLONE_VM | CLONE_SIGHAND | CLONE_THREAD | CLONE_NEWPID, EINVAL},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        struct clone_args args = {.flags = cases[i].flags};
+        if (!(args.flags & CLONE_THREAD)) args.exit_signal = SIGCHLD;
+        long child = syscall(SYS_clone, args.flags | args.exit_signal, 0UL, 0UL, 0UL, 0UL);
+        if (!child) _exit(1);
+        if (child > 0) waitpid(child, NULL, 0);
+        CHECK(child == -1 && errno == cases[i].error);
+        child = syscall(SYS_clone3, &args, sizeof(args));
+        if (!child) _exit(1);
+        if (child > 0) waitpid(child, NULL, 0);
+        CHECK(child == -1 && errno == cases[i].error);
+    }
+    return 0;
+}
+
 static int thread_clone3(void)
 {
     _Static_assert(sizeof(struct clone_args) == 88, "Linux clone_args size");
+    if (clone_unavailable_namespaces()) return 1;
     struct { struct clone_args args; uint64_t tail; } input = {0};
     struct clone_args *args = &input.args;
     CHECK(syscall(SYS_clone3, NULL, 4097) == -1 && errno == E2BIG);

@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/capability.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,13 +25,14 @@ static int report(const char *kind)
 {
     unsigned r, e, s;
     int elevated = !strcmp(kind, "elevated");
+    unsigned long secure = elevated || !strcmp(kind, "shared-fs");
     CHECK(syscall(SYS_getresuid, &r, &e, &s) == 0 && r == 1000 && e == (elevated ? 0 : 1000) && s == e);
     CHECK(syscall(SYS_setfsuid, -1) == e);
     CHECK(syscall(SYS_getresgid, &r, &e, &s) == 0 && r == 1000 && e == (elevated ? 123 : 1000) && s == e);
     CHECK(syscall(SYS_setfsgid, -1) == e);
     CHECK(getauxval(AT_UID) == 1000 && getauxval(AT_EUID) == (elevated ? 0 : 1000));
     CHECK(getauxval(AT_GID) == 1000 && getauxval(AT_EGID) == (elevated ? 123 : 1000));
-    CHECK(getauxval(AT_SECURE) == elevated && prctl(PR_GET_DUMPABLE) == !elevated);
+    CHECK(getauxval(AT_SECURE) == secure && prctl(PR_GET_DUMPABLE) == !elevated);
     unsigned group;
     CHECK(syscall(SYS_getgroups, 1, &group) == 1 && group == 456);
     struct __user_cap_header_struct h = {_LINUX_CAPABILITY_VERSION_3, 0};
@@ -38,8 +40,8 @@ static int report(const char *kind)
     CHECK(syscall(SYS_capget, &h, d) == 0);
     CHECK(!!(d[0].effective & (1U << CAP_SETUID)) == elevated);
 #ifdef SECURE_LOADER_TEST
-    CHECK(!!dlsym(RTLD_DEFAULT, "hostile_preloaded") == !elevated);
-    CHECK(secure_loader_dependency() == (elevated ? 1 : 2));
+    CHECK(!!dlsym(RTLD_DEFAULT, "hostile_preloaded") == !secure);
+    CHECK(secure_loader_dependency() == (secure ? 1 : 2));
 #endif
     CHECK(syscall(SYS_setresuid, 1000, 1000, 1000) == 0);
     CHECK(syscall(SYS_setuid, 0) == -1 && errno == EPERM);
@@ -57,6 +59,24 @@ static int execute(const char *kind)
     return 1;
 }
 static int normal(void) { return execute("elevated"); }
+static int execute_shared(void *unused)
+{
+    (void)unused;
+    return execute("shared-fs");
+}
+static int shared_fs(void)
+{
+    enum { stack_size = 65536 };
+    char *stack = malloc(stack_size);
+    CHECK(stack);
+    pid_t child = clone(execute_shared, stack + stack_size, CLONE_FS | SIGCHLD, NULL);
+    int status;
+    int ok = child > 0 && waitpid(child, &status, 0) == child &&
+        WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    free(stack);
+    CHECK(ok);
+    return 0;
+}
 static int nnp(void)
 {
     CHECK(prctl(PR_SET_NO_NEW_PRIVS, 1L, 0L, 0L, 0L) == 0);
@@ -105,8 +125,8 @@ int main(int argc, char **argv)
     puts("[setid] BEGIN real ELF, saved/fs IDs, auxv, NNP and mount enforcement");
     CHECK(copy_self(argv[0]) == 0);
     int failures = 0;
-    int (*cases[])(void) = {normal, nnp, nosuid, noexec, denied_mount};
-    const char *names[] = {"set-ID ELF", "NNP", "nosuid", "noexec", "mount privilege"};
+    int (*cases[])(void) = {normal, nnp, nosuid, noexec, denied_mount, shared_fs};
+    const char *names[] = {"set-ID ELF", "NNP", "nosuid", "noexec", "mount privilege", "CLONE_FS"};
     for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
         pid_t child = fork();
         if (!child) _exit(cases[i]());

@@ -13,6 +13,7 @@
 #include <reliefnt/net_udp.h>
 #include <reliefnt/net_packet.h>
 #include <reliefnt/netlink.h>
+#include <reliefnt/syscall.h>
 
 static _Noreturn int io_unexpected(const char *name, ...)
 {
@@ -33,6 +34,7 @@ static _Noreturn int io_unexpected(const char *name, ...)
 #define pty_is_hungup IO_UNAVAILABLE
 #define pty_read_output IO_UNAVAILABLE
 #define pty_input_available IO_UNAVAILABLE
+#define pty_input_ready IO_UNAVAILABLE
 #define pty_read_input IO_UNAVAILABLE
 #define task_socket_write IO_UNAVAILABLE
 #define task_socket_read IO_UNAVAILABLE
@@ -257,6 +259,25 @@ static void test_eventfd_results(void)
     memcpy(user_bytes, &value, sizeof(value));
     assert(syscall_io_write(3, (uintptr_t)user_bytes, 8) == -RELIEFOS_EAGAIN);
     assert(file.aux == 2);
+
+    /* libuv drains eventfd into a 1024-byte buffer. Linux consumes only one
+     * counter even when the advertised buffer extends beyond mapped memory. */
+    const unsigned lengths[] = {9, 1024};
+    file.aux2 = 0;
+    user_range_bytes = sizeof(uint64_t);
+    for (unsigned i = 0; i < sizeof(lengths) / sizeof(lengths[0]); ++i) {
+        file.aux = 7;
+        memset(user_bytes, 0x5a, 1024);
+        assert(syscall_io_read(3, (uintptr_t)user_bytes, lengths[i]) == 8);
+        memcpy(&value, user_bytes, sizeof(value));
+        assert(value == 7 && file.aux == 0);
+        for (unsigned j = 8; j < 1024; ++j) assert(user_bytes[j] == 0x5a);
+        value = 9;
+        memcpy(user_bytes, &value, sizeof(value));
+        assert(syscall_io_write(3, (uintptr_t)user_bytes, 8) == 8);
+        assert(file.aux == 9);
+    }
+    user_range_bytes = sizeof(user_bytes);
 }
 
 static void test_path_descriptor_write(void)
@@ -288,6 +309,23 @@ static void test_all_regular_providers_use_one_read_path(void)
     io_expected_regular=NULL;
 }
 
+#ifdef SYSCALL_IO_HAS_EAGAIN_CLASSIFIER
+/* Losing timerfd's nonblocking classification parks an empty drain in-kernel. */
+static void test_nonblocking_timerfd_drain_classification(void)
+{
+    struct task_file file = {.used = 1,
+        .flags = TASK_FILE_FLAG_TIMERFD | RELIEFOS_O_RDWR | RELIEFOS_O_NONBLOCK};
+    pin(&test_tasks[0], 3, &file);
+    assert(syscall_eagain_is_nonblocking_device(current_task, LINUX_SYS_READ, 3));
+    assert(syscall_eagain_is_nonblocking_device(current_task, LINUX_SYS_READV, 3));
+    file.flags &= ~RELIEFOS_O_NONBLOCK;
+    assert(!syscall_eagain_is_nonblocking_device(current_task, LINUX_SYS_READ, 3));
+    file.flags = RELIEFOS_O_NONBLOCK;
+    assert(!syscall_eagain_is_nonblocking_device(current_task, LINUX_SYS_READ, 3));
+    puts("timerfd O_NONBLOCK drain returns EAGAIN to userspace");
+}
+#endif
+
 int main(void)
 {
     assert(pipe_wake_regressions() == 0);
@@ -302,6 +340,9 @@ int main(void)
     test_path_descriptor_write();
     test_path_descriptor_rejects_io();
     test_all_regular_providers_use_one_read_path();
+#ifdef SYSCALL_IO_HAS_EAGAIN_CLASSIFIER
+    test_nonblocking_timerfd_drain_classification();
+#endif
     puts("syscall I/O: redirected stdio, EFAULT, EBADF, pipe wait/retry/EOF/SIGPIPE, null and eventfd passed");
     return 0;
 }

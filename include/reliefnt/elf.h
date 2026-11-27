@@ -22,6 +22,7 @@ struct elf_image_info {
     uint64_t low_vaddr;
     uint64_t high_vaddr;
     uint64_t program_break;
+    uint64_t program_data_size; /* Main ELF data interval used by brk(2). */
     uint64_t phdr_vaddr;
     uint64_t interpreter_entry;
     uint32_t abi_major;

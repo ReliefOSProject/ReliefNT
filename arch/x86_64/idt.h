@@ -29,4 +29,9 @@ void idt_load(void);
  */
 struct task *general_protection_dispatch(struct trap_frame *frame);
 
+/** @brief Deliver a user breakpoint from the hardware's post-instruction frame.
+ * @param frame Saved vector-3 registers and user iret frame.
+ * @return The task selected for user return, or NULL on invalid scheduling. */
+struct task *breakpoint_dispatch(struct trap_frame *frame);
+
 #endif

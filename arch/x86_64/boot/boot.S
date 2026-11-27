@@ -324,7 +324,7 @@ arch_enter_user_frame:
 ISR_NOERR isr0_stub 0
 ISR_NOERR isr1_stub 1
 ISR_NOERR isr2_stub 2
-ISR_NOERR isr3_stub 3
+ISR_NOERR isr3_kernel_stub 3
 ISR_NOERR isr4_stub 4
 ISR_NOERR isr5_stub 5
 ISR_NOERR isr6_stub 6
@@ -415,6 +415,19 @@ isr14_stub:
     pushq %r15
 .endm
 
+/* INT3 supplies the next RIP and no error code. Ring 0 retains the fatal entry. */
+.global isr3_stub
+.type isr3_stub, @function
+isr3_stub:
+    testb $3, 8(%rsp)
+    jz isr3_kernel_stub
+    PUSH_TRAP_FRAME 3 0
+    cld
+    mov %rsp, %rdi
+    call breakpoint_dispatch
+    jmp .Lrestore_user_exception
+.size isr3_stub, .-isr3_stub
+
 /**
  * @brief Handle a CPU-delivered vector-13 fault without normal return.
  * @details The processor supplies the #GP error code and interrupt-return
@@ -451,6 +464,7 @@ isr13_stub:
     pushq %r15
     mov %rsp, %rdi
     call general_protection_dispatch
+.Lrestore_user_exception:
     test %rax, %rax
     jz 1f
     mov %rax, %r12
@@ -469,7 +483,7 @@ isr13_stub:
     mov %r14, %rsp
     jmp trap_restore_frame
 1:
-    /* Never iret to the original #GP frame if scheduling did not select a
+    /* Never iret to the interrupted user frame if scheduling did not select a
      * replacement or recoverable return frame. */
     mov %rsp, %rdi
     call arch_schedule_failure

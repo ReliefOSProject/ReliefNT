@@ -16,21 +16,21 @@ int main(void)
     uint64_t used = 8192 + 65536;
     task.limits.as.rlim_cur = used;
     assert(task_vma_total_bytes(&task) == used);
-    assert(task_address_space_can_map(&task, base, base + 8192));
-    assert(!task_address_space_can_map(&task, base, base + 12288));
+    assert(task_address_space_can_map(&task, base, base + 8192, 0));
+    assert(!task_address_space_can_map(&task, base, base + 12288, 0));
     task.limits.as.rlim_cur = used + 4095;
-    assert(!task_address_space_can_map(&task, base + 8192, base + 12288));
+    assert(!task_address_space_can_map(&task, base + 8192, base + 12288, 0));
     task.limits.as.rlim_cur = used + 4096;
-    assert(task_address_space_can_map(&task, base + 8192, base + 12288));
+    assert(task_address_space_can_map(&task, base + 8192, base + 12288, 0));
     task.address_space.initial_stack_top = task.stack_top;
     task.address_space.initial_stack_low = task.stack_low;
     task.stack_low = base;
     task.stack_top = base + 8192;
     assert(task_vma_total_bytes(&task) == used);
     task.limits.as.rlim_cur = 0;
-    assert(!task_address_space_can_map(&task, base, base + 8192));
+    assert(!task_address_space_can_map(&task, base, base + 8192, 0));
     task.limits.as.rlim_cur = LINUX_RLIM_INFINITY;
-    assert(task_address_space_can_map(&task, base + 8192, base + 12288));
+    assert(task_address_space_can_map(&task, base + 8192, base + 12288, 0));
 
     /* RLIMIT_STACK is measured in Linux against the whole growable stack
      * span (stack_top - new_start), inclusive of the eager initial pages. */

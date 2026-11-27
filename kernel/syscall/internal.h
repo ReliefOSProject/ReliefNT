@@ -124,6 +124,8 @@ struct task_epoll_entry {
  * descriptions are weakly referenced by reverse lists and never kept alive.
  */
 struct task_epoll {
+    /* Reverse graph links are independent of movable descriptor table entries. */
+    struct task_epoll_watch *parents;
     uint32_t entries;
     uint32_t capacity;
     struct task_epoll_entry *item;
@@ -137,6 +139,7 @@ struct task_epoll {
  */
 struct task_epoll_watch {
     struct task_epoll_watch *next;
+    struct task_epoll_watch *parent_next;
     struct task_epoll *epoll;
     struct task_file *file;
     struct task_pty_description *pty;
@@ -902,6 +905,20 @@ int task_console_materialize_stdio(struct task *task);
  */
 int task_pty_materialize_stdio(struct task *task);
 
+/** @brief Read admitted or live descriptor metadata, retaining Linux FD types.
+ * @param task Borrowed task. @param fd Descriptor number. @param live Select the
+ * live table instead of syscall admission. @param out Required stat output.
+ * @return Zero or negative errno. Procfs must authorize access before entry.
+ * Execution-owned; no descriptor/graph lock spans provider I/O.
+ */
+int linux_stat_from_fd(struct task *task,int fd,bool live,struct linux_stat_abi *out);
+/** @brief Describe an explicit PTY alias or an implicit controlling terminal.
+ * @param endpoint Borrowed alias, nullable. @param implicit_id Fallback PTY ID.
+ * @param node Required node output. @param path Static intrinsic-name output.
+ * @return Zero or EBADF; no allocation, I/O or ownership transfer.
+ */
+int task_pty_node_from_endpoint(const struct task_pty_fd *endpoint,uint32_t implicit_id,
+                                  struct storage_node *node,const char **path);
 /** @brief Describe the admitted builtin terminal without namespace lookup.
  * @param task Borrowed current task under execution ownership.
  * @param fd Descriptor number with original PTY admission where applicable.

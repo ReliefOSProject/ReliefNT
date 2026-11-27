@@ -688,6 +688,20 @@ int proc_lookup(const char *path, struct storage_node *out);
 int proc_read(const char *path, uint64_t offset, void *buffer, uint32_t length,
               uint32_t *out_read);
 int proc_readlink(const char *path, char *buffer, uint32_t capacity);
+/** @brief Read admitted or live descriptor metadata, retaining Linux FD types.
+ * @param task Borrowed task. @param fd Descriptor number. @param live Select the
+ * live table instead of syscall admission. @param out Required stat output.
+ * @return Zero or negative errno. Procfs must authorize access before entry.
+ * Execution-owned; no descriptor/graph lock spans provider I/O.
+ */
+int linux_stat_from_fd(struct task *task,int fd,bool live,struct linux_stat_abi *out);
+/** @brief Describe an explicit PTY alias or an implicit controlling terminal.
+ * @param endpoint Borrowed alias, nullable. @param implicit_id Fallback PTY ID.
+ * @param node Required node output. @param path Static intrinsic-name output.
+ * @return Zero or EBADF; no allocation, I/O or ownership transfer.
+ */
+int task_pty_node_from_endpoint(const struct task_pty_fd *endpoint,uint32_t implicit_id,
+                                  struct storage_node *node,const char **path);
 /** @brief Acquire a proc FD magic-link target using READ_FSCREDS authorization.
  * @param target Stable target task under the execution transaction, nullable.
  * @param fd Target's descriptor number; resolves its current canonical OFD.

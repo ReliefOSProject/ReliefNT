@@ -2249,9 +2249,22 @@ static void test_epoll_fd_poll_readiness(void)
     file->flags = TASK_FILE_FLAG_EPOLL | RELIEFOS_O_RDWR;
     file->aux = (uint64_t)(uintptr_t)outer;
     event.events = EPOLLIN;
+    event.data = UINT64_C(0x7b);
     assert(syscall_epoll_ctl(outerfd, EPOLL_CTL_ADD, epfd,
-                             (uint64_t)(uintptr_t)&event) == -RELIEFOS_EPERM);
-    assert(outer->entries == 0 && !task_file_for_fd(task, epfd)->epoll_watches);
+                             (uint64_t)(uintptr_t)&event) == 0);
+    descriptor.fd = outerfd;
+    assert(syscall_poll((uint64_t)(uintptr_t)&descriptor, 1, 0) == 0);
+    event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+    event.data = UINT64_C(0x7a);
+    assert(syscall_epoll_ctl(epfd, EPOLL_CTL_MOD, watched,
+                             (uint64_t)(uintptr_t)&event) == 0);
+    assert(syscall_poll((uint64_t)(uintptr_t)&descriptor, 1, 0) == 1);
+    assert(descriptor.revents & POLLIN);
+    assert(syscall_epoll_wait(outerfd, (uint64_t)(uintptr_t)ready, 2, 0) == 1);
+    assert(ready[0].data == UINT64_C(0x7b));
+    assert(syscall_epoll_wait(epfd, (uint64_t)(uintptr_t)ready, 2, 0) == 1);
+    assert(ready[0].data == UINT64_C(0x7a));
+    assert(syscall_poll((uint64_t)(uintptr_t)&descriptor, 1, 0) == 0);
 
     assert(syscall_legacy_descriptors(LINUX_SYS_CLOSE, watched, 0, 0, 0, 0, 0) == 0);
     assert(syscall_legacy_descriptors(LINUX_SYS_CLOSE, outerfd, 0, 0, 0, 0, 0) == 0);
@@ -2259,10 +2272,10 @@ static void test_epoll_fd_poll_readiness(void)
     descriptor_dispatch_task = NULL;
     syscall_release_task_files(task);
     free(task);
-    puts("PASS epoll fd poll peeks armed readiness and rejects nested epoll targets");
+    puts("PASS epoll fd poll peeks armed readiness across nested epoll instances");
 }
 
-static void test_epoll_inflight_and_nested_rejection(void)
+static void test_epoll_inflight_and_nested_cycle(void)
 {
     struct task *task = calloc(1, sizeof(*task));
     struct task_file *file;
@@ -2305,23 +2318,24 @@ static void test_epoll_inflight_and_nested_rejection(void)
     file->aux = (uint64_t)(uintptr_t)second_state;
     event.data = UINT64_C(0x71);
     assert(syscall_epoll_ctl(first, EPOLL_CTL_ADD, second,
-                             (uint64_t)(uintptr_t)&event) == -RELIEFOS_EPERM);
+                             (uint64_t)(uintptr_t)&event) == 0);
     event.data = UINT64_C(0x72);
     assert(syscall_epoll_ctl(second, EPOLL_CTL_ADD, first,
-                             (uint64_t)(uintptr_t)&event) == -RELIEFOS_EPERM);
+                             (uint64_t)(uintptr_t)&event) == -ELOOP);
     struct task_file *first_description = task_file_for_fd(task, first);
     struct task_file *second_description = task_file_for_fd(task, second);
     assert(first_description && second_description);
-    assert(!first_description->epoll_watches && !second_description->epoll_watches);
-    assert(first_state->entries == 0 && second_state->entries == 0);
+    assert(!first_description->epoll_watches && second_description->epoll_watches);
+    assert(first_state->entries == 1 && second_state->entries == 0);
     assert(syscall_legacy_descriptors(LINUX_SYS_CLOSE, first, 0, 0, 0, 0, 0) == 0);
-    assert(second_state->entries == 0 && !second_description->epoll_watches);
+    assert(second_state->entries == 0 && !second_state->parents &&
+           !second_description->epoll_watches);
     assert(syscall_legacy_descriptors(LINUX_SYS_CLOSE, second, 0, 0, 0, 0, 0) == 0);
 
     descriptor_dispatch_task = NULL;
     syscall_release_task_files(task);
     free(task);
-    puts("PASS epoll watches retain in-flight OFDs and reject nested registrations cleanly");
+    puts("PASS epoll watches follow in-flight OFDs and reject cycles without leaving registrations");
 }
 
 static void test_console_descriptions(void)
@@ -3035,7 +3049,7 @@ int main(void)
     test_epoll_zero_mask_hup_and_oneshot_rearm();
     test_epoll_scm_rights_watch_lifetime();
     test_epoll_fd_poll_readiness();
-    test_epoll_inflight_and_nested_rejection();
+    test_epoll_inflight_and_nested_cycle();
     test_pty_descriptions();
     test_pty_endpoint_path_full_id_range();
     test_pty_alias_capacity();

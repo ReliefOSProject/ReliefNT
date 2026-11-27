@@ -62,7 +62,7 @@ static int object_lookup_run(struct vfs_namespace *ns,struct task *task,int32_t 
 {
     if(!out)return -RELIEFOS_EINVAL;
     *out=(struct vfs_lookup_result){0};
-    if(!task || lookup_flags&~(VFS_LOOKUP_FOLLOW|VFS_LOOKUP_PARENT|VFS_LOOKUP_MISSING))return -RELIEFOS_EINVAL;
+    if(!task || lookup_flags&~(VFS_LOOKUP_FOLLOW|VFS_LOOKUP_PARENT|VFS_LOOKUP_MISSING|VFS_LOOKUP_STAT))return -RELIEFOS_EINVAL;
     if(!ns || !ns->root)return -RELIEFOS_ENODEV;
     const struct vfs_path *root,*start;
     if(saved && saved->name) {

@@ -441,12 +441,16 @@ uint64_t task_vma_total_bytes(const struct task *task)
     return total;
 }
 
-/** @brief Check net virtual growth before MAP_FIXED destroys any existing VMA. */
-bool task_address_space_can_map(const struct task *task, uint64_t start, uint64_t end)
+/** @brief Check the net address-space cost before publishing a mapping.
+ * @param task Execution-owned MM. @param start Destination start.
+ * @param end Destination end. @param retiring Bytes at a separate remap source.
+ * @return True if the replacement fits the soft RLIMIT_AS. */
+bool task_address_space_can_map(const struct task *task, uint64_t start, uint64_t end,
+                                uint64_t retiring)
 {
     uint64_t limit = sched_task_limits(task)->as.rlim_cur & ~(PAGE_SIZE - 1ULL);
     if (sched_task_limits(task)->as.rlim_cur == LINUX_RLIM_INFINITY) return true;
-    uint64_t used = task_vma_total_bytes(task), replaced = 0;
+    uint64_t used = task_vma_total_bytes(task), replaced = retiring;
     for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
         const struct task_vma *vma = sched_task_vma_at((struct task *)task, i);
         if (!vma || !vma->used) continue;
@@ -454,6 +458,33 @@ bool task_address_space_can_map(const struct task *task, uint64_t start, uint64_
         uint64_t last = end < vma->end ? end : vma->end;
         if (last > first) replaced += last - first;
     }
-    uint64_t growth = end - start - replaced;
-    return used <= limit && growth <= limit - used;
+    if (replaced > used) return false;
+    used -= replaced;
+    return used <= limit && end - start <= limit - used;
+}
+
+/** @brief Read the data limit used by Linux VMA admission.
+ * @param task Execution-owned user task. @return Byte limit or LINUX_RLIM_INFINITY. */
+uint64_t task_vma_data_limit(const struct task *task)
+{
+    const struct linux_rlimit64 *limit = &sched_task_limits(task)->data;
+    /* Linux uses the hard limit when the soft limit is zero (Valgrind). */
+    return limit->rlim_cur ? limit->rlim_cur : limit->rlim_max;
+}
+
+/** @brief Count private writable VMA bytes outside a replacement interval.
+ * @param task Execution-owned MM. @param start Excluded start or zero.
+ * @param end Excluded end or zero. @return Virtual data size in bytes. */
+uint64_t task_vma_data_bytes(const struct task *task, uint64_t start, uint64_t end)
+{
+    uint64_t bytes = 0;
+    for (uint32_t i = 0; i < sched_task_vma_capacity(task); ++i) {
+        const struct task_vma *vma = sched_task_vma_at((struct task *)task, i);
+        if (!vma || !vma->used || !task_vma_is_data(vma->prot, vma->flags)) continue;
+        uint64_t first = start > vma->start ? start : vma->start;
+        uint64_t last = end < vma->end ? end : vma->end;
+        bytes += vma->end - vma->start;
+        if (last > first) bytes -= last - first;
+    }
+    return bytes;
 }

@@ -3,7 +3,19 @@
 #include <stdio.h>
 #include "../../kernel/time/time.c"
 static unsigned held;
-static unsigned display_ticks;
+/** @brief Supply scheduler-owned CPU times and check timekeeper lock ordering. */
+int sched_cpu_clock_get(int32_t clock, bool resolution, struct linux_timespec *value)
+{
+    assert(!held);
+    if (clock != LINUX_CLOCK_PROCESS_CPUTIME_ID &&
+        clock != LINUX_CLOCK_THREAD_CPUTIME_ID)
+        return -LINUX_EINVAL;
+    if (value) {
+        value->tv_sec = resolution ? 0 : 2;
+        value->tv_nsec = resolution ? 10000000 : 30000000;
+    }
+    return 0;
+}
 void kernel_spin_lock_irqsave(struct kernel_spinlock *lock, uint64_t *flags)
 { (void)lock; assert(held++ == 0); *flags=0; }
 void kernel_spin_unlock_irqrestore(struct kernel_spinlock *lock, uint64_t flags)
@@ -13,7 +25,6 @@ void sched_on_tick(void) { assert(!held); }
 void kthread_tick(void) { assert(!held); }
 void kernel_workqueue_tick(void) { assert(!held); }
 void sound_service_tick(void) { assert(!held); }
-void console_display_tick(void) { assert(!held); ++display_ticks; }
 /* This existing test covers the PIT discipline; the dedicated vDSO fixture
  * exercises trusted TSC interpolation with a controlled counter. */
 uint32_t smp_cpu_count(void) { return 2; }
@@ -26,12 +37,18 @@ void console_log(enum console_log_level level, const char *format, ...)
 }
 int main(void)
 {
+    struct linux_timespec cpu;
+    assert(time_clock_get(LINUX_CLOCK_THREAD_CPUTIME_ID, &cpu) == 0);
+    assert(cpu.tv_sec == 2 && cpu.tv_nsec == 30000000);
+    assert(time_clock_get(LINUX_CLOCK_PROCESS_CPUTIME_ID, &cpu) == 0);
+    assert(time_clock_getres(LINUX_CLOCK_THREAD_CPUTIME_ID, &cpu) == 0);
+    assert(cpu.tv_sec == 0 && cpu.tv_nsec == 10000000);
+    assert(time_clock_getres(LINUX_CLOCK_PROCESS_CPUTIME_ID, NULL) == 0);
     wall_clock_valid=1;
     wall_unix_seconds=1700000000;
     struct linux_timex tx={.modes=ADJ_FREQUENCY,.freq=32768000};
     assert(time_adjust(&tx,true)==TIME_ERROR);
     for(unsigned i=0;i<100;i++) time_on_tick();
-    assert(display_ticks == 50);
     struct linux_timespec wall, mono, raw;
     assert(time_clock_get(LINUX_CLOCK_REALTIME,&wall)==0);
     assert(time_clock_get(LINUX_CLOCK_MONOTONIC,&mono)==0);
@@ -43,7 +60,6 @@ int main(void)
     assert(time_clock_get(LINUX_CLOCK_MONOTONIC,&raw)==0);
     assert(raw.tv_sec==mono.tv_sec && raw.tv_nsec==mono.tv_nsec);
     time_on_tick();
-    assert(display_ticks == 50);
     assert(time_clock_get(LINUX_CLOCK_REALTIME,&wall)==0);
     assert(wall.tv_sec==1700000101 && wall.tv_nsec==10004999);
     assert(time_set_wall_clock_ns(1700000100,1000000000)==-1);

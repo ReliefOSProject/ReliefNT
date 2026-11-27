@@ -70,6 +70,18 @@ uint32_t sched_task_file_capacity(const struct task *t) { (void)t; return SCHED_
 struct task_file *task_file_for_fd(struct task *t, int fd)
 { return fd>=3 && fd<3+SCHED_TASK_FILE_MAX && t->files[fd-3].used ?
     task_file_description(&t->files[fd-3]) : NULL; }
+/** @brief Model the separately linked descriptor metadata provider.
+ * @param t Descriptor owner. @param fd Live descriptor. @param live Must be true.
+ * @param out Caller-owned metadata. @return Zero or EBADF for a closed alias.
+ */
+int linux_stat_from_fd(struct task *t,int fd,bool live,struct linux_stat_abi *out)
+{
+    assert(live);
+    struct task_file *file=task_file_for_fd(t,fd);
+    if(!file)return -RELIEFOS_EBADF;
+    *out=(struct linux_stat_abi){.st_ino=file->node.first_cluster,.st_mode=0600};
+    return 0;
+}
 uint32_t pty_vt_number(uint32_t id) { return id >= 1 && id <= 6 ? id : 0; }
 uint64_t address_space_user_resident_kib(const struct address_space *as)
 {
@@ -284,6 +296,36 @@ static void proc_path_release(void *context,const struct storage_node *node,void
 { (void)context;(void)node;assert(pin==&proc_path_pins && proc_path_pins);--proc_path_pins; }
 static bool proc_path_same(void *context,const struct storage_node *a,const struct storage_node *b)
 { (void)context;return a->first_cluster==b->first_cluster; }
+/** @brief Exercise stat-only proc magic links and ordinary suffix errors. */
+static void test_proc_fd_metadata(void)
+{
+    struct vfs_mount *mount=NULL;
+    struct vfs_namespace ns={0};
+    struct vfs_path root={0};
+    assert(!proc_create_vfs_mount(&mount));
+    assert(!vfs_namespace_init(&ns,mount));
+    vfs_mount_put(mount);
+    assert(!vfs_namespace_root(&ns,&root));
+    struct task_file *file=&current.files[0];
+    *file=(struct task_file){.used=1,.node={.first_cluster=93}};
+    struct vfs_lookup_policy policy={.flags=VFS_LOOKUP_FOLLOW|VFS_LOOKUP_STAT};
+    struct vfs_lookup_result found={0};
+    assert(!vfs_path_resolve(&ns,&root,&root,"self/fd/3",&policy,&found));
+    assert(found.has_stat && found.stat.st_ino==93 && found.stat.st_mode==0600);
+    vfs_path_put(&found.path);
+    assert(vfs_path_resolve(&ns,&root,&root,"self/fd/3/.",&policy,&found)==-RELIEFOS_ENOTDIR);
+    assert(vfs_path_resolve(&ns,&root,&root,"self/fd/3/",&policy,&found)==-RELIEFOS_ENOTDIR);
+    policy.flags=VFS_LOOKUP_STAT;
+    assert(!vfs_path_resolve(&ns,&root,&root,"self/fd/3",&policy,&found));
+    assert(!found.has_stat && vfs_path_node(&found.path)->type==RELIEFOS_FS_TYPE_SYMLINK);
+    vfs_path_put(&found.path);
+    *file=(struct task_file){0};
+    policy.flags|=VFS_LOOKUP_FOLLOW;
+    assert(vfs_path_resolve(&ns,&root,&root,"self/fd/3",&policy,&found)==-RELIEFOS_ENOENT);
+    vfs_path_put(&root);
+    vfs_namespace_destroy(&ns);
+    puts("PASS proc anonymous FD metadata, nofollow, suffixes and close");
+}
 static void test_proc_fd_object_link(void)
 {
     static const struct vfs_backend_ops ops={.lookup=proc_path_lookup,.retain=proc_path_retain,
@@ -458,6 +500,7 @@ static void test_proc_mount_failures(void)
 
 int main(void)
 {
+    test_proc_fd_metadata();
     test_proc_fd_object_link();
     test_proc_mount_objects();
     test_proc_mount_failures();

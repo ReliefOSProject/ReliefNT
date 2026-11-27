@@ -7,6 +7,7 @@
 #include <reliefos/system_abi.h>
 #include <reliefnt/console.h>
 #include <reliefnt/sched.h>
+#include <reliefnt/proc_stats.h>
 #include <reliefnt/time.h>
 #include <reliefnt/usb.h>
 #include <reliefnt/workqueue.h>
@@ -800,13 +801,17 @@ static int time_clock_get_locked(int32_t clock, struct linux_timespec *value)
     }
 }
 
-/** @brief Read a supported wall/monotonic clock atomically across CPUs and IRQs.
+/** @brief Read a supported wall, monotonic or current CPU clock atomically.
  * @param clock Linux clock ID. @param value Writable caller-owned timespec output.
  * @return Zero or EINVAL for an unsupported clock; no pointer ownership transfer.
- * IRQ/task safe short clock lock; no allocation, scheduling or hardware wait.
+ * CPU clocks require task context and use scheduler_lock. Other clocks use
+ * the IRQ-safe clock lock. No allocation, scheduling or hardware wait.
  */
 int time_clock_get(int32_t clock, struct linux_timespec *value)
 {
+    if (clock == LINUX_CLOCK_PROCESS_CPUTIME_ID ||
+        clock == LINUX_CLOCK_THREAD_CPUTIME_ID)
+        return sched_cpu_clock_get(clock, false, value);
     uint64_t flags;
     kernel_spin_lock_irqsave(&clock_lock, &flags);
     int result = time_clock_get_locked(clock, value);
@@ -819,10 +824,14 @@ int time_clock_get(int32_t clock, struct linux_timespec *value)
  * @param clock Linux clock selector.
  * @param value Optional writable kernel result; NULL validates without copying.
  * @return Zero or EINVAL for an unsupported clock, leaving output unchanged on failure.
- * Task/IRQ-safe query under the clock lock, with no user access, allocation or ownership transfer.
+ * CPU clocks report scheduler tick granularity. Other clocks use the IRQ-safe
+ * clock lock. No user access, allocation or ownership transfer occurs.
  */
 int time_clock_getres(int32_t clock, struct linux_timespec *value)
 {
+    if (clock == LINUX_CLOCK_PROCESS_CPUTIME_ID ||
+        clock == LINUX_CLOCK_THREAD_CPUTIME_ID)
+        return sched_cpu_clock_get(clock, true, value);
     uint64_t flags;
     kernel_spin_lock_irqsave(&clock_lock, &flags);
     struct linux_timespec now;

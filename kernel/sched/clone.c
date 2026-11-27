@@ -140,6 +140,18 @@ int sched_clone_validate_flags(uint64_t flags,uint64_t tls)
     if ((flags & CLONE_CLEAR_SIGHAND) && (flags & CLONE_SIGHAND)) return -22;
     if ((flags & CLONE_THREAD) && !(flags & CLONE_SIGHAND)) return -22;
     if ((flags & CLONE_SIGHAND) && !(flags & CLONE_VM)) return -22;
+    /* Linux without CONFIG_USER_NS rejects this in copy_creds(), before
+     * any privilege check for the other requested namespaces. */
+    if (flags & CLONE_NEWUSER) return -LINUX_EINVAL;
+    if (flags & (CLONE_NEWPID | CLONE_NEWNET)) {
+        /* copy_process() rejects a new PID namespace in the parent's thread
+         * group; copy_namespaces() otherwise checks CAP_SYS_ADMIN before
+         * reaching the unavailable PID/network namespace backend. */
+        if ((flags & CLONE_NEWPID) && (flags & CLONE_THREAD)) return -LINUX_EINVAL;
+        const struct task *parent = sched_current_task();
+        return parent && (parent->cap_effective & (1ULL << CAP_SYS_ADMIN))
+            ? -LINUX_EINVAL : -LINUX_EPERM;
+    }
     if (flags & ~supported) return -RELIEFOS_ENOSYS;
     if ((flags & CLONE_SETTLS) && tls >= RELIEFNT_USER_TLS_LIMIT) return -RELIEFOS_EPERM;
     return 0;

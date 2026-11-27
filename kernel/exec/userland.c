@@ -499,7 +499,7 @@ static int prepare_user_exec_stack(struct task *task, const char *execfn, uint64
  * @param next Prepared task with an owned executable path and inode reference.
  * @param old Borrowed previous credentials, stable under execution ownership.
  * @return Zero or metadata/unsupported errno; applies set-ID, nosuid,
- * capability, secure-exec and dumpability rules before publication. No
+ * shared-filesystem, capability, secure-exec and dumpability rules. No
  * diagnostic pathname lookup or graph/module lock spans metadata callbacks.
  */
 static int userland_prepare_exec_credentials(struct task *next, const struct task *old)
@@ -522,9 +522,15 @@ static int userland_prepare_exec_credentials(struct task *next, const struct tas
     uint64_t permitted = 0;
     if (!(old->securebits & SECBIT_NOROOT) && (!next->uid || !next->euid))
         permitted = old->cap_bset | old->cap_inheritable;
-    if (old->no_new_privs && (setid || (permitted & ~old->cap_permitted))) {
-        next->euid = next->uid;
-        next->egid = next->gid;
+    /* A separate CLONE_FS holder can modify the new image's cwd/root. The
+     * execution gate serializes this check through the start of sibling
+     * retirement, after which siblings cannot create a new external holder. */
+    if ((setid || (permitted & ~old->cap_permitted)) &&
+        (old->no_new_privs || sched_task_fs_shared_outside_group(old))) {
+        if (old->no_new_privs || !(old->cap_effective & (1ULL << CAP_SETUID))) {
+            next->euid = next->uid;
+            next->egid = next->gid;
+        }
         permitted &= old->cap_permitted;
     }
     next->suid = next->fsuid = next->euid;
@@ -605,6 +611,7 @@ static int userland_load_task_image_locked(struct task *task, const struct task 
             sched_task_mm(task)->program_break_base = (loaded.high_vaddr + loaded.load_bias + 4095ULL) & ~4095ULL;
         }
         sched_task_mm(task)->program_break = sched_task_mm(task)->program_break_base;
+        sched_task_mm(task)->program_data_size = loaded.program_data_size;
         task->flags &= ~TASK_FLAG_PENDING_LOAD;
     } else if (task->image && task->image_len) {
         if (!elf64_load_address_space(sched_task_as(task), task->image, task->image_len, &loaded)) {

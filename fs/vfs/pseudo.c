@@ -266,6 +266,20 @@ static int pseudo_remount(void *value, uint64_t flags)
     return (current & MS_RDONLY) && !(flags & MS_RDONLY) ? -EROFS : -EOPNOTSUPP;
 }
 
+/** @brief Obtain a live magic target's metadata under its retained identity.
+ * @param value Borrowed provider context. @param node Retained link inode.
+ * @param out Caller-owned target attributes, valid only on success.
+ * @return Zero, ENOENT for retired identities, EOPNOTSUPP for ordinary targets,
+ * or the provider's authorization/metadata error. No graph lock spans callbacks.
+ */
+static int pseudo_node_stat_link(void *value,const struct storage_node *node,struct linux_stat_abi *out)
+{
+    struct pseudo_mount *context=value;
+    struct pseudo_key *key=pseudo_key_find(context,node->entry_id);
+    if(!pseudo_key_live(context,key))return -ENOENT;
+    return context->provider->stat_link ? context->provider->stat_link(key->name,out) : -EOPNOTSUPP;
+}
+
 static int pseudo_node_getattr(void *value,const struct vfs_path *path,struct linux_stat_abi *out)
 {
     struct pseudo_mount *context=value;const struct storage_node *node=vfs_path_node(path);
@@ -281,6 +295,7 @@ static int pseudo_node_getattr(void *value,const struct vfs_path *path,struct li
         out->st_dev=node->flags&STORAGE_NODE_FLAG_SYSFS ? STORAGE_SYSFS_DEVICE :
             node->flags&STORAGE_NODE_FLAG_PROC ? STORAGE_PROCFS_DEVICE : STORAGE_DEVFS_DEVICE;
         out->st_mode|=mode.mode&07777;out->st_uid=mode.uid;out->st_gid=mode.gid;
+        if(context->provider->getattr)context->provider->getattr(key->name,out);
     }
     return rc;
 }
@@ -311,7 +326,7 @@ int vfs_pseudo_mount_new(const struct vfs_pseudo_provider *provider,struct vfs_m
     if(!try_module_get(provider->owner))return -ENODEV;
     static const struct vfs_backend_ops ops={.lookup=pseudo_node_lookup,.retain=pseudo_node_retain,
         .release=pseudo_node_release,.same_node=pseudo_node_same,.readlink=pseudo_node_readlink,
-        .follow_link=pseudo_node_follow,.destroy=pseudo_context_destroy,
+        .follow_link=pseudo_node_follow,.stat_link=pseudo_node_stat_link,.destroy=pseudo_context_destroy,
         .read=pseudo_node_read,.write=pseudo_node_write,.truncate=pseudo_node_truncate,
         .readdir=pseudo_node_readdir,.permissions=pseudo_node_permissions,
         .file_open=pseudo_file_open,.file_read=pseudo_file_read,.file_close=pseudo_file_close,

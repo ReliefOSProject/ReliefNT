@@ -154,6 +154,7 @@ static void task_init_limits(struct task *task)
         /* Linux v6.14 resource.h MLOCK_LIMIT / INIT_RLIMITS. */
         .memlock = {8ULL * 1024ULL * 1024ULL, 8ULL * 1024ULL * 1024ULL},
         .as = {LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY},
+        .data = {LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY},
         /* include/uapi/linux/resource.h:_STK_LIM and INIT_RLIMITS. */
         .stack = {8ULL * 1024ULL * 1024ULL, LINUX_RLIM_INFINITY}};
 }
