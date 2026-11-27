@@ -50,15 +50,16 @@ static int metadata_prepare_result(struct task *task, uint64_t address, size_t o
 
 /** @brief Read metadata from the admitted OFD or a builtin terminal endpoint.
  * @param task Borrowed task with dispatcher-owned descriptor admission.
- * @param fd Descriptor number; a suspended call keeps its original OFD.
+ * @param fd Descriptor number; a suspended admitted call keeps its original OFD.
+ * @param live Select the live descriptor table for authorized procfs queries.
  * @param out Required result, owned by the caller.
  * @return Zero or negative errno. Held paths retain their providers across
  * metadata I/O; anonymous descriptions never resolve a diagnostic pathname.
  * No graph/descriptor spinlock spans a callback.
  */
-static int metadata_fd_stat(struct task *task,int fd,struct linux_stat_abi *out)
+int linux_stat_from_fd(struct task *task,int fd,bool live,struct linux_stat_abi *out)
 {
-    struct task_file *file=task_file_for_io(task,fd);
+    struct task_file *file=live ? task_file_for_fd(task,fd) : task_file_for_io(task,fd);
     if(file) {
         int rc;
         if(vfs_path_node(&file->path_ref))rc=linux_stat_from_path(out,&file->path_ref);
@@ -69,11 +70,12 @@ static int metadata_fd_stat(struct task *task,int fd,struct linux_stat_abi *out)
         if(!rc)linux_stat_fd_type(out,file);
         return rc;
     }
-    struct task_pty_fd *endpoint=task_pty_for_io(task,fd);
+    struct task_pty_fd *endpoint=live ? task_pty_fd_for_fd(task,fd) : task_pty_for_io(task,fd);
     if(endpoint && endpoint->description && vfs_path_node(&endpoint->description->path_ref))
         return linux_stat_from_path(out,&endpoint->description->path_ref);
     struct storage_node node;const char *intrinsic;
-    int rc=task_pty_node_for_fd(task,fd,&node,&intrinsic);
+    uint32_t implicit=task_pty_stream_for_fd(task,fd)>=0 ? task->pty_id : 0;
+    int rc=task_pty_node_from_endpoint(endpoint,implicit,&node,&intrinsic);
     if(rc) {
         if(fd<0 || fd>=3 || (sched_task_fds(task)->closed_stdio_mask&(1u<<fd)))return -RELIEFOS_EBADF;
         node=(struct storage_node){.type=RELIEFOS_FS_TYPE_DEVICE,
@@ -134,7 +136,7 @@ static int metadata_at_stat(struct vfs_namespace *ns,struct task *task,int32_t d
     struct vfs_lookup_result found={0};
     bool empty=(flags&LINUX_AT_EMPTY_PATH)!=0;
     uint32_t follow=flags&LINUX_AT_SYMLINK_NOFOLLOW ? 0 : VFS_LOOKUP_FOLLOW;
-    int rc=resolve_kernel_object_at_flags(ns,task,dirfd,pathname,empty,false,follow,&found);
+    int rc=resolve_kernel_object_at_flags(ns,task,dirfd,pathname,empty,false,follow|VFS_LOOKUP_STAT,&found);
     bool fallback=rc==-RELIEFOS_EBADF && empty && dirfd!=LINUX_AT_FDCWD && !pathname[0];
     if(!rc || fallback) {
         rc=metadata_result_slot(task,METADATA_RESULT_STAT,slot);
@@ -142,7 +144,8 @@ static int metadata_at_stat(struct vfs_namespace *ns,struct task *task,int32_t d
             if((*slot)->dirfd!=(int32_t)sizeof(*out))rc=-RELIEFOS_EINVAL;
             else __builtin_memcpy(out,(*slot)->name,sizeof(*out));
         } else if(!rc) {
-            rc=fallback ? metadata_fd_stat(task,dirfd,out) : linux_stat_from_path(out,&found.path);
+            if(found.has_stat)*out=found.stat;
+            else rc=fallback ? linux_stat_from_fd(task,dirfd,false,out) : linux_stat_from_path(out,&found.path);
             if(!rc)storage_release_task_io(task->pid);
         }
     }
@@ -199,7 +202,7 @@ int64_t syscall_metadata(struct vfs_namespace *ns,struct task *task,uint64_t num
             if(slot->dirfd!=(int32_t)sizeof(value))rc=-RELIEFOS_EINVAL;
             else __builtin_memcpy(&value,slot->name,sizeof(value));
         } else if(!rc) {
-            rc=metadata_fd_stat(task,(int32_t)a0,&value);
+            rc=linux_stat_from_fd(task,(int32_t)a0,false,&value);
             if(!rc)storage_release_task_io(task->pid);
         }
     }

@@ -27,8 +27,8 @@ int proc_create_vfs_mount(struct vfs_mount **out)
         .immediate_write=proc_control_immediate,
         .read=proc_read,.readdir=proc_readdir,.readlink=proc_readlink,
         .get_identity=proc_key_identity,.identity_alive=proc_key_alive,.put_identity=proc_key_put,
-        .follow=proc_mount_magic_target,
-        .permissions=proc_control_permissions,
+        .follow=proc_mount_magic_target,.stat_link=proc_mount_magic_stat,
+        .permissions=proc_control_permissions,.getattr=proc_getattr,
         .open=proc_file_open,.read_open=proc_file_read,.close=proc_file_close};
     return vfs_pseudo_mount_new(&provider,out);
 }

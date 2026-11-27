@@ -372,6 +372,7 @@ static void setup(unsigned extra)
     current = calloc(1, sizeof(*current));
     assert(current);
     current->kind = TASK_KIND_USER;
+    current->limits.data = (struct linux_rlimit64){LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY};
     nx_enabled = true;
     assert(address_space_create(sched_task_as(current)));
     unsigned count = SCHED_TASK_VMA_MAX + extra;
@@ -596,6 +597,7 @@ static void test_checked_long_scan_nonmutating_peer(void)
     unrelated_mm_peer = calloc(1, sizeof(*unrelated_mm_peer));
     assert(unrelated_mm_peer);
     unrelated_mm_peer->kind = TASK_KIND_USER;
+    unrelated_mm_peer->limits.data = current->limits.data;
     assert(address_space_create(sched_task_as(unrelated_mm_peer)));
     assert(!mm_context_ensure(sched_task_as(unrelated_mm_peer)));
     *sched_task_vma_at(unrelated_mm_peer, 0) = (struct task_vma){.used = 1,
@@ -722,6 +724,7 @@ static void test_checked_noop_same_mm_peer(void)
     parent->shared_mm = shared;
     noop_peer->shared_mm = shared;
     noop_peer->kind = TASK_KIND_USER;
+    noop_peer->limits.data = parent->limits.data;
     memset(noop_peer_frames, 0, sizeof(noop_peer_frames));
     noop_peer_calls = noop_revision_changes = 0;
     noop_peer_passed_page32 = false;
@@ -871,6 +874,7 @@ static void test_checked_eager_current_same_mm_peer(void)
     current_peer->shared_mm = shared;
     as = sched_task_as(parent);
     current_peer->kind = TASK_KIND_USER;
+    current_peer->limits.data = parent->limits.data;
     current_peer->cap_effective = 1ULL << CAP_IPC_LOCK;
     progress_task = parent;
     progress_base = current_peer_target;
@@ -1679,6 +1683,7 @@ static void test_mlockall_shared_mm_policy(void)
     parent->shared_mm = shared;
     peer->shared_mm = shared;
     peer->kind = TASK_KIND_USER;
+    peer->limits.data = parent->limits.data;
     assert(mm_context_lock_intent_intersects(sched_task_as(peer), base, base + 4096));
     assert(mm_context_vma_revision(sched_task_as(peer)) == revision);
     parent->limits.memlock.rlim_cur = peer->limits.memlock.rlim_cur = 4096;
@@ -2385,6 +2390,7 @@ static void test_shared_fork_without_resident_pte(void)
     struct task *child = calloc(1, sizeof(*child));
     assert(child);
     child->kind = TASK_KIND_USER;
+    child->limits.data = current->limits.data;
     assert(address_space_clone_cow(sched_task_as(current), sched_task_as(child)));
     child->vmas[0] = *task_vma_containing(current, address, address + 8192);
     assert(!address_space_user_page_phys(sched_task_as(child), address));

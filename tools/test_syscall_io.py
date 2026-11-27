@@ -88,6 +88,9 @@ def main():
             for name in ("scalar_staged_file", "scalar_address_valid", "scalar_prepare_user"):
                 bodies.append(function(source, name))
         bodies.extend(backends)
+        if "static int syscall_eagain_is_nonblocking_device(" in source:
+            bodies.append("#define SYSCALL_IO_HAS_EAGAIN_CLASSIFIER 1")
+            bodies.append(function(source, "syscall_eagain_is_nonblocking_device"))
         (work / "syscall_io_body.inc").write_text("\n\n".join(bodies))
         for optimization in ("-O0", "-O2"):
             executable = work / ("syscall_io" + optimization)

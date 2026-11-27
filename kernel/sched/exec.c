@@ -126,8 +126,8 @@ int sched_set_task_exec_params(uint32_t pid, uint32_t argc, char *const argv[],
 /** @brief Retire sibling threads and detach execution state before image commit.
  * @param task Current task under exclusive execution ownership; required.
  * @return Zero when ready, negative file-table error, or EAGAIN while a remote
- * sibling is retiring. Preserves native private-FS-on-exec behavior, including
- * root/cwd object pins. Called without scheduler_lock; takes it for signals.
+ * sibling is retiring. Retains the filesystem state shared via CLONE_FS.
+ * Called without scheduler_lock; takes it for signals.
  */
 int sched_prepare_exec_current(struct task *task)
 {
@@ -208,7 +208,6 @@ int sched_prepare_exec_current(struct task *task)
         task->shared_sighand = NULL;
         if (!--old->references) kernel_free(old);
     }
-    sched_task_fs_unshare(task);
     task->fs_base = 0;
     return 0;
 }

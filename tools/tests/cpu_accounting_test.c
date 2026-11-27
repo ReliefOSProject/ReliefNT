@@ -219,6 +219,39 @@ static void test_user_kernel_modes(void)
     discard_fixture();
 }
 
+/** @brief Read real thread/group CPU time, including retired worker time. */
+static void test_cpu_clocks(void)
+{
+    fixture_cpu = 0;
+    fixture_us = 0;
+    fixture_online_mask = 3;
+    sched_init();
+    struct task *leader = start_task(0, 81);
+    struct task *worker = start_task(1, 82);
+    worker->tgid = leader->pid;
+    fixture_cpu = 0;
+    sched_account_mode(false);
+    fixture_cpu = 1;
+    sched_account_mode(true);
+    advance_ticks(125);
+    struct linux_timespec value;
+    assert(sched_cpu_clock_get(LINUX_CLOCK_THREAD_CPUTIME_ID, false, &value) == 0);
+    assert(value.tv_sec == 1 && value.tv_nsec == 250000000);
+    assert(sched_cpu_clock_get(LINUX_CLOCK_PROCESS_CPUTIME_ID, false, &value) == 0);
+    assert(value.tv_sec == 2 && value.tv_nsec == 500000000);
+    cpu_accounting_retire_thread(worker);
+    worker->pid = 0;
+    assert(sched_cpu_clock_get(LINUX_CLOCK_PROCESS_CPUTIME_ID, false, &value) == 0);
+    assert(value.tv_sec == 2 && value.tv_nsec == 500000000);
+    assert(sched_cpu_clock_get(LINUX_CLOCK_THREAD_CPUTIME_ID, true, &value) == 0);
+    assert(value.tv_sec == 0 && value.tv_nsec == 10000000);
+    assert(sched_cpu_clock_get(LINUX_CLOCK_PROCESS_CPUTIME_ID, true, NULL) == 0);
+    value.tv_sec = 7;
+    assert(sched_cpu_clock_get(99, false, &value) == -LINUX_EINVAL);
+    assert(value.tv_sec == 7);
+    discard_fixture();
+}
+
 int main(void)
 {
     test_time_does_not_depend_on_interrupt_count(25);
@@ -226,6 +259,7 @@ int main(void)
     test_idle_reservation_and_migration();
     test_offline_and_slot_reuse();
     test_user_kernel_modes();
+    test_cpu_clocks();
     puts("PASS CPU accounting: BSP USER_HZ, AP cadence, idle, reservations, migration, snapshots and reuse");
     return 0;
 }

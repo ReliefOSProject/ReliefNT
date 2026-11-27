@@ -106,6 +106,7 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
     /* Validate every page first. Linux permits mprotect to cover adjacent
      * VMAs with different attributes, but rejects a range containing a hole. */
     uint64_t cursor = addr;
+    uint64_t data_added = 0;
     uint32_t split_count = 0;
     bool vma_changed = false;
     while (cursor < end) {
@@ -125,12 +126,20 @@ int64_t syscall_mm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
             return -RELIEFOS_EOPNOTSUPP;
         }
         if (piece_end <= cursor) return -RELIEFOS_ENOMEM;
+        if (task_vma_is_data((uint32_t)prot, vma->flags) &&
+            !task_vma_is_data(vma->prot, vma->flags))
+            data_added += piece_end - cursor;
         if (vma->prot != prot) {
             vma_changed = true;
             if (cursor > vma->start) ++split_count;
             if (piece_end < vma->end) ++split_count;
         }
         cursor = piece_end;
+    }
+    uint64_t data_limit = task_vma_data_limit(task);
+    if (data_added && data_limit != LINUX_RLIM_INFINITY) {
+        uint64_t used = task_vma_data_bytes(task, 0, 0);
+        if (used > data_limit || data_added > data_limit - used) return -RELIEFOS_ENOMEM;
     }
 
     /* Secure every split slot before changing PTEs. Adding slots may grow and

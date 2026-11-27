@@ -98,6 +98,11 @@ int proc_object_target(const struct vfs_path *object, char *target, uint32_t cap
 /** @brief Identify supported streaming proc leaves without generating content.
  * @param path Intrinsic path. @return File=1, directory=2, symlink=3, absent=0. */
 int proc_extra_kind(const char *path);
+
+/** @brief Fill dynamic Linux stat attributes for a retained proc node.
+ * @param path Intrinsic proc key. @param out Generic stat data to augment.
+ */
+void proc_getattr(const char *path, struct linux_stat_abi *out);
 /** @brief Render a supported proc slice from actual subsystem state.
  * @param path Intrinsic key. @param s Required validated stream.
  * @return Zero or native errno, ENOENT if not owned; execution ownership held. */
@@ -161,4 +166,10 @@ int proc_lock_stats_permissions(const char *name, const struct storage_node *nod
 #endif
 int proc_mount_node_identity(const char *name,struct task_identity **out,bool *magic);
 int proc_mount_magic_target(const char *name,struct vfs_path *out);
+/** @brief Read authorized metadata for a live pathless proc FD magic link.
+ * @param name Retained intrinsic proc key. @param out Required stat output.
+ * @return Zero, EOPNOTSUPP for path-backed targets, or negative access/FD errno.
+ * Execution-owned; no graph lock, provider I/O or descriptor transfer.
+ */
+int proc_mount_magic_stat(const char *name,struct linux_stat_abi *out);
 #endif

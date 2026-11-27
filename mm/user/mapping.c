@@ -244,7 +244,7 @@ static int task_future_lock_mapping(struct task *task, uint64_t start, uint64_t 
  */
 static int64_t mm_mmap_internal(uint64_t addr, uint64_t len, uint64_t prot,
                                 uint64_t flags, uint64_t fd, uint64_t offset,
-                                bool populate, bool tag_io_retry)
+                                bool populate, bool tag_io_retry, uint64_t retiring)
 {
     struct task *task = sched_current_task();
     struct task_file *file = NULL;
@@ -290,6 +290,9 @@ static int64_t mm_mmap_internal(uint64_t addr, uint64_t len, uint64_t prot,
         if (offset > UINT64_MAX - mapped_len) {
             return -RELIEFOS_EINVAL;
         }
+        /* Linux's fget() consumes unsigned int; register high bits are not
+         * part of the descriptor even when a caller passes a packed handle. */
+        fd = (uint32_t)fd;
         if (fd > INT32_MAX) {
             return -RELIEFOS_EBADF;
         }
@@ -429,22 +432,27 @@ static int64_t mm_mmap_internal(uint64_t addr, uint64_t len, uint64_t prot,
         return -RELIEFOS_EAGAIN;
     }
 
-    if (flags & LINUX_MAP_FIXED) {
-        if ((flags & LINUX_MAP_FIXED_NOREPLACE) && !task_user_pages_free(task, start, end)) {
-            device_mapping_put(device_backing);
-            return -RELIEFOS_EEXIST;
-        }
-        if (!task_address_space_can_map(task, start, end)) {
-            device_mapping_put(device_backing);
-            return -RELIEFOS_ENOMEM;
-        }
-    } else if (!task_user_pages_free(task, start, end)) {
+    if ((flags & LINUX_MAP_FIXED_NOREPLACE) && !task_user_pages_free(task, start, end)) {
+        device_mapping_put(device_backing);
+        return -RELIEFOS_EEXIST;
+    }
+    if (!(flags & LINUX_MAP_FIXED) && !task_user_pages_free(task, start, end)) {
         device_mapping_put(device_backing);
         return -RELIEFOS_ENOMEM;
     }
-    if (!(flags & LINUX_MAP_FIXED) && !task_address_space_can_map(task, start, end)) {
+    if (!task_address_space_can_map(task, start, end, retiring)) {
         device_mapping_put(device_backing);
         return -RELIEFOS_ENOMEM;
+    }
+    uint64_t data_limit = task_vma_data_limit(task);
+    if (data_limit != LINUX_RLIM_INFINITY && mapped_len > retiring &&
+        task_vma_is_data((uint32_t)prot, vma_flags)) {
+        uint64_t used = task_vma_data_bytes(task, start, end);
+        if (used < retiring || used - retiring > data_limit ||
+            mapped_len > data_limit - (used - retiring)) {
+            device_mapping_put(device_backing);
+            return -RELIEFOS_ENOMEM;
+        }
     }
     /* The provider may return an already-owned backing without allocating.
      * Reserve every new view and physical-policy owner before MAP_FIXED can
@@ -563,7 +571,7 @@ static int64_t mm_mmap_internal(uint64_t addr, uint64_t len, uint64_t prot,
 int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                         uint64_t flags, uint64_t fd, uint64_t offset)
 {
-    return mm_mmap_internal(addr, len, prot, flags, fd, offset, true, false);
+    return mm_mmap_internal(addr, len, prot, flags, fd, offset, true, false, 0);
 }
 
 /** @brief Map for the syscall frame with a distinguishable metadata I/O wait.
@@ -575,7 +583,7 @@ int64_t syscall_mm_mmap(uint64_t addr, uint64_t len, uint64_t prot,
 int64_t syscall_mm_mmap_dispatch(uint64_t addr, uint64_t len, uint64_t prot,
                                 uint64_t flags, uint64_t fd, uint64_t offset)
 {
-    return mm_mmap_internal(addr, len, prot, flags, fd, offset, true, true);
+    return mm_mmap_internal(addr, len, prot, flags, fd, offset, true, true, 0);
 }
 
 int64_t syscall_mm_brk(uint64_t requested)
@@ -599,6 +607,12 @@ int64_t syscall_mm_brk(uint64_t requested)
      * be committed; callers distinguish this from a negative errno return. */
     if (requested < base || requested >= task_mmap_top(task)) return (int64_t)current;
     if (requested == current) return (int64_t)current;
+    uint64_t data_limit = sched_task_limits(task)->data.rlim_cur;
+    if (data_limit != LINUX_RLIM_INFINITY &&
+        (mm->program_data_size > data_limit ||
+         requested - base > data_limit - mm->program_data_size)) {
+        return (int64_t)current;
+    }
 
     old_page = align_up_page(current);
     new_page = align_up_page(requested);
@@ -613,7 +627,7 @@ int64_t syscall_mm_brk(uint64_t requested)
         mapped = mm_mmap_internal(old_page, new_page - old_page,
                                  LINUX_PROT_READ | LINUX_PROT_WRITE,
                                  LINUX_MAP_PRIVATE | LINUX_MAP_FIXED |
-                                 LINUX_MAP_ANONYMOUS, UINT64_MAX, 0, false, false);
+                                 LINUX_MAP_ANONYMOUS, UINT64_MAX, 0, false, false, 0);
         if (mapped != (int64_t)old_page) return (int64_t)current;
     } else if (new_page < old_page) {
         if (syscall_mm_munmap(new_page, old_page - new_page) < 0) {
@@ -655,14 +669,17 @@ static bool task_remap_lock_allowed(struct task *task, uint64_t old_len,
 /** @brief Reserve an anonymous remap without applying FUTURE to an old VMA.
  * @param task Execution-owned MM. @param address Destination or zero for search.
  * @param length Aligned new bytes. @param prot Original VMA permissions.
- * @param flags Original anonymous mapping mode. @return Address or negative errno.
+ * @param flags Original anonymous mapping mode.
+ * @param retiring Separate source bytes already charged with equal permissions.
+ * @return Address or negative errno.
  */
 static int64_t task_remap_reserve(struct task *task, uint64_t address, uint64_t length,
-                                  uint32_t prot, uint32_t flags)
+                                  uint32_t prot, uint32_t flags, uint64_t retiring)
 {
     uint32_t policy = mm_lock_flags(sched_task_as(task));
     if (policy & LINUX_MCL_FUTURE) mm_context_set_lock_flags(sched_task_as(task), 0);
-    int64_t result = syscall_mm_mmap(address, length, prot, flags, UINT64_MAX, 0);
+    int64_t result = mm_mmap_internal(address, length, prot, flags, UINT64_MAX, 0,
+                                      true, false, retiring);
     if (policy & LINUX_MCL_FUTURE) mm_context_set_lock_flags(sched_task_as(task), policy);
     return result;
 }
@@ -877,7 +894,8 @@ int64_t syscall_mm_mremap(uint64_t old_addr, uint64_t old_len, uint64_t new_len,
             return -RELIEFOS_EAGAIN;
         map_flags = (vma->flags & TASK_VMA_FLAG_SHARED) ? LINUX_MAP_SHARED : LINUX_MAP_PRIVATE;
         map_flags |= LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED;
-        moved = task_remap_reserve(task, old_end, new_mapped - old_mapped, source_prot, map_flags);
+        moved = task_remap_reserve(task, old_end, new_mapped - old_mapped,
+                                   source_prot, map_flags, 0);
         if (moved == (int64_t)old_end) {
             if (source_locked && mm_lock_remap(task, old_end, new_end, source_onfault) < 0) {
                 (void)syscall_mm_munmap(old_end, new_mapped - old_mapped);
@@ -905,7 +923,7 @@ int64_t syscall_mm_mremap(uint64_t old_addr, uint64_t old_len, uint64_t new_len,
     map_flags = (source_flags & TASK_VMA_FLAG_SHARED) ? LINUX_MAP_SHARED : LINUX_MAP_PRIVATE;
     map_flags |= LINUX_MAP_ANONYMOUS;
     if (flags & LINUX_MREMAP_FIXED) map_flags |= LINUX_MAP_FIXED;
-    moved = task_remap_reserve(task, new_addr, new_mapped, source_prot, map_flags);
+    moved = task_remap_reserve(task, new_addr, new_mapped, source_prot, map_flags, old_mapped);
     if (moved < 0) return moved;
     uint64_t copy_len = old_mapped < new_mapped ? old_mapped : new_mapped;
     if (map_flags & LINUX_MAP_SHARED) {
@@ -958,7 +976,7 @@ int64_t syscall_mm_map_sysv_shm(struct task *task, uint64_t address, uint64_t le
         return -RELIEFOS_EINVAL;
     uint64_t end = start + length;
     if (!remap && !task_user_pages_free(task, start, end)) return -RELIEFOS_EINVAL;
-    if (!task_address_space_can_map(task, start, end)) return -RELIEFOS_ENOMEM;
+    if (!task_address_space_can_map(task, start, end, 0)) return -RELIEFOS_ENOMEM;
     uint32_t vma_flags = TASK_VMA_FLAG_SHARED | TASK_VMA_FLAG_SYSV_SHM;
     if (task_future_lock_mapping(task, start, end, &vma_flags) < 0) return -RELIEFOS_EAGAIN;
     /* Reserve the metadata slot by index; SHM_REMAP may grow vma_extra. */

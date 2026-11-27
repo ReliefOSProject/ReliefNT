@@ -60,7 +60,7 @@ int vfs_path_resolve_resume(struct vfs_namespace *ns,const struct vfs_path *root
     if(!state || !result)return -EINVAL;
     *result=(struct vfs_lookup_result){0};
     unsigned flags=policy ? policy->flags : VFS_LOOKUP_FOLLOW;
-    int rc=flags&~(VFS_LOOKUP_FOLLOW|VFS_LOOKUP_PARENT|VFS_LOOKUP_MISSING) ? -EINVAL : 0;
+    int rc=flags&~(VFS_LOOKUP_FOLLOW|VFS_LOOKUP_PARENT|VFS_LOOKUP_MISSING|VFS_LOOKUP_STAT) ? -EINVAL : 0;
     if(!rc && *state && ((*state)->ns!=ns || (*state)->flags!=flags))rc=-EINVAL;
     if(!rc && !*state)rc=vfs_walk_new(ns,root,start,name,flags,state);
     if(rc){vfs_walk_cancel(state);return rc;}
@@ -127,6 +127,19 @@ int vfs_path_resolve_resume(struct vfs_namespace *ns,const struct vfs_path *root
         }
         case VFS_WALK_LINK: {
             if(walk->child.dentry->node.flags&STORAGE_NODE_FLAG_MAGIC_LINK) {
+                if((flags&VFS_LOOKUP_STAT) && walk->child.mount->ops->stat_link) {
+                    struct linux_stat_abi attributes;
+                    rc=walk->child.mount->ops->stat_link(walk->child.mount->context,
+                        &walk->child.dentry->node,&attributes);
+                    if(!rc && !walk->pending[walk->after]) {
+                        result->stat=attributes;result->has_stat=true;
+                        vfs_path_put(&walk->current);walk->current=walk->child;
+                        walk->child=(struct vfs_path){0};done=true;break;
+                    }
+                    if(!rc && (attributes.st_mode&LINUX_S_IFMT)!=LINUX_S_IFDIR)rc=-ENOTDIR;
+                    if(rc && rc!=-EOPNOTSUPP)break;
+                    rc=0;
+                }
                 struct vfs_path target={0};
                 rc=walk->child.mount->ops->follow_link ? walk->child.mount->ops->follow_link(
                     walk->child.mount->context,&walk->child.dentry->node,&target) : -EOPNOTSUPP;

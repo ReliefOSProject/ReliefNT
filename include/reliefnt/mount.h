@@ -73,6 +73,10 @@ struct vfs_backend_ops {
      * pathname replay; an anonymous file may belong to an unmounted backend.
      * Error output must be empty. No graph lock spans this provider callback. */
     int (*follow_link)(void *context,const struct storage_node *node,struct vfs_path *out);
+    /* Optional authorized metadata for a magic target without a VFS path.
+     * EOPNOTSUPP falls back to follow_link; all other errors are final.
+     * Caller retains the link/provider, with no graph lock across this call. */
+    int (*stat_link)(void *context,const struct storage_node *node,struct linux_stat_abi *out);
     /* Optional final backend quiescence, after every root/inode path retires.
      * Zero permits destroy; a negative error preserves the context and its
      * module pin in the core's detached retirement queue. Failure must leave
@@ -383,6 +387,9 @@ int vfs_path_readlink(const struct vfs_path *path,char *buffer,size_t capacity,s
  * Unlike PARENT, follows links according to FOLLOW, including a dangling final
  * symlink's actual target. Callers decide which creation types allow trailing /. */
 #define VFS_LOOKUP_MISSING 4u
+/* Metadata-only lookup may finish at a pathless magic-link target. The result
+ * owns the link path and a target-attribute snapshot, never a usable target path. */
+#define VFS_LOOKUP_STAT 8u
 #define VFS_PATH_MAX 4096u
 #define VFS_NAME_MAX 255u
 #define VFS_SYMLINK_MAX 40u
@@ -399,6 +406,8 @@ struct vfs_lookup_result {
     char last[VFS_NAME_MAX+1];
     bool trailing;
     bool missing;
+    bool has_stat;
+    struct linux_stat_abi stat;
 };
 /** @brief Resolve a path or its creation parent with per-directory authorization.
  * @param ns Shared namespace under execution ownership.

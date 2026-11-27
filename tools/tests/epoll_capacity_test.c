@@ -128,7 +128,16 @@ int64_t syscall_poll_impl(struct task *task, struct pollfd *fds,
     (void)timeout_ms;
     (void)generation;
     for (uint32_t i = 0; i < nfds; ++i) {
-        struct task_file *file = task_file_for_fd(task, fds[i].fd);
+        struct task_file *file = task->syscall_file && task->syscall_fd == fds[i].fd
+            ? task->syscall_file : task_file_for_fd(task, fds[i].fd);
+        if (file->flags & TASK_FILE_FLAG_EPOLL) {
+            fds[i].revents = task_epoll_poll_ready(task, file) ? fds[i].events & POLLIN : 0;
+            continue;
+        }
+        if (file->flags & TASK_FILE_FLAG_EVENTFD) {
+            fds[i].revents = file->aux ? fds[i].events & POLLIN : 0;
+            continue;
+        }
         bool ready = !(file->flags & TASK_FILE_FLAG_DEV_NODE) ||
             input_evdev_available_vt(file->node.first_cluster, file->aux,
                                      file->aux2, file->input_vt);
@@ -203,12 +212,73 @@ static void test_evdev_edges(void)
     puts("PASS evdev epoll: refill/loss edges, no duplicate, device/VT/grab isolation and oneshot rearm");
 }
 
+/** @brief Catch rejected nesting, lost inner readiness and graph cleanup bugs. */
+static void test_nested_epoll(void)
+{
+    struct task_file files[7] = {{0}};
+    struct task_file source = {.used = 1, .flags = TASK_FILE_FLAG_EVENTFD};
+    struct task_epoll *states[7];
+    struct epoll_event event = {.events = EPOLLIN, .data = 10}, output;
+    current.limits.nofile.rlim_cur = TEST_FD_MAX;
+    descriptors[20] = &source;
+    for (unsigned i = 0; i < 7; ++i) {
+        states[i] = calloc(1, sizeof(*states[i]));
+        assert(states[i]);
+        files[i] = (struct task_file){.used = 1, .flags = TASK_FILE_FLAG_EPOLL,
+            .aux = (uintptr_t)states[i]};
+        descriptors[10 + i] = &files[i];
+    }
+    assert(syscall_epoll_ctl(10, EPOLL_CTL_ADD, 20, (uintptr_t)&event) == 0);
+    assert(syscall_epoll_ctl(11, EPOLL_CTL_ADD, 10, (uintptr_t)&event) == 0);
+    assert(syscall_epoll_ctl(10, EPOLL_CTL_ADD, 11, (uintptr_t)&event) == -ELOOP);
+    assert(syscall_epoll_ctl(10, EPOLL_CTL_ADD, 10, (uintptr_t)&event) == -RELIEFOS_EINVAL);
+    descriptors[21] = &files[0];
+    assert(syscall_epoll_ctl(10, EPOLL_CTL_ADD, 21, (uintptr_t)&event) == -RELIEFOS_EINVAL);
+    assert(!task_epoll_poll_ready(&current, &files[1]));
+    source.aux = 1;
+    assert(task_epoll_poll_ready(&current, &files[1]));
+    assert(syscall_epoll_wait(11, (uintptr_t)&output, 1, 0) == 1 && output.data == 10);
+    assert(syscall_epoll_wait(10, (uintptr_t)&output, 1, 0) == 1);
+    source.aux = 0;
+    assert(!task_epoll_poll_ready(&current, &files[1]));
+    event.events = EPOLLIN | EPOLLONESHOT;
+    assert(syscall_epoll_ctl(11, EPOLL_CTL_MOD, 10, (uintptr_t)&event) == 0);
+    source.aux = 1;
+    assert(syscall_epoll_wait(11, (uintptr_t)&output, 1, 0) == 1);
+    assert(!task_epoll_poll_ready(&current, &files[1]));
+    assert(syscall_epoll_ctl(11, EPOLL_CTL_MOD, 10, (uintptr_t)&event) == 0);
+    assert(syscall_epoll_wait(11, (uintptr_t)&output, 1, 0) == 1);
+    event.events = EPOLLIN;
+    for (int fd = 12; fd <= 14; ++fd)
+        assert(syscall_epoll_ctl(fd, EPOLL_CTL_ADD, fd - 1, (uintptr_t)&event) == 0);
+    assert(syscall_epoll_ctl(15, EPOLL_CTL_ADD, 14, (uintptr_t)&event) == -ELOOP);
+    /* Inserting an intermediate node must inspect ancestors as well as children. */
+    assert(syscall_epoll_ctl(10, EPOLL_CTL_ADD, 16, (uintptr_t)&event) == -ELOOP);
+    assert(syscall_epoll_ctl(14, EPOLL_CTL_DEL, 13, 0) == 0);
+    assert(syscall_epoll_ctl(10, EPOLL_CTL_ADD, 16, (uintptr_t)&event) == 0);
+    task_epoll_remove_file_description(&files[1]);
+    task_epoll_destroy(states[1]); states[1] = NULL;
+    assert(!task_epoll_poll_ready(&current, &files[2]));
+    for (unsigned i = 0; i < 7; ++i) {
+        if (states[i]) {
+            task_epoll_remove_file_description(&files[i]);
+            task_epoll_destroy(states[i]);
+        }
+        descriptors[10 + i] = NULL;
+    }
+    assert(!source.epoll_watches);
+    descriptors[20] = descriptors[21] = NULL;
+    current = (struct task){0}; kernel_free_calls = 0;
+    puts("PASS nested epoll readiness, oneshot, cycles, depth and close cleanup");
+}
+
 int main(void)
 {
     struct task_epoll *epoll;
     struct epoll_event event;
     struct epoll_event ready[TEST_WATCHES];
 
+    test_nested_epoll();
     test_evdev_edges();
     memset(&current, 0, sizeof(current));
     current.pid = 1;

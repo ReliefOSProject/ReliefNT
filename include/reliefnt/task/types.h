@@ -295,6 +295,7 @@ struct task_address_space_state {
     /* Linux brk(2) state belongs to the address space, shared by CLONE_VM. */
     uint64_t program_break_base;
     uint64_t program_break;
+    uint64_t program_data_size;
     uint32_t references;
     uint64_t initial_stack_top;
     uint64_t initial_stack_low;
@@ -443,6 +444,7 @@ struct task_rlimit_state {
     uint32_t references;
     struct linux_rlimit64 nofile;
     struct linux_rlimit64 as;
+    struct linux_rlimit64 data;
     struct linux_rlimit64 sigpending;
     struct linux_rlimit64 stack;
     struct linux_rlimit64 nproc;
@@ -670,6 +672,7 @@ struct task {
             uint32_t vma_extra_capacity;
             uint64_t program_break_base;
             uint64_t program_break;
+            uint64_t program_data_size;
         };
     };
     union {

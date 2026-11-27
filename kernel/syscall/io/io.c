@@ -81,7 +81,10 @@ static int scalar_prepare_user(struct task *task,const struct task_file *file,
 #ifdef CONFIG_SWAP
     if(file && (file->flags & TASK_FILE_FLAG_DEV_SHM))size=(uint32_t)count;
 #endif
-    if (file && (file->flags & (TASK_FILE_FLAG_EVENTFD | TASK_FILE_FLAG_TIMERFD)) && count==8)
+    /* These read counts are capacities: only the returned counter is touched.
+     * eventfd writes still require an exact uint64_t, as Linux does. */
+    if (file && (file->flags & (TASK_FILE_FLAG_EVENTFD | TASK_FILE_FLAG_TIMERFD)) &&
+        (count == sizeof(uint64_t) || (!writing && count > sizeof(uint64_t))))
         bounded=true;
     if (bounded) {
         uint64_t limit=file && (file->flags & (TASK_FILE_FLAG_PIPE | TASK_FILE_FLAG_DEV_SHM)) ? 32768u :
@@ -349,7 +352,7 @@ int64_t syscall_io_read_iter(uint64_t a0, uint64_t a1, uint64_t a2, enum pty_rea
     }
     if (file->flags & TASK_FILE_FLAG_EVENTFD) {
         uint64_t value;
-        if (a2 != sizeof(uint64_t)) return -RELIEFOS_EINVAL;
+        if (a2 < sizeof(uint64_t)) return -RELIEFOS_EINVAL;
         if (!file->aux) return -RELIEFOS_EAGAIN;
         value = file->aux2 ? 1 : file->aux;
         file->aux -= value;
@@ -360,7 +363,7 @@ int64_t syscall_io_read_iter(uint64_t a0, uint64_t a1, uint64_t a2, enum pty_rea
     if (file->flags & TASK_FILE_FLAG_TIMERFD) {
         struct task_timerfd *timer = (struct task_timerfd *)(uintptr_t)file->aux;
         uint64_t value;
-        if (a2 != sizeof(uint64_t)) return -RELIEFOS_EINVAL;
+        if (a2 < sizeof(uint64_t)) return -RELIEFOS_EINVAL;
         task_timerfd_update(timer);
         if (!timer || !timer->expirations) return -RELIEFOS_EAGAIN;
         value = timer->expirations;

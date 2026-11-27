@@ -42,6 +42,29 @@ static void thread_paths(void)
     visible_tasks = 1;
 }
 
+static void thread_directory_links(void)
+{
+    struct vfs_mount *mount = NULL;
+    struct vfs_namespace ns = {0};
+    struct vfs_path root = {0}, task_dir = {0};
+    struct linux_stat_abi st;
+    assert(!proc_create_vfs_mount(&mount));
+    assert(!vfs_namespace_init(&ns, mount));
+    vfs_mount_put(mount);
+    assert(!vfs_namespace_root(&ns, &root));
+    assert(!vfs_path_lookup(&ns, &root, &root, "self/task", 0, &task_dir));
+    assert(!vfs_path_stat(&task_dir, &st) && st.st_nlink == 3);
+    extra_tasks[0] = (struct task){.pid = 100, .tgid = 42};
+    extra_tasks[1] = (struct task){.pid = 200};
+    visible_tasks = 3;
+    assert(!vfs_path_stat(&task_dir, &st) && st.st_nlink == 4);
+    visible_tasks = 1;
+    assert(!vfs_path_stat(&task_dir, &st) && st.st_nlink == 3);
+    vfs_path_put(&task_dir);
+    vfs_path_put(&root);
+    vfs_namespace_destroy(&ns);
+}
+
 static void io_views(void)
 {
     current.proc_read_chars = 10;
@@ -268,6 +291,7 @@ static void long_snapshots(void)
 int main(void)
 {
     thread_paths();
+    thread_directory_links();
     io_views();
     memory_views();
     inconsistent_page_counts();

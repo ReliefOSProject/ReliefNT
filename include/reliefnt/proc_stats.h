@@ -5,6 +5,7 @@
 #include <reliefnt/text_stream.h>
 struct task;
 struct task_file;
+struct linux_timespec;
 /** @brief Emit specialized eventfd/timerfd/epoll details without consuming events.
  * @param file Borrowed canonical OFD. @param s Required output.
  * @return Zero or backing metadata errno, serialized by execution ownership. */
@@ -25,6 +26,16 @@ void sched_cpu_times(uint64_t *user, uint64_t *system, uint64_t *idle, uint32_t 
  * I/O or ownership transfer.
  */
 void sched_task_cpu_times(const struct task *task, bool process, uint64_t *user, uint64_t *system);
+/** @brief Query a current process/thread CPU clock using scheduler accounting.
+ * @param clock CLOCK_PROCESS_CPUTIME_ID or CLOCK_THREAD_CPUTIME_ID.
+ * @param resolution Return the accounting tick resolution when true.
+ * @param value Writable kernel result, optional for resolution queries.
+ * @return Zero or negative EINVAL for an unsupported clock or absent task.
+ * CPU-time reads require task context and acquire scheduler_lock internally.
+ * No timekeeper lock, allocation, user access or reference transfer occurs.
+ */
+int sched_cpu_clock_get(int32_t clock, bool resolution, struct linux_timespec *value);
+
 /** @brief Count live OFDs independently of descriptor aliases or task tables.
  * @return Allocated canonical/inline descriptions, execution-owned snapshot. */
 uint64_t proc_open_file_count(void);

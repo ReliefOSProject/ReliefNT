@@ -295,6 +295,7 @@ static void test_memory_legacy_final_errors(void)
     struct task owner = {0};
     owner.kind = TASK_KIND_USER;
     owner.stack_top = RELIEFNT_USER_TOP - 4096;
+    owner.limits.data = (struct linux_rlimit64){LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY};
     owner.limits.as.rlim_cur = LINUX_RLIM_INFINITY;
     owner.limits.memlock.rlim_cur = 4096;
     /* The production checked walk requires a live root identity; this fixture
@@ -323,6 +324,7 @@ static void test_memory_legacy_final_errors(void)
 static void test_regular_mapping_description(void)
 {
     struct task owner={0};owner.kind=TASK_KIND_USER;
+    owner.limits.data = (struct linux_rlimit64){LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY};
     owner.stack_top=RELIEFNT_USER_TOP-4096;
     owner.limits.as.rlim_cur=owner.limits.as.rlim_max=LINUX_RLIM_INFINITY;
     current_task=&owner;
@@ -376,6 +378,7 @@ static struct task_vma *mmap_result_vma(struct task *task,uint64_t address)
 static void test_regular_mapping_provider(void)
 {
     struct task owner={.kind=TASK_KIND_USER};owner.stack_top=RELIEFNT_USER_TOP-4096;
+    owner.limits.data = (struct linux_rlimit64){LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY};
     owner.limits.as.rlim_cur=owner.limits.as.rlim_max=LINUX_RLIM_INFINITY;current_task=&owner;
     framebuffer_file=(struct task_file){.used=1,.references=1,.flags=LINUX_O_RDWR,
         .node={.type=RELIEFOS_FS_TYPE_FILE,.first_cluster=50,.size=1}};
@@ -391,6 +394,16 @@ static void test_regular_mapping_provider(void)
     assert(vma->file_node.size==3*page);assert(!syscall_mm_munmap(base,page));
     assert(syscall_mm_mmap(base,page,LINUX_PROT_WRITE,LINUX_MAP_PRIVATE|fixed,7,0)==(int64_t)base);
     assert(!syscall_mm_munmap(base,page));mmap_provider_flags=0;
+    /* Linux resolves fd through unsigned-int fget, ignoring register high bits.
+     * Chromium passes a packed two-fd handle in the native mmap fd register. */
+    const uint64_t descriptors[] = {UINT64_C(0x2d00000007), UINT64_C(0xffffffff00000007)};
+    for (unsigned i = 0; i < sizeof(descriptors)/sizeof(descriptors[0]); ++i) {
+        assert(syscall_mm_mmap(base,page,LINUX_PROT_READ|LINUX_PROT_WRITE,
+            LINUX_MAP_SHARED|fixed,descriptors[i],0)==(int64_t)base);
+        assert(!syscall_mm_munmap(base,page));
+    }
+    assert(syscall_mm_mmap(base,page,LINUX_PROT_READ,LINUX_MAP_SHARED|fixed,
+        UINT64_C(0x2dffffffff),0)==-EBADF);
     /* The actual mmap consumer must honor common admission even after the
      * numeric table entry names a different inode. */
     second_file=(struct task_file){.used=1,.references=1,.flags=LINUX_O_RDWR,
@@ -416,6 +429,7 @@ int main(void)
     const uint64_t start = RELIEFNT_USER_HEAP_BASE + 0x20000;
     struct task task = {0};
     task.kind = TASK_KIND_USER;
+    task.limits.data = (struct linux_rlimit64){LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY};
     task.stack_top = RELIEFNT_USER_TOP - page;
     task.limits.as.rlim_cur = LINUX_RLIM_INFINITY;
     task.limits.as.rlim_max = LINUX_RLIM_INFINITY;
@@ -475,6 +489,7 @@ int main(void)
     const uint64_t sparse_length = 1ULL << 40;
     struct task sparse = {0};
     sparse.kind = TASK_KIND_USER;
+    sparse.limits.data = (struct linux_rlimit64){LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY};
     sparse.stack_top = RELIEFNT_USER_TOP - page;
     sparse.limits.as.rlim_cur = LINUX_RLIM_INFINITY;
     sparse.limits.as.rlim_max = LINUX_RLIM_INFINITY;
@@ -501,6 +516,7 @@ int main(void)
      * must install the backing PFN, never the alias bits, in the user PTE. */
     struct task fb_task = {0};
     fb_task.kind = TASK_KIND_USER;
+    fb_task.limits.data = (struct linux_rlimit64){LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY};
     fb_task.stack_top = RELIEFNT_USER_TOP - page;
     fb_task.limits.as.rlim_cur = LINUX_RLIM_INFINITY;
     fb_task.limits.as.rlim_max = LINUX_RLIM_INFINITY;
@@ -535,6 +551,7 @@ int main(void)
     struct task thread;
     struct task_address_space_state shared_mm;
     process.kind = TASK_KIND_USER;
+    process.limits.data = (struct linux_rlimit64){LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY};
     process.stack_top = RELIEFNT_USER_TOP - page;
     process.limits.as.rlim_cur = LINUX_RLIM_INFINITY;
     process.limits.as.rlim_max = LINUX_RLIM_INFINITY;

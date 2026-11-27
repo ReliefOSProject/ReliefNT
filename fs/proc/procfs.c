@@ -674,8 +674,13 @@ int proc_fd_get_path(struct task *target,int fd,struct vfs_path *out)
     if(!target)return -RELIEFOS_ENOENT;
     if(!proc_stat_mm_visible(sched_current_task(),target))return -RELIEFOS_EACCES;
     struct task_file *file=task_file_for_fd(target,fd);
-    if(!file || !file->path_ref.mount)return -RELIEFOS_ENOENT;
-    vfs_path_get(&file->path_ref,out);return 0;
+    const struct vfs_path *path=file ? &file->path_ref : NULL;
+    if(!file) {
+        struct task_pty_fd *endpoint=task_pty_fd_for_fd(target,fd);
+        if(endpoint && endpoint->description)path=&endpoint->description->path_ref;
+    }
+    if(!path || !path->mount)return -RELIEFOS_ENOENT;
+    vfs_path_get(path,out);return 0;
 }
 
 int proc_mount_node_identity(const char *name,struct task_identity **out,bool *magic)
@@ -693,6 +698,31 @@ int proc_mount_node_identity(const char *name,struct task_identity **out,bool *m
     if(rc)return rc==-ESRCH ? -RELIEFOS_ENOENT : rc;
     *magic=file && (proc_fd_number(file)>=0 || proc_text_eq(file,"cwd") || proc_text_eq(file,"root") || proc_text_eq(file,"exe"));
     return 0;
+}
+
+/** @brief Read metadata for a proc FD whose live object has no retained path.
+ * @param name Stable intrinsic proc inode key. @param out Caller-owned result.
+ * @return Zero or negative errno; path-backed targets use normal VFS following.
+ * Authorizes before inspecting descriptors, under execution ownership. Pathless
+ * stat is synchronous and does not retain/replay a diagnostic link label.
+ */
+int proc_mount_magic_stat(const char *name,struct linux_stat_abi *out)
+{
+    const char *file_name=NULL;uint32_t pid=0;
+    int kind=proc_path_kind(name,&file_name,&pid);
+    if((kind!=2 && kind!=3) || !file_name)return -RELIEFOS_EOPNOTSUPP;
+    int fd=proc_fd_number(file_name);
+    if(fd<0)return -RELIEFOS_EOPNOTSUPP;
+    struct task *task=kind==3 ? sched_current_task() : sched_find(pid);
+    if(!task)return -RELIEFOS_ENOENT;
+    if(!proc_stat_mm_visible(sched_current_task(),task))return -RELIEFOS_EACCES;
+    struct task_file *file=task_file_for_fd(task,fd);
+    if(file && file->path_ref.mount)return -RELIEFOS_EOPNOTSUPP;
+    struct task_pty_fd *endpoint=task_pty_fd_for_fd(task,fd);
+    if(endpoint && endpoint->description && endpoint->description->path_ref.mount)
+        return -RELIEFOS_EOPNOTSUPP;
+    int rc=linux_stat_from_fd(task,fd,true,out);
+    return rc==-RELIEFOS_EBADF ? -RELIEFOS_ENOENT : rc;
 }
 
 int proc_mount_magic_target(const char *name,struct vfs_path *out)

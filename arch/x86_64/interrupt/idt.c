@@ -183,7 +183,7 @@ void idt_init(void)
     idt_set(0, isr0_stub, 0);
     idt_set(1, isr1_stub, 0);
     idt_set(2, isr2_stub, 0);
-    idt_set(3, isr3_stub, 0);
+    idt_set(3, isr3_stub, 3); /* INT3 is available to userspace. */
     idt_set(4, isr4_stub, 0);
     idt_set(5, isr5_stub, 0);
     idt_set(6, isr6_stub, 0);
@@ -284,6 +284,19 @@ void exception_dispatch(uint64_t vector, uint64_t error, uint64_t rip, uint64_t 
     uint64_t cr2 = x86_64_read_cr2();
     /* Fatal output must bypass the ordinary console lock, even for #DF/NMI. */
     bugcheck_exception(vector, error, rip, cs, rflags, rsp, ss, cr2);
+}
+
+/** @brief Deliver a user breakpoint from the hardware's post-instruction frame.
+ * @param frame Saved vector-3 registers and user iret frame.
+ * @return The task selected for user return, or NULL on invalid scheduling. */
+struct task *breakpoint_dispatch(struct trap_frame *frame)
+{
+    struct task *task = sched_current_task();
+    if (!task || task->kind != TASK_KIND_USER) {
+        bugcheck_trap("User Breakpoint without user task", frame, 0);
+    }
+    kernel_signal_force_fault(task, LINUX_SIGTRAP, LINUX_SI_KERNEL, 0);
+    return userland_schedule_from_frame(frame);
 }
 
 /**

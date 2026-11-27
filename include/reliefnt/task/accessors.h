@@ -212,13 +212,12 @@ int sched_task_fs_start(struct task *task,struct vfs_namespace *ns);
  */
 void sched_task_fs_inherit(struct task *task,const struct task *parent);
 
-/** @brief Detach shared FS state while retaining the same root/cwd objects.
- * @param task Task under exclusive execution ownership; NULL is accepted.
- * Preserves the existing native exec unshare policy and cached names/umask.
- * No allocation; the last shared reference releases its backend pins only
- * after the task has acquired independent pins. Final release may perform I/O.
+/** @brief Check whether a separate process can change a task's CLONE_FS state.
+ * @param task Current task under exclusive execution ownership; required.
+ * @return True if any filesystem-state reference is held outside the task's
+ * thread group. Borrows the scheduler task entries under execution ownership.
  */
-void sched_task_fs_unshare(struct task *task);
+bool sched_task_fs_shared_outside_group(const struct task *task);
 
 /** @brief Retire task root/cwd pins or its one shared CLONE_FS reference.
  * @param task Quiescent task under execution ownership; nullable.

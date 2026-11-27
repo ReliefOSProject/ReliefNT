@@ -301,14 +301,26 @@ int task_pty_materialize_stdio(struct task *task)
 int task_pty_node_for_fd(struct task *task, int fd, struct storage_node *node,
                                  const char **path)
 {
-    struct task_pty_fd *endpoint = task_pty_for_io(task, fd);
+    return task_pty_node_from_endpoint(task_pty_for_io(task,fd),
+        task_pty_stream_for_fd(task,fd)>=0 ? task->pty_id : 0,node,path);
+}
+
+/** @brief Describe an explicitly selected terminal endpoint without FD admission.
+ * @param endpoint Borrowed live or admitted alias, nullable for implicit stdio.
+ * @param implicit_id Controlling PTY for implicit stdio, zero when absent.
+ * @param node Required builtin node output. @param path Static metadata label.
+ * @return Zero or EBADF. Execution-owned, with no allocation or path lookup.
+ */
+int task_pty_node_from_endpoint(const struct task_pty_fd *endpoint,uint32_t implicit_id,
+                                  struct storage_node *node,const char **path)
+{
     if (endpoint && endpoint->endpoint == TASK_PTY_ENDPOINT_MASTER) {
         *path = "/dev/ptmx";
         *node=(struct storage_node){.type=RELIEFOS_FS_TYPE_DEVICE,
             .flags=STORAGE_NODE_FLAG_DEV_NODE,.first_cluster=STORAGE_DEV_KIND_PTMX};
         return 0;
     }
-    uint32_t id = endpoint ? endpoint->pty_id : task_pty_stream_for_fd(task, fd) >= 0 ? task->pty_id : 0;
+    uint32_t id = endpoint ? endpoint->pty_id : implicit_id;
     if (!id) return -RELIEFOS_EBADF;
     if (pty_vt_number(id)) {
         static const char *const vt_paths[] = {

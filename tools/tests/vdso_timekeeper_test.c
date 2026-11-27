@@ -9,6 +9,16 @@
 #include "../../kernel/time/time.c"
 
 static unsigned held;
+/** @brief Keep CPU-clock dispatch independent of the timekeeper fixture. */
+int sched_cpu_clock_get(int32_t clock, bool resolution, struct linux_timespec *value)
+{
+    (void)clock;
+    (void)resolution;
+    (void)value;
+    assert(!held);
+    return -LINUX_EINVAL;
+}
+
 static uint64_t fake_tsc;
 static uint32_t fake_online_cpus = 1;
 static uint32_t fake_cpu_count = 1;

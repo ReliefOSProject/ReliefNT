@@ -169,6 +169,17 @@ static uint32_t threads(struct task *t)
     return n;
 }
 
+void proc_getattr(const char *path, struct linux_stat_abi *out)
+{
+    if ((out->st_mode & LINUX_S_IFMT) != LINUX_S_IFDIR)
+        return;
+    const char *leaf = NULL;
+    struct task *task = proc_view_task(path, &leaf);
+    /* Linux counts both directory links and every thread subdirectory. */
+    if (task && leaf && !__builtin_strcmp(leaf, "task"))
+        out->st_nlink = 2 + (uint64_t)threads(task);
+}
+
 struct memory_totals {
     uint64_t size, rss, shared, text, data, stack, locked, pss, referenced, private_clean,
         private_dirty, shared_clean, shared_dirty, anonymous;

@@ -81,6 +81,73 @@ static int task_epoll_grow(struct task_epoll *epoll)
 }
 
 
+/* Linux permits four epoll-to-epoll edges (five epoll instances). */
+#define TASK_EPOLL_MAX_NESTS 4u
+
+/**
+ * @brief Borrow a watch's nested epoll while its target OFD is still live.
+ */
+static struct task_epoll *task_epoll_watch_target(const struct task_epoll_watch *watch)
+{
+    struct task_file *file = watch ? watch->file : NULL;
+    return file && (file->flags & TASK_FILE_FLAG_EPOLL)
+        ? (struct task_epoll *)(uintptr_t)file->aux : NULL;
+}
+
+/**
+ * @brief Measure the descendant chain and reject reaching the inserting epoll.
+ * @param epoll Stable graph node under the syscall execution transaction.
+ * @param inserting Node receiving the new edge.
+ * @param depth Number of existing descendant edges traversed.
+ * @return Maximum remaining height or -ELOOP for a cycle/overdeep graph.
+ */
+static int task_epoll_height(struct task_epoll *epoll, struct task_epoll *inserting,
+                              uint32_t depth)
+{
+    if (epoll == inserting || depth > TASK_EPOLL_MAX_NESTS) return -ELOOP;
+    int height = 0;
+    for (uint32_t i = 0; i < epoll->capacity; ++i) {
+        struct task_epoll_entry *entry = &epoll->item[i];
+        struct task_epoll *child = entry->active ? task_epoll_watch_target(entry->watch) : NULL;
+        if (!child) continue;
+        int below = task_epoll_height(child, inserting, depth + 1u);
+        if (below < 0) return below;
+        if (height < below + 1) height = below + 1;
+    }
+    return height;
+}
+
+/**
+ * @brief Measure all ancestor chains, including watchers in other processes.
+ * @param epoll Execution-owned graph node whose reverse links remain live.
+ * @param depth Existing ancestor edges traversed; bounds kernel stack use.
+ * @return Maximum ancestor height or -ELOOP for an invalid graph.
+ */
+static int task_epoll_ancestors(struct task_epoll *epoll, uint32_t depth)
+{
+    if (depth > TASK_EPOLL_MAX_NESTS) return -ELOOP;
+    int height = 0;
+    for (struct task_epoll_watch *watch = epoll->parents; watch; watch = watch->parent_next) {
+        int above = task_epoll_ancestors(watch->epoll, depth + 1u);
+        if (above < 0) return above;
+        if (height < above + 1) height = above + 1;
+    }
+    return height;
+}
+
+/**
+ * @brief Remove a nested watch's weak reverse link before its target can retire.
+ */
+static void task_epoll_watch_unlink_parent(struct task_epoll_watch *watch)
+{
+    struct task_epoll *target = task_epoll_watch_target(watch);
+    if (!target) return;
+    struct task_epoll_watch **cursor = &target->parents;
+    while (*cursor && *cursor != watch) cursor = &(*cursor)->parent_next;
+    if (*cursor) *cursor = watch->parent_next;
+    watch->parent_next = NULL;
+}
+
 /**
  * @brief Detach one watch from its borrowed target's reverse list.
  * @param watch Watch node to unlink; null is ignored.
@@ -90,6 +157,7 @@ static int task_epoll_grow(struct task_epoll *epoll)
 static void task_epoll_watch_detach(struct task_epoll_watch *watch)
 {
     if (!watch) return;
+    task_epoll_watch_unlink_parent(watch);
     struct task_epoll_watch **cursor = watch->file ? &watch->file->epoll_watches :
         (watch->pty ? &watch->pty->epoll_watches : NULL);
     while (cursor && *cursor && *cursor != watch) cursor = &(*cursor)->next;
@@ -140,6 +208,7 @@ void task_epoll_remove_file_description(struct task_file *description)
     while (description->epoll_watches) {
         struct task_epoll_watch *watch = description->epoll_watches;
         description->epoll_watches = watch->next;
+        task_epoll_watch_unlink_parent(watch);
         watch->file = NULL;
         removed |= task_epoll_watch_clear_entry(watch);
         kernel_free(watch);
@@ -262,8 +331,7 @@ bool task_epoll_poll_ready(struct task *task, struct task_file *file)
         uint64_t generation;
 
         if (!entry->active || entry->disabled || !watch ||
-            (!watch->file && !watch->pty) ||
-            (watch->file && (watch->file->flags & TASK_FILE_FLAG_EPOLL)))
+            (!watch->file && !watch->pty))
             continue;
         pollfd = (struct pollfd){
             .fd = entry->fd,
@@ -356,7 +424,8 @@ static int epoll_event_valid(uint32_t events)
  * @note Distinct descriptors referencing one OFD have separate registrations.
  * Closing a number alone does not remove the watch while any total OFD reference
  * (descriptor, SCM_RIGHTS, or in-flight I/O pin) remains.
- * Adding an epoll OFD as a target is unsupported and returns -EPERM.
+ * Nested epolls form a DAG of at most four edges. Self-watches return EINVAL;
+ * cycles and excessive nesting return ELOOP without publishing a watch.
  */
 int64_t syscall_epoll_ctl(uint64_t epfd_arg, uint64_t op_arg,
                                  uint64_t fd_arg, uint64_t event_ptr)
@@ -376,7 +445,9 @@ int64_t syscall_epoll_ctl(uint64_t epfd_arg, uint64_t op_arg,
     if (!task || epfd_arg > INT32_MAX || fd_arg > INT32_MAX) return -RELIEFOS_EBADF;
     epoll = task_epoll_for_fd(task, epfd);
     target = task_file_for_fd(task, fd);
-    if (!epoll || fd == epfd) return -RELIEFOS_EBADF;
+    if (!epoll) return -RELIEFOS_EBADF;
+    if (target && (target->flags & TASK_FILE_FLAG_EPOLL) &&
+        target->aux == (uint64_t)(uintptr_t)epoll) return -RELIEFOS_EINVAL;
     if (op != EPOLL_CTL_DEL && event_ptr) {
         int prep=epoll_prepare_user(task,event_ptr,sizeof(event),false);
         if(prep)return prep;
@@ -388,8 +459,6 @@ int64_t syscall_epoll_ctl(uint64_t epfd_arg, uint64_t op_arg,
         if (!epoll_event_valid(event.events) || (event.events & EPOLLEXCLUSIVE))
             return -RELIEFOS_EINVAL;
     }
-    if (op == EPOLL_CTL_ADD && target && (target->flags & TASK_FILE_FLAG_EPOLL))
-        return -RELIEFOS_EPERM;
     if (target) {
         target_pin = task_file_get(target);
         if (!target_pin) return -RELIEFOS_ENOMEM;
@@ -411,6 +480,15 @@ int64_t syscall_epoll_ctl(uint64_t epfd_arg, uint64_t op_arg,
     int64_t result = 0;
     if (op == EPOLL_CTL_ADD) {
         if (found >= 0) { result = -RELIEFOS_EEXIST; goto out; }
+        if (target_pin && (target_pin->flags & TASK_FILE_FLAG_EPOLL)) {
+            struct task_epoll *nested = (struct task_epoll *)(uintptr_t)target_pin->aux;
+            int below = task_epoll_height(nested, epoll, 0);
+            int above = task_epoll_ancestors(epoll, 0);
+            if (below < 0 || above < 0 || (uint32_t)(above + 1 + below) > TASK_EPOLL_MAX_NESTS) {
+                result = -ELOOP;
+                goto out;
+            }
+        }
         uint32_t slot = epoll->capacity;
         for (uint32_t i = 0; i < epoll->capacity; ++i) {
             if (epoll->item[i].active) continue;
@@ -429,6 +507,11 @@ int64_t syscall_epoll_ctl(uint64_t epfd_arg, uint64_t op_arg,
         if (target_pin) {
             watch->next = target_pin->epoll_watches;
             target_pin->epoll_watches = watch;
+            struct task_epoll *nested = task_epoll_watch_target(watch);
+            if (nested) {
+                watch->parent_next = nested->parents;
+                nested->parents = watch;
+            }
         } else {
             watch->next = pty_snapshot.description->epoll_watches;
             pty_snapshot.description->epoll_watches = watch;

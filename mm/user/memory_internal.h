@@ -232,8 +232,30 @@ uint32_t task_vma_count(const struct task *task);
 
 uint64_t task_vma_total_bytes(const struct task *task);
 
-/** @brief Check net virtual growth before MAP_FIXED destroys any existing VMA. */
-bool task_address_space_can_map(const struct task *task, uint64_t start, uint64_t end);
+/** @brief Check the net address-space cost before publishing a mapping.
+ * @param task Execution-owned MM. @param start Destination start.
+ * @param end Destination end. @param retiring Bytes at a separate remap source.
+ * @return True if the replacement fits the soft RLIMIT_AS. */
+bool task_address_space_can_map(const struct task *task, uint64_t start, uint64_t end,
+                                uint64_t retiring);
+
+/** @brief Test whether a VMA is chargeable as private writable data.
+ * @param prot Effective permissions. @param flags Internal VMA flags.
+ * @return True for ordinary private writable VMAs. The initial stack is tracked separately. */
+static inline bool task_vma_is_data(uint32_t prot, uint32_t flags)
+{
+    return (prot & TASK_VMA_PROT_WRITE) &&
+           !(flags & (TASK_VMA_FLAG_SHARED | TASK_VMA_FLAG_DEVICE));
+}
+
+/** @brief Read the data limit used by Linux VMA admission.
+ * @param task Execution-owned user task. @return Byte limit or LINUX_RLIM_INFINITY. */
+uint64_t task_vma_data_limit(const struct task *task);
+
+/** @brief Count private writable VMA bytes outside a replacement interval.
+ * @param task Execution-owned MM. @param start Excluded start or zero.
+ * @param end Excluded end or zero. @return Virtual data size in bytes. */
+uint64_t task_vma_data_bytes(const struct task *task, uint64_t start, uint64_t end);
 
 /**
  * Task unmap pages.

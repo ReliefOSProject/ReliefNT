@@ -14,10 +14,11 @@ struct linux_timespec;
 struct linux_timex;
 /** @brief Apply/query the actual clock discipline with privilege checked by the caller. */
 int time_adjust(struct linux_timex *value, bool privileged);
-/** @brief Read a supported wall/monotonic clock atomically across CPUs and IRQs.
+/** @brief Read a supported wall, monotonic or current CPU clock atomically.
  * @param clock Linux clock ID. @param value Writable caller-owned timespec output.
  * @return Zero or EINVAL for an unsupported clock; no pointer ownership transfer.
- * IRQ/task safe short clock lock; no allocation, scheduling or hardware wait.
+ * CPU clocks require task context and use scheduler_lock. Other clocks use
+ * the IRQ-safe clock lock. No allocation, scheduling or hardware wait.
  */
 int time_clock_get(int32_t clock, struct linux_timespec *value);
 /**
@@ -25,7 +26,8 @@ int time_clock_get(int32_t clock, struct linux_timespec *value);
  * @param clock Linux clock selector.
  * @param value Optional writable kernel result; NULL validates without copying.
  * @return Zero or EINVAL for an unsupported clock, leaving output unchanged on failure.
- * Task/IRQ-safe query under the clock lock, with no user access, allocation or ownership transfer.
+ * CPU clocks report scheduler tick granularity. Other clocks use the IRQ-safe
+ * clock lock. No user access, allocation or ownership transfer occurs.
  */
 int time_clock_getres(int32_t clock, struct linux_timespec *value);
 
