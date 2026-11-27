@@ -1,0 +1,39 @@
+==============
+ReliefNT 5.3.4
+==============
+
+更新内容
+========
+
+- 新增 VirtIO-GPU DRM/KMS，在宿主支持 VirGL 时提供 OpenGL 加速；用新的 DRM/KMS 后端替换旧 VMware SVGA II 驱动，保留兼容 vmwgfx 的用户态接口，并改进多种显示设备上的帧缓冲刷新。
+
+- 新增现代 PCI VirtIO-Block 驱动、RTL8139 和 Intel I225/I226-V 网卡支持；VMXNET3 增加 MSI-X 接收处理，NVMe 和 AHCI 增加中断驱动的读完成处理。
+
+- 新增 SquashFS 4.0 只读挂载，支持 fragment、扩展属性和 gzip、XZ、Zstd、LZ4、LZO、LZMA 压缩；修复 FAT 大簇读取、ext4 查找重试及文件映射在 I/O 有进展时过早失败的问题。
+
+- 为原生 x86-64 Linux ABI 增加 pidfd 和经典 BPF 的 seccomp 过滤模式；补齐 PIE 装载、事件描述符、嵌套 epoll、procfs、CPU 时钟和资源限制等语义，改善 Java、Electron 等运行时依赖的内核行为。
+
+- 增加 PTY 包模式和队列清空，修复真实 TTY 的行编辑及终端状态处理；内核日志统一等级与组件标记，默认过滤常规调试信息，运行期 COM1 输出改用队列与中断。
+
+- 降低调度器、页缓存和存储路径开销；修复 SMP 下的 FPU 状态交接、写时复制与 mprotect 后的跨核 TLB 同步，以及辅助 CPU 的缓存配置；改善非阻塞 Unix 套接字连接和 IPv6 地址绑定。
+
+破坏性更新
+==========
+
+- **是，涉及旧 VMware 显示驱动及内核模块配套。** 不再提供旧 SVGA II 后端；自定义配置需要改用新的 DRM 后端。旧版 ``.ko``、``Module.symvers``、模块 SDK 和 initramfs 不应与本版内核混用；现有磁盘不需要转换格式。
+
+更新与迁移注意事项
+==================
+
+- 本次为**源码发布**，不附内核、模块或镜像二进制。对已有配置运行 ``olddefconfig``，重新构建内核、模块和 initramfs，并保留一个可启动的回退版本。
+
+- VirtIO-Block 限于现代 PCI 传输，目前不能作 swap 后端；VirtIO-GPU 不宣称支持 Venus/Vulkan。SquashFS 仅支持只读块设备挂载，seccomp 过滤模式不支持严格模式或用户通知。
+
+- 本次发布检查覆盖版本生成、数字宏、版本后缀、procfs 宿主回归和三语文档；未重新编译完整内核、打包或运行整版 QEMU 回归。**VMware 验证未完成**，也未重新验证实体硬件。
+
+开发者提示
+==========
+
+- ``configs/build-version`` 的基准值为 **5.3.4**，生成数字字段为 **5/3/4**；``EXTRAVERSION``、``LOCALVERSION`` 与模块 ABI 后缀规则不变。pidfd 与 seccomp 是 Linux 扩展，不属于 POSIX。
+
+- 发布范围为上一版本提交 ``0a4f22a4fb6055ae36d27c6a5544eca6fa599b9a`` 之后至本次版本提交；仅包含 ReliefNT 仓库中的有效更改。
