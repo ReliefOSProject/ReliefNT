@@ -39,35 +39,35 @@ static int open_truncate_inode(struct task_file *file)
  * @param flags Sanitized native flags, including private O_PATH translation.
  * @param diagnostic Optional display name; never used for inode I/O.
  * @return Descriptor or negative errno with complete rollback. Writer admission
- * precedes truncation, including the temporary lease for O_RDONLY|O_TRUNC.
- * Optional provider capture belongs to this canonical OFD and rolls back on
- * every failure. O_PATH never captures, truncates or acquires a writer lease.
+ * precedes truncation. A writable regular description owns its attachment's
+ * writer charge, even without provider-private state. Optional provider state
+ * and the charge roll back together. O_PATH acquires neither and never truncates.
  * No graph/module lock spans provider callbacks or I/O.
  */
 static int open_inode_path(struct task *task,const struct vfs_path *path,uint32_t flags,
                               const char *diagnostic)
 {
     const struct storage_node *node=vfs_path_node(path);
-    int fd;
-    if(node->flags&STORAGE_NODE_FLAG_MEMFD) {
-        struct task_file *file=NULL;fd=task_allocate_fd(task,0,&file);if(fd<0)return fd;
+    struct task_file *file=NULL;
+    bool shmem=(node->flags&STORAGE_NODE_FLAG_MEMFD)!=0;
+    int fd,rc=0;
+    if(shmem) {
+        fd=task_allocate_fd(task,0,&file);if(fd<0)return fd;
         file->flags=flags;file->fd_flags=flags&LINUX_O_CLOEXEC ? RELIEFOS_FD_CLOEXEC : 0;
-        int rc=task_shm_reopen(file,path);
-        if(!rc && !(flags&TASK_FILE_FLAG_PATH) && (flags&LINUX_O_TRUNC))rc=open_truncate_inode(file);
-        if(rc){task_discard_file_fd(task,fd);return rc;}
-        return fd;
+        rc=task_shm_reopen(file,path);
+    } else {
+        fd=alloc_task_fd(task,node,flags,diagnostic);if(fd<0)return fd;
+        file=task_file_for_fd(task,fd);task_file_bind_path(file,path);
     }
-    fd=alloc_task_fd(task,node,flags,diagnostic);
-    if(fd<0){return fd;}
-    struct task_file *file=task_file_for_fd(task,fd);task_file_bind_path(file,path);
-    if(!(flags&TASK_FILE_FLAG_PATH)) {
-        int rc=vfs_file_open(path,flags,&file->provider_file);
-        if(rc){task_discard_file_fd(task,fd);return rc;}
+    if(!rc && !(flags&TASK_FILE_FLAG_PATH)) {
+        if(node->type==RELIEFOS_FS_TYPE_FILE && file_can_write(file)) {
+            rc=vfs_path_write_get(&file->path_ref);
+            if(!rc)file->mount_write_access=true;
+        }
+        if(!rc && !shmem)rc=vfs_file_open(path,flags,&file->provider_file);
+        if(!rc && node->type==RELIEFOS_FS_TYPE_FILE && (flags&LINUX_O_TRUNC))rc=open_truncate_inode(file);
     }
-    if(!(flags&TASK_FILE_FLAG_PATH) && node->type==RELIEFOS_FS_TYPE_FILE && (flags&LINUX_O_TRUNC)) {
-        int rc=open_truncate_inode(file);
-        if(rc){task_discard_file_fd(task,fd);return rc;}
-    }
+    if(rc){task_discard_file_fd(task,fd);return rc;}
     return fd;
 }
 
@@ -81,7 +81,8 @@ static int open_inode_path(struct task *task,const struct vfs_path *path,uint32_
  * @return Descriptor, negative errno or FIFO blocking sentinel. Existing
  * O_CREAT files keep their metadata; dangling links create at their actual
  * target, O_EXCL never follows the final link, and O_PATH avoids inode/device
- * open side effects. Every published OFD retains its mount before final puts.
+ * open side effects. A writable regular OFD holds a writer charge on its
+ * selected attachment until the last reference retires.
  */
 int64_t syscall_open_object(struct vfs_namespace *ns,struct task *task,int32_t dirfd,
                                uint64_t pathname,uint32_t flags,uint32_t mode)

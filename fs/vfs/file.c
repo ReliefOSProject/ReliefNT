@@ -139,6 +139,29 @@ int vfs_mount_set_flags(struct vfs_mount *mount,uint64_t flags)
     mount->policy=vfs_policy_bits(flags);return 0;
 }
 
+/** @brief Change only the exact attached root's policy for MS_BIND|MS_REMOUNT.
+ * @param path Borrowed retained mount root, not an interior dentry.
+ * @param flags Remount flags without MS_BIND and MS_REMOUNT. Supported shared
+ * policy bits and MS_REC are ignored; no submount or superblock is changed.
+ * @return Zero, EINVAL for a non-mount root, EOPNOTSUPP for unsupported flags,
+ * or EBUSY for a readonly transition with local writers. Validation and
+ * policy publication are serialized by execution ownership, with no backend
+ * reconfiguration. Omitted atime flags preserve the attachment's selection.
+ */
+int vfs_path_bind_remount(const struct vfs_path *path,uint64_t flags)
+{
+    if(!vfs_path_valid(path) || !path->mount->ns || path->dentry!=path->mount->root)return -EINVAL;
+    if(flags&~(VFS_MOUNT_POLICY_MASK|VFS_SUPER_POLICY_MASK|MS_STRICTATIME|MS_REC))return -EOPNOTSUPP;
+    struct vfs_mount *mount=path->mount;
+    const uint64_t atime=MS_NOATIME|MS_NODIRATIME|MS_RELATIME;
+    if(!(flags&(atime|MS_STRICTATIME)))flags|=mount->policy&atime;
+    else if(flags&MS_NOATIME)flags&=~MS_RELATIME;
+    else flags|=MS_RELATIME;
+    uint64_t policy=vfs_policy_bits(flags);
+    if(mount->writers && (policy&MS_RDONLY) && !(vfs_path_mount_flags(path)&MS_RDONLY))return -EBUSY;
+    mount->policy=policy;return 0;
+}
+
 /** @brief Reconfigure the selected attachment after shared backend preparation.
  * @param path Borrowed actual attached filesystem root, required.
  * @param flags Requested supported MS flags; omitted atime preserves old bits.

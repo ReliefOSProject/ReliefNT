@@ -248,6 +248,15 @@ int vfs_path_remount(const struct vfs_path *path,uint64_t flags);
  * Caller holds execution ownership and has checked CAP_SYS_ADMIN.
  */
 int vfs_path_remount_options(const struct vfs_path *path,uint64_t flags,const char *options);
+/** @brief Apply bind-remount flags only to the exact selected attachment.
+ * @param path Borrowed retained mount root under execution ownership.
+ * @param flags Requested flags without MS_BIND and MS_REMOUNT.
+ * Supported shared policy bits and MS_REC are ignored, as are submounts.
+ * @return Zero or negative errno, leaving policy unchanged on failure. A new
+ * readonly transition with writers on this attachment returns EBUSY; shared
+ * backend flags stay effective and no provider reconfiguration is invoked.
+ */
+int vfs_path_bind_remount(const struct vfs_path *path,uint64_t flags);
 struct vfs_boot_mount {
     const char *target;
     /* Transfer one detached owned mount only on success; callbacks/context
@@ -313,6 +322,17 @@ int vfs_path_dirent_stat(const struct vfs_path *directory,const char *name,struc
  * @return Zero or negative errno; no namespace lookup or lock across I/O.
  */
 int vfs_path_statfs(const struct vfs_path *path,struct linux_statfs_abi *out);
+/** @brief Acquire one writer charge on a held regular file's attachment.
+ * @param path Borrowed path retained by the caller until vfs_path_write_put.
+ * @return Zero or negative errno. Execution ownership serializes access with
+ * per-mount policy changes; no additional path or inode reference is taken.
+ */
+int vfs_path_write_get(const struct vfs_path *path);
+/** @brief Release the writer charge before dropping its path reference.
+ * @param path Retained path on which vfs_path_write_get succeeded.
+ * Caller holds execution ownership and consumes exactly one charge.
+ */
+void vfs_path_write_put(const struct vfs_path *path);
 /** @brief Write through a retained inode after caller DAC/writer admission.
  * @param path Borrowed file path retaining its provider.
  * @param offset Nonnegative byte offset.

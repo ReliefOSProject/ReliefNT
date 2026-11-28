@@ -49,7 +49,8 @@ static void clear_task_files(struct task *task);
  * @note A final canonical release detaches weak epoll watches before releasing
  * OFD-owned resources. SCM queue and in-flight I/O references use this same path.
  * Captured provider state closes before its inode/path/code can retire. Caller
- * holds execution ownership without graph/scheduler/module locks across cleanup.
+ * holds execution ownership without graph/scheduler/module locks across cleanup;
+ * the attachment writer charge ends before its OFD-owned path is released.
  */
 int clear_task_file_result(struct task_file *file)
 {
@@ -112,6 +113,8 @@ int clear_task_file_result(struct task_file *file)
         file->aux2 != 0) {
         input_evdev_release(file->node.first_cluster, file->aux2);
     }
+    if(file->mount_write_access)vfs_path_write_put(&file->path_ref);
+    file->mount_write_access=false;
     vfs_path_put(&file->path_ref);
     file->used = 0;
     file->kind = 0;
@@ -221,14 +224,15 @@ struct task_file *task_file_get(struct task_file *source)
 }
 
 /** @brief Give a canonical OFD an independent reference to its actual path.
- * @param file Live descriptor or canonical OFD, borrowed under execution ownership.
+ * @param file Live descriptor or canonical OFD without an attachment writer
+ * charge, borrowed under execution ownership.
  * @param path Borrowed held path or NULL to detach a former binding.
  * Retains before releasing, so rebinding to the same pair is safe. No allocation;
  * final backend release may perform I/O and runs without a mount graph lock.
  */
 void task_file_bind_path(struct task_file *file,const struct vfs_path *path)
 {
-    file=task_file_description(file);if(!file || !file->used)return;
+    file=task_file_description(file);if(!file || !file->used || file->mount_write_access)return;
     struct vfs_path next={0};vfs_path_get(path,&next);
     struct vfs_path old=file->path_ref;file->path_ref=next;vfs_path_put(&old);
 }

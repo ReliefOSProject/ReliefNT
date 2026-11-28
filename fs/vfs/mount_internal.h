@@ -31,6 +31,7 @@ struct vfs_mount {
     void *context;
     struct module *owner;
     uint64_t references,id,policy;
+    uint64_t writers; /* Open writable file descriptions on this attachment. */
     char *source,*filesystem;
     uint64_t device;
 };

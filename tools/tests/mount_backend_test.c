@@ -270,6 +270,19 @@ void task_socket_collect(void) {}
 /* The device entry point must route these tests to a real PTY endpoint. */
 int task_shm_attach(struct task_file *file, uint32_t size)
 { (void)file; (void)size; abort(); }
+/** @brief Reject anonymous shmem in the regular-file mount fixture.
+ * @param file Unexpected destination OFD. @param path Unexpected memfd path.
+ * @return Does not return; the fixture does not create a memfd.
+ */
+int task_shm_reopen(struct task_file *file,const struct vfs_path *path)
+{ (void)file; (void)path; abort(); }
+/** @brief Reject FIFO rendezvous in the regular-file mount fixture.
+ * @param task Unexpected caller. @param node Unexpected FIFO, nullable on retry.
+ * @param flags Unexpected open flags. @param path Unexpected diagnostic name.
+ * @return Does not return; the fixture does not open FIFOs.
+ */
+int task_fifo_open(struct task *task,const struct storage_node *node,uint32_t flags,const char *path)
+{ (void)task; (void)node; (void)flags; (void)path; abort(); }
 uint64_t input_evdev_cursor_now(void) { abort(); }
 uint32_t task_evdev_vt_hint(const struct task *task) { (void)task; abort(); }
 
@@ -2968,6 +2981,93 @@ static void runtime_recursive_bind(struct vfs_namespace *ns,const struct vfs_pat
     puts("PASS recursive bind: subdirectory boundary, sibling/nested topology, distinct policies and OOM rollback");
 }
 
+/** @brief Exercise per-attachment bind remount and canonical OFD writer lifetime.
+ * @param ns Borrowed test namespace with both source and destination visible.
+ * @param root Held namespace root. @param fs Base tmpfs for fixture mountpoints.
+ */
+static void runtime_bind_remount(struct vfs_namespace *ns,const struct vfs_path *root,
+                                 struct tmpfs_super *fs)
+{
+    struct {
+        char source[32],target[32],source_file[40],target_file[40];
+    } user={"/bind-remount-source","/bind-remount-target",
+        "/bind-remount-source/data","/bind-remount-target/data"};
+    assert(!tmpfs_create(fs,user.source,LINUX_S_IFDIR|0755,NULL,NULL));
+    assert(!tmpfs_create(fs,user.target,LINUX_S_IFDIR|0755,NULL,NULL));
+    struct task actor={.pid=905,.fsuid=1000,.fsgid=1000,.cap_effective=1ULL<<CAP_SYS_ADMIN};
+    sched_task_limits(&actor)->nofile.rlim_cur=32;
+    vfs_path_get(root,&actor.fs_paths.root);vfs_path_get(root,&actor.fs_paths.cwd);
+    lookup_user_base=(uintptr_t)&user;lookup_user_bytes=sizeof(user);
+    uint64_t source=(uintptr_t)user.source,target=(uintptr_t)user.target;
+    const uint64_t remount=MS_BIND|MS_REMOUNT;
+    struct vfs_path point={0},original={0},bound={0},child={0};
+    struct vfs_mount *mount=NULL;
+    assert(!vfs_path_lookup(ns,root,root,user.source,0,&point));
+    assert(!storage_new_tmpfs_mount("bind-fixture",MS_NOATIME,"size=32768",1000,1000,&mount));
+    assert(!vfs_mount_attach(ns,mount,&point));vfs_mount_put(mount);vfs_path_put(&point);
+    assert(!vfs_path_lookup(ns,root,root,user.source,0,&original));
+    struct reliefos_permissions mode={0600,1000,1000};
+    assert(!vfs_path_new_file(&original,"data",&mode,&point));vfs_path_put(&point);
+    mode.mode=0755;
+    assert(!vfs_path_create_node(&original,"child",LINUX_S_IFDIR,&mode,NULL,&point));
+    assert(!storage_new_tmpfs_mount("bind-child",MS_RELATIME,NULL,1000,1000,&mount));
+    assert(!vfs_mount_attach(ns,mount,&point));vfs_mount_put(mount);vfs_path_put(&point);
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,source,target,UINT64_MAX,MS_BIND|MS_REC,UINT64_MAX));
+    assert(!vfs_path_lookup(ns,root,root,user.target,0,&bound));
+    assert(!vfs_path_lookup(ns,root,&bound,"child",0,&child));
+
+    int source_fd=syscall_open_object(ns,&actor,LINUX_AT_FDCWD,(uintptr_t)user.source_file,LINUX_O_RDWR,0);
+    int path_fd=syscall_open_object(ns,&actor,LINUX_AT_FDCWD,(uintptr_t)user.target_file,LINUX_O_PATH,0);
+    assert(source_fd>=0 && path_fd>=0);
+    const uint64_t policy=MS_RDONLY|MS_NOSUID|MS_NODEV|MS_NOEXEC;
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,UINT64_MAX,target,UINT64_MAX,
+                             remount|policy|MS_SYNCHRONOUS|MS_REC,UINT64_MAX));
+    assert(vfs_path_mount_flags(&bound)==(policy|MS_NOATIME));
+    assert(vfs_path_mount_flags(&original)==MS_NOATIME && vfs_path_mount_flags(&child)==MS_RELATIME);
+    struct linux_statfs_abi stats;
+    assert(!vfs_path_statfs(&bound,&stats) && stats.f_blocks==8 &&
+        (stats.f_flags&~LINUX_ST_VALID)==(policy|MS_NOATIME));
+    char table[4096];uint32_t count=0;
+    assert(!vfs_read_mount_table(ns,root,true,0,table,sizeof(table)-1,&count));table[count]=0;
+    assert(strstr(table," /bind-remount-target ro,nosuid,nodev,noexec,noatime - tmpfs bind-fixture rw\n"));
+    struct task_file *origin=task_file_for_fd(&actor,source_fd);
+    assert(!vfs_path_write(&origin->path_ref,0,"x",1,&count) && count==1);
+    assert(syscall_open_object(ns,&actor,LINUX_AT_FDCWD,(uintptr_t)user.target_file,LINUX_O_WRONLY,0)==-EROFS);
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,(uintptr_t)user.target_file,0,remount,0)==-EINVAL);
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,target,0,remount|MS_NODIRATIME,0));
+    assert(vfs_path_mount_flags(&bound)==(MS_NODIRATIME|MS_RELATIME));
+
+    int fd=syscall_open_object(ns,&actor,LINUX_AT_FDCWD,(uintptr_t)user.target_file,LINUX_O_RDWR,0);
+    assert(fd>=0 && !task_file_for_fd(&actor,fd)->provider_file);
+    int duplicate=task_duplicate_file_fd(&actor,fd,0,0);
+    assert(duplicate>=0 && duplicate!=fd);
+    /* A mapping retains the canonical OFD with the same get/put pair. */
+    struct task_file *mapping_pin=task_file_get(task_file_for_fd(&actor,duplicate));assert(mapping_pin);
+    task_discard_file_fd(&actor,fd);
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,target,0,remount|policy,0)==-EBUSY);
+    task_discard_file_fd(&actor,duplicate);
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,target,0,remount|policy,0)==-EBUSY);
+    assert(vfs_path_mount_flags(&bound)==(MS_NODIRATIME|MS_RELATIME));
+    task_file_put(mapping_pin);
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,target,0,remount|policy|MS_STRICTATIME,0));
+    assert(vfs_path_mount_flags(&bound)==policy);
+    task_discard_file_fd(&actor,source_fd);task_discard_file_fd(&actor,path_fd);
+
+    assert(!vfs_path_remount(&original,MS_RDONLY));
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,target,0,remount,0));
+    assert(vfs_path_mount_flags(&bound)==MS_RDONLY && vfs_path_mount_flags(&child)==MS_RELATIME);
+    assert(!vfs_path_remount(&original,0));
+    assert(!(vfs_path_mount_flags(&bound)&MS_RDONLY));
+    assert(!vfs_mount_unmount(ns,&child));vfs_path_put(&child);
+    assert(!vfs_mount_unmount(ns,&bound));vfs_path_put(&bound);
+    assert(!vfs_path_lookup(ns,root,&original,"child",0,&child));
+    assert(!vfs_mount_unmount(ns,&child));vfs_path_put(&child);
+    assert(!vfs_mount_unmount(ns,&original));vfs_path_put(&original);
+    vfs_path_put(&actor.fs_paths.root);vfs_path_put(&actor.fs_paths.cwd);
+    lookup_user_base=lookup_user_bytes=0;
+    puts("PASS bind remount: local policy, shared readonly, and stateless writer until final OFD put");
+}
+
 /** @brief Check real deferred-script rewriting, final DAC and OOM ownership.
  * @param fs Borrowed initial memory filesystem with no published namespace.
  * @return None. Uses actual namei/inodes/script parser, retires every task
@@ -3074,6 +3174,7 @@ int main(int argc,char **argv)
     runtime_attachment_policies(&ns,&root);
     runtime_mount_syscalls(&ns,&root,fs);
     runtime_recursive_bind(&ns,&root,fs);
+    runtime_bind_remount(&ns,&root,fs);
     device_mount_objects(&ns,&root,fs);
     assert(!vfs_path_lookup(&ns,&root,&root,"mnt",VFS_LOOKUP_FOLLOW,&old_dir));
     assert(!vfs_path_lookup(&ns,&root,&old_dir,"old",VFS_LOOKUP_FOLLOW,&old_file));

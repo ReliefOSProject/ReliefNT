@@ -281,9 +281,11 @@ int task_file_reference(struct task_file *destination, struct task_file *source)
 struct task_file *task_file_get(struct task_file *source);
 
 /** @brief Bind an authorized held path to the canonical open-file description.
- * @param file Live descriptor or canonical OFD under execution ownership.
+ * @param file Live descriptor or canonical OFD under execution ownership,
+ * without an active attachment writer charge.
  * @param path Borrowed path; NULL clears the previous binding.
- * Takes the new reference before dropping the old one, without allocation.
+ * Ignores descriptions with an active writer charge. Otherwise takes the
+ * new reference before dropping the old one, without allocation.
  * Dup/fork/in-flight/VMA references share this one OFD-owned mount lifetime;
  * final close releases it after file/device callbacks. No graph lock is held.
  */

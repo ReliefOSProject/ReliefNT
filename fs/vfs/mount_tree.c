@@ -85,6 +85,30 @@ void vfs_path_get(const struct vfs_path *source,struct vfs_path *out)
     *out=*source;++out->mount->references;++out->dentry->references;
 }
 
+/** @brief Admit a writer on the exact attachment held by a regular-file OFD.
+ * @param path Borrowed retained path, held until the matching release.
+ * @return Zero, EINVAL for an invalid path, EROFS for either readonly layer,
+ * or EOVERFLOW. Execution ownership serializes admission with remount; this
+ * acquires no path, inode, backend write lease or allocation of its own.
+ */
+int vfs_path_write_get(const struct vfs_path *path)
+{
+    if(!vfs_path_valid(path))return -EINVAL;
+    struct vfs_mount *mount=path->mount;
+    if((mount->policy|vfs_super_flags(mount))&MS_RDONLY)return -EROFS;
+    if(mount->writers==UINT64_MAX)return -EOVERFLOW;
+    ++mount->writers;return 0;
+}
+
+/** @brief Retire one attachment writer before giving up its holding path.
+ * @param path Live retained path whose attachment owns the writer charge.
+ * Execution ownership is required; no inode or path reference is consumed.
+ */
+void vfs_path_write_put(const struct vfs_path *path)
+{
+    --path->mount->writers;
+}
+
 /* The root has one permanent mount-owned reference. A child retains its
  * parent dentry once, independently of the number of paths to the child. */
 void vfs_dentry_put(struct vfs_mount *mount,struct vfs_dentry *dentry)
