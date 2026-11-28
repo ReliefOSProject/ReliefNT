@@ -26,13 +26,19 @@ void vfs_rename_abort(struct vfs_rename *change)
     kernel_free(change->name);kernel_free(change);
 }
 
+/** @brief Prepare rename on one attachment, even if held after lazy detach.
+ * @param ns Borrowed execution-owned namespace. @param source Retained inode.
+ * @param parent Held destination directory on the same attachment.
+ * @param name Borrowed new basename. @param out Receives owned change on success.
+ * @return Zero or negative errno without mutating the source or destination.
+ */
 int vfs_rename_prepare(struct vfs_namespace *ns,const struct vfs_path *source,
                          const struct vfs_path *parent,const char *name,
                          struct vfs_rename **out)
 {
     if(!out)return -EINVAL;*out=NULL;
     if(!ns || !vfs_path_valid(source) || !vfs_path_valid(parent) || !name)return -EINVAL;
-    if(source->mount->ns!=ns || parent->mount->ns!=ns || source->mount!=parent->mount)return -EXDEV;
+    if(source->mount!=parent->mount || !vfs_path_walkable(ns,source))return -EXDEV;
     if(parent->dentry->node.type!=RELIEFOS_FS_TYPE_DIR)return -ENOTDIR;
     if(source->dentry->disconnected || parent->dentry->disconnected)return -ENOENT;
     if(source->dentry==source->mount->root || vfs_path_covered(ns,source))return -EBUSY;

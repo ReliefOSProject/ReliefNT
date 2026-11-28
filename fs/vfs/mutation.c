@@ -18,10 +18,16 @@ static unsigned vfs_notify_last_link(const struct vfs_path *path)
     return rc ? 2 : status.st_nlink<=1 ? 1 : 0;
 }
 
+/** @brief Remove a retained member without crossing a mountpoint.
+ * @param ns Borrowed execution-owned namespace. @param path Retained member,
+ * possibly in an attachment retained after lazy detach.
+ * @param directory True for rmdir, false for unlink.
+ * @return Zero or negative policy/type/provider errno.
+ */
 int vfs_path_remove(struct vfs_namespace *ns,const struct vfs_path *path,bool directory)
 {
     if(!ns || !vfs_path_valid(path))return -EINVAL;
-    if(path->mount->ns!=ns)return -EXDEV;
+    if(!vfs_path_walkable(ns,path))return -EXDEV;
     if(path->dentry->disconnected)return -ENOENT;
     if(path->dentry==path->mount->root || vfs_path_covered(ns,path))return -EBUSY;
     if((path->dentry->node.type==RELIEFOS_FS_TYPE_DIR)!=directory)
@@ -67,12 +73,18 @@ int vfs_path_rename(struct vfs_namespace *ns,const struct vfs_path *source,
     vfs_rename_abort(change);return rc ? rc : -EIO;
 }
 
+/** @brief Link a live inode within one writable attachment.
+ * @param ns Borrowed execution-owned namespace. @param source Retained inode.
+ * @param parent Retained directory on the same attachment; lazy detach does
+ * not revoke a held attachment. @param name Borrowed destination basename.
+ * @return Zero or negative preflight/provider errno.
+ */
 int vfs_path_link(struct vfs_namespace *ns,const struct vfs_path *source,
                      const struct vfs_path *parent,const char *name)
 {
     if(!ns || !vfs_path_valid(source) || !vfs_path_valid(parent))return -EINVAL;
     if(source->dentry->node.type==RELIEFOS_FS_TYPE_DIR)return -EPERM;
-    if(source->mount!=parent->mount || source->mount->ns!=ns)return -EXDEV;
+    if(source->mount!=parent->mount || !vfs_path_walkable(ns,source))return -EXDEV;
     if(vfs_path_mount_flags(source)&MS_RDONLY)return -EROFS;
     struct vfs_path existing={0};int rc=vfs_path_lookup_child(parent,name,&existing);
     if(!rc){vfs_path_put(&existing);return -EEXIST;}

@@ -2892,7 +2892,7 @@ static void runtime_mount_syscalls(struct vfs_namespace *ns,const struct vfs_pat
     assert(!vfs_path_lookup(ns,root,root,user.target,0,&mounted));
     assert(vfs_path_context(&mounted)==volume && (vfs_path_mount_flags(&mounted)&MS_RDONLY));vfs_path_put(&mounted);
     assert(scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,target,0x100,0,0,0)==-EINVAL);
-    assert(scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,target,MNT_DETACH,0,0,0)==-EOPNOTSUPP);
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,target,MNT_FORCE,0,0,0)==-EOPNOTSUPP);
     strcpy(user.source,"/syscall-link");
     assert(scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,source,UMOUNT_NOFOLLOW,0,0,0)==-EINVAL);
     assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,source,0,0,0,0));
@@ -2979,6 +2979,92 @@ static void runtime_recursive_bind(struct vfs_namespace *ns,const struct vfs_pat
     vfs_path_put(&point);vfs_path_put(&actor.fs_paths.root);vfs_path_put(&actor.fs_paths.cwd);
     lookup_user_base=lookup_user_bytes=0;
     puts("PASS recursive bind: subdirectory boundary, sibling/nested topology, distinct policies and OOM rollback");
+}
+
+/** @brief Verify lazy detach hides a mount tree without revoking retained paths.
+ * @param ns Borrowed namespace under fixture execution ownership.
+ * @param root Retained namespace anchor. @param fs Base tmpfs for the fixture.
+ */
+static void runtime_lazy_unmount(struct vfs_namespace *ns,const struct vfs_path *root,
+                                 struct tmpfs_super *fs)
+{
+    const struct reliefos_permissions mode={0755,1000,1000};
+    const struct reliefos_permissions file_mode={0644,1000,1000};
+    assert(!tmpfs_create(fs,"/lazy-root",LINUX_S_IFDIR|0755,NULL,NULL));
+    assert(!tmpfs_create(fs,"/lazy-link",LINUX_S_IFLNK|0777,"lazy-root",NULL));
+    struct vfs_path cover={0},top={0},point={0},child={0},alias={0},result={0};
+    assert(!vfs_path_lookup(ns,root,root,"/lazy-root",0,&cover));
+    struct vfs_mount *mount=NULL;
+    assert(!storage_new_tmpfs_mount("lazy-parent",0,NULL,1000,1000,&mount));
+    assert(!vfs_mount_attach(ns,mount,&cover));vfs_mount_put(mount);
+    assert(!vfs_path_lookup(ns,root,root,"/lazy-root",0,&top));
+    struct storage_volume *outer=vfs_path_context(&top);
+    assert(!vfs_path_create_node(&top,"child",LINUX_S_IFDIR,&mode,NULL,&point));
+    assert(!storage_new_tmpfs_mount("lazy-child",0,NULL,1000,1000,&mount));
+    assert(!vfs_mount_attach(ns,mount,&point));vfs_mount_put(mount);
+    vfs_path_put(&point);
+    assert(!vfs_path_lookup(ns,root,&top,"child",0,&child));
+    struct storage_volume *inner=vfs_path_context(&child);
+    struct vfs_path source={0};
+    assert(!vfs_path_create_node(&child,"view",LINUX_S_IFDIR,&mode,NULL,&source));
+    assert(!vfs_path_create_node(&child,"alias",LINUX_S_IFDIR,&mode,NULL,&point));
+    assert(!vfs_path_new_file(&source,"data",&file_mode,&result));
+    uint32_t count=0;
+    assert(!vfs_path_write(&result,0,"old",3,&count) && count==3);
+    vfs_path_put(&result);
+    assert(!vfs_mount_bind(ns,&source,&point));
+    vfs_path_put(&source);vfs_path_put(&point);
+    assert(!vfs_path_lookup(ns,root,&child,"alias",0,&alias));
+
+    struct task actor={.pid=904,.fsuid=1000,.fsgid=1000};
+    sched_task_limits(&actor)->nofile.rlim_cur=32;
+    vfs_path_get(root,&actor.fs_paths.root);vfs_path_get(&alias,&actor.fs_paths.cwd);
+    struct {char target[24],link[24],base[4],file[8],cwd[64];} user={
+        .target="/lazy-root",.link="/lazy-link",.base="/",.file="data"};
+    lookup_user_base=(uintptr_t)&user;lookup_user_bytes=sizeof(user);
+    const uint64_t target=(uintptr_t)user.target,link=(uintptr_t)user.link;
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,target,MNT_DETACH,0,0,0)==-EPERM);
+    actor.cap_effective=1ULL<<CAP_SYS_ADMIN;
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,target,0,0,0,0)==-EBUSY);
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,link,MNT_DETACH|UMOUNT_NOFOLLOW,0,0,0)==-EINVAL);
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,link,MNT_DETACH,0,0,0));
+    assert(!actor.lookup_scope.armed && outer->ready && inner->ready);
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,target,MNT_DETACH|MNT_EXPIRE,0,0,0)==-EINVAL);
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,(uintptr_t)user.base,MNT_DETACH,0,0,0)==-EBUSY);
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,target,MNT_DETACH,0,0,0)==-EINVAL);
+    assert(!vfs_path_namespace(&top) && !vfs_path_namespace(&child) && !vfs_path_namespace(&alias));
+    assert(!vfs_path_lookup(ns,root,root,user.target,0,&result) && vfs_path_equal(&result,&cover));
+    vfs_path_put(&result);
+    assert(vfs_path_lookup(ns,root,root,"/lazy-root/child",0,&result)==-ENOENT);
+    assert(!vfs_path_lookup(ns,root,&top,"child",0,&result));
+    assert(vfs_path_same_filesystem(&result,&top));vfs_path_put(&result);
+    char text[4096];
+    assert(!vfs_read_mount_table(ns,root,true,0,text,sizeof(text)-1,&count));text[count]=0;
+    assert(!strstr(text,"lazy-root") && !strstr(text,"lazy-child"));
+    assert(!vfs_path_lookup(ns,root,&alias,"..",0,&result) && vfs_path_equal(&result,&alias));
+    vfs_path_put(&result);
+    assert(syscall_directory(ns,&actor,LINUX_SYS_GETCWD,(uintptr_t)user.cwd,sizeof(user.cwd))==(int64_t)sizeof("(unreachable)/"));
+    assert(!strcmp(user.cwd,"(unreachable)/"));
+
+    int fd=syscall_open_object(ns,&actor,LINUX_AT_FDCWD,(uintptr_t)user.file,LINUX_O_RDONLY,0);
+    assert(fd>=0);
+    const struct vfs_path *file=&task_file_for_fd(&actor,fd)->path_ref;
+    assert(!vfs_path_read(file,0,text,sizeof(text),&count) && count==3 && !memcmp(text,"old",3));
+    assert(!vfs_path_format_link(NULL,NULL,file,text,sizeof(text)) && !strcmp(text,"/data"));
+    assert(!vfs_path_rename(ns,file,&alias,"renamed"));
+    assert(!vfs_path_link(ns,file,&alias,"hardlink"));
+    assert(!vfs_path_remove(ns,file,false));
+    assert(!vfs_path_read(file,0,text,sizeof(text),&count) && count==3 && !memcmp(text,"old",3));
+    vfs_path_put(&actor.fs_paths.root);vfs_path_put(&actor.fs_paths.cwd);
+    vfs_path_put(&cover);vfs_path_put(&top);vfs_path_put(&child);vfs_path_put(&alias);
+    assert(inner->ready);task_discard_file_fd(&actor,fd);
+    assert(outer->ready && inner->ready && vfs_reclaim_pending());
+    for(unsigned attempt=0;attempt<3 && vfs_reclaim_pending();++attempt)
+        assert(vfs_reclaim_mounts(8));
+    assert(!vfs_reclaim_pending());
+    assert(!outer->ready && !inner->ready);
+    lookup_user_base=lookup_user_bytes=0;
+    puts("PASS lazy unmount: immediate subtree removal, held paths, mount-root boundary and deferred cleanup");
 }
 
 /** @brief Exercise per-attachment bind remount and canonical OFD writer lifetime.
@@ -3175,6 +3261,7 @@ int main(int argc,char **argv)
     runtime_mount_syscalls(&ns,&root,fs);
     runtime_recursive_bind(&ns,&root,fs);
     runtime_bind_remount(&ns,&root,fs);
+    runtime_lazy_unmount(&ns,&root,fs);
     device_mount_objects(&ns,&root,fs);
     assert(!vfs_path_lookup(&ns,&root,&root,"mnt",VFS_LOOKUP_FOLLOW,&old_dir));
     assert(!vfs_path_lookup(&ns,&root,&old_dir,"old",VFS_LOOKUP_FOLLOW,&old_file));

@@ -129,8 +129,9 @@ void vfs_dentry_put(struct vfs_mount *mount,struct vfs_dentry *dentry)
 
 /** @brief Release final root ownership before finish or deferred reclamation.
  * @param mount Owned live reference or NULL, under execution ownership.
- * @return None. Final failure transfers the rootless backend and provider pin
- * to the private FIFO; no allocation or graph/module lock spans callbacks.
+ * @return None. Lazy detach and final finish failure transfer the rootless
+ * mount/provider pin to the FIFO; lazy detach never flushes in this path.
+ * No allocation or graph/module lock spans callbacks.
  */
 void vfs_mount_put(struct vfs_mount *mount)
 {
@@ -138,7 +139,7 @@ void vfs_mount_put(struct vfs_mount *mount)
     vfs_lookup_cache_purge(mount);
     if(!mount->bind_source.mount)vfs_dentry_put(mount,mount->root);
     mount->root=NULL;
-    if(!vfs_finish_retirement(mount))vfs_queue_retirement(mount);
+    if(mount->lazy_detached || !vfs_finish_retirement(mount))vfs_queue_retirement(mount);
 }
 
 void vfs_path_put(struct vfs_path *path)
@@ -148,10 +149,16 @@ void vfs_path_put(struct vfs_path *path)
     vfs_dentry_put(old.mount,old.dentry);vfs_mount_put(old.mount);
 }
 
+/** @brief Set diagnostic identity on an unpublished mount.
+ * @param mount Owned mount never published in a namespace.
+ * @param source Nonempty backing label. @param filesystem Nonempty type name.
+ * @param device Linux encoded device number.
+ * @return Zero or negative errno; a lazily detached mount cannot be renamed.
+ */
 int vfs_mount_describe(struct vfs_mount *mount,const char *source,const char *filesystem,uint64_t device)
 {
     if(!mount || !source || !source[0] || !filesystem || !filesystem[0])return -EINVAL;
-    if(mount->ns || mount->point.mount)return -EBUSY;
+    if(mount->ns || mount->point.mount || mount->lazy_detached)return -EBUSY;
     size_t source_length=0,type_length=0;
     while(source[source_length])if(++source_length>=VFS_PATH_MAX)return -ENAMETOOLONG;
     while(filesystem[type_length]) {
@@ -213,9 +220,13 @@ int vfs_path_anonymous(struct vfs_mount *mount,const struct storage_node *node,s
     struct vfs_path value={mount,dentry};vfs_path_get(&value,out);return 0;
 }
 
+/** @brief Retain an unpublished mount as the permanent namespace anchor.
+ * @param ns Borrowed empty namespace. @param root Borrowed unpublished root.
+ * @return Zero or negative errno. Previously lazily detached roots are rejected.
+ */
 int vfs_namespace_init(struct vfs_namespace *ns,struct vfs_mount *root)
 {
-    if(!ns || ns->root || ns->mounts || !root || root->ns || root->point.mount)return -EINVAL;
+    if(!ns || ns->root || ns->mounts || !root || root->ns || root->point.mount || root->lazy_detached)return -EINVAL;
     ++root->references;root->ns=ns;root->id=1;root->next=NULL;
     ns->root=root;ns->mounts=root;ns->next_id=2;return 0;
 }
@@ -245,12 +256,19 @@ int vfs_namespace_root(const struct vfs_namespace *ns,struct vfs_path *out)
     vfs_follow_mounts(ns,out);return 0;
 }
 
+/** @brief Publish an unused mount at an exact directory in the namespace.
+ * @param ns Borrowed execution-owned namespace.
+ * @param mount Caller-retained unpublished mount; membership takes its own ref.
+ * @param target Borrowed retained directory path in ns.
+ * @return Zero or negative errno, with no graph change on failure. A mount
+ * that was lazily detached is not eligible for reattachment.
+ */
 int vfs_mount_attach(struct vfs_namespace *ns,struct vfs_mount *mount,const struct vfs_path *target)
 {
     if(!ns || !ns->root || !mount || !vfs_path_valid(target))return -EINVAL;
     if(target->mount->ns!=ns)return -EXDEV;
     if(target->dentry->node.type!=RELIEFOS_FS_TYPE_DIR)return -ENOTDIR;
-    if(mount->ns || mount->point.mount || vfs_covering(ns,target))return -EBUSY;
+    if(mount->ns || mount->point.mount || mount->lazy_detached || vfs_covering(ns,target))return -EBUSY;
     if(!ns->next_id)return -EOVERFLOW;
     vfs_path_get(target,&mount->point);++mount->references;
     mount->ns=ns;mount->id=ns->next_id++;
@@ -418,6 +436,34 @@ int vfs_mount_unmount(struct vfs_namespace *ns,const struct vfs_path *path)
     vfs_mount_detach(ns,mount);return 0;
 }
 
+/** @brief Disconnect a visible subtree before releasing any association.
+ * @param ns Borrowed namespace under execution ownership.
+ * @param path Held selected mount root, excluding the permanent anchor.
+ * @return Zero or negative errno before mutation. Retained paths keep their
+ * objects; no allocation, sync, busy preflight or final backend finish here.
+ */
+int vfs_mount_unmount_lazy(struct vfs_namespace *ns,const struct vfs_path *path)
+{
+    if(!ns || !vfs_path_valid(path))return -EINVAL;
+    struct vfs_mount *root=path->mount;
+    if(root->ns!=ns || path->dentry!=root->root)return -EINVAL;
+    if(root==ns->root || !root->point.mount)return -EBUSY;
+
+    struct vfs_mount *detached=NULL,**link=&ns->mounts;
+    while(*link) {
+        struct vfs_mount *mount=*link,*ancestor=mount;
+        while(ancestor && ancestor!=root)ancestor=ancestor->point.mount;
+        if(!ancestor){link=&mount->next;continue;}
+        *link=mount->next;mount->next=detached;detached=mount;
+        mount->ns=NULL;mount->lazy_detached=true;
+    }
+    while(detached) {
+        struct vfs_mount *mount=detached;detached=mount->next;mount->next=NULL;
+        vfs_path_put(&mount->point);vfs_mount_put(mount);
+    }
+    return 0;
+}
+
 int vfs_namespace_destroy(struct vfs_namespace *ns)
 {
     if(!ns)return -EINVAL;
@@ -510,6 +556,11 @@ int vfs_bind_child(const struct vfs_path *parent,const char *name,
     struct vfs_path value={mount,dentry};vfs_path_get(&value,out);return 0;
 }
 
+/** @brief Walk one parent step across visible edges or stop at a detached root.
+ * @param root Borrowed task lookup boundary.
+ * @param path Owned current path, replaced with an equally owned parent.
+ * Unattached bind roots do not expose the backing dentry's outside parent.
+ */
 void vfs_path_parent(const struct vfs_path *root,struct vfs_path *path)
 {
     if(vfs_path_equal(root,path))return;
@@ -518,6 +569,7 @@ void vfs_path_parent(const struct vfs_path *root,struct vfs_path *path)
         next=next.mount->point;
         if(vfs_path_equal(root,&next))break;
     }
-    if(!vfs_path_equal(root,&next) && next.dentry->parent)next.dentry=next.dentry->parent;
+    if(!vfs_path_equal(root,&next) && next.dentry!=next.mount->root && next.dentry->parent)
+        next.dentry=next.dentry->parent;
     struct vfs_path owned={0};vfs_path_get(&next,&owned);vfs_path_put(path);*path=owned;
 }

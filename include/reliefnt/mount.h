@@ -188,7 +188,7 @@ bool vfs_path_same_inode(const struct vfs_path *left,const struct vfs_path *righ
 bool vfs_path_same_filesystem(const struct vfs_path *left,const struct vfs_path *right);
 /** @brief Borrow the shared namespace containing an owned path.
  * @param path Borrowed retained path, nullable; serialized task context.
- * @return Namespace or NULL for an invalid/detached anonymous mount. The
+ * @return Namespace or NULL for an invalid path or detached mount. The
  * caller must retain its path and may not persist the bare pointer. No I/O,
  * graph traversal, locking or ownership transfer occurs.
  */
@@ -435,7 +435,7 @@ struct vfs_lookup_result {
 /** @brief Resolve a path or its creation parent with per-directory authorization.
  * @param ns Shared namespace under execution ownership.
  * @param root Held task root, used for absolute input/links and .. boundary.
- * @param start Held cwd/dirfd for relative input.
+ * @param start Held cwd/dirfd for relative input, including a lazily detached mount.
  * @param name Kernel-owned NUL-terminated input, at most VFS_PATH_MAX-1 bytes.
  * @param policy Borrowed callback/context/flags; NULL follows links as kernel.
  * @param out Empty output; owns one path on success. PARENT returns the held
@@ -489,7 +489,7 @@ int vfs_mount_new(const struct vfs_backend_ops *ops,void *context,struct module 
                    const struct storage_node *root,struct vfs_mount **out);
 /** @brief Drop an owned mount handle; retire its root before final teardown.
  * @param mount Owned reference or NULL; task context under execution ownership.
- * A failed finish retains context/code in the detached core retirement queue.
+ * Lazy detach or a failed finish retains context/code in the retirement queue.
  * No allocation or graph/module lock spans finish/destroy callbacks.
  */
 void vfs_mount_put(struct vfs_mount *mount);
@@ -516,7 +516,7 @@ bool vfs_reclaim_pending(void);
 int vfs_mount_set_flags(struct vfs_mount *mount,uint64_t flags);
 /** @brief Initialize an empty namespace, retaining its initial root mount.
  * @param ns Zero-initialized namespace owned by the caller.
- * @param root Detached mount, borrowed and retained; caller keeps its handle.
+ * @param root Unpublished mount, borrowed and retained; caller keeps its handle.
  * @return Zero or negative errno, no change on failure. Serialized task context.
  */
 int vfs_namespace_init(struct vfs_namespace *ns,struct vfs_mount *root);
@@ -534,7 +534,7 @@ int vfs_namespace_destroy(struct vfs_namespace *ns);
 int vfs_namespace_root(const struct vfs_namespace *ns,struct vfs_path *out);
 /** @brief Attach a detached mount at a directory object, retaining both sides.
  * @param ns Shared namespace under execution ownership.
- * @param mount Detached mount; caller retains its own handle.
+ * @param mount Unpublished mount; caller retains its own handle.
  * @param target Held directory path in ns; an already covered slot is busy.
  * @return Zero or negative errno without partial publication. Task context.
  */
@@ -575,6 +575,13 @@ int vfs_mount_move(struct vfs_namespace *ns,const struct vfs_path *source,
  * success retains the caller's path until vfs_path_put, no forced free.
  */
 int vfs_mount_unmount(struct vfs_namespace *ns,const struct vfs_path *path);
+/** @brief Lazily disconnect a mounted subtree without ordinary busy checking.
+ * @param ns Borrowed namespace under execution ownership.
+ * @param path Retained visible root of a mount, not the namespace anchor.
+ * @return Zero or negative errno. Held paths remain usable; final cleanup
+ * is deferred. No new allocations or synchronous backend flush on detach.
+ */
+int vfs_mount_unmount_lazy(struct vfs_namespace *ns,const struct vfs_path *path);
 /** @brief Prepare retained directory-name changes before a backend rename.
  * @param ns Shared namespace, serialized by the execution transaction.
  * @param source Held source dentry, excluding a mount root or covered point.
@@ -744,6 +751,7 @@ int vfs_path_create_node(const struct vfs_path *parent,const char *name,uint32_t
 /** @brief Unlink/rmdir the exact retained directory member.
  * @param ns Borrowed shared namespace under execution ownership.
  * @param path Borrowed victim path retaining its parent, inode and provider.
+ * A previously detached but retained attachment remains usable.
  * @param directory Select rmdir rather than unlink type/empty checks.
  * @return Zero or negative errno. Caller authorizes parent/sticky policy.
  * Rejects mount roots/covered mountpoints, retains metadata before removal,
@@ -811,9 +819,9 @@ int vfs_path_lookup(struct vfs_namespace *ns,const struct vfs_path *root,
 int vfs_path_format(const struct vfs_namespace *ns,const struct vfs_path *root,
                      const struct vfs_path *path,char *buffer,size_t capacity);
 /** @brief Render a held object for proc magic-link diagnostics, like d_path.
- * @param ns Borrowed shared namespace, nullable for an anonymous inode.
- * @param root Held caller root; nullable for an anonymous inode. Paths outside
- * it use the namespace base root.
+ * @param ns Borrowed namespace, nullable for anonymous or lazily detached paths.
+ * @param root Held caller root; nullable for those paths. Paths outside it
+ * use the namespace base root or the surviving detached mount root.
  * @param path Actual held object, including a renamed or unlinked dentry.
  * @param buffer Writable diagnostic output, empty on failure.
  * @param capacity Bytes including NUL and any deleted suffix.
@@ -832,7 +840,8 @@ int vfs_path_format_link(const struct vfs_namespace *ns,const struct vfs_path *r
  * @param capacity Bytes including NUL; no truncated path is returned.
  * @return Zero or negative errno. Disconnected/deleted directories return
  * ENOENT; a still-linked cwd outside root is prefixed with (unreachable).
- * Uses actual mount attachments, never replays a cached pathname or performs I/O.
+ * Detached cwd names are relative to their surviving mount root. Uses actual
+ * mount attachments, never replays a cached pathname or performs I/O.
  */
 int vfs_path_getcwd(const struct vfs_namespace *ns,const struct vfs_path *root,
                        const struct vfs_path *cwd,char *buffer,size_t capacity);

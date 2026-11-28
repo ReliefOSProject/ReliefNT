@@ -126,15 +126,16 @@ uint64_t vfs_path_mount_flags(const struct vfs_path *path)
 }
 
 /** @brief Configure a detached attachment without mutating its shared backend.
- * @param mount Owned unpublished mount, required.
+ * @param mount Owned mount never published in a namespace, required.
  * @param flags Only per-mount bits and optional strictatime selector.
  * @return Zero or negative state/unsupported errno, preserving state on error.
+ * A lazily detached attachment keeps its policy until retirement.
  * Pure execution-owned publication, no callbacks/allocation/ownership change.
  */
 int vfs_mount_set_flags(struct vfs_mount *mount,uint64_t flags)
 {
     if(!mount || !mount->references)return -EINVAL;
-    if(mount->ns || mount->point.mount)return -EBUSY;
+    if(mount->ns || mount->point.mount || mount->lazy_detached)return -EBUSY;
     if(flags&~(VFS_MOUNT_POLICY_MASK|MS_STRICTATIME))return -EOPNOTSUPP;
     mount->policy=vfs_policy_bits(flags);return 0;
 }

@@ -31,15 +31,21 @@ void vfs_walk_cancel(struct vfs_walk **state)
     kernel_free(walk);
 }
 
-/* Own all cursor text and objects before the first backend search/lookup.
- * Only per-call policy callbacks are borrowed; no callback context survives
- * EAGAIN. A retained current object never follows a newly added overmount. */
+/** @brief Own cursor text and paths before the first backend search/lookup.
+ * @param ns Borrowed execution-owned namespace.
+ * @param root Retained absolute lookup boundary, including detached roots.
+ * @param start Retained cwd or dirfd; relative access survives lazy detach.
+ * @param name Borrowed pathname. @param flags Validated lookup mode.
+ * @param state Receives the new owned cursor on success.
+ * @return Zero or negative errno. No callback context survives a wait and an
+ * already retained current object does not redirect through a new cover.
+ */
 static int vfs_walk_new(struct vfs_namespace *ns,const struct vfs_path *root,
                            const struct vfs_path *start,const char *name,unsigned flags,
                            struct vfs_walk **state)
 {
     if(!ns || !vfs_path_valid(root) || !vfs_path_valid(start) || !name)return -EINVAL;
-    if(root->mount->ns!=ns || start->mount->ns!=ns)return -EXDEV;
+    if(!vfs_path_walkable(ns,root) || !vfs_path_walkable(ns,start))return -EXDEV;
     size_t length=vfs_path_length(name);if(length>=VFS_PATH_MAX)return -ENAMETOOLONG;
     if(!length)return -ENOENT;
     struct vfs_walk *walk=kernel_malloc(sizeof(*walk));
@@ -221,15 +227,30 @@ static int vfs_path_format_walk(const struct vfs_path *root,const struct vfs_pat
     __builtin_memmove(buffer,buffer+at,capacity-at);return 0;
 }
 
+/** @brief Format a held path when connected to the specified lookup root.
+ * @param ns Borrowed execution-owned namespace.
+ * @param root Retained formatting boundary, possibly lazily detached.
+ * @param path Borrowed retained path. @param buffer Required output storage.
+ * @param capacity Bytes including NUL.
+ * @return Zero or negative errno; ENOENT when attachment edges do not connect.
+ */
 int vfs_path_format(const struct vfs_namespace *ns,const struct vfs_path *root,
                      const struct vfs_path *path,char *buffer,size_t capacity)
 {
     if(!buffer || !capacity)return -EINVAL;buffer[0]=0;
     if(!ns || !vfs_path_valid(root) || !vfs_path_valid(path))return -EINVAL;
-    if(root->mount->ns!=ns || path->mount->ns!=ns)return -EXDEV;
+    if(!vfs_path_walkable(ns,root) || !vfs_path_walkable(ns,path))return -EXDEV;
     return vfs_path_format_walk(root,path,buffer,capacity,false);
 }
 
+/** @brief Format a proc/descriptor link without granting pathname access.
+ * @param ns Borrowed namespace, unnecessary for detached or anonymous paths.
+ * @param root Optional caller root for those paths, required for live names.
+ * @param path Actual retained object. @param buffer Required output storage.
+ * @param capacity Bytes including NUL and any deleted suffix.
+ * @return Zero or negative errno. A detached path is printed relative to its
+ * surviving mount root when not reachable from the caller root.
+ */
 int vfs_path_format_link(const struct vfs_namespace *ns,const struct vfs_path *root,
                             const struct vfs_path *path,char *buffer,size_t capacity)
 {
@@ -238,11 +259,15 @@ int vfs_path_format_link(const struct vfs_namespace *ns,const struct vfs_path *r
     if(path->dentry!=path->mount->root && !path->dentry->name)
         return path->mount->ops->display_name ? path->mount->ops->display_name(path->mount->context,
             &path->dentry->node,buffer,capacity) : -EOPNOTSUPP;
-    if(!ns || !ns->root || !vfs_path_valid(root))return -EINVAL;
-    if(root->mount->ns!=ns || path->mount->ns!=ns)return -EXDEV;
-    int rc=vfs_path_format_walk(root,path,buffer,capacity,true);
+    bool detached=path->mount->lazy_detached;
+    if(!detached) {
+        if(!ns || !ns->root || !vfs_path_valid(root))return -EINVAL;
+        if(!vfs_path_walkable(ns,root) || path->mount->ns!=ns)return -EXDEV;
+    }
+    int rc=vfs_path_valid(root) ? vfs_path_format_walk(root,path,buffer,capacity,true) : -ENOENT;
     if(rc==-ENOENT) {
-        struct vfs_path anchor={ns->root,ns->root->root};
+        struct vfs_mount *base=detached ? path->mount : ns->root;
+        struct vfs_path anchor={base,base->root};
         rc=vfs_path_format_walk(&anchor,path,buffer,capacity,true);
     }
     if(!rc && path->dentry->disconnected) {
@@ -263,6 +288,13 @@ int vfs_path_backend_name(const struct vfs_path *path,char *buffer,size_t capaci
     return vfs_path_format_walk(&root,&native,buffer,capacity,false);
 }
 
+/** @brief Format the held cwd, including the unreachable detached case.
+ * @param ns Borrowed execution-owned namespace. @param root Owned task root.
+ * @param cwd Held current directory. @param buffer Required output storage.
+ * @param capacity Bytes including NUL and any unreachable prefix.
+ * @return Zero or negative errno. A detached cwd outside root uses its mount
+ * root rather than inventing a path back to the former attachment point.
+ */
 int vfs_path_getcwd(const struct vfs_namespace *ns,const struct vfs_path *root,
                        const struct vfs_path *cwd,char *buffer,size_t capacity)
 {
@@ -272,7 +304,8 @@ int vfs_path_getcwd(const struct vfs_namespace *ns,const struct vfs_path *root,
     static const char marker[]="(unreachable)";
     size_t prefix=sizeof(marker)-1;
     if(capacity<=prefix)return -ENAMETOOLONG;
-    struct vfs_path anchor={ns->root,ns->root->root};
+    struct vfs_mount *base=cwd->mount->lazy_detached ? cwd->mount : ns->root;
+    struct vfs_path anchor={base,base->root};
     rc=vfs_path_format(ns,&anchor,cwd,buffer+prefix,capacity-prefix);
     if(!rc)__builtin_memcpy(buffer,marker,prefix);
     else buffer[0]=0;

@@ -55,7 +55,7 @@ msgid ""
 "``mount(source, target, NULL, MS_BIND, NULL)`` 支持非递归目录绑定。 新挂载保留源目录的实际 "
 "inode、父链和文件系统生命周期，继承源挂载的 只读、nosuid、nodev 等策略。``/proc/self/mountinfo`` 的 "
 "root 字段报告源目录 在文件系统内的路径；命名空间路径、``..`` 和 chroot 边界按新挂载计算。 "
-"源文件系统在绑定仍存在时不能卸载，解绑不销毁源文件系统。"
+"源文件系统在绑定仍存在时不能正常卸载，解绑不销毁源文件系统。"
 msgstr ""
 "``mount(source, target, NULL, MS_BIND, NULL)`` supports nonrecursive "
 "directory binds. The new mount retains the source directory's actual "
@@ -63,8 +63,8 @@ msgstr ""
 "policies such as read-only, nosuid, and nodev. The root field of "
 "``/proc/self/mountinfo`` reports the source directory's path within its "
 "filesystem; namespace paths, ``..``, and chroot boundaries are computed "
-"relative to the new mount. The source filesystem cannot be unmounted "
-"while the bind remains, and unbinding does not destroy it."
+"relative to the new mount. The source filesystem cannot be ordinarily "
+"unmounted while the bind remains, and unbinding does not destroy it."
 
 msgid ""
 "``MS_BIND | MS_REC`` 还会复制源目录下的挂载拓扑。子挂载在目的树中拥有新的 挂载 ID 和独立策略，但仍共享各自的源 "
@@ -101,6 +101,15 @@ msgstr "``RELIEFOS_PR_GET_UNAME_LINUX`` (``0x52550002``): all arguments must be 
 
 msgid "非法值及非零保留参数返回 EINVAL，状态不变。新任务默认使用 ReliefNT； fork、vfork、clone 复制调用任务的选择，exec 保留选择。已经存在的其他任务 不受影响，线程也可独立设置该值。该开关仅将 ``uname(2)`` 返回的 ``sysname`` 改为 Linux，其余字段、全局 UTS 状态及 procfs 均不改变。 使用标准 libc prctl 包装或原始系统调用均可；不改变 personality 数值语义。"
 msgstr "Invalid values and nonzero reserved arguments return EINVAL without changing state. New tasks use ReliefNT by default. fork, vfork, and clone copy the calling task's selection, and exec preserves it. Other existing tasks are unaffected; threads may also set their selection independently. The switch changes only the ``sysname`` returned by ``uname(2)`` to Linux; other fields, global UTS state, and procfs are unchanged. Both the standard libc prctl wrapper and raw syscalls are supported. Linux personality values retain their existing meaning."
+
+msgid "延迟卸载"
+msgstr "Lazy Unmount"
+
+msgid "``umount2(target, MNT_DETACH)`` 立即移除目标挂载及其子挂载的命名空间连接， 不等待持有者或同步刷盘。新的路径查找会看到原挂载点下的内容，挂载表不再列出 已摘除的挂载。永久的命名空间基准根不可摘除。"
+msgstr "``umount2(target, MNT_DETACH)`` immediately disconnects the target and its submounts from the namespace without waiting for references or synchronously flushing data. Fresh lookups see the original contents beneath the mountpoint, and the mount table no longer lists the detached mounts. The permanent namespace anchor cannot be detached."
+
+msgid "已打开的文件及持有的目录仍可使用，子挂载的独立引用亦有效。从保留的目录开始 查找时不再跨越被摘除的挂载边，``..`` 不越过已摘除的挂载根。当工作目录不再 连接到任务根时，原始 ``getcwd`` 返回以 ``(unreachable)`` 开头的路径。 最后的引用释放后由 VFS 工作队列完成文件系统清理。"
+msgstr "Open files and retained directories remain usable, including independent references to submounts. Lookups starting from a retained directory no longer cross the detached mount edges, and ``..`` stops at the detached mount root. If the working directory is no longer connected to the task root, raw ``getcwd`` returns a path prefixed with ``(unreachable)``. The VFS work queue completes filesystem cleanup after the last reference is released."
 
 msgid "glibc 线程与 CPU 状态兼容"
 msgstr "glibc thread and CPU-state compatibility"

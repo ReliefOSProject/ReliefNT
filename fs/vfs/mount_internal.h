@@ -32,9 +32,21 @@ struct vfs_mount {
     struct module *owner;
     uint64_t references,id,policy;
     uint64_t writers; /* Open writable file descriptions on this attachment. */
+    bool lazy_detached; /* No namespace edges; retained paths still work. */
     char *source,*filesystem;
     uint64_t device;
 };
+bool vfs_path_valid(const struct vfs_path *path);
+/** @brief Admit a held path for pathname access, not mount topology changes.
+ * @param ns Borrowed execution-owned lookup namespace.
+ * @param path Borrowed retained path, nullable.
+ * @return True for a member or a previously attached mount now detached.
+ * Unpublished mounts and live mounts in an unrelated namespace are excluded.
+ */
+static inline bool vfs_path_walkable(const struct vfs_namespace *ns,const struct vfs_path *path)
+{
+    return ns && vfs_path_valid(path) && (path->mount->ns==ns || path->mount->lazy_detached);
+}
 /** @brief Normalize supported attachment input independently of its backend.
  * @param flags Native MS inputs; unsupported bits have no representation here.
  * @return Canonical mount bits. Strictatime clears both noatime and relatime,
@@ -128,7 +140,6 @@ struct vfs_rename {
 };
 /* All helpers require the caller's execution transaction. No internal spinlock
  * or backend callback is hidden behind a mount graph lock. */
-bool vfs_path_valid(const struct vfs_path *path);
 /** @brief Resolve a child for a retained walker, preserving its private
  * pre-I/O native-workspace marker. The walker owns final normalization.
  */

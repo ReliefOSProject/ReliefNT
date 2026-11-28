@@ -45,29 +45,28 @@ static int mount_bind(struct vfs_namespace *ns,struct task *task,uint64_t source
     vfs_path_put(&from.path);vfs_path_put(&to.path);return rc;
 }
 
-/** @brief Sync and detach the selected topmost mount with real busy checking.
+/** @brief Detach the selected visible mount; only ordinary unmount syncs.
  * @param ns Borrowed execution-owned namespace.
  * @param task Authorized caller retaining any retry scope.
  * @param target User target pathname pointer, required.
  * @param flags Low-32-bit Linux umount flags; nofollow is supported.
- * @return Zero or input/unsupported/lookup/busy/provider errno. Lazy/forced/
- * expired unmount is explicitly unsupported. A sync wait keeps the original
- * scope; after sync its redundant reference is retired before graph detach.
- * The local path pins code/backing until all callbacks and cleanup finish.
+ * @return Zero or input/unsupported/lookup/busy/provider errno. MNT_DETACH
+ * immediately disconnects the subtree; forced/expire operations are unsupported.
+ * Only ordinary unmount can wait in sync; both discard redundant lookup refs
+ * before detaching. The local path pins the provider across the operation.
  */
 static int mount_unmount(struct vfs_namespace *ns,struct task *task,uint64_t target,uint32_t flags)
 {
     if(flags&~(MNT_FORCE|MNT_DETACH|MNT_EXPIRE|UMOUNT_NOFOLLOW))return -RELIEFOS_EINVAL;
-    if(flags&(MNT_FORCE|MNT_DETACH|MNT_EXPIRE))return -RELIEFOS_EOPNOTSUPP;
+    if((flags&MNT_EXPIRE) && (flags&(MNT_FORCE|MNT_DETACH)))return -RELIEFOS_EINVAL;
+    if(flags&(MNT_FORCE|MNT_EXPIRE))return -RELIEFOS_EOPNOTSUPP;
     struct vfs_lookup_result found={0};
     int rc=resolve_user_object_at_flags(ns,task,LINUX_AT_FDCWD,target,false,false,
         flags&UMOUNT_NOFOLLOW ? 0 : VFS_LOOKUP_FOLLOW,&found);
-    if(!rc) {
-        rc=vfs_path_sync(&found.path,true,false);
-    }
+    if(!rc && !(flags&MNT_DETACH))rc=vfs_path_sync(&found.path,true,false);
     if(!rc) {
         task_lookup_scope_cancel(task);
-        rc=vfs_mount_unmount(ns,&found.path);
+        rc=flags&MNT_DETACH ? vfs_mount_unmount_lazy(ns,&found.path) : vfs_mount_unmount(ns,&found.path);
     }
     vfs_path_put(&found.path);return rc;
 }
