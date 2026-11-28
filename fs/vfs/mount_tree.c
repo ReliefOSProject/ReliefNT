@@ -34,6 +34,7 @@ static bool vfs_finish_retirement(struct vfs_mount *mount)
 {
     if(mount->bind_source.mount) {
         struct vfs_path backing=mount->bind_source;
+        if(mount->propagation_backing)--backing.mount->propagation_pins;
         if(vfs_notify_mount_retired)vfs_notify_mount_retired(mount);
         struct module *owner=mount->owner;
         kernel_free(mount->source);kernel_free(mount);
@@ -228,7 +229,7 @@ int vfs_namespace_init(struct vfs_namespace *ns,struct vfs_mount *root)
 {
     if(!ns || ns->root || ns->mounts || !root || root->ns || root->point.mount || root->lazy_detached)return -EINVAL;
     ++root->references;root->ns=ns;root->id=1;root->next=NULL;
-    ns->root=root;ns->mounts=root;ns->next_id=2;return 0;
+    ns->root=root;ns->mounts=root;ns->next_id=2;ns->next_peer_id=1;return 0;
 }
 
 /* Mountpoint identity is a retained parent mount + dentry, never text. */
@@ -256,25 +257,6 @@ int vfs_namespace_root(const struct vfs_namespace *ns,struct vfs_path *out)
     vfs_follow_mounts(ns,out);return 0;
 }
 
-/** @brief Publish an unused mount at an exact directory in the namespace.
- * @param ns Borrowed execution-owned namespace.
- * @param mount Caller-retained unpublished mount; membership takes its own ref.
- * @param target Borrowed retained directory path in ns.
- * @return Zero or negative errno, with no graph change on failure. A mount
- * that was lazily detached is not eligible for reattachment.
- */
-int vfs_mount_attach(struct vfs_namespace *ns,struct vfs_mount *mount,const struct vfs_path *target)
-{
-    if(!ns || !ns->root || !mount || !vfs_path_valid(target))return -EINVAL;
-    if(target->mount->ns!=ns)return -EXDEV;
-    if(target->dentry->node.type!=RELIEFOS_FS_TYPE_DIR)return -ENOTDIR;
-    if(mount->ns || mount->point.mount || mount->lazy_detached || vfs_covering(ns,target))return -EBUSY;
-    if(!ns->next_id)return -EOVERFLOW;
-    vfs_path_get(target,&mount->point);++mount->references;
-    mount->ns=ns;mount->id=ns->next_id++;
-    mount->next=ns->mounts;ns->mounts=mount;return 0;
-}
-
 /** @brief Check mount ancestry by retained topology rather than pathname.
  * @param root Borrowed candidate subtree root.
  * @param mount Borrowed attachment to test.
@@ -286,12 +268,13 @@ static bool vfs_mount_below(const struct vfs_mount *root,const struct vfs_mount 
     return false;
 }
 
-/** @brief Apply private or unbindable propagation type to live attachments.
+/** @brief Apply one supported propagation type to selected live attachments.
  * @param ns Borrowed namespace under execution ownership.
  * @param path Retained exact root of the selected live mount.
  * @param flags One propagation selector and optional MS_REC.
  * @return Zero or negative errno. The whole change is validated before
- * editing any mount. No allocation, backend callback or access-policy change.
+ * editing any mount or advancing the group ID counter. No allocation, backend
+ * callback or access-policy change. Slave propagation is not implemented.
  */
 int vfs_mount_set_propagation(struct vfs_namespace *ns,const struct vfs_path *path,uint64_t flags)
 {
@@ -299,36 +282,161 @@ int vfs_mount_set_propagation(struct vfs_namespace *ns,const struct vfs_path *pa
     if(!type || (type&(type-1)) || (type&~VFS_PROPAGATION_MASK))return -EINVAL;
     if(!ns || !vfs_path_valid(path) || path->mount->ns!=ns || path->dentry!=path->mount->root)
         return -EINVAL;
-    if(type!=MS_PRIVATE && type!=MS_UNBINDABLE)return -EOPNOTSUPP;
-    bool unbindable=type==MS_UNBINDABLE;
-    path->mount->unbindable=unbindable;
-    if(flags&MS_REC)
-        for(struct vfs_mount *mount=ns->mounts;mount;mount=mount->next)
-            if(vfs_mount_below(path->mount,mount))mount->unbindable=unbindable;
+    if(type==MS_SLAVE)return -EOPNOTSUPP;
+    struct vfs_mount *root=path->mount;
+    bool recursive=(flags&MS_REC)!=0;
+    uint64_t next=ns->next_peer_id;
+    if(type==MS_SHARED) {
+        for(struct vfs_mount *mount=recursive ? ns->mounts : root;mount;
+            mount=recursive ? mount->next : NULL) {
+            if(mount->peer_group || !vfs_mount_below(root,mount))continue;
+            if(!next)return -EOVERFLOW;
+            ++next;
+        }
+    }
+    for(struct vfs_mount *mount=recursive ? ns->mounts : root;mount;
+        mount=recursive ? mount->next : NULL) {
+        if(!vfs_mount_below(root,mount))continue;
+        mount->unbindable=type==MS_UNBINDABLE;
+        if(type!=MS_SHARED)mount->peer_group=0;
+        else if(!mount->peer_group)mount->peer_group=ns->next_peer_id++;
+    }
     return 0;
 }
 
 /** @brief Prepare an unattached directory view of an existing filesystem.
- * @param source Valid retained source directory; its mount and inode are shared.
+ * @param view Valid source directory; supplies the root and attachment policy.
+ * @param backing Retained path to the same dentry, pinned for this view's lifetime.
+ * @param propagation True for a fresh mount's replica-only backing reference.
  * @param out Receives the privately owned clone on success, NULL on failure.
  * @return Zero or negative provider/admission/allocation errno. No new backend
  * is created, and the clone has no namespace membership or inotify registration.
  */
-static int vfs_bind_clone(const struct vfs_path *source,struct vfs_mount **out)
+static int vfs_bind_clone(const struct vfs_path *view,const struct vfs_path *backing,
+                           bool propagation,struct vfs_mount **out)
 {
     *out=NULL;
-    struct vfs_mount *original=source->mount;
+    struct vfs_mount *original=view->mount;
     if(!try_module_get(original->owner))return -ENODEV;
     struct vfs_mount *mount=kernel_malloc(sizeof(*mount));
     if(!mount){module_put(original->owner);return -ENOMEM;}
     *mount=(struct vfs_mount){.ops=original->ops,.context=original->context,
-        .owner=original->owner,.references=1,.root=source->dentry,.policy=original->policy};
-    vfs_path_get(source,&mount->bind_source);
+        .owner=original->owner,.references=1,.root=view->dentry,.policy=original->policy,
+        .propagation_backing=propagation};
+    vfs_path_get(backing,&mount->bind_source);
+    if(propagation)++backing->mount->propagation_pins;
     int rc=vfs_mount_describe(mount,original->source ? original->source : "none",
         original->filesystem ? original->filesystem : "none",original->device);
     if(rc)vfs_mount_put(mount);
     else *out=mount;
     return rc;
+}
+
+struct vfs_mount_batch {
+    struct vfs_mount *pending;
+    uint64_t next_id,next_peer_id;
+};
+
+/** @brief Add one privately owned mount reference to an unpublished batch.
+ * @param batch Staging list ordered from newest to oldest for rollback.
+ * @param mount Prepared mount; its reference transfers to the batch.
+ * @param point Borrowed exact destination, retained by the staged mount.
+ * @param id Reserved mount ID. @param group Reserved or inherited peer ID.
+ */
+static void vfs_stage_mount(struct vfs_mount_batch *batch,struct vfs_mount *mount,
+                            const struct vfs_path *point,uint64_t id,uint64_t group)
+{
+    mount->id=id;mount->peer_group=group;
+    vfs_path_get(point,&mount->point);
+    mount->next=batch->pending;batch->pending=mount;
+}
+
+/** @brief Roll back all staged mounts or publish them together without allocation.
+ * @param ns Borrowed execution-owned namespace.
+ * @param batch Owned unpublished mounts and tentative ID counters.
+ * @param status Nonzero to discard, zero to commit all changes.
+ * @return The supplied status. Rollback releases descendants before parents;
+ * neither graph nor namespace counters change on error.
+ */
+static int vfs_finish_mount_batch(struct vfs_namespace *ns,struct vfs_mount_batch *batch,int status)
+{
+    if(status) {
+        while(batch->pending) {
+            struct vfs_mount *mount=batch->pending;batch->pending=mount->next;
+            mount->next=NULL;vfs_path_put(&mount->point);vfs_mount_put(mount);
+        }
+        return status;
+    }
+    struct vfs_mount **tail=&batch->pending;
+    for(;*tail;tail=&(*tail)->next) {
+        struct vfs_mount *mount=*tail;mount->ns=ns;
+        if(!mount->notify_link && vfs_notify_mount_created)vfs_notify_mount_created(mount);
+    }
+    *tail=ns->mounts;ns->mounts=batch->pending;
+    ns->next_id=batch->next_id;ns->next_peer_id=batch->next_peer_id;
+    return 0;
+}
+
+/** @brief Test whether one connected dentry lies inside a directory view.
+ * @param dentry Borrowed candidate. @param root Borrowed directory boundary.
+ * @return True for the boundary itself or a descendant connected to it.
+ */
+static bool vfs_dentry_below(const struct vfs_dentry *dentry,const struct vfs_dentry *root)
+{
+    for(;dentry && !dentry->disconnected;dentry=dentry->parent)
+        if(dentry==root)return true;
+    return false;
+}
+
+/** @brief Identify another shared parent containing this exact mountpoint.
+ * @param target Resolved origin within a shared parent, borrowed.
+ * @param peer Candidate live attachment in the same namespace.
+ * @return True for a different group member whose bind root contains target.
+ */
+static bool vfs_mount_receiver(const struct vfs_path *target,const struct vfs_mount *peer)
+{
+    return peer!=target->mount && target->mount->peer_group &&
+        peer->peer_group==target->mount->peer_group && vfs_dentry_below(target->dentry,peer->root);
+}
+
+/** @brief Publish a new mount and all shared peer copies in one transaction.
+ * @param ns Borrowed execution-owned namespace.
+ * @param mount Caller-retained unpublished mount; membership takes its own ref.
+ * @param target Borrowed retained directory path in ns.
+ * @return Zero or negative errno, without consuming IDs or modifying the
+ * mount on failure. Already covered receiver slots are unsupported.
+ */
+int vfs_mount_attach(struct vfs_namespace *ns,struct vfs_mount *mount,const struct vfs_path *target)
+{
+    if(!ns || !ns->root || !mount || !vfs_path_valid(target))return -EINVAL;
+    if(target->mount->ns!=ns)return -EXDEV;
+    if(target->dentry->node.type!=RELIEFOS_FS_TYPE_DIR)return -ENOTDIR;
+    if(target->dentry->disconnected)return -ENOENT;
+    if(mount->ns || mount->point.mount || mount->lazy_detached || vfs_covering(ns,target))return -EBUSY;
+    if(!ns->next_id)return -EOVERFLOW;
+    struct vfs_mount_batch batch={.next_id=ns->next_id+1,.next_peer_id=ns->next_peer_id};
+    uint64_t group=0;
+    int rc=0;
+    if(target->mount->peer_group) {
+        if(!batch.next_peer_id)return -EOVERFLOW;
+        group=batch.next_peer_id++;
+        struct vfs_path view={mount,mount->root};
+        for(struct vfs_mount *peer=ns->mounts;peer;peer=peer->next) {
+            if(!vfs_mount_receiver(target,peer))continue;
+            struct vfs_path point={peer,target->dentry};
+            if(vfs_covering(ns,&point)){rc=-EOPNOTSUPP;break;}
+            if(!batch.next_id){rc=-EOVERFLOW;break;}
+            struct vfs_mount *copy;
+            rc=vfs_bind_clone(&view,&view,true,&copy);
+            if(rc)break;
+            vfs_stage_mount(&batch,copy,&point,batch.next_id++,group);
+        }
+    }
+    if(!rc) {
+        ++mount->references;
+        vfs_stage_mount(&batch,mount,target,ns->next_id,group);
+    }
+    return vfs_finish_mount_batch(ns,&batch,rc);
 }
 
 /** @brief Find the next direct submount within the selected directory view.
@@ -340,21 +448,67 @@ static int vfs_bind_clone(const struct vfs_path *source,struct vfs_mount **out)
  */
 static struct vfs_mount *vfs_bind_child_mount(const struct vfs_path *view,struct vfs_mount *candidate)
 {
-    for(;candidate;candidate=candidate->next) {
-        if(candidate->point.mount!=view->mount || candidate->unbindable)continue;
-        for(const struct vfs_dentry *d=candidate->point.dentry;d && !d->disconnected;d=d->parent)
-            if(d==view->dentry)return candidate;
-    }
+    for(;candidate;candidate=candidate->next)
+        if(candidate->point.mount==view->mount && !candidate->unbindable &&
+           vfs_dentry_below(candidate->point.dentry,view->dentry))return candidate;
     return NULL;
 }
 
-/** @brief Clone and publish a directory attachment and optionally its submounts.
- * @param ns Borrowed namespace under execution ownership.
+/** @brief Stage one bind tree using previously resolved directory identities.
+ * @param batch Transaction owning all clones, including partial trees on error.
+ * @param source Source view in the live graph or first staged tree.
+ * @param target Borrowed retained destination for this tree.
+ * @param mounts Fixed inventory of source attachments for a recursive walk.
+ * @param recursive True to copy bindable child mounts.
+ * @param shared True to give previously private copies a peer group.
+ * @param receiver True when replaying the first staged tree for another peer.
+ * @param out Receives the staged tree root, possibly NULL on failure.
+ * @return Zero or negative errno. No backend graph changes or path replay.
+ */
+static int vfs_stage_bind_tree(struct vfs_mount_batch *batch,const struct vfs_path *source,
+                              const struct vfs_path *target,struct vfs_mount *mounts,
+                              bool recursive,bool shared,bool receiver,struct vfs_mount **out)
+{
+    struct vfs_path view=*source,point=*target;
+    *out=NULL;
+    for(;;) {
+        if(!batch->next_id)return -EOVERFLOW;
+        uint64_t group=view.mount->peer_group;
+        if(shared && !group) {
+            if(!batch->next_peer_id)return -EOVERFLOW;
+            group=batch->next_peer_id++;
+        }
+        struct vfs_mount *copy;
+        /* All parallel bind views retain the actual source, not another
+         * destination which may be unmounted independently. */
+        const struct vfs_path *backing=receiver ? &view.mount->bind_source : &view;
+        int rc=vfs_bind_clone(&view,backing,false,&copy);
+        if(rc)return rc;
+        vfs_stage_mount(batch,copy,&point,batch->next_id++,group);
+        if(!*out)*out=copy;
+        if(!recursive)return 0;
+
+        /* Walk the two trees in step. Their mountpoint dentries are shared;
+         * only the parent attachment changes. The inventory stays fixed. */
+        struct vfs_mount *child=vfs_bind_child_mount(&view,mounts);
+        while(!child && view.mount!=source->mount) {
+            struct vfs_mount *previous=view.mount;
+            copy=copy->point.mount;
+            view=(struct vfs_path){previous->point.mount,copy->root};
+            child=vfs_bind_child_mount(&view,previous->next);
+        }
+        if(!child)return 0;
+        view=(struct vfs_path){child,child->root};
+        point=(struct vfs_path){copy,child->point.dentry};
+    }
+}
+
+/** @brief Publish a directory bind and all shared peer copies atomically.
+ * @param ns Borrowed execution-owned namespace.
  * @param source Borrowed retained source directory in ns.
  * @param target Borrowed retained destination directory in ns.
  * @param recursive True to copy the source's bindable descendant branches.
- * @return Zero or negative errno. Staging traverses the original graph without
- * recursion or pathname replay; on failure the graph and next ID are unchanged.
+ * @return Zero or negative errno without consuming IDs or partially publishing.
  */
 static int vfs_bind_tree(struct vfs_namespace *ns,const struct vfs_path *source,
                          const struct vfs_path *target,bool recursive)
@@ -366,50 +520,22 @@ static int vfs_bind_tree(struct vfs_namespace *ns,const struct vfs_path *source,
     if(source->dentry->disconnected || target->dentry->disconnected)return -ENOENT;
     if(vfs_covering(ns,target))return -EBUSY;
 
-    struct vfs_path view=*source,point=*target;
-    struct vfs_mount *pending=NULL;
-    uint64_t next_id=ns->next_id;
-    int rc=0;
-    for(;;) {
-        if(!next_id){rc=-EOVERFLOW;break;}
-        struct vfs_mount *copy;
-        rc=vfs_bind_clone(&view,&copy);
-        if(rc)break;
-        copy->id=next_id++;
-        vfs_path_get(&point,&copy->point);
-        copy->next=pending;pending=copy;
-        if(!recursive)break;
-
-        /* Walk the two trees in step. Their mountpoint dentries are shared;
-         * only the parent attachment changes. Never visit a staged clone. */
-        struct vfs_mount *child=vfs_bind_child_mount(&view,ns->mounts);
-        while(!child && view.mount!=source->mount) {
-            struct vfs_mount *previous=view.mount;
-            copy=copy->point.mount;
-            view=(struct vfs_path){previous->point.mount,copy->root};
-            child=vfs_bind_child_mount(&view,previous->next);
+    struct vfs_mount_batch batch={.next_id=ns->next_id,.next_peer_id=ns->next_peer_id};
+    struct vfs_mount *first;
+    bool shared=target->mount->peer_group!=0;
+    int rc=vfs_stage_bind_tree(&batch,source,target,ns->mounts,recursive,shared,false,&first);
+    if(!rc && shared) {
+        struct vfs_mount *inventory=batch.pending;
+        struct vfs_path view={first,first->root};
+        for(struct vfs_mount *peer=ns->mounts;!rc && peer;peer=peer->next) {
+            if(!vfs_mount_receiver(target,peer))continue;
+            struct vfs_path point={peer,target->dentry};
+            if(vfs_covering(ns,&point)){rc=-EOPNOTSUPP;break;}
+            struct vfs_mount *copy;
+            rc=vfs_stage_bind_tree(&batch,&view,&point,inventory,recursive,false,true,&copy);
         }
-        if(!child)break;
-        view=(struct vfs_path){child,child->root};
-        point=(struct vfs_path){copy,child->point.dentry};
     }
-    if(rc) {
-        /* Reverse creation order always releases descendants before parents. */
-        while(pending) {
-            struct vfs_mount *copy=pending;pending=copy->next;
-            vfs_path_put(&copy->point);vfs_mount_put(copy);
-        }
-        return rc;
-    }
-
-    /* Transfer the staging references to the namespace in one commit. */
-    struct vfs_mount **tail=&pending;
-    for(;*tail;tail=&(*tail)->next) {
-        (*tail)->ns=ns;
-        if(vfs_notify_mount_created)vfs_notify_mount_created(*tail);
-    }
-    *tail=ns->mounts;ns->mounts=pending;ns->next_id=next_id;
-    return 0;
+    return vfs_finish_mount_batch(ns,&batch,rc);
 }
 
 /** @brief Publish one directory view without copying submounts.
@@ -433,6 +559,13 @@ int vfs_mount_bind_recursive(struct vfs_namespace *ns,const struct vfs_path *sou
     return vfs_bind_tree(ns,source,target,true);
 }
 
+/** @brief Move a subtree only when neither parent needs propagation.
+ * @param ns Borrowed execution-owned namespace.
+ * @param source Retained mounted root, excluding the namespace anchor.
+ * @param target Retained destination directory in ns.
+ * @return Zero or negative errno before mutation. Moving out of a shared
+ * parent is invalid; moving into one needs not-yet-supported propagation.
+ */
 int vfs_mount_move(struct vfs_namespace *ns,const struct vfs_path *source,const struct vfs_path *target)
 {
     if(!ns || !vfs_path_valid(source) || !vfs_path_valid(target))return -EINVAL;
@@ -441,6 +574,8 @@ int vfs_mount_move(struct vfs_namespace *ns,const struct vfs_path *source,const 
     if(source->dentry!=mount->root)return -EINVAL;
     if(mount==ns->root || !mount->point.mount)return -EBUSY;
     if(target->dentry->node.type!=RELIEFOS_FS_TYPE_DIR)return -ENOTDIR;
+    if(mount->point.mount->peer_group)return -EINVAL;
+    if(target->mount->peer_group)return -EOPNOTSUPP;
     for(struct vfs_mount *ancestor=target->mount;ancestor;ancestor=ancestor->point.mount)
         for(struct vfs_mount *backing=ancestor;backing;backing=backing->bind_source.mount)
             if(backing==mount)return -ELOOP;
@@ -449,29 +584,134 @@ int vfs_mount_move(struct vfs_namespace *ns,const struct vfs_path *source,const 
     struct vfs_path old=mount->point;mount->point=replacement;vfs_path_put(&old);return 0;
 }
 
+/** @brief Disconnect a single leaf during namespace destruction.
+ * @param ns Borrowed execution-owned namespace.
+ * @param mount Live leaf with no remaining dependents in ns.
+ */
 static void vfs_mount_detach(struct vfs_namespace *ns,struct vfs_mount *mount)
 {
     struct vfs_mount **link=&ns->mounts;
     while(*link && *link!=mount)link=&(*link)->next;
     if(*link)*link=mount->next;
     struct vfs_path old=mount->point;mount->point=(struct vfs_path){0};
-    mount->ns=NULL;mount->next=NULL;vfs_path_put(&old);vfs_mount_put(mount);
+    mount->ns=NULL;mount->next=NULL;mount->peer_group=0;mount->unbindable=false;
+    vfs_path_put(&old);vfs_mount_put(mount);
 }
 
+/** @brief Mark origin mounts and the matching slots of their shared parents.
+ * @param ns Borrowed namespace under execution ownership.
+ * @param root Root of the requested unmount.
+ * @param subtree True to send events for the entire original subtree.
+ * Only parents' groups determine delivery. A receiver which has any child
+ * outside the batch is kept, even if other children of that receiver detach.
+ */
+static void vfs_select_unmounts(struct vfs_namespace *ns,struct vfs_mount *root,bool subtree)
+{
+    bool propagated=false;
+    for(struct vfs_mount *event=subtree ? ns->mounts : root;event;
+        event=subtree ? event->next : NULL) {
+        if(subtree && !vfs_mount_below(root,event))continue;
+        event->unmount_selected=true;
+        struct vfs_mount *parent=event->point.mount;
+        if(!parent || !parent->peer_group)continue;
+        for(struct vfs_mount *receiver=ns->mounts;receiver;receiver=receiver->next) {
+            const struct vfs_path *point=&receiver->point;
+            if(point->mount && point->mount!=parent && point->mount->peer_group==parent->peer_group &&
+               point->dentry==event->point.dentry) {
+                receiver->unmount_selected=true;propagated=true;
+            }
+        }
+    }
+    if(propagated) {
+        for(struct vfs_mount *child=ns->mounts;child;child=child->next) {
+            if(child->unmount_selected)continue;
+            for(struct vfs_mount *parent=child->point.mount;parent && parent->unmount_selected;
+                parent=parent->point.mount)parent->unmount_selected=false;
+        }
+    }
+}
+
+/** @brief Reject busy mounts before changing any member of an unmount batch.
+ * @param ns Borrowed execution-owned namespace with selected mounts marked.
+ * @param root Origin mount with the caller's lookup reference.
+ * @return Zero or negative busy/provider errno. Replica lifetime pins and
+ * edges disappearing in this batch are not external path references. A
+ * regular bind outside the batch still pins its source as before.
+ */
+static int vfs_unmount_preflight(const struct vfs_namespace *ns,const struct vfs_mount *root)
+{
+    for(struct vfs_mount *mount=ns->mounts;mount;mount=mount->next) {
+        if(!mount->unmount_selected)continue;
+        uint64_t expected=1+(mount==root)+mount->propagation_pins;
+        struct vfs_mount *backing=mount->propagation_backing ? mount->bind_source.mount : mount;
+        uint64_t replicas=0;
+        bool first_replica=true;
+        for(struct vfs_mount *other=ns->mounts;other;other=other->next) {
+            if(!other->unmount_selected)continue;
+            if(other->point.mount==mount)++expected;
+            if(other->bind_source.mount==mount && !other->propagation_backing)++expected;
+            if(other->bind_source.mount==backing && other->propagation_backing) {
+                ++replicas;
+                if(other->id<mount->id)first_replica=false;
+            }
+        }
+        if(mount->references!=expected)return -EBUSY;
+        /* Check native backing users once only when origin and all lifetime
+         * replicas are going away. The origin may already be detached. */
+        bool final_check=mount->propagation_backing ? !backing->ns && first_replica &&
+            backing->references==backing->propagation_pins : !mount->bind_source.mount;
+        if(final_check && replicas==backing->propagation_pins && backing->ops->can_unmount) {
+            int rc=backing->ops->can_unmount(backing->context,backing->root->backend_pin);
+            if(rc)return rc;
+        }
+    }
+    return 0;
+}
+
+/** @brief Unlink the entire selected graph before dropping retained edges.
+ * @param ns Borrowed execution-owned namespace with selected mounts marked.
+ * @param lazy True to keep external paths walkable and defer final teardown.
+ * No allocation, and lazy unmount invokes no synchronous backend finish.
+ */
+static void vfs_disconnect_unmounts(struct vfs_namespace *ns,bool lazy)
+{
+    struct vfs_mount *detached=NULL,**link=&ns->mounts;
+    while(*link) {
+        struct vfs_mount *mount=*link;
+        if(!mount->unmount_selected){link=&mount->next;continue;}
+        *link=mount->next;mount->next=detached;detached=mount;
+        mount->ns=NULL;mount->lazy_detached=lazy;
+        mount->peer_group=0;mount->unbindable=false;mount->unmount_selected=false;
+    }
+    while(detached) {
+        struct vfs_mount *mount=detached;detached=mount->next;mount->next=NULL;
+        vfs_path_put(&mount->point);vfs_mount_put(mount);
+    }
+}
+
+/** @brief Detach one idle mount and all removable counterparts atomically.
+ * @param ns Borrowed execution-owned namespace.
+ * @param path Retained origin root, excluding the permanent anchor.
+ * @return Zero or negative errno; failures leave all attachments intact.
+ */
 int vfs_mount_unmount(struct vfs_namespace *ns,const struct vfs_path *path)
 {
     if(!ns || !vfs_path_valid(path))return -EINVAL;
-    struct vfs_mount *mount=path->mount;
-    if(mount->ns!=ns)return -EXDEV;
-    if(path->dentry!=mount->root)return -EINVAL;
-    if(mount==ns->root || !mount->point.mount || mount->references!=2)return -EBUSY;
-    if(!mount->bind_source.mount && mount->ops->can_unmount) {
-        int rc=mount->ops->can_unmount(mount->context,mount->root->backend_pin);if(rc)return rc;
-    }
-    vfs_mount_detach(ns,mount);return 0;
+    struct vfs_mount *root=path->mount;
+    if(root->ns!=ns)return -EXDEV;
+    if(path->dentry!=root->root)return -EINVAL;
+    if(root==ns->root || !root->point.mount)return -EBUSY;
+    for(struct vfs_mount *child=ns->mounts;child;child=child->next)
+        if(child->point.mount==root)return -EBUSY;
+
+    vfs_select_unmounts(ns,root,false);
+    int rc=vfs_unmount_preflight(ns,root);
+    if(!rc)vfs_disconnect_unmounts(ns,false);
+    else for(struct vfs_mount *mount=ns->mounts;mount;mount=mount->next)mount->unmount_selected=false;
+    return rc;
 }
 
-/** @brief Disconnect a visible subtree before releasing any association.
+/** @brief Disconnect a visible subtree and its removable shared counterparts.
  * @param ns Borrowed namespace under execution ownership.
  * @param path Held selected mount root, excluding the permanent anchor.
  * @return Zero or negative errno before mutation. Retained paths keep their
@@ -483,19 +723,8 @@ int vfs_mount_unmount_lazy(struct vfs_namespace *ns,const struct vfs_path *path)
     struct vfs_mount *root=path->mount;
     if(root->ns!=ns || path->dentry!=root->root)return -EINVAL;
     if(root==ns->root || !root->point.mount)return -EBUSY;
-
-    struct vfs_mount *detached=NULL,**link=&ns->mounts;
-    while(*link) {
-        struct vfs_mount *mount=*link;
-        if(!vfs_mount_below(root,mount)){link=&mount->next;continue;}
-        *link=mount->next;mount->next=detached;detached=mount;
-        mount->ns=NULL;mount->lazy_detached=true;
-    }
-    while(detached) {
-        struct vfs_mount *mount=detached;detached=mount->next;mount->next=NULL;
-        vfs_path_put(&mount->point);vfs_mount_put(mount);
-    }
-    return 0;
+    vfs_select_unmounts(ns,root,true);
+    vfs_disconnect_unmounts(ns,true);return 0;
 }
 
 int vfs_namespace_destroy(struct vfs_namespace *ns)

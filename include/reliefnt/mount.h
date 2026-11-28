@@ -194,7 +194,7 @@ bool vfs_path_same_filesystem(const struct vfs_path *left,const struct vfs_path 
  * graph traversal, locking or ownership transfer occurs.
  */
 struct vfs_namespace *vfs_path_namespace(const struct vfs_path *path);
-struct vfs_namespace {struct vfs_mount *root,*mounts;uint64_t next_id;};
+struct vfs_namespace {struct vfs_mount *root,*mounts;uint64_t next_id,next_peer_id;};
 /** @brief Assign immutable diagnostic identity before publishing a mount.
  * @param mount Owned detached mount, required; attachment returns EBUSY.
  * @param source Nonempty kernel source label, copied with PATH_MAX bounds.
@@ -533,21 +533,22 @@ int vfs_namespace_destroy(struct vfs_namespace *ns);
  * @return Zero or negative errno. Serialized task context.
  */
 int vfs_namespace_root(const struct vfs_namespace *ns,struct vfs_path *out);
-/** @brief Attach a detached mount at a directory object, retaining both sides.
+/** @brief Attach an unpublished mount and propagate to eligible shared peers.
  * @param ns Shared namespace under execution ownership.
  * @param mount Unpublished mount; caller retains its own handle.
  * @param target Held directory path in ns; an already covered slot is busy.
- * @return Zero or negative errno without partial publication. Task context.
+ * @return Zero or negative errno without partial publication or ID use on
+ * failure. Covered receiver insertion is not supported. Task context.
  */
 int vfs_mount_attach(struct vfs_namespace *ns,struct vfs_mount *mount,
                       const struct vfs_path *target);
-/** @brief Isolate one mount attachment or its complete visible subtree.
+/** @brief Change the propagation type of a mount or its visible subtree.
  * @param ns Borrowed execution-owned namespace.
  * @param path Held root of an attached mount in ns, not an interior dentry.
  * @param flags Exactly one propagation type, optionally with MS_REC.
- * @return Zero or negative errno without partial changes. MS_PRIVATE and
- * MS_UNBINDABLE do not change access policy or call into the backend.
- * Peer/slave propagation is not yet supported.
+ * @return Zero or negative errno without partial changes. MS_SHARED assigns
+ * peer groups to nonshared mounts; MS_PRIVATE and MS_UNBINDABLE leave a group.
+ * No backend or access policy changes. MS_SLAVE is not yet supported.
  */
 int vfs_mount_set_propagation(struct vfs_namespace *ns,const struct vfs_path *path,uint64_t flags);
 /** @brief Bind one directory inode into a separate nonrecursive attachment.
@@ -556,7 +557,8 @@ int vfs_mount_set_propagation(struct vfs_namespace *ns,const struct vfs_path *pa
  * @param target Destination directory, required in the same namespace.
  * @return Zero or negative errno without a partial attachment. Inherits
  * source mount policy; shares inode identities and backend lifetime without
- * duplicating provider destruction. Child mounts are not copied and an
+ * duplicating provider destruction. Joins the source's shared group and
+ * propagates under a shared destination. Child mounts are not copied and an
  * unbindable source returns EINVAL.
  */
 int vfs_mount_bind(struct vfs_namespace *ns,const struct vfs_path *source,
@@ -567,6 +569,7 @@ int vfs_mount_bind(struct vfs_namespace *ns,const struct vfs_path *source,
  * @param target Uncovered destination directory in the same namespace.
  * @return Zero or negative errno without publishing a partial tree. Each clone
  * has an independent ID and mount policy but pins the original backing objects.
+ * Each eligible shared destination peer receives the same bindable tree.
  * Unbindable descendant branches are skipped; an unbindable source is rejected.
  */
 int vfs_mount_bind_recursive(struct vfs_namespace *ns,const struct vfs_path *source,
@@ -575,23 +578,26 @@ int vfs_mount_bind_recursive(struct vfs_namespace *ns,const struct vfs_path *sou
  * @param ns Namespace under execution ownership.
  * @param source Held root of an attached mount, never the namespace base root.
  * @param target Held destination directory path in the same namespace.
- * @return Zero or negative errno; cycles/cross-namespace/invalid targets leave
- * the old attachment unchanged. No callbacks or allocation during commit.
+ * @return Zero or negative errno; moving out of a shared parent gives EINVAL,
+ * moving into one is unsupported. Rejected moves leave the attachment intact.
+ * No callbacks or allocation during commit.
  */
 int vfs_mount_move(struct vfs_namespace *ns,const struct vfs_path *source,
                     const struct vfs_path *target);
-/** @brief Detach an unused mounted tree root using ordinary Linux busy semantics.
+/** @brief Unmount one root and its removable shared propagation counterparts.
  * @param ns Namespace under execution ownership.
  * @param path The caller's sole external path to the mounted root.
- * @return Zero or negative errno. Children/other held paths keep it busy;
- * success retains the caller's path until vfs_path_put, no forced free.
+ * @return Zero or negative errno. The origin must have no child mounts; a
+ * receiver with children is skipped. Other held paths on selected mounts
+ * keep the entire operation busy. Success does not consume the caller's path.
  */
 int vfs_mount_unmount(struct vfs_namespace *ns,const struct vfs_path *path);
-/** @brief Lazily disconnect a mounted subtree without ordinary busy checking.
+/** @brief Lazily disconnect a subtree and eligible propagated attachments.
  * @param ns Borrowed namespace under execution ownership.
  * @param path Retained visible root of a mount, not the namespace anchor.
- * @return Zero or negative errno. Held paths remain usable; final cleanup
- * is deferred. No new allocations or synchronous backend flush on detach.
+ * @return Zero or negative errno. Receivers with unrelated children remain
+ * attached. Held paths remain usable and final cleanup is deferred. No new
+ * allocations or synchronous backend flush on detach.
  */
 int vfs_mount_unmount_lazy(struct vfs_namespace *ns,const struct vfs_path *path);
 /** @brief Prepare retained directory-name changes before a backend rename.

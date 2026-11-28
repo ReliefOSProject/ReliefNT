@@ -96,7 +96,9 @@ static int mount_line(const struct vfs_namespace *ns,const struct vfs_path *root
         mount_number(text,(mount->device&255)|((mount->device>>12)&~255ULL));mount_emit(text," ");
         mount_field(text,backing);mount_emit(text," ");mount_field(text,point);mount_emit(text," ");
         mount_options(text,mount->policy,true,false);
-        if(mount->unbindable)mount_emit(text," unbindable");
+        if(mount->peer_group) {
+            mount_emit(text," shared:");mount_number(text,mount->peer_group);
+        } else if(mount->unbindable)mount_emit(text," unbindable");
         mount_emit(text," - ");mount_emit(text,filesystem);mount_emit(text," ");
         mount_field(text,source);mount_emit(text," ");mount_options(text,vfs_super_flags(mount),true,true);mount_emit(text,"\n");
     } else {

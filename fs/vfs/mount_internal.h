@@ -30,8 +30,11 @@ struct vfs_mount {
     const struct vfs_backend_ops *ops;
     void *context;
     struct module *owner;
-    uint64_t references,id,policy;
+    uint64_t references,id,policy,peer_group; /* Zero group is not shared. */
+    uint64_t propagation_pins; /* Replica lifetime references, not open paths. */
     uint64_t writers; /* Open writable file descriptions on this attachment. */
+    bool propagation_backing; /* This bind_source is a replica lifetime pin. */
+    bool unmount_selected; /* Scratch under the namespace execution writer. */
     bool unbindable; /* Pruned by recursive bind; never a valid bind source. */
     bool lazy_detached; /* No namespace edges; retained paths still work. */
     char *source,*filesystem;

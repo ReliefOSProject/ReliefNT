@@ -45,13 +45,14 @@ static int mount_bind(struct vfs_namespace *ns,struct task *task,uint64_t source
     vfs_path_put(&from.path);vfs_path_put(&to.path);return rc;
 }
 
-/** @brief Detach the selected visible mount; only ordinary unmount syncs.
+/** @brief Detach the selected visible mount and applicable shared counterparts.
  * @param ns Borrowed execution-owned namespace.
  * @param task Authorized caller retaining any retry scope.
  * @param target User target pathname pointer, required.
  * @param flags Low-32-bit Linux umount flags; nofollow is supported.
  * @return Zero or input/unsupported/lookup/busy/provider errno. MNT_DETACH
- * immediately disconnects the subtree; forced/expire operations are unsupported.
+ * immediately disconnects the subtree and removable propagated mounts;
+ * forced/expire operations are unsupported.
  * Only ordinary unmount can wait in sync; both discard redundant lookup refs
  * before detaching. The local path pins the provider across the operation.
  */
@@ -87,7 +88,7 @@ static int mount_bind_remount(struct vfs_namespace *ns,struct task *task,uint64_
     vfs_path_put(&found.path);return rc;
 }
 
-/** @brief Change propagation on the actual selected mount attachment.
+/** @brief Apply a propagation type to the selected mount or its subtree.
  * @param ns Borrowed namespace under execution ownership.
  * @param task Authorized caller with retry-stable pathname state.
  * @param target Required user mountpoint pathname, following final symlinks.

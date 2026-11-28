@@ -3033,6 +3033,191 @@ static void runtime_recursive_bind(struct vfs_namespace *ns,const struct vfs_pat
     puts("PASS recursive bind: subdirectory boundary, sibling/nested topology, distinct policies and OOM rollback");
 }
 
+/** @brief Read one mountinfo row's shared peer ID, or zero for a private mount.
+ * @param ns Borrowed namespace. @param root Retained mount table viewer root.
+ * @param point Expected absolute mountpoint, with no mountinfo escapes.
+ * @return The parsed peer group ID; the fixture requires a matching row.
+ */
+static unsigned long long fixture_shared_id(struct vfs_namespace *ns,const struct vfs_path *root,
+                                             const char *point)
+{
+    char table[6144],field[128];uint32_t count=0;
+    assert(!vfs_read_mount_table(ns,root,true,0,table,sizeof(table)-1,&count));table[count]=0;
+    assert(snprintf(field,sizeof(field)," %s ",point)<(int)sizeof(field));
+    char *row=strstr(table,field);assert(row);
+    char *separator=strstr(row," - ");assert(separator);
+    char *tag=strstr(row," shared:");
+    return tag && tag<separator ? strtoull(tag+8,NULL,10) : 0;
+}
+
+/** @brief Exercise shared groups and propagated mount transactions via actual paths.
+ * @param ns Borrowed fixture namespace. @param root Retained namespace root.
+ */
+static void runtime_shared_mounts(struct vfs_namespace *ns,const struct vfs_path *root)
+{
+    assert(!vfs_kernel_mkdir(ns,"/shared-a",0755));
+    assert(!vfs_kernel_mkdir(ns,"/shared-b",0755));
+    assert(!vfs_kernel_mkdir(ns,"/shared-narrow",0755));
+    assert(!vfs_kernel_mkdir(ns,"/shared-source",0755));
+    assert(!vfs_kernel_mkdir(ns,"/shared-source-copy",0755));
+    struct task actor={.pid=908,.fsuid=1000,.fsgid=1000,.cap_effective=1ULL<<CAP_SYS_ADMIN};
+    vfs_path_get(root,&actor.fs_paths.root);vfs_path_get(root,&actor.fs_paths.cwd);
+    struct {char source[64],target[64],type[8];} user={"shared fixture","/shared-a","tmpfs"};
+    const uint64_t from=(uintptr_t)user.source,to=(uintptr_t)user.target,type=(uintptr_t)user.type;
+    lookup_user_base=(uintptr_t)&user;lookup_user_bytes=sizeof(user);
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,type,0,0));
+    assert(!vfs_kernel_mkdir(ns,"/shared-a/p",0755));
+    assert(!vfs_kernel_mkdir(ns,"/shared-a/outside",0755));
+    assert(!vfs_kernel_mkdir(ns,"/shared-a/p/event",0755));
+    assert(!vfs_kernel_mkdir(ns,"/shared-a/covered",0755));
+    strcpy(user.target,"/shared-a/covered");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,type,0,0));
+    strcpy(user.target,"/shared-a");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,UINT64_MAX,to,UINT64_MAX,MS_SHARED,UINT64_MAX));
+    unsigned long long group=fixture_shared_id(ns,root,"/shared-a");assert(group);
+    strcpy(user.source,"/shared-a");strcpy(user.target,"/shared-b");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,UINT64_MAX,MS_BIND,0));
+    strcpy(user.source,"/shared-a/p");strcpy(user.target,"/shared-narrow");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,UINT64_MAX,MS_BIND,0));
+    assert(fixture_shared_id(ns,root,"/shared-b")==group && fixture_shared_id(ns,root,"/shared-narrow")==group);
+
+    struct vfs_path a={0},b={0},point={0},found={0};struct vfs_mount *mount=NULL;
+    strcpy(user.target,"/shared-b/covered");
+    const uint64_t covered_id=ns->next_id,covered_peer_id=ns->next_peer_id;
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,type,0,0)==-EOPNOTSUPP);
+    assert(ns->next_id==covered_id && ns->next_peer_id==covered_peer_id);
+    assert(!vfs_path_lookup(ns,root,root,"/shared-b/covered",0,&point));
+    assert(!vfs_path_lookup(ns,root,root,"/shared-b",0,&b));
+    assert(vfs_path_mount_id(&point)==vfs_path_mount_id(&b));vfs_path_put(&point);vfs_path_put(&b);
+    strcpy(user.target,"/shared-a/covered");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0));
+
+    assert(!vfs_path_lookup(ns,root,root,"/shared-a/outside",0,&point));
+    assert(!storage_new_tmpfs_mount("shared event",0,NULL,1000,1000,&mount));
+    const uint64_t next_id=ns->next_id,peer_id=ns->next_peer_id;
+    test_fail_heap_after=1;
+    assert(vfs_mount_attach(ns,mount,&point)==-ENOMEM);
+    test_fail_heap_after=-1;
+    assert(ns->next_id==next_id && ns->next_peer_id==peer_id);
+    assert(!vfs_path_lookup(ns,root,root,"/shared-a/outside",0,&found));
+    assert(vfs_path_equal(&found,&point));vfs_path_put(&found);
+    assert(!vfs_path_lookup(ns,root,root,"/shared-b/outside",0,&found));
+    assert(vfs_path_same_inode(&found,&point));vfs_path_put(&found);
+    assert(!vfs_mount_attach(ns,mount,&point));vfs_mount_put(mount);vfs_path_put(&point);
+    assert(ns->next_id==next_id+2);
+    unsigned long long event=fixture_shared_id(ns,root,"/shared-a/outside");
+    assert(event && event!=group && fixture_shared_id(ns,root,"/shared-b/outside")==event);
+    assert(vfs_path_lookup(ns,root,root,"/shared-narrow/outside",0,&found)==-ENOENT);
+    assert(!vfs_path_lookup(ns,root,root,"/shared-b/outside",0,&b));
+    strcpy(user.target,"/shared-a/outside");
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0)==-EBUSY);
+    vfs_path_put(&b);
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0));
+    assert(!vfs_path_lookup(ns,root,root,"/shared-b/outside",0,&b));
+    assert(!vfs_path_lookup(ns,root,root,"/shared-a/outside",0,&a));
+    assert(vfs_path_same_inode(&a,&b));vfs_path_put(&a);vfs_path_put(&b);
+    assert(!vfs_kernel_mkdir(ns,"/shared-b/outside/after",0755));
+
+    strcpy(user.source,"shared source");strcpy(user.target,"/shared-source");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,type,0,0));
+    assert(!vfs_kernel_mkdir(ns,"/shared-source/child",0755));
+    strcpy(user.target,"/shared-source/child");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,type,0,0));
+    assert(!vfs_kernel_mkdir(ns,"/shared-source/child/nested",0755));
+    assert(!vfs_path_lookup(ns,root,root,"/shared-source",0,&a));
+    assert(!vfs_path_lookup(ns,root,root,"/shared-a/p/event",0,&point));
+    const uint64_t bind_id=ns->next_id,bind_peer_id=ns->next_peer_id;
+    /* The first tree and one receiver tree fit, but not the final receiver. */
+    test_fail_heap_after=8;
+    assert(vfs_mount_bind_recursive(ns,&a,&point)==-ENOMEM);
+    test_fail_heap_after=-1;
+    assert(ns->next_id==bind_id && ns->next_peer_id==bind_peer_id);
+    assert(!fixture_shared_id(ns,root,"/shared-source"));
+    assert(vfs_path_lookup(ns,root,root,"/shared-a/p/event/child",0,&found)==-ENOENT);
+    assert(vfs_path_lookup(ns,root,root,"/shared-b/p/event/child",0,&found)==-ENOENT);
+    assert(vfs_path_lookup(ns,root,root,"/shared-narrow/event/child",0,&found)==-ENOENT);
+    vfs_path_put(&point);vfs_path_put(&a);
+    strcpy(user.source,"/shared-source");strcpy(user.target,"/shared-a/p/event");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,UINT64_MAX,MS_BIND|MS_REC,0));
+    unsigned long long child=fixture_shared_id(ns,root,"/shared-a/p/event/child");
+    assert(child && child==fixture_shared_id(ns,root,"/shared-b/p/event/child") &&
+        child==fixture_shared_id(ns,root,"/shared-narrow/event/child"));
+    assert(!fixture_shared_id(ns,root,"/shared-source/child"));
+    strcpy(user.source,"nested event");strcpy(user.target,"/shared-narrow/event/child/nested");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,type,0,0));
+    assert(!vfs_path_lookup(ns,root,root,"/shared-a/p/event/child/nested",0,&a));
+    assert(!vfs_path_lookup(ns,root,root,"/shared-b/p/event/child/nested",0,&b));
+    assert(vfs_path_same_inode(&a,&b));vfs_path_put(&a);
+    strcpy(user.target,"/shared-a/p/event");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,MNT_DETACH,0,0,0));
+    assert(vfs_path_lookup(ns,root,root,"/shared-b/p/event/child",0,&found)==-ENOENT);
+    assert(vfs_path_lookup(ns,root,root,"/shared-narrow/event/child",0,&found)==-ENOENT);
+    assert(!vfs_path_namespace(&b));vfs_path_put(&b);
+    while(vfs_reclaim_mounts(32)){}
+
+    strcpy(user.source,"/shared-source");
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,0,MS_MOVE,0)==-EOPNOTSUPP);
+    for(unsigned lazy=0;lazy<2;++lazy) {
+        strcpy(user.source,"peer with local child");strcpy(user.target,"/shared-a/p/event");
+        assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,type,0,0));
+        assert(!vfs_kernel_mkdir(ns,"/shared-b/p/event/local",0755));
+        strcpy(user.target,"/shared-b/p/event");
+        assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,0,MS_PRIVATE,0));
+        strcpy(user.target,"/shared-b/p/event/local");
+        assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,type,0,0));
+        strcpy(user.source,"/shared-a/p/event");strcpy(user.target,"/shared-source-copy");
+        assert(scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,0,MS_MOVE,0)==-EINVAL);
+        strcpy(user.target,"/shared-a/p/event");
+        assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,lazy ? MNT_DETACH : 0,0,0,0));
+        assert(vfs_path_lookup(ns,root,root,"/shared-a/p/event/local",0,&found)==-ENOENT);
+        assert(vfs_path_lookup(ns,root,root,"/shared-narrow/event/local",0,&found)==-ENOENT);
+        assert(!vfs_path_lookup(ns,root,root,"/shared-b/p/event/local",0,&b));vfs_path_put(&b);
+        assert(!vfs_kernel_mkdir(ns,"/shared-b/p/event/still-writable",0755));
+        while(vfs_reclaim_mounts(32)){}
+        strcpy(user.target,"/shared-b/p/event/local");
+        assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0));
+        strcpy(user.target,"/shared-b/p/event");
+        if(!lazy) {
+            /* A last live replica still has to check native backing users. */
+            struct storage_inode_ref *pin=NULL;
+            assert(!vfs_path_lookup(ns,root,root,user.target,0,&b));
+            assert(!storage_inode_get(vfs_path_node(&b),&pin) && pin);vfs_path_put(&b);
+            assert(scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0)==-EBUSY);
+            assert(!storage_inode_put(pin));
+        }
+        assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0));
+        while(vfs_reclaim_mounts(32)){}
+    }
+
+    strcpy(user.source,"/shared-source");strcpy(user.target,"/shared-source");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,0,MS_SHARED|MS_REC,0));
+    unsigned long long source_group=fixture_shared_id(ns,root,"/shared-source");
+    unsigned long long source_child=fixture_shared_id(ns,root,"/shared-source/child");
+    assert(source_group && source_child && source_group!=source_child);
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,0,MS_SHARED|MS_REC,0));
+    assert(fixture_shared_id(ns,root,"/shared-source")==source_group);
+    assert(fixture_shared_id(ns,root,"/shared-source/child")==source_child);
+    strcpy(user.target,"/shared-source-copy");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,0,MS_BIND|MS_REC,0));
+    assert(fixture_shared_id(ns,root,"/shared-source-copy")==source_group);
+    assert(fixture_shared_id(ns,root,"/shared-source-copy/child")==source_child);
+    strcpy(user.target,"/shared-source/child");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0));
+    assert(vfs_path_lookup(ns,root,root,"/shared-source-copy/child/nested",0,&found)==-ENOENT);
+
+    strcpy(user.target,"/shared-b");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,0,MS_PRIVATE,0));
+    assert(!fixture_shared_id(ns,root,"/shared-b") && fixture_shared_id(ns,root,"/shared-a")==group);
+    const char *cleanup[]={"/shared-source-copy","/shared-source","/shared-narrow","/shared-b","/shared-a"};
+    for(unsigned i=0;i<sizeof(cleanup)/sizeof(cleanup[0]);++i) {
+        strcpy(user.target,cleanup[i]);
+        assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0));
+    }
+    vfs_path_put(&actor.fs_paths.root);vfs_path_put(&actor.fs_paths.cwd);
+    lookup_user_base=lookup_user_bytes=0;
+    puts("PASS shared propagation: group IDs, bounded peer roots, rollback, busy peers, retained local branches and recursive detach");
+}
+
 /** @brief Verify lazy detach hides a mount tree without revoking retained paths.
  * @param ns Borrowed namespace under fixture execution ownership.
  * @param root Retained namespace anchor. @param fs Base tmpfs for the fixture.
@@ -3312,6 +3497,7 @@ int main(int argc,char **argv)
     runtime_attachment_policies(&ns,&root);
     runtime_mount_syscalls(&ns,&root,fs);
     runtime_recursive_bind(&ns,&root,fs);
+    runtime_shared_mounts(&ns,&root);
     runtime_bind_remount(&ns,&root,fs);
     runtime_lazy_unmount(&ns,&root,fs);
     device_mount_objects(&ns,&root,fs);
