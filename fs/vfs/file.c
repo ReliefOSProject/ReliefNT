@@ -204,6 +204,8 @@ int vfs_path_new_file(const struct vfs_path *parent,const char *name,
                          const struct reliefos_permissions *value,struct vfs_path *out)
 {return !out ? -EINVAL : vfs_path_create_node(parent,name,LINUX_S_IFREG,value,NULL,out);}
 
+/** @brief Create a child only through a writable attachment and supported provider.
+ * No cached or returned inode is published before successful backend creation. */
 int vfs_path_create_node(const struct vfs_path *parent,const char *name,uint32_t type,
                             const struct reliefos_permissions *value,const char *target,struct vfs_path *out)
 {
@@ -221,7 +223,7 @@ int vfs_path_create_node(const struct vfs_path *parent,const char *name,uint32_t
        type!=LINUX_S_IFIFO && type!=LINUX_S_IFSOCK)return -EOPNOTSUPP;
     if(type==LINUX_S_IFLNK && (!target || !target[0]))return -ENOENT;
     if(type!=LINUX_S_IFLNK && target)return -EINVAL;
-    if(!parent->mount->ops->create_node)return -EROFS;
+    if((vfs_path_mount_flags(parent)&MS_RDONLY) || !parent->mount->ops->create_node)return -EROFS;
     struct vfs_dentry *reserved=NULL;
     if(out) {
         reserved=kernel_malloc(sizeof(*reserved));if(!reserved)return -ENOMEM;

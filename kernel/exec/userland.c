@@ -731,7 +731,8 @@ static int userland_bind_pending_image(struct task *task,const char *path)
  * @param make_ready Nonzero to publish after all references/parameters attach.
  * @return PID or negative errno. Requires the published shared namespace;
  * initializes fresh root/cwd before publication without resetting inherited
- * objects. Execution-owned task context; no scheduler lock spans backend I/O.
+ * objects. Runnable publication checks the current cgroup PID quota.
+ * Execution-owned task context; no scheduler lock spans backend I/O.
  */
 static int64_t spawn_pending_image_ex(const char *path, const char *task_name,
                                       const struct exec_launch *launch,
@@ -741,10 +742,9 @@ static int64_t spawn_pending_image_ex(const char *path, const char *task_name,
 {
     struct vfs_namespace *namespace=vfs_system_namespace();
     if(!namespace)return -19;
-    uint32_t pid = sched_create_user_task(task_name, 0, USER_STACK_TOP, parent, flags);
-    if (!pid) {
-        return -12;
-    }
+    int64_t prepared = sched_create_user_task(task_name, 0, USER_STACK_TOP, parent, flags);
+    if (prepared < 0) return prepared;
+    uint32_t pid = (uint32_t)prepared;
     int fs_ret=sched_task_fs_start(sched_find(pid),namespace);
     if(fs_ret<0){sched_exit(pid,127);return fs_ret;}
     sched_set_task_path(pid, path);
@@ -775,7 +775,8 @@ static int64_t spawn_pending_image_ex(const char *path, const char *task_name,
      * scheduler has been published.  Bootstrap callers may defer this one
      * final transition while they attach the controlling PTY. */
     if (make_ready) {
-        sched_mark_ready(pid);
+        int rc = sched_publish_user_task(pid);
+        if (rc) { sched_exit(pid, 127); return rc; }
     }
     return pid;
 }
@@ -1068,7 +1069,7 @@ const char *userland_boot_cmdline(void)
 /**
  * @brief Prepare runtime objects in the assembled namespace and start PID1.
  * @param boot Borrowed boot handoff; namespace already owns root/providers.
- * @return None. Stops at idle on missing root/namespace or failed preparation;
+ * @return None. Stops at idle on missing root/namespace or failed launch;
  * otherwise starts the configured user image with inherited actual root/cwd.
  * Exclusive boot execution precedes user tasks and secondary CPU startup.
  */
@@ -1118,7 +1119,11 @@ void userland_init(const struct boot_info *boot)
     }
     init_pid = (uint32_t)pid;
     console_info("[reliefnt] PID 1 path=%s console=tty1\n", init_path);
-    sched_mark_ready(init_pid);
+    int publish = sched_publish_user_task(init_pid);
+    if (publish < 0) {
+        console_fatal("[boot] cannot publish PID 1 ret=%d\n", publish);
+        kernel_idle_loop();
+    }
 }
 
 /**
@@ -1401,7 +1406,8 @@ int64_t userland_spawn_path_argv_with_fds(const char *path,
 }
 
 /**
- * @brief Spawn path as a child of parent_pid and tag it with the given user identity/session; returns the PID or a negative errno.
+ * @brief Spawn path as a child of parent_pid with the given user identity/session.
+ * @return PID or negative errno, including EAGAIN on cgroup quota denial.
  */
 int64_t userland_spawn_path_argv_for_user(const char *path,
                                           const char *const argv[],
@@ -1431,7 +1437,8 @@ int64_t userland_spawn_path_argv_for_user(const char *path,
         sched_set_task_identity((uint32_t)pid, user, session_id);
         ret=userland_bind_pending_image(sched_find((uint32_t)pid),path);
         if(ret<0){sched_exit((uint32_t)pid,127);return ret;}
-        sched_mark_ready((uint32_t)pid);
+        ret = sched_publish_user_task((uint32_t)pid);
+        if (ret < 0) { sched_exit((uint32_t)pid, 127); return ret; }
         console_debug("[reliefnt] spawn trusted path=%s pid=%u parent=%u user=%u\n",
                        path, (unsigned)pid, parent_pid, user->uid);
     }

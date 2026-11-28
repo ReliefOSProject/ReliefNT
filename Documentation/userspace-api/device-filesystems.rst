@@ -1,6 +1,6 @@
-============================
-设备节点、devtmpfs 与 devpts
-============================
+====================
+设备与控制组文件系统
+====================
 
 devtmpfs
 ========
@@ -78,11 +78,53 @@ devpts 挂载选项
 权限决定是否可打开。找不到有效的 devpts 多路复用器时沿用启动阶段的旧 PTY
 分配；其他查找错误则返回调用方。
 
+cgroup v2
+=========
+
+``mount("none", "/sys/fs/cgroup", "cgroup2", flags, data)`` 挂载统一控制组层级。
+``/proc/filesystems`` 将其列为 ``nodev``，``statfs`` 返回 ``0x63677270``。
+所有挂载共享同一层级和 inode 身份，包括最后一次卸载后的重新挂载；只读等挂载点
+策略独立。管理员可以用 ``mkdir`` 创建控制组，用 ``rmdir`` 删除没有活任务和
+子组的非根组。
+
+成员与事件
+----------
+
+向 ``cgroup.procs`` 写入 PID 或 TID 会迁移该进程的所有活线程，不迁移子进程；
+写入 0 选择调用者。读取该文件列出本组的进程 ID；只读的 ``cgroup.threads``
+列出本组的线程 ID。``/proc/<pid>/cgroup`` 以 ``0::/路径`` 报告成员身份，
+不依赖控制组层级挂载在何处。只有拥有 ``CAP_SYS_ADMIN`` 的用户任务能修改层级和控制值。
+
+非根组的 ``cgroup.events`` 中，``populated`` 表示本组或后代是否仍有活线程，
+不包含僵尸。其变化与 ``pids.events``、``pids.events.local`` 的变化由 VFS worker
+合并后发出 inotify ``IN_MODIFY``。被删除的组或已停用的控制器文件不再接受读写；
+保留的 inode 不会指向后来创建的同名组或文件。仍保留成员引用的僵尸显示
+`` (deleted)`` 后缀。
+
+PID 配额
+--------
+
+``pids`` 是唯一支持的控制器。向 ``cgroup.subtree_control`` 写 ``+pids``，
+可为直接子组启用 ``pids.max``、``pids.current``、``pids.peak`` 和事件计数。
+非根组必须先从父组继承控制器，才能向下启用。已经向下启用的控制器须从下往上停用。
+``pids.max`` 默认为 ``max``。降低上限或迁移线程可以使计数超过上限；以后创建的
+线程若超过本组或祖先的上限，则返回 ``EAGAIN``。
+
+配额按照线程计数，且只在创建成功时计入。普通线程退出后释放其配额；可等待的
+僵尸仍计入 ``pids.current``，直至实际回收。带 ``WNOWAIT`` 的等待不回收配额。
+``pids.events.local`` 记录本组触发的拒绝，``pids.events`` 还累计后代的拒绝。
+
+不支持 cgroup v1、threaded 模式、cgroup namespace、非特权委托或其他控制器。
+``nsdelegate``、``memory_recursiveprot`` 只接受为兼容性挂载参数，不启用相应功能。
+通知仅支持 inotify，不支持通过 ``POLLPRI`` 订阅状态变化。
+
 验证范围
 ========
 
 ``tools/test_mount_backend.py`` 覆盖 devtmpfs 共享挂载、元数据、设备号、符号
 链接、设备增删、用户替换、挂载策略和内存不足重试，也验证 devpts 实例隔离、
 选项、绑定、端点生命周期、编号回收及失败回滚。``tools/test_linux_pty.py``
-覆盖 PTY ABI、会话与主端挂断行为。目标系统启动与 udev 集成由 ReliefOS 的
-系统迁移验证覆盖。
+覆盖 PTY ABI、会话与主端挂断行为。控制组挂载、文件语义及 inotify 也由
+``tools/test_mount_backend.py`` 覆盖；``tools/test_cgroup_scheduler.py`` 检查真实
+调度器的配额拒绝、创建回滚、退出及回收。来宾启动、udev 和 systemd 集成需要
+另行验证。

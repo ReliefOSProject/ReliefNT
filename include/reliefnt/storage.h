@@ -295,6 +295,8 @@ struct storage_read_cursor {
 #define STORAGE_NODE_FLAG_SQUASHFS 0x00200000u
 /* Instance-bound devpts inode, resolved before global rdev dispatch. */
 #define STORAGE_NODE_FLAG_DEVPTS 0x00400000u
+/* Generated cgroup2 controls, not regular-file data for RLIMIT_FSIZE. */
+#define STORAGE_NODE_FLAG_CGROUP 0x00800000u
 #define STORAGE_SYSFS_DEVICE 202u
 #define STORAGE_NODE_FLAG_DEV_LINK 0x00000200u
 /* Anonymous filesystem device numbers, also exported in proc mountinfo. */

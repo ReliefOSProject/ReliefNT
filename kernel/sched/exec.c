@@ -1,5 +1,6 @@
 #include <reliefnt/swap.h>
 #include "internal.h"
+#include <reliefnt/cgroup.h>
 
 /** @brief Invalidate OOM holder snapshots after an exec root commit.
  * Production supplies the allocation-free notifier; detached scheduler
@@ -127,7 +128,8 @@ int sched_set_task_exec_params(uint32_t pid, uint32_t argc, char *const argv[],
  * @param task Current task under exclusive execution ownership; required.
  * @return Zero when ready, negative file-table error, or EAGAIN while a remote
  * sibling is retiring. Retains the filesystem state shared via CLONE_FS.
- * Called without scheduler_lock; takes it for signals.
+ * During de-threading, the retired leader's PID charge does not follow its
+ * PID to the surviving task. Called without scheduler_lock; takes it for signals.
  */
 int sched_prepare_exec_current(struct task *task)
 {
@@ -187,6 +189,7 @@ int sched_prepare_exec_current(struct task *task)
         task->parent_exit_notified = 0;
         task->flags |= leader->flags & TASK_FLAG_WAITABLE_CHILD;
         leader->flags &= ~TASK_FLAG_WAITABLE_CHILD;
+        if (cgroup2_task_reap) cgroup2_task_reap(leader);
         leader->process_pending_signals = 0;
         leader->alarm_deadline = 0;
         leader->alarm_interval_ns = leader->alarm_last_expiry = 0;
@@ -201,6 +204,7 @@ int sched_prepare_exec_current(struct task *task)
         current_pid[scheduler_cpu_index()] = group;
         current_task[scheduler_cpu_index()] = task;
         kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
+        if (cgroup2_kick) cgroup2_kick();
     }
     if (task->shared_sighand) {
         struct task_sighand_state *old = task->shared_sighand;

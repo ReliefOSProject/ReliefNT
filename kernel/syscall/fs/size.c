@@ -7,7 +7,8 @@
  * @param path Borrowed held inode retaining its provider through I/O.
  * @param length Validated nonnegative logical size.
  * @return Zero or negative errno. Acquires a temporary inode/write lease
- * before truncation and releases it on every outcome, including retry.
+ * before truncation for stored files, releasing it on every outcome. Generated
+ * cgroup controls validate truncation directly without a storage inode lease.
  * No text lookup or graph/module spinlock spans the provider callback.
  */
 static int truncate_inode_path(struct task *task,const struct vfs_path *path,uint64_t length)
@@ -16,6 +17,7 @@ static int truncate_inode_path(struct task *task,const struct vfs_path *path,uin
     if(!node)return -RELIEFOS_EINVAL;
     if(node->type==RELIEFOS_FS_TYPE_DIR)return -RELIEFOS_EISDIR;
     if(node->type!=RELIEFOS_FS_TYPE_FILE)return -RELIEFOS_EINVAL;
+    if(node->flags&STORAGE_NODE_FLAG_CGROUP)return vfs_path_truncate(path,length);
     int limited=task_file_limit_size(task,length);if(limited)return limited;
     struct storage_inode_ref *inode=NULL;
     int rc=storage_inode_get(node,&inode);if(rc)return rc;

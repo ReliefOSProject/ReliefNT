@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: Apache-2.0
+obj-y := hierarchy.o filesystem.o
+include $(srctree)/scripts/Makefile.module

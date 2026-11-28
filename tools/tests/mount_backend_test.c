@@ -12,7 +12,9 @@
 #define RELIEFNT_FIXTURE_SEPARATE_JOURNAL
 #define RELIEFNT_FIXTURE_DEVICE_FLUSH
 #define main storage_mkdir_reference_main
+#define sched_current_task storage_fixture_current_task
 #include "storage_mkdir_mount_test.c"
+#undef sched_current_task
 #undef main
 static unsigned file_size_signals;
 /** @brief Observe FSIZE delivery while keeping the VFS fixture alive.
@@ -27,10 +29,15 @@ int kernel_signal_queue_task(struct task *task,int signal_number)
 #include <reliefnt/module.h>
 #include <reliefnt/devfs.h>
 #include <reliefnt/devpts.h>
+#include <reliefnt/cgroup.h>
+#include <reliefnt/deferred.h>
+#include <reliefnt/fsnotify.h>
+#include <reliefnt/fsnotify_vfs.h>
 #include <reliefnt/pty.h>
 #include <reliefnt/console.h>
 #include <reliefnt/permissions.h>
 #include <reliefnt/procfs.h>
+#include <reliefnt/text_stream.h>
 #include <reliefnt/inventory.h>
 #include "../../kernel/syscall/internal.h"
 #include "../../kernel/syscall/ipc/unix_path.h"
@@ -185,6 +192,8 @@ void sched_truncate_file_mappings(const struct storage_node *node,uint64_t size)
 /* PTYs use the production core and descriptors. This fixture has one actor,
  * no asynchronous console hardware and no other scheduler terminal owners. */
 static struct task *devpts_actor;
+static struct task *cgroup_tasks[2];
+struct kernel_spinlock scheduler_lock;
 bool console_vga_text_mode;
 /** @brief Reject an unexpected blocked scheduler actor in the synchronous fixture.
  * @param task Unexpected waiter. */
@@ -193,8 +202,20 @@ const struct framebuffer *framebuffer_get(void) { return NULL; }
 void kernel_spin_init(struct kernel_spinlock *lock) { lock->state = 0; }
 void console_vt_write(uint32_t number, const char *text, size_t count)
 { (void)number; (void)text; (void)count; }
+/** @brief Return the cgroup scenario's current actor; other cases run as kernel. */
+struct task *sched_current_task(void) { return cgroup_tasks[0]; }
+/** @brief Enumerate the two user threads enrolled in the cgroup scenario. */
+struct task *sched_task_at(uint32_t index) { return index < 2 ? cgroup_tasks[index] : NULL; }
+/** @brief Resolve a modeled PID without changing scheduler ownership. */
 struct task *sched_find(uint32_t pid)
-{ return devpts_actor && devpts_actor->pid == pid ? devpts_actor : NULL; }
+{
+    for (uint32_t i = 0; i < 2; ++i)
+        if (cgroup_tasks[i] && cgroup_tasks[i]->pid == pid) return cgroup_tasks[i];
+    return devpts_actor && devpts_actor->pid == pid ? devpts_actor : NULL;
+}
+/** @brief Model the deferred-service handoff; never wake while holding the task lock. */
+void kernel_deferred_request(enum kernel_deferred_service service)
+{ assert(service == DEFERRED_VFS && !scheduler_lock.state); }
 uint32_t sched_pty_reference_count(uint32_t id) { return pty_transfer_count(id, 0); }
 uint32_t sched_pty_master_reference_count(uint32_t id) { return pty_transfer_count(id, 1); }
 int sched_hangup_user_tasks_for_pty(uint32_t id, uint32_t owner)
@@ -2361,6 +2382,138 @@ static int64_t scoped_mount_call(struct vfs_namespace *ns,struct task *task,uint
     if(rc!=-EAGAIN)task_lookup_scope_cancel(task);
     return rc;
 }
+
+/** @brief Read a generated cgroup control by its retained inode and check exact bytes. */
+static void cgroup_check_text(const struct vfs_path *directory,const char *name,const char *expected)
+{
+    struct vfs_path file={0};char data[80];uint32_t count=0;
+    assert(!vfs_path_lookup_child(directory,name,&file));
+    assert(!vfs_path_read(&file,0,data,sizeof(data),&count));
+    assert(count==strlen(expected) && !memcmp(data,expected,count));
+    vfs_path_put(&file);
+}
+
+/** @brief Write one command through a real VFS control and check completion semantics. */
+static void cgroup_write_text(const struct vfs_path *directory,const char *name,const char *text,int status)
+{
+    struct vfs_path file={0};uint32_t count=UINT32_MAX;
+    assert(!vfs_path_lookup_child(directory,name,&file));
+    assert(vfs_path_write(&file,0,text,strlen(text),&count)==status);
+    assert(count==(status ? 0 : strlen(text)));
+    vfs_path_put(&file);
+}
+
+/** @brief Verify one nameless inode notification from the real inotify core. */
+static void cgroup_expect_event(struct fsnotify_instance *instance,int wd,uint32_t mask)
+{
+    const struct inotify_event *event=NULL;
+    assert(fsnotify_peek(instance,&event)==sizeof(*event));
+    assert(event->wd==wd && event->mask==mask && !event->cookie && !event->len);
+    fsnotify_pop(instance);
+}
+
+/** @brief Exercise cgroup attachments, generated controls, migration and inode lifetime. */
+static void cgroup_mount_syscalls(struct vfs_namespace *ns,const struct vfs_path *root)
+{
+    assert(!vfs_kernel_mkdir(ns,"/cgroup",0755));
+    assert(!vfs_kernel_mkdir(ns,"/cgroup-ro",0755));
+    struct task actor={.pid=903,.kind=TASK_KIND_USER,.state=TASK_RUNNING,.cap_effective=1ULL<<CAP_SYS_ADMIN};
+    struct task thread={.pid=904,.tgid=903,.kind=TASK_KIND_USER,.state=TASK_READY};
+    cgroup_tasks[0]=&actor;cgroup_tasks[1]=&thread;
+    vfs_path_get(root,&actor.fs_paths.root);vfs_path_get(root,&actor.fs_paths.cwd);
+    struct {char source[16],target[32],type[16],options[40];} user={
+        "cgroup2","/cgroup","cgroup2","nsdelegate,memory_recursiveprot"};
+    lookup_user_base=(uintptr_t)&user;lookup_user_bytes=sizeof(user);
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,(uintptr_t)user.source,
+        (uintptr_t)user.target,(uintptr_t)user.type,MS_NODEV|MS_NOSUID,(uintptr_t)user.options));
+    strcpy(user.target,"/cgroup-ro");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,(uintptr_t)user.source,
+        (uintptr_t)user.target,(uintptr_t)user.type,MS_NOSUID|MS_RDONLY,(uintptr_t)user.options));
+    struct vfs_path rw={0},ro={0},group={0},alias={0},old={0},fresh={0},events={0};
+    assert(!vfs_path_lookup(ns,root,root,"/cgroup",0,&rw));
+    assert(!vfs_path_lookup(ns,root,root,user.target,0,&ro));
+    struct linux_statfs_abi fs;
+    assert(!vfs_path_statfs(&ro,&fs) && fs.f_type==0x63677270 && (fs.f_flags&LINUX_ST_RDONLY));
+    assert(!vfs_path_statfs(&rw,&fs) && fs.f_type==0x63677270 && !(fs.f_flags&LINUX_ST_RDONLY));
+    cgroup_check_text(&rw,"cgroup.controllers","pids\n");
+    cgroup_check_text(&rw,"cgroup.subtree_control","");
+    struct reliefos_permissions mode={.mode=0755};
+    assert(vfs_path_create_node(&ro,"jobs",LINUX_S_IFDIR,&mode,NULL,&group)==-EROFS);
+    test_fail_heap_after=2;
+    assert(vfs_path_create_node(&rw,"jobs",LINUX_S_IFDIR,&mode,NULL,&group)==-ENOMEM);
+    test_fail_heap_after=-1;
+    assert(vfs_path_lookup_child(&ro,"jobs",&group)==-ENOENT);
+    assert(!vfs_path_create_node(&rw,"jobs",LINUX_S_IFDIR,&mode,NULL,&group));
+    assert(!vfs_path_lookup_child(&ro,"jobs",&alias));
+    struct linux_stat_abi a,b;
+    assert(!vfs_path_stat(&group,&a) && !vfs_path_stat(&alias,&b));
+    assert(a.st_dev==b.st_dev && a.st_ino==b.st_ino);
+    cgroup_check_text(&alias,"cgroup.controllers","");
+    assert(vfs_path_lookup_child(&alias,"pids.max",&fresh)==-ENOENT);
+    cgroup_write_text(&ro,"cgroup.subtree_control","+pids",-EROFS);
+    cgroup_write_text(&rw,"cgroup.subtree_control","+pids +nope",-EINVAL);
+    cgroup_check_text(&rw,"cgroup.subtree_control","");
+    cgroup_write_text(&rw,"cgroup.subtree_control","+pids\n",0);
+    assert(!vfs_path_lookup_child(&alias,"pids.max",&old));
+    assert(!vfs_path_lookup_child(&alias,"cgroup.events",&events));
+    struct fsnotify_instance *watch=NULL;
+    struct fsnotify_key key;
+    assert(!fsnotify_create(0,NULL,NULL,&watch));
+    assert(!vfs_notify_key(&events,&key));
+    int population=fsnotify_add_watch(watch,&key,IN_MODIFY);assert(population>0);
+    assert(!vfs_notify_key(&old,&key));
+    int removed=fsnotify_add_watch(watch,&key,IN_DELETE_SELF);assert(removed>0);
+
+    cgroup_write_text(&group,"pids.max","0",0);
+    actor.cap_effective=0;
+    cgroup_write_text(&group,"cgroup.procs","904",-EPERM);
+    actor.cap_effective=1ULL<<CAP_SYS_ADMIN;
+    cgroup_write_text(&group,"cgroup.procs","904\n",0);
+    cgroup_check_text(&alias,"cgroup.procs","903\n");
+    cgroup_check_text(&alias,"cgroup.threads","903\n904\n");
+    cgroup_check_text(&alias,"pids.current","2\n");
+    cgroup_check_text(&alias,"pids.peak","2\n");
+    cgroup_check_text(&alias,"cgroup.events","populated 1\nfrozen 0\n");
+    char membership[32]={0};
+    struct text_stream output={.offset=3,.buffer=membership,.capacity=sizeof(membership)-1};
+    cgroup2_proc_emit(&thread,&output);assert(!strcmp(membership,"/jobs\n"));
+    assert(!fsnotify_ready(watch));cgroup2_service(16);
+    cgroup_expect_event(watch,population,IN_MODIFY);
+    assert(vfs_path_remove(ns,&group,true)==-EBUSY);
+    cgroup_write_text(&rw,"cgroup.procs","0",0);
+    cgroup2_service(16);cgroup_expect_event(watch,population,IN_MODIFY);
+    cgroup_check_text(&group,"pids.current","0\n");
+
+    cgroup_write_text(&rw,"cgroup.subtree_control","-pids",0);
+    cgroup_expect_event(watch,removed,IN_DELETE_SELF);
+    cgroup_expect_event(watch,removed,IN_IGNORED);
+    cgroup_write_text(&rw,"cgroup.subtree_control","+pids",0);
+    cgroup_check_text(&alias,"pids.max","max\n");
+    assert(!vfs_path_lookup_child(&alias,"pids.max",&fresh));
+    assert(!vfs_path_stat(&old,&a) && !a.st_nlink && !vfs_path_stat(&fresh,&b) && a.st_ino!=b.st_ino);
+    char byte;uint32_t count=0;
+    assert(vfs_path_read(&old,0,&byte,1,&count)==-ENODEV && !count);
+    assert(vfs_path_write(&old,0,"0",1,&count)==-EROFS && !count);
+    assert(vfs_path_remove(ns,&alias,true)==-EROFS);
+    assert(!vfs_path_remove(ns,&group,true));
+    assert(!vfs_path_stat(&events,&a) && !a.st_nlink);
+    assert(vfs_path_read(&events,0,&byte,1,&count)==-ENODEV && !count);
+    struct vfs_path recreated={0};
+    assert(!vfs_path_create_node(&rw,"jobs",LINUX_S_IFDIR,&mode,NULL,&recreated));
+    assert(!vfs_path_stat(&group,&a) && !a.st_nlink);
+    assert(!vfs_path_stat(&recreated,&b) && b.st_nlink==2 && a.st_ino!=b.st_ino);
+    assert(!vfs_path_remove(ns,&recreated,true));vfs_path_put(&recreated);
+    vfs_path_put(&fresh);vfs_path_put(&old);vfs_path_put(&events);
+    vfs_path_put(&alias);vfs_path_put(&group);
+    cgroup_write_text(&rw,"cgroup.subtree_control","-pids",0);
+    fsnotify_put(watch);cgroup2_service(16);
+    assert(!vfs_mount_unmount(ns,&ro));vfs_path_put(&ro);
+    assert(!vfs_mount_unmount(ns,&rw));vfs_path_put(&rw);
+    vfs_path_put(&actor.fs_paths.root);vfs_path_put(&actor.fs_paths.cwd);
+    cgroup_tasks[0]=cgroup_tasks[1]=NULL;
+    lookup_user_base=lookup_user_bytes=0;
+    puts("PASS cgroup2 mount syscall: shared hierarchy, readonly, TID migration, notifications and retired inode keys");
+}
 /** @brief Exercise publication, allocation retry and userspace inode ownership.
  * @param ns Live fixture namespace. @param root Its retained root path.
  * DRM availability models the provider's real inventory transitions.
@@ -2929,6 +3082,7 @@ int main(int argc,char **argv)
     assert(!storage_create_vfs_mount(&g_volumes[0],NULL,&mount));
     assert(!vfs_namespace_init(&ns,mount));vfs_mount_put(mount);
     assert(!vfs_namespace_root(&ns,&root));
+    cgroup_mount_syscalls(&ns,&root);
     devtmpfs_mount_syscalls(&ns,&root,fs);
     devpts_mount_syscalls(&ns,&root,fs);
     vfs_path_put(&root);

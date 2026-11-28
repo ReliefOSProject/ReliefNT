@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: Apache-2.0 */
+#include <reliefnt/cgroup.h>
 #include <reliefnt/deferred.h>
 #include <reliefnt/workqueue.h>
 #include <reliefnt/usb.h>
@@ -28,13 +29,14 @@ static void usb_work(struct kernel_work *work,void *context)
     (void)context;usb_process_work();
     if(usb_service_pending())(void)kernel_queue_delayed_work(work,1);
 }
-/** @brief Retry bounded detached-mount cleanup while preserving failed owners.
+/** @brief Service device and cgroup updates and retry bounded mount cleanup.
  * @param work Permanent VFS work. @param context Unused NULL.
  */
 static void vfs_work(struct kernel_work *work,void *context)
 {
     (void)context;
     (void)devtmpfs_refresh();
+    cgroup2_service(16);
     (void)vfs_reclaim_mounts(2);
     if(vfs_reclaim_pending() || devtmpfs_pending())(void)kernel_queue_delayed_work(work,1);
 }

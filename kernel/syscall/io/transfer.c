@@ -149,6 +149,7 @@ capture_offsets:
  * @return Zero or negative busy/metadata/range errno. EAGAIN retains original
  * offsets and provider pins. No partial new reservation is acquired when the
  * peer OFD is owned by another task. Provider metadata I/O is synchronous.
+ * Do not apply stored-file growth limits to generated control destinations.
  */
 static int transfer_prepare(struct task *task)
 {
@@ -176,7 +177,7 @@ static int transfer_prepare(struct task *task)
        state->output_position<state->input_position+state->count &&
        state->input_position<state->output_position+state->count)return -EINVAL;
     if(state->output->node.type==RELIEFOS_FS_TYPE_FILE &&
-       !(state->output->node.flags&(STORAGE_NODE_FLAG_PROC|STORAGE_NODE_FLAG_SYSFS))) {
+       !(state->output->node.flags&(STORAGE_NODE_FLAG_PROC|STORAGE_NODE_FLAG_SYSFS|STORAGE_NODE_FLAG_CGROUP))) {
         rc=task_file_limit_write(task,state->output_position,&state->count,true);
         if(rc)return rc;
     }

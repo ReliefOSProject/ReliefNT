@@ -17,6 +17,7 @@
 #include <reliefnt/text_stream.h>
 #include <reliefnt/lock_profile.h>
 #include <reliefnt/permissions.h>
+#include <reliefnt/cgroup.h>
 #include <reliefnt/pty.h>
 #include <reliefos/fs_abi.h>
 #include <linux/capability.h>
@@ -234,7 +235,7 @@ static int proc_oom_key(const char *name, struct task **task)
  * @param buffer Writable kernel buffer, always NUL-terminated on return.
  * @param capacity Nonzero byte capacity of buffer.
  * @return Zero with the file content in buffer, or negative ENOENT for paths
- * this generator does not own. The filesystem list includes devpts.
+ * this generator does not own. The filesystem list includes devpts and cgroup2.
  */
 static int proc_fill_content(const char *path, char *buffer, uint32_t capacity)
 {
@@ -280,7 +281,7 @@ static int proc_fill_content(const char *path, char *buffer, uint32_t capacity)
 #ifdef CONFIG_SQUASHFS
         proc_append_text(buffer, &pos, capacity, "\tsquashfs\n");
 #endif
-        proc_append_text(buffer, &pos, capacity, "nodev\tproc\nnodev\tdevfs\nnodev\tdevtmpfs\nnodev\tdevpts\nnodev\tsysfs\nnodev\ttmpfs\n");
+        proc_append_text(buffer, &pos, capacity, "nodev\tproc\nnodev\tdevfs\nnodev\tdevtmpfs\nnodev\tdevpts\nnodev\tcgroup2\nnodev\tsysfs\nnodev\ttmpfs\n");
         return 0;
     }
     if (proc_text_eq(path, "/proc/asound/cards")) {
@@ -824,7 +825,8 @@ static void proc_task_stat(struct task *task, struct text_stream *s, bool proces
 /** @brief Look up proc node types without following the last symbolic link.
  * @param path Borrowed absolute intrinsic pathname, NULL is rejected.
  * @param out Optional caller-owned writable node metadata.
- * @return Zero or negative ENOENT. Execution-owned; no reference transfers. */
+ * @return Zero or negative ENOENT. Execution-owned; no reference transfers.
+ * Includes the unified cgroup membership file in process and thread views. */
 int proc_lookup(const char *path, struct storage_node *out)
 {
     int extra = proc_extra_kind(path);
@@ -969,7 +971,8 @@ int proc_lookup(const char *path, struct storage_node *out)
         }
         if ((kind == 2 || kind == 3) && file &&
             (proc_text_eq(file, "stat") || proc_text_eq(file, "comm") || proc_text_eq(file, "cmdline") || proc_text_eq(file, "environ") || proc_text_eq(file, "status") ||
-             proc_text_eq(file, "oom_score") || proc_text_eq(file, "oom_score_adj"))) {
+             proc_text_eq(file, "oom_score") || proc_text_eq(file, "oom_score_adj") ||
+             proc_text_eq(file, "cgroup"))) {
             if (kind == 2 && !sched_find(pid)) return -2;
             if (out) {
                 *out = (struct storage_node){
@@ -993,7 +996,8 @@ int proc_lookup(const char *path, struct storage_node *out)
  * @param length Maximum bytes to copy.
  * @param out_read Optional caller-owned writable actual byte count.
  * @return Zero or negative errno, preserving backend failures. Execution-owned;
- * retains no caller memory and live generated views can change between reads. */
+ * retains no caller memory and live generated views can change between reads.
+ * A cgroup membership record reflects a single locked ancestry snapshot. */
 int proc_read(const char *path, uint64_t offset, void *buffer, uint32_t length,
               uint32_t *out_read)
 {
@@ -1043,6 +1047,15 @@ int proc_read(const char *path, uint64_t offset, void *buffer, uint32_t length,
     }
     const char *file=0; uint32_t pid=0; int kind=proc_path_kind(path,&file,&pid);
     if(kind==3) pid=sched_current_pid();
+    if ((kind == 2 || kind == 3) && file && proc_text_eq(file,"cgroup")) {
+        const struct task *task=sched_find(pid);
+        if (!pid || !task || task->kind != TASK_KIND_USER) return -ENOENT;
+        struct text_stream stream={.offset=offset,.buffer=buffer,.capacity=length};
+        if (cgroup2_proc_emit) cgroup2_proc_emit(task,&stream);
+        else text_string(&stream,"0::/\n");
+        if(out_read)*out_read=stream.written;
+        return 0;
+    }
     if ((kind == 2 || kind == 3) && file &&
         (proc_text_eq(file,"oom_score") || proc_text_eq(file,"oom_score_adj"))) {
         struct task *task=sched_find(pid);
@@ -1167,6 +1180,7 @@ int proc_readlink(const char *path, char *buffer, uint32_t capacity)
  * @param entry Required writable record, assigned on success.
  * @return One entry, zero EOF, or negative errno. Caller serializes execution
  * and retains the provider; no scheduler lock spans a generated-file callback.
+ * The process entries include unified cgroup membership.
  */
 int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *entry)
 {
@@ -1286,7 +1300,7 @@ int proc_readdir(const char *path, uint64_t *offset, struct reliefos_dir_entry *
                                            "exe",  "cwd",     "root",         "comm",   "environ",
                                            "fd",   "task",    "fdinfo",       "limits", "statm",
                                            "maps", "smaps",   "smaps_rollup", "auxv",   "io",
-                                           "oom_score", "oom_score_adj"};
+                                           "oom_score", "oom_score_adj", "cgroup"};
         if (*offset == 11 && (proc_thread_path(path) || sched_task_tgid(sched_find(pid)) != pid ||
                               !__builtin_strncmp(path, "/proc/thread-self", 17)))
             ++*offset;

@@ -651,9 +651,9 @@ struct task *alloc_task_slot(void);
 struct task *sched_create_kernel_task(const char *name,uint64_t entry,uint64_t low,uint64_t top,uint32_t cpu);
 
 /**
- * @brief Allocate a user task, build its address space and stack, and inherit cwd/identity from parent.
+ * @brief Prepare an unpublished user task and its address space; return PID or negative errno.
  */
-uint32_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack_top,
+int64_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack_top,
                                 uint32_t parent_pid, uint32_t flags);
 
 /**

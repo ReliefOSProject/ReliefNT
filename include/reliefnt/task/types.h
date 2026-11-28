@@ -27,6 +27,7 @@ struct drm_file;
 struct drm_prime_file;
 struct task_epoll_watch;
 struct task_identity;
+struct cgroup;
 struct vfs_exec_source;
 struct task_transfer_state;
 struct seccomp_filter;
@@ -250,6 +251,8 @@ enum task_kind {
 #define TASK_FLAG_FORK_NOEXEC 0x00000100u
 #define TASK_FLAG_ORPHAN_NOTIFY 0x00000200u
 #define TASK_FLAG_PDEATH_NOTIFY 0x00000400u
+/* Internal launch has a PID but is not published as a runnable cgroup member. */
+#define TASK_FLAG_LAUNCH_PREPARING 0x00000800u
 
 /* A stopped or continued child retains its task slot until its parent has
  * observed the state transition through waitpid. */
@@ -524,6 +527,8 @@ struct task_lookup_scope {
 struct task {
     /* Lazily allocated PID identity, retained independently by proc inodes. */
     struct task_identity *identity_token;
+    /* Owned non-root membership or zombie charge, protected by scheduler_lock. */
+    struct cgroup *cgroup;
     uint64_t proc_read_chars, proc_write_chars, proc_read_calls, proc_write_calls;
     uint64_t proc_read_bytes, proc_write_bytes;
     /* Group-leader CPU time retained when retired thread slots are reused.

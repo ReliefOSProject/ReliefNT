@@ -1,4 +1,5 @@
 #include "internal.h"
+#include <reliefnt/cgroup.h>
 #include <reliefnt/seccomp.h>
 
 /** @brief Invalidate OOM snapshots when a vfork relation ends.
@@ -168,6 +169,9 @@ int sched_clone_validate_flags(uint64_t flags,uint64_t tls)
  * @return Child process ID, or a negative errno if creation fails. Copies held
  * root/cwd objects for fork, shares them for CLONE_FS, and releases only child
  * ownership on rollback. Called under execution ownership; takes scheduler_lock.
+ * Checks cgroup admission before construction and charges only at publication.
+ * Rollback hides the reserved PID before unlocking for provider cleanup; the
+ * blocked slot is not reusable until cleanup completes.
  * The child never borrows the parent's retained PID-identity object or pending
  * syscall lookup names/root/dirfd references or imported vector/transfer state,
  * including on early allocation failure.
@@ -200,9 +204,10 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
         sched_task_identity_put(identity);
         return -22;
     }
-    if (task_nproc_denied_locked(parent)) {
+    if (task_nproc_denied_locked(parent) || (cgroup2_fork_allowed && !cgroup2_fork_allowed(parent))) {
         kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
         sched_task_identity_put(identity);
+        if (cgroup2_kick) cgroup2_kick();
         return -LINUX_EAGAIN;
     }
     parent->nproc_exceeded = false;
@@ -230,6 +235,8 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
     }
     task_zero(child);
     *child = *parent;
+    /* Borrowed by the shallow copy; only successful publication takes a charge. */
+    child->cgroup = NULL;
 #ifdef CONFIG_SECCOMP_FILTER
     /* The shallow copy hasn't taken a reference, nor does a new thread
      * inherit a pending synchronous signal. */
@@ -554,10 +561,12 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
     child->proc_read_bytes = child->proc_write_bytes = 0;
     child->cpu_user_ticks = child->cpu_system_ticks = 0;
     child->retired_user_ticks = child->retired_system_ticks = 0;
+    if (cgroup2_fork_commit) cgroup2_fork_commit(child, parent);
     ++proc_created;
     child->state = TASK_READY;
     sched_request_reschedule_all_online();
     kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
+    if (cgroup2_kick) cgroup2_kick();
     /* Execution ownership keeps the published child stable while this
      * non-scheduler-locked healthy-path MM identity preparation runs. */
     uint64_t generation;
@@ -565,14 +574,19 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
     return (int64_t)child_pid;
 
 fail:
-    sched_task_fs_release(child);
+    /* Retain the blocked slot, but hide its unbound PID before allowing
+     * provider puts to take scheduler_lock (e.g. Unix socket GC closing a
+     * cgroup file from an SCM_RIGHTS queue). */
+    child->pid = 0;
     if (child->shared_mm) --child->shared_mm->references;
-    else {
+    if (child->shared_files) --child->shared_files->references;
+    kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
+    sched_task_fs_release(child);
+    if (!child->shared_mm) {
         address_space_destroy(sched_task_as(child));
         sched_task_vma_release(child);
     }
-    if (child->shared_files) --child->shared_files->references;
-    else {
+    if (!child->shared_files) {
         if (files_retained) syscall_release_task_files(child);
         else {
             sched_task_file_release(child);
@@ -582,6 +596,7 @@ fail:
     kernel_free(child->exec_argv);
     kernel_free(child->exec_envp);
     kernel_free(child->exec_data);
+    kernel_spin_lock_irqsave(&scheduler_lock, &lock_flags);
     task_zero(child);
     child->state = TASK_EXITED;
     child->running_cpu = SCHED_CPU_NONE;

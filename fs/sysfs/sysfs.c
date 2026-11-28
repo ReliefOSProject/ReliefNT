@@ -447,9 +447,12 @@ static int sys_modules_walk(sys_visit visit,void *context)
     }
     return 0;
 }
+/** @brief Walk sysfs nodes, including the empty cgroup2 mountpoint. */
 static int sys_walk(sys_visit visit, void *ctx)
 {
     static const char *dirs[] = {"/sys",
+                                 "/sys/fs",
+                                 "/sys/fs/cgroup",
                                  "/sys/dev",
                                  "/sys/dev/char",
                                  "/sys/dev/block",

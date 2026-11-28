@@ -55,9 +55,11 @@ static struct task *fair_task(struct eevdf_entity *entity)
     return (struct task *)((char *)entity - __builtin_offsetof(struct task, fair));
 }
 
+/** @brief Admit runnable user tasks only after their launch has been published. */
 static bool fair_runnable(const struct task *task)
 {
     return task->kind == TASK_KIND_USER &&
+        !(task->flags & TASK_FLAG_LAUNCH_PREPARING) &&
         (task->state == TASK_READY || task->state == TASK_RUNNING) &&
         (!task->vfork_child || kernel_signal_fatal_pending(task)) &&
         (task->entry || (task->image && task->image_len) || (task->flags & TASK_FLAG_PENDING_LOAD)) &&

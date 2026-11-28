@@ -205,6 +205,7 @@ static void regular_stage_copy_read(struct regular_io_stage *s, uint32_t count)
  * genuine block nodes use the block service. No graph/module lock spans
  * callbacks. O_APPEND stats the actual inode; sync flags flush the retained
  * provider, except for the immediately committed proc diagnostic control.
+ * Generated controls, including cgroup commands, do not grow a stored file.
  */
 int64_t syscall_regular_io(struct task *task, struct task_file *file, uint64_t buffer, uint64_t count,
                            uint64_t position, bool writing, bool positional)
@@ -245,7 +246,8 @@ int64_t syscall_regular_io(struct task *task, struct task_file *file, uint64_t b
         }
         if (position > INT64_MAX || count > (uint64_t)INT64_MAX - position)
             return -LINUX_EINVAL;
-        if (!block && writing && !(file->node.flags & (STORAGE_NODE_FLAG_PROC | STORAGE_NODE_FLAG_SYSFS))) {
+        if (!block && writing && !(file->node.flags & (STORAGE_NODE_FLAG_PROC | STORAGE_NODE_FLAG_SYSFS |
+                                                   STORAGE_NODE_FLAG_CGROUP))) {
             int ret = task_file_limit_write(task, position, &count,
                                              !task->vector_io || !task->vector_io->completed);
             if (ret) return ret;

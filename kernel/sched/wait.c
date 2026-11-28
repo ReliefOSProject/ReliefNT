@@ -1,5 +1,6 @@
 #include <reliefnt/export.h>
 #include "internal.h"
+#include <reliefnt/cgroup.h>
 #include <linux/resource.h>
 #include <linux/wait.h>
 
@@ -167,7 +168,8 @@ static void sched_wait_usage(struct linux_rusage *out, const struct task *task)
  * -2 for an absent waiter, or -RELIEFOS_EAGAIN while a matching child is pending.
  * The caller must not hold scheduler_lock; resource teardown and diagnostics
  * execute outside it. WNOWAIT observes without consuming or logging a reap.
- * Consuming a zombie invalidates its retained PID identity before PID unpublish.
+ * Consuming a zombie releases its cgroup charge and invalidates its retained
+ * PID identity before PID unpublish.
  */
 static int64_t sched_wait_child(uint32_t waiter_pid, int32_t wanted_pid,
                                 const struct task_identity *identity,
@@ -202,7 +204,7 @@ static int64_t sched_wait_child(uint32_t waiter_pid, int32_t wanted_pid,
     for (uint32_t i = 0; i < task_count; ++i) {
         struct task *task = tasks[i];
         if (exact && task != exact) continue;
-        if (task->pid == 0 || task->kind != TASK_KIND_USER) {
+        if (task->pid == 0 || task->kind != TASK_KIND_USER || (task->flags & TASK_FLAG_LAUNCH_PREPARING)) {
             continue;
         }
         if (task->pid != sched_task_tgid(task)) continue;
@@ -286,6 +288,7 @@ static int64_t sched_wait_child(uint32_t waiter_pid, int32_t wanted_pid,
                 kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
                 return reap_pid;
             }
+            if (cgroup2_task_reap) cgroup2_task_reap(reap_task);
             reap_task->parent_pid = 0;
             notify_pidfd = sched_task_pidfd_watched(reap_task);
             sched_task_identity_detach(reap_task);
@@ -311,6 +314,7 @@ static int64_t sched_wait_child(uint32_t waiter_pid, int32_t wanted_pid,
         kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
         if (notify_pidfd) kernel_poll_readiness_notify();
         if (reap_event) {
+            if (cgroup2_kick) cgroup2_kick();
             console_debug("[reliefnt] scheduler wait reaped pid=%u by pid=%u\n",
                            reap_pid, waiter_pid);
         }

@@ -159,6 +159,7 @@ usb_storage tools/test_usb_storage.py
 mbr_partitions tools/test_mbr_partitions.py
 mount_tree tools/test_mount_tree.py
 mount_backend tools/test_mount_backend.py
+cgroup_scheduler tools/test_cgroup_scheduler.py
 filesystem_registry tools/test_filesystem_registry.py
 filesystem_boundaries tools/test_filesystem_boundaries.py
 filesystem_format tools/test_filesystem_format.py

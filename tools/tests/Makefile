@@ -15,7 +15,7 @@ test-host-smoke:
 	 --suite acpi_pm_timer --suite apic_timer --suite cpu_accounting \
 	 --suite fat_async_read --suite fat_read_split \
 	 --suite squashfs --suite squashfs_boot \
-	 --suite linux_pty --suite mount_backend \
+	 --suite linux_pty --suite mount_backend --suite cgroup_scheduler \
 	 --suite vdso_mapping --suite vdso_time
 
 test-smp-time:

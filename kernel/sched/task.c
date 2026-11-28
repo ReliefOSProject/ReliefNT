@@ -1,4 +1,5 @@
 #include "internal.h"
+#include <reliefnt/cgroup.h>
 #ifdef CONFIG_SWAP
 /** @brief Cancel a task's optional pressure-refill state and its owned queue link.
  * @param task Execution-owned task, nullable; borrowed without ownership transfer.
@@ -419,27 +420,29 @@ struct task *sched_create_kernel_task(const char *name,uint64_t entry,uint64_t l
  * @brief Allocate a user task, build its address space and stack, and inherit cwd/identity from parent.
  * @param name Borrowed NUL-terminated task name. @param entry User entry address.
  * @param stack_top Initial exclusive stack top. @param parent_pid Inheriting parent.
- * @param flags Initial task flags. @return Published PID, or zero on failure.
- * Prepares PID identity before scheduler locking and retains root state for the task.
+ * @param flags Initial task flags. @return Prepared PID or negative errno.
+ * Prepares the address space and PID identity but neither charges cgroups nor
+ * makes the task runnable. Execution ownership required through final publication.
  */
-uint32_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack_top,
+int64_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack_top,
                                 uint32_t parent_pid, uint32_t flags)
 {
     struct task_identity *identity = sched_task_identity_prepare();
-    if (!identity) return 0;
+    if (!identity) return -LINUX_ENOMEM;
     uint64_t lock_flags;
     kernel_spin_lock_irqsave(&scheduler_lock, &lock_flags);
-    if (task_nproc_denied_locked(sched_find(parent_pid))) {
+    struct task *real_parent = parent_pid ? sched_find(parent_pid) : NULL;
+    if (task_nproc_denied_locked(real_parent)) {
         kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
         sched_task_identity_put(identity);
-        return 0;
+        return -LINUX_EAGAIN;
     }
     struct task *task = alloc_task_slot();
     uint32_t pid;
     if (!task) {
         kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
         sched_task_identity_put(identity);
-        return 0;
+        return -LINUX_ENOMEM;
     }
     pid = task_allocate_pid();
     if (!pid) {
@@ -447,12 +450,11 @@ uint32_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack
         task->state = TASK_EXITED;
         kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
         sched_task_identity_put(identity);
-        return 0;
+        return -LINUX_ENOMEM;
     }
     task_zero(task);
     task->pid = pid;
     task->start_uptime_ms = time_uptime_ms();
-    struct task *real_parent = parent_pid ? sched_find(parent_pid) : NULL;
     task->parent_pid = real_parent ? sched_task_tgid(real_parent) : parent_pid;
     task->pdeath_parent_pid = parent_pid;
     task->parent_exit_signal = 17;
@@ -485,7 +487,7 @@ uint32_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack
         task->flags = TASK_FLAG_RESOURCES_RELEASED;
         kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
         sched_task_identity_put(identity);
-        return 0;
+        return -LINUX_ENOMEM;
     }
     task->frame.rip = entry;
     task->frame.cs = RELIEFNT_USER_CS;
@@ -498,7 +500,7 @@ uint32_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack
     task->state = TASK_BLOCKED;
     task->running_cpu = SCHED_CPU_NONE;
     task->kind = TASK_KIND_USER;
-    task->flags = flags;
+    task->flags = flags | TASK_FLAG_LAUNCH_PREPARING;
     sched_task_identity_bind(task, identity);
     task_clear_identity(task);
     task_copy_cwd(task, "/");
@@ -532,7 +534,6 @@ uint32_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack
                    (unsigned long long)task->entry,
                    (unsigned long long)task->stack_top,
                    task->flags);
-    ++proc_created;
     kernel_spin_unlock_irqrestore(&scheduler_lock, lock_flags);
     /* The task is still unpublished to its caller; prepare the root identity
      * after dropping scheduler_lock. Reclaim can use its reserve fallback if
@@ -542,12 +543,43 @@ uint32_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack
     return task->pid;
 }
 
+/** @brief Admit a fully prepared launch and make it runnable in one transaction.
+ * @param pid Prepared task's PID. @return Zero, -ESRCH or -EAGAIN on quota denial.
+ * Caller owns execution and must retire the still uncharged task on failure.
+ * Inherit cgroup membership only from a published, live user parent.
+ */
+int sched_publish_user_task(uint32_t pid)
+{
+    uint64_t flags;
+    kernel_spin_lock_irqsave(&scheduler_lock, &flags);
+    struct task *task = pid ? sched_find(pid) : NULL;
+    int rc = -LINUX_ESRCH;
+    if (task && task->state != TASK_EXITED && (task->flags & TASK_FLAG_LAUNCH_PREPARING)) {
+        const struct task *parent = task->pdeath_parent_pid ? sched_find(task->pdeath_parent_pid) : NULL;
+        if (parent && (parent->kind != TASK_KIND_USER || parent->state == TASK_EXITED ||
+                       (parent->flags & TASK_FLAG_LAUNCH_PREPARING))) parent = NULL;
+        if (cgroup2_fork_allowed && !cgroup2_fork_allowed(parent)) rc = -LINUX_EAGAIN;
+        else {
+            if (cgroup2_fork_commit) cgroup2_fork_commit(task, parent);
+            task->flags &= ~TASK_FLAG_LAUNCH_PREPARING;
+            task->state = TASK_READY;
+            ++proc_created;
+            sched_request_reschedule_all_online();
+            rc = 0;
+        }
+    }
+    kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
+    if (cgroup2_kick) cgroup2_kick();
+    return rc;
+}
+
 /**
  * @brief Publish terminal task state and log its first exit after releasing the scheduler lock.
  * @param pid Task identifier; PID 1 panics and an absent PID has no exit event.
  * @param code Exit status; repeated calls retain the existing status-update and cleanup semantics.
  * The caller must not hold scheduler_lock. Capture a bounded diagnostic under
- * that lock; defer resource release until the CPU reservation is quiescent.
+ * that lock, update cgroup population once, and defer resource release until
+ * the CPU reservation is quiescent.
  */
 void sched_exit(uint32_t pid, uint64_t code)
 {
@@ -570,6 +602,7 @@ void sched_exit(uint32_t pid, uint64_t code)
             exiting = tasks[i];
             exit_event = tasks[i]->state != TASK_EXITED;
             if (exit_event) {
+                if (cgroup2_task_exit) cgroup2_task_exit(exiting);
                 exit_pid = tasks[i]->pid;
                 exit_code = code;
                 task_copy_identity_text(exit_name, sizeof(exit_name), tasks[i]->name);
@@ -599,7 +632,8 @@ void sched_exit(uint32_t pid, uint64_t code)
                 tasks[i]->parent_pid = 1;
                 /* Thread siblings follow the parent relationship, but only
                  * process leaders become waitable children of PID 1. */
-                if (tasks[i]->pid == sched_task_tgid(tasks[i])) {
+                if (tasks[i]->pid == sched_task_tgid(tasks[i]) &&
+                    !(tasks[i]->flags & TASK_FLAG_LAUNCH_PREPARING)) {
                     tasks[i]->parent_exit_signal = 17;
                     tasks[i]->parent_exit_notified = 0;
                     tasks[i]->flags |= TASK_FLAG_WAITABLE_CHILD;
@@ -610,6 +644,7 @@ void sched_exit(uint32_t pid, uint64_t code)
             } else {
                 tasks[i]->parent_pid = 0;
                 tasks[i]->flags &= ~TASK_FLAG_WAITABLE_CHILD;
+                if (tasks[i]->state == TASK_EXITED && cgroup2_task_reap) cgroup2_task_reap(tasks[i]);
             }
         }
     }
@@ -646,6 +681,7 @@ void sched_exit(uint32_t pid, uint64_t code)
          * after retirement and the mm_release futex work below. */
     }
     kernel_spin_unlock_irqrestore(&scheduler_lock, flags);
+    if (cgroup2_kick) cgroup2_kick();
     if (exit_event) {
         console_debug("[reliefnt] scheduler task exited pid=%u name=%s code=%llu\n",
                        exit_pid,

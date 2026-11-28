@@ -20,10 +20,14 @@ void sched_init(void);
  */
 struct task *sched_create_kernel_task(const char *name,uint64_t entry,uint64_t low,uint64_t top,uint32_t cpu);
 /**
- * @brief Create a user task named name with the given entry, stack, parent, and flags; returns pid.
+ * @brief Prepare a blocked user task with inherited identity but no cgroup charge.
+ * @return Prepared PID or negative errno. Caller finishes with sched_publish_user_task().
  */
-uint32_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack_top,
+int64_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack_top,
                                 uint32_t parent_pid, uint32_t flags);
+/** @brief Publish a prepared task under the scheduler lock with current cgroup admission.
+ * @return Zero or negative errno. Failed admission leaves the launch uncharged. */
+int sched_publish_user_task(uint32_t pid);
 /**
  * @brief Wake (or release) task's CLONE_VFORK child as exec/exit completes.
  *
