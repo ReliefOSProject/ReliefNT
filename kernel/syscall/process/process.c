@@ -528,10 +528,12 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
             if (!task->rseq_area || task->rseq_area != a0 || task->rseq_len != length)
                 return -LINUX_EINVAL;
             if (task->rseq_sig != signature) return -LINUX_EPERM;
+            int prep = process_prepare_user(task, task->rseq_area, sizeof(struct rseq), true);
+            if (prep) return prep;
             if (!user_range_writable(task->rseq_area, sizeof(struct rseq)))
                 return -LINUX_EFAULT;
             struct rseq *area = (struct rseq *)(uintptr_t)task->rseq_area;
-            area->cpu_id_start = RSEQ_CPU_ID_UNINITIALIZED;
+            area->cpu_id_start = 0;
             area->cpu_id = RSEQ_CPU_ID_UNINITIALIZED;
             area->node_id = 0;
             area->mm_cid = 0;
@@ -551,17 +553,22 @@ int64_t syscall_process_control(uint64_t number, uint64_t a0,
             (length == RSEQ_SIZE ? (a0 & (RSEQ_SIZE - 1U)) != 0 :
                                    ((a0 & 31U) != 0 || length < sizeof(struct rseq))))
             return -LINUX_EINVAL;
+        int prep = process_prepare_user(task, a0, sizeof(struct rseq), true);
+        if (prep) return prep;
         if (!user_range_writable(a0, length)) return -LINUX_EFAULT;
         struct rseq *area = (struct rseq *)(uintptr_t)a0;
         task->rseq_area = a0;
         task->rseq_len = length;
         task->rseq_sig = signature;
-        area->cpu_id_start = 0;
-        area->cpu_id = 0;
-        area->rseq_cs = 0;
-        area->flags = 0;
+        /* Publish the CPU that owns the registration.  glibc's
+         * sched_getcpu() fast path reads these fields directly instead of
+         * issuing getcpu(2), so a hard-coded zero becomes stale as soon as
+         * the task is scheduled on another CPU. */
+        uint32_t cpu = smp_current_cpu();
+        area->cpu_id_start = cpu;
+        area->cpu_id = cpu;
         area->node_id = 0;
-        area->mm_cid = 0;
+        area->mm_cid = cpu;
         return 0;
     }
     (void)a3;

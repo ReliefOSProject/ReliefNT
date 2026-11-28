@@ -736,6 +736,7 @@
         "-Iinclude",
         "-Iinclude/uapi",
         "tools/tests/futex_queue_test.c",
+        "kernel/ipc/futex_pi.c",
         "-o",
         "{tmp}/futex-exit-extended-green-1"
       ]
@@ -794,6 +795,7 @@
         "-Iinclude",
         "-Iinclude/uapi",
         "tools/tests/futex_queue_test.c",
+        "kernel/ipc/futex_pi.c",
         "-o",
         "{tmp}/futex-swap-green-1"
       ]

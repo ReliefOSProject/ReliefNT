@@ -8,6 +8,13 @@
 #include "../../kernel/ipc/futex.c"
 
 static struct task tasks_test[4], *current;
+static unsigned retained_pages;
+struct task *sched_find(uint32_t pid)
+{ return pid && pid <= 4 ? &tasks_test[pid - 1] : NULL; }
+void mm_retain_page(uint64_t physical)
+{ assert(physical && !(physical & 4095)); ++retained_pages; }
+void mm_free_pages(uint64_t physical, uint32_t count)
+{ assert(physical && !(physical & 4095) && count == 1 && retained_pages); --retained_pages; }
 static uint64_t ticks = 100;
 static uint32_t words[1024] __attribute__((aligned(4096)));
 static unsigned blocks, wakes;
@@ -193,7 +200,7 @@ int main(void)
     tasks_test[1].clear_child_tid = (uintptr_t)&words[1];
     futex_task_exit(&tasks_test[1]);
     assert(call(0, 1, FUTEX_WAIT, 0, 0, 0, 0) == 0);
-    assert(!waiters && !tasks_test[1].clear_child_tid);
+    assert(!futex_waiters && !tasks_test[1].clear_child_tid);
     words[1] = 37;
     inaccessible_page = (uintptr_t)&words[1] & ~4095ULL;
     tasks_test[1].clear_child_tid = (uintptr_t)&words[1];
@@ -261,7 +268,7 @@ int main(void)
     assert(call(0, 4, FUTEX_WAIT, 0, (uintptr_t)ts, 0, 0) == KERNEL_SYSCALL_BLOCKED);
     assert(tasks_test[0].futex_deadline > ticks);
     futex_cancel_wait(&tasks_test[0]);
-    assert(!waiters);
+    assert(!futex_waiters);
     uint64_t address = (uintptr_t)&words[8];
     uint64_t destination = (uintptr_t)&words[9];
     current = &tasks_test[0];
@@ -301,7 +308,7 @@ int main(void)
     ticks += 5;
     assert(syscall_futex_wait2(address, 0, 1, FUTEX2_SIZE_U32,
                                 (uintptr_t)ts, 0) == -ETIMEDOUT);
-    assert(!waiters);
+    assert(!futex_waiters);
     words[10] = 0;
     words[11] = 0;
     struct futex_waitv waitv[2] = {
@@ -321,6 +328,6 @@ int main(void)
                                FUTEX2_SIZE_U32 | FUTEX2_PRIVATE) == 1);
     current = &tasks_test[0];
     assert(syscall_futex_waitv((uintptr_t)waitv, 2, 0, 0, LINUX_CLOCK_MONOTONIC) == 1);
-    assert(!waiters);
+    assert(!futex_waiters);
     puts("PASS futex: queues, requeue, wake-op, signed/shift operands, access errors, realtime and saturated deadlines, robust exit");
 }

@@ -12,6 +12,7 @@
 #endif
 
 #include <reliefnt/arch.h>
+#include <reliefnt/smp.h>
 #include <reliefnt/futex.h>
 #include <reliefnt/wait.h>
 #include <reliefnt/lock.h>
@@ -21,6 +22,7 @@
 #include <linux/syscall.h>
 #include <linux/time.h>
 #include <linux/errno.h>
+#include <linux/futex.h>
 #include <reliefnt/time.h>
 #include <reliefnt/power.h>
 #include <reliefnt/storage.h>
@@ -247,7 +249,9 @@ static int signal_setup_frame(struct task *task, int sig,
     uint64_t base;
     uint64_t bit = 1ULL << (uint32_t)(sig - 1);
     uint64_t handler_mask = task->blocked_signals;
-    uint8_t fpstate[512] __attribute__((aligned(16)));
+    uint8_t fpstate[RELIEFNT_FPU_STATE_MAX_SIZE + 4u] __attribute__((aligned(64)));
+    uint32_t fpu_state_size = arch_fpu_state_size();
+    uint32_t fpstate_size = fpu_state_size + (arch_fpu_xstate_mask() ? 4u : 0u);
     uint64_t fpbase;
     bool on_altstack = task->signal_stack_size && frame->rsp >= task->signal_stack_base &&
         frame->rsp - task->signal_stack_base < task->signal_stack_size;
@@ -257,8 +261,8 @@ static int signal_setup_frame(struct task *task, int sig,
 
     /* Preserve the interrupted red zone and align the FXSAVE image separately
      * from the ABI's rsp % 16 == 8 function-entry frame. */
-    if (stack_top < 128 + sizeof(fpstate) + size + 80) return -14;
-    fpbase = (stack_top - 128 - sizeof(fpstate)) & ~63ULL;
+    if (stack_top < 128 + fpstate_size + size + 80) return -14;
+    fpbase = (stack_top - 128 - fpstate_size) & ~63ULL;
     base = ((fpbase - size) & ~15ULL) - 8;
     if (!base || base < RELIEFNT_USER_BASE || base > stack_top) {
         return -12;
@@ -275,6 +279,8 @@ static int signal_setup_frame(struct task *task, int sig,
                                 ? task->sigsuspend_saved_mask
                                 : task->blocked_signals;
     user_frame.info = *info;
+    if (sched_rseq_notify(task, frame, smp_current_cpu(), true) < 0)
+        return -LINUX_EFAULT;
     if (task->restart_syscall) {
         uint64_t nr = task->restart_syscall - 1;
 #ifdef CONFIG_SWAP
@@ -301,6 +307,10 @@ static int signal_setup_frame(struct task *task, int sig,
             nr != __NR_poll && nr != __NR_ppoll && nr != __NR_epoll_wait && nr != __NR_epoll_pwait &&
             nr != __NR_epoll_pwait2 && nr != __NR_select && nr != __NR_pselect6 && nr != __NR_rt_sigtimedwait && !sleeping &&
             !(nr == __NR_futex && frame->r10) && !task->socket_io_timed;
+        uint32_t futex_op = (uint32_t)frame->rsi & FUTEX_CMD_MASK;
+        if (nr == __NR_futex &&
+            (futex_op == FUTEX_LOCK_PI || futex_op == FUTEX_LOCK_PI2))
+            restart = true;
         uint64_t received = task->socket_receive_done;
         bool batch = task->mmsg.active;
 #ifdef CONFIG_SWAP
@@ -354,10 +364,49 @@ static int signal_setup_frame(struct task *task, int sig,
     user_frame.uc.context.cr2 = task->signal_fault_address;
     user_frame.uc.context.oldmask = handler_mask;
     user_frame.uc.context.fpstate = fpbase;
-    __builtin_memcpy(fpstate, task->fpu_state, sizeof(fpstate));
-    /* FXSAVE's software-reserved tail must not advertise an XSAVE extension. */
-    __builtin_memset(fpstate + 464, 0, sizeof(fpstate) - 464);
-    if (user_copy_to_task(task, fpbase, fpstate, sizeof(fpstate)) < 0 ||
+    __builtin_memcpy(fpstate, sched_task_fpu_state(task), fpu_state_size);
+    if (arch_fpu_xstate_mask()) {
+        uint32_t magic = 0x46505853U;
+        uint32_t magic2 = 0x46505845U;
+        uint32_t extended_size = fpstate_size;
+        uint64_t xfeatures = arch_fpu_xstate_mask();
+        uint32_t xstate_size = fpu_state_size;
+        uint64_t present;
+        __builtin_memcpy(&present, fpstate + 512, sizeof(present));
+        /* XSAVE may omit initial components. Materialize the legacy prefix
+         * before exposing it to signal handlers that modify x87/XMM fields. */
+        if (!(present & 1u)) {
+            __builtin_memset(fpstate, 0, 24);
+            __builtin_memset(fpstate + 32, 0, 128);
+            uint16_t control = 0x037fU;
+            __builtin_memcpy(fpstate, &control, sizeof(control));
+        }
+        if (!(present & 2u)) __builtin_memset(fpstate + 160, 0, 256);
+        if (!(present & 6u)) {
+            uint32_t mxcsr = 0x1f80U;
+            __builtin_memcpy(fpstate + 24, &mxcsr, sizeof(mxcsr));
+        }
+        if ((xfeatures & 4u) && !(present & 4u))
+            __builtin_memset(fpstate + 576, 0, 256);
+        present |= 3u;
+        __builtin_memcpy(fpstate + 512, &present, sizeof(present));
+        __builtin_memset(fpstate + 416, 0, 48);
+        user_frame.uc.flags |= 1u; /* UC_FP_XSTATE */
+        /* Linux's _fpx_sw_bytes occupies the software-reserved FXSAVE
+         * tail. The XSAVE header follows at offset 512 and the YMM upper
+         * halves occupy 576..831 for the x87/SSE/AVX policy. */
+        __builtin_memcpy(fpstate + 464, &magic, sizeof(magic));
+        __builtin_memcpy(fpstate + 468, &extended_size, sizeof(extended_size));
+        __builtin_memcpy(fpstate + 472, &xfeatures, sizeof(xfeatures));
+        __builtin_memcpy(fpstate + 480, &xstate_size, sizeof(xstate_size));
+        __builtin_memset(fpstate + 484, 0, 28);
+        __builtin_memset(fpstate + 520, 0, 56);
+        __builtin_memcpy(fpstate + fpstate_size - sizeof(magic2), &magic2, sizeof(magic2));
+    } else {
+        /* Legacy FXSAVE frames use bytes 464..511 for software metadata. */
+        __builtin_memset(fpstate + 464, 0, fpu_state_size - 464);
+    }
+    if (user_copy_to_task(task, fpbase, fpstate, fpstate_size) < 0 ||
         user_copy_to_task(task, base, &user_frame, size) < 0) return -14;
     if (task->signal_stack_flags & 0x80000000u) {
         task->signal_stack_size = 0;
@@ -422,11 +471,13 @@ static int signal_prepare_frame(struct task *task, struct kernel_signal_action *
     uint64_t top = frame->rsp;
     if ((action->flags & LINUX_SA_ONSTACK) && task->signal_stack_size && !on_altstack)
         top = task->signal_stack_base + task->signal_stack_size;
-    if (top < 128 + 512 + size + 80) return 0;
-    uint64_t fpbase = (top - 128 - 512) & ~63ULL;
+    uint32_t fpu_state_size = arch_fpu_state_size();
+    uint32_t fpstate_size = fpu_state_size + (arch_fpu_xstate_mask() ? 4u : 0u);
+    if (top < 128 + fpstate_size + size + 80) return 0;
+    uint64_t fpbase = (top - 128 - fpstate_size) & ~63ULL;
     uint64_t base = ((fpbase - size) & ~15ULL) - 8;
     if (!base || base < RELIEFNT_USER_BASE || base > top) return 0;
-    int ret = signal_prepare_range(task, base, fpbase + 512 - base, true);
+    int ret = signal_prepare_range(task, base, fpbase + fpstate_size - base, true);
     if (ret) return ret;
     if (task->restart_syscall && task->nanosleep_remaining) {
         uint64_t nr = task->restart_syscall - 1;
@@ -458,6 +509,10 @@ static int signal_deliver_pending_locked(struct task *task, struct trap_frame *f
         if (fatal) signal_default_action(task, fatal);
         return 0;
     }
+    /* A completed PI acquisition owns its user lock word. Consume the result
+     * before a handler can enter another mutex operation on this thread. */
+    if (task->restart_syscall && task->futex_pi && task->futex_state == 2)
+        return 0;
     /* signalfd_dequeue checks its queue before signal_pending after a wakeup.
      * Our parked syscall must regain control before return-to-user delivery. */
     if (task->restart_syscall && task->signalfd_waiting && task->syscall_file &&
@@ -585,7 +640,8 @@ void kernel_signal_force_fault(struct task *task, int sig, int code, uint64_t ad
 int64_t kernel_signal_rt_sigreturn(struct task *task, struct trap_frame *frame)
 {
     struct linux_rt_sigframe user_frame;
-    uint8_t fpstate[512] __attribute__((aligned(16)));
+    uint8_t fpstate[RELIEFNT_FPU_STATE_MAX_SIZE + 4u] __attribute__((aligned(64)));
+    uint32_t fpu_state_size = arch_fpu_state_size();
     uint64_t base;
     uint64_t size = sizeof(user_frame);
 
@@ -605,18 +661,74 @@ int64_t kernel_signal_rt_sigreturn(struct task *task, struct trap_frame *frame)
         context->rip >= RELIEFNT_USER_TOP || context->rsp >= RELIEFNT_USER_TOP) {
         return -22;
     }
+    __builtin_memset(fpstate, 0, sizeof(fpstate));
     if (context->fpstate) {
-        prep = signal_prepare_range(task, context->fpstate, sizeof(fpstate), false);
+        uint64_t address = context->fpstate;
+        if ((address & 15u) || address < RELIEFNT_USER_BASE ||
+            address > RELIEFNT_USER_TOP - RELIEFNT_FPU_LEGACY_STATE_SIZE)
+            return -LINUX_EINVAL;
+        /* Read only the legacy prefix until valid extension metadata proves
+         * that additional bytes belong to this frame. */
+        prep = signal_prepare_range(task, address, RELIEFNT_FPU_LEGACY_STATE_SIZE, false);
         if (prep == SWAP_STORAGE_CONTENDED) return KERNEL_SYSCALL_SWAP_CONTENDED;
-        if (prep < 0) return -14;
-        if (!user_range_ok(context->fpstate, sizeof(fpstate))) return -14;
-        __builtin_memcpy(fpstate, (const void *)(uintptr_t)context->fpstate, sizeof(fpstate));
+        if (prep < 0 || !user_range_ok(address, RELIEFNT_FPU_LEGACY_STATE_SIZE))
+            return -LINUX_EFAULT;
+        __builtin_memcpy(fpstate, (const void *)(uintptr_t)address,
+                         RELIEFNT_FPU_LEGACY_STATE_SIZE);
         uint32_t mxcsr;
+        uint32_t magic;
+        uint32_t extended_size;
+        uint32_t xstate_size;
+        uint64_t features;
         __builtin_memcpy(&mxcsr, fpstate + 24, sizeof(mxcsr));
-        if (mxcsr & ~0xffffU) return -22;
-        __builtin_memcpy(task->fpu_state, fpstate, sizeof(fpstate));
-        arch_fpu_restore(task->fpu_state);
+        if (mxcsr & ~arch_fpu_mxcsr_mask()) return -LINUX_EINVAL;
+        __builtin_memcpy(&magic, fpstate + 464, sizeof(magic));
+        __builtin_memcpy(&extended_size, fpstate + 468, sizeof(extended_size));
+        __builtin_memcpy(&features, fpstate + 472, sizeof(features));
+        __builtin_memcpy(&xstate_size, fpstate + 480, sizeof(xstate_size));
+        bool extended = false;
+        if (arch_fpu_xstate_mask() && magic == 0x46505853U &&
+            xstate_size >= 576u && xstate_size <= fpu_state_size &&
+            xstate_size <= extended_size) {
+            uint32_t bytes = xstate_size + 4u;
+            if ((address & 63u) || address > RELIEFNT_USER_TOP - bytes)
+                return -LINUX_EINVAL;
+            prep = signal_prepare_range(task, address, bytes, false);
+            if (prep == SWAP_STORAGE_CONTENDED) return KERNEL_SYSCALL_SWAP_CONTENDED;
+            if (prep < 0 || !user_range_ok(address, bytes)) return -LINUX_EFAULT;
+            __builtin_memcpy(fpstate, (const void *)(uintptr_t)address, bytes);
+            uint32_t trailer;
+            __builtin_memcpy(&trailer, fpstate + xstate_size, sizeof(trailer));
+            extended = trailer == 0x46505845U;
+            if (extended) {
+                uint64_t present;
+                __builtin_memcpy(&present, fpstate + 512, sizeof(present));
+                if ((features & ~arch_fpu_xstate_mask()) || (present & ~features) ||
+                    ((present & 4u) && xstate_size < 832u))
+                    return -LINUX_EINVAL;
+                for (unsigned i = 520; i < 576; ++i)
+                    if (fpstate[i]) return -LINUX_EINVAL;
+                __builtin_memset(fpstate + xstate_size, 0,
+                                 sizeof(fpstate) - xstate_size);
+            }
+        }
+        /* The extension read replaces the legacy prefix. Validate the final
+         * kernel-owned image even if userspace changed it between the reads. */
+        __builtin_memcpy(&mxcsr, fpstate + 24, sizeof(mxcsr));
+        if (mxcsr & ~arch_fpu_mxcsr_mask()) return -LINUX_EINVAL;
+        if (!extended && arch_fpu_xstate_mask()) {
+            __builtin_memset(fpstate + 512, 0, sizeof(fpstate) - 512);
+            uint64_t present = 3u;
+            __builtin_memcpy(fpstate + 512, &present, sizeof(present));
+        }
+        __builtin_memset(fpstate + 464, 0, 48);
+        __builtin_memcpy(sched_task_fpu_state(task), fpstate, fpu_state_size);
+        __builtin_memset(sched_task_fpu_state(task) + fpu_state_size, 0,
+                         RELIEFNT_FPU_STATE_MAX_SIZE - fpu_state_size);
+    } else {
+        arch_fpu_task_init(sched_task_fpu_state(task));
     }
+    arch_fpu_restore(sched_task_fpu_state(task));
     signal_context_restore(frame, context);
     /* The restored context's rcx/r11 are live values again; drop the
      * SYSCALL-entry marker so the return goes through iretq. */

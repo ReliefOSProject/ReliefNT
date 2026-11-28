@@ -16,6 +16,7 @@ void signal_fixture_exit_group(uint32_t tgid, uint64_t code);
 void signal_fixture_job_control(uint32_t tgid, int signal_number);
 #define sched_exit_group signal_fixture_exit_group
 #define sched_signal_job_control signal_fixture_job_control
+#include "signal_arch_fixture.h"
 #include "../../kernel/signal/signal.c"
 #undef sched_exit_group
 #undef sched_signal_job_control
@@ -36,7 +37,6 @@ void *mm_phys_to_virt(uint64_t physical) { return (void *)(uintptr_t)physical; }
 static uint32_t fake_cpu;
 static uint64_t fake_time;
 static unsigned futex_cancellations;
-static bool synccpu_uninterruptible;
 
 uint32_t smp_current_cpu(void) { return fake_cpu; }
 uint32_t smp_cpu_count(void) { return 1; }
@@ -102,6 +102,7 @@ void futex_cancel_wait(struct task *task)
 {
     assert(task == fixture_task && task->futex_state == 1);
     task->futex_state = 0;
+    task->futex_pi = false;
     task->futex_next = NULL;
     task->futex_deadline = 0;
     ++futex_cancellations;
@@ -155,7 +156,6 @@ static struct task *start_fixture(void)
     fake_cpu = 0;
     fake_time = 100000;
     futex_cancellations = 0;
-    synccpu_uninterruptible = false;
     memset(user_stack, 0, sizeof(user_stack));
     sched_init();
 
@@ -301,18 +301,6 @@ static void test_running_signal_then_untimed_futex_park(void)
     sched_wake_interruptible(task);
     capture_and_reselect(task, &frame);
 
-    /* The existing uninterruptible SYNCCPU guard still owns its wait. */
-    synccpu_uninterruptible = true;
-    assert(kernel_signal_queue_task(task, ALARM_SIGNAL) == 0);
-    frame = untimed_private_futex_frame(task);
-    sched_block_current();
-    assert(kernel_signal_deliver_pending(task, &frame) == 0);
-    assert(task->state == TASK_BLOCKED && task->pending_signals & ALARM_BIT);
-    synccpu_uninterruptible = false;
-    kernel_signal_flush(task, false, ALARM_BIT);
-    sched_wake_interruptible(task);
-    capture_and_reselect(task, &frame);
-
     /* vfork parents remain parked until their child releases the relation. */
     struct task vfork_child = {0};
     task->vfork_child = &vfork_child;
@@ -351,9 +339,57 @@ static void test_running_signal_then_untimed_futex_park(void)
     discard_fixture();
 }
 
+/* Linux restarts PI locking after handlers even without SA_RESTART, including
+ * absolute timed locking. Completed acquisitions return before handler entry. */
+static void test_pi_signal_restart(void)
+{
+    const uint32_t operations[] = {FUTEX_LOCK_PI, FUTEX_LOCK_PI2};
+    for (size_t i = 0; i < sizeof(operations) / sizeof(operations[0]); ++i) {
+        struct task *task = start_fixture();
+        sched_task_actions(task)[ALARM_SIGNAL].flags = 0;
+        task->restart_syscall = __NR_futex + 1;
+        task->futex_state = 1;
+        task->futex_pi = true;
+        struct trap_frame frame = untimed_private_futex_frame(task);
+        frame.rsi = operations[i] | FUTEX_PRIVATE_FLAG;
+        frame.r10 = STACK_ADDRESS + 128;
+        uint64_t original_rip = frame.rip;
+        assert(kernel_signal_queue_task(task, ALARM_SIGNAL) == 0);
+        sched_block_current();
+        assert(kernel_signal_deliver_pending(task, &frame) == 1);
+        struct linux_rt_sigframe saved;
+        memcpy(&saved, user_stack + (frame.rsp - STACK_ADDRESS), sizeof(saved));
+        assert(saved.uc.context.rip == original_rip);
+        assert(saved.uc.context.rax == __NR_futex);
+        assert(saved.uc.context.rsi == (operations[i] | FUTEX_PRIVATE_FLAG));
+        assert(saved.uc.context.r10 == STACK_ADDRESS + 128);
+        assert(!task->restart_syscall && !task->futex_pi);
+        assert(futex_cancellations == 1);
+        discard_fixture();
+    }
+
+    struct task *task = start_fixture();
+    task->restart_syscall = __NR_futex + 1;
+    task->futex_pi = true;
+    task->futex_state = 2;
+    struct trap_frame frame = untimed_private_futex_frame(task);
+    frame.rsi = FUTEX_LOCK_PI | FUTEX_PRIVATE_FLAG;
+    assert(kernel_signal_queue_task(task, ALARM_SIGNAL) == 0);
+    assert(kernel_signal_deliver_pending(task, &frame) == 0);
+    assert(task->pending_signals & ALARM_BIT);
+    assert(task->restart_syscall && task->futex_state == 2);
+    assert(futex_cancellations == 0);
+    task->restart_syscall = 0;
+    task->futex_pi = false;
+    task->futex_state = 0;
+    assert(kernel_signal_deliver_pending(task, &frame) == 1);
+    discard_fixture();
+}
+
 int main(void)
 {
     test_running_signal_then_untimed_futex_park();
+    test_pi_signal_restart();
     puts("PASS signal delivery wakes a parked SA_RESTART untimed private futex and preserves scheduler ownership");
     return 0;
 }

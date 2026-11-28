@@ -138,7 +138,40 @@ static int rseq_abi(void)
 {
     struct rseq area __attribute__((aligned(32))) = {0};
     CHECK(syscall(SYS_rseq, &area, sizeof(area), 0, RSEQ_SIG) == 0);
-    CHECK(area.cpu_id_start == 0 && area.cpu_id == 0 && area.rseq_cs == 0);
+    unsigned registered_cpu = UINT_MAX;
+    CHECK(syscall(SYS_getcpu, &registered_cpu, NULL, NULL) == 0);
+    CHECK(area.cpu_id_start == registered_cpu && area.cpu_id == registered_cpu &&
+          area.rseq_cs == 0);
+    /* A registered area follows the task when the scheduler moves it.  This
+     * is the ABI that glibc's sched_getcpu() fast path reads directly. Keep
+     * the case optional for single-CPU guests, but exercise it whenever a
+     * second online CPU is available. */
+    uint64_t original_affinity = 0;
+    unsigned current_cpu = registered_cpu, target_cpu = UINT_MAX;
+    CHECK(syscall(SYS_sched_getaffinity, 0, sizeof(original_affinity),
+                  &original_affinity) == (long)sizeof(original_affinity));
+    for (unsigned cpu = 0; cpu < sizeof(original_affinity) * 8; ++cpu) {
+        if ((original_affinity & (UINT64_C(1) << cpu)) && cpu != current_cpu) {
+            target_cpu = cpu;
+            break;
+        }
+    }
+    if (target_cpu != UINT_MAX) {
+        uint64_t target_affinity = UINT64_C(1) << target_cpu;
+        CHECK(syscall(SYS_sched_setaffinity, 0, sizeof(target_affinity),
+                      &target_affinity) == 0);
+        for (unsigned attempt = 0; attempt < 2000; ++attempt) {
+            CHECK(syscall(SYS_getcpu, &current_cpu, NULL, NULL) == 0);
+            if (current_cpu == target_cpu && area.cpu_id_start == target_cpu &&
+                area.cpu_id == target_cpu)
+                break;
+            sched_yield();
+        }
+        CHECK(current_cpu == target_cpu && area.cpu_id_start == target_cpu &&
+              area.cpu_id == target_cpu);
+        CHECK(syscall(SYS_sched_setaffinity, 0, sizeof(original_affinity),
+                      &original_affinity) == 0);
+    }
     CHECK(syscall(SYS_rseq, &area, sizeof(area), 0, RSEQ_SIG) == -1 && errno == EBUSY);
     CHECK(syscall(SYS_rseq, &area, sizeof(area), 0, RSEQ_SIG ^ 1U) == -1 && errno == EPERM);
     CHECK(syscall(SYS_rseq, &area, sizeof(area), RSEQ_FLAG_UNREGISTER, RSEQ_SIG ^ 1U) == -1 && errno == EPERM);

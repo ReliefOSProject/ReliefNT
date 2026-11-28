@@ -630,6 +630,10 @@ struct task {
     uint64_t futex_deadline;
     uint32_t futex_bitset;
     int32_t futex_state;
+    bool futex_pi;
+    struct task *futex_pi_owner;
+    int32_t futex_pi_result;
+    uint64_t futex_pi_page;
 #define SCHED_FUTEX_WAITV_MAX 128
     uint32_t futex_waitv_count;
     uint32_t futex_waitv_index;
@@ -771,11 +775,22 @@ struct task {
     struct trap_frame frame;
     uint64_t signal_fault_address;
     uint32_t page_fault_signal;
-    uint8_t fpu_state[512] __attribute__((aligned(16)));
+    /* Heap objects have 16-byte alignment. Reserve padding so the actual
+     * XSAVE image remains aligned independently of the task allocation. */
+    uint8_t fpu_storage[RELIEFNT_FPU_STATE_MAX_SIZE + 63u];
     struct kernel_signal_action signal_actions[KERNEL_SIGNAL_ACTION_MAX];
     uint32_t running_cpu;
     uint32_t last_cpu;
 };
 
+/**
+ * @brief Locate a task's 64-byte aligned architectural floating-point image.
+ * @param task Task owning the overallocated state storage.
+ * @return Aligned image with RELIEFNT_FPU_STATE_MAX_SIZE usable bytes.
+ */
+static inline uint8_t *sched_task_fpu_state(struct task *task)
+{
+    return (uint8_t *)(((uintptr_t)task->fpu_storage + 63u) & ~(uintptr_t)63u);
+}
 
 #endif

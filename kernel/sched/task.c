@@ -492,7 +492,7 @@ uint32_t sched_create_user_task(const char *name, uint64_t entry, uint64_t stack
     task->frame.rflags = 0x202;
     task->frame.rsp = stack_top;
     task->frame.ss = RELIEFNT_USER_DS;
-    arch_fpu_task_init(task->fpu_state);
+    arch_fpu_task_init(sched_task_fpu_state(task));
     /* Keep a newly allocated user task off the run queue until its creator
      * has attached the executable metadata and launch arguments. */
     task->state = TASK_BLOCKED;
