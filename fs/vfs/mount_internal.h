@@ -33,6 +33,7 @@ struct vfs_mount {
     void *context;
     struct module *owner;
     uint64_t references,id,policy,peer_group; /* Zero group is not shared. */
+    uint64_t staged_peer_group; /* Tentative group of an original mount during MS_MOVE. */
     uint64_t propagation_pins; /* Replica lifetime references, not open paths. */
     uint64_t writers; /* Open writable file descriptions on this attachment. */
     bool propagation_backing; /* This bind_source is a replica lifetime pin. */

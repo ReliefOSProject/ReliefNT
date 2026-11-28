@@ -3197,8 +3197,6 @@ static void runtime_shared_mounts(struct vfs_namespace *ns,const struct vfs_path
     assert(!vfs_path_namespace(&b));vfs_path_put(&b);
     while(vfs_reclaim_mounts(32)){}
 
-    strcpy(user.source,"/shared-source");
-    assert(scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,0,MS_MOVE,0)==-EOPNOTSUPP);
     for(unsigned lazy=0;lazy<2;++lazy) {
         strcpy(user.source,"peer with local child");strcpy(user.target,"/shared-a/p/event");
         assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,type,0,0));
@@ -3426,6 +3424,124 @@ static void runtime_slave_mounts(struct vfs_namespace *ns,const struct vfs_path 
     vfs_path_put(&actor.fs_paths.root);vfs_path_put(&actor.fs_paths.cwd);
     lookup_user_base=lookup_user_bytes=0;
     puts("PASS slave propagation: recursive demotion, directional propagation, covered and lazy detach, bind rollback");
+}
+
+/** @brief Relocate a live tree and its propagation receivers in one transaction.
+ * @param ns Borrowed fixture namespace. @param root Retained namespace root.
+ */
+static void runtime_shared_move(struct vfs_namespace *ns,const struct vfs_path *root)
+{
+    const char *outer[]={"/move-a","/move-b","/move-s","/move-t","/move-src","/move-up"};
+    for(unsigned i=0;i<sizeof(outer)/sizeof(outer[0]);++i)assert(!vfs_kernel_mkdir(ns,outer[i],0755));
+    struct task actor={.pid=910,.fsuid=1000,.fsgid=1000,.cap_effective=1ULL<<CAP_SYS_ADMIN};
+    vfs_path_get(root,&actor.fs_paths.root);vfs_path_get(root,&actor.fs_paths.cwd);
+    struct {char source[64],target[64],type[8];} user={"move fixture","/move-a","tmpfs"};
+    const uint64_t from=(uintptr_t)user.source,to=(uintptr_t)user.target,type=(uintptr_t)user.type;
+    lookup_user_base=(uintptr_t)&user;lookup_user_bytes=sizeof(user);
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,type,0,0));
+    assert(!vfs_kernel_mkdir(ns,"/move-a/slot",0755));
+    assert(!vfs_kernel_mkdir(ns,"/move-a/relocate",0755));
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,0,MS_SHARED,0));
+    strcpy(user.source,"/move-a");
+    for(unsigned i=1;i<=3;++i) {
+        strcpy(user.target,outer[i]);
+        assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,0,MS_BIND,0));
+        if(i>1)assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,0,MS_SLAVE,0));
+    }
+    strcpy(user.source,"move fixture");strcpy(user.target,"/move-s/slot");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,type,0,0));
+    struct vfs_path cover={0},original={0},child={0},target={0},found={0};
+    assert(!vfs_path_lookup(ns,root,root,user.target,0,&cover));
+    strcpy(user.target,"/move-up");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,type,MS_NODEV,0));
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,0,MS_SHARED,0));
+    const unsigned long long upstream=fixture_shared_id(ns,root,"/move-up");
+    strcpy(user.source,"/move-up");strcpy(user.target,"/move-src");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,0,MS_BIND,0));
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,0,MS_SLAVE,0));
+    assert(!vfs_kernel_mkdir(ns,"/move-src/child",0755));
+    strcpy(user.source,"move child");strcpy(user.target,"/move-src/child");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,type,MS_NOSUID,0));
+    assert(!vfs_kernel_mkdir(ns,"/move-src/child/data",0755));
+    assert(!vfs_path_lookup(ns,root,root,"/move-src",0,&original));
+    assert(!vfs_path_lookup(ns,root,root,"/move-src/child",0,&child));
+    assert(!vfs_path_lookup(ns,root,root,"/move-a/slot",0,&target));
+    const uint64_t id=vfs_path_mount_id(&original),child_id=vfs_path_mount_id(&child);
+    const uint64_t next=ns->next_id,next_group=ns->next_peer_id;
+    strcpy(user.source,"/move-src");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,0,MS_UNBINDABLE,0));
+    strcpy(user.target,"/move-a/slot");
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,0,MS_MOVE,0)==-EINVAL);
+    strcpy(user.target,"/move-src/child");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,0,MS_PRIVATE,0));
+
+    /* Force failure after a receiver tree has been partially prepared. */
+    test_fail_heap_after=5;
+    assert(vfs_mount_move(ns,&original,&target)==-ENOMEM);
+    test_fail_heap_after=-1;
+    assert(ns->next_id==next && ns->next_peer_id==next_group);
+    assert(!fixture_shared_id(ns,root,"/move-src") && !fixture_shared_id(ns,root,"/move-src/child"));
+    assert(fixture_mount_tag(ns,root,"/move-src"," master:")==upstream);
+    assert(!vfs_path_lookup(ns,root,root,"/move-a/slot",0,&found) && vfs_path_equal(&found,&target));
+    vfs_path_put(&found);vfs_path_put(&target);
+    assert(vfs_path_lookup(ns,root,root,"/move-b/slot/child",0,&found)==-ENOENT);
+
+    strcpy(user.target,"/move-a/slot");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,UINT64_MAX,MS_MOVE,UINT64_MAX));
+    assert(ns->next_id==next+6 && ns->next_peer_id==next_group+2);
+    assert(!vfs_path_lookup(ns,root,root,"/move-a/slot",0,&found));
+    assert(vfs_path_equal(&found,&original) && vfs_path_mount_id(&found)==id);vfs_path_put(&found);
+    assert(!vfs_path_lookup(ns,root,root,"/move-a/slot/child",0,&found));
+    assert(vfs_path_equal(&found,&child) && vfs_path_mount_id(&found)==child_id);vfs_path_put(&found);
+    char name[64];
+    assert(!vfs_path_format_link(ns,root,&child,name,sizeof(name)) && !strcmp(name,"/move-a/slot/child"));
+    assert(vfs_path_lookup(ns,root,root,"/move-src/child",0,&found)==-ENOENT);
+    assert(!vfs_path_lookup(ns,root,root,"/move-b/slot/child",0,&found));
+    assert(vfs_path_mount_id(&found)!=child_id && vfs_path_same_inode(&found,&child));
+    assert(vfs_path_mount_flags(&found)&MS_NOSUID);vfs_path_put(&found);
+    assert(!vfs_path_lookup(ns,root,root,"/move-t/slot/child/data",0,&found));vfs_path_put(&found);
+    assert(!vfs_path_lookup(ns,root,root,"/move-s/slot",0,&found) && vfs_path_equal(&found,&cover));
+    vfs_path_put(&found);
+    const unsigned long long group=fixture_shared_id(ns,root,"/move-a/slot");
+    const unsigned long long child_group=fixture_shared_id(ns,root,"/move-a/slot/child");
+    assert(group && child_group && group!=child_group);
+    assert(fixture_shared_id(ns,root,"/move-b/slot")==group);
+    assert(fixture_shared_id(ns,root,"/move-b/slot/child")==child_group);
+    assert(fixture_mount_tag(ns,root,"/move-a/slot"," master:")==upstream);
+    assert(fixture_mount_tag(ns,root,"/move-b/slot"," master:")==upstream);
+    assert(fixture_mount_tag(ns,root,"/move-t/slot"," master:")==group);
+    assert(fixture_mount_tag(ns,root,"/move-t/slot/child"," master:")==child_group);
+    strcpy(user.source,"/move-a/slot");strcpy(user.target,"/move-src");
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,0,MS_MOVE,0)==-EINVAL);
+    vfs_path_put(&original);vfs_path_put(&child);
+    strcpy(user.target,"/move-a/slot");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,MNT_DETACH,0,0,0));
+    assert(vfs_path_lookup(ns,root,root,"/move-b/slot/child",0,&found)==-ENOENT);
+    assert(!vfs_path_lookup(ns,root,root,"/move-s/slot",0,&found) && vfs_path_equal(&found,&cover));
+    vfs_path_put(&found);vfs_path_put(&cover);
+    strcpy(user.target,"/move-s/slot");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0));
+    while(vfs_reclaim_mounts(32)){}
+
+    /* The source can itself occupy the receiver slot it is about to vacate. */
+    strcpy(user.target,"/move-s/relocate");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,type,0,0));
+    assert(!vfs_path_lookup(ns,root,root,user.target,0,&original));
+    strcpy(user.source,user.target);strcpy(user.target,"/move-a/relocate");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,0,MS_MOVE,0));
+    assert(!vfs_path_lookup(ns,root,root,user.target,0,&found) && vfs_path_equal(&found,&original));
+    vfs_path_put(&found);
+    assert(!vfs_path_lookup(ns,root,root,"/move-s/relocate",0,&found));
+    assert(!vfs_path_equal(&found,&original) && vfs_path_same_inode(&found,&original));
+    vfs_path_put(&found);vfs_path_put(&original);
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0));
+    for(unsigned i=sizeof(outer)/sizeof(outer[0]);i--;) {
+        if(i==4)continue;
+        strcpy(user.target,outer[i]);assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0));
+    }
+    vfs_path_put(&actor.fs_paths.root);vfs_path_put(&actor.fs_paths.cwd);
+    lookup_user_base=lookup_user_bytes=0;
+    puts("PASS shared MS_MOVE: subtree identity, peer/slave replicas, covered slots and atomic failure");
 }
 
 /** @brief Verify lazy detach hides a mount tree without revoking retained paths.
@@ -3709,6 +3825,7 @@ int main(int argc,char **argv)
     runtime_recursive_bind(&ns,&root,fs);
     runtime_shared_mounts(&ns,&root);
     runtime_slave_mounts(&ns,&root);
+    runtime_shared_move(&ns,&root);
     runtime_bind_remount(&ns,&root,fs);
     runtime_lazy_unmount(&ns,&root,fs);
     device_mount_objects(&ns,&root,fs);

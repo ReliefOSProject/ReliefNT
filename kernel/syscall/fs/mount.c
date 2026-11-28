@@ -7,12 +7,12 @@
 #include <reliefnt/inventory.h>
 #include <reliefnt/fat_options.h>
 
-/** @brief Resolve both exact endpoints of a mount move and commit the graph.
+/** @brief Resolve both endpoints of a mount move, including propagated moves.
  * @param ns Borrowed execution-owned namespace.
  * @param task Authorized caller with actual root/cwd and optional retry scope.
  * @param source User source pathname pointer, required.
  * @param target User destination pathname pointer, required.
- * @return Zero or lookup/type/cycle/busy errno; EAGAIN preserves scoped
+ * @return Zero or lookup/type/cycle/busy/allocation errno; EAGAIN preserves scoped
  * operands. Local references retire on every path; no graph lock spans I/O.
  */
 static int mount_move(struct vfs_namespace *ns,struct task *task,uint64_t source,uint64_t target)

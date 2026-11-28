@@ -579,9 +579,10 @@ int vfs_mount_bind_recursive(struct vfs_namespace *ns,const struct vfs_path *sou
  * @param ns Namespace under execution ownership.
  * @param source Held root of an attached mount, never the namespace base root.
  * @param target Held destination directory path in the same namespace.
- * @return Zero or negative errno; moving out of a shared parent gives EINVAL,
- * moving into one is unsupported. Rejected moves leave the attachment intact.
- * No callbacks or allocation during commit.
+ * @return Zero or negative errno without partial moves or replicas. Moving
+ * out of a shared parent, or moving an unbindable branch into one, gives
+ * EINVAL. A shared destination publishes peer and slave copies of the tree.
+ * The original subtree moves intact; allocations finish before commit.
  */
 int vfs_mount_move(struct vfs_namespace *ns,const struct vfs_path *source,
                     const struct vfs_path *target);
