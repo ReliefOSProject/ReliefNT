@@ -26,6 +26,7 @@ struct vfs_mount {
     struct vfs_mount *next,*notify_next;
     struct vfs_mount **notify_link;
     struct vfs_mount *master; /* Weak edge to a live member of the upstream peer group. */
+    struct vfs_mount *staged_cover; /* Existing receiver cover; only set before batch commit. */
     struct vfs_path point,bind_source;
     struct vfs_dentry *root;
     const struct vfs_backend_ops *ops;
@@ -36,6 +37,8 @@ struct vfs_mount {
     uint64_t writers; /* Open writable file descriptions on this attachment. */
     bool propagation_backing; /* This bind_source is a replica lifetime pin. */
     bool unmount_selected; /* Scratch under the namespace execution writer. */
+    bool lift_cover; /* Scratch: retain this overmount above a removed receiver. */
+    bool propagation_copy; /* Receiver can detach beneath an unrelated root cover. */
     bool unbindable; /* Pruned by recursive bind; never a valid bind source. */
     bool lazy_detached; /* No namespace edges; retained paths still work. */
     char *source,*filesystem;

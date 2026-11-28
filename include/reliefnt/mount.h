@@ -538,7 +538,7 @@ int vfs_namespace_root(const struct vfs_namespace *ns,struct vfs_path *out);
  * @param mount Unpublished mount; caller retains its own handle.
  * @param target Held directory path in ns; an already covered slot is busy.
  * @return Zero or negative errno without partial publication or ID use on
- * failure. Covered receiver insertion is not supported. Task context.
+ * failure. Existing receiver covers remain visible above the copy. Task context.
  */
 int vfs_mount_attach(struct vfs_namespace *ns,struct vfs_mount *mount,
                       const struct vfs_path *target);
@@ -589,16 +589,17 @@ int vfs_mount_move(struct vfs_namespace *ns,const struct vfs_path *source,
  * @param ns Namespace under execution ownership.
  * @param path The caller's sole external path to the mounted root.
  * @return Zero or negative errno. The origin must have no child mounts; a
- * receiver with children is skipped. Other held paths on selected mounts
- * keep the entire operation busy. Success does not consume the caller's path.
+ * receiver with unrelated children is skipped, except root covers that can be
+ * reparented. Other held paths on selected mounts keep the entire operation
+ * busy. Success does not consume the caller's path.
  */
 int vfs_mount_unmount(struct vfs_namespace *ns,const struct vfs_path *path);
 /** @brief Lazily disconnect a subtree and eligible propagated attachments.
  * @param ns Borrowed namespace under execution ownership.
  * @param path Retained visible root of a mount, not the namespace anchor.
- * @return Zero or negative errno. Receivers with unrelated children remain
- * attached. Held paths remain usable and final cleanup is deferred. No new
- * allocations or synchronous backend flush on detach.
+ * @return Zero or negative errno. Receivers with unrelated children stay,
+ * except root covers that can be reparented. Held paths remain usable and
+ * final cleanup is deferred. No allocations or synchronous backend flush.
  */
 int vfs_mount_unmount_lazy(struct vfs_namespace *ns,const struct vfs_path *path);
 /** @brief Prepare retained directory-name changes before a backend rename.

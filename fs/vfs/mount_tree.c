@@ -232,7 +232,11 @@ int vfs_namespace_init(struct vfs_namespace *ns,struct vfs_mount *root)
     ns->root=root;ns->mounts=root;ns->next_id=2;ns->next_peer_id=1;return 0;
 }
 
-/* Mountpoint identity is a retained parent mount + dentry, never text. */
+/** @brief Find the attachment immediately covering an exact retained slot.
+ * @param ns Borrowed execution-owned namespace.
+ * @param path Borrowed parent mount/dentry pair, never a textual pathname.
+ * @return Borrowed immediate cover or NULL; does not follow the mount stack.
+ */
 static struct vfs_mount *vfs_covering(const struct vfs_namespace *ns,const struct vfs_path *path)
 {
     for(struct vfs_mount *mount=ns->mounts;mount;mount=mount->next)
@@ -377,12 +381,24 @@ static void vfs_stage_mount(struct vfs_mount_batch *batch,struct vfs_mount *moun
     mount->next=batch->pending;batch->pending=mount;
 }
 
+/** @brief Transfer an attachment to another exact parent slot.
+ * @param mount Live or staged mount whose old mountpoint is retained.
+ * @param point Borrowed new slot, retained before releasing the old one.
+ * Caller excludes topology cycles and holds both graphs through the update.
+ */
+static void vfs_replace_mountpoint(struct vfs_mount *mount,const struct vfs_path *point)
+{
+    struct vfs_path replacement={0},old=mount->point;
+    vfs_path_get(point,&replacement);mount->point=replacement;vfs_path_put(&old);
+}
+
 /** @brief Roll back all staged mounts or publish them together without allocation.
  * @param ns Borrowed execution-owned namespace.
  * @param batch Owned unpublished mounts and tentative ID counters.
  * @param status Nonzero to discard, zero to commit all changes.
  * @return The supplied status. Rollback releases descendants before parents;
- * neither graph nor namespace counters change on error.
+ * neither graph nor namespace counters change on error. At commit, rehang
+ * any existing receiver stack on its newly inserted mount's root.
  */
 static int vfs_finish_mount_batch(struct vfs_namespace *ns,struct vfs_mount_batch *batch,int status)
 {
@@ -396,6 +412,11 @@ static int vfs_finish_mount_batch(struct vfs_namespace *ns,struct vfs_mount_batc
     struct vfs_mount **tail=&batch->pending;
     for(;*tail;tail=&(*tail)->next) {
         struct vfs_mount *mount=*tail;mount->ns=ns;
+        if(mount->staged_cover) {
+            struct vfs_path root={mount,mount->root};
+            vfs_replace_mountpoint(mount->staged_cover,&root);
+            mount->staged_cover=NULL;
+        }
         if(!mount->notify_link && vfs_notify_mount_created)vfs_notify_mount_created(mount);
     }
     *tail=ns->mounts;ns->mounts=batch->pending;
@@ -502,6 +523,7 @@ static int vfs_stage_bind_tree(struct vfs_mount_batch *batch,const struct vfs_pa
         if(rc)return rc;
         copy->peer_group=group;
         copy->master=kind==VFS_COPY_SLAVE ? view.mount : view.mount->master;
+        copy->propagation_copy=kind!=VFS_COPY_BIND;
         vfs_stage_mount(batch,copy,&point);
         if(!*out)*out=copy;
         if(!recursive)return 0;
@@ -530,7 +552,8 @@ static int vfs_stage_bind_tree(struct vfs_mount_batch *batch,const struct vfs_pa
  * @return Zero or negative errno. Parents are visited before their slaves;
  * each receiving peer group shares one new group per copied attachment.
  * A group with no matching directory view is skipped as a recipient but
- * does not block eligible descendants from receiving the event.
+ * does not block eligible descendants from receiving the event. An existing
+ * cover is reparented only at commit so it remains visible above the copy.
  */
 static int vfs_stage_propagation(struct vfs_namespace *ns,struct vfs_mount_batch *batch,
                                  struct vfs_mount *origin,bool recursive,bool fresh)
@@ -546,7 +569,6 @@ static int vfs_stage_propagation(struct vfs_namespace *ns,struct vfs_mount_batch
             if(depth>level){deeper=true;continue;}
             if(depth!=level)continue;
             struct vfs_path point={peer,target->dentry};
-            if(vfs_covering(ns,&point))return -EOPNOTSUPP;
 
             struct vfs_mount *prior=peer->peer_group ? vfs_staged_peer(batch,peer,point.dentry) : NULL;
             enum vfs_mount_copy kind=prior ? VFS_COPY_PEER : VFS_COPY_SLAVE;
@@ -559,6 +581,7 @@ static int vfs_stage_propagation(struct vfs_namespace *ns,struct vfs_mount_batch
             int rc=vfs_stage_bind_tree(batch,&view,&point,batch->pending,recursive,peer->peer_group!=0,
                                         kind,fresh,&copy);
             if(rc)return rc;
+            copy->staged_cover=vfs_covering(ns,&point);
         }
         if(!deeper)return 0;
     }
@@ -569,7 +592,7 @@ static int vfs_stage_propagation(struct vfs_namespace *ns,struct vfs_mount_batch
  * @param mount Caller-retained unpublished mount; membership takes its own ref.
  * @param target Borrowed retained directory path in ns.
  * @return Zero or negative errno, without consuming IDs or modifying the
- * mount on failure. Already covered receiver slots are unsupported.
+ * mount on failure. An existing receiving stack stays above the new copy.
  */
 int vfs_mount_attach(struct vfs_namespace *ns,struct vfs_mount *mount,const struct vfs_path *target)
 {
@@ -660,8 +683,7 @@ int vfs_mount_move(struct vfs_namespace *ns,const struct vfs_path *source,const 
         for(struct vfs_mount *backing=ancestor;backing;backing=backing->bind_source.mount)
             if(backing==mount)return -ELOOP;
     if(vfs_covering(ns,target))return -EBUSY;
-    struct vfs_path replacement={0};vfs_path_get(target,&replacement);
-    struct vfs_path old=mount->point;mount->point=replacement;vfs_path_put(&old);return 0;
+    vfs_replace_mountpoint(mount,target);return 0;
 }
 
 /** @brief Disconnect a single leaf and relink its propagation receivers.
@@ -676,7 +698,19 @@ static void vfs_mount_detach(struct vfs_namespace *ns,struct vfs_mount *mount)
     if(*link)*link=mount->next;
     struct vfs_path old=mount->point;mount->point=(struct vfs_path){0};
     mount->ns=NULL;mount->next=NULL;mount->master=NULL;mount->unbindable=false;
+    mount->propagation_copy=false;
     vfs_path_put(&old);vfs_mount_put(mount);
+}
+
+/** @brief Identify a surviving cover that can be lifted out of an unmount batch.
+ * @param mount Borrowed candidate mount, whose visible parent might detach.
+ * @return True if the candidate covers the root of a propagation receiver and
+ * its retained parent edge can be transferred to the receiver's old slot.
+ */
+static bool vfs_removable_cover_edge(const struct vfs_mount *mount)
+{
+    const struct vfs_mount *parent=mount->point.mount;
+    return parent && parent->propagation_copy && mount->point.dentry==parent->root;
 }
 
 /** @brief Mark origin mounts and the matching slots of propagation receivers.
@@ -684,7 +718,7 @@ static void vfs_mount_detach(struct vfs_namespace *ns,struct vfs_mount *mount)
  * @param root Root of the requested unmount.
  * @param subtree True to send events for the entire original subtree.
  * The parents' peer groups and downstream edges determine delivery. A receiver
- * with a child outside the batch stays, even if other children detach.
+ * with an unrelated child stays, except a root cover that can be lifted.
  */
 static void vfs_select_unmounts(struct vfs_namespace *ns,struct vfs_mount *root,bool subtree)
 {
@@ -707,8 +741,17 @@ static void vfs_select_unmounts(struct vfs_namespace *ns,struct vfs_mount *root,
     if(propagated) {
         for(struct vfs_mount *child=ns->mounts;child;child=child->next) {
             if(child->unmount_selected)continue;
-            for(struct vfs_mount *parent=child->point.mount;parent && parent->unmount_selected;
-                parent=parent->point.mount)parent->unmount_selected=false;
+            struct vfs_mount *parent=child->point.mount;
+            if(!vfs_removable_cover_edge(child))
+                while(parent && parent->unmount_selected) {
+                    parent->unmount_selected=false;
+                    if(vfs_removable_cover_edge(parent))break;
+                    parent=parent->point.mount;
+                }
+        }
+        for(struct vfs_mount *mount=ns->mounts;mount;mount=mount->next) {
+            mount->lift_cover=!mount->unmount_selected && vfs_removable_cover_edge(mount) &&
+                mount->point.mount->unmount_selected;
         }
     }
 }
@@ -717,8 +760,8 @@ static void vfs_select_unmounts(struct vfs_namespace *ns,struct vfs_mount *root,
  * @param ns Borrowed execution-owned namespace with selected mounts marked.
  * @param root Origin mount with the caller's lookup reference.
  * @return Zero or negative busy/provider errno. Replica lifetime pins and
- * edges disappearing in this batch are not external path references. A
- * regular bind outside the batch still pins its source as before.
+ * edges disappearing or being reparented in this batch are not external path
+ * references. A regular bind outside the batch still pins its source as before.
  */
 static int vfs_unmount_preflight(const struct vfs_namespace *ns,const struct vfs_mount *root)
 {
@@ -729,8 +772,8 @@ static int vfs_unmount_preflight(const struct vfs_namespace *ns,const struct vfs
         uint64_t replicas=0;
         bool first_replica=true;
         for(struct vfs_mount *other=ns->mounts;other;other=other->next) {
+            if((other->unmount_selected || other->lift_cover) && other->point.mount==mount)++expected;
             if(!other->unmount_selected)continue;
-            if(other->point.mount==mount)++expected;
             if(other->bind_source.mount==mount && !other->propagation_backing)++expected;
             if(other->bind_source.mount==backing && other->propagation_backing) {
                 ++replicas;
@@ -753,11 +796,18 @@ static int vfs_unmount_preflight(const struct vfs_namespace *ns,const struct vfs
 /** @brief Unlink the entire selected graph before dropping retained edges.
  * @param ns Borrowed execution-owned namespace with selected mounts marked.
  * @param lazy True to keep external paths walkable and defer final teardown.
- * Repair weak propagation edges before removing each member. No allocation,
- * and lazy unmount invokes no synchronous backend finish.
+ * Reparent preserved covers and repair weak propagation edges before removing
+ * each member. No allocation, and lazy unmount invokes no backend finish.
  */
 static void vfs_disconnect_unmounts(struct vfs_namespace *ns,bool lazy)
 {
+    for(struct vfs_mount *mount=ns->mounts;mount;mount=mount->next) {
+        if(!mount->lift_cover)continue;
+        const struct vfs_path *point=&mount->point.mount->point;
+        while(point->mount->unmount_selected)point=&point->mount->point;
+        vfs_replace_mountpoint(mount,point);
+        mount->lift_cover=false;
+    }
     struct vfs_mount *detached=NULL,**link=&ns->mounts;
     while(*link) {
         struct vfs_mount *mount=*link;
@@ -765,7 +815,8 @@ static void vfs_disconnect_unmounts(struct vfs_namespace *ns,bool lazy)
         vfs_leave_peer_group(ns,mount);
         *link=mount->next;mount->next=detached;detached=mount;
         mount->ns=NULL;mount->lazy_detached=lazy;
-        mount->master=NULL;mount->unbindable=false;mount->unmount_selected=false;
+        mount->master=NULL;mount->unbindable=false;
+        mount->unmount_selected=false;mount->propagation_copy=false;
     }
     while(detached) {
         struct vfs_mount *mount=detached;detached=mount->next;mount->next=NULL;
@@ -791,7 +842,8 @@ int vfs_mount_unmount(struct vfs_namespace *ns,const struct vfs_path *path)
     vfs_select_unmounts(ns,root,false);
     int rc=vfs_unmount_preflight(ns,root);
     if(!rc)vfs_disconnect_unmounts(ns,false);
-    else for(struct vfs_mount *mount=ns->mounts;mount;mount=mount->next)mount->unmount_selected=false;
+    else for(struct vfs_mount *mount=ns->mounts;mount;mount=mount->next)
+        mount->unmount_selected=mount->lift_cover=false;
     return rc;
 }
 

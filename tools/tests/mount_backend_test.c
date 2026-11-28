@@ -3091,6 +3091,7 @@ static void runtime_shared_mounts(struct vfs_namespace *ns,const struct vfs_path
     assert(!vfs_kernel_mkdir(ns,"/shared-a/covered",0755));
     strcpy(user.target,"/shared-a/covered");
     assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,type,0,0));
+    assert(!vfs_kernel_mkdir(ns,"/shared-a/covered/local",0755));
     strcpy(user.target,"/shared-a");
     assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,UINT64_MAX,to,UINT64_MAX,MS_SHARED,UINT64_MAX));
     unsigned long long group=fixture_shared_id(ns,root,"/shared-a");assert(group);
@@ -3102,12 +3103,34 @@ static void runtime_shared_mounts(struct vfs_namespace *ns,const struct vfs_path
 
     struct vfs_path a={0},b={0},point={0},found={0};struct vfs_mount *mount=NULL;
     strcpy(user.target,"/shared-b/covered");
+    assert(!vfs_path_lookup(ns,root,root,"/shared-a/covered",0,&a));
+    assert(!vfs_path_lookup(ns,root,root,user.target,0,&point));
+    assert(!storage_new_tmpfs_mount("stacked event",0,NULL,1000,1000,&mount));
     const uint64_t covered_id=ns->next_id,covered_peer_id=ns->next_peer_id;
-    assert(scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,type,0,0)==-EOPNOTSUPP);
+    test_fail_heap_after=1;
+    assert(vfs_mount_attach(ns,mount,&point)==-ENOMEM);
+    test_fail_heap_after=-1;
     assert(ns->next_id==covered_id && ns->next_peer_id==covered_peer_id);
-    assert(!vfs_path_lookup(ns,root,root,"/shared-b/covered",0,&point));
-    assert(!vfs_path_lookup(ns,root,root,"/shared-b",0,&b));
-    assert(vfs_path_mount_id(&point)==vfs_path_mount_id(&b));vfs_path_put(&point);vfs_path_put(&b);
+    assert(!vfs_path_lookup(ns,root,root,"/shared-a/covered",0,&found));
+    assert(vfs_path_equal(&a,&found));vfs_path_put(&found);
+    assert(!vfs_mount_attach(ns,mount,&point));vfs_mount_put(mount);vfs_path_put(&point);
+    assert(ns->next_id==covered_id+2 && ns->next_peer_id==covered_peer_id+1);
+    assert(!vfs_kernel_mkdir(ns,"/shared-b/covered/incoming",0755));
+    assert(vfs_path_lookup(ns,root,root,"/shared-a/covered/incoming",0,&found)==-ENOENT);
+    assert(!vfs_path_lookup(ns,root,root,"/shared-a/covered",0,&found));
+    assert(vfs_path_equal(&a,&found));vfs_path_put(&found);
+    assert(!vfs_path_lookup(ns,root,root,user.target,0,&b));
+    struct vfs_path interior={0};
+    vfs_path_get(&a.mount->point,&interior);
+    assert(vfs_path_same_inode(&interior,&b));vfs_path_put(&b);
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0)==-EBUSY);
+    vfs_path_put(&interior);
+    /* A held path to the unrelated top mount is not a busy reference on
+     * the inserted event. Unmount removes only the event, not the cover. */
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0));
+    assert(!vfs_path_lookup(ns,root,root,"/shared-a/covered/local",0,&found));vfs_path_put(&found);
+    assert(vfs_path_lookup(ns,root,root,"/shared-a/covered/incoming",0,&found)==-ENOENT);
+    vfs_path_put(&a);
     strcpy(user.target,"/shared-a/covered");
     assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0));
 
@@ -3234,7 +3257,7 @@ static void runtime_shared_mounts(struct vfs_namespace *ns,const struct vfs_path
     }
     vfs_path_put(&actor.fs_paths.root);vfs_path_put(&actor.fs_paths.cwd);
     lookup_user_base=lookup_user_bytes=0;
-    puts("PASS shared propagation: group IDs, bounded peer roots, rollback, busy peers, retained local branches and recursive detach");
+    puts("PASS shared propagation: bounded peers, covered receiver insertion, rollback, busy peers and recursive detach");
 }
 
 /** @brief Verify one-way and transitive mount propagation through slave groups.
@@ -3255,7 +3278,7 @@ static void runtime_slave_mounts(struct vfs_namespace *ns,const struct vfs_path 
     assert(!fixture_shared_id(ns,root,"/slave-a") && !fixture_mount_tag(ns,root,"/slave-a"," master:"));
 
     const char *child[]={"/slave-a/old","/slave-a/event","/slave-a/rec","/slave-a/local","/slave-a/late",
-        "/slave-a/narrow","/slave-a/narrow/slot"};
+        "/slave-a/narrow","/slave-a/narrow/slot","/slave-a/post-cover"};
     for(unsigned i=0;i<sizeof(child)/sizeof(child[0]);++i)assert(!vfs_kernel_mkdir(ns,child[i],0755));
     strcpy(user.target,"/slave-a/old");
     assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,type,0,0));
@@ -3315,6 +3338,19 @@ static void runtime_slave_mounts(struct vfs_namespace *ns,const struct vfs_path 
     assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0));
     assert(vfs_path_lookup(ns,root,root,"/slave-d/event/down",0,&found)==-ENOENT);
 
+    strcpy(user.target,"/slave-a/post-cover");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,type,0,0));
+    assert(!vfs_kernel_mkdir(ns,"/slave-a/post-cover/incoming",0755));
+    strcpy(user.target,"/slave-d/post-cover");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,type,0,0));
+    assert(!vfs_kernel_mkdir(ns,"/slave-d/post-cover/local",0755));
+    strcpy(user.target,"/slave-a/post-cover");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0));
+    assert(!vfs_path_lookup(ns,root,root,"/slave-d/post-cover/local",0,&b));vfs_path_put(&b);
+    strcpy(user.target,"/slave-d/post-cover");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0));
+    assert(vfs_path_lookup(ns,root,root,"/slave-d/post-cover/incoming",0,&found)==-ENOENT);
+
     strcpy(user.target,"/slave-source");
     assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,type,0,0));
     assert(!vfs_kernel_mkdir(ns,"/slave-source/child",0755));
@@ -3323,6 +3359,11 @@ static void runtime_slave_mounts(struct vfs_namespace *ns,const struct vfs_path 
     assert(!vfs_kernel_mkdir(ns,"/slave-source/child/inside",0755));
     strcpy(user.target,"/slave-source");
     assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,0,MS_SHARED|MS_REC,0));
+    /* A slave's local stack survives propagation and lazy detach of a
+     * recursive bind underneath it, including the bind's child mounts. */
+    strcpy(user.target,"/slave-d/rec");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,type,0,0));
+    assert(!vfs_kernel_mkdir(ns,"/slave-d/rec/local",0755));
     assert(!vfs_path_lookup(ns,root,root,"/slave-source",0,&a));
     assert(!vfs_path_lookup(ns,root,root,"/slave-a/rec",0,&b));
     const uint64_t id=ns->next_id,group=ns->next_peer_id;
@@ -3341,7 +3382,12 @@ static void runtime_slave_mounts(struct vfs_namespace *ns,const struct vfs_path 
     assert(fixture_mount_tag(ns,root,"/slave-b/rec/child"," master:")==src_child);
     assert(fixture_mount_tag(ns,root,"/slave-c/rec/child"," master:")==slave_child);
     assert(fixture_mount_tag(ns,root,"/slave-d/rec/child"," master:")==slave_child);
+    assert(!vfs_path_lookup(ns,root,root,"/slave-d/rec/local",0,&b));vfs_path_put(&b);
+    assert(vfs_path_lookup(ns,root,root,"/slave-d/rec/child/inside",0,&found)==-ENOENT);
     assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,MNT_DETACH,0,0,0));
+    assert(!vfs_path_lookup(ns,root,root,"/slave-d/rec/local",0,&b));vfs_path_put(&b);
+    strcpy(user.target,"/slave-d/rec");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0));
     assert(vfs_path_lookup(ns,root,root,"/slave-d/rec/child/inside",0,&found)==-ENOENT);
     while(vfs_reclaim_mounts(32)){}
 
@@ -3379,7 +3425,7 @@ static void runtime_slave_mounts(struct vfs_namespace *ns,const struct vfs_path 
     while(vfs_reclaim_mounts(32)){}
     vfs_path_put(&actor.fs_paths.root);vfs_path_put(&actor.fs_paths.cwd);
     lookup_user_base=lookup_user_bytes=0;
-    puts("PASS slave propagation: recursive demotion, directional propagation, reparenting, unmount and bind rollback");
+    puts("PASS slave propagation: recursive demotion, directional propagation, covered and lazy detach, bind rollback");
 }
 
 /** @brief Verify lazy detach hides a mount tree without revoking retained paths.
