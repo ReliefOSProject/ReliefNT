@@ -530,6 +530,15 @@ int vfs_mount_attach(struct vfs_namespace *ns,struct vfs_mount *mount,
  */
 int vfs_mount_bind(struct vfs_namespace *ns,const struct vfs_path *source,
                     const struct vfs_path *target);
+/** @brief Bind a directory and all attachments beneath it in one transaction.
+ * @param ns Execution-owned namespace containing both retained paths.
+ * @param source Directory that bounds the original mount subtree.
+ * @param target Uncovered destination directory in the same namespace.
+ * @return Zero or negative errno without publishing a partial tree. Each clone
+ * has an independent ID and mount policy but pins the original backing objects.
+ */
+int vfs_mount_bind_recursive(struct vfs_namespace *ns,const struct vfs_path *source,
+                              const struct vfs_path *target);
 /** @brief Atomically move an attached subtree, preserving held paths and IDs.
  * @param ns Namespace under execution ownership.
  * @param source Held root of an attached mount, never the namespace base root.

@@ -2866,7 +2866,6 @@ static void runtime_mount_syscalls(struct vfs_namespace *ns,const struct vfs_pat
     assert(vfs_path_mount_flags(&mounted)&MS_RDONLY);
     assert(vfs_path_mount_flags(&mounted)&MS_RELATIME);vfs_path_put(&mounted);
     strcpy(user.source,"/syscall-source");strcpy(user.target,"/syscall-destination");
-    assert(scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,source,target,UINT64_MAX,MS_BIND|MS_REC,UINT64_MAX)==-EOPNOTSUPP);
     assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,source,target,UINT64_MAX,MS_BIND|MS_SILENT,UINT64_MAX));
     assert(!vfs_path_lookup(ns,root,root,user.target,0,&mounted));
     assert(vfs_path_context(&mounted)==volume);
@@ -2898,6 +2897,75 @@ static void runtime_mount_syscalls(struct vfs_namespace *ns,const struct vfs_pat
     assert(scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,source,target,type,0,options)==-EOPNOTSUPP);
     vfs_path_put(&actor.fs_paths.root);vfs_path_put(&actor.fs_paths.cwd);
     puts("PASS actual mount/remount/MS_MOVE/umount syscalls: scoped objects, capability, busy refs, atime preservation, ignored remount source/type and nofollow");
+}
+
+/** @brief Clone only the selected directory's mount topology, or publish none of it.
+ * @param ns Borrowed test-owned namespace. @param root Held root in that namespace.
+ * @param fs Base tmpfs in which to prepare the source, target and sibling points.
+ */
+static void runtime_recursive_bind(struct vfs_namespace *ns,const struct vfs_path *root,
+                                   struct tmpfs_super *fs)
+{
+    const char *directories[]={"/rbind-source","/rbind-source/view","/rbind-source/view/child",
+        "/rbind-source/view/peer","/rbind-source/outside","/rbind-target"};
+    for(unsigned i=0;i<sizeof(directories)/sizeof(directories[0]);++i)
+        assert(!tmpfs_create(fs,directories[i],LINUX_S_IFDIR|0755,NULL,NULL));
+    const char *original_names[]={"/rbind-source/view/child","/rbind-source/view/child/deep",
+        "/rbind-source/view/peer","/rbind-source/outside"};
+    const uint64_t flags[]={MS_NOSUID,MS_NODEV,MS_NOEXEC,0};
+    struct vfs_path original[4]={0},point={0};
+    const struct reliefos_permissions mode={0755,1000,1000};
+    for(unsigned i=0;i<4;++i) {
+        struct vfs_mount *mount=NULL;
+        assert(!vfs_path_lookup(ns,root,root,original_names[i],0,&point));
+        assert(!storage_new_tmpfs_mount("rbind fixture",flags[i],NULL,1000,1000,&mount));
+        assert(!vfs_mount_attach(ns,mount,&point));
+        vfs_path_put(&point);vfs_mount_put(mount);
+        assert(!vfs_path_lookup(ns,root,root,original_names[i],0,&original[i]));
+        if(!i)assert(!vfs_path_create_node(&original[i],"deep",LINUX_S_IFDIR,&mode,NULL,NULL));
+    }
+    struct task actor={.pid=902,.fsuid=1000,.fsgid=1000,.cap_effective=1ULL<<CAP_SYS_ADMIN};
+    vfs_path_get(root,&actor.fs_paths.root);vfs_path_get(root,&actor.fs_paths.cwd);
+    struct {char source[32],target[32];} user={"/rbind-source/view","/rbind-target"};
+    lookup_user_base=(uintptr_t)&user;lookup_user_bytes=sizeof(user);
+    uint64_t source=(uintptr_t)user.source,target=(uintptr_t)user.target;
+    assert(!vfs_path_lookup(ns,root,root,user.target,0,&point));
+    const uint64_t next_id=ns->next_id;
+    bool attached=false;
+    for(int budget=0;budget<64;++budget) {
+        test_fail_heap_after=budget;
+        int64_t rc=scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,source,target,UINT64_MAX,
+                                    MS_BIND|MS_REC,UINT64_MAX);
+        test_fail_heap_after=-1;
+        if(!rc){attached=true;break;}
+        assert(rc==-ENOMEM);
+        struct vfs_path unchanged={0};
+        assert(ns->next_id==next_id && !actor.lookup_scope.armed);
+        assert(!vfs_path_lookup(ns,root,root,user.target,0,&unchanged));
+        assert(vfs_path_equal(&unchanged,&point));vfs_path_put(&unchanged);
+    }
+    assert(attached && ns->next_id==next_id+4);
+    struct vfs_path bound={0},copy[3]={0};
+    const char *copy_names[]={"/rbind-target/child","/rbind-target/child/deep","/rbind-target/peer"};
+    assert(!vfs_path_lookup(ns,root,root,user.target,0,&bound));
+    for(unsigned i=0;i<3;++i) {
+        assert(!vfs_path_lookup(ns,root,root,copy_names[i],0,&copy[i]));
+        assert(vfs_path_same_inode(&copy[i],&original[i]));
+        assert(vfs_path_mount_id(&copy[i])!=vfs_path_mount_id(&original[i]));
+        assert(vfs_path_mount_flags(&copy[i])==vfs_path_mount_flags(&original[i]));
+    }
+    assert(vfs_path_lookup(ns,root,root,"/rbind-target/outside",0,&(struct vfs_path){0})==-ENOENT);
+    assert(vfs_mount_unmount(ns,&bound)==-EBUSY);
+    assert(!vfs_mount_unmount(ns,&copy[1]));vfs_path_put(&copy[1]);
+    assert(!vfs_mount_unmount(ns,&copy[0]));vfs_path_put(&copy[0]);
+    assert(!vfs_mount_unmount(ns,&copy[2]));vfs_path_put(&copy[2]);
+    assert(!vfs_mount_unmount(ns,&bound));vfs_path_put(&bound);
+    for(unsigned i=4;i>0;--i) {
+        assert(!vfs_mount_unmount(ns,&original[i-1]));vfs_path_put(&original[i-1]);
+    }
+    vfs_path_put(&point);vfs_path_put(&actor.fs_paths.root);vfs_path_put(&actor.fs_paths.cwd);
+    lookup_user_base=lookup_user_bytes=0;
+    puts("PASS recursive bind: subdirectory boundary, sibling/nested topology, distinct policies and OOM rollback");
 }
 
 /** @brief Check real deferred-script rewriting, final DAC and OOM ownership.
@@ -3005,6 +3073,7 @@ int main(int argc,char **argv)
     runtime_failed_teardown();
     runtime_attachment_policies(&ns,&root);
     runtime_mount_syscalls(&ns,&root,fs);
+    runtime_recursive_bind(&ns,&root,fs);
     device_mount_objects(&ns,&root,fs);
     assert(!vfs_path_lookup(&ns,&root,&root,"mnt",VFS_LOOKUP_FOLLOW,&old_dir));
     assert(!vfs_path_lookup(&ns,&root,&old_dir,"old",VFS_LOOKUP_FOLLOW,&old_file));
