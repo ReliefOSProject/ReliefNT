@@ -3,6 +3,7 @@
 #include <reliefnt/workqueue.h>
 #include <reliefnt/usb.h>
 #include <reliefnt/mount.h>
+#include <reliefnt/devfs.h>
 #include <reliefnt/graphics_service.h>
 #include <reliefnt/driver_manager_phase.h>
 #include <reliefnt/net.h>
@@ -32,8 +33,10 @@ static void usb_work(struct kernel_work *work,void *context)
  */
 static void vfs_work(struct kernel_work *work,void *context)
 {
-    (void)context;(void)vfs_reclaim_mounts(2);
-    if(vfs_reclaim_pending())(void)kernel_queue_delayed_work(work,1);
+    (void)context;
+    (void)devtmpfs_refresh();
+    (void)vfs_reclaim_mounts(2);
+    if(vfs_reclaim_pending() || devtmpfs_pending())(void)kernel_queue_delayed_work(work,1);
 }
 /** @brief Service graphics fences/retirement at the existing tick cadence.
  * @param work Permanent dispatch work. @param context Unused NULL.

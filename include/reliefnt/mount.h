@@ -98,6 +98,9 @@ struct vfs_backend_ops {
      * preserve old flags. Attachment policy belongs to VFS, not context.
      * Caller separately authorizes and owns this mount. */
     int (*remount)(void *context,uint64_t flags);
+    /* Optional atomic filesystem option/shared-policy reconfiguration. Failure
+     * preserves both options and flags. Execution ownership is held. */
+    int (*remount_options)(void *context,uint64_t flags,const char *options);
     /* Optional positional I/O through the retained backend inode. Callers
      * retain the mount/provider while these callbacks run without graph locks.
      * mount_flags is the current attachment policy plus shared superblock
@@ -239,7 +242,7 @@ int vfs_path_remount(const struct vfs_path *path,uint64_t flags);
 /** @brief Validate filesystem-specific options before changing remount policy.
  * @param path Retained mounted filesystem root, required.
  * @param flags Final policy excluding MS_REMOUNT.
- * @param options Optional copied data, empty or ext3 data=ordered.
+ * @param options Optional copied filesystem-specific data validated by its backend.
  * @return Zero or negative option/type/provider errno. Unsupported data leaves
  * the attachment unchanged. The retained mount determines the filesystem type.
  * Caller holds execution ownership and has checked CAP_SYS_ADMIN.

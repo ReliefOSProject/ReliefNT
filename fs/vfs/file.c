@@ -147,7 +147,7 @@ int vfs_mount_set_flags(struct vfs_mount *mount,uint64_t flags)
  * lock spans the optional shared-policy callback. Strictatime clears noatime
  * and relatime. All other attachment policy changes affect this mount alone.
  */
-int vfs_path_remount(const struct vfs_path *path,uint64_t flags)
+static int vfs_remount(const struct vfs_path *path,uint64_t flags,const char *options)
 {
     if(!vfs_path_valid(path) || !path->mount->ns || path->dentry!=path->mount->root)return -EINVAL;
     if(flags&~(VFS_MOUNT_POLICY_MASK|VFS_SUPER_POLICY_MASK|MS_STRICTATIME))return -EOPNOTSUPP;
@@ -156,27 +156,33 @@ int vfs_path_remount(const struct vfs_path *path,uint64_t flags)
     uint64_t policy=vfs_policy_bits(flags),shared=flags&VFS_SUPER_POLICY_MASK;
     if(!(flags&(atime|MS_STRICTATIME)))policy|=mount->policy&atime;
     int rc=0;
-    if(mount->ops->remount)rc=mount->ops->remount(mount->context,shared);
+    if(mount->ops->remount_options)
+        rc=mount->ops->remount_options(mount->context,shared,options);
+    else if(options && options[0])rc=-EOPNOTSUPP;
+    else if(mount->ops->remount)rc=mount->ops->remount(mount->context,shared);
     else if(shared!=vfs_super_flags(mount))rc=(vfs_super_flags(mount)&MS_RDONLY) && !(shared&MS_RDONLY) ? -EROFS : -EOPNOTSUPP;
-    if(!rc)mount->policy=policy;return rc;
+    if(!rc)mount->policy=policy;
+    return rc;
 }
 
-/** @brief Accept an unchanged ext3 ordered mode on the actual selected mount.
- * @param path Retained mounted filesystem root, required.
- * @param flags Requested final mount and filesystem policy.
- * @param options Optional copied filesystem data, empty or data=ordered.
- * @return Zero or negative option/type/provider errno. Option validation occurs
- * before policy changes. Execution ownership retains metadata and provider code.
+/** @brief Remount an attached filesystem without filesystem-specific options.
+ * @param path Retained mounted root. @param flags Requested Linux mount policy.
+ * @return Zero or negative errno, preserving policy on failure.
+ */
+int vfs_path_remount(const struct vfs_path *path,uint64_t flags)
+{
+    return vfs_remount(path,flags,NULL);
+}
+
+/** @brief Reconfigure backend options and mount policy in one transaction.
+ * @param path Retained mounted root. @param flags Requested Linux mount policy.
+ * @param options Optional filesystem-specific data, validated by its backend.
+ * @return Zero or negative errno, preserving options and policy on failure.
+ * Execution ownership retains the provider and serializes validation/commit.
  */
 int vfs_path_remount_options(const struct vfs_path *path,uint64_t flags,const char *options)
 {
-    if (!vfs_path_valid(path)) return -EINVAL;
-    if (options && options[0]) {
-        const char *filesystem=path->mount->filesystem;
-        if (!filesystem || __builtin_strcmp(filesystem,"ext3") ||
-            __builtin_strcmp(options,"data=ordered")) return -EOPNOTSUPP;
-    }
-    return vfs_path_remount(path,flags);
+    return vfs_remount(path,flags,options);
 }
 
 int vfs_path_dirent_stat(const struct vfs_path *directory,const char *name,struct linux_stat_abi *out)

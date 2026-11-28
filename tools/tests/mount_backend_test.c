@@ -215,6 +215,8 @@ void sched_block_current(void){abort();}
 void sched_sleep_current_until(uint64_t wake_tick){(void)wake_tick;abort();}
 bool user_range_writable(uint64_t address,uint64_t length)
 {return user_range_ok(address,length);}
+int user_range_readable(uint64_t address,uint64_t length)
+{return user_range_ok(address,length) ? 0 : -EFAULT;}
 static unsigned readlink_waits;
 static struct storage_node sync_expected;
 static unsigned sync_errors;
@@ -2287,6 +2289,121 @@ static int64_t scoped_mount_call(struct vfs_namespace *ns,struct task *task,uint
     if(rc!=-EAGAIN)task_lookup_scope_cancel(task);
     return rc;
 }
+/** @brief Exercise publication, allocation retry and userspace inode ownership.
+ * @param ns Live fixture namespace. @param root Its retained root path.
+ * DRM availability models the provider's real inventory transitions.
+ */
+static void devtmpfs_device_lifecycle(struct vfs_namespace *ns,const struct vfs_path *root)
+{
+    bool saved_registered=test_drm_registered,saved_render=test_drm_render_ready;
+    struct vfs_path directory={0},node={0};
+    test_drm_registered=true;
+    test_drm_render_ready=true;
+    devtmpfs_notify();
+    assert(devtmpfs_pending() && !devtmpfs_refresh() && !devtmpfs_pending());
+    assert(!vfs_path_lookup(ns,root,root,"/devtmp-one/dri",0,&directory));
+    assert(!vfs_path_lookup(ns,root,root,"/devtmp-one/dri/renderD128",0,&node));
+    struct linux_stat_abi status;
+    assert(!vfs_path_stat(&node,&status));
+    assert(status.st_mode==(LINUX_S_IFCHR|0600) && status.st_rdev==0xe280);
+    struct reliefos_permissions mode={0660,1000,44};
+    assert(!vfs_path_permissions(&node,&mode,true));
+    uint64_t inode=status.st_ino;
+    vfs_path_put(&node);
+    devtmpfs_notify();
+    assert(!devtmpfs_refresh());
+    assert(!vfs_path_lookup(ns,root,root,"/devtmp-one/dri/renderD128",0,&node));
+    assert(!vfs_path_stat(&node,&status) && status.st_ino==inode);
+    assert(!vfs_path_permissions(&node,&mode,false) && mode.mode==0660 && mode.uid==1000 && mode.gid==44);
+    vfs_path_put(&node);
+
+    test_drm_render_ready=false;
+    devtmpfs_notify();
+    test_fail_heap_after=0;
+    assert(devtmpfs_refresh()==-ENOMEM && devtmpfs_pending());
+    test_fail_heap_after=-1;
+    assert(!vfs_path_lookup(ns,root,root,"/devtmp-one/dri/renderD128",0,&node));
+    vfs_path_put(&node);
+    assert(!devtmpfs_refresh() && !devtmpfs_pending());
+    assert(vfs_path_lookup(ns,root,root,"/devtmp-one/dri/renderD128",0,&node)==-ENOENT);
+
+    assert(!vfs_path_lookup(ns,root,root,"/devtmp-one/dri/card0",0,&node));
+    assert(!vfs_path_remove(ns,&node,false));
+    vfs_path_put(&node);
+    devtmpfs_notify();
+    assert(!devtmpfs_refresh());
+    assert(vfs_path_lookup(ns,root,root,"/devtmp-one/dri/card0",0,&node)==-ENOENT);
+    mode=(struct reliefos_permissions){0640,1000,1000};
+    assert(!vfs_path_new_file(&directory,"card0",&mode,&node));
+    assert(!vfs_path_stat(&node,&status));
+    inode=status.st_ino;
+    vfs_path_put(&node);
+    test_drm_registered=false;
+    devtmpfs_notify();
+    assert(!devtmpfs_refresh());
+    assert(!vfs_path_lookup(ns,root,root,"/devtmp-one/dri/card0",0,&node));
+    assert(!vfs_path_stat(&node,&status) && status.st_ino==inode && (status.st_mode&LINUX_S_IFMT)==LINUX_S_IFREG);
+    assert(!vfs_path_remove(ns,&node,false));
+    vfs_path_put(&node);
+    assert(!vfs_path_remove(ns,&directory,true));
+    vfs_path_put(&directory);
+    test_drm_registered=saved_registered;
+    test_drm_render_ready=saved_render;
+    devtmpfs_notify();
+    assert(!devtmpfs_refresh());
+    puts("PASS devtmpfs lifecycle: hotplug, stable metadata, snapshot OOM retry, user deletion and replacement");
+}
+/* udev needs real writable inodes, shared across independent devtmpfs mounts. */
+static void devtmpfs_mount_syscalls(struct vfs_namespace *ns,const struct vfs_path *root,struct tmpfs_super *fs)
+{
+    assert(!tmpfs_create(fs,"/devtmp-one",LINUX_S_IFDIR|0755,NULL,NULL));
+    assert(!tmpfs_create(fs,"/devtmp-two",LINUX_S_IFDIR|0755,NULL,NULL));
+    struct task actor={.pid=902,.cap_effective=1ULL<<CAP_SYS_ADMIN};
+    vfs_path_get(root,&actor.fs_paths.root);vfs_path_get(root,&actor.fs_paths.cwd);
+    struct {char source[16],target[32],type[16],options[32];} user={
+        "udev","/devtmp-one","devtmpfs","mode=0755"};
+    lookup_user_base=(uintptr_t)&user;lookup_user_bytes=sizeof(user);
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,(uintptr_t)user.source,
+        (uintptr_t)user.target,(uintptr_t)user.type,MS_NOSUID,(uintptr_t)user.options));
+    struct vfs_path one={0},two={0},node={0},alias={0};
+    assert(!vfs_path_lookup(ns,root,root,user.target,0,&one));
+    strcpy(user.target,"/devtmp-two");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,(uintptr_t)user.source,
+        (uintptr_t)user.target,(uintptr_t)user.type,MS_NOEXEC,0));
+    assert(!vfs_path_lookup(ns,root,root,user.target,0,&two));
+    assert(vfs_path_context(&one)==vfs_path_context(&two));
+    assert(vfs_path_mount_flags(&one)&MS_NOSUID);
+    assert(vfs_path_mount_flags(&two)&MS_NOEXEC);
+    assert(!strcmp(one.mount->filesystem,"devtmpfs"));
+    assert(!vfs_path_lookup(ns,root,root,"/devtmp-one/null",0,&node));
+    struct linux_stat_abi status;
+    assert(!vfs_path_stat(&node,&status));
+    assert((status.st_mode&LINUX_S_IFMT)==LINUX_S_IFCHR && status.st_rdev==0x103);
+    struct reliefos_permissions mode={0660,123,456};
+    assert(!vfs_path_permissions(&node,&mode,true));
+    assert(!vfs_path_lookup(ns,root,root,"/devtmp-two/null",0,&alias));
+    mode=(struct reliefos_permissions){0};
+    assert(!vfs_path_permissions(&alias,&mode,false));
+    assert(mode.mode==0660 && mode.uid==123 && mode.gid==456);
+    vfs_path_put(&node);vfs_path_put(&alias);
+    assert(!vfs_path_lookup(ns,root,root,"/devtmp-one/stdin",0,&node));
+    char link[64]={0};size_t length=0;
+    assert(!vfs_path_readlink(&node,link,sizeof(link),&length));
+    assert(length==15 && !memcmp(link,"/proc/self/fd/0",15));
+    vfs_path_put(&node);
+    mode=(struct reliefos_permissions){0600,0,0};
+    assert(!vfs_path_new_file(&one,"udev-data",&mode,&node));
+    vfs_path_put(&node);
+    devtmpfs_device_lifecycle(ns,root);
+    assert(!vfs_mount_unmount(ns,&one));vfs_path_put(&one);
+    assert(!vfs_path_lookup(ns,root,root,"/devtmp-two/udev-data",0,&node));
+    vfs_path_put(&node);
+    assert(!vfs_mount_unmount(ns,&two));vfs_path_put(&two);
+    vfs_path_put(&actor.fs_paths.root);vfs_path_put(&actor.fs_paths.cwd);
+    lookup_user_base=lookup_user_bytes=0;
+    puts("PASS devtmpfs mount syscall: shared writable device inodes, metadata, fd symlinks and independent mount policy");
+}
+
 static void runtime_mount_syscalls(struct vfs_namespace *ns,const struct vfs_path *root,struct tmpfs_super *fs)
 {
     assert(!tmpfs_create(fs,"/syscall-source",LINUX_S_IFDIR|0755,NULL,NULL));
@@ -2307,7 +2424,13 @@ static void runtime_mount_syscalls(struct vfs_namespace *ns,const struct vfs_pat
     assert((vfs_path_mount_flags(&mounted)&(MS_RELATIME|MS_NOSUID|MS_NODEV))==(MS_RELATIME|MS_NOSUID|MS_NODEV));
     strcpy(user.options,"data=ordered");
     assert(scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,UINT64_MAX,target,UINT64_MAX,
-                            MS_REMOUNT|MS_NOSUID|MS_NODEV,options)==-EOPNOTSUPP);
+                            MS_REMOUNT|MS_NOSUID|MS_NODEV,options)==-EINVAL);
+    assert(!(vfs_path_mount_flags(&mounted)&MS_RDONLY));
+    strcpy(user.options,"size=16384,nr_inodes=32,mode=0755");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,UINT64_MAX,target,UINT64_MAX,
+                             MS_REMOUNT|MS_NOSUID|MS_NODEV,options));
+    struct reliefos_permissions retained_mode;
+    assert(!vfs_path_permissions(&mounted,&retained_mode,false) && retained_mode.mode==0700);
     user.options[0]=0;
     assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,UINT64_MAX,target,UINT64_MAX,
                              MS_REMOUNT|MS_NOSUID|MS_NODEV,options));
@@ -2525,6 +2648,19 @@ int main(int argc,char **argv)
     if(argc==3)ext_family(argv[1],argv[2]);
     if(argc==2)iso_filesystem(argv[1]);
     if(argc==4)cluster_filesystem(argv[1],argv[2],!strcmp(argv[3],"exfat"));
+    /* devtmpfs retains a private backing reference for the kernel lifetime.
+     * Exercise it after fixtures which deliberately recycle all dynamic slots. */
+    assert(!tmpfs_new(0,0,"size=0,nr_inodes=0",0,0,&fs));
+    g_volumes[0]=(struct storage_volume){.volume_id=0,.kind=STORAGE_VOLUME_ANONYMOUS,
+        .ready=true,.filesystem=STORAGE_FILESYSTEM_TMPFS,.fs_ops=&storage_tmpfs_ops,.tmpfs=fs};
+    ns=(struct vfs_namespace){0};
+    assert(!storage_create_vfs_mount(&g_volumes[0],NULL,&mount));
+    assert(!vfs_namespace_init(&ns,mount));vfs_mount_put(mount);
+    assert(!vfs_namespace_root(&ns,&root));
+    devtmpfs_mount_syscalls(&ns,&root,fs);
+    vfs_path_put(&root);
+    assert(!vfs_namespace_destroy(&ns) && !storage_inode_volume_busy(0));
+    tmpfs_destroy(fs);g_volumes[0]=(struct storage_volume){0};
     puts("PASS real tmpfs mount backend: inode-relative lookup, covered cwd, symlink traversal, removed objects retained through final path, no text-prefix routing");
     return 0;
 }

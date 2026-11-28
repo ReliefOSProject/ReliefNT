@@ -2,6 +2,7 @@
 #include <reliefnt/swap_internal.h>
 #endif
 #include "internal.h"
+#include <reliefnt/devfs.h>
 
 /** @brief Map a supported public format selector to its registered native type.
  * @param filesystem Validated RELIEFOS_DISK_FILESYSTEM selector.
@@ -143,6 +144,7 @@ static int disk_gpt_write(struct install_disk_state *disk, struct disk_gpt_table
      * first sector and keep it invalid on every error path; successful writes
      * are invalidated again below for clarity. */
     disk_block_cache_invalidate_disk(disk);
+    devtmpfs_notify();
     table_crc = storage_crc32(storage_cluster_buf, table->table_bytes);
     table->backup.partition_entries_crc32 = table_crc;
     table->backup.header_crc32 = 0;
@@ -609,6 +611,7 @@ static int storage_disk_initialize_gpt_owned(const struct reliefos_disk_gpt_init
      * any extents learned from a previous table before clearing sector 0 and
      * the GPT copies, including when a later write fails. */
     disk_block_cache_invalidate_disk(disk);
+    devtmpfs_notify();
     if (sector_count < 655360ULL) {
         return -28;
     }

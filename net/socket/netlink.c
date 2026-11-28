@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: Apache-2.0 */
+#include <reliefnt/devfs.h>
 /* Netlink state is owned by the ordinary kernel execution context. */
 #include <reliefnt/netlink.h>
 #include <reliefnt/net_ipv6.h>
@@ -447,6 +448,7 @@ static void nl_multicast(int protocol, uint32_t group, const void *data, uint32_
 void netlink_uevent_change(const char *devpath, const char *subsystem,
                          const char *properties, uint32_t length)
 {
+    devtmpfs_notify();
     char payload[512];
     struct text_stream stream = {.buffer = payload, .capacity = sizeof(payload)};
     static const char action[] = "\0ACTION=change\0DEVPATH=";

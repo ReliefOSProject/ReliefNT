@@ -191,6 +191,26 @@ static int storage_vfs_remount(void *context,uint64_t flags)
        (storage_inode_volume_writers(volume->volume_id) || storage_inode_volume_swap_active(volume->volume_id)))return -EBUSY;
     volume->mount_flags=flags;if(volume->tmpfs)tmpfs_set_flags(volume->tmpfs,flags);return 0;
 }
+/** @brief Validate backend mount data before committing shared policy.
+ * @param context Retained storage volume under execution ownership.
+ * @param flags Shared superblock flags. @param options Optional mount data.
+ * @return Zero or negative errno. A failed validation or readonly transition
+ * leaves flags and quotas unchanged. Quota commit cannot allocate or fail
+ * after its validation in this execution transaction.
+ */
+static int storage_vfs_remount_options(void *context,uint64_t flags,const char *options)
+{
+    struct storage_volume *volume=context;
+    int rc=0;
+    if(volume->tmpfs)rc=tmpfs_reconfigure(volume->tmpfs,options,false);
+    else if(options && options[0] &&
+            (volume->filesystem!=STORAGE_FILESYSTEM_EXT3 || __builtin_strcmp(options,"data=ordered")))
+        rc=-EOPNOTSUPP;
+    if(rc)return rc;
+    rc=storage_vfs_remount(context,flags);
+    if(!rc && volume->tmpfs)rc=tmpfs_reconfigure(volume->tmpfs,options,true);
+    return rc;
+}
 static int storage_vfs_can_unmount(void *context,void *pin)
 {
     struct storage_volume *volume=context;
@@ -266,6 +286,7 @@ static const struct vfs_backend_ops storage_vfs_ops={
     .lookup=storage_backend_lookup_vfs,.retain=storage_vfs_retain,.release=storage_vfs_release,
     .same_node=storage_backend_same_node,.readlink=storage_vfs_readlink,
     .finish=storage_vfs_finish,.destroy=storage_vfs_destroy,.can_unmount=storage_vfs_can_unmount,.remount=storage_vfs_remount,
+    .remount_options=storage_vfs_remount_options,
     .read=storage_vfs_read,.read_cursor=storage_vfs_read_cursor,.readdir=storage_vfs_readdir,.permissions=storage_backend_permissions,
     .mount_flags=storage_vfs_flags,.create_node=storage_backend_create_node,
     .getattr=storage_backend_getattr,.statfs=storage_backend_statfs,

@@ -179,8 +179,12 @@ int pty_inode_permissions(const struct storage_node *node,struct reliefos_permis
 uint32_t smp_cpu_count(void) { return 1; }
 int pty_lookup_path(const char *path, struct storage_node *node)
 { (void)path; (void)node; abort(); }
+/** @brief Model virtual consoles before tty initialization.
+ * @param path Requested console path. @param node Optional node output.
+ * @return ENOENT because this storage fixture has no live VT sessions.
+ */
 int pty_lookup_vt_path(const char *path, struct storage_node *node)
-{ (void)path; (void)node; abort(); }
+{ (void)path; (void)node; return -2; }
 /* RAM-backed ext2 must never touch the physical controller or other codecs. */
 #ifndef RELIEFNT_FIXTURE_OWN_IRQ_LOCKS
 void kernel_spin_lock_irqsave(struct kernel_spinlock *lock,uint64_t *flags)

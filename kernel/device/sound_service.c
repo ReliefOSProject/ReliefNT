@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include <reliefnt/sound_service.h>
+#include <reliefnt/devfs.h>
 #include <reliefnt/export.h>
 #include <reliefnt/deferred.h>
 #include <linux/errno.h>
@@ -63,7 +64,9 @@ int sound_service_register_card(const struct audio_card_identity * identity,cons
     if(!kernel_service_acquire(&sound_service_slot,&call))return -ENODEV;
     const struct sound_service_operations *provider_ops=call.operations;
     int result=provider_ops->register_card ? provider_ops->register_card(identity,operations,context,owner,out_id) : -ENODEV;
-    kernel_service_release(&call);return result;
+    kernel_service_release(&call);
+    if(!result)devtmpfs_notify();
+    return result;
 }
 /** @brief Disconnect one card through the original sound provider.
  * @param card Exact registered token.
@@ -78,7 +81,9 @@ int sound_service_unregister_card(uint32_t card,uint32_t force)
     if(!kernel_service_acquire(&sound_service_slot,&call))return -ENODEV;
     const struct sound_service_operations *provider_ops=call.operations;
     int result=provider_ops->unregister_card ? provider_ops->unregister_card(card,force) : -ENODEV;
-    kernel_service_release(&call);return result;
+    kernel_service_release(&call);
+    if(!result)devtmpfs_notify();
+    return result;
 }
 /** @brief Drain sound cards before their hardware owner retires.
  * @param owner Driver-manager slot to drain.
@@ -93,7 +98,9 @@ int sound_service_unregister_owner(uint32_t owner,uint32_t force)
     if(!kernel_service_acquire(&sound_service_slot,&call))return 0;
     const struct sound_service_operations *provider_ops=call.operations;
     int result=provider_ops->unregister_owner ? provider_ops->unregister_owner(owner,force) : 0;
-    kernel_service_release(&call);return result;
+    kernel_service_release(&call);
+    if(!result)devtmpfs_notify();
+    return result;
 }
 /** @brief Change a card service while retaining optional sound-core code.
  * @param card Live card token.
@@ -123,7 +130,9 @@ int sound_service_request_disconnect(uint32_t card)
     if(!kernel_service_acquire(&sound_service_slot,&call))return -ENODEV;
     const struct sound_service_operations *provider_ops=call.operations;
     int result=provider_ops->request_disconnect ? provider_ops->request_disconnect(card) : -ENODEV;
-    kernel_service_release(&call);return result;
+    kernel_service_release(&call);
+    if(!result)devtmpfs_notify();
+    return result;
 }
 /** @brief Report completed audio frames without exposing optional code addresses.
  * @param card Card generation token.

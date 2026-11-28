@@ -280,7 +280,7 @@ static int proc_fill_content(const char *path, char *buffer, uint32_t capacity)
 #ifdef CONFIG_SQUASHFS
         proc_append_text(buffer, &pos, capacity, "\tsquashfs\n");
 #endif
-        proc_append_text(buffer, &pos, capacity, "nodev\tproc\nnodev\tdevfs\nnodev\tsysfs\nnodev\ttmpfs\n");
+        proc_append_text(buffer, &pos, capacity, "nodev\tproc\nnodev\tdevfs\nnodev\tdevtmpfs\nnodev\tsysfs\nnodev\ttmpfs\n");
         return 0;
     }
     if (proc_text_eq(path, "/proc/asound/cards")) {

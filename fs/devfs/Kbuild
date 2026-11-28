@@ -1,4 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-obj-y := devfs.o mount.o identity.o device.o
+obj-y := devfs.o mount.o identity.o device.o devtmpfs.o devtmpfs_nodes.o
 
 include $(srctree)/scripts/Makefile.module

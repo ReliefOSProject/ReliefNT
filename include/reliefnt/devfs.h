@@ -29,4 +29,26 @@ void devfs_stat_identity(struct linux_stat_abi *out,const struct storage_node *n
  * references transfer and no graph/module lock spans provider metadata I/O.
  */
 int devfs_lookup_rdev(uint32_t type,uint64_t device,struct storage_node *out);
+/** @brief Create a shared writable device filesystem mount.
+ * @param source Diagnostic mount source. @param flags Linux mount flags.
+ * @param options Optional tmpfs mount data. @param out Owned detached mount.
+ * @return Zero or negative errno. Requires execution ownership.
+ */
+int devtmpfs_create_vfs_mount(const char *source,uint64_t flags,const char *options,
+                              struct vfs_mount **out);
+/** @brief Mark the device inventory dirty without allocation or hardware I/O.
+ * IRQ/task safe. Standalone device fixtures may omit devtmpfs entirely.
+ */
+void devtmpfs_changed(void) __attribute__((weak));
+/** @brief Notify mounted devtmpfs instances after releasing device registry locks. */
+static inline void devtmpfs_notify(void)
+{
+    if(devtmpfs_changed)devtmpfs_changed();
+}
+/** @brief Query deferred inventory work. Execution ownership required. */
+bool devtmpfs_pending(void);
+/** @brief Reconcile coalesced device changes. Execution ownership required.
+ * @return Zero or negative errno, retaining pending work on failure.
+ */
+int devtmpfs_refresh(void);
 #endif

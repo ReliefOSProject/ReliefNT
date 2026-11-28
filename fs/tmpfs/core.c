@@ -233,30 +233,26 @@ int tmpfs_create_anonymous(struct tmpfs_super *fs, uint32_t uid, uint32_t gid,
     return 0;
 }
 
-int tmpfs_new(uint32_t volume, uint64_t flags, const char *options, uint32_t uid, uint32_t gid,
-              struct tmpfs_super **out)
+/** @brief Parsed tmpfs policy prepared before mutating any live instance. */
+struct tmpfs_options {
+    uint64_t max_pages, max_inodes;
+    uint32_t mode, uid, gid;
+};
+
+/** @brief Parse Linux tmpfs mount data into caller-owned candidate policy.
+ * @param options Optional comma-separated mount data.
+ * @param parsed Candidate initialized with current/default values.
+ * @return Zero or -EINVAL. Failure never changes a live filesystem.
+ */
+static int tmpfs_parse_options(const char *options, struct tmpfs_options *parsed)
 {
-    if (!out)
-        return -22;
-    *out = NULL;
-    struct tmpfs_super *fs = kernel_malloc(sizeof(*fs));
-    if (!fs)
-        return -12;
-    __builtin_memset(fs, 0, sizeof(*fs));
-    fs->volume = volume;
-    fs->next_ino = 1;
-    fs->lookup_generation = 1;
-    fs->flags = flags;
-    fs->max_pages = fs->max_inodes = mm_total_memory_kib() / 8; /* Half RAM, in pages. */
-    uint32_t mode = 01777;
     const char *p = options ? options : "";
-    int ret = -22;
     while (*p) {
         char option[128];
         unsigned length = 0;
         while (*p && *p != ',') {
             if (length + 1 == sizeof(option))
-                goto fail;
+                return -22;
             option[length++] = *p++;
         }
         if (*p)
@@ -268,7 +264,7 @@ int tmpfs_new(uint32_t volume, uint64_t flags, const char *options, uint32_t uid
         while (*value && *value != '=')
             ++value;
         if (!*value)
-            goto fail;
+            return -22;
         *value++ = 0;
         uint64_t number;
         bool is_mode = !__builtin_strcmp(option, "mode");
@@ -276,45 +272,91 @@ int tmpfs_new(uint32_t volume, uint64_t flags, const char *options, uint32_t uid
         bool is_blocks = !__builtin_strcmp(option, "nr_blocks");
         bool is_inodes = !__builtin_strcmp(option, "nr_inodes");
         if (tmpfs_number(value, &number, is_mode ? 8 : 10, is_size || is_blocks || is_inodes, is_size))
-            goto fail;
+            return -22;
         if (is_size) {
             if (number > UINT64_MAX - 4095)
-                goto fail;
-            fs->max_pages = (number + 4095) / 4096;
+                return -22;
+            parsed->max_pages = (number + 4095) / 4096;
         } else if (is_blocks) {
             if (number > INT64_MAX)
-                goto fail;
-            fs->max_pages = number;
+                return -22;
+            parsed->max_pages = number;
         } else if (is_inodes) {
             if (number > UINT32_MAX)
-                goto fail;
-            fs->max_inodes = number;
+                return -22;
+            parsed->max_inodes = number;
         } else if (is_mode) {
             if (number > UINT32_MAX)
-                goto fail;
-            mode = number & 07777;
+                return -22;
+            parsed->mode = number & 07777;
         } else if (!__builtin_strcmp(option, "uid")) {
             if (number >= UINT32_MAX)
-                goto fail;
-            uid = number;
+                return -22;
+            parsed->uid = number;
         } else if (!__builtin_strcmp(option, "gid")) {
             if (number >= UINT32_MAX)
-                goto fail;
-            gid = number;
+                return -22;
+            parsed->gid = number;
         } else
-            goto fail;
+            return -22;
     }
-    ret = tmpfs_alloc_inode(fs, LINUX_S_IFDIR | mode, &fs->root);
-    if (ret)
-        goto fail;
+    return 0;
+}
+
+/** @brief Validate or commit quota changes without reinitializing root metadata.
+ * @param fs Live execution-owned filesystem.
+ * @param options Optional Linux tmpfs mount data.
+ * @param apply Commit after validation when true, otherwise leave state intact.
+ * @return Zero or -EINVAL. Unlimited instances cannot become limited, and a
+ * new limit must contain existing allocations. Mode/uid/gid only apply during
+ * initial creation, matching Linux shmem reconfiguration semantics.
+ */
+int tmpfs_reconfigure(struct tmpfs_super *fs, const char *options, bool apply)
+{
+    if (!fs) return -22;
+    struct tmpfs_options parsed = {
+        .max_pages = fs->max_pages, .max_inodes = fs->max_inodes
+    };
+    int rc = tmpfs_parse_options(options, &parsed);
+    if (rc) return rc;
+    if ((parsed.max_pages && (!fs->max_pages || parsed.max_pages < fs->used_pages)) ||
+        (parsed.max_inodes && (!fs->max_inodes || parsed.max_inodes < fs->used_inodes)))
+        return -22;
+    if (apply) {
+        fs->max_pages = parsed.max_pages;
+        fs->max_inodes = parsed.max_inodes;
+    }
+    return 0;
+}
+
+int tmpfs_new(uint32_t volume, uint64_t flags, const char *options, uint32_t uid, uint32_t gid,
+              struct tmpfs_super **out)
+{
+    if (!out) return -22;
+    *out = NULL;
+    struct tmpfs_options parsed = {
+        .max_pages = mm_total_memory_kib() / 8,
+        .max_inodes = mm_total_memory_kib() / 8,
+        .mode = 01777, .uid = uid, .gid = gid
+    };
+    int ret = tmpfs_parse_options(options, &parsed);
+    if (ret) return ret;
+    struct tmpfs_super *fs = kernel_malloc(sizeof(*fs));
+    if (!fs) return -12;
+    *fs = (struct tmpfs_super){
+        .volume = volume, .next_ino = 1, .lookup_generation = 1,
+        .flags = flags, .max_pages = parsed.max_pages, .max_inodes = parsed.max_inodes
+    };
+    ret = tmpfs_alloc_inode(fs, LINUX_S_IFDIR | parsed.mode, &fs->root);
+    if (ret) {
+        tmpfs_destroy(fs);
+        return ret;
+    }
     fs->root->parent = fs->root;
-    fs->root->stat.st_uid = uid;
-    fs->root->stat.st_gid = gid;
+    fs->root->stat.st_uid = parsed.uid;
+    fs->root->stat.st_gid = parsed.gid;
     *out = fs;
     return 0;
-fail:
-    tmpfs_destroy(fs);
-    return ret;
 }
 static struct tmpfs_entry **tmpfs_find(struct tmpfs_inode *dir, const char *name)
 {

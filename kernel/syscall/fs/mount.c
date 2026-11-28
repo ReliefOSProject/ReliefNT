@@ -108,6 +108,7 @@ static int mount_remount(struct vfs_namespace *ns,struct task *task,uint64_t tar
 static int mount_backend(struct vfs_namespace *ns,struct task *task,const char *source,uint64_t source_user,
                              const char *type,const char *options,uint64_t flags,struct vfs_mount **out)
 {
+    if(!__builtin_strcmp(type,"devtmpfs"))return devtmpfs_create_vfs_mount(source,flags,options,out);
     if(!__builtin_strcmp(type,"tmpfs"))return storage_new_tmpfs_mount(source,flags,options,task->fsuid,task->fsgid,out);
     /* The ext3 engine always uses ordered metadata transactions. Consume only
      * that supported mode before the common FAT option validation/application. */

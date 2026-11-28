@@ -11,6 +11,13 @@ struct tmpfs_super;
 uint64_t tmpfs_lookup_generation(const struct tmpfs_super *fs);
 int tmpfs_new(uint32_t volume, uint64_t flags, const char *options, uint32_t uid, uint32_t gid,
               struct tmpfs_super **out);
+/** @brief Validate or apply Linux tmpfs quota reconfiguration atomically.
+ * @param fs Live filesystem under execution ownership. @param options Mount data.
+ * @param apply Commit quotas when true, validate without mutation when false.
+ * @return Zero or -EINVAL, preserving root mode/ownership and all inode data.
+ * Unlimited quotas cannot become limited. New limits must contain allocations.
+ */
+int tmpfs_reconfigure(struct tmpfs_super *fs, const char *options, bool apply);
 void tmpfs_destroy(struct tmpfs_super *fs);
 /**
  * @brief Create an unlinked regular inode under the storage execution lock.

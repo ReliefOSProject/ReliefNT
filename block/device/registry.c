@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include <reliefnt/blkdev.h>
+#include <reliefnt/devfs.h>
 #include <reliefnt/module.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/lock.h>
@@ -103,7 +104,10 @@ static int device_close(void *context)
     if(device->users){kernel_spin_unlock_irqrestore(&device_lock,flags);return -EBUSY;}
     bool linked=device->linked;if(linked)device_unlink_locked(device);
     kernel_spin_unlock_irqrestore(&device_lock,flags);
-    if(linked)device_put(device);
+    if(linked) {
+        device_put(device);
+        devtmpfs_notify();
+    }
     return 0;
 }
 
@@ -160,7 +164,9 @@ int register_block_device(const struct block_device_registration *registration)
         kernel_spin_unlock_irqrestore(&device_lock,flags);
         if(result)(void)device_close(device);
     }
-    device_put(device);return result;
+    device_put(device);
+    if(!result)devtmpfs_notify();
+    return result;
 }
 
 /** @brief Unpublish only an idle descriptor, preserving active open/mount users.
@@ -177,7 +183,9 @@ int unregister_block_device(const struct block_device_registration *registration
     if(!device){kernel_spin_unlock_irqrestore(&device_lock,flags);return -ENOENT;}
     if(device->users){kernel_spin_unlock_irqrestore(&device_lock,flags);return -EBUSY;}
     device_unlink_locked(device);kernel_spin_unlock_irqrestore(&device_lock,flags);
-    device_put(device);return 0;
+    device_put(device);
+    devtmpfs_notify();
+    return 0;
 }
 
 /** @brief Close I/O admission for a physically removed exact block registration.
@@ -194,6 +202,7 @@ int disconnect_block_device(const struct block_device_registration *registration
     while(device && device->registration!=registration)device=device->next;
     if(device){device->active=false;device->revoked=true;}
     kernel_spin_unlock_irqrestore(&device_lock,flags);
+    if(device)devtmpfs_notify();
     return device ? 0 : -ENOENT;
 }
 EXPORT_SYMBOL(disconnect_block_device);

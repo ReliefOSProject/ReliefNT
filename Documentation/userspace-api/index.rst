@@ -10,6 +10,7 @@
    abi
    exec
    descriptors
+   device-filesystems
    inotify
    ipv6
    pidfd

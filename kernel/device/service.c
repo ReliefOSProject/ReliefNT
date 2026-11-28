@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include <reliefnt/service.h>
+#include <reliefnt/devfs.h>
 #include <reliefnt/export.h>
 #include <reliefnt/heap.h>
 #include <reliefnt/lock.h>
@@ -41,7 +42,11 @@ static int service_binding_stop(void *value)
         binding->linked=false;binding->active=false;detached=true;
     }
     kernel_spin_unlock_irqrestore(&service_binding_lock,flags);
-    if(detached)service_binding_put(binding);return rc;
+    if(detached) {
+        service_binding_put(binding);
+        devtmpfs_notify();
+    }
+    return rc;
 }
 /** @brief Consume a fully stopped module cleanup-ledger binding reference.
  * @param value Owned ledger reference, consumed once.
@@ -75,7 +80,9 @@ int kernel_service_register(struct kernel_service_slot *slot,const struct kernel
         } else rc=-EBUSY;
         kernel_spin_unlock_irqrestore(&service_binding_lock,flags);
     }
-    service_binding_put(binding);return rc;
+    service_binding_put(binding);
+    if(!rc)devtmpfs_notify();
+    return rc;
 }
 /** @brief Detach an idle exact table without rebinding a former provider's token.
  * @param slot Permanent core slot. @param descriptor Exact immutable identity.
