@@ -45,7 +45,7 @@ static int mount_bind(struct vfs_namespace *ns,struct task *task,uint64_t source
     vfs_path_put(&from.path);vfs_path_put(&to.path);return rc;
 }
 
-/** @brief Detach the selected visible mount and applicable shared counterparts.
+/** @brief Detach the selected visible mount and applicable propagation receivers.
  * @param ns Borrowed execution-owned namespace.
  * @param task Authorized caller retaining any retry scope.
  * @param target User target pathname pointer, required.

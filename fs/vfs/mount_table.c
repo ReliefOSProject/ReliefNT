@@ -99,6 +99,9 @@ static int mount_line(const struct vfs_namespace *ns,const struct vfs_path *root
         if(mount->peer_group) {
             mount_emit(text," shared:");mount_number(text,mount->peer_group);
         } else if(mount->unbindable)mount_emit(text," unbindable");
+        if(mount->master) {
+            mount_emit(text," master:");mount_number(text,mount->master->peer_group);
+        }
         mount_emit(text," - ");mount_emit(text,filesystem);mount_emit(text," ");
         mount_field(text,source);mount_emit(text," ");mount_options(text,vfs_super_flags(mount),true,true);mount_emit(text,"\n");
     } else {

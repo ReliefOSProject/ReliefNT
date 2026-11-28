@@ -533,7 +533,7 @@ int vfs_namespace_destroy(struct vfs_namespace *ns);
  * @return Zero or negative errno. Serialized task context.
  */
 int vfs_namespace_root(const struct vfs_namespace *ns,struct vfs_path *out);
-/** @brief Attach an unpublished mount and propagate to eligible shared peers.
+/** @brief Attach an unpublished mount and propagate to eligible peers and slaves.
  * @param ns Shared namespace under execution ownership.
  * @param mount Unpublished mount; caller retains its own handle.
  * @param target Held directory path in ns; an already covered slot is busy.
@@ -547,8 +547,9 @@ int vfs_mount_attach(struct vfs_namespace *ns,struct vfs_mount *mount,
  * @param path Held root of an attached mount in ns, not an interior dentry.
  * @param flags Exactly one propagation type, optionally with MS_REC.
  * @return Zero or negative errno without partial changes. MS_SHARED assigns
- * peer groups to nonshared mounts; MS_PRIVATE and MS_UNBINDABLE leave a group.
- * No backend or access policy changes. MS_SLAVE is not yet supported.
+ * peer groups to nonshared mounts. MS_SLAVE leaves a peer group while retaining
+ * an upstream group if available. MS_PRIVATE and MS_UNBINDABLE clear both.
+ * No backend or access policy changes.
  */
 int vfs_mount_set_propagation(struct vfs_namespace *ns,const struct vfs_path *path,uint64_t flags);
 /** @brief Bind one directory inode into a separate nonrecursive attachment.
@@ -557,9 +558,9 @@ int vfs_mount_set_propagation(struct vfs_namespace *ns,const struct vfs_path *pa
  * @param target Destination directory, required in the same namespace.
  * @return Zero or negative errno without a partial attachment. Inherits
  * source mount policy; shares inode identities and backend lifetime without
- * duplicating provider destruction. Joins the source's shared group and
- * propagates under a shared destination. Child mounts are not copied and an
- * unbindable source returns EINVAL.
+ * duplicating provider destruction. Inherits the source's peer and master
+ * groups, and propagates under a shared destination. Child mounts are not
+ * copied and an unbindable source returns EINVAL.
  */
 int vfs_mount_bind(struct vfs_namespace *ns,const struct vfs_path *source,
                     const struct vfs_path *target);
@@ -569,7 +570,7 @@ int vfs_mount_bind(struct vfs_namespace *ns,const struct vfs_path *source,
  * @param target Uncovered destination directory in the same namespace.
  * @return Zero or negative errno without publishing a partial tree. Each clone
  * has an independent ID and mount policy but pins the original backing objects.
- * Each eligible shared destination peer receives the same bindable tree.
+ * Eligible destination peers and slaves each receive a bindable tree.
  * Unbindable descendant branches are skipped; an unbindable source is rejected.
  */
 int vfs_mount_bind_recursive(struct vfs_namespace *ns,const struct vfs_path *source,
@@ -584,7 +585,7 @@ int vfs_mount_bind_recursive(struct vfs_namespace *ns,const struct vfs_path *sou
  */
 int vfs_mount_move(struct vfs_namespace *ns,const struct vfs_path *source,
                     const struct vfs_path *target);
-/** @brief Unmount one root and its removable shared propagation counterparts.
+/** @brief Unmount one root and its removable peer and slave counterparts.
  * @param ns Namespace under execution ownership.
  * @param path The caller's sole external path to the mounted root.
  * @return Zero or negative errno. The origin must have no child mounts; a

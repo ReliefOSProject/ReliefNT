@@ -25,6 +25,7 @@ struct vfs_mount {
     struct vfs_namespace *ns;
     struct vfs_mount *next,*notify_next;
     struct vfs_mount **notify_link;
+    struct vfs_mount *master; /* Weak edge to a live member of the upstream peer group. */
     struct vfs_path point,bind_source;
     struct vfs_dentry *root;
     const struct vfs_backend_ops *ops;

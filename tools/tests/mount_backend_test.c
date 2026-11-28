@@ -2939,6 +2939,8 @@ static void runtime_unbindable(struct vfs_namespace *ns,const struct vfs_path *r
     assert(strstr(table," /rbind-source/view/child rw,nosuid - tmpfs "));
     assert(strstr(table," /rbind-source/view/child/deep rw,nodev unbindable - tmpfs "));
     assert(!scoped_mount_call(ns,actor,LINUX_SYS_MOUNT,ignored,to,ignored,MS_UNBINDABLE,ignored));
+    /* Making an already nonshared mount a slave preserves its type. */
+    assert(!scoped_mount_call(ns,actor,LINUX_SYS_MOUNT,ignored,to,ignored,MS_SLAVE,ignored));
 
     strcpy(source,"/rbind-source/view/child");strcpy(target,"/rbind-target");
     uint64_t before=ns->next_id;
@@ -3033,21 +3035,38 @@ static void runtime_recursive_bind(struct vfs_namespace *ns,const struct vfs_pat
     puts("PASS recursive bind: subdirectory boundary, sibling/nested topology, distinct policies and OOM rollback");
 }
 
-/** @brief Read one mountinfo row's shared peer ID, or zero for a private mount.
+/** @brief Read one optional numeric mountinfo field from an exact mountpoint.
  * @param ns Borrowed namespace. @param root Retained mount table viewer root.
  * @param point Expected absolute mountpoint, with no mountinfo escapes.
- * @return The parsed peer group ID; the fixture requires a matching row.
+ * @param tag Optional field prefix, including a leading space and colon.
+ * @return The parsed group ID or zero if the field is absent.
+ */
+static unsigned long long fixture_mount_tag(struct vfs_namespace *ns,const struct vfs_path *root,
+                                             const char *point,const char *tag)
+{
+    char table[6144],field[128];uint32_t count=0;
+    assert(!vfs_read_mount_table(ns,root,true,0,table,sizeof(table)-1,&count));table[count]=0;
+    for(char *row=table;*row;) {
+        char *end=strchr(row,'\n');assert(end);*end=0;
+        assert(sscanf(row,"%*s %*s %*s %*s %127s",field)==1);
+        if(!strcmp(field,point)) {
+            char *separator=strstr(row," - ");assert(separator);*separator=0;
+            const char *found=strstr(row,tag);
+            return found ? strtoull(found+strlen(tag),NULL,10) : 0;
+        }
+        row=end+1;
+    }
+    assert(!"missing mountinfo row");return 0;
+}
+
+/** @brief Read a fixture mount's peer group. @param ns Borrowed namespace.
+ * @param root Retained viewer root. @param point Absolute mountpoint.
+ * @return Group ID or zero for a nonshared mount.
  */
 static unsigned long long fixture_shared_id(struct vfs_namespace *ns,const struct vfs_path *root,
                                              const char *point)
 {
-    char table[6144],field[128];uint32_t count=0;
-    assert(!vfs_read_mount_table(ns,root,true,0,table,sizeof(table)-1,&count));table[count]=0;
-    assert(snprintf(field,sizeof(field)," %s ",point)<(int)sizeof(field));
-    char *row=strstr(table,field);assert(row);
-    char *separator=strstr(row," - ");assert(separator);
-    char *tag=strstr(row," shared:");
-    return tag && tag<separator ? strtoull(tag+8,NULL,10) : 0;
+    return fixture_mount_tag(ns,root,point," shared:");
 }
 
 /** @brief Exercise shared groups and propagated mount transactions via actual paths.
@@ -3216,6 +3235,151 @@ static void runtime_shared_mounts(struct vfs_namespace *ns,const struct vfs_path
     vfs_path_put(&actor.fs_paths.root);vfs_path_put(&actor.fs_paths.cwd);
     lookup_user_base=lookup_user_bytes=0;
     puts("PASS shared propagation: group IDs, bounded peer roots, rollback, busy peers, retained local branches and recursive detach");
+}
+
+/** @brief Verify one-way and transitive mount propagation through slave groups.
+ * @param ns Borrowed fixture namespace. @param root Retained namespace root.
+ */
+static void runtime_slave_mounts(struct vfs_namespace *ns,const struct vfs_path *root)
+{
+    const char *outer[]={"/slave-a","/slave-b","/slave-c","/slave-d","/slave-source","/slave-peer"};
+    for(unsigned i=0;i<sizeof(outer)/sizeof(outer[0]);++i)assert(!vfs_kernel_mkdir(ns,outer[i],0755));
+    struct task actor={.pid=909,.fsuid=1000,.fsgid=1000,.cap_effective=1ULL<<CAP_SYS_ADMIN};
+    vfs_path_get(root,&actor.fs_paths.root);vfs_path_get(root,&actor.fs_paths.cwd);
+    struct {char source[64],target[64],type[8];} user={"slave fixture","/slave-a","tmpfs"};
+    const uint64_t from=(uintptr_t)user.source,to=(uintptr_t)user.target,type=(uintptr_t)user.type;
+    lookup_user_base=(uintptr_t)&user;lookup_user_bytes=sizeof(user);
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,type,0,0));
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,0,MS_SHARED,0));
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,UINT64_MAX,to,UINT64_MAX,MS_SLAVE,UINT64_MAX));
+    assert(!fixture_shared_id(ns,root,"/slave-a") && !fixture_mount_tag(ns,root,"/slave-a"," master:"));
+
+    const char *child[]={"/slave-a/old","/slave-a/event","/slave-a/rec","/slave-a/local","/slave-a/late",
+        "/slave-a/narrow","/slave-a/narrow/slot"};
+    for(unsigned i=0;i<sizeof(child)/sizeof(child[0]);++i)assert(!vfs_kernel_mkdir(ns,child[i],0755));
+    strcpy(user.target,"/slave-a/old");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,type,0,0));
+    strcpy(user.target,"/slave-a");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,0,MS_SHARED|MS_REC,0));
+    const unsigned long long upstream=fixture_shared_id(ns,root,"/slave-a");
+    strcpy(user.source,"/slave-a");strcpy(user.target,"/slave-b");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,0,MS_BIND|MS_REC,0));
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,0,MS_SLAVE|MS_REC,0));
+    assert(!fixture_shared_id(ns,root,"/slave-b") && !fixture_shared_id(ns,root,"/slave-b/old"));
+    assert(fixture_mount_tag(ns,root,"/slave-b/old"," master:")==fixture_shared_id(ns,root,"/slave-a/old"));
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,0,MS_SHARED,0));
+    const unsigned long long middle=fixture_shared_id(ns,root,"/slave-b");
+    assert(middle && middle!=upstream && fixture_mount_tag(ns,root,"/slave-b"," master:")==upstream);
+    strcpy(user.source,"/slave-b");strcpy(user.target,"/slave-c");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,0,MS_BIND,0));
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,0,MS_SLAVE,0));
+    strcpy(user.source,"/slave-c");strcpy(user.target,"/slave-d");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,0,MS_BIND,0));
+    assert(!fixture_shared_id(ns,root,"/slave-c") && !fixture_shared_id(ns,root,"/slave-d"));
+    assert(fixture_mount_tag(ns,root,"/slave-c"," master:")==middle);
+    assert(fixture_mount_tag(ns,root,"/slave-d"," master:")==middle);
+
+    strcpy(user.target,"/slave-c/local");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,type,0,0));
+    assert(!vfs_kernel_mkdir(ns,"/slave-c/local/only",0755));
+    struct vfs_path a={0},b={0},found={0};
+    assert(vfs_path_lookup(ns,root,root,"/slave-a/local/only",0,&found)==-ENOENT);
+    assert(vfs_path_lookup(ns,root,root,"/slave-b/local/only",0,&found)==-ENOENT);
+    assert(vfs_path_lookup(ns,root,root,"/slave-d/local/only",0,&found)==-ENOENT);
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0));
+
+    strcpy(user.target,"/slave-a/event");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,type,0,0));
+    const unsigned long long up_event=fixture_shared_id(ns,root,"/slave-a/event");
+    const unsigned long long mid_event=fixture_shared_id(ns,root,"/slave-b/event");
+    assert(up_event && mid_event && up_event!=mid_event);
+    assert(fixture_mount_tag(ns,root,"/slave-b/event"," master:")==up_event);
+    assert(fixture_mount_tag(ns,root,"/slave-c/event"," master:")==mid_event);
+    assert(fixture_mount_tag(ns,root,"/slave-d/event"," master:")==mid_event);
+    assert(!vfs_path_lookup(ns,root,root,"/slave-d/event",0,&b));
+    assert(scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0)==-EBUSY);
+    vfs_path_put(&b);
+    assert(!vfs_kernel_mkdir(ns,"/slave-a/event/down",0755));
+    strcpy(user.target,"/slave-b/event/down");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,type,0,0));
+    assert(!vfs_kernel_mkdir(ns,"/slave-c/event/down/only",0755));
+    assert(vfs_path_lookup(ns,root,root,"/slave-a/event/down/only",0,&found)==-ENOENT);
+    assert(!vfs_path_lookup(ns,root,root,"/slave-d/event/down/only",0,&b));vfs_path_put(&b);
+    strcpy(user.target,"/slave-c/event/down");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0));
+    assert(!vfs_path_lookup(ns,root,root,"/slave-b/event/down/only",0,&b));vfs_path_put(&b);
+    strcpy(user.target,"/slave-b/event/down");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0));
+    assert(vfs_path_lookup(ns,root,root,"/slave-d/event/down/only",0,&found)==-ENOENT);
+    strcpy(user.target,"/slave-a/event");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0));
+    assert(vfs_path_lookup(ns,root,root,"/slave-d/event/down",0,&found)==-ENOENT);
+
+    strcpy(user.target,"/slave-source");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,type,0,0));
+    assert(!vfs_kernel_mkdir(ns,"/slave-source/child",0755));
+    strcpy(user.target,"/slave-source/child");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,type,0,0));
+    assert(!vfs_kernel_mkdir(ns,"/slave-source/child/inside",0755));
+    strcpy(user.target,"/slave-source");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,0,MS_SHARED|MS_REC,0));
+    assert(!vfs_path_lookup(ns,root,root,"/slave-source",0,&a));
+    assert(!vfs_path_lookup(ns,root,root,"/slave-a/rec",0,&b));
+    const uint64_t id=ns->next_id,group=ns->next_peer_id;
+    test_fail_heap_after=9;
+    assert(vfs_mount_bind_recursive(ns,&a,&b)==-ENOMEM);
+    test_fail_heap_after=-1;
+    assert(ns->next_id==id && ns->next_peer_id==group);
+    assert(vfs_path_lookup(ns,root,root,"/slave-d/rec/child",0,&found)==-ENOENT);
+    vfs_path_put(&a);vfs_path_put(&b);
+    strcpy(user.source,"/slave-source");strcpy(user.target,"/slave-a/rec");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,0,MS_BIND|MS_REC,0));
+    const unsigned long long src_child=fixture_shared_id(ns,root,"/slave-source/child");
+    const unsigned long long slave_child=fixture_shared_id(ns,root,"/slave-b/rec/child");
+    assert(src_child && slave_child && src_child!=slave_child);
+    assert(fixture_shared_id(ns,root,"/slave-a/rec/child")==src_child);
+    assert(fixture_mount_tag(ns,root,"/slave-b/rec/child"," master:")==src_child);
+    assert(fixture_mount_tag(ns,root,"/slave-c/rec/child"," master:")==slave_child);
+    assert(fixture_mount_tag(ns,root,"/slave-d/rec/child"," master:")==slave_child);
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,MNT_DETACH,0,0,0));
+    assert(vfs_path_lookup(ns,root,root,"/slave-d/rec/child/inside",0,&found)==-ENOENT);
+    while(vfs_reclaim_mounts(32)){}
+
+    /* If only a narrower peer survives, events outside its view can still
+     * reach deeper slaves. In-range events use the surviving intermediate group. */
+    strcpy(user.source,"/slave-b/narrow");strcpy(user.target,"/slave-peer");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,0,MS_BIND,0));
+    strcpy(user.target,"/slave-b");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,0,MS_PRIVATE,0));
+    assert(!fixture_mount_tag(ns,root,"/slave-b"," master:"));
+    assert(fixture_mount_tag(ns,root,"/slave-c"," master:")==middle);
+    strcpy(user.target,"/slave-a/narrow/slot");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,type,0,0));
+    const unsigned long long narrowed=fixture_shared_id(ns,root,"/slave-peer/slot");
+    assert(narrowed && fixture_mount_tag(ns,root,"/slave-d/narrow/slot"," master:")==narrowed);
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0));
+    strcpy(user.target,"/slave-a/late");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,type,0,0));
+    assert(fixture_mount_tag(ns,root,"/slave-d/late"," master:")==fixture_shared_id(ns,root,"/slave-a/late"));
+    assert(!vfs_kernel_mkdir(ns,"/slave-c/late/forwarded",0755));
+    assert(vfs_path_lookup(ns,root,root,"/slave-b/late/forwarded",0,&found)==-ENOENT);
+    assert(!vfs_path_lookup(ns,root,root,"/slave-d/late/forwarded",0,&b));vfs_path_put(&b);
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,0,0,0,0));
+    strcpy(user.target,"/slave-peer");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,MNT_DETACH,0,0,0));
+    assert(fixture_mount_tag(ns,root,"/slave-c"," master:")==upstream);
+    strcpy(user.target,"/slave-a");
+    assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,MNT_DETACH,0,0,0));
+    assert(!fixture_mount_tag(ns,root,"/slave-c"," master:") && !fixture_mount_tag(ns,root,"/slave-d"," master:"));
+    const char *cleanup[]={"/slave-d","/slave-c","/slave-b","/slave-source"};
+    for(unsigned i=0;i<sizeof(cleanup)/sizeof(cleanup[0]);++i) {
+        strcpy(user.target,cleanup[i]);
+        assert(!scoped_mount_call(ns,&actor,LINUX_SYS_UMOUNT2,to,MNT_DETACH,0,0,0));
+    }
+    while(vfs_reclaim_mounts(32)){}
+    vfs_path_put(&actor.fs_paths.root);vfs_path_put(&actor.fs_paths.cwd);
+    lookup_user_base=lookup_user_bytes=0;
+    puts("PASS slave propagation: recursive demotion, directional propagation, reparenting, unmount and bind rollback");
 }
 
 /** @brief Verify lazy detach hides a mount tree without revoking retained paths.
@@ -3498,6 +3662,7 @@ int main(int argc,char **argv)
     runtime_mount_syscalls(&ns,&root,fs);
     runtime_recursive_bind(&ns,&root,fs);
     runtime_shared_mounts(&ns,&root);
+    runtime_slave_mounts(&ns,&root);
     runtime_bind_remount(&ns,&root,fs);
     runtime_lazy_unmount(&ns,&root,fs);
     device_mount_objects(&ns,&root,fs);
