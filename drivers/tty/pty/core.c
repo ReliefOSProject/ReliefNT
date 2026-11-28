@@ -1,4 +1,5 @@
 #include "internal.h"
+#include <linux/errno.h>
 
 
 struct pty_session_page {
@@ -102,6 +103,10 @@ int pty_get_node(uint32_t pty_id, struct storage_node *node)
     return 0;
 }
 
+/** @brief Resolve a legacy PTY pathname under execution ownership.
+ * @param path Global /dev/pts pathname.
+ * @param node Optional output metadata.
+ * @return Zero or negative ENOENT. Devpts bindings are instance-scoped. */
 int pty_lookup_path(const char *path, struct storage_node *node)
 {
     const char *prefix = "/dev/pts/";
@@ -115,8 +120,46 @@ int pty_lookup_path(const char *path, struct storage_node *node)
         if (id > pty_session_slot_capacity()) return -2;
     } while (*path >= '0' && *path <= '9');
     struct pty_session *session = find_session(id);
-    if (*path || !session || session->hungup || session->console) return -2;
+    if (*path || !session || session->hungup || session->console || session->devpts) return -2;
     return pty_get_node(id, node);
+}
+
+/** @brief Read the public PTY number under execution ownership.
+ * @param pty_id Stable internal ID.
+ * @return Bound index, or the legacy internal ID if unbound or invalid. */
+uint32_t pty_number(uint32_t pty_id)
+{
+    struct pty_session *session = find_session(pty_id);
+    return session && session->devpts ? session->public_number : pty_id;
+}
+
+/** @brief Inspect devpts membership under execution ownership.
+ * @param pty_id Stable internal ID.
+ * @return Nonzero when the session belongs to a devpts instance. */
+int pty_is_devpts(uint32_t pty_id)
+{
+    struct pty_session *session = find_session(pty_id);
+    return session && session->devpts;
+}
+
+/** @brief Publish one instance-local binding for a retained live session.
+ * @param pty_id Stable internal ID.
+ * @param number Public index.
+ * @param binding Borrowed inode retained until callback delivery.
+ * @param hangup One-shot unlink callback invoked under execution ownership.
+ * @return Zero or negative EINVAL/EBUSY. No ownership transfers on failure. */
+int pty_bind_devpts(uint32_t pty_id, uint32_t number, void *binding,
+                   void (*hangup)(void *binding))
+{
+    struct pty_session *session = find_session(pty_id);
+    if (!session || session->hungup || session->console || !binding || !hangup)
+        return -EINVAL;
+    if (session->devpts) return -EBUSY;
+    session->devpts = true;
+    session->public_number = number;
+    session->devpts_binding = binding;
+    session->devpts_hangup = hangup;
+    return 0;
 }
 
 /** @brief Resolve one of the six fixed Linux virtual consoles.
@@ -362,6 +405,10 @@ void pty_transfer_put(uint32_t pty_id, uint32_t endpoint)
  * The session is not freed while slave descriptors remain open. The slave
  * keeps draining buffered input, then reports EOF/POLLHUP and rejects writes
  * with EIO. SIGHUP and SIGCONT are delivered to the controlling session leader.
+ * Devpts bindings are unlinked once before the final session reap.
+ * @param owner_pid Legacy owner of the session.
+ * @param pty_id Stable internal session ID.
+ * @return Zero or negative EINVAL. Requires execution ownership.
  */
 int pty_destroy(uint32_t owner_pid, uint32_t pty_id)
 {
@@ -389,6 +436,11 @@ int pty_destroy(uint32_t owner_pid, uint32_t pty_id)
         sched_signal_user_process(sid, 18);
     }
     kernel_poll_readiness_notify();
+    void *binding = session->devpts_binding;
+    void (*hangup)(void *) = session->devpts_hangup;
+    session->devpts_binding = NULL;
+    session->devpts_hangup = NULL;
+    if (hangup) hangup(binding);
     pty_reap_hungup(pty_id);
     return 0;
 }

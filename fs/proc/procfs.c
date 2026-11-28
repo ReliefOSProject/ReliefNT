@@ -234,7 +234,7 @@ static int proc_oom_key(const char *name, struct task **task)
  * @param buffer Writable kernel buffer, always NUL-terminated on return.
  * @param capacity Nonzero byte capacity of buffer.
  * @return Zero with the file content in buffer, or negative ENOENT for paths
- * this generator does not own.
+ * this generator does not own. The filesystem list includes devpts.
  */
 static int proc_fill_content(const char *path, char *buffer, uint32_t capacity)
 {
@@ -280,7 +280,7 @@ static int proc_fill_content(const char *path, char *buffer, uint32_t capacity)
 #ifdef CONFIG_SQUASHFS
         proc_append_text(buffer, &pos, capacity, "\tsquashfs\n");
 #endif
-        proc_append_text(buffer, &pos, capacity, "nodev\tproc\nnodev\tdevfs\nnodev\tdevtmpfs\nnodev\tsysfs\nnodev\ttmpfs\n");
+        proc_append_text(buffer, &pos, capacity, "nodev\tproc\nnodev\tdevfs\nnodev\tdevtmpfs\nnodev\tdevpts\nnodev\tsysfs\nnodev\ttmpfs\n");
         return 0;
     }
     if (proc_text_eq(path, "/proc/asound/cards")) {
@@ -746,6 +746,7 @@ int proc_mount_magic_target(const char *name,struct vfs_path *out)
  * Legacy private uid/role fields belong in status rather than Linux stat positions.
  * @param task Borrowed live target. @param s Required output stream.
  * @param process Sum CPU times across the group; false selects a thread.
+ * Controlling devpts terminals encode their instance-local public number.
  * Execution ownership protects task/VMA metadata; CPU counters use their lock.
  */
 static void proc_task_stat(struct task *task, struct text_stream *s, bool process)
@@ -760,8 +761,12 @@ static void proc_task_stat(struct task *task, struct text_stream *s, bool proces
         }
     }
     uint32_t foreground = 0;
-    if (task->controlling_pty_id && pty_get_foreground_pgid(task->controlling_pty_id, &foreground) == 0)
-        values[7] = (136u << 8) | (task->controlling_pty_id - 1);
+    if (task->controlling_pty_id && pty_get_foreground_pgid(task->controlling_pty_id, &foreground) == 0) {
+        uint32_t vt = pty_vt_number(task->controlling_pty_id);
+        uint32_t number = pty_number(task->controlling_pty_id);
+        values[7] = vt ? (4u << 8) | vt : (136u << 8) |
+            (number & 255u) | ((uint64_t)(number & ~255u) << 12);
+    }
     values[4] = task->parent_pid;
     values[5] = task->process_group;
     values[6] = task->process_session;

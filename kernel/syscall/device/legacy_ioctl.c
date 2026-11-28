@@ -318,6 +318,7 @@ blit_out:
  * @param a5 Sixth native ABI argument.
  * @return Original result, negative errno, or internal blocking/retry status.
  * @note The caller retains the kernel execution transaction and descriptor pins.
+ * TIOCGPTN returns the master session's instance-local devpts index.
  */
 int64_t syscall_legacy_ioctl(uint64_t number, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
 {
@@ -747,7 +748,7 @@ int64_t syscall_legacy_ioctl(uint64_t number, uint64_t a0, uint64_t a1, uint64_t
             if (!endpoint || endpoint->endpoint != TASK_PTY_ENDPOINT_MASTER) return -RELIEFOS_EINVAL;
             IOCTL_PREPARE(a2, sizeof(uint32_t), true, -RELIEFOS_EINVAL);
             if (!user_range_writable(a2, sizeof(uint32_t))) return -RELIEFOS_EINVAL;
-            *(uint32_t *)(uintptr_t)a2 = pty_id;
+            *(uint32_t *)(uintptr_t)a2 = pty_number(pty_id);
             return 0;
         }
         if (a1 == TIOCSPTLCK) {

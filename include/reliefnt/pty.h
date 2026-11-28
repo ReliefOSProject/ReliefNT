@@ -18,6 +18,23 @@ int pty_lookup_path(const char *path, struct storage_node *node);
  * @return Zero if resolved or negative ENOENT. */
 int pty_lookup_vt_path(const char *path, struct storage_node *node);
 int pty_get_node(uint32_t pty_id, struct storage_node *node);
+/** @brief Read the userspace PTY number under execution ownership.
+ * @param pty_id Stable internal session ID.
+ * @return Instance-local index for devpts, internal ID for legacy PTYs. */
+uint32_t pty_number(uint32_t pty_id);
+/** @brief Test whether a session belongs to a devpts instance.
+ * @param pty_id Stable internal session ID.
+ * @return Nonzero for a bound devpts session, including after hangup. */
+int pty_is_devpts(uint32_t pty_id);
+/** @brief Bind a live PTY to one devpts inode under execution ownership.
+ * @param pty_id Stable internal session ID, retained by the caller.
+ * @param number Zero-based public index within the instance.
+ * @param binding Borrowed inode kept alive until hangup callback delivery.
+ * @param hangup One-shot callback which consumes the binding's publication pin.
+ * @return Zero, negative EINVAL for invalid input, or EBUSY if already bound. */
+int pty_bind_devpts(uint32_t pty_id, uint32_t number, void *binding,
+                   void (*hangup)(void *binding));
+
 int pty_inode_permissions(const struct storage_node *node,
                            struct reliefos_permissions *value, bool write);
 

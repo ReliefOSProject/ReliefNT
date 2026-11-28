@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: Apache-2.0 */
+#include <reliefnt/devpts.h>
 #include "../internal.h"
 #include <reliefnt/devfs.h>
 #include <reliefnt/procfs.h>
@@ -94,11 +95,11 @@ static int mount_remount(struct vfs_namespace *ns,struct task *task,uint64_t tar
 
 /** @brief Construct one supported backend without publishing a pathname alias.
  * @param ns Borrowed execution-owned namespace for block-source resolution.
- * @param task Authorized caller whose fsuid/fsgid own a new tmpfs root.
+ * @param task Authorized caller whose fsuid/fsgid own a new tmpfs/devpts root.
  * @param source Copied kernel source label; its user pointer is passed separately.
  * @param source_user Original user source pathname for a disk filesystem.
  * @param type Copied filesystem type, empty for existing native detection.
- * @param options Copied tmpfs, FAT ownership, or ext3 ordered-mode options.
+ * @param options Copied tmpfs/devpts, FAT ownership, or ext3 ordered-mode options.
  * @param flags Final mount policy without operation bits.
  * @param out Receives one owned detached mount, empty on failure.
  * @return Zero or unsupported/device/lookup/provider errno. Source resolution
@@ -108,6 +109,7 @@ static int mount_remount(struct vfs_namespace *ns,struct task *task,uint64_t tar
 static int mount_backend(struct vfs_namespace *ns,struct task *task,const char *source,uint64_t source_user,
                              const char *type,const char *options,uint64_t flags,struct vfs_mount **out)
 {
+    if(!__builtin_strcmp(type,"devpts"))return devpts_create_vfs_mount(source,flags,options,task->fsuid,task->fsgid,out);
     if(!__builtin_strcmp(type,"devtmpfs"))return devtmpfs_create_vfs_mount(source,flags,options,out);
     if(!__builtin_strcmp(type,"tmpfs"))return storage_new_tmpfs_mount(source,flags,options,task->fsuid,task->fsgid,out);
     /* The ext3 engine always uses ordered metadata transactions. Consume only

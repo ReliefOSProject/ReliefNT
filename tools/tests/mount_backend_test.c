@@ -6,6 +6,7 @@
 #define RELIEFNT_FIXTURE_ISO_READER
 #define RELIEFNT_FIXTURE_SECTOR_STATS
 #define RELIEFNT_FIXTURE_REAL_DAC
+#define RELIEFNT_FIXTURE_REAL_PTY
 #define RELIEFNT_FIXTURE_PTY_METADATA
 #define RELIEFNT_FIXTURE_UNMAPPED_TRUNCATE
 #define RELIEFNT_FIXTURE_SEPARATE_JOURNAL
@@ -25,6 +26,9 @@ int kernel_signal_queue_task(struct task *task,int signal_number)
 #include <reliefnt/exec_file.h>
 #include <reliefnt/module.h>
 #include <reliefnt/devfs.h>
+#include <reliefnt/devpts.h>
+#include <reliefnt/pty.h>
+#include <reliefnt/console.h>
 #include <reliefnt/permissions.h>
 #include <reliefnt/procfs.h>
 #include <reliefnt/inventory.h>
@@ -178,8 +182,76 @@ void sched_truncate_file_mappings(const struct storage_node *node,uint64_t size)
     assert(node && (node->flags&STORAGE_NODE_FLAG_TMPFS) && size<=INT64_MAX);
     ++unmapped_truncate_notifications;
 }
-int pty_inode_permissions(const struct storage_node *node,struct reliefos_permissions *value,bool write)
-{(void)node;(void)value;(void)write;return -EOPNOTSUPP;}
+/* PTYs use the production core and descriptors. This fixture has one actor,
+ * no asynchronous console hardware and no other scheduler terminal owners. */
+static struct task *devpts_actor;
+bool console_vga_text_mode;
+/** @brief Reject an unexpected blocked scheduler actor in the synchronous fixture.
+ * @param task Unexpected waiter. */
+void sched_wake_interruptible(struct task *task) { (void)task; abort(); }
+const struct framebuffer *framebuffer_get(void) { return NULL; }
+void kernel_spin_init(struct kernel_spinlock *lock) { lock->state = 0; }
+void console_vt_write(uint32_t number, const char *text, size_t count)
+{ (void)number; (void)text; (void)count; }
+struct task *sched_find(uint32_t pid)
+{ return devpts_actor && devpts_actor->pid == pid ? devpts_actor : NULL; }
+uint32_t sched_pty_reference_count(uint32_t id) { return pty_transfer_count(id, 0); }
+uint32_t sched_pty_master_reference_count(uint32_t id) { return pty_transfer_count(id, 1); }
+int sched_hangup_user_tasks_for_pty(uint32_t id, uint32_t owner)
+{ (void)id; (void)owner; return 0; }
+int sched_signal_kernel_group(uint32_t group, int signal)
+{ (void)group; (void)signal; return 0; }
+int sched_signal_user_process(uint32_t pid, int signal)
+{ (void)pid; (void)signal; return 0; }
+int sched_process_group_orphaned(uint32_t group) { (void)group; return 0; }
+void sched_set_controlling_pty(uint32_t pid, uint32_t id)
+{ assert(devpts_actor && devpts_actor->pid == pid); devpts_actor->controlling_pty_id = id; }
+void task_epoll_remove_pty_description(struct task_pty_description *description)
+{ (void)description; }
+/** @brief Clear the fixture actor's controlling-terminal identity on hangup.
+ * @param id Internal session being detached. */
+void sched_clear_controlling_pty(uint32_t id)
+{ if (devpts_actor && devpts_actor->controlling_pty_id == id) devpts_actor->controlling_pty_id = 0; }
+struct reliefos_flock_entry reliefos_flocks[RELIEFOS_FLOCK_MAX];
+/** @brief Model the empty advisory-lock and epoll registries in this fixture.
+ * @param owner Borrowed open description with no registered watches or locks. */
+void syscall_flock_release_owner(struct task_file *owner) { (void)owner; }
+/** @brief Observe close against an empty record-lock registry.
+ * @param task Borrowed actor. @param descriptor Borrowed descriptor. */
+void syscall_record_locks_close(struct task *task, struct task_file *descriptor)
+{ (void)task; (void)descriptor; }
+/** @brief Retire an unwatched description in this fixture.
+ * @param description Borrowed open description. */
+void task_epoll_remove_file_description(struct task_file *description) { (void)description; }
+/** @brief Reject use of an unmodelled epoll object.
+ * @param epoll Unexpected owned object. */
+void task_epoll_destroy(struct task_epoll *epoll) { (void)epoll; abort(); }
+/** @brief Reject use of an unmodelled pidfd identity.
+ * @param identity Unexpected owned identity. */
+void sched_task_pidfd_put(struct task_identity *identity) { (void)identity; abort(); }
+/** @brief Reject release of an unmodelled input grab.
+ * @param kind Unexpected device kind. @param token Unexpected grab identity. */
+void input_evdev_release(uint32_t kind, uint64_t token) { (void)kind; (void)token; abort(); }
+/** @brief Check that generic close has no pipe resource to release.
+ * @param file Borrowed fixture description. */
+void task_pipe_release(struct task_file *file) { assert(!(file->flags & TASK_FILE_FLAG_PIPE)); }
+/** @brief Check that generic close has no Unix socket resource to release.
+ * @param file Borrowed fixture description. */
+void task_socket_release(struct task_file *file) { assert(!(file->flags & TASK_FILE_FLAG_SOCKET_UNIX)); }
+/** @brief Check that generic close has no Internet socket resource to release.
+ * @param file Borrowed fixture description. */
+void task_inet_release(struct task_file *file) { assert(!(file->flags & TASK_FILE_FLAG_SOCKET_INET)); }
+/** @brief Check that generic close has no shared-memory device to release.
+ * @param file Borrowed fixture description. */
+void task_shm_release(struct task_file *file) { assert(!task_device_is(file, STORAGE_DEV_KIND_SHM)); }
+/** @brief Model the empty queued-socket collector. */
+void task_socket_collect(void) {}
+/* The device entry point must route these tests to a real PTY endpoint. */
+int task_shm_attach(struct task_file *file, uint32_t size)
+{ (void)file; (void)size; abort(); }
+uint64_t input_evdev_cursor_now(void) { abort(); }
+uint32_t task_evdev_vt_hint(const struct task *task) { (void)task; abort(); }
+
 static uint64_t filesystem_sector_reads;
 static uintptr_t lookup_user_base;
 static size_t lookup_user_bytes;
@@ -2404,6 +2476,206 @@ static void devtmpfs_mount_syscalls(struct vfs_namespace *ns,const struct vfs_pa
     puts("PASS devtmpfs mount syscall: shared writable device inodes, metadata, fd symlinks and independent mount policy");
 }
 
+/** @brief Exercise mounted PTYs through the actual device-open/FD lifecycle.
+ * @param ns Real fixture namespace. @param root Its retained root path.
+ * @param fs Tmpfs hosting the mountpoints. No asynchronous hardware is used. */
+static void devpts_mount_syscalls(struct vfs_namespace *ns, const struct vfs_path *root,
+                                  struct tmpfs_super *fs)
+{
+    const char *invalid[] = {"uid=", "uid=-1", "gid=4294967295", "mode=08",
+        "ptmxmode=10000", "max=1048577", "max=-1", "newinstance=1", "unknown=1"};
+    struct vfs_mount *detached = NULL;
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        assert(devpts_create_vfs_mount(NULL, 0, invalid[i], 0, 0, &detached) == -EINVAL);
+        assert(!detached);
+    }
+    bool created = false;
+    for (int budget = 0; budget < 20; ++budget) {
+        test_fail_heap_after = budget;
+        int rc = devpts_create_vfs_mount(NULL, 0, NULL, 0, 0, &detached);
+        test_fail_heap_after = -1;
+        if (!rc) {
+            vfs_mount_put(detached);
+            created = true;
+            break;
+        }
+        assert(rc == -ENOMEM && !detached);
+    }
+    assert(created);
+    assert(!tmpfs_create(fs, "/pts-one", LINUX_S_IFDIR | 0755, NULL, NULL));
+    assert(!tmpfs_create(fs, "/pts-two", LINUX_S_IFDIR | 0755, NULL, NULL));
+    assert(!tmpfs_create(fs, "/ptys", LINUX_S_IFDIR | 0755, NULL, NULL));
+    assert(!tmpfs_create(fs, "/ptys/pts", LINUX_S_IFDIR | 0755, NULL, NULL));
+    struct storage_node directory;
+    struct reliefos_permissions device_mode = {0666, 1000, 1000};
+    assert(!tmpfs_lookup(fs, "/ptys", &directory));
+    assert(!tmpfs_mknod_child(fs, directory.first_cluster, "ptmx", LINUX_S_IFCHR | 0666,
+        0x502, &device_mode, NULL));
+    assert(!tmpfs_mknod_child(fs, directory.first_cluster, "copied-slave", LINUX_S_IFCHR | 0666,
+        136u << 8, &device_mode, NULL));
+    assert(!tmpfs_create(fs, "/ptys/link", LINUX_S_IFLNK | 0777, "pts/ptmx", NULL));
+    struct task actor = {.pid = 903, .fsuid = 1000, .fsgid = 1000,
+        .cap_effective = 1ULL << CAP_SYS_ADMIN};
+    devpts_actor = &actor;
+    sched_task_limits(&actor)->nofile.rlim_cur = 64;
+    vfs_path_get(root, &actor.fs_paths.root);
+    vfs_path_get(root, &actor.fs_paths.cwd);
+    struct { char source[16], target[32], type[16], options[96]; } user = {
+        "devpts", "/pts-one", "devpts", "newinstance,uid=123,gid=456,mode=0620,ptmxmode=0666,max=2"};
+    lookup_user_base = (uintptr_t)&user;
+    lookup_user_bytes = sizeof(user);
+    assert(!scoped_mount_call(ns, &actor, LINUX_SYS_MOUNT, (uintptr_t)user.source,
+        (uintptr_t)user.target, (uintptr_t)user.type, MS_NOSUID, (uintptr_t)user.options));
+    struct vfs_path one = {0}, two = {0}, first = {0}, second = {0}, slave = {0};
+    assert(!vfs_path_lookup(ns, root, root, "/pts-one/ptmx", 0, &one));
+    strcpy(user.target, "/pts-two");
+    assert(!scoped_mount_call(ns, &actor, LINUX_SYS_MOUNT, (uintptr_t)user.source,
+        (uintptr_t)user.target, (uintptr_t)user.type, 0, 0));
+    assert(!vfs_path_lookup(ns, root, root, "/pts-two/ptmx", 0, &two));
+    struct linux_stat_abi status, other;
+    assert(!vfs_path_stat(&one, &status) && (status.st_mode & 0777) == 0666);
+    assert(!vfs_path_stat(&two, &other) && (other.st_mode & 0777) == 0);
+    assert(status.st_rdev == 0x502 && other.st_rdev == 0x502 && status.st_dev != other.st_dev);
+    int master = task_open_device_path(&actor, &one, LINUX_O_RDWR | LINUX_O_NOCTTY, NULL);
+    assert(master >= 0);
+    uint32_t id = task_pty_fd_for_fd(&actor, master)->pty_id;
+    assert(pty_is_devpts(id) && pty_number(id) == 0);
+    assert(vfs_path_equal(&task_pty_fd_for_fd(&actor, master)->description->path_ref, &one));
+    int another = task_open_device_path(&actor, &two, LINUX_O_RDWR | LINUX_O_NOCTTY, NULL);
+    assert(another >= 0);
+    uint32_t other_id = task_pty_fd_for_fd(&actor, another)->pty_id;
+    assert(id != other_id && pty_number(other_id) == 0);
+    assert(!vfs_path_lookup(ns, root, root, "/pts-one/0", 0, &first));
+    assert(!vfs_path_lookup(ns, root, root, "/pts-two/0", 0, &second));
+    assert(!vfs_path_stat(&first, &status) && status.st_uid == 123 && status.st_gid == 456);
+    assert((status.st_mode & 0777) == 0620);
+    assert(!vfs_path_stat(&second, &other) && other.st_uid == 1000 && other.st_gid == 1000);
+    assert(status.st_rdev == other.st_rdev && status.st_dev != other.st_dev);
+    assert(task_open_device_path(&actor, &first, LINUX_O_RDWR | LINUX_O_NOCTTY, NULL) == -EIO);
+    assert(!pty_set_lock(id, 0) && !pty_set_lock(other_id, 0));
+    int fd = task_open_device_path(&actor, &first, LINUX_O_RDWR | LINUX_O_NOCTTY, NULL);
+    assert(fd >= 0 && task_pty_fd_for_fd(&actor, fd)->pty_id == id);
+    int other_fd = task_open_device_path(&actor, &second, LINUX_O_RDWR | LINUX_O_NOCTTY, NULL);
+    assert(other_fd >= 0 && task_pty_fd_for_fd(&actor, other_fd)->pty_id == other_id);
+    assert(pty_write_input(actor.pid, id, "one\n", 4) == 4);
+    char input[8] = {0};
+    assert(pty_read_input(other_id, input, sizeof(input)) == -EAGAIN);
+    assert(pty_read_input(id, input, sizeof(input)) == 4 && !memcmp(input, "one\n", 4));
+    assert(!vfs_path_lookup(ns, root, root, "/pts-one", 0, &slave));
+    struct vfs_path target = {0}, bound = {0};
+    assert(!vfs_path_lookup(ns, root, root, "/ptys/pts", 0, &target));
+    assert(!vfs_mount_bind(ns, &slave, &target));
+    vfs_path_put(&target);
+    assert(!vfs_path_lookup(ns, root, root, "/ptys/pts/0", 0, &bound));
+    uint32_t bound_id = 0;
+    assert(!devpts_slave_pty(&bound, &bound_id) && bound_id == id);
+    vfs_path_put(&bound);
+    const char *multiplexors[] = {"/ptys/ptmx", "/ptys/link"};
+    for (size_t i = 0; i < sizeof(multiplexors) / sizeof(multiplexors[0]); ++i) {
+        assert(!vfs_path_lookup(ns, root, root, multiplexors[i], VFS_LOOKUP_FOLLOW, &bound));
+        int alias = task_open_device_path(&actor, &bound, LINUX_O_RDWR, NULL);
+        assert(alias >= 0);
+        struct task_pty_fd *endpoint = task_pty_fd_for_fd(&actor, alias);
+        assert(pty_number(endpoint->pty_id) == 1 && pty_is_devpts(endpoint->pty_id));
+        assert(vfs_path_context(&endpoint->description->path_ref) == vfs_path_context(&one));
+        task_pty_release_entry(endpoint);
+        vfs_path_put(&bound);
+    }
+    assert(!vfs_path_lookup(ns, root, root, "/ptys/copied-slave", 0, &bound));
+    assert(task_open_device_path(&actor, &bound, LINUX_O_RDWR, NULL) == -ENXIO);
+    vfs_path_put(&bound);
+    assert(!vfs_path_lookup(ns, root, root, "/ptys/pts", 0, &target));
+    assert(!vfs_mount_unmount(ns, &target));
+    vfs_path_put(&target);
+    vfs_path_put(&slave);
+    /* Failed option parsing preserves policy and metadata. Remount defaults
+     * apply to new slaves, while existing slave owners and modes survive. */
+    assert(!vfs_path_lookup(ns, root, root, "/pts-one", 0, &target));
+    assert(vfs_path_remount_options(&target, MS_NODEV, "ptmxmode=0600,unknown=1") == -EINVAL);
+    assert(!(vfs_path_mount_flags(&one) & MS_NODEV));
+    assert(!vfs_path_stat(&one, &status) && (status.st_mode & 07777) == 0666);
+    assert(!vfs_path_remount_options(&target, MS_NODEV, ",mode=06720,ptmxmode=01666,max=2,"));
+    assert(!vfs_path_stat(&one, &status) && (status.st_mode & 07777) == 01666);
+    assert(task_open_device_path(&actor, &one, LINUX_O_RDWR, NULL) == -EACCES);
+    assert(task_open_device_path(&actor, &first, LINUX_O_RDWR, NULL) == -EACCES);
+    assert(!vfs_path_remount_options(&target, MS_NOSUID, NULL));
+    assert(!vfs_path_stat(&one, &status) && (status.st_mode & 07777) == 0);
+    int defaults = task_open_device_path(&actor, &one, LINUX_O_RDWR, NULL);
+    assert(defaults >= 0);
+    assert(!vfs_path_lookup(ns, root, root, "/pts-one/1", 0, &slave));
+    assert(!vfs_path_stat(&slave, &status) && (status.st_mode & 07777) == 0600);
+    assert(status.st_uid == actor.fsuid && status.st_gid == actor.fsgid);
+    task_pty_release_entry(task_pty_fd_for_fd(&actor, defaults));
+    vfs_path_put(&slave);
+    assert(!vfs_path_stat(&first, &status) && (status.st_mode & 07777) == 0620);
+    assert(status.st_uid == 123 && status.st_gid == 456);
+    assert(!vfs_path_remount_options(&target, MS_NOSUID,
+        "uid=123,gid=456,mode=0620,ptmxmode=0666,max=2"));
+    vfs_path_put(&target);
+    bool opened = false;
+    for (int budget = 0; budget < 20; ++budget) {
+        test_fail_heap_after = budget;
+        int rc = task_open_device_path(&actor, &one, LINUX_O_RDWR, NULL);
+        test_fail_heap_after = -1;
+        if (rc >= 0) {
+            assert(pty_number(task_pty_fd_for_fd(&actor, rc)->pty_id) == 1);
+            task_pty_release_entry(task_pty_fd_for_fd(&actor, rc));
+            opened = true;
+            break;
+        }
+        assert(rc == -ENOMEM);
+        assert(vfs_path_lookup(ns, root, root, "/pts-one/1", 0, &slave) == -ENOENT);
+    }
+    assert(opened);
+    /* A failed FD reservation must retire the new name and instance quota. */
+    sched_task_limits(&actor)->nofile.rlim_cur = 0;
+    assert(task_open_device_path(&actor, &one, LINUX_O_RDWR, NULL) == -EMFILE);
+    sched_task_limits(&actor)->nofile.rlim_cur = 64;
+    assert(vfs_path_lookup(ns, root, root, "/pts-one/1", 0, &slave) == -ENOENT);
+    int extra = task_open_device_path(&actor, &one, LINUX_O_RDWR, NULL);
+    assert(extra >= 0 && pty_number(task_pty_fd_for_fd(&actor, extra)->pty_id) == 1);
+    assert(task_open_device_path(&actor, &one, LINUX_O_RDWR, NULL) == -ENOSPC);
+    task_pty_release_entry(task_pty_fd_for_fd(&actor, extra));
+    task_pty_release_entry(task_pty_fd_for_fd(&actor, master));
+    assert(vfs_path_lookup(ns, root, root, "/pts-one/0", 0, &slave) == -ENOENT);
+    assert(task_open_device_path(&actor, &first, LINUX_O_RDWR, NULL) == -EIO);
+    assert(!vfs_path_stat(&first, &status) && status.st_nlink == 0);
+    assert(pty_read_input(id, input, sizeof(input)) == 0);
+    extra = task_open_device_path(&actor, &one, LINUX_O_RDWR, NULL);
+    assert(extra >= 0 && pty_number(task_pty_fd_for_fd(&actor, extra)->pty_id) == 1);
+    task_pty_release_entry(task_pty_fd_for_fd(&actor, extra));
+    task_pty_release_entry(task_pty_fd_for_fd(&actor, fd));
+    uint64_t old_ino = status.st_ino;
+    /* A retained inode alone must allow index/quota reuse after endpoints close. */
+    extra = task_open_device_path(&actor, &one, LINUX_O_RDWR, NULL);
+    assert(extra >= 0 && pty_number(task_pty_fd_for_fd(&actor, extra)->pty_id) == 0);
+    assert(!vfs_path_lookup(ns, root, root, "/pts-one/0", 0, &slave));
+    assert(!vfs_path_stat(&slave, &status) && status.st_ino != old_ino);
+    assert(task_open_device_path(&actor, &first, LINUX_O_RDWR, NULL) == -EIO);
+    task_pty_release_entry(task_pty_fd_for_fd(&actor, extra));
+    vfs_path_put(&slave);
+    vfs_path_put(&first);
+    /* Ordinary unmount stays busy while endpoints or inode paths are retained. */
+    assert(!vfs_path_lookup(ns, root, root, "/pts-two", 0, &target));
+    assert(vfs_mount_unmount(ns, &target) == -EBUSY);
+    task_pty_release_entry(task_pty_fd_for_fd(&actor, another));
+    task_pty_release_entry(task_pty_fd_for_fd(&actor, other_fd));
+    vfs_path_put(&second);
+    vfs_path_put(&two);
+    assert(!vfs_mount_unmount(ns, &target));
+    vfs_path_put(&target);
+    vfs_path_put(&one);
+    assert(!vfs_path_lookup(ns, root, root, "/pts-one", 0, &target));
+    assert(!vfs_mount_unmount(ns, &target));
+    vfs_path_put(&target);
+    vfs_path_put(&actor.fs_paths.root);
+    vfs_path_put(&actor.fs_paths.cwd);
+    sched_task_pty_release(&actor);
+    lookup_user_base = lookup_user_bytes = 0;
+    devpts_actor = NULL;
+    puts("PASS devpts: independent zero-based indices, metadata, exact device opens, bind identity, max, FD rollback, hangup and reuse");
+}
+
 static void runtime_mount_syscalls(struct vfs_namespace *ns,const struct vfs_path *root,struct tmpfs_super *fs)
 {
     assert(!tmpfs_create(fs,"/syscall-source",LINUX_S_IFDIR|0755,NULL,NULL));
@@ -2658,6 +2930,7 @@ int main(int argc,char **argv)
     assert(!vfs_namespace_init(&ns,mount));vfs_mount_put(mount);
     assert(!vfs_namespace_root(&ns,&root));
     devtmpfs_mount_syscalls(&ns,&root,fs);
+    devpts_mount_syscalls(&ns,&root,fs);
     vfs_path_put(&root);
     assert(!vfs_namespace_destroy(&ns) && !storage_inode_volume_busy(0));
     tmpfs_destroy(fs);g_volumes[0]=(struct storage_volume){0};

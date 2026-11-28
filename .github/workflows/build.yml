@@ -50,6 +50,10 @@ jobs:
             libncurses-dev \
             gzip \
             squashfs-tools \
+            e2fsprogs \
+            dosfstools \
+            exfatprogs \
+            xorriso \
             curl \
             python3
 

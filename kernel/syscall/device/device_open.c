@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "../internal.h"
 #include <reliefnt/devfs.h>
+#include <reliefnt/devpts.h>
 
 /** @brief Bind a newly created PTY description to its held device path.
  * @param task Current fd-table owner under execution ownership.
@@ -18,13 +19,46 @@ static int device_pty_path(struct task *task,int fd,const struct vfs_path *path)
     return fd;
 }
 
+/** @brief Allocate a master from the actual multiplexor's devpts instance.
+ * @param task Borrowed descriptor-table owner under execution ownership.
+ * @param path Borrowed authorized ptmx inode, including legacy 5:2 devices.
+ * @param flags Sanitized open flags.
+ * @return Descriptor or negative errno with session and path rollback.
+ * A legacy inode selects its sibling pts mount. An absent devpts sibling keeps
+ * the existing bootstrap PTY behavior until the runtime mounts devpts.
+ */
+static int device_ptmx_open(struct task *task, const struct vfs_path *path, uint32_t flags)
+{
+    struct vfs_path ptmx = {0};
+    int rc = devpts_resolve_ptmx(path, &sched_task_paths(task)->root, &ptmx);
+    uint32_t id = 0;
+    if (!rc) {
+        rc = devpts_new_pty(&ptmx, task->pid, task->fsuid, task->fsgid, &id);
+    } else if (!(vfs_path_node(path)->flags & STORAGE_NODE_FLAG_DEVPTS) &&
+               (rc == -RELIEFOS_ENOENT || rc == -RELIEFOS_ENODEV)) {
+        int32_t legacy = pty_create(task->pid);
+        rc = legacy < 0 ? legacy : 0;
+        if (!rc) id = (uint32_t)legacy;
+    }
+    if (rc) {
+        vfs_path_put(&ptmx);
+        return rc;
+    }
+    int fd = task_pty_endpoint_fd(task, id, TASK_PTY_ENDPOINT_MASTER, flags);
+    if (fd < 0) (void)pty_destroy(task->pid, id);
+    else device_pty_path(task, fd, ptmx.mount ? &ptmx : path);
+    vfs_path_put(&ptmx);
+    return fd;
+}
+
 /** @brief Open an already authorized character/block device by inode identity.
  * @param task Current task, borrowed under execution ownership.
  * @param path Borrowed held device path, retained before driver callbacks.
  * @param flags Sanitized status/descriptor flags; O_PATH is handled by caller.
  * @param diagnostic Optional display name, never used for device selection.
  * @return Descriptor or negative errno. PTY/DRM/audio ownership and failure
- * rollback use the existing device lifecycles; no namespace-prefix routing.
+ * rollback use the existing device lifecycles. Devpts slaves resolve through
+ * their held instance/inode identity before global device-number dispatch.
  * No mount/module registry spinlock spans any driver callback or wait.
  */
 int task_open_device_path(struct task *task,const struct vfs_path *path,uint32_t flags,
@@ -34,7 +68,10 @@ int task_open_device_path(struct task *task,const struct vfs_path *path,uint32_t
     if(!node)return -RELIEFOS_EINVAL;
     if(vfs_path_mount_flags(path)&MS_NODEV)return -RELIEFOS_EACCES;
     struct storage_node device;bool native=(node->flags&STORAGE_NODE_FLAG_RDEV)!=0;
-    if(native) {
+    bool devpts = (node->flags & STORAGE_NODE_FLAG_DEVPTS) != 0;
+    if (devpts && !(node->flags & STORAGE_NODE_FLAG_PTY))
+        return device_ptmx_open(task, path, flags);
+    if(native && !devpts) {
         struct linux_stat_abi status;int rc=vfs_path_stat(path,&status);
         if(!rc)rc=devfs_lookup_rdev(status.st_mode&LINUX_S_IFMT,status.st_rdev,&device);
         if(rc)return rc;
@@ -52,21 +89,22 @@ int task_open_device_path(struct task *task,const struct vfs_path *path,uint32_t
         return -RELIEFOS_EBADF;
     }
     if(node->flags&STORAGE_NODE_FLAG_PTY) {
-        int fd=task_pty_endpoint_fd(task,node->first_cluster,TASK_PTY_ENDPOINT_SLAVE,flags);
+        uint32_t id = node->first_cluster;
+        if (devpts) {
+            int rc = devpts_slave_pty(path, &id);
+            if (rc) return rc;
+        }
+        int fd=task_pty_endpoint_fd(task,id,TASK_PTY_ENDPOINT_SLAVE,flags);
         if(fd>=0 && !(flags&LINUX_O_NOCTTY))
-            pty_open_controlling(node->first_cluster,task->pid,(flags&LINUX_O_ACCMODE)!=LINUX_O_WRONLY);
+            pty_open_controlling(id,task->pid,(flags&LINUX_O_ACCMODE)!=LINUX_O_WRONLY);
         return device_pty_path(task,fd,path);
     }
     if(node->first_cluster==STORAGE_DEV_KIND_TTY && (native || (at_root && !__builtin_strcmp(name,"tty")))) {
         if(!task->controlling_pty_id)return -LINUX_ENXIO;
         return device_pty_path(task,task_pty_endpoint_fd(task,task->controlling_pty_id,TASK_PTY_ENDPOINT_SLAVE,flags),path);
     }
-    if(node->first_cluster==STORAGE_DEV_KIND_PTMX) {
-        int32_t id=pty_create(task->pid);if(id<0)return id;
-        int fd=task_pty_endpoint_fd(task,(uint32_t)id,TASK_PTY_ENDPOINT_MASTER,flags);
-        if(fd<0)(void)pty_destroy(task->pid,(uint32_t)id);
-        return device_pty_path(task,fd,path);
-    }
+    if(node->first_cluster==STORAGE_DEV_KIND_PTMX)
+        return device_ptmx_open(task, path, flags);
     if(node->first_cluster==STORAGE_DEV_KIND_DRM_CARD0 && (flags&LINUX_O_EXCL))return -LINUX_EBUSY;
     uint32_t kind=TASK_FILE_FLAG_DEV_NODE;
     if(node->first_cluster==STORAGE_DEV_KIND_NULL)kind|=TASK_FILE_FLAG_DEV_NULL;

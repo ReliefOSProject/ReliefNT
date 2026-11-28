@@ -77,6 +77,35 @@ void console_log(enum console_log_level level, const char *format, ...)
 }
 void console_write_len(const char *text, size_t count) { (void)text; (void)count; }
 
+static unsigned devpts_hangups;
+/** @brief Observe the binding removal after hangup is visible.
+ * @param binding Borrowed counter retained until callback delivery.
+ */
+static void test_devpts_hangup(void *binding)
+{
+    assert(binding == &devpts_hangups);
+    ++devpts_hangups;
+}
+
+/** @brief Exercise public numbering, legacy isolation and one-shot hangup. */
+static void test_devpts_binding(void)
+{
+    pty_init();
+    descriptor_refs = 0;
+    int id = pty_create(owner.pid);
+    assert(id > 0 && pty_number(id) == (uint32_t)id);
+    assert(!pty_transfer_get(id, TASK_PTY_ENDPOINT_MASTER));
+    assert(!pty_bind_devpts(id, 0, &devpts_hangups, test_devpts_hangup));
+    assert(pty_is_devpts(id) && pty_number(id) == 0);
+    assert(pty_bind_devpts(id, 1, &devpts_hangups, test_devpts_hangup) == -LINUX_EBUSY);
+    char name[32];
+    snprintf(name, sizeof(name), "/dev/pts/%u", id);
+    assert(pty_lookup_path(name, NULL) == -LINUX_ENOENT);
+    pty_transfer_put(id, TASK_PTY_ENDPOINT_MASTER);
+    assert(devpts_hangups == 1 && !pty_is_active(id));
+    descriptor_refs = 1;
+}
+
 static void test_queue_boundaries(void)
 {
     char input[PTY_OUTPUT_CAP + 32], output[sizeof(input)];
@@ -556,6 +585,7 @@ int main(void)
         assert(pty_write_output(1, "h\ni", 3) == 3);
         assert(vt_written_len == 4 && !memcmp(vt_written, "h\r\ni", 4));
     }
+    test_devpts_binding();
     test_queue_boundaries();
     test_cooked_echo();
     puts("PASS native PTY modes, OPOST output post-processing, controlling-session isolation and queued-rights lifetime");

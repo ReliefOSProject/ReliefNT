@@ -293,6 +293,8 @@ struct storage_read_cursor {
 /* Native inode carrying st_rdev; first_cluster remains its inode identity. */
 #define STORAGE_NODE_FLAG_RDEV 0x00100000u
 #define STORAGE_NODE_FLAG_SQUASHFS 0x00200000u
+/* Instance-bound devpts inode, resolved before global rdev dispatch. */
+#define STORAGE_NODE_FLAG_DEVPTS 0x00400000u
 #define STORAGE_SYSFS_DEVICE 202u
 #define STORAGE_NODE_FLAG_DEV_LINK 0x00000200u
 /* Anonymous filesystem device numbers, also exported in proc mountinfo. */

@@ -39,6 +39,10 @@ struct pty_session {
     uint32_t foreground_pgid;
     uint32_t transfer_refs;
     uint32_t transfer_masters;
+    bool devpts;
+    uint32_t public_number;
+    void *devpts_binding;
+    void (*devpts_hangup)(void *binding);
     uint8_t input[PTY_INPUT_CAP];
     /* Per-slot canonical line ends; EOF is a delimiter, never a returned byte. */
     uint8_t input_end[PTY_INPUT_CAP];

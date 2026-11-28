@@ -127,7 +127,7 @@ int task_pty_endpoint_fd(struct task *task, uint32_t pty_id,
 }
 
 /**
- * @brief Parse a live numeric devpts path or resolve the active-VT alias.
+ * @brief Parse a live legacy PTY path or resolve the active-VT alias.
  * @param path NUL-terminated endpoint path; NULL is rejected.
  * @param pty_id Writable result for the recognized active PTY identifier.
  * @return One for a recognized live endpoint path, zero for malformed, inactive,
@@ -152,7 +152,7 @@ int task_pty_endpoint_path(const char *path, uint32_t *pty_id)
         value = value * 10u + digit;
         ++path; ++digits;
     }
-    if (!digits || *path || !value || !pty_is_active(value)) return 0;
+    if (!digits || *path || !value || !pty_is_active(value) || pty_is_devpts(value)) return 0;
     *pty_id = value;
     return 1;
 }
