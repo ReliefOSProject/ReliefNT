@@ -8,6 +8,7 @@
 /* Model the kernel direct map with host pointers to the destination pages. */
 #undef RELIEFNT_KERNEL_DIRECT_MAP_BASE
 #define RELIEFNT_KERNEL_DIRECT_MAP_BASE 0
+#include "signal_arch_fixture.h"
 #include "../../kernel/signal/signal.c"
 #include "../../kernel/signal/signal_queue.c"
 #include "../../kernel/exec/usercopy_task.c"
@@ -98,7 +99,8 @@ static unsigned demand_faults;
 static unsigned drained_io;
 static uint64_t clock_ticks = 100;
 static unsigned fpu_restore_calls;
-static uint8_t restored_fpu_state[512];
+static uint8_t restored_fpu_state[RELIEFNT_FPU_STATE_MAX_SIZE];
+uint32_t smp_current_cpu(void) { return 0; }
 void power_reboot(void) { abort(); }
 void power_shutdown(void) { abort(); }
 void storage_drain_task_io(uint32_t pid) {
@@ -244,6 +246,85 @@ uint64_t address_space_user_page_phys(const struct address_space *as, uint64_t v
     assert(vaddr >= STACK_ADDRESS && vaddr < STACK_ADDRESS + sizeof(target_pages));
     translated_pages |= 1u << ((vaddr - STACK_ADDRESS) / 4096);
     return (uintptr_t)target_pages + ((vaddr - STACK_ADDRESS) & ~4095ULL);
+}
+
+/** @brief Exercise Linux legacy and extended signal FPU frame contracts. */
+static void check_xstate_signal_frames(uint8_t *user_stack)
+{
+    fixture_fpu_size = 832;
+    fixture_xstate_mask = 7;
+    uint8_t *state = sched_task_fpu_state(&target);
+    memset(state, 0x5a, RELIEFNT_FPU_STATE_MAX_SIZE);
+    uint64_t present = 3;
+    uint32_t mxcsr = 0x1f80;
+    memcpy(state + 24, &mxcsr, sizeof(mxcsr));
+    memcpy(state + 512, &present, sizeof(present));
+    struct trap_frame frame = {.rsp = STACK_ADDRESS + sizeof(target_pages),
+        .rip = 0x430000, .cs = 0x23, .ss = 0x1b, .rflags = 0x202};
+    struct kernel_signal_action action = {.handler = 0x410000, .restorer = 0x420000};
+    struct linux_siginfo info = {.signo = 2};
+    assert(!signal_setup_frame(&target, 2, &action, &frame, &info));
+    struct linux_rt_sigframe saved;
+    memcpy(&saved, target_pages + (frame.rsp - STACK_ADDRESS), sizeof(saved));
+    uint8_t *image = target_pages + (saved.uc.context.fpstate - STACK_ADDRESS);
+    assert(saved.uc.flags & 1);
+    for (unsigned i = 576; i < 832; ++i) assert(image[i] == 0);
+    uint32_t magic;
+    memcpy(&magic, image + 832, sizeof(magic));
+    assert(magic == 0x46505845U);
+    memcpy(user_stack, target_pages, sizeof(target_pages));
+    struct linux_rt_sigframe *user_frame = (void *)(uintptr_t)frame.rsp;
+    uint8_t *fp = (void *)(uintptr_t)user_frame->uc.context.fpstate;
+    struct trap_frame returning = frame;
+    returning.rsp += 8;
+    present = 7;
+    memcpy(fp + 512, &present, sizeof(present));
+    memset(fp + 576, 0x8a, 256);
+    struct trap_frame context = returning;
+    assert(!kernel_signal_rt_sigreturn(&target, &context));
+    assert(restored_fpu_state[576] == 0x8a && restored_fpu_state[831] == 0x8a);
+    uint64_t invalid = 1ULL << 63;
+    memcpy(fp + 512, &invalid, sizeof(invalid));
+    context = returning;
+    assert(kernel_signal_rt_sigreturn(&target, &context) == -LINUX_EINVAL);
+    memcpy(fp + 512, &present, sizeof(present));
+    uint32_t invalid_mxcsr = 0x80000000U;
+    memcpy(fp + 24, &invalid_mxcsr, sizeof(invalid_mxcsr));
+    context = returning;
+    assert(kernel_signal_rt_sigreturn(&target, &context) == -LINUX_EINVAL);
+    memcpy(fp + 24, &mxcsr, sizeof(mxcsr));
+
+    /* A shorter valid image initializes AVX without retaining its trailer. */
+    uint32_t shorter = 576, extended = 580;
+    uint64_t features = 3;
+    memcpy(fp + 468, &extended, sizeof(extended));
+    memcpy(fp + 472, &features, sizeof(features));
+    memcpy(fp + 480, &shorter, sizeof(shorter));
+    memcpy(fp + 512, &features, sizeof(features));
+    memcpy(fp + 576, &magic, sizeof(magic));
+    context = returning;
+    assert(!kernel_signal_rt_sigreturn(&target, &context));
+    for (unsigned i = 576; i < 832; ++i) assert(restored_fpu_state[i] == 0);
+
+    /* Legacy frames can end at a mapped page boundary and need only 16-byte alignment. */
+    uint8_t *legacy = user_stack + sizeof(target_pages) - 512;
+    memset(legacy, 0, 512);
+    memcpy(legacy + 24, &mxcsr, sizeof(mxcsr));
+    legacy[160] = 0x19;
+    user_frame->uc.context.fpstate = (uintptr_t)legacy;
+    context = returning;
+    assert(!kernel_signal_rt_sigreturn(&target, &context));
+    assert(restored_fpu_state[160] == 0x19);
+    memcpy(&present, restored_fpu_state + 512, sizeof(present));
+    assert(present == 3 && !restored_fpu_state[576]);
+    user_frame->uc.context.fpstate = 0;
+    context = returning;
+    assert(!kernel_signal_rt_sigreturn(&target, &context));
+    assert(restored_fpu_state[0] == 0x7f && restored_fpu_state[1] == 3);
+    memcpy(&present, restored_fpu_state + 512, sizeof(present));
+    assert(!present && !restored_fpu_state[160]);
+    fixture_fpu_size = 512;
+    fixture_xstate_mask = 0;
 }
 
 int main(void)
@@ -634,9 +715,9 @@ int main(void)
     target.signal_stack_flags = 0;
     target.blocked_signals = 0;
     target.ignored_signals = 0;
-    memset(target.fpu_state, 0x3c, sizeof(target.fpu_state));
+    memset(sched_task_fpu_state(&target), 0x3c, RELIEFNT_FPU_STATE_MAX_SIZE);
     uint32_t mxcsr = 0x1f80;
-    memcpy(target.fpu_state + 24, &mxcsr, sizeof(mxcsr));
+    memcpy(sched_task_fpu_state(&target) + 24, &mxcsr, sizeof(mxcsr));
     frame = (struct trap_frame){
         .r15 = 0x1515151515151515ULL, .r14 = 0x1414141414141414ULL,
         .r13 = 0x1313131313131313ULL, .r12 = 0x1212121212121212ULL,
@@ -697,6 +778,7 @@ int main(void)
            restored_fpu_state[175] == 0x8f);
     memcpy(&mxcsr, restored_fpu_state + 24, sizeof(mxcsr));
     assert(mxcsr == 0x1f80);
+    check_xstate_signal_frames(previous_stack);
     memcpy(previous_stack, previous_stack_backup, sizeof(previous_stack_backup));
 
     /* A synchronous blocked fault must become fatal, not run a blocked handler. */

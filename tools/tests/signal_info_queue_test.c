@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "signal_arch_fixture.h"
 #include "../../kernel/signal/signal.c"
 #include "../../kernel/signal/signal_queue.c"
 #include "../../kernel/syscall/time/time.c"

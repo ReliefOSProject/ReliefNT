@@ -809,7 +809,7 @@ static int time_clock_get_locked(int32_t clock, struct linux_timespec *value)
  */
 int time_clock_get(int32_t clock, struct linux_timespec *value)
 {
-    if (clock == LINUX_CLOCK_PROCESS_CPUTIME_ID ||
+    if (clock < 0 || clock == LINUX_CLOCK_PROCESS_CPUTIME_ID ||
         clock == LINUX_CLOCK_THREAD_CPUTIME_ID)
         return sched_cpu_clock_get(clock, false, value);
     uint64_t flags;
@@ -829,7 +829,7 @@ int time_clock_get(int32_t clock, struct linux_timespec *value)
  */
 int time_clock_getres(int32_t clock, struct linux_timespec *value)
 {
-    if (clock == LINUX_CLOCK_PROCESS_CPUTIME_ID ||
+    if (clock < 0 || clock == LINUX_CLOCK_PROCESS_CPUTIME_ID ||
         clock == LINUX_CLOCK_THREAD_CPUTIME_ID)
         return sched_cpu_clock_get(clock, true, value);
     uint64_t flags;

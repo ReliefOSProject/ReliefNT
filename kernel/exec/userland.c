@@ -885,7 +885,7 @@ retry:
              * queueing is serialized under the execution lock, so the
              * pending check cannot race the delivery. */
             if (sched_task_pending(current) & ~current->blocked_signals) {
-                arch_fpu_save(current->fpu_state);
+                arch_fpu_save(sched_task_fpu_state(current));
                 live_fpu_saved = 1;
                 if (kernel_signal_deliver_pending_outer(current, frame) == SWAP_STORAGE_CONTENDED)
                     sched_sleep_current_until(time_ticks() + 1);
@@ -910,7 +910,7 @@ retry:
              * frame still owns the hardware image. A selection retry has no
              * live frame and must preserve the selected task's saved image. */
             if (!live_fpu_saved && current->state != TASK_EXITED)
-                arch_fpu_save(current->fpu_state);
+                arch_fpu_save(sched_task_fpu_state(current));
             if (current->state != TASK_EXITED && !sched_capture_current_user_frame(frame)) {
                 console_error("[reliefnt] rejected scheduler frame pid=%u rip=0x%llx cs=0x%llx\n",
                                current->pid,
@@ -949,6 +949,9 @@ retry:
         kernel_execution_unlock_irqrestore(execution_flags);
         return NULL;
     }
+    if (sched_rseq_notify(next, &next->frame, smp_current_cpu(),
+                           next->frame.vector != 0x80) < 0)
+        kernel_signal_force_fault(next, 11, LINUX_SI_KERNEL, next->rseq_area);
     if (kernel_signal_deliver_pending_outer(next, &next->frame) == SWAP_STORAGE_CONTENDED)
         sched_sleep_current_until(time_ticks() + 1);
     if (next->state == TASK_EXITED) { frame = NULL; goto retry; }
@@ -987,7 +990,7 @@ retry:
         /* Complete an admitted syscall from this kernel-owned frame. No
          * user instruction can run between the park and the continuation. */
         paging_load_cr3_if_changed(sched_task_cr3(next));
-        arch_fpu_restore(next->fpu_state);
+        arch_fpu_restore(sched_task_fpu_state(next));
         bool complete = syscall_resume_parked(next);
         if (complete && next->state == TASK_RUNNING &&
             kernel_signal_deliver_pending_outer(next, &next->frame) == SWAP_STORAGE_CONTENDED)
@@ -1008,7 +1011,7 @@ retry:
     arch_set_user_fs(next->fs_base);
     /* Even the original task may have run elsewhere while this CPU idled.
      * Only its saved image is authoritative after ownership was released. */
-    arch_fpu_restore(next->fpu_state);
+    arch_fpu_restore(sched_task_fpu_state(next));
     sched_account_mode(false);
     kernel_execution_unlock_irqrestore(execution_flags);
     return next;
@@ -1186,8 +1189,8 @@ static int userland_commit_prepared(struct task *task, struct task *prepared)
     *sched_futex_exit_cursor(task) = (struct futex_exit_cursor){0};
 #endif
     syscall_close_cloexec_files(task);
-    arch_fpu_task_init(task->fpu_state);
-    arch_fpu_restore(task->fpu_state);
+    arch_fpu_task_init(sched_task_fpu_state(task));
+    arch_fpu_restore(sched_task_fpu_state(task));
     console_debug("[reliefnt] exec pid=%u path=%s pty=%u committed cr3=0x%llx\n",
                    task->pid, prepared->path, task->pty_id,
                    (unsigned long long)(*sched_task_as(task)).cr3);

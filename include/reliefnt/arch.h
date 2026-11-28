@@ -30,7 +30,8 @@ void arch_ap_init(uint32_t cpu_index, void *kernel_stack_top);
 void arch_set_user_fs(uint64_t base);
 uint64_t arch_get_user_fs(void);
 /**
- * @brief Enable x87/SSE and capture the default FPU state used for new tasks.
+ * @brief Enable x87/SSE and the supported AVX XSAVE subset, then capture the
+ * default FPU state used for new tasks.
  */
 void arch_fpu_init(void);
 /**
@@ -45,6 +46,19 @@ void arch_fpu_save(void *state);
  * @brief Reload x87/SSE state from a task's save area when switching back to it.
  */
 void arch_fpu_restore(const void *state);
+/**
+ * @brief Return the active user FPU image size.
+ * @return 512 for legacy FXSAVE or 832 for the x87/SSE/AVX XSAVE subset.
+ */
+uint32_t arch_fpu_state_size(void);
+/**
+ * @brief Return the active XSAVE feature mask used for user state.
+ * @return XCR0-compatible mask (zero when the legacy FXSAVE path is active).
+ */
+uint64_t arch_fpu_xstate_mask(void);
+
+/** @brief Return the hardware MXCSR bits permitted in user FPU images. */
+uint32_t arch_fpu_mxcsr_mask(void);
 /** Run a bounded kernel callback on a scheduler-owned alternate ring-0 stack. */
 void arch_call_on_stack(void *stack_top, void (*callback)(void *), void *argument);
 /**

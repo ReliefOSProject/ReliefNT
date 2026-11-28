@@ -320,9 +320,9 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
     child->exit_signal = 0;
     child->clear_child_tid = (flags & CLONE_CHILD_CLEARTID) ? child_tid : 0;
     child->robust_list = 0;
-    child->rseq_area = 0;
-    child->rseq_len = 0;
-    child->rseq_sig = 0;
+    child->rseq_area = (flags & CLONE_VM) ? 0 : parent->rseq_area;
+    child->rseq_len = (flags & CLONE_VM) ? 0 : parent->rseq_len;
+    child->rseq_sig = (flags & CLONE_VM) ? 0 : parent->rseq_sig;
     child->restart_syscall = 0;
     child->nanosleep_deadline = child->nanosleep_remaining = 0;
     child->sigwait_deadline = child->sigwait_mask = 0;
@@ -365,6 +365,10 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
     }
     child->futex_next = NULL;
     child->futex_state = 0;
+    child->futex_pi = false;
+    child->futex_pi_owner = NULL;
+    child->futex_pi_result = 0;
+    child->futex_pi_page = 0;
     child->futex_waitv_count = 0;
     child->futex_waitv_index = 0;
     child->futex_address = 0;
@@ -403,7 +407,7 @@ int64_t sched_clone_current(const struct trap_frame *parent_frame, uint64_t flag
             }
         }
     }
-    arch_fpu_save(child->fpu_state);
+    arch_fpu_save(sched_task_fpu_state(child));
     task_copy_name(child, parent->name);
     if (flags & CLONE_VM) {
         child->shared_mm = parent->shared_mm;

@@ -33,8 +33,8 @@ void sched_task_vma_release(struct task *task) { assert(task); }
 void sched_task_fs_release(struct task *task) { assert(task);++fs_releases; }
 void kernel_signal_reset_handlers(struct task *task) { assert(task==&target); }
 void syscall_close_cloexec_files(struct task *task) { assert(task==&target); }
-void arch_fpu_task_init(void *state) { assert(state==target.fpu_state); }
-void arch_fpu_restore(const void *state) { assert(state==target.fpu_state); }
+void arch_fpu_task_init(void *state) { assert(state==sched_task_fpu_state(&target)); }
+void arch_fpu_restore(const void *state) { assert(state==sched_task_fpu_state(&target)); }
 void sched_exit(uint32_t pid,uint64_t status) { assert(pid==target.pid && status==127);++exits;target.state=TASK_EXITED; }
 void console_log(enum console_log_level level,const char *format,...)
 { (void)level;(void)format; }

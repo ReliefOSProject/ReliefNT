@@ -219,6 +219,11 @@ static void test_user_kernel_modes(void)
     discard_fixture();
 }
 
+static int32_t encoded_cpu_clock(uint32_t pid, bool thread, unsigned kind)
+{
+    return (int32_t)((~pid << 3) | (thread ? 4U : 0U) | kind);
+}
+
 /** @brief Read real thread/group CPU time, including retired worker time. */
 static void test_cpu_clocks(void)
 {
@@ -239,6 +244,38 @@ static void test_cpu_clocks(void)
     assert(value.tv_sec == 1 && value.tv_nsec == 250000000);
     assert(sched_cpu_clock_get(LINUX_CLOCK_PROCESS_CPUTIME_ID, false, &value) == 0);
     assert(value.tv_sec == 2 && value.tv_nsec == 500000000);
+    /* glibc uses negative Linux CPU-clock IDs, including PID-zero forms. */
+    assert(sched_cpu_clock_get(encoded_cpu_clock(0, true, 2), false, &value) == 0);
+    assert(value.tv_sec == 1 && value.tv_nsec == 250000000);
+    assert(sched_cpu_clock_get(encoded_cpu_clock(leader->pid, true, 0), false, &value) == 0);
+    assert(value.tv_sec == 1 && value.tv_nsec == 250000000);
+    assert(sched_cpu_clock_get(encoded_cpu_clock(leader->pid, true, 1), false, &value) == 0);
+    assert(value.tv_sec == 1 && value.tv_nsec == 250000000);
+    assert(sched_cpu_clock_get(encoded_cpu_clock(worker->pid, true, 1), false, &value) == 0);
+    assert(value.tv_sec == 0 && value.tv_nsec == 0);
+    assert(sched_cpu_clock_get(encoded_cpu_clock(leader->pid, false, 2), false, &value) == 0);
+    assert(value.tv_sec == 2 && value.tv_nsec == 500000000);
+    assert(sched_cpu_clock_get(encoded_cpu_clock(0, false, 1), false, &value) == 0);
+    assert(value.tv_sec == 1 && value.tv_nsec == 250000000);
+    /* Linux permits gettime for the caller's own nonleader process-clock ID. */
+    fixture_cpu = 1;
+    assert(sched_cpu_clock_get(encoded_cpu_clock(worker->pid, false, 2), false, &value) == 0);
+    assert(value.tv_sec == 2 && value.tv_nsec == 500000000);
+    assert(sched_cpu_clock_get(encoded_cpu_clock(worker->pid, false, 2), true, &value) == -LINUX_EINVAL);
+    fixture_cpu = 0;
+    assert(sched_cpu_clock_get(encoded_cpu_clock(worker->pid, false, 2), false, &value) == -LINUX_EINVAL);
+    struct task *other = alloc_task_slot();
+    assert(other);
+    other->pid = 83;
+    other->kind = TASK_KIND_USER;
+    other->state = TASK_BLOCKED;
+    other->cpu_user_ticks = 42;
+    assert(sched_cpu_clock_get(encoded_cpu_clock(other->pid, true, 2), false, &value) == -LINUX_EINVAL);
+    assert(sched_cpu_clock_get(encoded_cpu_clock(other->pid, false, 2), false, &value) == 0);
+    assert(value.tv_sec == 0 && value.tv_nsec == 420000000);
+    assert(sched_cpu_clock_get(encoded_cpu_clock(999, false, 2), true, NULL) == -LINUX_EINVAL);
+    assert(sched_cpu_clock_get(-5, false, &value) == -LINUX_EINVAL);
+    assert(sched_cpu_clock_get(INT32_MIN, false, &value) == -LINUX_EINVAL);
     cpu_accounting_retire_thread(worker);
     worker->pid = 0;
     assert(sched_cpu_clock_get(LINUX_CLOCK_PROCESS_CPUTIME_ID, false, &value) == 0);

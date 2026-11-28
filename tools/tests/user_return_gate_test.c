@@ -93,6 +93,8 @@ void sched_account_mode(bool kernel)
 }
 
 uint32_t smp_current_cpu(void) { return cpu; }
+int sched_rseq_notify(struct task *task, struct trap_frame *frame, uint32_t owner, bool fixup)
+{ (void)task; (void)frame; (void)owner; (void)fixup; return 0; }
 bool net_tcp_maintenance_due(void)
 { assert(exclusive()); return network_due; }
 /** @brief Model a completed pressure batch on the scheduler service stack.
@@ -392,9 +394,9 @@ static void test_idle_wait(void)
          * old hardware image; CPU 1 must receive the latest saved image. */
         assert(!exclusive() && !fpu_idle_returns);
         cpu=1;uint64_t flags;kernel_execution_lock_irqsave(&flags);
-        arch_fpu_restore(current.fpu_state);
+        arch_fpu_restore(sched_task_fpu_state(&current));
         for (unsigned i=0;i<512;++i) assert(live_fpu[1][i]==0x31);
-        memset(live_fpu[1],0x62,512);arch_fpu_save(current.fpu_state);
+        memset(live_fpu[1],0x62,512);arch_fpu_save(sched_task_fpu_state(&current));
         kernel_execution_unlock_irqrestore(flags);cpu=0;++fpu_idle_returns;
         return;
     }
@@ -504,12 +506,12 @@ static void test_fpu_idle_handoff(void)
         struct trap_frame frame=prepare(LINUX_SYS_GETPID);
         current.state=TASK_BLOCKED;fpu_idle_roundtrip=true;
         selected=same ? &current : &replacement;
-        memset(live_fpu[0],0x31,512);memset(current.fpu_state,0x10,512);
-        memset(replacement.fpu_state,0x73,512);
+        memset(live_fpu[0],0x31,512);memset(sched_task_fpu_state(&current),0x10,512);
+        memset(sched_task_fpu_state(&replacement),0x73,512);
         assert(userland_schedule_from_frame(&frame)==selected);
         assert(fpu_idle_returns==1 && !irq_state);
         for (unsigned i=0;i<512;++i) {
-            assert(current.fpu_state[i]==0x62);
+            assert(sched_task_fpu_state(&current)[i]==0x62);
             assert(live_fpu[0][i]==(same ? 0x62 : 0x73));
         }
     }
@@ -519,13 +521,13 @@ static void test_fpu_selection_retry(void)
 {
     struct trap_frame frame=prepare(LINUX_SYS_GETPID);
     current.state=TASK_READY;selected=&replacement;stop_selected=true;
-    memset(live_fpu[0],0x31,512);memset(current.fpu_state,0x10,512);
-    memset(replacement.fpu_state,0x73,512);
+    memset(live_fpu[0],0x31,512);memset(sched_task_fpu_state(&current),0x10,512);
+    memset(sched_task_fpu_state(&replacement),0x73,512);
     assert(userland_schedule_from_frame(&frame)==&current);
     assert(replacement.state==TASK_STOPPED);
     for (unsigned i=0;i<512;++i) {
-        assert(current.fpu_state[i]==0x31 && live_fpu[0][i]==0x31);
-        assert(replacement.fpu_state[i]==0x73);
+        assert(sched_task_fpu_state(&current)[i]==0x31 && live_fpu[0][i]==0x31);
+        assert(sched_task_fpu_state(&replacement)[i]==0x73);
     }
 }
 int main(void)

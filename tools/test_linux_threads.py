@@ -6,7 +6,7 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix="reliefos-threads-") as tmp:
-    for test in ("futex_queue", "process_signal_queue", "signal_info_queue", "signalfd",
+    for test in ("rseq", "futex_queue", "futex_pi", "process_signal_queue", "signal_info_queue", "signalfd",
                  "signal_address_space", "signal_wake", "user_gp_dispatch", "resource_limits", "membarrier_cpu"):
         output = str(Path(tmp) / test)
         subprocess.run([
@@ -16,6 +16,8 @@ with tempfile.TemporaryDirectory(prefix="reliefos-threads-") as tmp:
             "-Iinclude", "-Iinclude", "-Iinclude/uapi", "-Iinclude",
             *(["-D_GNU_SOURCE"] if test == "signal_address_space" else []),
         f"tools/tests/{test}_test.c", "kernel/syscall/ipc/sysv_sem.c",
+        *(["kernel/sched/rseq.c"] if test == "rseq" else []),
+        *(["kernel/ipc/futex_pi.c"] if test in ("futex_queue", "futex_pi") else []),
         *(["arch/x86_64/cpu/barrier.c"] if test == "membarrier_cpu" else []),
         *(["kernel/syscall/io/vector.c"] if test == "signal_wake" else []),
         *(["kernel/syscall/fs/locks.c"] if test == "signal_address_space" else []), "-o", output,

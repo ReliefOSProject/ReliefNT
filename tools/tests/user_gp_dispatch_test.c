@@ -14,6 +14,7 @@
 #include <reliefnt/userland.h>
 
 #include "../../arch/x86_64/interrupt/idt.c"
+#include "signal_arch_fixture.h"
 #include "../../kernel/signal/signal.c"
 #include "../../kernel/signal/signal_queue.c"
 

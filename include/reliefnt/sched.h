@@ -144,6 +144,16 @@ void sched_yield_current(void);
  */
 void sched_request_reschedule_current(void);
 /**
+ * @brief Fix interrupted rseq state and publish the selected task's CPU identity.
+ * @param task Pinned user task under execution ownership, without scheduler_lock.
+ * @param frame Saved user registers, rewritten to the abort handler when needed.
+ * @param cpu Logical CPU that will resume the task.
+ * @param fixup True on preemption or signal delivery, false on syscall return.
+ * @return Zero or a negative errno requiring synchronous SIGSEGV delivery.
+ */
+int sched_rseq_notify(struct task *task, struct trap_frame *frame,
+                       uint32_t cpu, bool fixup);
+/**
  * @brief Report elapsed busy and idle CPU time in Linux USER_HZ (100) units.
  */
 void sched_cpu_ticks(uint64_t *busy_ticks, uint64_t *idle_ticks);
