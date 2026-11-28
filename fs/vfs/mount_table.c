@@ -66,7 +66,8 @@ static void mount_options(struct mount_text *text,uint64_t flags,bool mountinfo,
  * @param info True for mountinfo, false for combined mounts options.
  * @param text Borrowed bounded stream state. @param workspace Two VFS_PATH_MAX buffers.
  * @return Zero, hidden-root success or negative path-format errno. No
- * allocation/I/O/ownership change; flags are read from their actual owners.
+ * allocation/I/O/ownership change; access flags and optional propagation
+ * tags are read from their actual owners.
  */
 static int mount_line(const struct vfs_namespace *ns,const struct vfs_path *root,
                          const struct vfs_mount *mount,bool info,struct mount_text *text,char *workspace)
@@ -94,7 +95,9 @@ static int mount_line(const struct vfs_namespace *ns,const struct vfs_path *root
         mount_number(text,(mount->device>>8)&0xfff);mount_emit(text,":");
         mount_number(text,(mount->device&255)|((mount->device>>12)&~255ULL));mount_emit(text," ");
         mount_field(text,backing);mount_emit(text," ");mount_field(text,point);mount_emit(text," ");
-        mount_options(text,mount->policy,true,false);mount_emit(text," - ");mount_emit(text,filesystem);mount_emit(text," ");
+        mount_options(text,mount->policy,true,false);
+        if(mount->unbindable)mount_emit(text," unbindable");
+        mount_emit(text," - ");mount_emit(text,filesystem);mount_emit(text," ");
         mount_field(text,source);mount_emit(text," ");mount_options(text,vfs_super_flags(mount),true,true);mount_emit(text,"\n");
     } else {
         mount_field(text,source);mount_emit(text," ");mount_field(text,point);mount_emit(text," ");

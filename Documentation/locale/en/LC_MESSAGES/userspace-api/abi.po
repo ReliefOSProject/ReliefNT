@@ -68,14 +68,8 @@ msgstr ""
 
 msgid ""
 "``MS_BIND | MS_REC`` 还会复制源目录下的挂载拓扑。子挂载在目的树中拥有新的 挂载 ID 和独立策略，但仍共享各自的源 "
-"inode 和文件系统。源目录之外的挂载不复制， 后续拓扑变更也不会传播。准备失败时目的树和现有挂载保持原样。"
-msgstr ""
-"``MS_BIND | MS_REC`` also copies the topology of mounts below the source "
-"directory. Submounts in the destination tree have new mount IDs and "
-"independent policies, but each shares its original inodes and filesystem."
-" Mounts outside the source directory are not copied, and later topology "
-"changes do not propagate. Preparation failure leaves the destination tree"
-" and existing mounts unchanged."
+"inode 和文件系统。源目录之外的挂载和 unbindable 子树不复制。准备失败时目的树和现有挂载保持原样。"
+msgstr "``MS_BIND | MS_REC`` also copies the mount topology beneath the source directory. The new attachments have their own mount IDs and policies but share their respective source inodes and filesystems. Mounts outside the source directory and unbindable subtrees are skipped. Preparation failure leaves the destination tree and existing mounts unchanged."
 
 msgid "``mount(NULL, target, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL)`` 只更新目标挂载点的策略，不读取源、类型或文件系统选项。源挂载、子挂载和共享 文件系统保持原样。省略 atime 选项时保留原策略；共享文件系统只读时，清除 挂载点的只读标志不会使其可写。"
 msgstr "``mount(NULL, target, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL)`` only changes the policy at the target mountpoint. It does not read the source, type, or filesystem options. The source mount, submounts, and shared filesystem are unchanged. Omitted atime options preserve the existing policy. If the shared filesystem is read-only, clearing the mountpoint's read-only flag does not make it writable."
@@ -101,6 +95,12 @@ msgstr "``RELIEFOS_PR_GET_UNAME_LINUX`` (``0x52550002``): all arguments must be 
 
 msgid "非法值及非零保留参数返回 EINVAL，状态不变。新任务默认使用 ReliefNT； fork、vfork、clone 复制调用任务的选择，exec 保留选择。已经存在的其他任务 不受影响，线程也可独立设置该值。该开关仅将 ``uname(2)`` 返回的 ``sysname`` 改为 Linux，其余字段、全局 UTS 状态及 procfs 均不改变。 使用标准 libc prctl 包装或原始系统调用均可；不改变 personality 数值语义。"
 msgstr "Invalid values and nonzero reserved arguments return EINVAL without changing state. New tasks use ReliefNT by default. fork, vfork, and clone copy the calling task's selection, and exec preserves it. Other existing tasks are unaffected; threads may also set their selection independently. The switch changes only the ``sysname`` returned by ``uname(2)`` to Linux; other fields, global UTS state, and procfs are unchanged. Both the standard libc prctl wrapper and raw syscalls are supported. Linux personality values retain their existing meaning."
+
+msgid "私有和不可绑定挂载"
+msgstr "Private and unbindable mounts"
+
+msgid "新挂载默认是 private。``mount(NULL, target, NULL, MS_PRIVATE, NULL)`` 将 目标恢复为 private；``MS_UNBINDABLE`` 使目标不可作为 bind 源，并使递归 bind 跳过该子树。``MS_REC`` 将同一类型应用于目标及其现有子挂载；以后新建的子挂载 不会继承 unbindable。类型变更要求 ``CAP_SYS_ADMIN`` 且目标必须是挂载根， 不改变访问策略、文件系统状态或已有 bind。``/proc/self/mountinfo`` 使用 ``unbindable`` 可选字段报告不可绑定挂载。共享和 slave 传播尚不支持。"
+msgstr "New mounts are private by default. ``mount(NULL, target, NULL, MS_PRIVATE, NULL)`` makes the target private again. ``MS_UNBINDABLE`` prohibits using the target as a bind source and prunes its subtree from recursive binds. ``MS_REC`` applies the selected type to the target and its existing submounts; new submounts do not inherit the unbindable type. Changing the type requires ``CAP_SYS_ADMIN`` and a target at a mount root. It does not change access policy, filesystem state, or existing binds. ``/proc/self/mountinfo`` reports the ``unbindable`` optional field. Shared and slave propagation are not yet supported."
 
 msgid "延迟卸载"
 msgstr "Lazy Unmount"

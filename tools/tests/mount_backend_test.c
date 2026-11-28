@@ -2912,6 +2912,57 @@ static void runtime_mount_syscalls(struct vfs_namespace *ns,const struct vfs_pat
     puts("PASS actual mount/remount/MS_MOVE/umount syscalls: scoped objects, capability, busy refs, atime preservation, ignored remount source/type and nofollow");
 }
 
+/** @brief Check root-scoped propagation changes and unbindable bind pruning.
+ * @param ns Borrowed test namespace. @param root Retained namespace root.
+ * @param actor Privileged task with the fixture paths.
+ * @param source Writable user-path slot for the bind source.
+ * @param target Writable user-path slot for the mount/bind target.
+ * @param peer Held original bindable sibling for inode comparison.
+ */
+static void runtime_unbindable(struct vfs_namespace *ns,const struct vfs_path *root,
+                               struct task *actor,char *source,char *target,
+                               const struct vfs_path *peer)
+{
+    const uint64_t from=(uintptr_t)source,to=(uintptr_t)target;
+    const uint64_t ignored=UINT64_MAX;
+    strcpy(target,"/rbind-source/view");
+    assert(scoped_mount_call(ns,actor,LINUX_SYS_MOUNT,ignored,to,ignored,MS_PRIVATE,ignored)==-EINVAL);
+    strcpy(target,"/rbind-source/view/child");
+    assert(scoped_mount_call(ns,actor,LINUX_SYS_MOUNT,ignored,to,ignored,MS_UNBINDABLE|MS_PRIVATE,ignored)==-EINVAL);
+    actor->cap_effective=0;
+    assert(scoped_mount_call(ns,actor,LINUX_SYS_MOUNT,ignored,to,ignored,MS_UNBINDABLE,ignored)==-EPERM);
+    actor->cap_effective=1ULL<<CAP_SYS_ADMIN;
+    assert(!scoped_mount_call(ns,actor,LINUX_SYS_MOUNT,ignored,to,ignored,MS_UNBINDABLE|MS_REC,ignored));
+    assert(!scoped_mount_call(ns,actor,LINUX_SYS_MOUNT,ignored,to,ignored,MS_PRIVATE,ignored));
+    char table[3072];uint32_t count=0;
+    assert(!vfs_read_mount_table(ns,root,true,0,table,sizeof(table)-1,&count));table[count]=0;
+    assert(strstr(table," /rbind-source/view/child rw,nosuid - tmpfs "));
+    assert(strstr(table," /rbind-source/view/child/deep rw,nodev unbindable - tmpfs "));
+    assert(!scoped_mount_call(ns,actor,LINUX_SYS_MOUNT,ignored,to,ignored,MS_UNBINDABLE,ignored));
+
+    strcpy(source,"/rbind-source/view/child");strcpy(target,"/rbind-target");
+    uint64_t before=ns->next_id;
+    for(unsigned i=0;i<2;++i)
+        assert(scoped_mount_call(ns,actor,LINUX_SYS_MOUNT,from,to,ignored,MS_BIND|(i ? MS_REC : 0),ignored)==-EINVAL);
+    assert(ns->next_id==before);
+    strcpy(source,"/rbind-source/view");
+    assert(!scoped_mount_call(ns,actor,LINUX_SYS_MOUNT,from,to,ignored,MS_BIND|MS_REC,ignored));
+    assert(ns->next_id==before+2);
+    struct vfs_path found={0};
+    assert(vfs_path_lookup(ns,root,root,"/rbind-target/child/deep",0,&found)==-ENOENT);
+    assert(!vfs_path_lookup(ns,root,root,"/rbind-target/peer",0,&found));
+    assert(vfs_path_same_inode(&found,peer));
+    assert(!vfs_mount_unmount(ns,&found));vfs_path_put(&found);
+    assert(!vfs_path_lookup(ns,root,root,target,0,&found));
+    assert(!vfs_mount_unmount(ns,&found));vfs_path_put(&found);
+
+    strcpy(target,"/rbind-source/view/child");
+    assert(!scoped_mount_call(ns,actor,LINUX_SYS_MOUNT,ignored,to,ignored,MS_PRIVATE|MS_REC,ignored));
+    assert(!vfs_read_mount_table(ns,root,true,0,table,sizeof(table)-1,&count));table[count]=0;
+    assert(!strstr(table," unbindable - "));
+    puts("PASS mount propagation types: root and capability checks, recursive private, unbindable mountinfo and bind pruning");
+}
+
 /** @brief Clone only the selected directory's mount topology, or publish none of it.
  * @param ns Borrowed test-owned namespace. @param root Held root in that namespace.
  * @param fs Base tmpfs in which to prepare the source, target and sibling points.
@@ -2939,7 +2990,7 @@ static void runtime_recursive_bind(struct vfs_namespace *ns,const struct vfs_pat
     }
     struct task actor={.pid=902,.fsuid=1000,.fsgid=1000,.cap_effective=1ULL<<CAP_SYS_ADMIN};
     vfs_path_get(root,&actor.fs_paths.root);vfs_path_get(root,&actor.fs_paths.cwd);
-    struct {char source[32],target[32];} user={"/rbind-source/view","/rbind-target"};
+    struct {char source[48],target[48];} user={"/rbind-source/view","/rbind-target"};
     lookup_user_base=(uintptr_t)&user;lookup_user_bytes=sizeof(user);
     uint64_t source=(uintptr_t)user.source,target=(uintptr_t)user.target;
     assert(!vfs_path_lookup(ns,root,root,user.target,0,&point));
@@ -2973,6 +3024,7 @@ static void runtime_recursive_bind(struct vfs_namespace *ns,const struct vfs_pat
     assert(!vfs_mount_unmount(ns,&copy[0]));vfs_path_put(&copy[0]);
     assert(!vfs_mount_unmount(ns,&copy[2]));vfs_path_put(&copy[2]);
     assert(!vfs_mount_unmount(ns,&bound));vfs_path_put(&bound);
+    runtime_unbindable(ns,root,&actor,user.source,user.target,&original[2]);
     for(unsigned i=4;i>0;--i) {
         assert(!vfs_mount_unmount(ns,&original[i-1]));vfs_path_put(&original[i-1]);
     }

@@ -32,6 +32,7 @@ struct vfs_mount {
     struct module *owner;
     uint64_t references,id,policy;
     uint64_t writers; /* Open writable file descriptions on this attachment. */
+    bool unbindable; /* Pruned by recursive bind; never a valid bind source. */
     bool lazy_detached; /* No namespace edges; retained paths still work. */
     char *source,*filesystem;
     uint64_t device;

@@ -87,6 +87,21 @@ static int mount_bind_remount(struct vfs_namespace *ns,struct task *task,uint64_
     vfs_path_put(&found.path);return rc;
 }
 
+/** @brief Change propagation on the actual selected mount attachment.
+ * @param ns Borrowed namespace under execution ownership.
+ * @param task Authorized caller with retry-stable pathname state.
+ * @param target Required user mountpoint pathname, following final symlinks.
+ * @param flags Propagation selector and optional recursion.
+ * @return Zero or negative lookup/type errno. No other arguments are read.
+ */
+static int mount_propagation(struct vfs_namespace *ns,struct task *task,uint64_t target,uint64_t flags)
+{
+    struct vfs_lookup_result found={0};
+    int rc=resolve_user_object_at_flags(ns,task,LINUX_AT_FDCWD,target,false,false,VFS_LOOKUP_FOLLOW,&found);
+    if(!rc)rc=vfs_mount_set_propagation(ns,&found.path,flags);
+    vfs_path_put(&found.path);return rc;
+}
+
 /** @brief Validate and apply policy to the actual selected filesystem root.
  * @param ns Borrowed execution-owned namespace.
  * @param task Authorized calling task with retry-stable lookup scope.
@@ -183,13 +198,14 @@ static int mount_backend(struct vfs_namespace *ns,struct task *task,const char *
  * @param ns Borrowed live namespace under execution ownership.
  * @param task Calling task, required; CAP_SYS_ADMIN checked before user input.
  * @param number Linux MOUNT or UMOUNT2 operation number.
- * @param a0 User source/label, or unmount target pointer; ignored for remount.
+ * @param a0 User source/label, or unmount target pointer; ignored for remount
+ * and propagation changes.
  * @param a1 Mount target pointer, or unmount low-32-bit flags.
- * @param a2 User filesystem type; ignored for bind/remount/move/unmount.
+ * @param a2 User filesystem type; ignored for bind/remount/move/propagation/unmount.
  * @param a3 Native mount flags; ignored for unmount. Legacy magic and the
  * MS_SILENT diagnostic hint never become attachment policy or move selectors.
  * @param a4 Optional user mount data; ignored for bind, bind remount, move
- * and unmount.
+ * propagation changes and unmount.
  * @return Zero or negative Linux errno/internal EAGAIN. Text and lookup state
  * remain scope-owned across waits; temporary unscoped allocations are always
  * freed. The resulting graph owns backend lifetime, without target prefixes.
@@ -207,9 +223,10 @@ int64_t syscall_mount_control(struct vfs_namespace *ns,struct task *task,uint64_
         if(a3&MS_BIND)return mount_bind_remount(ns,task,a1,a3&~(MS_REMOUNT|MS_BIND));
         return mount_remount(ns,task,a1,a3&~MS_REMOUNT,a4);
     }
-    if(a3&MS_MOVE)return a3!=MS_MOVE ? -RELIEFOS_EOPNOTSUPP : mount_move(ns,task,a0,a1);
     if(a3&MS_BIND)return a3&~(MS_BIND|MS_REC) ? -RELIEFOS_EOPNOTSUPP :
         mount_bind(ns,task,a0,a1,(a3&MS_REC)!=0);
+    if(a3&VFS_PROPAGATION_MASK)return mount_propagation(ns,task,a1,a3);
+    if(a3&MS_MOVE)return a3!=MS_MOVE ? -RELIEFOS_EOPNOTSUPP : mount_move(ns,task,a0,a1);
     const uint64_t supported=MS_RDONLY|MS_NOSUID|MS_NODEV|MS_NOEXEC|MS_SYNCHRONOUS|MS_DIRSYNC|
         MS_NOATIME|MS_NODIRATIME|MS_RELATIME|MS_STRICTATIME|MS_LAZYTIME;
     if(a3&~supported)return -RELIEFOS_EOPNOTSUPP;

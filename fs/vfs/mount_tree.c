@@ -275,6 +275,39 @@ int vfs_mount_attach(struct vfs_namespace *ns,struct vfs_mount *mount,const stru
     mount->next=ns->mounts;ns->mounts=mount;return 0;
 }
 
+/** @brief Check mount ancestry by retained topology rather than pathname.
+ * @param root Borrowed candidate subtree root.
+ * @param mount Borrowed attachment to test.
+ * @return True if mount is root or reaches it through parent edges.
+ */
+static bool vfs_mount_below(const struct vfs_mount *root,const struct vfs_mount *mount)
+{
+    for(;mount;mount=mount->point.mount)if(mount==root)return true;
+    return false;
+}
+
+/** @brief Apply private or unbindable propagation type to live attachments.
+ * @param ns Borrowed namespace under execution ownership.
+ * @param path Retained exact root of the selected live mount.
+ * @param flags One propagation selector and optional MS_REC.
+ * @return Zero or negative errno. The whole change is validated before
+ * editing any mount. No allocation, backend callback or access-policy change.
+ */
+int vfs_mount_set_propagation(struct vfs_namespace *ns,const struct vfs_path *path,uint64_t flags)
+{
+    uint64_t type=flags&~MS_REC;
+    if(!type || (type&(type-1)) || (type&~VFS_PROPAGATION_MASK))return -EINVAL;
+    if(!ns || !vfs_path_valid(path) || path->mount->ns!=ns || path->dentry!=path->mount->root)
+        return -EINVAL;
+    if(type!=MS_PRIVATE && type!=MS_UNBINDABLE)return -EOPNOTSUPP;
+    bool unbindable=type==MS_UNBINDABLE;
+    path->mount->unbindable=unbindable;
+    if(flags&MS_REC)
+        for(struct vfs_mount *mount=ns->mounts;mount;mount=mount->next)
+            if(vfs_mount_below(path->mount,mount))mount->unbindable=unbindable;
+    return 0;
+}
+
 /** @brief Prepare an unattached directory view of an existing filesystem.
  * @param source Valid retained source directory; its mount and inode are shared.
  * @param out Receives the privately owned clone on success, NULL on failure.
@@ -301,13 +334,14 @@ static int vfs_bind_clone(const struct vfs_path *source,struct vfs_mount **out)
 /** @brief Find the next direct submount within the selected directory view.
  * @param view The original mount and the directory bounding its subtree.
  * @param candidate Start of a suffix of the unchanged namespace mount list.
- * @return Borrowed matching attachment or NULL. A mount on the same backing
- * dentry through another attachment is not part of this view.
+ * @return Borrowed matching bindable attachment or NULL. An unbindable
+ * attachment prunes its branch; a mount through another attachment is not
+ * part of the view even when its backing dentry is shared.
  */
 static struct vfs_mount *vfs_bind_child_mount(const struct vfs_path *view,struct vfs_mount *candidate)
 {
     for(;candidate;candidate=candidate->next) {
-        if(candidate->point.mount!=view->mount)continue;
+        if(candidate->point.mount!=view->mount || candidate->unbindable)continue;
         for(const struct vfs_dentry *d=candidate->point.dentry;d && !d->disconnected;d=d->parent)
             if(d==view->dentry)return candidate;
     }
@@ -318,7 +352,7 @@ static struct vfs_mount *vfs_bind_child_mount(const struct vfs_path *view,struct
  * @param ns Borrowed namespace under execution ownership.
  * @param source Borrowed retained source directory in ns.
  * @param target Borrowed retained destination directory in ns.
- * @param recursive True to copy the source's exact descendant attachments.
+ * @param recursive True to copy the source's bindable descendant branches.
  * @return Zero or negative errno. Staging traverses the original graph without
  * recursion or pathname replay; on failure the graph and next ID are unchanged.
  */
@@ -327,6 +361,7 @@ static int vfs_bind_tree(struct vfs_namespace *ns,const struct vfs_path *source,
 {
     if(!ns || !ns->root || !vfs_path_valid(source) || !vfs_path_valid(target))return -EINVAL;
     if(source->mount->ns!=ns || target->mount->ns!=ns)return -EXDEV;
+    if(source->mount->unbindable)return -EINVAL;
     if(source->dentry->node.type!=RELIEFOS_FS_TYPE_DIR || target->dentry->node.type!=RELIEFOS_FS_TYPE_DIR)return -ENOTDIR;
     if(source->dentry->disconnected || target->dentry->disconnected)return -ENOENT;
     if(vfs_covering(ns,target))return -EBUSY;
@@ -387,7 +422,7 @@ int vfs_mount_bind(struct vfs_namespace *ns,const struct vfs_path *source,const 
     return vfs_bind_tree(ns,source,target,false);
 }
 
-/** @brief Publish a directory view with independent copies of its submounts.
+/** @brief Publish a directory view with independent copies of its bindable subtrees.
  * @param ns Execution-owned namespace. @param source Retained subtree root.
  * @param target Retained destination directory.
  * @return Zero or negative errno without partial publication.
@@ -451,9 +486,8 @@ int vfs_mount_unmount_lazy(struct vfs_namespace *ns,const struct vfs_path *path)
 
     struct vfs_mount *detached=NULL,**link=&ns->mounts;
     while(*link) {
-        struct vfs_mount *mount=*link,*ancestor=mount;
-        while(ancestor && ancestor!=root)ancestor=ancestor->point.mount;
-        if(!ancestor){link=&mount->next;continue;}
+        struct vfs_mount *mount=*link;
+        if(!vfs_mount_below(root,mount)){link=&mount->next;continue;}
         *link=mount->next;mount->next=detached;detached=mount;
         mount->ns=NULL;mount->lazy_detached=true;
     }

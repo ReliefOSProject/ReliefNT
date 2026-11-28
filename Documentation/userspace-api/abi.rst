@@ -47,8 +47,8 @@ fork、vfork、clone 复制调用任务的选择，exec 保留选择。已经存
 源文件系统在绑定仍存在时不能正常卸载，解绑不销毁源文件系统。
 
 ``MS_BIND | MS_REC`` 还会复制源目录下的挂载拓扑。子挂载在目的树中拥有新的
-挂载 ID 和独立策略，但仍共享各自的源 inode 和文件系统。源目录之外的挂载不复制，
-后续拓扑变更也不会传播。准备失败时目的树和现有挂载保持原样。
+挂载 ID 和独立策略，但仍共享各自的源 inode 和文件系统。源目录之外的挂载和
+unbindable 子树不复制。准备失败时目的树和现有挂载保持原样。
 
 ``mount(NULL, target, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL)``
 只更新目标挂载点的策略，不读取源、类型或文件系统选项。源挂载、子挂载和共享
@@ -60,6 +60,16 @@ dup、fork 和文件映射持有的同一打开文件描述也会延续这项限
 或仅持有 O_PATH 不会阻止此转换。
 
 文件绑定尚不支持，返回明确错误。
+
+私有和不可绑定挂载
+==================
+
+新挂载默认是 private。``mount(NULL, target, NULL, MS_PRIVATE, NULL)`` 将
+目标恢复为 private；``MS_UNBINDABLE`` 使目标不可作为 bind 源，并使递归 bind
+跳过该子树。``MS_REC`` 将同一类型应用于目标及其现有子挂载；以后新建的子挂载
+不会继承 unbindable。类型变更要求 ``CAP_SYS_ADMIN`` 且目标必须是挂载根，
+不改变访问策略、文件系统状态或已有 bind。``/proc/self/mountinfo`` 使用
+``unbindable`` 可选字段报告不可绑定挂载。共享和 slave 传播尚不支持。
 
 延迟卸载
 ========
