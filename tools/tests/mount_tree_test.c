@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
 #include <mntent.h>
 #include <reliefnt/mount.h>
 #include <reliefnt/pseudo_fs.h>
@@ -289,6 +290,113 @@ static void mount_failed_teardown(struct module *owner)
     assert(!context_release_owner->users && allocations==before && !vfs_reclaim_mounts(8));
     puts("PASS failed detached backend cleanup pins actual module until bounded retry and final destroy");
 }
+
+/** @brief Snapshot an exact covered graph and retire either view without losing its provider.
+ * @param owner Live fixture module supplying the covered child filesystem.
+ */
+static void namespace_snapshot_objects(struct module *owner)
+{
+    struct vfs_namespace source={0},copy={0},later={0};
+    struct vfs_mount *base=mount_new(&a,NULL),*mount=NULL;
+    assert(!vfs_namespace_init(&source,base));vfs_mount_put(base);
+    struct vfs_path root={0};assert(!vfs_namespace_root(&source,&root));
+    struct vfs_path slot=find(&source,&root,&root,"mnt",2);
+    mount=mount_new(&b,NULL);
+    assert(!vfs_mount_set_flags(mount,MS_NODEV|MS_NOATIME));
+    assert(!vfs_mount_attach(&source,mount,&slot));vfs_mount_put(mount);
+    struct vfs_path lower=find(&source,&root,&root,"mnt",1);
+    struct vfs_path inner=find(&source,&root,&lower,"child",3);
+    struct vfs_path writer=find(&source,&root,&lower,"new",2);
+    assert(!vfs_path_write_get(&writer));
+
+    struct vfs_backend_ops owned=ops;owned.finish=finish_context;owned.destroy=release_context;
+    struct storage_node child_node=node(&c_entries[0]);
+    assert(!vfs_mount_new(&owned,&c,owner,&child_node,&mount));
+    assert(!vfs_mount_attach(&source,mount,&inner));vfs_mount_put(mount);
+    struct vfs_path child=find(&source,&root,&lower,"child",1);
+    assert(!vfs_mount_set_propagation(&source,&child,MS_UNBINDABLE));
+
+    mount=mount_new(&a,NULL);
+    assert(!vfs_mount_attach(&source,mount,&lower));vfs_mount_put(mount);
+    struct vfs_path upper=find(&source,&root,&root,"mnt",1);
+    assert(vfs_path_context(&upper)==&a);
+    struct vfs_path other=find(&source,&root,&root,"other",3);
+    assert(!vfs_mount_set_propagation(&source,&lower,MS_SHARED));
+    assert(!vfs_mount_bind(&source,&inner,&other));
+    struct vfs_path slave=find(&source,&root,&root,"other",3);
+    assert(!vfs_mount_set_propagation(&source,&slave,MS_SLAVE));
+    struct vfs_path task_root={0},cwd={0};
+    vfs_path_get(&lower,&task_root);vfs_path_get(&inner,&cwd);
+
+    const size_t before=allocations;
+    const uint64_t last=vfs_path_mount_id(&slave);
+    unsigned failed=0;
+    for(unsigned nth=1;nth<=16;++nth) {
+        fail_after=nth;allocation_attempts=0;
+        int rc=vfs_namespace_snapshot(&copy,&source,&task_root,&cwd);
+        fail_after=0;
+        if(!rc)break;
+        assert(rc==-ENOMEM && !copy.root && !copy.mounts && !copy.next_peer_id);
+        assert(vfs_path_equal(&task_root,&lower) && vfs_path_equal(&cwd,&inner));
+        assert(allocations==before && context_release_owner->users==1);++failed;
+    }
+    assert(failed>=5 && vfs_path_namespace(&task_root)==&copy && vfs_path_namespace(&cwd)==&copy);
+    assert(task_root.mount==cwd.mount && task_root.mount!=lower.mount);
+    assert(task_root.dentry==lower.dentry && cwd.dentry==inner.dentry);
+    assert(vfs_path_mount_id(&task_root)>last && vfs_path_same_filesystem(&task_root,&lower));
+
+    struct vfs_path visible={0};assert(!vfs_namespace_root(&copy,&visible));
+    assert(vfs_path_mount_id(&visible)==last+1);
+    struct vfs_path top=find(&copy,&visible,&visible,"mnt",1);
+    assert(vfs_path_same_inode(&top,&upper) && vfs_path_mount_id(&top)!=vfs_path_mount_id(&upper));
+    struct vfs_path branch=find(&copy,&task_root,&task_root,"child",1);
+    assert(vfs_path_same_inode(&branch,&child));
+    struct vfs_path parent=find(&copy,&task_root,&cwd,"..",1);
+    assert(vfs_path_equal(&parent,&task_root));vfs_path_put(&parent);
+    struct vfs_path bound=find(&copy,&visible,&visible,"other",3);
+    assert(vfs_path_same_inode(&bound,&cwd) && !vfs_path_equal(&bound,&cwd));
+    assert(vfs_mount_bind(&copy,&branch,&bound)==-EINVAL);
+    assert(vfs_path_mount_flags(&task_root)==(MS_NODEV|MS_NOATIME));
+    assert(!vfs_path_bind_remount(&task_root,MS_RDONLY));
+    assert(vfs_path_mount_flags(&task_root)==(MS_RDONLY|MS_NOATIME));
+    assert(vfs_path_mount_flags(&lower)==(MS_NODEV|MS_NOATIME));
+    assert(vfs_namespace_snapshot(&copy,&source,NULL,NULL)==-EINVAL);
+    assert(vfs_namespace_snapshot(&later,&source,&visible,NULL)==-EXDEV && !later.root);
+
+    char table[2048];uint32_t read=0;
+    assert(!vfs_read_mount_table(&copy,&visible,true,0,table,sizeof(table)-1,&read));table[read]=0;
+    assert(strstr(table,"/mnt ro,noatime shared:1 ") && strstr(table,"/other rw,nodev,noatime master:1 "));
+    assert(strstr(table,"/mnt/child rw unbindable "));
+
+    /* A backend-only snapshot pin is not a busy reference to the original. */
+    assert(!vfs_mount_unmount(&source,&upper));vfs_path_put(&upper);
+    struct vfs_path found=find(&source,&root,&root,"mnt",1);
+    assert(vfs_path_equal(&found,&lower));vfs_path_put(&found);
+    found=find(&copy,&visible,&visible,"mnt",1);
+    assert(vfs_path_equal(&found,&top));vfs_path_put(&found);
+    vfs_path_write_put(&writer);vfs_path_put(&writer);
+
+    unsigned released=context_releases;finish_attempts=0;finish_failures=1;
+    assert(vfs_namespace_destroy(&source)==-EBUSY);
+    vfs_namespace_retire(&source);
+    assert(!source.root && !source.mounts && !vfs_path_namespace(&child) && !finish_attempts);
+    found=find(&copy,&visible,&child,"nested",2);vfs_path_put(&found);
+    found=find(&copy,&task_root,&task_root,"child/nested",2);vfs_path_put(&found);
+    assert(!vfs_namespace_snapshot(&later,&copy,NULL,&child));
+    assert(!vfs_path_namespace(&child)); /* Already detached cwd stays on the old mount. */
+    vfs_namespace_retire(&later);vfs_namespace_retire(&copy);
+    assert(!copy.root && !copy.mounts && !vfs_path_namespace(&branch) && !finish_attempts);
+    assert(vfs_path_context(&branch)==&c && vfs_path_node(&branch)->first_cluster==1);
+    vfs_path_put(&branch);vfs_path_put(&bound);vfs_path_put(&top);vfs_path_put(&visible);
+    vfs_path_put(&cwd);vfs_path_put(&task_root);vfs_path_put(&slave);vfs_path_put(&other);
+    vfs_path_put(&child);vfs_path_put(&inner);vfs_path_put(&lower);vfs_path_put(&slot);vfs_path_put(&root);
+    assert(!finish_attempts && context_releases==released && vfs_reclaim_pending());
+    for(unsigned i=0;i<8 && vfs_reclaim_pending();++i)(void)vfs_reclaim_mounts(32);
+    assert(finish_attempts==2 && context_releases==released+1 && !vfs_reclaim_pending());
+    assert(!context_release_owner->users);no_pins(&a);no_pins(&b);no_pins(&c);
+    puts("PASS mount namespace snapshot: covered task paths, independent policy and IDs, atomic rollback and deferred retirement");
+}
+
 static unsigned pseudo_lookup_calls;
 static int owned_pseudo_lookup(const char *name,struct storage_node *out)
 {
@@ -345,16 +453,21 @@ static void mount_table_objects(void)
     struct vfs_path child=find(&ns,&root,&inside,"child",3);
     mounted=mount_new(&c,NULL);assert(!vfs_mount_describe(mounted,"nested","testfs",0x110304));
     assert(!vfs_mount_attach(&ns,mounted,&child));vfs_mount_put(mounted);
+    struct vfs_path moved=find(&ns,&root,&inside,"child",1);
+    const uint64_t root_id=vfs_path_mount_id(&root),inside_id=vfs_path_mount_id(&inside);
+    const uint64_t nested_id=vfs_path_mount_id(&moved);
+    char base_row[128],inside_row[128],nested_row[128];
+    snprintf(base_row,sizeof(base_row),"%" PRIu64 " %" PRIu64 " 8:0 / / rw - testfs rootfs rw\n",root_id,root_id);
+    snprintf(inside_row,sizeof(inside_row),"%" PRIu64 " %" PRIu64 " 0:2 / /mnt rw - tmpfs a\\040b\\134c\\011d\\012e rw\n",inside_id,root_id);
+    snprintf(nested_row,sizeof(nested_row),"%" PRIu64 " %" PRIu64 " 259:260 / /mnt/child rw - testfs nested rw\n",nested_id,inside_id);
     char text[4096]={0},chunks[4096]={0};uint32_t count=0,got=0;
     char diagnostic[64];
     assert(!vfs_namespace_context_mountpoint(&ns,&b,diagnostic,sizeof(diagnostic)) && !strcmp(diagnostic,"/mnt"));
     assert(!vfs_namespace_context_mountpoint(&ns,&c,diagnostic,sizeof(diagnostic)) && !strcmp(diagnostic,"/mnt/child"));
     assert(vfs_namespace_context_mountpoint(&ns,&ns,diagnostic,sizeof(diagnostic))==-ENOENT && !diagnostic[0]);
     assert(!vfs_read_mount_table(&ns,&root,true,0,text,sizeof(text)-1,&count));text[count]=0;
-    assert(strstr(text,"1 1 8:0 / / rw - testfs rootfs rw\n"));
-    assert(strstr(text,"2 1 0:2 / /mnt rw - tmpfs a\\040b\\134c\\011d\\012e rw\n"));
-    assert(strstr(text,"3 2 259:260 / /mnt/child rw - testfs nested rw\n"));
-    assert(strstr(text,"2 1 0:2 ")<strstr(text,"3 2 259:260 "));
+    assert(strstr(text,base_row) && strstr(text,inside_row) && strstr(text,nested_row));
+    assert(strstr(text,inside_row)<strstr(text,nested_row));
     assert(!strstr(text,"/dev") && !strstr(text,"/proc") && !strstr(text,"/sys"));
     for(uint32_t position=0;position<count;position+=got)
         assert(!vfs_read_mount_table(&ns,&root,true,position,chunks+position,7,&got) && got);
@@ -374,24 +487,28 @@ static void mount_table_objects(void)
     assert(strstr(text,"nested /other/child testfs rw 0 0\n") && !strstr(text,"/mnt"));
     mounted=mount_new(&b,NULL);assert(!vfs_mount_attach(&ns,mounted,&point));vfs_mount_put(mounted);
     struct vfs_path alias=find(&ns,&root,&root,"mnt",1);
+    const uint64_t alias_id=vfs_path_mount_id(&alias);
     assert(!vfs_namespace_context_mountpoint(&ns,&b,diagnostic,sizeof(diagnostic)) && !strcmp(diagnostic,"/other"));
-    /* Mount IDs do not imply ancestry: move ID3 below the newer parent ID4.
+    /* Mount IDs do not imply ancestry: move the child below a newer parent.
      * Consumers such as GNU GRUB must encounter the parent before this child. */
     struct vfs_path newer_parent_child=find(&ns,&root,&alias,"child",3);
-    struct vfs_path moved=find(&ns,&root,&root,"other/child",1);
     assert(!vfs_mount_move(&ns,&moved,&newer_parent_child));
+    snprintf(inside_row,sizeof(inside_row),"%" PRIu64 " %" PRIu64 " 0:0 / /mnt ",alias_id,root_id);
+    snprintf(nested_row,sizeof(nested_row),"%" PRIu64 " %" PRIu64 " 259:260 / /mnt/child ",nested_id,alias_id);
     char ordered[4096]={0};uint32_t ordered_count=0;
     assert(!vfs_read_mount_table(&ns,&root,true,0,ordered,sizeof(ordered)-1,&ordered_count));
     ordered[ordered_count]=0;
-    assert(strstr(ordered,"4 1 0:0 / /mnt ") && strstr(ordered,"3 4 259:260 / /mnt/child "));
-    assert(strstr(ordered,"4 1 0:0 ")<strstr(ordered,"3 4 259:260 "));
+    assert(strstr(ordered,inside_row) && strstr(ordered,nested_row));
+    assert(strstr(ordered,inside_row)<strstr(ordered,nested_row));
     for(uint32_t position=0;position<ordered_count;position+=got)
         assert(!vfs_read_mount_table(&ns,&root,true,position,chunks+position,7,&got) && got);
     assert(!memcmp(ordered,chunks,ordered_count));
     assert(!vfs_read_mount_table(&ns,&alias,true,0,ordered,sizeof(ordered)-1,&ordered_count));
     ordered[ordered_count]=0;
-    assert(strstr(ordered,"4 1 0:0 / / ") && strstr(ordered,"3 4 259:260 / /child "));
-    assert(strstr(ordered,"4 1 0:0 ")<strstr(ordered,"3 4 259:260 "));
+    snprintf(inside_row,sizeof(inside_row),"%" PRIu64 " %" PRIu64 " 0:0 / / ",alias_id,root_id);
+    snprintf(nested_row,sizeof(nested_row),"%" PRIu64 " %" PRIu64 " 259:260 / /child ",nested_id,alias_id);
+    assert(strstr(ordered,inside_row) && strstr(ordered,nested_row));
+    assert(strstr(ordered,inside_row)<strstr(ordered,nested_row));
     assert(!vfs_mount_move(&ns,&moved,&child));
     vfs_path_put(&moved);vfs_path_put(&newer_parent_child);
     FILE *stream=tmpfile();assert(stream && fwrite(text,1,count,stream)==count);rewind(stream);
@@ -401,12 +518,15 @@ static void mount_table_objects(void)
     }
     assert(decoded && !fclose(stream));
     assert(!vfs_read_mount_table(&ns,&inside,true,0,text,sizeof(text)-1,&count));text[count]=0;
-    assert(strstr(text,"2 1 0:2 / / rw - tmpfs") && strstr(text,"3 2 259:260 / /child rw"));
+    snprintf(inside_row,sizeof(inside_row),"%" PRIu64 " %" PRIu64 " 0:2 / / rw - tmpfs",inside_id,root_id);
+    snprintf(nested_row,sizeof(nested_row),"%" PRIu64 " %" PRIu64 " 259:260 / /child rw",nested_id,inside_id);
+    assert(strstr(text,inside_row) && strstr(text,nested_row));
     assert(!strstr(text,"rootfs"));
     /* Linux skips mount roots outside chroot; it never invents a new mount
      * root from the process's subdirectory (Linux6.12 show_mountinfo). */
     assert(!vfs_read_mount_table(&ns,&child,true,0,text,sizeof(text)-1,&count));text[count]=0;
-    assert(!strcmp(text,"3 2 259:260 / / rw - testfs nested rw\n"));
+    snprintf(nested_row,sizeof(nested_row),"%" PRIu64 " %" PRIu64 " 259:260 / / rw - testfs nested rw\n",nested_id,inside_id);
+    assert(!strcmp(text,nested_row));
     struct vfs_path nested=find(&ns,&root,&root,"other/child",1);
     assert(!vfs_mount_unmount(&ns,&nested));vfs_path_put(&nested);vfs_path_put(&child);
     assert(!vfs_mount_unmount(&ns,&inside));vfs_path_put(&inside);
@@ -415,7 +535,7 @@ static void mount_table_objects(void)
     assert(vfs_namespace_context_mountpoint(&ns,&b,diagnostic,sizeof(diagnostic))==-ENOENT && !diagnostic[0]);
     vfs_path_put(&alias);
     assert(!vfs_read_mount_table(&ns,&root,true,0,text,sizeof(text)-1,&count));text[count]=0;
-    assert(!strcmp(text,"1 1 8:0 / / rw - testfs rootfs rw\n"));
+    assert(!strcmp(text,base_row));
     vfs_path_put(&point);vfs_path_put(&other);vfs_path_put(&root);
     assert(!vfs_namespace_destroy(&ns));no_pins(&a);no_pins(&b);no_pins(&c);assert(!allocations);
     puts("PASS proc mount views follow actual moves, subtree parent IDs, escaping, chroot, chunked reads and detach");
@@ -483,6 +603,7 @@ int main(void)
     assert(!runtime->users);runtime->state=MODULE_LIVE;
     context_release_owner=runtime;mount_context_lifetime(&owner);mount_failed_teardown(&owner);
     pseudo_provider_lifetime(&owner);
+    namespace_snapshot_objects(&owner);assert(allocations==1);
     for(unsigned nth=1;nth<=2;++nth) {
         fail_after=nth;allocation_attempts=0;
         assert(vfs_mount_new(&ops,&b,&owner,&root_node,&unpublished)==-ENOMEM && !unpublished);

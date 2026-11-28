@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -351,6 +352,20 @@ static void test_proc_fd_object_link(void)
     assert(proc_fd_get_path(&current,3,&target)==-RELIEFOS_ENOENT && !target.mount);
     puts("PASS proc FD magic target owns the anonymous file object without replaying display names");
 }
+/** @brief Assert one mountinfo record with IDs from the retained attachments.
+ * @param table NUL-terminated output from the proc mountinfo view.
+ * @param mount Retained proc attachment. @param parent Retained actual parent.
+ * @param point Expected mountpoint relative to the view's captured root.
+ */
+static void assert_proc_mount_row(const char *table,const struct vfs_path *mount,
+                                  const struct vfs_path *parent,const char *point)
+{
+    char expected[128];
+    snprintf(expected,sizeof(expected),"%" PRIu64 " %" PRIu64 " 0:201 / %s rw - proc proc rw\n",
+             vfs_path_mount_id(mount),vfs_path_mount_id(parent),point);
+    assert(strstr(table,expected));
+}
+
 static void test_proc_mount_objects(void)
 {
     static const struct vfs_backend_ops ops={.lookup=proc_path_lookup,.retain=proc_path_retain,
@@ -380,7 +395,7 @@ static void test_proc_mount_objects(void)
     struct vfs_path mounts_view={0};char mount_text[512];
     assert(!vfs_path_lookup(&ns,&root,&root,"/procdir/self/mountinfo",VFS_LOOKUP_FOLLOW,&mounts_view));
     assert(!vfs_path_read(&mounts_view,0,mount_text,sizeof(mount_text)-1,&got));mount_text[got]=0;
-    assert(strstr(mount_text,"2 1 0:201 / /procdir rw - proc proc rw\n"));
+    assert_proc_mount_row(mount_text,&mounted,&root,"/procdir");
     struct vfs_open_file *old_view=NULL,*new_view=NULL;
     unsigned open_baseline=proc_allocations;
     for(int budget=0;budget<3;++budget) {
@@ -426,11 +441,11 @@ static void test_proc_mount_objects(void)
     assert(!vfs_path_lookup(&ns,&root,&old_process,"status",VFS_LOOKUP_FOLLOW,&old_status));
     assert(!vfs_mount_move(&ns,&mounted,&destination));
     assert(!vfs_path_read(&mounts_view,0,mount_text,sizeof(mount_text)-1,&got));mount_text[got]=0;
-    assert(strstr(mount_text,"2 1 0:201 / /else rw - proc proc rw\n") && !strstr(mount_text,"/procdir"));
+    assert_proc_mount_row(mount_text,&mounted,&root,"/else");assert(!strstr(mount_text,"/procdir"));
     assert(!vfs_file_read(old_view,0,mount_text,sizeof(mount_text)-1,&got));mount_text[got]=0;
     assert(strstr(mount_text,"/else rw - proc proc rw\n") && !strstr(mount_text,"/procdir"));
     assert(!vfs_file_read(new_view,0,mount_text,sizeof(mount_text)-1,&got));mount_text[got]=0;
-    assert(strstr(mount_text,"2 1 0:201 / / rw - proc proc rw\n"));
+    assert_proc_mount_row(mount_text,&mounted,&root,"/");
     vfs_path_put(&mounts_view);
     const char *actual_executable="/else/sys/kernel/osrelease";
     assert(proc_readlink("/proc/self/exe",bytes,sizeof(bytes))==(int)strlen(actual_executable) &&
@@ -451,7 +466,7 @@ static void test_proc_mount_objects(void)
     assert(!vfs_file_read(old_view,0,mount_text,sizeof(mount_text)-1,&got));mount_text[got]=0;
     assert(strstr(mount_text,"/else rw - proc proc rw\n"));
     assert(!vfs_file_read(new_view,0,mount_text,sizeof(mount_text)-1,&got));mount_text[got]=0;
-    assert(strstr(mount_text,"2 1 0:201 / / rw - proc proc rw\n"));
+    assert_proc_mount_row(mount_text,&mounted,&root,"/");
     vfs_file_close(old_view);vfs_file_close(new_view);
     assert(!vfs_path_lookup(&ns,&root,&root,"/else/42",0,&target));
     assert(!vfs_path_equal(&old_process,&target));vfs_path_put(&target);
@@ -612,6 +627,7 @@ int main(void)
     }
     assert(proc_readdir("/proc/42", &offset, &entry) == 1 && !strcmp(entry.name, "oom_score") && entry.type == RELIEFOS_FS_TYPE_FILE);
     assert(proc_readdir("/proc/42", &offset, &entry) == 1 && !strcmp(entry.name, "oom_score_adj") && entry.type == RELIEFOS_FS_TYPE_FILE);
+    assert(proc_readdir("/proc/42", &offset, &entry) == 1 && !strcmp(entry.name, "cgroup") && entry.type == RELIEFOS_FS_TYPE_FILE);
     assert(proc_readdir("/proc/42", &offset, &entry) == 0);
     offset = 0;
     /* Anonymous descriptors must survive proc inode lookup during getdents.

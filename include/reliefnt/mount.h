@@ -194,7 +194,7 @@ bool vfs_path_same_filesystem(const struct vfs_path *left,const struct vfs_path 
  * graph traversal, locking or ownership transfer occurs.
  */
 struct vfs_namespace *vfs_path_namespace(const struct vfs_path *path);
-struct vfs_namespace {struct vfs_mount *root,*mounts;uint64_t next_id,next_peer_id;};
+struct vfs_namespace {struct vfs_mount *root,*mounts;uint64_t next_peer_id;};
 /** @brief Assign immutable diagnostic identity before publishing a mount.
  * @param mount Owned detached mount, required; attachment returns EBUSY.
  * @param source Nonempty kernel source label, copied with PATH_MAX bounds.
@@ -521,6 +521,27 @@ int vfs_mount_set_flags(struct vfs_mount *mount,uint64_t flags);
  * @return Zero or negative errno, no change on failure. Serialized task context.
  */
 int vfs_namespace_init(struct vfs_namespace *ns,struct vfs_mount *root);
+/** @brief Publish a separate snapshot of a live namespace, sharing backends.
+ * @param dest Caller-owned empty namespace at its final address.
+ * @param source Live namespace, borrowed under exclusive VFS execution.
+ * @param root Optional owned task root slot to rebind, or NULL.
+ * @param cwd Optional owned working directory slot to rebind, or NULL.
+ * @return Zero or negative errno, leaving dest and both paths unchanged on
+ * failure. Held paths in source retain the same dentry on the corresponding
+ * new mount, even under an overmount; detached paths and empty slots remain
+ * unchanged. Live paths outside source are rejected. Mount IDs and policy
+ * are independent; propagation relations are copied locally, not connected
+ * between namespaces. No filesystem lookup or backend creation is needed.
+ */
+int vfs_namespace_snapshot(struct vfs_namespace *dest,const struct vfs_namespace *source,
+                           struct vfs_path *root,struct vfs_path *cwd);
+/** @brief Disconnect all mounts for last-owner namespace teardown.
+ * @param ns Caller-owned namespace with no remaining graph users, or NULL.
+ * Serialized VFS execution. Clears ns without propagating, checking busy
+ * paths or flushing backends. Held paths survive as detached objects;
+ * final backend cleanup is deferred. The caller owns the namespace storage.
+ */
+void vfs_namespace_retire(struct vfs_namespace *ns);
 /** @brief Destroy a namespace only when every external path/handle has gone.
  * @param ns Namespace to clear; NULL is invalid.
  * @return Zero or -EBUSY without partial detach on an external reference.

@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Existing whole VFS composition supplies the real tmpfs/inode adapters and
  * physical-I/O boundary stubs. Production code is independently compiled. */
+#include <inttypes.h>
+
 #define RELIEFNT_FIXTURE_REGISTER_TYPES
 #define RELIEFNT_FIXTURE_OWN_IRQ_LOCKS
 #define RELIEFNT_FIXTURE_ISO_READER
@@ -171,14 +173,16 @@ uint64_t mm_total_memory_kib(void){return 65536;}
 static void real_mount_description(struct vfs_namespace *ns,const struct vfs_path *root,
                                    const char *type,const char *flags)
 {
-    char text[1024],wanted[80];uint32_t count=0;
+    char text[1024],wanted[128];uint32_t count=0;
     assert(!vfs_read_mount_table(ns,root,true,0,text,sizeof(text)-1,&count));text[count]=0;
     uint32_t major=0,minor=1;
     if(strcmp(type,"tmpfs")) {
         const struct test_memory_disk *disk=test_memory_disk(vfs_path_context(root));
         major=1;minor=disk->registration.info.controller;
     }
-    snprintf(wanted,sizeof(wanted),"1 1 %u:%u / / %s - %s ",major,minor,flags,type);
+    const uint64_t id=vfs_path_mount_id(root);
+    snprintf(wanted,sizeof(wanted),"%" PRIu64 " %" PRIu64 " %u:%u / / %s - %s ",
+             id,id,major,minor,flags,type);
     assert(strstr(text,wanted));
 }
 /* This inode-only fixture creates no VMAs. Observe the real tmpfs resize
@@ -2943,13 +2947,13 @@ static void runtime_unbindable(struct vfs_namespace *ns,const struct vfs_path *r
     assert(!scoped_mount_call(ns,actor,LINUX_SYS_MOUNT,ignored,to,ignored,MS_SLAVE,ignored));
 
     strcpy(source,"/rbind-source/view/child");strcpy(target,"/rbind-target");
-    uint64_t before=ns->next_id;
+    uint64_t before=vfs_mount_next_id();
     for(unsigned i=0;i<2;++i)
         assert(scoped_mount_call(ns,actor,LINUX_SYS_MOUNT,from,to,ignored,MS_BIND|(i ? MS_REC : 0),ignored)==-EINVAL);
-    assert(ns->next_id==before);
+    assert(vfs_mount_next_id()==before);
     strcpy(source,"/rbind-source/view");
     assert(!scoped_mount_call(ns,actor,LINUX_SYS_MOUNT,from,to,ignored,MS_BIND|MS_REC,ignored));
-    assert(ns->next_id==before+2);
+    assert(vfs_mount_next_id()==before+2);
     struct vfs_path found={0};
     assert(vfs_path_lookup(ns,root,root,"/rbind-target/child/deep",0,&found)==-ENOENT);
     assert(!vfs_path_lookup(ns,root,root,"/rbind-target/peer",0,&found));
@@ -2996,7 +3000,7 @@ static void runtime_recursive_bind(struct vfs_namespace *ns,const struct vfs_pat
     lookup_user_base=(uintptr_t)&user;lookup_user_bytes=sizeof(user);
     uint64_t source=(uintptr_t)user.source,target=(uintptr_t)user.target;
     assert(!vfs_path_lookup(ns,root,root,user.target,0,&point));
-    const uint64_t next_id=ns->next_id;
+    const uint64_t next_id=vfs_mount_next_id();
     bool attached=false;
     for(int budget=0;budget<64;++budget) {
         test_fail_heap_after=budget;
@@ -3006,11 +3010,11 @@ static void runtime_recursive_bind(struct vfs_namespace *ns,const struct vfs_pat
         if(!rc){attached=true;break;}
         assert(rc==-ENOMEM);
         struct vfs_path unchanged={0};
-        assert(ns->next_id==next_id && !actor.lookup_scope.armed);
+        assert(vfs_mount_next_id()==next_id && !actor.lookup_scope.armed);
         assert(!vfs_path_lookup(ns,root,root,user.target,0,&unchanged));
         assert(vfs_path_equal(&unchanged,&point));vfs_path_put(&unchanged);
     }
-    assert(attached && ns->next_id==next_id+4);
+    assert(attached && vfs_mount_next_id()==next_id+4);
     struct vfs_path bound={0},copy[3]={0};
     const char *copy_names[]={"/rbind-target/child","/rbind-target/child/deep","/rbind-target/peer"};
     assert(!vfs_path_lookup(ns,root,root,user.target,0,&bound));
@@ -3106,15 +3110,15 @@ static void runtime_shared_mounts(struct vfs_namespace *ns,const struct vfs_path
     assert(!vfs_path_lookup(ns,root,root,"/shared-a/covered",0,&a));
     assert(!vfs_path_lookup(ns,root,root,user.target,0,&point));
     assert(!storage_new_tmpfs_mount("stacked event",0,NULL,1000,1000,&mount));
-    const uint64_t covered_id=ns->next_id,covered_peer_id=ns->next_peer_id;
+    const uint64_t covered_id=vfs_mount_next_id(),covered_peer_id=ns->next_peer_id;
     test_fail_heap_after=1;
     assert(vfs_mount_attach(ns,mount,&point)==-ENOMEM);
     test_fail_heap_after=-1;
-    assert(ns->next_id==covered_id && ns->next_peer_id==covered_peer_id);
+    assert(vfs_mount_next_id()==covered_id && ns->next_peer_id==covered_peer_id);
     assert(!vfs_path_lookup(ns,root,root,"/shared-a/covered",0,&found));
     assert(vfs_path_equal(&a,&found));vfs_path_put(&found);
     assert(!vfs_mount_attach(ns,mount,&point));vfs_mount_put(mount);vfs_path_put(&point);
-    assert(ns->next_id==covered_id+2 && ns->next_peer_id==covered_peer_id+1);
+    assert(vfs_mount_next_id()==covered_id+2 && ns->next_peer_id==covered_peer_id+1);
     assert(!vfs_kernel_mkdir(ns,"/shared-b/covered/incoming",0755));
     assert(vfs_path_lookup(ns,root,root,"/shared-a/covered/incoming",0,&found)==-ENOENT);
     assert(!vfs_path_lookup(ns,root,root,"/shared-a/covered",0,&found));
@@ -3136,17 +3140,17 @@ static void runtime_shared_mounts(struct vfs_namespace *ns,const struct vfs_path
 
     assert(!vfs_path_lookup(ns,root,root,"/shared-a/outside",0,&point));
     assert(!storage_new_tmpfs_mount("shared event",0,NULL,1000,1000,&mount));
-    const uint64_t next_id=ns->next_id,peer_id=ns->next_peer_id;
+    const uint64_t next_id=vfs_mount_next_id(),peer_id=ns->next_peer_id;
     test_fail_heap_after=1;
     assert(vfs_mount_attach(ns,mount,&point)==-ENOMEM);
     test_fail_heap_after=-1;
-    assert(ns->next_id==next_id && ns->next_peer_id==peer_id);
+    assert(vfs_mount_next_id()==next_id && ns->next_peer_id==peer_id);
     assert(!vfs_path_lookup(ns,root,root,"/shared-a/outside",0,&found));
     assert(vfs_path_equal(&found,&point));vfs_path_put(&found);
     assert(!vfs_path_lookup(ns,root,root,"/shared-b/outside",0,&found));
     assert(vfs_path_same_inode(&found,&point));vfs_path_put(&found);
     assert(!vfs_mount_attach(ns,mount,&point));vfs_mount_put(mount);vfs_path_put(&point);
-    assert(ns->next_id==next_id+2);
+    assert(vfs_mount_next_id()==next_id+2);
     unsigned long long event=fixture_shared_id(ns,root,"/shared-a/outside");
     assert(event && event!=group && fixture_shared_id(ns,root,"/shared-b/outside")==event);
     assert(vfs_path_lookup(ns,root,root,"/shared-narrow/outside",0,&found)==-ENOENT);
@@ -3168,12 +3172,12 @@ static void runtime_shared_mounts(struct vfs_namespace *ns,const struct vfs_path
     assert(!vfs_kernel_mkdir(ns,"/shared-source/child/nested",0755));
     assert(!vfs_path_lookup(ns,root,root,"/shared-source",0,&a));
     assert(!vfs_path_lookup(ns,root,root,"/shared-a/p/event",0,&point));
-    const uint64_t bind_id=ns->next_id,bind_peer_id=ns->next_peer_id;
+    const uint64_t bind_id=vfs_mount_next_id(),bind_peer_id=ns->next_peer_id;
     /* The first tree and one receiver tree fit, but not the final receiver. */
     test_fail_heap_after=8;
     assert(vfs_mount_bind_recursive(ns,&a,&point)==-ENOMEM);
     test_fail_heap_after=-1;
-    assert(ns->next_id==bind_id && ns->next_peer_id==bind_peer_id);
+    assert(vfs_mount_next_id()==bind_id && ns->next_peer_id==bind_peer_id);
     assert(!fixture_shared_id(ns,root,"/shared-source"));
     assert(vfs_path_lookup(ns,root,root,"/shared-a/p/event/child",0,&found)==-ENOENT);
     assert(vfs_path_lookup(ns,root,root,"/shared-b/p/event/child",0,&found)==-ENOENT);
@@ -3364,11 +3368,11 @@ static void runtime_slave_mounts(struct vfs_namespace *ns,const struct vfs_path 
     assert(!vfs_kernel_mkdir(ns,"/slave-d/rec/local",0755));
     assert(!vfs_path_lookup(ns,root,root,"/slave-source",0,&a));
     assert(!vfs_path_lookup(ns,root,root,"/slave-a/rec",0,&b));
-    const uint64_t id=ns->next_id,group=ns->next_peer_id;
+    const uint64_t id=vfs_mount_next_id(),group=ns->next_peer_id;
     test_fail_heap_after=9;
     assert(vfs_mount_bind_recursive(ns,&a,&b)==-ENOMEM);
     test_fail_heap_after=-1;
-    assert(ns->next_id==id && ns->next_peer_id==group);
+    assert(vfs_mount_next_id()==id && ns->next_peer_id==group);
     assert(vfs_path_lookup(ns,root,root,"/slave-d/rec/child",0,&found)==-ENOENT);
     vfs_path_put(&a);vfs_path_put(&b);
     strcpy(user.source,"/slave-source");strcpy(user.target,"/slave-a/rec");
@@ -3467,7 +3471,7 @@ static void runtime_shared_move(struct vfs_namespace *ns,const struct vfs_path *
     assert(!vfs_path_lookup(ns,root,root,"/move-src/child",0,&child));
     assert(!vfs_path_lookup(ns,root,root,"/move-a/slot",0,&target));
     const uint64_t id=vfs_path_mount_id(&original),child_id=vfs_path_mount_id(&child);
-    const uint64_t next=ns->next_id,next_group=ns->next_peer_id;
+    const uint64_t next=vfs_mount_next_id(),next_group=ns->next_peer_id;
     strcpy(user.source,"/move-src");
     assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,0,to,0,MS_UNBINDABLE,0));
     strcpy(user.target,"/move-a/slot");
@@ -3479,7 +3483,7 @@ static void runtime_shared_move(struct vfs_namespace *ns,const struct vfs_path *
     test_fail_heap_after=5;
     assert(vfs_mount_move(ns,&original,&target)==-ENOMEM);
     test_fail_heap_after=-1;
-    assert(ns->next_id==next && ns->next_peer_id==next_group);
+    assert(vfs_mount_next_id()==next && ns->next_peer_id==next_group);
     assert(!fixture_shared_id(ns,root,"/move-src") && !fixture_shared_id(ns,root,"/move-src/child"));
     assert(fixture_mount_tag(ns,root,"/move-src"," master:")==upstream);
     assert(!vfs_path_lookup(ns,root,root,"/move-a/slot",0,&found) && vfs_path_equal(&found,&target));
@@ -3488,7 +3492,7 @@ static void runtime_shared_move(struct vfs_namespace *ns,const struct vfs_path *
 
     strcpy(user.target,"/move-a/slot");
     assert(!scoped_mount_call(ns,&actor,LINUX_SYS_MOUNT,from,to,UINT64_MAX,MS_MOVE,UINT64_MAX));
-    assert(ns->next_id==next+6 && ns->next_peer_id==next_group+2);
+    assert(vfs_mount_next_id()==next+6 && ns->next_peer_id==next_group+2);
     assert(!vfs_path_lookup(ns,root,root,"/move-a/slot",0,&found));
     assert(vfs_path_equal(&found,&original) && vfs_path_mount_id(&found)==id);vfs_path_put(&found);
     assert(!vfs_path_lookup(ns,root,root,"/move-a/slot/child",0,&found));

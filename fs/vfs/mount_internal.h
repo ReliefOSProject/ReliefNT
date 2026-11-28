@@ -34,9 +34,9 @@ struct vfs_mount {
     struct module *owner;
     uint64_t references,id,policy,peer_group; /* Zero group is not shared. */
     uint64_t staged_peer_group; /* Tentative group of an original mount during MS_MOVE. */
-    uint64_t propagation_pins; /* Replica lifetime references, not open paths. */
+    uint64_t propagation_pins; /* Shared backend lifetime references, not open paths. */
     uint64_t writers; /* Open writable file descriptions on this attachment. */
-    bool propagation_backing; /* This bind_source is a replica lifetime pin. */
+    bool propagation_backing; /* This bind_source is a replica or snapshot lifetime pin. */
     bool unmount_selected; /* Scratch under the namespace execution writer. */
     bool lift_cover; /* Scratch: retain this overmount above a removed receiver. */
     bool propagation_copy; /* Receiver can detach beneath an unrelated root cover. */
@@ -45,6 +45,11 @@ struct vfs_mount {
     char *source,*filesystem;
     uint64_t device;
 };
+/** @brief Read the VFS-wide attachment ID cursor under execution ownership.
+ * @return Next unassigned mount ID, or zero after exhaustion. Failing a mount
+ * publication or snapshot never advances this cursor.
+ */
+uint64_t vfs_mount_next_id(void);
 bool vfs_path_valid(const struct vfs_path *path);
 /** @brief Admit a held path for pathname access, not mount topology changes.
  * @param ns Borrowed execution-owned lookup namespace.

@@ -14,6 +14,7 @@
    kthread
    memory
    path-cache
+   mount-namespaces
    resource-limits
    drivers
    storage-completion
